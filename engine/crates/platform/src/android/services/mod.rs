@@ -2,16 +2,18 @@
 //!
 //! Implements `migo_core::services::DeviceServices` traits using JNI calls.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use migo_core::services::{
     AccelerometerService, AdService, AudioPlatformService, AuthService, BatteryService,
     BluetoothService, CameraService, ClipboardService, CodecService, CommerceServices,
     CompassService, ConnectivityServices, DeviceMotionService, FileService, GameLogService,
     GyroscopeService, ImageApiService, InteractionService, KeyboardService, LocationService,
-    MediaServices, NavigateService, NetworkService, PaymentService, RecorderService,
-    ScanCodeService, ScreenService, SensorServices, ServiceError, ShareService, SubpackageService,
-    SystemInfoService, SystemUtilServices, VibrationService, VideoService,
+    MediaServices, NavigateService, NetworkService, PaymentService, PermissionService,
+    RecorderService, ScanCodeService, Scope, ScopeState, ScreenService, SensorServices,
+    ServiceError, ShareService, SubpackageService, SystemInfoService, SystemUtilServices,
+    VibrationService, VideoService,
 };
 
 use crate::android::jni;
@@ -179,6 +181,12 @@ impl CommerceServices for AndroidDeviceServices {
 
 // ---- SystemUtilServices ----
 impl SystemUtilServices for AndroidDeviceServices {
+    #[cfg(feature = "api-system")]
+    fn permission(&self) -> Option<Arc<dyn PermissionService>> {
+        Some(Arc::new(AndroidPermission {
+            host_id: self.host_id,
+        }))
+    }
     #[cfg(feature = "api-sensors")]
     fn clipboard(&self) -> Option<Arc<dyn ClipboardService>> {
         Some(Arc::new(AndroidClipboard {
@@ -850,6 +858,63 @@ struct AndroidGameLog {
 impl GameLogService for AndroidGameLog {
     fn report_log(&self, log_json: &str) -> Result<(), ServiceError> {
         Ok(jni::game_log_report(self.host_id, log_json)?)
+    }
+}
+
+// ==================== Permission ====================
+
+/// Scope decisions the host has pushed for a session.
+///
+/// Cached on this side rather than fetched per check: `scope_state` runs on
+/// every gated op -- a Bluetooth scan touches it repeatedly -- and a JNI
+/// round-trip there would put a cross-language hop on a hot path to answer a
+/// question whose answer changes only when a user acts.
+///
+/// The host is still the authority; this is its answer, held where the check
+/// happens. `NativeExports.updatePermission` writes it, at session start and
+/// whenever a decision changes.
+static PERMISSION_STATE: OnceLock<Mutex<HashMap<(i32, String), bool>>> = OnceLock::new();
+
+fn permission_map() -> &'static Mutex<HashMap<(i32, String), bool>> {
+    PERMISSION_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the host's decision for one scope.
+pub fn set_permission(host_id: i32, scope: &str, granted: bool) {
+    if let Ok(mut map) = permission_map().lock() {
+        map.insert((host_id, scope.to_string()), granted);
+    }
+}
+
+/// Drop a session's decisions when it ends, so a later session on the same host
+/// id cannot inherit them.
+pub fn clear_permissions(host_id: i32) {
+    if let Ok(mut map) = permission_map().lock() {
+        map.retain(|(id, _), _| *id != host_id);
+    }
+}
+
+struct AndroidPermission {
+    host_id: i32,
+}
+
+impl PermissionService for AndroidPermission {
+    fn scope_state(&self, scope: Scope) -> ScopeState {
+        let decided = permission_map().lock().ok().and_then(|map| {
+            map.get(&(self.host_id, scope.as_wx_str().to_string()))
+                .copied()
+        });
+        match decided {
+            Some(true) => ScopeState::Granted,
+            Some(false) => ScopeState::Denied,
+            // Absent means the host has not spoken about this scope. Not the
+            // same as a refusal: content may still ask, and `authorize` is how.
+            None => ScopeState::Unknown,
+        }
+    }
+
+    fn request_scope(&self, request_json: &str) -> Result<(), ServiceError> {
+        Ok(jni::permission_request(self.host_id, request_json)?)
     }
 }
 

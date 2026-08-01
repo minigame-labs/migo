@@ -6,6 +6,7 @@
 use deno_core::{Extension, OpState, op2};
 use deno_error::JsErrorBox;
 use shared::op_state::HostOpState;
+use shared::services::Scope;
 
 // ==================== Clipboard Ops ====================
 
@@ -346,6 +347,7 @@ pub fn op_get_location(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::UserLocation)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(location) = services.location() {
@@ -362,6 +364,7 @@ pub fn op_get_fuzzy_location(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::UserLocation)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(location) = services.location() {

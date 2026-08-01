@@ -1266,6 +1266,28 @@ pub(crate) extern "system" fn onBeaconUpdate<'local>(
     });
 }
 
+/// Record the host's decision for one scope.
+///
+/// Written into this side's cache rather than routed to JS: `require_scope`
+/// runs on every gated op and reads it there, and JS holds no permission state
+/// at all -- a permission answer content can reach is a permission answer
+/// content can change.
+pub(crate) extern "system" fn updatePermission<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    scope: JString<'local>,
+    granted: jni::sys::jboolean,
+) {
+    jni_safe!("updatePermission", {
+        let scope: String = match env.get_string(&scope) {
+            Ok(s) => s.into(),
+            Err(_) => return,
+        };
+        crate::android::services::set_permission(host_id, &scope, granted != 0);
+    });
+}
+
 pub(crate) extern "system" fn onBeaconServiceChange(
     _env: JNIEnv,
     _class: JClass,
@@ -1479,6 +1501,8 @@ jni_json_callback!(onScanCodeResult, "_internalOnScanCodeResult");
 // hide -- arrives on this single channel and is routed to an ad object by the
 // `adId` inside the payload.
 jni_json_callback!(onAdEvent, "_internalOnAdEvent");
+
+jni_json_callback!(onAuthorizeResult, "_internalOnAuthorizeResult");
 
 jni_json_callback!(onLoginResult, "_internalOnLoginResult");
 jni_json_callback!(onCheckSessionResult, "_internalOnCheckSessionResult");

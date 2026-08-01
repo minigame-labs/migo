@@ -21,6 +21,8 @@ import com.migo.runtime.callback.AdEventSink;
 import com.migo.runtime.callback.AdHandler;
 import com.migo.runtime.callback.AuthHandler;
 import com.migo.runtime.callback.GameLogHandler;
+import com.migo.runtime.callback.PermissionHandler;
+import com.migo.runtime.callback.PermissionSink;
 import com.migo.runtime.callback.SubpackageHandler;
 
 import com.migo.runtime.GameSession;
@@ -72,6 +74,10 @@ public final class NativeExports {
 
     /** Per-session auth handlers set via GameSession API. */
     private static final ConcurrentHashMap<Integer, AuthHandler> sAuthHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session permission handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, PermissionHandler> sPermissionHandlers =
             new ConcurrentHashMap<>();
 
     /** Per-session ad handlers set via GameSession API. */
@@ -2818,6 +2824,122 @@ public final class NativeExports {
             handler.destroyAd(adId);
         } catch (Exception e) {
             android.util.Log.w("NativeExports", "adDestroy: handler threw: " + e);
+        }
+    }
+
+    // ==================== Permission ====================
+    //
+    // The host decides; this is transport. Standing decisions go straight into
+    // the native cache that `require_scope` reads, and one-off `wx.authorize()`
+    // replies settle the pending promise. Nothing is kept in JavaScript: a
+    // permission answer content can reach is a permission answer content can
+    // change.
+
+    /**
+     * Set or clear the permission handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setPermissionHandler}.
+     */
+    public static void setPermissionHandler(int sessionId, PermissionHandler handler) {
+        if (handler == null) {
+            sPermissionHandlers.remove(sessionId);
+        } else {
+            sPermissionHandlers.put(sessionId, handler);
+        }
+    }
+
+    private static void clearPermissionHandler(int sessionId) {
+        sPermissionHandlers.remove(sessionId);
+    }
+
+    /** One sink per session; stateless apart from the id, so sharing is safe. */
+    private static final class SessionPermissionSink implements PermissionSink {
+        private final int sessionId;
+
+        SessionPermissionSink(int sessionId) {
+            this.sessionId = sessionId;
+        }
+
+        @Override
+        public void setScope(String scope, boolean granted) {
+            if (scope == null || scope.isEmpty()) return;
+            NativeMethods.updatePermission(sessionId, scope, granted);
+        }
+
+        @Override
+        public void resolveRequest(int requestId, boolean granted) {
+            try {
+                JSONObject res = new JSONObject();
+                res.put("requestId", requestId);
+                res.put("granted", granted);
+                NativeMethods.onAuthorizeResult(sessionId, res.toString());
+            } catch (JSONException e) {
+                failRequest(requestId, "internal error");
+            }
+        }
+
+        @Override
+        public void failRequest(int requestId, String errMsg) {
+            try {
+                JSONObject res = new JSONObject();
+                res.put("requestId", requestId);
+                res.put("error", errMsg != null ? errMsg : "authorize failed");
+                NativeMethods.onAuthorizeResult(sessionId, res.toString());
+            } catch (JSONException e) {
+                NativeMethods.onAuthorizeResult(sessionId,
+                        "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
+            }
+        }
+    }
+
+    private static final ConcurrentHashMap<Integer, SessionPermissionSink> sPermissionSinks =
+            new ConcurrentHashMap<>();
+
+    private static PermissionSink permissionSink(int sessionId) {
+        SessionPermissionSink existing = sPermissionSinks.get(sessionId);
+        if (existing != null) return existing;
+        SessionPermissionSink created = new SessionPermissionSink(sessionId);
+        SessionPermissionSink raced = sPermissionSinks.putIfAbsent(sessionId, created);
+        return raced != null ? raced : created;
+    }
+
+    /** @hide Called from native when content calls wx.authorize(). */
+    public static void permissionRequest(int sessionId, String requestJson) {
+        int requestId = 0;
+        String scope = "";
+        String desc = "";
+        try {
+            JSONObject req = new JSONObject(requestJson == null ? "{}" : requestJson);
+            requestId = req.optInt("requestId", 0);
+            scope = req.optString("scope", "");
+            desc = req.optString("desc", "");
+        } catch (JSONException ignored) {
+            // Fall through: a malformed request still owes content an answer.
+        }
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            clearPermissionHandler(sessionId);
+            sPermissionSinks.remove(sessionId);
+            return;
+        }
+
+        PermissionHandler handler = sPermissionHandlers.get(sessionId);
+        if (handler == null) {
+            // No handler is a refusal, not silence: content is awaiting a reply
+            // and would otherwise wait forever.
+            permissionSink(sessionId).failRequest(requestId, "authorize:fail no permission handler");
+            return;
+        }
+        if (scope.isEmpty()) {
+            permissionSink(sessionId).failRequest(requestId, "authorize:fail scope is required");
+            return;
+        }
+
+        try {
+            handler.requestScope(requestId, scope, desc, permissionSink(sessionId));
+        } catch (Exception e) {
+            permissionSink(sessionId).failRequest(requestId, "authorize:fail " + e);
         }
     }
 

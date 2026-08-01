@@ -104,6 +104,7 @@ mod input;
 mod io_state;
 mod lifecycle;
 pub(crate) mod network;
+mod permission;
 #[cfg(feature = "api-media")]
 pub use network::fetch::create_audio_http_client;
 mod rendering;

@@ -9,6 +9,7 @@ mod ad_reward_integrity;
 mod binary_helper;
 mod global_surface;
 mod install_receipt;
+mod permission_reporting;
 mod prelude;
 mod published_namespace_isolation;
 mod snapshot_fingerprint;

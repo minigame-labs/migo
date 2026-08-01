@@ -7,6 +7,7 @@ use shared::{
         AudioBufferId, AudioBufferInfo, AudioCmd, AudioContextId, AudioNodeId, InnerAudioId,
         InnerAudioInfo, InnerAudioState,
     },
+    services::Scope,
     vfs::{FileOp, VirtualFS},
 };
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
@@ -1181,6 +1182,8 @@ pub fn op_recorder_start(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), AudioError> {
+    crate::permission::require_scope(state, Scope::Record)
+        .map_err(|denied| audio_err(denied.to_string()))?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(recorder) = services.recorder() {
@@ -1193,6 +1196,8 @@ pub fn op_recorder_start(
 /// Pause recording.
 #[op2(fast)]
 pub fn op_recorder_pause(state: &mut OpState) -> Result<(), AudioError> {
+    crate::permission::require_scope(state, Scope::Record)
+        .map_err(|denied| audio_err(denied.to_string()))?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(recorder) = services.recorder() {
@@ -1205,6 +1210,8 @@ pub fn op_recorder_pause(state: &mut OpState) -> Result<(), AudioError> {
 /// Resume recording after pause.
 #[op2(fast)]
 pub fn op_recorder_resume(state: &mut OpState) -> Result<(), AudioError> {
+    crate::permission::require_scope(state, Scope::Record)
+        .map_err(|denied| audio_err(denied.to_string()))?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(recorder) = services.recorder() {
@@ -1217,6 +1224,8 @@ pub fn op_recorder_resume(state: &mut OpState) -> Result<(), AudioError> {
 /// Stop recording. Results delivered asynchronously via RecorderEvent.
 #[op2(fast)]
 pub fn op_recorder_stop(state: &mut OpState) -> Result<(), AudioError> {
+    crate::permission::require_scope(state, Scope::Record)
+        .map_err(|denied| audio_err(denied.to_string()))?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(recorder) = services.recorder() {

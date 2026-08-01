@@ -10,6 +10,7 @@ import android.view.Surface;
 import android.view.View;
 
 import com.migo.runtime.callback.AdHandler;
+import com.migo.runtime.callback.PermissionHandler;
 import com.migo.runtime.callback.AuthHandler;
 import com.migo.runtime.callback.GameLogHandler;
 import com.migo.runtime.callback.GameSessionListener;
@@ -703,6 +704,26 @@ public final class GameSession implements Closeable {
      *
      * @param handler host ad handler, or null to clear
      */
+    /**
+     * Set or clear the permission handler for this session.
+     * <p>
+     * You decide what the game may do. With no handler installed every scope is
+     * denied: {@code wx.getSetting()} reports nothing granted and capability
+     * calls fail with {@code auth deny}. That is deliberate — your app may hold
+     * the camera permission for its own features, and without this a game would
+     * reach it under your grant with nobody asked about that game.
+     * <p>
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host permission handler, or null to clear
+     */
+    public void setPermissionHandler(PermissionHandler handler) {
+        synchronized (lock) {
+            if (state.get() == SessionState.DESTROYED) return;
+            NativeExports.setPermissionHandler(sessionId, handler);
+        }
+    }
+
     public void setAdHandler(AdHandler handler) {
         synchronized (lock) {
             if (state.get() == SessionState.DESTROYED) return;

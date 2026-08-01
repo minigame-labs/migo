@@ -146,6 +146,8 @@ const NATIVE_COMMERCE: &[JniMethod] = methods![
 ];
 
 const NATIVE_SYSTEM: &[JniMethod] = methods![
+    ("onAuthorizeResult", "(ILjava/lang/String;)V"),
+    ("updatePermission", "(ILjava/lang/String;Z)V"),
     ("onModalResult", "(III)V"),
     ("onActionSheetResult", "(II)V"),
 ];
@@ -310,6 +312,7 @@ const JAVA_COMMERCE: &[JniMethod] = methods![
 ];
 
 const JAVA_SYSTEM: &[JniMethod] = methods![
+    ("permissionRequest", "(ILjava/lang/String;)V"),
     ("showToast", "(ILjava/lang/String;)V"),
     ("hideToast", "(I)V"),
     ("showModal", "(ILjava/lang/String;)V"),
@@ -422,9 +425,11 @@ mod tests {
         // edit rather than a side effect. Last moved by the host-authoritative
         // ad bridge: +1 native (`onAdEvent`, the single inbound ad channel)
         // and +6 Java (`adCreate`/`adLoad`/`adShow`/`adHide`/`adUpdateStyle`/
-        // `adDestroy`).
-        assert_eq!(native.len(), 67, "full NativeBridge surface changed");
-        assert_eq!(java.len(), 123, "full NativeExports surface changed");
+        // `adDestroy`). Then by host-decided permissions: +2 native
+        // (`onAuthorizeResult`, `updatePermission`) and +1 Java
+        // (`permissionRequest`).
+        assert_eq!(native.len(), 69, "full NativeBridge surface changed");
+        assert_eq!(java.len(), 124, "full NativeExports surface changed");
         assert_unique(&native);
         assert_unique(&java);
     }

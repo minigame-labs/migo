@@ -104,6 +104,14 @@ jobs:
       - name: Runtime internals not published contract
         run: bash scripts/test-runtime-internals-not-published.sh
 
+      # Every op reaching a gated capability must ask the host first. A
+      # permission system covering most of its surface advertises a guarantee it
+      # does not hold, to a customer making a compliance decision on it -- so the
+      # required set is derived from the sources, not from a register someone
+      # has to remember to update.
+      - name: Permission coverage contract
+        run: bash scripts/test-permission-coverage-contract.sh
+
       # The prescreen scanner answers "which APIs does this bundle need". Its
       # dangerous failure is silent under-reporting -- an alias or computed key
       # it does not follow turns into a confident "everything is supported".

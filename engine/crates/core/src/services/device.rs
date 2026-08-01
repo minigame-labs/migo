@@ -8,7 +8,7 @@ pub use shared::services::{
     CompassService, ConnectivityServices, DeviceMotionService, DeviceServices, FileService,
     GameLogService, GyroscopeService, ImageApiService, InteractionService, KeyboardService,
     LocationService, MediaServices, NavigateService, NetworkService, PaymentService,
-    RecorderService, ScanCodeService, ScreenService, SensorServices, ServiceError,
-    ServiceErrorCode, ShareService, SubpackageService, SystemInfoService, SystemUtilServices,
-    VibrationService, VideoService,
+    PermissionService, RecorderService, ScanCodeService, Scope, ScopeState, ScreenService,
+    SensorServices, ServiceError, ServiceErrorCode, ShareService, SubpackageService,
+    SystemInfoService, SystemUtilServices, VibrationService, VideoService,
 };

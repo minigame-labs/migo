@@ -1076,6 +1076,13 @@ jni_void_json!(ad_hide, "adHide");
 jni_void_json!(ad_update_style, "adUpdateStyle");
 jni_void_json!(ad_destroy, "adDestroy");
 
+// ==================== Permission ====================
+//
+// Fire-and-forget: the host may put the question to a user, so the decision
+// comes back on the `onAuthorizeResult` channel rather than as a return value.
+
+jni_void_json!(permission_request, "permissionRequest");
+
 // ==================== Auth ====================
 
 jni_void_json!(auth_login, "authLogin");
