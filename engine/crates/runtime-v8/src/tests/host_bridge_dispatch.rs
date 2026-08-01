@@ -1,21 +1,21 @@
 //! Host callbacks delivered through a handle instead of a name.
 //!
-//! Callbacks travel as eval'd JavaScript that names
+//! Callbacks used to travel as eval'd JavaScript naming
 //! `globalThis[Symbol.for('Migo.hostBridge')]`. `Symbol.for` reads the *global*
-//! symbol registry, so content asks for the same symbol and reaches every hook
+//! symbol registry, so content asked for the same symbol and reached every hook
 //! on the holder -- 78 of them, measured against a real runtime.
 //!
-//! `_internalDispatch` is the replacement: the runtime resolves it once at
-//! start-up and keeps a handle, and a handle needs no name. Once every call
-//! site has moved, the symbol can be removed from globalThis and the host still
+//! `_internalDispatch` replaced it: the runtime resolves it once at start-up,
+//! keeps a handle, and then deletes the symbol from globalThis. The host still
 //! reaches everything, because the retained handle keeps the holder alive
-//! through the dispatcher's closure.
+//! through the dispatcher's closure; content has nothing left to ask for.
 //!
-//! These tests pin the dispatcher against the four call shapes it has to
-//! replace. They were established by reading every existing call site, not by
-//! guessing at what a dispatcher might need: a shape it cannot carry is a
-//! callback that would go silent after the migration, on the channel that
-//! delivers every async result -- login, payment, location, camera, keyboard.
+//! Two things are pinned here. The dispatcher against the four call shapes it
+//! replaced -- established by reading every call site, not by guessing, since a
+//! shape it cannot carry is a callback that goes silent on the channel that
+//! delivers every async result (login, payment, location, camera, keyboard).
+//! And the retirement itself: that the name is gone, that hooks still arrive
+//! without it, and that a reload does not quietly depend on it.
 
 #[cfg(test)]
 mod host_bridge_dispatch_tests {
@@ -25,6 +25,8 @@ mod host_bridge_dispatch_tests {
     };
 
     use deno_core::{FastString, JsRuntime, RuntimeOptions};
+
+    use crate::js_bindings::JsBindings;
     use shared::{
         channel::ThreadWakeup,
         device::gpu_caps::GpuCaps,
@@ -217,13 +219,81 @@ mod host_bridge_dispatch_tests {
         );
     }
 
-    /// The holder must be removable once every call site has moved.
+    /// The name is gone as soon as the runtime holds a handle to what it named.
     ///
-    /// It was installed non-configurable, which would have left it permanently
-    /// reachable however much else changed -- the migration's last step would
-    /// have had nothing to delete.
+    /// This is the property the whole change exists for: `Symbol.for` reads the
+    /// *global* registry, so while the name was installed, content asking for
+    /// the same symbol reached every host hook -- login, payment, rewarded-video
+    /// completion. Afterwards there is no name to ask for, and the host reaches
+    /// them anyway.
     #[test]
-    fn the_holder_can_be_deleted_once_nothing_needs_its_name() {
+    fn the_holder_name_is_retired_once_the_runtime_holds_its_handle() {
+        let mut rt = boot();
+        assert_js(
+            &mut rt,
+            "let __ok = globalThis[Symbol.for('Migo.hostBridge')] !== undefined; \
+             let __msg = 'the holder should be reachable before bindings resolve it'",
+        );
+
+        let _bindings = JsBindings::new(&mut rt, 1);
+
+        assert_js(
+            &mut rt,
+            "let __ok = globalThis[Symbol.for('Migo.hostBridge')] === undefined; \
+             let __msg = 'the holder is still reachable by name from content'",
+        );
+    }
+
+    /// Retiring the name must not retire the hooks.
+    ///
+    /// The holder survives because `99_main.js` closes over it and the runtime
+    /// keeps a handle; if either of those stopped holding it, this dispatch
+    /// would reach nothing while every other signal stayed green.
+    #[test]
+    fn the_dispatcher_still_delivers_after_the_name_is_retired() {
+        let mut rt = boot();
+        exec(&mut rt, PROBE);
+
+        let bindings = JsBindings::new(&mut rt, 1);
+        bindings.invoke_host_hook(&mut rt, "_internalProbe", r#"["after"]"#);
+
+        assert_js(
+            &mut rt,
+            "const c = globalThis.__calls; \
+             let __ok = c.length === 1 && c[0][0] === 'after'; \
+             let __msg = JSON.stringify(c)",
+        );
+    }
+
+    /// A reload re-resolves every hook, and by then the name is gone -- so it
+    /// has to work from what was retained the first time.
+    ///
+    /// Without that, a reload would quietly fall back to the global object,
+    /// find none of the hooks there, and leave every host callback dead with
+    /// nothing reporting a failure.
+    #[test]
+    fn a_reload_does_not_depend_on_the_retired_name() {
+        let mut rt = boot();
+        exec(&mut rt, PROBE);
+
+        let mut bindings = JsBindings::new(&mut rt, 1);
+        bindings.reload(&mut rt, 1);
+        bindings.invoke_host_hook(&mut rt, "_internalProbe", r#"["after reload"]"#);
+
+        assert_js(
+            &mut rt,
+            "const c = globalThis.__calls; \
+             let __ok = c.length === 1 && c[0][0] === 'after reload'; \
+             let __msg = JSON.stringify(c)",
+        );
+    }
+
+    /// The holder property has to stay configurable for the retirement above to
+    /// take effect. Pinned separately because a non-configurable property makes
+    /// `delete` a silent no-op -- the failure would show up as a reachable
+    /// holder rather than as an error.
+    #[test]
+    fn the_holder_property_is_configurable() {
         let mut rt = boot();
         assert_js(
             &mut rt,

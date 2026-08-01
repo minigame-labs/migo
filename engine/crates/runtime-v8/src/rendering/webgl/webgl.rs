@@ -2844,14 +2844,18 @@ mod tests {
                 r#"
                 const gl = new WebGLRenderingContext({ _rid: 148, width: 1, height: 1 }, {});
                 gl.clear(0x4000);
-                const bridge = globalThis[Symbol.for("Migo.hostBridge")];
-                if (typeof bridge?._internalTriggerWebglContextEvent !== "function") {
-                    throw new Error("missing context lifecycle bridge");
-                }
-                bridge._internalTriggerWebglContextEvent("webglcontextlost");
-                gl.flush();
                 "#,
             )
+            .expect("context-loss setup must execute");
+
+        // Fire the loss the way the host does -- through the handle the runtime
+        // retains -- rather than by naming the host-bridge holder. The name is
+        // retired once the runtime holds it, and reaching hooks by name is the
+        // thing content is no longer able to do.
+        runtime.dispatch_webgl_context_event("webglcontextlost");
+
+        runtime
+            .exec_script("r2_context_loss_flush.js", "gl.flush();")
             .expect("context-loss discard path must execute");
 
         let (submit_calls, decoded) = crate::rendering::webgl::submit_test_counter::read();

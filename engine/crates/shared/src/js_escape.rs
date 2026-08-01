@@ -1,3 +1,7 @@
+use std::borrow::Cow;
+
+use serde::Serialize;
+
 /// Escape a string for safe interpolation into a JSON double-quoted string.
 ///
 /// Handles: backslash, double quote, newlines, carriage return, and tab.
@@ -16,200 +20,114 @@ pub fn escape_for_json_string(s: &str) -> String {
     out
 }
 
-/// Escape a string for safe interpolation into a JS single-quoted string literal.
+/// Arguments for a host hook delivered through the retained dispatcher.
 ///
-/// Handles all characters that could break out of the string or inject code:
-/// backslash, single quote, newlines, null, backtick, dollar sign, and
-/// Unicode line separators (U+2028, U+2029).
-pub fn escape_for_js_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 16);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
-            '`' => out.push_str("\\`"),
-            '$' => out.push_str("\\$"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            _ => out.push(c),
-        }
-    }
-    out
+/// The dispatcher does `JSON.parse(args)` on what it is handed and spreads the
+/// result, so these build a JSON array.
+///
+/// The encoding lives here rather than at each call site for one reason: an
+/// array that does not parse is a callback the dispatcher **drops**, and a
+/// dropped callback is a promise that never settles. A hand-rolled quoter that
+/// forgets one control character loses the login result of whichever user
+/// happens to have it in their nickname. `serde_json` is the encoder; nothing
+/// below writes a quote by hand.
+pub const HOOK_ARGS_NONE: &str = "[]";
+
+/// One argument.
+///
+/// Pass a `&str` for the hooks that parse their own JSON, a
+/// [`serde_json::Value`] for the ones that take an object, a number for the
+/// rest -- the shapes are the hooks', and this does not reinterpret them.
+pub fn hook_args_one<T: Serialize>(value: T) -> Cow<'static, str> {
+    encode_hook_args(&(value,))
 }
 
-/// JS expression that resolves the host-bridge holder object at runtime.
-///
-/// The runtime relocates all `_internal*` host-bridge hooks off the
-/// game-visible global onto a Symbol-keyed holder (see `99_main.js`). Host
-/// callbacks delivered through the EvalScript channel must therefore qualify
-/// the hook name with this prefix instead of calling a bare global identifier.
-///
-/// Keep this in sync with the Symbol key used in `99_main.js` and the lookup
-/// in `runtime-v8/src/js_bindings.rs`.
-pub const HOST_BRIDGE_EXPR: &str = "globalThis[Symbol.for('Migo.hostBridge')]";
+/// Two arguments -- `_internalOnModalResult(confirm, cancel)`.
+pub fn hook_args_two<A: Serialize, B: Serialize>(a: A, b: B) -> Cow<'static, str> {
+    encode_hook_args(&(a, b))
+}
 
-/// Build a complete `<holder>.callbackName('escaped_json');` JS source string
-/// in a single allocation.
-///
-/// `callback_name` is the bare hook name (e.g. `_internalOnLoginResult`); this
-/// function prefixes it with [`HOST_BRIDGE_EXPR`] so the call resolves the hook
-/// from the Symbol-keyed host-bridge holder rather than the global scope (the
-/// hooks are no longer exposed as global identifiers -- see `99_main.js`).
-///
-/// This combines the work of `escape_for_js_string` + `format!` into one pass,
-/// eliminating the intermediate escaped String allocation. The escape rules are
-/// identical to `escape_for_js_string`.
-pub fn build_eval_script(callback_name: &str, json: &str) -> String {
-    // HOST_BRIDGE_EXPR + '.' + name + "('" + escaped + "');"
-    let mut out = String::with_capacity(
-        HOST_BRIDGE_EXPR.len() + 1 + callback_name.len() + json.len() + 5 + 16,
-    );
-    out.push_str(HOST_BRIDGE_EXPR);
-    out.push('.');
-    out.push_str(callback_name);
-    out.push_str("('");
-    for c in json.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
-            '`' => out.push_str("\\`"),
-            '$' => out.push_str("\\$"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            _ => out.push(c),
+fn encode_hook_args<T: Serialize>(value: &T) -> Cow<'static, str> {
+    match serde_json::to_string(value) {
+        Ok(encoded) => Cow::Owned(encoded),
+        // Unreachable for the types above: serde_json fails only on non-string
+        // map keys and non-finite floats, and `Value` can hold neither.
+        //
+        // The fallback is deliberately *not* `HOOK_ARGS_NONE`: that would call
+        // the hook with `undefined` where it expects a result, settling a
+        // promise with nonsense. An empty string does not parse, so the
+        // dispatcher drops the call -- the same treatment any other malformed
+        // payload gets.
+        Err(e) => {
+            tracing::error!("host hook arguments could not be encoded: {e}");
+            Cow::Borrowed("")
         }
     }
-    out.push_str("');");
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The dispatcher spreads what it decodes, so a one-argument call has to
+    /// arrive as a one-element array -- not as a bare value.
     #[test]
-    fn plain_ascii_unchanged() {
-        assert_eq!(escape_for_js_string("hello"), "hello");
+    fn one_argument_is_a_one_element_array() {
+        assert_eq!(hook_args_one("payload"), r#"["payload"]"#);
     }
 
     #[test]
-    fn single_quote_escaped() {
-        assert_eq!(escape_for_js_string("it's"), "it\\'s");
+    fn two_arguments_keep_their_order() {
+        assert_eq!(hook_args_two(1, 0), "[1,0]");
     }
 
+    /// The hooks that take a JSON result are handed the *string*, exactly as
+    /// they were by the channel this replaces. Encoding it as an object here
+    /// would silently change the argument every one of them receives.
     #[test]
-    fn backslash_escaped() {
-        assert_eq!(escape_for_js_string("a\\b"), "a\\\\b");
+    fn a_json_payload_stays_a_string() {
+        let encoded = hook_args_one(r#"{"code":"abc"}"#);
+        assert_eq!(encoded, r#"["{\"code\":\"abc\"}"]"#);
     }
 
+    /// An object argument -- `onShow` launch options -- travels as a value.
     #[test]
-    fn newline_escaped() {
-        assert_eq!(escape_for_js_string("a\nb"), "a\\nb");
+    fn an_object_argument_travels_as_a_value() {
+        let value: serde_json::Value = serde_json::json!({"scene": 1001});
+        assert_eq!(hook_args_one(value), r#"[{"scene":1001}]"#);
     }
 
+    /// The characters that used to need escaping for JS source, and the ones a
+    /// hand-rolled JSON quoter forgets.
+    ///
+    /// U+2028/U+2029 are the interesting pair: valid inside a JSON string, but
+    /// line terminators in JS source. They needed escaping only because the
+    /// payload was pasted into source, and nothing here is source -- so they
+    /// may pass through unescaped, and the result must still parse.
     #[test]
-    fn carriage_return_escaped() {
-        assert_eq!(escape_for_js_string("a\rb"), "a\\rb");
+    fn control_characters_survive_the_round_trip() {
+        for payload in [
+            "it's a `$100` note",
+            "line\nbreak\r\ttab",
+            "null\u{0}byte",
+            "unit\u{1}separator",
+            "sep\u{2028}and\u{2029}para",
+            "quote\"and\\slash",
+            "",
+        ] {
+            let encoded = hook_args_one(payload);
+            let decoded: Vec<String> =
+                serde_json::from_str(&encoded).expect("encoded arguments must parse");
+            assert_eq!(decoded, vec![payload.to_string()], "payload {payload:?}");
+        }
     }
 
+    /// Zero arguments is a literal, not an encoding, so pin that it is the
+    /// array the dispatcher expects rather than something like `null`.
     #[test]
-    fn backtick_escaped() {
-        assert_eq!(escape_for_js_string("a`b"), "a\\`b");
-    }
-
-    #[test]
-    fn dollar_escaped() {
-        assert_eq!(escape_for_js_string("$var"), "\\$var");
-    }
-
-    #[test]
-    fn null_escaped() {
-        assert_eq!(escape_for_js_string("a\0b"), "a\\0b");
-    }
-
-    #[test]
-    fn u2028_line_separator_escaped() {
-        assert_eq!(escape_for_js_string("a\u{2028}b"), "a\\u2028b");
-    }
-
-    #[test]
-    fn u2029_paragraph_separator_escaped() {
-        assert_eq!(escape_for_js_string("a\u{2029}b"), "a\\u2029b");
-    }
-
-    #[test]
-    fn combined_escapes() {
-        assert_eq!(
-            escape_for_js_string("it's a `$100` note\n"),
-            "it\\'s a \\`\\$100\\` note\\n"
-        );
-    }
-
-    #[test]
-    fn empty_string() {
-        assert_eq!(escape_for_js_string(""), "");
-    }
-
-    #[test]
-    fn all_special_chars() {
-        assert_eq!(escape_for_js_string("\\'\n\r"), "\\\\\\'\\n\\r");
-    }
-
-    // ---- build_eval_script tests ----
-
-    #[test]
-    fn build_eval_script_plain_json() {
-        assert_eq!(
-            build_eval_script("_internalOnResult", r#"{"ok":true}"#),
-            format!("{HOST_BRIDGE_EXPR}._internalOnResult('{{\"ok\":true}}');"),
-        );
-    }
-
-    #[test]
-    fn build_eval_script_json_with_single_quotes() {
-        assert_eq!(
-            build_eval_script("_internalOnResult", r#"{"msg":"it's done"}"#),
-            format!("{HOST_BRIDGE_EXPR}._internalOnResult('{{\"msg\":\"it\\'s done\"}}');"),
-        );
-    }
-
-    #[test]
-    fn build_eval_script_empty_json() {
-        assert_eq!(
-            build_eval_script("_internalOnResult", ""),
-            format!("{HOST_BRIDGE_EXPR}._internalOnResult('');"),
-        );
-    }
-
-    #[test]
-    fn build_eval_script_matches_escape_plus_format() {
-        // Verify that build_eval_script produces identical output to the
-        // two-step escape_for_js_string + format! approach.
-        let json = r#"{"path":"C:\\Users\\test","note":"line1\nline2"}"#;
-        let callback = "_internalOnChooseImageResult";
-        let expected = format!(
-            "{HOST_BRIDGE_EXPR}.{}('{}');",
-            callback,
-            escape_for_js_string(json)
-        );
-        assert_eq!(build_eval_script(callback, json), expected);
-    }
-
-    #[test]
-    fn build_eval_script_all_special_chars() {
-        let json = "\\'\n\r\0`$\u{2028}\u{2029}";
-        let callback = "_cb";
-        let expected = format!(
-            "{HOST_BRIDGE_EXPR}.{}('{}');",
-            callback,
-            escape_for_js_string(json)
-        );
-        assert_eq!(build_eval_script(callback, json), expected);
+    fn no_arguments_is_an_empty_array() {
+        let decoded: Vec<String> =
+            serde_json::from_str(HOOK_ARGS_NONE).expect("HOOK_ARGS_NONE must parse");
+        assert!(decoded.is_empty());
     }
 }

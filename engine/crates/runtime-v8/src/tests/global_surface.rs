@@ -5,8 +5,12 @@
 //! scope. They pin the contract that a security audit dumping
 //! `Object.getOwnPropertyNames(globalThis)` sees neither deno_core internals
 //! (`Deno`, `__bootstrap`) nor the host-bridge hooks (`_internal*`), while the
-//! host's two delivery channels can still reach those hooks via the
-//! `Symbol.for('Migo.hostBridge')` holder.
+//! host can still reach those hooks.
+//!
+//! These boot the runtime *without* `JsBindings`, which is the window in which
+//! the `Symbol.for('Migo.hostBridge')` holder is still installed -- so they
+//! reach hooks by name to stand in for the host. A real runtime resolves the
+//! holder and deletes that name; see `tests/host_bridge_dispatch.rs`.
 
 #[cfg(test)]
 mod global_surface_tests {
@@ -251,32 +255,6 @@ mod global_surface_tests {
              catch (_) { escaped = true; } finally { console.error = originalError; } \
              let __ok = reached && !escaped; \
              let __msg = 'reached=' + reached + ' escaped=' + escaped",
-        );
-    }
-
-    /// The eval-channel script shape the host builds must resolve to the holder
-    /// hook and deliver its payload. We install a probe on the holder, run a
-    /// script identical to what `build_eval_script` produces, and verify it ran.
-    #[test]
-    fn eval_channel_reaches_holder() {
-        let mut rt = boot_runtime();
-        assert_js(
-            &mut rt,
-            "globalThis[Symbol.for('Migo.hostBridge')].__probe = (s) => { globalThis.__got = s; }; \
-             let __ok = true; let __msg = 'setup'",
-        );
-        // Mirror build_eval_script's output shape (holder-qualified call).
-        rt.execute_script(
-            "eval-script",
-            FastString::from_static(
-                "globalThis[Symbol.for('Migo.hostBridge')].__probe('{\"code\":\"ok\"}');",
-            ),
-        )
-        .expect("eval-channel script runs");
-        assert_js(
-            &mut rt,
-            "let __ok = globalThis.__got === '{\"code\":\"ok\"}'; \
-             let __msg = 'got=' + globalThis.__got",
         );
     }
 

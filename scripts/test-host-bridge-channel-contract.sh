@@ -1,104 +1,144 @@
 #!/usr/bin/env bash
-# The host-bridge holder is reachable from content, and its user list may not grow.
+# The host reaches content through a handle, never through a name.
 #
-# `globalThis[Symbol.for('Migo.hostBridge')]` holds every `_internal*` hook the
-# host calls into. `Symbol.for` reads the *global* symbol registry, so content
-# retrieves the same symbol and reaches all of them -- measured against a real
-# runtime: 78 hooks, and content can forge a rewarded-video completion through
-# `_internalOnAdEvent`.
+# Host callbacks used to travel as eval'd JavaScript naming
+# `globalThis[Symbol.for('Migo.hostBridge')]`. `Symbol.for` reads the *global*
+# symbol registry, so content asked for the same symbol and reached all 78
+# hooks behind it -- including `_internalOnAdEvent`, through which it could
+# forge a rewarded-video completion.
 #
-# That does not weaken the reward invariant (the host stays authoritative for
-# what it reports to its ad network; content forging its own callback deceives
-# only itself). It matters where the JS context holds more than one trust
-# domain -- a publisher-injected anti-cheat or analytics prelude expecting to
-# observe real host events -- and it weakens the auditable-boundary claim.
+# That is closed: `js_bindings` resolves the holder once at start-up, keeps a
+# handle, and deletes the symbol from the global object. A handle needs no
+# name, so the host still reaches every hook and content reaches none.
 #
-# Closing it means host callbacks stop travelling as eval'd source that has to
-# name a holder content can also name. The design is in CLAUDE.md §8; the
-# migration is all-or-nothing, because a call site left behind evaluates against
-# a holder that has been deleted and fails **silently**, on the one channel that
-# carries every async result -- login, payment, location, camera, keyboard,
-# scanCode, share, subpackage.
-#
-# Until that lands this gate does the one useful thing available: it pins the
-# set of call sites so the debt cannot grow while nobody is looking, and gives
-# the migration a number that has to reach zero.
-#
-# When migrating: the count only ever goes down. Update EXPECTED as you go, and
-# delete the holder from globalThis **last** -- the ordering is the whole
-# safety property.
+# This gate protects the *mechanism*; the behaviour is covered by
+# `runtime-v8/src/tests/host_bridge_dispatch.rs`. The split matters: tests catch
+# a dispatcher that stops working, and this catches the channel being rebuilt
+# alongside it -- a new callback added the old way would pass every test in the
+# suite while re-opening exactly what was closed.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Call sites that build JS source naming the content-reachable holder.
-# `js_escape.rs` is excluded: it *defines* the constant and the builder.
-EXPECTED_HOST_RS=10
-EXPECTED_INBOUND_RS=4
+python3 - "$ROOT_DIR" <<'PY'
+from __future__ import annotations
 
-count_in() {
-    grep -c "HOST_BRIDGE_EXPR" "$1" 2>/dev/null || echo 0
-}
+import pathlib
+import re
+import sys
 
-host_rs="$ROOT_DIR/engine/crates/core/src/runtime/host.rs"
-inbound_rs="$ROOT_DIR/engine/crates/platform/src/android/jni/inbound.rs"
-escape_rs="$ROOT_DIR/engine/crates/shared/src/js_escape.rs"
+root = pathlib.Path(sys.argv[1]).resolve()
 
-for required in "$host_rs" "$inbound_rs" "$escape_rs"; do
-    [[ -f "$required" ]] || { echo "ERROR: $required not found" >&2; exit 1; }
-done
+crates = root / "engine/crates"
+bindings_rs = crates / "runtime-v8/src/js_bindings.rs"
+main_js = crates / "runtime-v8/src/99_main.js"
 
-# Uses, not the `use` line that imports the constant.
-host_count=$(( $(count_in "$host_rs") - 1 ))
-inbound_count=$(( $(count_in "$inbound_rs") - 1 ))
+for required in (crates, bindings_rs, main_js):
+    if not required.exists():
+        print(f"ERROR: {required} not found; this gate cannot check anything", file=sys.stderr)
+        sys.exit(1)
 
-failures=0
 
-report() {
-    printf '  %-52s %s\n' "$1" "$2"
-}
+def strip_comments(text: str) -> str:
+    """A name discussed in a comment is not a name in the code.
 
-echo "host-bridge channel inventory:"
-report "core/src/runtime/host.rs" "$host_count (pinned $EXPECTED_HOST_RS)"
-report "platform/src/android/jni/inbound.rs" "$inbound_count (pinned $EXPECTED_INBOUND_RS)"
+    Every doc block below explains this channel at length, and a grep that sees
+    those reports the mechanism as present after it has been removed -- or as
+    reintroduced when someone merely wrote about it.
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return "\n".join(re.sub(r"//.*", "", line) for line in text.splitlines())
 
-if (( host_count > EXPECTED_HOST_RS )); then
-    echo "FAIL: host.rs gained a host-bridge call site ($host_count > $EXPECTED_HOST_RS)" >&2
-    echo "      Every one of these is reachable from content. Route the new callback" >&2
-    echo "      through the retained-handle channel instead -- see CLAUDE.md §8." >&2
-    failures=1
-fi
-if (( inbound_count > EXPECTED_INBOUND_RS )); then
-    echo "FAIL: inbound.rs gained a host-bridge call site ($inbound_count > $EXPECTED_INBOUND_RS)" >&2
-    failures=1
-fi
 
-# Going down is the point, but the pin has to follow or the gate stops meaning
-# anything: a pin above the real count silently permits re-growth back up to it.
-if (( host_count < EXPECTED_HOST_RS || inbound_count < EXPECTED_INBOUND_RS )); then
-    echo "FAIL: the count went down without the pin following it" >&2
-    echo "      host.rs=$host_count inbound.rs=$inbound_count" >&2
-    echo "      Lower EXPECTED_HOST_RS/EXPECTED_INBOUND_RS in this script to match." >&2
-    echo "      A pin left above the real count permits growing back to it unnoticed." >&2
-    failures=1
-fi
+HOLDER = "Migo.hostBridge"
+failures: list[str] = []
 
-# Anti-vacuity: if the constant is renamed, every count above reads zero and the
-# gate congratulates itself on a surface it can no longer see.
+# --- 1. No Rust builds JS source that names the holder --------------------
 #
-# Matches the declaration with comments stripped, not the name anywhere in the
-# file: doc comments here discuss `HOST_BRIDGE_EXPR` at length, and a grep that
-# sees those reports the constant as present after it has been renamed away.
-if ! sed 's|//.*||' "$escape_rs" | grep -qE '^[[:space:]]*pub const HOST_BRIDGE_EXPR[[:space:]]*:'; then
-    echo "FAIL: HOST_BRIDGE_EXPR is not defined in js_escape.rs" >&2
-    echo "      If the channel was replaced, delete this gate along with it." >&2
-    echo "      If it was renamed, this gate has been counting nothing." >&2
-    failures=1
-fi
+# Tests are exempt and deliberately so: they simulate the host at a layer below
+# `js_bindings`, before the name is retired, and one of them asserts that it is
+# retired. Excluding them costs nothing here because production code reaching
+# the holder by name is what this looks for, and that cannot hide in a test.
+offenders: list[str] = []
+for source_path in sorted(crates.rglob("*.rs")):
+    rel = source_path.relative_to(root)
+    if "/tests/" in str(rel) or source_path == bindings_rs:
+        continue
+    text = strip_comments(source_path.read_text(encoding="utf-8", errors="replace"))
+    for index, line in enumerate(text.splitlines(), start=1):
+        if HOLDER in line:
+            offenders.append(f"{rel}:{index}")
 
-if (( failures )); then
-    exit 1
-fi
+if offenders:
+    failures.append(
+        "these name the host-bridge holder in code, which puts the host back on a "
+        "channel content can also use -- route the callback through "
+        "`HostCommand::InvokeHostHook` instead:\n      "
+        + "\n      ".join(offenders)
+    )
 
-total=$(( host_count + inbound_count ))
-echo "PASS: host-bridge channel inventory unchanged ($total call sites to migrate)"
+# --- 2. The JS-source builders stay gone ----------------------------------
+#
+# They existed only to phrase a host callback as source. Their return is the
+# regression, whether or not anything calls them yet.
+for gone in ("HOST_BRIDGE_EXPR", "build_eval_script"):
+    hits = [
+        str(p.relative_to(root))
+        for p in sorted(crates.rglob("*.rs"))
+        if re.search(rf"\b(pub\s+)?(const|fn)\s+{gone}\b", strip_comments(p.read_text(encoding="utf-8", errors="replace")))
+    ]
+    if hits:
+        failures.append(f"`{gone}` is back ({', '.join(hits)}); it builds the channel this gate closed")
+
+# --- 3. js_bindings resolves, retains, and retires -------------------------
+#
+# All three or none: resolving without retiring leaves the name reachable;
+# retiring without retaining kills every callback on the next reload, silently,
+# because the fallback path finds an empty global instead.
+bindings = strip_comments(bindings_rs.read_text(encoding="utf-8"))
+for anchor, why in (
+    (r"\bbridge_holder\b", "the holder is not retained, so a reload has nothing to fall back on"),
+    (r"\bfn\s+retire_bridge_name\b", "nothing removes the holder's name from the global object"),
+    (r"\bglobal\.delete\s*\(", "`retire_bridge_name` no longer deletes anything"),
+    (r"Symbol::for_key", "the holder is no longer resolved through the global symbol registry"),
+):
+    if not re.search(anchor, bindings):
+        failures.append(f"{bindings_rs.relative_to(root)}: {why}")
+
+# A defined-but-uncalled retirement leaves the name installed while every
+# anchor above still matches. Checked by removing the declaration and looking
+# for the identifier again: what is left can only be a use.
+if not re.search(r"\bretire_bridge_name\b", re.sub(r"\bfn\s+retire_bridge_name\b", "", bindings)):
+    failures.append(
+        f"{bindings_rs.relative_to(root)}: `retire_bridge_name` is defined but never "
+        "called, so the holder keeps the name it was meant to lose"
+    )
+
+# --- 4. The holder property has to be deletable ---------------------------
+#
+# `delete` on a non-configurable property is a silent no-op, so this would fail
+# as "content can still reach the holder" with everything else looking correct.
+holder_block = re.search(
+    r"Object\.defineProperty\(\s*globalThis,\s*Symbol\.for\(\s*\"Migo\.hostBridge\"\s*\)\s*,\s*\{(?P<body>.*?)\}\s*\)",
+    strip_comments(main_js.read_text(encoding="utf-8")),
+    re.DOTALL,
+)
+if not holder_block:
+    failures.append(
+        f"{main_js.relative_to(root)}: the holder installation was not found; "
+        "this gate can no longer tell whether it is deletable"
+    )
+elif not re.search(r"configurable:\s*true", holder_block.group("body")):
+    failures.append(
+        f"{main_js.relative_to(root)}: the holder is installed non-configurable, "
+        "which makes retiring its name a silent no-op"
+    )
+
+if failures:
+    print("FAIL: host-bridge channel contract", file=sys.stderr)
+    for failure in failures:
+        print(f"  - {failure}", file=sys.stderr)
+    sys.exit(1)
+
+print("PASS: host callbacks travel by handle; the holder's global name is retired")
+PY
