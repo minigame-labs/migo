@@ -1593,6 +1593,33 @@ impl CanvasManager {
         }
     }
 
+    /// Rebuild a canvas's 2D context, carrying its drawing state across.
+    ///
+    /// The state is the load-bearing half. JS de-duplicates every setter
+    /// against a shadow (`if (this._fillStyle === value) return;`) that nothing
+    /// clears, and Canvas2D has no context-loss event for content to react to,
+    /// because browsers restore 2D contexts transparently and no engine listens
+    /// for one. A context rebuilt at spec defaults is therefore permanently
+    /// desynchronised from the content, silently: fills paint opaque black and
+    /// no layer reports an error.
+    ///
+    /// Every drop-and-re-create pair goes through here so the sequence exists
+    /// once. `Canvas2DContext::resize` already preserves the state on its happy
+    /// path; this is the same promise for the path where that resize fails.
+    fn rebuild_2d_context_preserving_state(&mut self, id: CanvasId) -> EngineResult<()> {
+        let state = self.contexts_2d.get(&id).map(|ctx| ctx.drawing_state());
+        if let Some(tag) = self.drop_2d_context(id, true) {
+            self.image_registry
+                .store_mut()
+                .purge_wrappers_for_context(tag);
+        }
+        context_2d_impl::init_skia_for_canvas(self, id)?;
+        if let (Some(state), Some(ctx)) = (state, self.contexts_2d.get_mut(&id)) {
+            ctx.adopt_drawing_state(state);
+        }
+        Ok(())
+    }
+
     /// Record what a future surface install owes this canvas.
     ///
     /// Only ever sets, never clears: the obligation outlives any number of
@@ -2852,12 +2879,7 @@ impl CanvasManager {
                     .unwrap_or(true)
             };
             if !resized_ok {
-                if let Some(tag) = self.drop_2d_context(id, true) {
-                    self.image_registry
-                        .store_mut()
-                        .purge_wrappers_for_context(tag);
-                }
-                context_2d_impl::init_skia_for_canvas(self, id)?;
+                self.rebuild_2d_context_preserving_state(id)?;
             }
 
             // WebGL default framebuffer viewport resets after drawing buffer resize.
@@ -2991,12 +3013,7 @@ impl CanvasManager {
                 .unwrap_or(true)
         };
         if !resized_ok {
-            if let Some(tag) = self.drop_2d_context(id, true) {
-                self.image_registry
-                    .store_mut()
-                    .purge_wrappers_for_context(tag);
-            }
-            context_2d_impl::init_skia_for_canvas(self, id)?;
+            self.rebuild_2d_context_preserving_state(id)?;
         }
 
         if !was_current {
@@ -5472,6 +5489,75 @@ mod recovery_source_guards {
         assert!(
             plan.contains("state_2d"),
             "the restore plan must carry the drawing state, not merely a flag"
+        );
+    }
+
+    /// No path may drop a 2D context and re-create it without carrying the
+    /// drawing state -- whatever the trigger is.
+    ///
+    /// This invariant has now been broken three times, each on a different
+    /// trigger and each silent: surface recreate (#48), a background round trip
+    /// where the teardown and the install are separate events, and GPU
+    /// context-loss recovery. The per-site guards each covered the site they
+    /// were written for; this one covers the shape.
+    ///
+    /// `rebuild_2d_context_preserving_state` is the single sequence point, so
+    /// the check is that nothing else pairs a drop with a re-create.
+    #[test]
+    fn no_path_re_creates_a_2d_context_without_carrying_its_state() {
+        let helper = function_body(MGR, "fn rebuild_2d_context_preserving_state");
+        for needle in ["drawing_state()", "drop_2d_context", "init_skia_for_canvas"] {
+            assert!(
+                helper.contains(needle),
+                "the sequence point must still {needle}"
+            );
+        }
+        assert!(
+            helper.find("drawing_state()") < helper.find("drop_2d_context"),
+            "the state must be captured before the context it belongs to is dropped"
+        );
+        assert!(
+            helper.find("init_skia_for_canvas") < helper.find("adopt_drawing_state"),
+            "the state must be adopted by the context that replaces the old one"
+        );
+
+        // Any other function that drops a 2D context and re-creates it in the
+        // same body has bypassed the sequence point. `create_onscreen` is
+        // excluded: it defers the re-create to the obligation it records, which
+        // `onscreen_surface_recreate_carries_the_2d_drawing_state_across` pins,
+        // and `destroy_onscreen_internal` only ever drops.
+        let allowed = [
+            "fn rebuild_2d_context_preserving_state",
+            "pub(crate) fn create_onscreen",
+        ];
+        // Only the production half. `MGR` is this file, so a scan of the whole
+        // of it matches the test module -- including this test's own allow-list
+        // literals, which name both sides of the pair it looks for.
+        let production = MGR
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("mod.rs must have a test module boundary to cut at");
+        let mut offenders = Vec::new();
+        for (index, _) in production.match_indices("fn ") {
+            let tail = &production[index..];
+            let Some(name_end) = tail.find(['(', '<']) else {
+                continue;
+            };
+            let signature = &tail[..name_end];
+            if allowed.iter().any(|a| a.ends_with(signature)) {
+                continue;
+            }
+            let body_end = tail.find("\n    }").unwrap_or(tail.len());
+            let body = &tail[..body_end];
+            if body.contains("drop_2d_context") && body.contains("init_skia_for_canvas") {
+                offenders.push(signature.trim().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these drop and re-create a 2D context without going through \
+             `rebuild_2d_context_preserving_state`, so the content keeps drawing \
+             with state the render side no longer has: {offenders:?}"
         );
     }
 
