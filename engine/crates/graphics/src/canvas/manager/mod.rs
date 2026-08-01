@@ -970,6 +970,7 @@ impl CanvasManager {
             installed_size,
             surface_size,
             self.contexts_2d.contains_key(&id),
+            self.onscreen_2d_restore.is_some(),
             force_recreate,
         );
 
