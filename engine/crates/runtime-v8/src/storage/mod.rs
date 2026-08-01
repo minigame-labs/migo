@@ -1,7 +1,8 @@
 //! Key-value storage ops and buffer URL management.
 //!
 //! Backed by an embedded WAL-mode SQLite database opened lazily per
-//! session at `{app_files_dir}/kv_storage/storage.db`.  The on-disk
+//! session at `{game user_data_dir}/kv_storage/storage.db` -- per game, not
+//! per host app; see [`storage_dir`].  The on-disk
 //! layout (a single `storage.db`) is a full replacement of the
 //! previous `file-per-key` hex-named layout — see
 //! [`migo_io::storage_ops`] and [`migo_io::kv_store`] for the rationale and
@@ -27,19 +28,19 @@ use deno_core::{Extension, JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
 use migo_io::storage_ops::{self, StorageInfo};
 use migo_io::task::{IoRequest, PriorityClass, RequestKind};
-use shared::error::EngineError;
+use shared::error::{EngineError, ErrorCode};
 use shared::op_state::HostOpState;
 
 use crate::io_state::IoSchedulerState;
 
-/// Storage directory name under `app_files_dir`.
+/// Storage directory name under the game's user-data directory.
 ///
 /// The SQLite file itself lives at `{STORAGE_DIR}/storage.db`; the
 /// directory layer is kept so per-game cleanup tools that `rm -rf`
 /// the folder keep working.
 const STORAGE_DIR: &str = "kv_storage";
 
-/// Buffer URL directory name under `app_cache_dir`.
+/// Buffer URL directory name under the game's cache directory.
 const BUFFER_URL_DIR: &str = "buffer_urls";
 
 /// Maximum size of a single stored value (1 MB).
@@ -53,20 +54,50 @@ const MAX_TOTAL_BYTES: u64 = LIMIT_SIZE_KB as u64 * 1024;
 
 // ==================== Path Helpers ====================
 
+/// Per-game storage root.
+///
+/// Anchored to the game's own user-data directory, not to the host app's files
+/// directory. A host that runs several games -- a game centre with a catalogue
+/// of third-party titles is the case this product is sold into -- would
+/// otherwise give all of them one SQLite file: any game could read another's
+/// saves by guessing keys, a single `wx.clearStorage()` would wipe the whole
+/// catalogue, and the 10 MB quota would be a shared pool one game could
+/// exhaust for the rest. Code, cache and user-data directories were already
+/// per-game; this was the one that was not.
+///
+/// It also restores wx's own semantics, where each mini-game has its own 10 MB.
+///
+/// Fails when no game is loaded rather than falling back to a shared location:
+/// `game_paths` is populated when a module is evaluated, so content cannot be
+/// running without it, and a fallback would silently reintroduce the shared
+/// file it exists to prevent.
 #[inline]
-fn storage_dir(state: &OpState) -> PathBuf {
-    state
-        .borrow::<HostOpState>()
-        .app_files_dir
-        .join(STORAGE_DIR)
+pub(crate) fn storage_dir(state: &OpState) -> Result<PathBuf, EngineError> {
+    let host = state.borrow::<HostOpState>();
+    match host.game_paths.as_ref() {
+        Some(paths) => Ok(paths.user_data_dir().join(STORAGE_DIR)),
+        None => Err(EngineError::from_detail(
+            ErrorCode::InvalidOperation,
+            "storage is unavailable before a game is loaded".to_string(),
+        )),
+    }
 }
 
+/// Per-game scratch space for `URL.createObjectURL` payloads.
+///
+/// Same isolation as [`storage_dir`], for the same reason: these are files
+/// written on behalf of one game, and the host app's cache directory is shared
+/// by every game it runs.
 #[inline]
-fn buffer_url_dir(state: &OpState) -> PathBuf {
-    state
-        .borrow::<HostOpState>()
-        .app_cache_dir
-        .join(BUFFER_URL_DIR)
+pub(crate) fn buffer_url_dir(state: &OpState) -> Result<PathBuf, EngineError> {
+    let host = state.borrow::<HostOpState>();
+    match host.game_paths.as_ref() {
+        Some(paths) => Ok(paths.cache_dir().join(BUFFER_URL_DIR)),
+        None => Err(EngineError::from_detail(
+            ErrorCode::InvalidOperation,
+            "buffer URLs are unavailable before a game is loaded".to_string(),
+        )),
+    }
 }
 
 #[inline]
@@ -137,7 +168,7 @@ fn info_to_json(info: &StorageInfo) -> String {
 #[string]
 pub fn op_storage_get(state: &mut OpState, #[string] key: &str) -> Result<String, JsErrorBox> {
     let scheduler = get_scheduler(state);
-    let dir = storage_dir(state);
+    let dir = storage_dir(state).map_err(js_err)?;
     // Missing key maps to "" so the JS-side `deserialize("")` contract
     // (return empty string) keeps working without a wire-format change.
     storage_ops::storage_get_sync_with_scheduler(scheduler, dir, key.to_string(), MAX_TOTAL_BYTES)
@@ -155,7 +186,7 @@ pub fn op_storage_set(
         return Err(JsErrorBox::generic("setStorage:fail data exceeds max size"));
     }
     let scheduler = get_scheduler(state);
-    let dir = storage_dir(state);
+    let dir = storage_dir(state).map_err(js_err)?;
     storage_ops::storage_set_sync_with_scheduler(
         scheduler,
         dir,
@@ -169,7 +200,7 @@ pub fn op_storage_set(
 #[op2(fast)]
 pub fn op_storage_remove(state: &mut OpState, #[string] key: &str) -> Result<(), JsErrorBox> {
     let scheduler = get_scheduler(state);
-    let dir = storage_dir(state);
+    let dir = storage_dir(state).map_err(js_err)?;
     storage_ops::storage_remove_sync_with_scheduler(
         scheduler,
         dir,
@@ -182,7 +213,7 @@ pub fn op_storage_remove(state: &mut OpState, #[string] key: &str) -> Result<(),
 #[op2(fast)]
 pub fn op_storage_clear(state: &mut OpState) -> Result<(), JsErrorBox> {
     let scheduler = get_scheduler(state);
-    let dir = storage_dir(state);
+    let dir = storage_dir(state).map_err(js_err)?;
     storage_ops::storage_clear_sync_with_scheduler(scheduler, dir, MAX_TOTAL_BYTES).map_err(js_err)
 }
 
@@ -190,7 +221,7 @@ pub fn op_storage_clear(state: &mut OpState) -> Result<(), JsErrorBox> {
 #[string]
 pub fn op_storage_info(state: &mut OpState) -> Result<String, JsErrorBox> {
     let scheduler = get_scheduler(state);
-    let dir = storage_dir(state);
+    let dir = storage_dir(state).map_err(js_err)?;
     let info = storage_ops::storage_info_sync_with_scheduler(scheduler, dir, MAX_TOTAL_BYTES)
         .map_err(js_err)?;
     Ok(info_to_json(&info))
@@ -224,7 +255,7 @@ where
 {
     let (scheduler, dir) = {
         let st = state.borrow();
-        (get_scheduler(&st), storage_dir(&st))
+        (get_scheduler(&st), storage_dir(&st)?)
     };
     scheduler
         .run_async(
@@ -246,7 +277,7 @@ pub async fn op_storage_get_async(
 ) -> Result<String, StorageError> {
     let (scheduler, dir) = {
         let st = state.borrow();
-        (get_scheduler(&st), storage_dir(&st))
+        (get_scheduler(&st), storage_dir(&st)?)
     };
     storage_ops::storage_get_with_scheduler(
         scheduler,
@@ -301,7 +332,7 @@ pub async fn op_storage_clear_async(state: Rc<RefCell<OpState>>) -> Result<(), S
 pub async fn op_storage_info_async(state: Rc<RefCell<OpState>>) -> Result<String, StorageError> {
     let (scheduler, dir) = {
         let st = state.borrow();
-        (get_scheduler(&st), storage_dir(&st))
+        (get_scheduler(&st), storage_dir(&st)?)
     };
     let info = scheduler
         .run_async(
@@ -324,7 +355,7 @@ pub fn op_create_buffer_url(
     state: &mut OpState,
     #[buffer] buffer: JsBuffer,
 ) -> Result<String, JsErrorBox> {
-    let dir = buffer_url_dir(state);
+    let dir = buffer_url_dir(state).map_err(js_err)?;
     ensure_dir(&dir)?;
 
     // Unique file name: nanosecond timestamp in hex.
@@ -346,7 +377,7 @@ pub fn op_create_buffer_url(
 
 #[op2(fast)]
 pub fn op_revoke_buffer_url(state: &mut OpState, #[string] url: &str) -> Result<(), JsErrorBox> {
-    let dir = buffer_url_dir(state);
+    let dir = buffer_url_dir(state).map_err(js_err)?;
     let path = std::path::Path::new(url);
     // Only allow deleting files within the buffer URL directory.
     if path.starts_with(&dir) && path.is_file() {

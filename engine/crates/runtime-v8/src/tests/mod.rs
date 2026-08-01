@@ -12,5 +12,6 @@ mod install_receipt;
 mod prelude;
 mod published_namespace_isolation;
 mod snapshot_fingerprint;
+mod storage_isolation;
 mod timers;
 mod v8_limits;
