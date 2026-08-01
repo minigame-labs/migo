@@ -104,6 +104,12 @@ jobs:
       - name: Runtime internals not published contract
         run: bash scripts/test-runtime-internals-not-published.sh
 
+      # The prescreen scanner answers "which APIs does this bundle need". Its
+      # dangerous failure is silent under-reporting -- an alias or computed key
+      # it does not follow turns into a confident "everything is supported".
+      - name: Prescreen scanner contract
+        run: bash scripts/test-prescreen-scanner.sh
+
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
 
