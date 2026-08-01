@@ -702,6 +702,11 @@ impl Host {
             }
             HostCommand::EvalScript { source } => self.on_eval_script(source),
 
+            HostCommand::InvokeHostHook { hook, args_json } => {
+                self.js.invoke_host_hook(&hook, &args_json);
+                Ok(())
+            }
+
             HostCommand::Restart => self.on_restart().await,
 
             HostCommand::OnShow { options_json } => {

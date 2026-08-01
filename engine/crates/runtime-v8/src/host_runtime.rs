@@ -496,6 +496,16 @@ impl HostJsRuntime {
 
     /// Fire a WebGL context-loss lifecycle event on the main canvas
     /// (`webglcontextlost` / `webglcontextrestored`).
+    /// Call one host-bridge hook through the handle resolved at start-up.
+    ///
+    /// The boundary-safe replacement for handing `core` a string of JavaScript
+    /// to evaluate: that string has to name the bridge holder, and the holder
+    /// is reachable from content because `Symbol.for` reads the global symbol
+    /// registry. Dispatching through a retained handle needs no name.
+    pub fn invoke_host_hook(&mut self, hook: &str, args_json: &str) {
+        self.with_v8(|rt, bindings| bindings.invoke_host_hook(rt, hook, args_json));
+    }
+
     pub fn dispatch_webgl_context_event(&mut self, kind: &str) {
         self.with_v8(|rt, bindings| bindings.dispatch_webgl_context_event(rt, kind));
     }

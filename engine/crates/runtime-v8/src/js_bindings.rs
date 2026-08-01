@@ -31,6 +31,14 @@ pub(crate) struct JsBindings {
     empty_string: v8::Global<v8::String>,
 
     // ---- Touch / Input ----
+    /// The host-bridge dispatcher.
+    ///
+    /// Held as a handle so host callbacks stop being eval'd source that has to
+    /// name `globalThis[Symbol.for('Migo.hostBridge')]` -- a name content
+    /// reaches too, because `Symbol.for` reads the global symbol registry. The
+    /// handle keeps the holder alive through the dispatcher's closure, so the
+    /// symbol can be removed from globalThis once every call site has moved.
+    dispatch_hook_fn: Option<v8::Global<v8::Function>>,
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
 
     // ---- Audio ----
@@ -108,6 +116,7 @@ impl JsBindings {
         let mut this = Self {
             main_js_context,
             empty_string,
+            dispatch_hook_fn: None,
             enqueue_touch_event_fn: None,
             enqueue_inner_audio_event_fn: None,
             recorder_event_fn: None,
@@ -186,6 +195,7 @@ impl JsBindings {
         }
 
         let (
+            dispatch_hook,
             enqueue_touch,
             enqueue_audio,
             rec_event,
@@ -218,6 +228,7 @@ impl JsBindings {
             // (see 99_main.js). Resolve it once, then look up every hook there.
             let bridge = resolve_host_bridge(scope, global);
             (
+                get_global_fn(scope, bridge, "_internalDispatch"),
                 get_global_fn(scope, bridge, "_internalEnqueueRawTouchEvent"),
                 get_global_fn(scope, bridge, "_internalEnqueueInnerAudioEvent"),
                 get_global_fn(scope, bridge, "_internalOnRecorderEvent"),
@@ -252,6 +263,7 @@ impl JsBindings {
             )
         });
 
+        self.dispatch_hook_fn = dispatch_hook;
         self.enqueue_touch_event_fn = enqueue_touch;
         self.enqueue_inner_audio_event_fn = enqueue_audio;
         self.recorder_event_fn = rec_event;
@@ -393,6 +405,32 @@ impl JsBindings {
 
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
+        });
+    }
+
+    /// Call one host-bridge hook by name, with arguments encoded as a JSON array.
+    ///
+    /// Replaces building JS source that names the holder. The four call shapes
+    /// in use -- no arguments, one JSON string, one parsed object, plain numbers
+    /// -- all encode as an array, so the caller does not have to say which it is.
+    ///
+    /// Silent when the dispatcher is missing: that means bindings have not been
+    /// resolved yet, which is a start-up ordering question rather than anything
+    /// content did, and the old channel is still in place until every site has
+    /// moved.
+    pub fn invoke_host_hook(&self, rt: &mut deno_core::JsRuntime, hook: &str, args_json: &str) {
+        let Some(func_g) = self.dispatch_hook_fn.clone() else {
+            return;
+        };
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let Some(name) = v8::String::new(scope, hook) else {
+                return;
+            };
+            let Some(args) = v8::String::new(scope, args_json) else {
+                return;
+            };
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &[name.into(), args.into()]);
         });
     }
 

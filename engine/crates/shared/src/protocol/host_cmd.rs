@@ -212,6 +212,23 @@ pub enum HostCommand {
         source: String,
     },
 
+    /// Call one host-bridge hook by name, arguments encoded as a JSON array.
+    ///
+    /// The replacement for delivering host callbacks as [`Self::EvalScript`]
+    /// source. That source has to name
+    /// `globalThis[Symbol.for('Migo.hostBridge')]`, and `Symbol.for` reads the
+    /// *global* symbol registry -- so the holder is reachable by content, which
+    /// can then call any hook on it. Dispatching through a handle the runtime
+    /// resolved at start-up needs no name at all.
+    InvokeHostHook {
+        /// Hook name on the host bridge, e.g. `_internalOnLoginResult`.
+        hook: String,
+        /// Arguments as a JSON array. Covers every shape in use: `[]` for no
+        /// arguments, `["{...}"]` for a JSON string, `[{...}]` for an object,
+        /// `[1, 0]` for numbers.
+        args_json: String,
+    },
+
     // ---- Lifecycle Events ----
     /// Restart the current game runtime.
     ///

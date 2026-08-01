@@ -83,9 +83,48 @@ for (let i = 0; i < _globalKeys.length; i++) {
         }
     }
 }
+// One entry point the host can hold a handle to, so its callbacks stop needing
+// a name content can also reach.
+//
+// `Symbol.for` reads the *global* symbol registry, so the holder below is
+// retrievable by any code that asks for the same symbol -- content included.
+// `js_bindings` resolves this function once at start-up and keeps a handle to
+// it; a handle keeps the holder alive through the closure, so the symbol can
+// then be removed from globalThis and the host still reaches every hook.
+//
+// Uniform shape on purpose. The call sites it replaces take four forms -- no
+// arguments, one JSON string, one parsed object, and plain numbers -- and
+// `apply` over a decoded array covers all of them without the caller having to
+// say which it is.
+Object.defineProperty(_hostBridge, "_internalDispatch", {
+    value: function (name, argsJson) {
+        const hook = _hostBridge[name];
+        if (typeof hook !== "function") return;
+        let args;
+        try {
+            args = JSON.parse(argsJson);
+        } catch (_) {
+            // A malformed payload is dropped rather than guessed at: calling a
+            // host hook with the wrong arguments is worse than not calling it.
+            return;
+        }
+        if (!Array.isArray(args)) return;
+        hook.apply(_hostBridge, args);
+    },
+    enumerable: false,
+    configurable: false,
+    writable: false,
+});
+
 Object.defineProperty(globalThis, Symbol.for("Migo.hostBridge"), {
     value: _hostBridge,
     enumerable: false,
-    configurable: false,
+    // Configurable so the runtime can remove it once `js_bindings` holds its
+    // handles -- a non-configurable property cannot be deleted, which would
+    // leave the holder permanently reachable no matter what else changed.
+    //
+    // Nothing runs between this line and that removal except runtime start-up,
+    // so there is no window in which content could redefine it.
+    configurable: true,
     writable: false,
 });
