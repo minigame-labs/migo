@@ -10,6 +10,7 @@ mod binary_helper;
 mod global_surface;
 mod install_receipt;
 mod prelude;
+mod published_namespace_isolation;
 mod snapshot_fingerprint;
 mod timers;
 mod v8_limits;

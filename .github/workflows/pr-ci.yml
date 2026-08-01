@@ -111,6 +111,13 @@ jobs:
       - name: Ad reward integrity contract
         run: bash scripts/test-ad-reward-integrity-contract.sh
 
+      # Content must not reach the native op table. The wx/migo namespaces are
+      # mirrored off globalThis before `harden_global_scope` removes deno_core's
+      # internals, so anything hardening deletes has to be excluded from the
+      # mirror too -- `wx.Deno.core.ops` once handed content 616 invocable ops.
+      - name: Runtime internals not published contract
+        run: bash scripts/test-runtime-internals-not-published.sh
+
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
 

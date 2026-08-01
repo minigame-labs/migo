@@ -1,0 +1,230 @@
+//! Content must not be able to reach the native op table.
+//!
+//! Every JS-level API is a policy point: the network allowlist, the file
+//! sandbox, the ad reward verdict. All of it is bypassed if content can call
+//! ops directly, so "no reachable op table" is the assumption the rest of the
+//! sandbox is built on rather than one hardening step among many.
+//!
+//! It was not holding. `97_wx_namespace.js` builds the `wx` and `migo`
+//! namespaces during bootstrap by copying property descriptors off globalThis;
+//! `harden_global_scope` deletes deno_core's internals *afterwards*, because
+//! deleting them from JS breaks deno_core's snapshot restore path. A mirror
+//! built first therefore captured `Deno`, and deleting `globalThis.Deno` later
+//! did nothing to the copy -- leaving `wx.Deno.core.ops` with 616 invocable
+//! ops, including file and network ops. `__bootstrap` escaped only because its
+//! name starts with an underscore, which the mirror filter happens to skip.
+//!
+//! These tests search the published namespaces for an op table **by shape**,
+//! not by name. A future internal that leaks the same way fails here even if
+//! nobody thinks to add it to an exclusion list -- which is the failure mode
+//! that produced this bug.
+
+#[cfg(test)]
+mod published_namespace_isolation_tests {
+    use std::{
+        path::PathBuf,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    use deno_core::{FastString, JsRuntime, RuntimeOptions};
+    use shared::{
+        channel::ThreadWakeup,
+        device::gpu_caps::GpuCaps,
+        op_state::{AudioSender, HostOpState, NetworkPolicy},
+        render_command_sender::CommandSender,
+    };
+    use tokio::sync::mpsc;
+
+    fn host_state() -> HostOpState {
+        let (render_tx, _render_rx) = CommandSender::new();
+        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
+
+        HostOpState {
+            id: 1,
+            app_cache_dir: PathBuf::from("/tmp/cache"),
+            app_files_dir: PathBuf::from("/tmp/files"),
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            mount_table: None,
+            render_tx,
+            text_measurer: None,
+            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            host_tx,
+            device_services: None,
+            raf_rx: None,
+            raf_demand: Arc::new(shared::raf_signal::RafDemand::new()),
+            request_vsync: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
+            network_policy: NetworkPolicy::default(),
+            backgrounded: Arc::new(AtomicBool::new(false)),
+            timer_backgrounded: Arc::new(AtomicBool::new(false)),
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: Arc::new(shared::op_state::ContextLostState::default()),
+            code_signing_enabled: false,
+            gpu_caps: GpuCaps::new(),
+        }
+    }
+
+    /// Boot the way a real session does: extensions, then hardening. The order
+    /// is the whole point -- hardening runs after the namespaces are built.
+    fn boot() -> JsRuntime {
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions: crate::main_extensions(host_state()),
+            ..Default::default()
+        });
+        crate::harden_global_scope(&mut rt);
+        rt
+    }
+
+    fn assert_js(rt: &mut JsRuntime, src: &str) {
+        let wrapped = format!(
+            "(()=>{{ {src}; if (!__ok) throw new Error('assertion failed: ' + __msg); }})()"
+        );
+        rt.execute_script("<test:isolation>", FastString::from(wrapped))
+            .expect("isolation assertion script");
+    }
+
+    /// Walks every published namespace looking for the op table's shape.
+    ///
+    /// Deliberately shape-based. Asserting `wx.Deno === undefined` would pass
+    /// the day someone exposes the same object under a different name, and
+    /// that is exactly how this bug survived: the exclusion list was correct
+    /// for the names on it.
+    const FIND_OP_TABLE: &str = r#"
+        globalThis.__findOpTable = function () {
+            const roots = [
+                ['globalThis', globalThis],
+                ['wx', globalThis.wx],
+                ['migo', globalThis.migo],
+                ['GameGlobal', globalThis.GameGlobal],
+            ];
+            const looksLikeOpTable = (value) => {
+                if (!value || typeof value !== 'object') return false;
+                let keys;
+                try { keys = Object.getOwnPropertyNames(value); } catch (_) { return false; }
+                // The op table is a bag of `op_*` functions. One stray property
+                // named `op_x` on a game object should not trip this, so require
+                // several.
+                let hits = 0;
+                for (const k of keys) if (k.indexOf('op_') === 0) { hits += 1; if (hits >= 3) return true; }
+                return false;
+            };
+            const found = [];
+            for (const [rootName, root] of roots) {
+                if (!root || typeof root !== 'object') continue;
+                let names;
+                try { names = Object.getOwnPropertyNames(root); } catch (_) { continue; }
+                for (const name of names) {
+                    let holder;
+                    try { holder = root[name]; } catch (_) { continue; }
+                    if (!holder || typeof holder !== 'object') continue;
+                    if (looksLikeOpTable(holder)) { found.push(rootName + '.' + name); continue; }
+                    let core;
+                    try { core = holder.core; } catch (_) { continue; }
+                    if (!core || typeof core !== 'object') continue;
+                    let ops;
+                    try { ops = core.ops; } catch (_) { continue; }
+                    if (looksLikeOpTable(ops)) found.push(rootName + '.' + name + '.core.ops');
+                }
+            }
+            return found;
+        };
+    "#;
+
+    /// The invariant: no published namespace reaches the op table.
+    #[test]
+    fn content_cannot_reach_the_op_table_through_any_published_namespace() {
+        let mut rt = boot();
+        rt.execute_script("<test:helper>", FastString::from_static(FIND_OP_TABLE))
+            .expect("helper");
+        assert_js(
+            &mut rt,
+            "const found = globalThis.__findOpTable(); \
+             let __ok = found.length === 0; \
+             let __msg = 'op table reachable via: ' + found.join(', ')",
+        );
+    }
+
+    /// Anti-vacuity: the search must actually be able to find an op table.
+    ///
+    /// Without this, a helper that silently matches nothing -- a typo in the
+    /// shape check, an exception swallowed by one of the try/catch guards --
+    /// would report a clean sandbox forever.
+    #[test]
+    fn the_op_table_search_finds_a_planted_one() {
+        let mut rt = boot();
+        rt.execute_script("<test:helper>", FastString::from_static(FIND_OP_TABLE))
+            .expect("helper");
+        assert_js(
+            &mut rt,
+            "globalThis.wx.__planted = { core: { ops: { op_a(){}, op_b(){}, op_c(){} } } }; \
+             const found = globalThis.__findOpTable(); \
+             let __ok = found.indexOf('wx.__planted.core.ops') !== -1; \
+             let __msg = 'planted op table not found; search reported: ' + found.join(', ')",
+        );
+    }
+
+    /// The specific escape that was live, pinned by name as well.
+    ///
+    /// The shape test above is the durable one; this one names `Deno` so a
+    /// regression reads as what it is instead of as an anonymous shape hit.
+    #[test]
+    fn deno_is_absent_from_the_global_and_from_both_mirrors() {
+        let mut rt = boot();
+        assert_js(
+            &mut rt,
+            "const where = []; \
+             if (typeof globalThis.Deno !== 'undefined') where.push('globalThis'); \
+             if (globalThis.wx && typeof globalThis.wx.Deno !== 'undefined') where.push('wx'); \
+             if (globalThis.migo && typeof globalThis.migo.Deno !== 'undefined') where.push('migo'); \
+             let __ok = where.length === 0; \
+             let __msg = 'Deno still reachable on: ' + where.join(', ')",
+        );
+    }
+
+    #[test]
+    fn bootstrap_is_absent_from_the_global_and_from_both_mirrors() {
+        let mut rt = boot();
+        assert_js(
+            &mut rt,
+            "const where = []; \
+             if (typeof globalThis.__bootstrap !== 'undefined') where.push('globalThis'); \
+             if (globalThis.wx && typeof globalThis.wx.__bootstrap !== 'undefined') where.push('wx'); \
+             if (globalThis.migo && typeof globalThis.migo.__bootstrap !== 'undefined') where.push('migo'); \
+             let __ok = where.length === 0; \
+             let __msg = '__bootstrap still reachable on: ' + where.join(', ')",
+        );
+    }
+
+    /// The mirrors must keep working: this fix removes internals, not APIs.
+    #[test]
+    fn the_wx_and_migo_namespaces_still_publish_content_apis() {
+        let mut rt = boot();
+        assert_js(
+            &mut rt,
+            "const wxNames = Object.getOwnPropertyNames(globalThis.wx || {}); \
+             const migoNames = Object.getOwnPropertyNames(globalThis.migo || {}); \
+             let __ok = wxNames.length > 300 && migoNames.length > 300 \
+                 && typeof globalThis.wx.createCanvas === 'function' \
+                 && typeof globalThis.wx.getSystemInfoSync === 'function'; \
+             let __msg = 'wx=' + wxNames.length + ' migo=' + migoNames.length",
+        );
+    }
+
+    /// Gamepad APIs stay `migo`-only: this change must not blur that split,
+    /// which is what `_NON_WX` exists to hold.
+    #[test]
+    fn migo_only_capabilities_stay_off_the_wx_namespace() {
+        let mut rt = boot();
+        assert_js(
+            &mut rt,
+            "let __ok = typeof globalThis.migo.getGamepads === 'function' \
+                 && typeof globalThis.wx.getGamepads === 'undefined'; \
+             let __msg = 'migo.getGamepads=' + typeof globalThis.migo.getGamepads \
+                 + ' wx.getGamepads=' + typeof globalThis.wx.getGamepads",
+        );
+    }
+}
