@@ -112,6 +112,16 @@ jobs:
       - name: Permission coverage contract
         run: bash scripts/test-permission-coverage-contract.sh
 
+      # Embedders compile against com.migo.runtime and ship that binding inside
+      # their app, so a method that quietly changes shape costs them a release.
+      # Read from the compiled classes rather than scraped from sources: a rule
+      # for what "looks public" misses things, and what it misses is what
+      # changes unnoticed.
+      - name: Android host API v0 contract
+        run: |
+          (cd platforms/android && ./gradlew --no-daemon :library:compileFullDebugJavaWithJavac)
+          bash scripts/test-android-host-api-contract.sh
+
       # The prescreen scanner answers "which APIs does this bundle need". Its
       # dangerous failure is silent under-reporting -- an alias or computed key
       # it does not follow turns into a confident "everything is supported".

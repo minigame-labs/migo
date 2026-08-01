@@ -1,0 +1,350 @@
+  public T getOrThrow();
+  public T getValue();
+  public abstract void checkSession(com.migo.runtime.callback.AuthHandler$CheckSessionCallback);
+  public abstract void download(com.migo.runtime.callback.SubpackageHandler$SubpackageRequest, com.migo.runtime.callback.SubpackageHandler$DownloadCallback);
+  public abstract void emitClose(int, boolean);
+  public abstract void emitError(int, int, java.lang.String);
+  public abstract void emitHide(int);
+  public abstract void emitLoad(int);
+  public abstract void emitLoad(int, boolean);
+  public abstract void emitResize(int, int, int);
+  public abstract void failRequest(int, java.lang.String);
+  public abstract void login(int, com.migo.runtime.callback.AuthHandler$LoginCallback);
+  public abstract void onError(com.migo.runtime.MigoException);
+  public abstract void onFailure(java.lang.String);
+  public abstract void onFailure(java.lang.String);
+  public abstract void onFailure(java.lang.String);
+  public abstract void onFailure(java.lang.String);
+  public abstract void onFailure(java.lang.String, java.lang.Integer);
+  public abstract void onGameExit(int);
+  public abstract void onGameReady();
+  public abstract void onLog(java.lang.String);
+  public abstract void onMessage(java.lang.String, java.lang.String);
+  public abstract void onProgress(int, long, long);
+  public abstract void onSessionCreated(com.migo.runtime.GameSession);
+  public abstract void onStateChanged(com.migo.runtime.GameSession, com.migo.runtime.SessionState, com.migo.runtime.SessionState);
+  public abstract void onSuccess();
+  public abstract void onSuccess(com.migo.runtime.callback.AuthHandler$UserInfoResult);
+  public abstract void onSuccess(java.lang.String);
+  public abstract void onSuccess(java.lang.String);
+  public abstract void onSuccess(java.lang.String);
+  public abstract void requestScope(int, java.lang.String, java.lang.String, com.migo.runtime.callback.PermissionSink);
+  public abstract void resolveRequest(int, boolean);
+  public abstract void setScope(java.lang.String, boolean);
+  public boolean dispatchTouchEvent(android.view.MotionEvent);
+  public boolean initIcuData(java.lang.String);
+  public boolean isCodeSigningEnabled();
+  public boolean isDebugEnabled();
+  public boolean isDeviceSupported();
+  public boolean isFailure();
+  public boolean isGameStarted();
+  public boolean isImmersiveMode();
+  public boolean isNativeLoaded();
+  public boolean isRecoverable();
+  public boolean isSuccess();
+  public boolean isValid();
+  public boolean isWatchdogEnabled();
+  public boolean onInterceptTouchEvent(android.view.MotionEvent);
+  public boolean onTouchEvent(android.view.MotionEvent);
+  public boolean onTouchEvent(android.view.MotionEvent);
+  public boolean performClick();
+  public com.migo.runtime.BuildConfig();
+  public com.migo.runtime.ConsoleLogView(android.content.Context, int);
+  public com.migo.runtime.DebugOverlayView getDebugOverlay();
+  public com.migo.runtime.DebugOverlayView(android.content.Context, int);
+  public com.migo.runtime.GamePaths getPaths();
+  public com.migo.runtime.GamePaths(com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.GameSession createSession(android.app.Activity, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.GameSession createSession(android.content.Context, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.GameSession getSession();
+  public com.migo.runtime.MigoException(int, java.lang.String);
+  public com.migo.runtime.MigoException(int, java.lang.String, java.lang.Throwable);
+  public com.migo.runtime.MigoException(int, java.lang.String, java.lang.Throwable, boolean);
+  public com.migo.runtime.MigoGameActivity();
+  public com.migo.runtime.MigoGameView(android.content.Context);
+  public com.migo.runtime.MigoRuntime$Result<com.migo.runtime.GameSession> createSessionSafe(android.app.Activity, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.PerformanceSnapshot getPerformanceSnapshot();
+  public com.migo.runtime.PerformanceSnapshot(float, float, int, int, int);
+  public com.migo.runtime.RuntimeConfig build();
+  public com.migo.runtime.RuntimeConfig$Builder addPreludeScript(java.lang.String, java.lang.String);
+  public com.migo.runtime.RuntimeConfig$Builder addSubPackage(java.lang.String, java.lang.String);
+  public com.migo.runtime.RuntimeConfig$Builder setCodeCacheDir(java.lang.String);
+  public com.migo.runtime.RuntimeConfig$Builder setCodeSigningEnabled(boolean);
+  public com.migo.runtime.RuntimeConfig$Builder setCodeSigningPubkey(java.lang.String);
+  public com.migo.runtime.RuntimeConfig$Builder setDebugEnabled(boolean);
+  public com.migo.runtime.RuntimeConfig$Builder setImmersiveMode(boolean);
+  public com.migo.runtime.RuntimeConfig$Builder setLogLevel(com.migo.runtime.RuntimeConfig$LogLevel);
+  public com.migo.runtime.RuntimeConfig$Builder setStartupOrientation(java.lang.String);
+  public com.migo.runtime.RuntimeConfig$Builder setTargetFps(int);
+  public com.migo.runtime.RuntimeConfig$Builder setWatchdogEnabled(boolean);
+  public com.migo.runtime.RuntimeConfig$Builder setWatchdogTimeoutSecs(int);
+  public com.migo.runtime.RuntimeConfig$Builder setWorkersPath(java.lang.String);
+  public com.migo.runtime.RuntimeConfig$Builder(android.content.Context);
+  public com.migo.runtime.RuntimeConfig$Builder(java.lang.String, java.lang.String, float);
+  public com.migo.runtime.RuntimeConfig$LogLevel getLogLevel();
+  public com.migo.runtime.SessionState getState();
+  public com.migo.runtime.callback.AuthHandler$UserInfo userInfo;
+  public com.migo.runtime.callback.AuthHandler$UserInfo();
+  public com.migo.runtime.callback.AuthHandler$UserInfoResult();
+  public com.migo.runtime.callback.SubpackageHandler$SubpackageRequest(java.lang.String, java.lang.String);
+  public default void createAd(int, java.lang.String, java.lang.String, java.lang.String, com.migo.runtime.callback.AdEventSink);
+  public default void destroyAd(int);
+  public default void getPhoneNumber(boolean, boolean, com.migo.runtime.callback.AuthHandler$PhoneNumberCallback);
+  public default void getUserInfo(boolean, java.lang.String, com.migo.runtime.callback.AuthHandler$UserInfoCallback);
+  public default void hideAd(int, com.migo.runtime.callback.AdEventSink);
+  public default void loadAd(int, com.migo.runtime.callback.AdEventSink);
+  public default void onDestroyed();
+  public default void onLoadingEnd();
+  public default void onLoadingProgress(float, java.lang.String);
+  public default void onLoadingStart();
+  public default void onPaused();
+  public default void onResumed();
+  public default void showAd(int, com.migo.runtime.callback.AdEventSink);
+  public default void updateAdStyle(int, java.lang.String, com.migo.runtime.callback.AdEventSink);
+  public final float fps;
+  public final float frameTimeMs;
+  public final int commandDrops;
+  public final int droppedFrames;
+  public final int firstFrameMs;
+  public final java.lang.String name;
+  public final java.lang.String root;
+  public float getDisplayDensity();
+  public int gender;
+  public int getActiveSessionCount();
+  public int getErrorCode();
+  public int getErrorCode();
+  public int getMinSdkVersion();
+  public int getSessionId();
+  public int getTargetFps();
+  public int getValue();
+  public int getWatchdogTimeoutSecs();
+  public int startGameSafe(java.lang.String);
+  public java.io.File getCacheDir();
+  public java.io.File getCodeDir();
+  public java.io.File getTempDir();
+  public java.io.File getUserDataDir();
+  public java.lang.String avatarUrl;
+  public java.lang.String city;
+  public java.lang.String cloudID;
+  public java.lang.String country;
+  public java.lang.String encryptedData;
+  public java.lang.String getCacheDir();
+  public java.lang.String getCodeCacheDir();
+  public java.lang.String getCodeSigningPubkey();
+  public java.lang.String getErrorMessage();
+  public java.lang.String getFilesDir();
+  public java.lang.String getGameId();
+  public java.lang.String getGameId();
+  public java.lang.String getNativeVersion();
+  public java.lang.String getStartupOrientation();
+  public java.lang.String getVersion();
+  public java.lang.String getWorkersPath();
+  public java.lang.String iv;
+  public java.lang.String language;
+  public java.lang.String nickName;
+  public java.lang.String province;
+  public java.lang.String rawData;
+  public java.lang.String signature;
+  public java.lang.String toString();
+  public java.lang.String toString();
+  public java.lang.String toString();
+  public java.lang.String toString();
+  public java.lang.String toString();
+  public java.lang.Throwable getNativeLoadError();
+  public java.util.List<java.lang.String[]> getPreludeScripts();
+  public java.util.List<java.lang.String[]> getSubPackages();
+  public long getCacheSize();
+  public long getUserDataSize();
+  public static boolean isRecoverable(int);
+  public static boolean isSuccess(int);
+  public static boolean isValidGameId(java.lang.String);
+  public static com.migo.runtime.MigoRuntime getInstance();
+  public static com.migo.runtime.RuntimeConfig$LogLevel valueOf(java.lang.String);
+  public static com.migo.runtime.RuntimeConfig$LogLevel[] values();
+  public static com.migo.runtime.SessionState valueOf(java.lang.String);
+  public static com.migo.runtime.SessionState[] values();
+  public static final boolean DEBUG;
+  public static final boolean MIGO_API_COMMERCE;
+  public static final boolean MIGO_API_CONNECTIVITY;
+  public static final boolean MIGO_API_MEDIA;
+  public static final boolean MIGO_API_SENSORS;
+  public static final boolean MIGO_API_SYSTEM;
+  public static final com.migo.runtime.RuntimeConfig$LogLevel DEBUG;
+  public static final com.migo.runtime.RuntimeConfig$LogLevel ERROR;
+  public static final com.migo.runtime.RuntimeConfig$LogLevel INFO;
+  public static final com.migo.runtime.RuntimeConfig$LogLevel OFF;
+  public static final com.migo.runtime.RuntimeConfig$LogLevel TRACE;
+  public static final com.migo.runtime.RuntimeConfig$LogLevel WARN;
+  public static final com.migo.runtime.SessionState CREATED;
+  public static final com.migo.runtime.SessionState DESTROYED;
+  public static final com.migo.runtime.SessionState PAUSED;
+  public static final com.migo.runtime.SessionState RUNNING;
+  public static final int ERR_CODE_DIR_NOT_FOUND;
+  public static final int ERR_ENTRY_NOT_FOUND;
+  public static final int ERR_INIT_FAILED;
+  public static final int ERR_INVALID_ACTIVITY;
+  public static final int ERR_INVALID_CONFIG;
+  public static final int ERR_INVALID_GAME_ID;
+  public static final int ERR_INVALID_SURFACE;
+  public static final int ERR_JS_EXECUTION;
+  public static final int ERR_NATIVE_LOAD_FAILED;
+  public static final int ERR_NOT_SUPPORTED;
+  public static final int ERR_SESSION_DESTROYED;
+  public static final int NATIVE_ANR;
+  public static final int NATIVE_CODE_INTEGRITY_FAILED;
+  public static final int NATIVE_CODE_SIGNATURE_INVALID;
+  public static final int NATIVE_HOST_PANIC;
+  public static final int NATIVE_JS_EXECUTION_TIMEOUT;
+  public static final int NATIVE_OUT_OF_MEMORY;
+  public static final int SUCCESS;
+  public static final java.lang.String BUILD_TIME;
+  public static final java.lang.String BUILD_TYPE;
+  public static final java.lang.String COMMIT;
+  public static final java.lang.String EXTRA_CONFIG_TOKEN;
+  public static final java.lang.String EXTRA_ENTRY_POINT;
+  public static final java.lang.String EXTRA_GAME_ID;
+  public static final java.lang.String FLAVOR;
+  public static final java.lang.String LIBRARY_PACKAGE_NAME;
+  public static final java.lang.String SDK_VERSION;
+  public static final java.lang.String TYPE_BANNER;
+  public static final java.lang.String TYPE_CUSTOM;
+  public static final java.lang.String TYPE_GAME_BANNER;
+  public static final java.lang.String TYPE_GAME_ICON;
+  public static final java.lang.String TYPE_GAME_PORTAL;
+  public static final java.lang.String TYPE_GRID;
+  public static final java.lang.String TYPE_INTERSTITIAL;
+  public static final java.lang.String TYPE_REWARDED_VIDEO;
+  public static final java.lang.String VERSION;
+  public static java.lang.String getMessage(int);
+  public static void launch(android.content.Context, java.lang.String, java.lang.String);
+  public static void launch(android.content.Context, java.lang.String, java.lang.String, com.migo.runtime.RuntimeConfig);
+  public void attachButton(android.view.View);
+  public void attachToWindow(android.view.View);
+  public void cleanupTemp();
+  public void close();
+  public void deleteAll();
+  public void destroy();
+  public void detach();
+  public void detachFromWindow();
+  public void dispatchMemoryWarning(int);
+  public void ensureDirectories();
+  public void evaluateJavaScript(java.lang.String);
+  public void loadGame(java.lang.String, java.lang.String);
+  public void notifyGameReady();
+  public void onActivityCreated(android.app.Activity, android.os.Bundle);
+  public void onActivityDestroyed(android.app.Activity);
+  public void onActivityPaused(android.app.Activity);
+  public void onActivityResumed(android.app.Activity);
+  public void onActivitySaveInstanceState(android.app.Activity, android.os.Bundle);
+  public void onActivityStarted(android.app.Activity);
+  public void onActivityStopped(android.app.Activity);
+  public void onConfigurationChanged(android.content.res.Configuration);
+  public void onLowMemory();
+  public void onSurfaceDestroyed();
+  public void onTrimMemory(int);
+  public void pause();
+  public void requestVsyncFrame();
+  public void restart();
+  public void resume();
+  public void setAdHandler(com.migo.runtime.callback.AdHandler);
+  public void setAuthHandler(com.migo.runtime.callback.AuthHandler);
+  public void setConfig(com.migo.runtime.RuntimeConfig);
+  public void setDebugEnabled(boolean);
+  public void setGameListener(com.migo.runtime.callback.GameSessionListener);
+  public void setGameLogHandler(com.migo.runtime.callback.GameLogHandler);
+  public void setListener(com.migo.runtime.callback.GameSessionListener);
+  public void setMessageHandler(com.migo.runtime.GameSession$MessageHandler);
+  public void setOnStateChangeListener(com.migo.runtime.OnStateChangeListener);
+  public void setPermissionHandler(com.migo.runtime.callback.PermissionHandler);
+  public void setSessionCreatedListener(com.migo.runtime.MigoGameView$SessionCreatedListener);
+  public void setSubpackageHandler(com.migo.runtime.callback.SubpackageHandler);
+  public void setUpdateInterval(int);
+  public void startGame(java.lang.String);
+  public void startMonitoring();
+  public void startPolling();
+  public void stopMonitoring();
+  public void stopPolling();
+  public void surfaceChanged(android.view.SurfaceHolder, int, int, int);
+  public void surfaceChanged(android.view.SurfaceHolder, int, int, int);
+  public void surfaceCreated(android.view.SurfaceHolder);
+  public void surfaceCreated(android.view.SurfaceHolder);
+  public void surfaceDestroyed(android.view.SurfaceHolder);
+  public void surfaceDestroyed(android.view.SurfaceHolder);
+  public void updateSurface(android.view.Surface);
+  public void updateSurface(android.view.Surface, int, int);
+class com.migo.runtime.ConsoleLogView$LogEntry {
+class com.migo.runtime.MigoGameView$EmptyActivityLifecycleCallbacks implements android.app.Application$ActivityLifecycleCallbacks {
+public class com.migo.runtime.ConsoleLogView {
+public class com.migo.runtime.DebugOverlayView extends android.widget.LinearLayout {
+public class com.migo.runtime.MigoException extends java.lang.RuntimeException {
+public class com.migo.runtime.MigoGameActivity extends android.app.Activity implements android.view.SurfaceHolder$Callback,android.content.ComponentCallbacks2 {
+public class com.migo.runtime.MigoGameView extends android.widget.FrameLayout implements android.view.SurfaceHolder$Callback {
+public final class com.migo.runtime.BuildConfig {
+public final class com.migo.runtime.BuildInfo {
+public final class com.migo.runtime.ErrorCode {
+public final class com.migo.runtime.GamePaths {
+public final class com.migo.runtime.GameSession implements java.io.Closeable {
+public final class com.migo.runtime.MigoRuntime {
+public final class com.migo.runtime.MigoRuntime$Result<T> {
+public final class com.migo.runtime.PerformanceSnapshot {
+public final class com.migo.runtime.RuntimeConfig {
+public final class com.migo.runtime.RuntimeConfig$Builder {
+public final class com.migo.runtime.RuntimeConfig$LogLevel extends java.lang.Enum<com.migo.runtime.RuntimeConfig$LogLevel> {
+public final class com.migo.runtime.SessionState extends java.lang.Enum<com.migo.runtime.SessionState> {
+public final class com.migo.runtime.callback.AuthHandler$UserInfo {
+public final class com.migo.runtime.callback.AuthHandler$UserInfoResult {
+public final class com.migo.runtime.callback.SubpackageHandler$SubpackageRequest {
+public interface com.migo.runtime.GameSession$MessageHandler {
+public interface com.migo.runtime.MigoGameView$SessionCreatedListener {
+public interface com.migo.runtime.OnStateChangeListener {
+public interface com.migo.runtime.callback.AdEventSink {
+public interface com.migo.runtime.callback.AdHandler {
+public interface com.migo.runtime.callback.AuthHandler {
+public interface com.migo.runtime.callback.AuthHandler$CheckSessionCallback {
+public interface com.migo.runtime.callback.AuthHandler$LoginCallback {
+public interface com.migo.runtime.callback.AuthHandler$PhoneNumberCallback {
+public interface com.migo.runtime.callback.AuthHandler$UserInfoCallback {
+public interface com.migo.runtime.callback.GameLogHandler {
+public interface com.migo.runtime.callback.GameSessionListener {
+public interface com.migo.runtime.callback.PermissionHandler {
+public interface com.migo.runtime.callback.PermissionSink {
+public interface com.migo.runtime.callback.SubpackageHandler {
+public interface com.migo.runtime.callback.SubpackageHandler$DownloadCallback {
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
