@@ -1,5 +1,6 @@
 extern crate khronos_egl as egl;
 
+use crate::backend::gl::state::Canvas2DState;
 use crate::backend::gl::surface::Canvas2DContext;
 use crate::dirty_region::damage_tracker::ResolvedDamage;
 use crate::{
@@ -262,6 +263,24 @@ pub(crate) struct CanvasManager {
     /// EGLSurface is bound to an abandoned ANativeWindow even if Android hands
     /// back an equal window pointer/size. Consumed (cleared) on read.
     force_onscreen_recreate: bool,
+
+    /// What the next onscreen surface install owes the content: the 2D drawing
+    /// state of the context that was torn down, if there was one.
+    ///
+    /// Recorded by the teardown rather than read at install time, because on
+    /// Android those are two separate events. `surfaceDestroyed` takes the
+    /// onscreen 2D context away when the app is backgrounded; `surfaceCreated`
+    /// arrives whenever the user comes back, which may be much later. An
+    /// install that asks "did this canvas have a 2D context?" by looking at
+    /// `contexts_2d` is asking after the answer has already been destroyed --
+    /// it reads `false`, skips the rebuild, and every later `Canvas2DBatch`
+    /// fails with `2d context not found` while the game runs on at full speed,
+    /// painting into nothing.
+    ///
+    /// Content never re-requests the context: it holds the object it got from
+    /// `getContext('2d')` and has no idea the surface went away. So nothing
+    /// else will ever ask for the rebuild.
+    onscreen_2d_restore: Option<Canvas2DState>,
 
     /// Debug one-shot: when set (via `WEBGL_lose_context.loseContext()` ->
     /// `GLCmd::DebugLoseContext`), the next `check_graphics_reset_status()`
@@ -720,6 +739,7 @@ impl CanvasManager {
             context_lost: false,
             surface_unavailable: false,
             force_onscreen_recreate: false,
+            onscreen_2d_restore: None,
             simulated_reset: false,
             installed_surface: None,
             pending_onscreen: None,
@@ -1115,7 +1135,6 @@ impl CanvasManager {
         // re-initialize it after the new EGL context is created. This is
         // needed for Android resume: the surface is a different native window
         // but the game's JS code still expects canvas_id=1 to work.
-        let mut had_2d_context = false;
         // The drawing state of that context, carried across the rebuild.
         //
         // JS shadows every Canvas2D state setter and skips sending a value it
@@ -1128,7 +1147,6 @@ impl CanvasManager {
         // screen while JS drew every frame, the context was healthy, and every
         // boundary reported success. `Canvas2DContext::resize` preserves this
         // state for the same reason; the destroy-and-recreate path must too.
-        let mut retained_2d_state = None;
 
         if let Some(_entry) = self.canvases.get(&id) {
             // Destroy and recreate the EGL surface when the ANativeWindow
@@ -1137,8 +1155,6 @@ impl CanvasManager {
             // resizes (e.g. navigation bar hide/show). Reusing the old
             // surface leads to buffer size mismatches that SurfaceFlinger
             // rejects ("rejecting buffer"), causing flicker.
-            had_2d_context = self.contexts_2d.contains_key(&id);
-            retained_2d_state = self.contexts_2d.get(&id).map(|ctx| ctx.drawing_state());
             self.destroy_onscreen_internal(id).map_err(|error| {
                 SurfaceInstallFailure::from_phase(
                     error,
@@ -1446,13 +1462,20 @@ impl CanvasManager {
                 .unwrap_or(true)
         };
         if !resized_ok {
+            // Same obligation as a teardown: this drops the context the content
+            // still believes it holds.
+            self.stash_onscreen_2d_restore(id);
             if let Some(tag) = self.drop_2d_context(id, true) {
                 self.image_registry
                     .store_mut()
                     .purge_wrappers_for_context(tag);
             }
         }
-        if had_2d_context && (!self.contexts_2d.contains_key(&id) || !resized_ok) {
+        // Discharge whatever a teardown recorded -- this call's, or one from an
+        // earlier `surfaceDestroyed` that has been waiting for the app to come
+        // back to the foreground.
+        let retained_2d_state = self.onscreen_2d_restore.take();
+        if retained_2d_state.is_some() && (!self.contexts_2d.contains_key(&id) || !resized_ok) {
             if let Err(error) = context_2d_impl::init_skia_for_canvas(self, id) {
                 let cleanup = self.cleanup_failed_onscreen_install(id);
                 return Err(SurfaceInstallFailure::from_phase(
@@ -1569,7 +1592,20 @@ impl CanvasManager {
         }
     }
 
+    /// Record what a future surface install owes this canvas.
+    ///
+    /// Only ever sets, never clears: the obligation outlives any number of
+    /// teardowns and is discharged by the install that rebuilds the context.
+    fn stash_onscreen_2d_restore(&mut self, id: CanvasId) {
+        if let Some(ctx) = self.contexts_2d.get(&id) {
+            self.onscreen_2d_restore = Some(ctx.drawing_state());
+        }
+    }
+
     fn destroy_onscreen_internal(&mut self, id: CanvasId) -> EngineResult<()> {
+        // Before anything is dropped: whoever installs the next surface has to
+        // know this canvas had a 2D context, and with which drawing state.
+        self.stash_onscreen_2d_restore(id);
         if let Some(mut entry) = self.canvases.remove(&id) {
             let skia_ctx_current = self
                 .egl
@@ -2167,6 +2203,12 @@ impl CanvasManager {
     }
 
     pub(crate) fn destroy_canvas(&mut self, id: CanvasId) -> EngineResult<()> {
+        // The content threw this canvas away; a later surface install owes it
+        // nothing. Leaving the obligation would rebuild a context for a canvas
+        // that no longer exists.
+        if id == CanvasId::from(1u32) {
+            self.onscreen_2d_restore = None;
+        }
         shared::ensure!(
             id != 1,
             ErrorCode::InvalidArgument,
