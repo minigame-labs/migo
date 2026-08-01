@@ -3938,6 +3938,27 @@ impl CanvasManager {
         let prev_tex_2d = unsafe { self.gl.get_parameter_i32(glow::TEXTURE_BINDING_2D) };
         let prev_read_fbo = unsafe { self.gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING) };
         let prev_draw_fbo = unsafe { self.gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
+        // `glBlitFramebuffer` writes to the DRAW framebuffer *through the
+        // scissor test*, and Skia leaves its own scissor behind after painting:
+        // a fill that does not span the full surface produces a box with a
+        // non-zero origin. This blit writes to (0,0) of a fresh destination
+        // texture, so such a box rejects every pixel and the snapshot comes
+        // back fully transparent -- with no GL error, because a fully
+        // scissored blit is not an error.
+        //
+        // The consequence is not cosmetic: `getImageData` is backed by these
+        // snapshots, so content that builds a sprite texture from a readback
+        // (Migo's own bunnymark does), hit-tests against one, or runs an image
+        // effect on one silently gets an empty buffer. Measured: a fill
+        // covering a quarter of the surface was enough.
+        //
+        // Same reasoning, same fix as the DrawingBuffer present blit in
+        // `drawing_buffer.rs` -- a snapshot is system-level work, not part of
+        // the content's draw state, so it must not inherit the content's clip.
+        let prev_scissor_enabled = unsafe { self.gl.is_enabled(glow::SCISSOR_TEST) };
+        if prev_scissor_enabled {
+            unsafe { self.gl.disable(glow::SCISSOR_TEST) };
+        }
 
         // Allocate storage on the destination texture.
         unsafe {
@@ -4032,6 +4053,7 @@ impl CanvasManager {
                     prev_tex_2d,
                     prev_read_fbo,
                     prev_draw_fbo,
+                    prev_scissor_enabled,
                 );
                 return Ok(0);
             }
@@ -4074,6 +4096,7 @@ impl CanvasManager {
             prev_tex_2d,
             prev_read_fbo,
             prev_draw_fbo,
+            prev_scissor_enabled,
         );
 
         // We mutated ACTIVE_TEXTURE/TEXTURE_BINDING_2D and the FBO
@@ -4130,8 +4153,14 @@ impl CanvasManager {
         prev_tex_2d: i32,
         prev_read_fbo: i32,
         prev_draw_fbo: i32,
+        prev_scissor_enabled: bool,
     ) {
         unsafe {
+            // Restored here rather than at the blit so it happens on every exit
+            // path, including the early returns that abandon the snapshot.
+            if prev_scissor_enabled {
+                self.gl.enable(glow::SCISSOR_TEST);
+            }
             // ACTIVE_TEXTURE first because the texture binding is
             // unit-scoped.
             if prev_active_texture as u32 >= glow::TEXTURE0 {
@@ -5558,6 +5587,58 @@ mod recovery_source_guards {
             "these drop and re-create a 2D context without going through \
              `rebuild_2d_context_preserving_state`, so the content keeps drawing \
              with state the render side no longer has: {offenders:?}"
+        );
+    }
+
+    /// Every `glBlitFramebuffer` in the crate must neutralise the scissor test.
+    ///
+    /// A blit writes to the DRAW framebuffer *through* the scissor, and both
+    /// Skia and game code leave their own boxes enabled. A blit that inherits
+    /// one is silently clipped -- and a fully clipped blit is not a GL error,
+    /// so nothing anywhere reports it. It cost this crate two separate bugs:
+    /// the present blit landing the game in a corner of the window, and
+    /// `getImageData` returning a fully transparent buffer whenever the
+    /// preceding fill left a box with a non-zero origin.
+    ///
+    /// Asserted over every call site rather than the two that were fixed,
+    /// because the next blit added here will be written by someone who has not
+    /// read either bug.
+    #[test]
+    fn every_blit_neutralises_the_scissor_test() {
+        let sources = [
+            ("canvas/manager/mod.rs", MGR),
+            (
+                "canvas/manager/drawing_buffer.rs",
+                include_str!("drawing_buffer.rs"),
+            ),
+            (
+                "renderergl/handler.rs",
+                include_str!("../../renderergl/handler.rs"),
+            ),
+        ];
+        let mut offenders = Vec::new();
+        for (name, source) in sources {
+            let production = source.split_once("#[cfg(test)]").map_or(source, |(a, _)| a);
+            let blits = production.matches("blit_framebuffer(").count();
+            if blits == 0 {
+                continue;
+            }
+            // `is_enabled(SCISSOR_TEST)` + `disable(SCISSOR_TEST)` is the
+            // established idiom; a file that blits without both has a call site
+            // running under whatever clip the caller happened to leave.
+            let reads = production.matches("is_enabled(glow::SCISSOR_TEST)").count();
+            let disables = production.matches("disable(glow::SCISSOR_TEST)").count();
+            if reads == 0 || disables == 0 {
+                offenders.push(format!(
+                    "{name}: {blits} blit(s), {reads} scissor read(s), {disables} disable(s)"
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these blit without neutralising the scissor test, so the copy is \
+             silently clipped by whatever box the caller left enabled -- with no \
+             GL error to notice: {offenders:?}"
         );
     }
 
