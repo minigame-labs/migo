@@ -6,16 +6,16 @@
   "target_triple": "x86_64-linux-android",
   "generation_cpu_policy": "target-baseline",
   "normalized_parameters": ["--arch=x86_64","--cpu-policy=target-baseline","--product-profile=full","--runtime-kind=worker","--warmup=none"],
-  "external_references_sha256": "756eba0357f2c88a095d0260a71f35f0b27543d53132b72171581fad3c44e3eb",
-  "bootstrap_inputs_sha256": "acfabca593f3ad8505d10225e11f15acc26f2dc8a9d050a37ee6ca3f3364a1d6",
+  "external_references_sha256": "22c0ecc4235631285b887332ef5f865fe85b31bde61141e458b87cce3480a316",
+  "bootstrap_inputs_sha256": "87d8e2e741e5373066bec31ca596aa2e9207c66a5baa679c6863e23c9b566e8f",
   "features": ["api-commerce","api-connectivity","api-media","api-sensors","api-system","code-signing","profile-full","v8-limits"],
   "features_sha256": "ecb0cd56faa4de5f0830c63cd350f6f62e600fee80ba8224c526a20b8908e6d9",
-  "rust_sources_sha256": "756eba0357f2c88a095d0260a71f35f0b27543d53132b72171581fad3c44e3eb",
+  "rust_sources_sha256": "22c0ecc4235631285b887332ef5f865fe85b31bde61141e458b87cce3480a316",
   "v8_archive_sha256": "ce14223a4d938011b888a3ea32ffd795ae1904d86e71989321e0cec2cfee5413",
   "snapshot_size": 1550170,
-  "snapshot_sha256": "95e7eb3891441b89c14d6e637a5d8b87213e15a17020d5c4c11363492a0647c0",
-  "js_sources_sha256": "47c56d3b4fa8a24a700c2d9e4122673e4a497dc7606e8a774422c1b8eece35ad",
+  "snapshot_sha256": "6aa734b3c7cc3f590e15571bc15ce4cc14ed3e97459777b1869561ccf78dfe4d",
+  "js_sources_sha256": "501b3f9132faaf59733fda7e6a6061159c83bac184b4a491c3df5f11f6c80337",
   "deno_core_version": "0.385.0",
-  "git_commit": "635c498",
-  "generated_at": "2026-07-28T15:31:51Z"
+  "git_commit": "5891deb",
+  "generated_at": "2026-07-31T18:51:58Z"
 }

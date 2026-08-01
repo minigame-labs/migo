@@ -7,7 +7,7 @@ use crate::{
     android::jni::{
         JAVA_METHOD_CACHE, JavaMethodCache, executeScript, getConsoleLogs, getDebugStats,
         getMinApiLevel, init, initIcuData, mod_main, nativeAhbPointerFromHardwareBuffer,
-        onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin,
+        onAccelerometerChange, onActionSheetResult, onAdEvent, onAudioInterruptionBegin,
         onAudioInterruptionEnd, onBLECharacteristicValueChange, onBLEConnectionStateChange,
         onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange,
         onBluetoothDeviceFound, onCameraEvent, onCameraFrameData, onCheckSessionResult,
@@ -124,6 +124,8 @@ fn native_fn_ptr(name: &str) -> Option<*mut c_void> {
         "onOpenSettingResult" => onOpenSettingResult as *mut c_void,
         #[cfg(feature = "api-connectivity")]
         "onNavigateToMiniProgramResult" => onNavigateToMiniProgramResult as *mut c_void,
+        #[cfg(feature = "api-commerce")]
+        "onAdEvent" => onAdEvent as *mut c_void,
         #[cfg(feature = "api-commerce")]
         "onShareAppMessageResult" => onShareAppMessageResult as *mut c_void,
         #[cfg(feature = "api-commerce")]

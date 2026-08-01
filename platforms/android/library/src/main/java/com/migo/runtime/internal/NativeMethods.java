@@ -897,6 +897,27 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Ad Callbacks ====================
+
+    /**
+     * Deliver one ad event to content.
+     * <p>
+     * Called from {@link com.migo.runtime.internal.NativeExports}' ad event
+     * sink. Every ad event -- load, error, close, resize, hide -- uses this one
+     * channel; the payload's {@code adId} routes it to the right ad object.
+     * <p>
+     * For a rewarded-video {@code close}, the payload's {@code isEnded} is the
+     * reward verdict and originates in the host's ad SDK.
+     *
+     * @param sessionId The session ID
+     * @param eventJson JSON: {"adId":N,"event":"close","isEnded":true}
+     */
+    public static void onAdEvent(int sessionId, String eventJson) {
+        if (sessionId >= 0 && eventJson != null) {
+            NativeBridge.onAdEvent(sessionId, eventJson);
+        }
+    }
+
     // ==================== Auth Callbacks ====================
 
     /**

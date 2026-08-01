@@ -5,10 +5,10 @@ use std::sync::Arc;
 use crate::protocol::error::ServiceError;
 
 use super::{
-    AuthService, CameraService, ClipboardService, CodecService, FileService, GameLogService,
-    ImageApiService, InteractionService, LocationService, NavigateService, NetworkService,
-    PaymentService, ScanCodeService, ShareService, SubpackageService, SystemInfoService,
-    VideoService,
+    AdService, AuthService, CameraService, ClipboardService, CodecService, FileService,
+    GameLogService, ImageApiService, InteractionService, LocationService, NavigateService,
+    NetworkService, PaymentService, ScanCodeService, ShareService, SubpackageService,
+    SystemInfoService, VideoService,
 };
 
 // ==================== Battery ====================
@@ -588,9 +588,19 @@ pub trait ConnectivityServices: Send + Sync {
     }
 }
 
-/// Platform integration services: payment, auth, sharing, game logs, subpackage.
+/// Platform integration services: payment, ads, auth, sharing, game logs,
+/// subpackage.
 pub trait CommerceServices: Send + Sync {
     fn game_log(&self) -> Option<Arc<dyn GameLogService>> {
+        None
+    }
+    /// Host-provided advertising bridge.
+    ///
+    /// Returning `None` means the host installed no ad integration. Content
+    /// still gets working ad objects, but no advert is ever shown and
+    /// incentivised video reports `isEnded: false` -- see [`AdService`] for
+    /// why the runtime must never invent a reward.
+    fn ad(&self) -> Option<Arc<dyn AdService>> {
         None
     }
     fn auth(&self) -> Option<Arc<dyn AuthService>> {

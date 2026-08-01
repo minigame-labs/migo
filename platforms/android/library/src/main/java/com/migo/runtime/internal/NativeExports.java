@@ -17,6 +17,8 @@ import com.migo.runtime.internal.platform.Permissions;
 import com.migo.runtime.internal.platform.ScreenBrightness;
 import com.migo.runtime.internal.platform.SystemSettings;
 import com.migo.runtime.internal.platform.Vibrator;
+import com.migo.runtime.callback.AdEventSink;
+import com.migo.runtime.callback.AdHandler;
 import com.migo.runtime.callback.AuthHandler;
 import com.migo.runtime.callback.GameLogHandler;
 import com.migo.runtime.callback.SubpackageHandler;
@@ -70,6 +72,10 @@ public final class NativeExports {
 
     /** Per-session auth handlers set via GameSession API. */
     private static final ConcurrentHashMap<Integer, AuthHandler> sAuthHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session ad handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, AdHandler> sAdHandlers =
             new ConcurrentHashMap<>();
 
     /** Per-session game log handlers set via GameSession API. */
@@ -2545,6 +2551,273 @@ public final class NativeExports {
             sMainHandler.post(() -> handler.onMessage(type, payload));
         } catch (Exception e) {
             android.util.Log.w("NativeExports", "onHostMessage: failed to parse JSON: " + e.getMessage());
+        }
+    }
+
+    // ==================== Ads ====================
+    //
+    // The runtime owns no ad SDK. Everything below is transport: commands in,
+    // events out. In particular the reward verdict for incentivised video is
+    // whatever the host's AdHandler reports -- see AdEventSink's javadoc for
+    // why nothing here may invent one.
+
+    /**
+     * Set or clear the ad handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setAdHandler(AdHandler)}.
+     */
+    public static void setAdHandler(int sessionId, AdHandler handler) {
+        if (handler == null) {
+            sAdHandlers.remove(sessionId);
+        } else {
+            sAdHandlers.put(sessionId, handler);
+        }
+    }
+
+    private static void clearAdHandler(int sessionId) {
+        sAdHandlers.remove(sessionId);
+    }
+
+    /**
+     * The sink handed to every AdHandler call.
+     *
+     * <p>One instance per session rather than per call: an ad SDK typically
+     * retains the listener it was given for the life of the ad, so a per-call
+     * sink would either leak or go stale. It is stateless apart from the
+     * session id, so sharing it is safe from any thread.
+     */
+    private static final class SessionAdEventSink implements AdEventSink {
+        private final int sessionId;
+
+        SessionAdEventSink(int sessionId) {
+            this.sessionId = sessionId;
+        }
+
+        private void emit(int adId, String event, JSONObject extra) {
+            try {
+                JSONObject payload = extra != null ? extra : new JSONObject();
+                payload.put("adId", adId);
+                payload.put("event", event);
+                NativeMethods.onAdEvent(sessionId, payload.toString());
+            } catch (JSONException e) {
+                android.util.Log.w("NativeExports",
+                        "onAdEvent: failed to build payload: " + e.getMessage());
+            }
+        }
+
+        @Override
+        public void emitLoad(int adId) {
+            emit(adId, "load", null);
+        }
+
+        @Override
+        public void emitLoad(int adId, boolean useFallbackSharePage) {
+            try {
+                JSONObject extra = new JSONObject();
+                extra.put("useFallbackSharePage", useFallbackSharePage);
+                emit(adId, "load", extra);
+            } catch (JSONException e) {
+                emit(adId, "load", null);
+            }
+        }
+
+        @Override
+        public void emitError(int adId, int errCode, String errMsg) {
+            try {
+                JSONObject extra = new JSONObject();
+                extra.put("errCode", errCode);
+                extra.put("errMsg", errMsg != null ? errMsg : "ad error");
+                emit(adId, "error", extra);
+            } catch (JSONException e) {
+                emit(adId, "error", null);
+            }
+        }
+
+        @Override
+        public void emitClose(int adId, boolean isEnded) {
+            try {
+                JSONObject extra = new JSONObject();
+                // The reward verdict. Passed through from the host's ad SDK;
+                // nothing in this file decides it.
+                extra.put("isEnded", isEnded);
+                emit(adId, "close", extra);
+            } catch (JSONException e) {
+                // A close that loses its verdict must not read as a completed
+                // view: fall back to the un-rewarded shape rather than to a
+                // payload with no isEnded at all.
+                emit(adId, "close", null);
+            }
+        }
+
+        @Override
+        public void emitResize(int adId, int width, int height) {
+            try {
+                JSONObject extra = new JSONObject();
+                extra.put("width", width);
+                extra.put("height", height);
+                emit(adId, "resize", extra);
+            } catch (JSONException e) {
+                emit(adId, "resize", null);
+            }
+        }
+
+        @Override
+        public void emitHide(int adId) {
+            emit(adId, "hide", null);
+        }
+    }
+
+    /** Per-session sinks, created on first use and dropped with the session. */
+    private static final ConcurrentHashMap<Integer, SessionAdEventSink> sAdSinks =
+            new ConcurrentHashMap<>();
+
+    private static AdEventSink adSink(int sessionId) {
+        SessionAdEventSink existing = sAdSinks.get(sessionId);
+        if (existing != null) return existing;
+        SessionAdEventSink created = new SessionAdEventSink(sessionId);
+        SessionAdEventSink raced = sAdSinks.putIfAbsent(sessionId, created);
+        return raced != null ? raced : created;
+    }
+
+    /**
+     * Resolve the handler for a session, reporting an error on the ad's own
+     * channel when there is none.
+     *
+     * <p>Reporting rather than staying silent matters: content that called
+     * show() is waiting for either a close or an error, and a silent drop
+     * leaves it waiting forever.
+     */
+    private static AdHandler adHandlerOrReportError(int sessionId, int adId, String api) {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            clearAdHandler(sessionId);
+            sAdSinks.remove(sessionId);
+            return null;
+        }
+        AdHandler handler = sAdHandlers.get(sessionId);
+        if (handler == null) {
+            adSink(sessionId).emitError(adId, -1, api + ":fail no ad handler");
+            return null;
+        }
+        return handler;
+    }
+
+    private static JSONObject parseAdRequest(String requestJson) {
+        if (requestJson == null || requestJson.isEmpty()) {
+            return new JSONObject();
+        }
+        try {
+            return new JSONObject(requestJson);
+        } catch (JSONException e) {
+            return new JSONObject();
+        }
+    }
+
+    private static int parseAdId(JSONObject request) {
+        return request != null ? request.optInt("adId", 0) : 0;
+    }
+
+    /** @hide Called from native when content creates an ad. */
+    public static void adCreate(int sessionId, String requestJson) {
+        JSONObject request = parseAdRequest(requestJson);
+        int adId = parseAdId(request);
+        if (adId == 0) return;
+
+        AdHandler handler = adHandlerOrReportError(sessionId, adId, "createAd");
+        if (handler == null) return;
+
+        String adType = request.optString("adType", "");
+        String adUnitId = request.optString("adUnitId", "");
+        JSONObject options = request.optJSONObject("options");
+        String optionsJson = options != null ? options.toString() : "{}";
+
+        try {
+            handler.createAd(adId, adType, adUnitId, optionsJson, adSink(sessionId));
+        } catch (Exception e) {
+            adSink(sessionId).emitError(adId, -1, "createAd:fail " + e);
+        }
+    }
+
+    /** @hide Called from native when content loads an ad. */
+    public static void adLoad(int sessionId, String requestJson) {
+        JSONObject request = parseAdRequest(requestJson);
+        int adId = parseAdId(request);
+        if (adId == 0) return;
+
+        AdHandler handler = adHandlerOrReportError(sessionId, adId, "loadAd");
+        if (handler == null) return;
+
+        try {
+            handler.loadAd(adId, adSink(sessionId));
+        } catch (Exception e) {
+            adSink(sessionId).emitError(adId, -1, "loadAd:fail " + e);
+        }
+    }
+
+    /** @hide Called from native when content shows an ad. */
+    public static void adShow(int sessionId, String requestJson) {
+        JSONObject request = parseAdRequest(requestJson);
+        int adId = parseAdId(request);
+        if (adId == 0) return;
+
+        AdHandler handler = adHandlerOrReportError(sessionId, adId, "showAd");
+        if (handler == null) return;
+
+        try {
+            handler.showAd(adId, adSink(sessionId));
+        } catch (Exception e) {
+            adSink(sessionId).emitError(adId, -1, "showAd:fail " + e);
+        }
+    }
+
+    /** @hide Called from native when content hides an ad. */
+    public static void adHide(int sessionId, String requestJson) {
+        JSONObject request = parseAdRequest(requestJson);
+        int adId = parseAdId(request);
+        if (adId == 0) return;
+
+        AdHandler handler = sAdHandlers.get(sessionId);
+        if (handler == null) return;
+
+        try {
+            handler.hideAd(adId, adSink(sessionId));
+        } catch (Exception e) {
+            android.util.Log.w("NativeExports", "adHide: handler threw: " + e);
+        }
+    }
+
+    /** @hide Called from native when content mutates a positioned ad's style. */
+    public static void adUpdateStyle(int sessionId, String requestJson) {
+        JSONObject request = parseAdRequest(requestJson);
+        int adId = parseAdId(request);
+        if (adId == 0) return;
+
+        AdHandler handler = sAdHandlers.get(sessionId);
+        if (handler == null) return;
+
+        JSONObject style = request.optJSONObject("style");
+        String styleJson = style != null ? style.toString() : "{}";
+
+        try {
+            handler.updateAdStyle(adId, styleJson, adSink(sessionId));
+        } catch (Exception e) {
+            android.util.Log.w("NativeExports", "adUpdateStyle: handler threw: " + e);
+        }
+    }
+
+    /** @hide Called from native when content destroys an ad. */
+    public static void adDestroy(int sessionId, String requestJson) {
+        JSONObject request = parseAdRequest(requestJson);
+        int adId = parseAdId(request);
+        if (adId == 0) return;
+
+        AdHandler handler = sAdHandlers.get(sessionId);
+        if (handler == null) return;
+
+        try {
+            handler.destroyAd(adId);
+        } catch (Exception e) {
+            android.util.Log.w("NativeExports", "adDestroy: handler threw: " + e);
         }
     }
 

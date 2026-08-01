@@ -528,6 +528,14 @@ public final class NativeBridge {
     public static native void onLoginResult(int sessionId, String resultJson);
 
     /**
+     * Deliver one ad event (load / error / close / resize / hide) to content.
+     *
+     * @param sessionId The session ID
+     * @param eventJson JSON carrying adId, event name and event fields
+     */
+    public static native void onAdEvent(int sessionId, String eventJson);
+
+    /**
      * Callback when checkSession operation completes.
      *
      * @param sessionId  The session ID

@@ -1475,6 +1475,11 @@ jni_json_callback!(onScanCodeResult, "_internalOnScanCodeResult");
 
 // ==================== Auth Callbacks ====================
 
+// Every ad event -- load, error, close (with the reward verdict), resize,
+// hide -- arrives on this single channel and is routed to an ad object by the
+// `adId` inside the payload.
+jni_json_callback!(onAdEvent, "_internalOnAdEvent");
+
 jni_json_callback!(onLoginResult, "_internalOnLoginResult");
 jni_json_callback!(onCheckSessionResult, "_internalOnCheckSessionResult");
 jni_json_callback!(onGetUserInfoResult, "_internalOnGetUserInfoResult");

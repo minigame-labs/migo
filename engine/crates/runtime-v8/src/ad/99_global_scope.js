@@ -16,6 +16,10 @@ ObjectDefineProperties(globalThis, {
     onDirectAdStatusChange: core.propNonEnumerable(adApi.onDirectAdStatusChange),
     offDirectAdStatusChange: core.propNonEnumerable(adApi.offDirectAdStatusChange),
     _internalTriggerDirectAdStatusChange: core.propNonEnumerable(adApi._internalTriggerDirectAdStatusChange),
+    // Inbound host bridge: the single channel every ad event arrives on.
+    // 99_main.js relocates `_internal*` onto the Symbol-keyed host-bridge
+    // holder, so this is not reachable from content.
+    _internalOnAdEvent: core.propNonEnumerable(adApi._internalOnAdEvent),
     getShowSplashAdStatus: core.propNonEnumerable(adApi.getShowSplashAdStatus),
     createGameBanner: core.propNonEnumerable(adApi.createGameBanner),
     createGameIcon: core.propNonEnumerable(adApi.createGameIcon),
