@@ -1593,6 +1593,33 @@ impl CanvasManager {
         }
     }
 
+    /// Rebuild a canvas's 2D context, carrying its drawing state across.
+    ///
+    /// The state is the load-bearing half. JS de-duplicates every setter
+    /// against a shadow (`if (this._fillStyle === value) return;`) that nothing
+    /// clears, and Canvas2D has no context-loss event for content to react to,
+    /// because browsers restore 2D contexts transparently and no engine listens
+    /// for one. A context rebuilt at spec defaults is therefore permanently
+    /// desynchronised from the content, silently: fills paint opaque black and
+    /// no layer reports an error.
+    ///
+    /// Every drop-and-re-create pair goes through here so the sequence exists
+    /// once. `Canvas2DContext::resize` already preserves the state on its happy
+    /// path; this is the same promise for the path where that resize fails.
+    fn rebuild_2d_context_preserving_state(&mut self, id: CanvasId) -> EngineResult<()> {
+        let state = self.contexts_2d.get(&id).map(|ctx| ctx.drawing_state());
+        if let Some(tag) = self.drop_2d_context(id, true) {
+            self.image_registry
+                .store_mut()
+                .purge_wrappers_for_context(tag);
+        }
+        context_2d_impl::init_skia_for_canvas(self, id)?;
+        if let (Some(state), Some(ctx)) = (state, self.contexts_2d.get_mut(&id)) {
+            ctx.adopt_drawing_state(state);
+        }
+        Ok(())
+    }
+
     /// Record what a future surface install owes this canvas.
     ///
     /// Only ever sets, never clears: the obligation outlives any number of
@@ -2080,7 +2107,7 @@ impl CanvasManager {
                     entry.physical_height,
                 )
             }),
-            |id| self.contexts_2d.contains_key(&id),
+            |id| self.contexts_2d.get(&id).map(|ctx| ctx.drawing_state()),
         );
 
         // Skia contexts: abandoned on the loss path; drop every one so they
@@ -2157,13 +2184,23 @@ impl CanvasManager {
         plan: &ShareGroupRestorePlan,
         onscreen_id: CanvasId,
     ) -> EngineResult<()> {
-        if plan.onscreen_2d {
+        // A rebuilt context starts at spec defaults, and the content will not
+        // re-send what it believes is still in force -- the JS setters
+        // de-duplicate against a shadow no GPU reset clears. Restoring the
+        // state is as load-bearing as restoring the context.
+        if let Some(state) = plan.onscreen_2d.clone() {
             context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
+            if let Some(ctx) = self.contexts_2d.get_mut(&onscreen_id) {
+                ctx.adopt_drawing_state(state);
+            }
         }
         for spec in &plan.offscreen {
             self.register_offscreen(spec.id, spec.width, spec.height)?;
-            if spec.had_2d {
+            if let Some(state) = spec.state_2d.clone() {
                 context_2d_impl::init_skia_for_canvas(self, spec.id)?;
+                if let Some(ctx) = self.contexts_2d.get_mut(&spec.id) {
+                    ctx.adopt_drawing_state(state);
+                }
             }
         }
         if !plan.offscreen.is_empty() {
@@ -2842,12 +2879,7 @@ impl CanvasManager {
                     .unwrap_or(true)
             };
             if !resized_ok {
-                if let Some(tag) = self.drop_2d_context(id, true) {
-                    self.image_registry
-                        .store_mut()
-                        .purge_wrappers_for_context(tag);
-                }
-                context_2d_impl::init_skia_for_canvas(self, id)?;
+                self.rebuild_2d_context_preserving_state(id)?;
             }
 
             // WebGL default framebuffer viewport resets after drawing buffer resize.
@@ -2981,12 +3013,7 @@ impl CanvasManager {
                 .unwrap_or(true)
         };
         if !resized_ok {
-            if let Some(tag) = self.drop_2d_context(id, true) {
-                self.image_registry
-                    .store_mut()
-                    .purge_wrappers_for_context(tag);
-            }
-            context_2d_impl::init_skia_for_canvas(self, id)?;
+            self.rebuild_2d_context_preserving_state(id)?;
         }
 
         if !was_current {
@@ -5291,16 +5318,20 @@ fn can_bypass_drawing_buffer(
 
 /// One offscreen canvas that must be re-created after the EGL share group is
 /// rebuilt, captured before the dead group is torn down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct OffscreenRestore {
     pub id: CanvasId,
     pub width: u32,
     pub height: u32,
-    /// The canvas had a Skia Canvas2D context. JS holds the corresponding
-    /// context object forever and never re-issues `getContext('2d')`, so
-    /// recovery must re-initialise it rather than wait for a call that
-    /// will not come.
-    pub had_2d: bool,
+    /// The 2D drawing state of the context this canvas had, if it had one.
+    ///
+    /// JS holds the context object forever and never re-issues
+    /// `getContext('2d')`, so recovery must re-initialise it rather than wait
+    /// for a call that will not come -- and it must restore the state, because
+    /// the JS setters de-duplicate against a shadow that a GPU reset does not
+    /// clear. A context rebuilt at spec defaults means every value the content
+    /// set once and never re-sent is silently wrong from then on.
+    pub state_2d: Option<Canvas2DState>,
 }
 
 /// The JS-visible canvas state a share-group teardown destroyed, which the
@@ -5314,13 +5345,13 @@ pub(super) struct OffscreenRestore {
 /// handle: every later op on it fails `NotFound` and the game silently stops
 /// drawing. Identity therefore outlives the GPU state, and the teardown hands
 /// this plan to the rebuild rather than discarding it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 #[must_use = "a torn-down share group must be restored or JS-visible canvases silently vanish"]
 pub(super) struct ShareGroupRestorePlan {
-    /// The onscreen canvas had a Skia Canvas2D context. The canvas itself is
-    /// rebuilt by `create_onscreen` (it needs the window target), but its 2D
-    /// context is not.
-    pub onscreen_2d: bool,
+    /// The onscreen canvas's 2D drawing state, if it had a context. The canvas
+    /// itself is rebuilt by `create_onscreen` (it needs the window target), but
+    /// its 2D context is not.
+    pub onscreen_2d: Option<Canvas2DState>,
     /// Offscreen canvases, ordered by id.
     pub offscreen: Vec<OffscreenRestore>,
 }
@@ -5333,7 +5364,7 @@ pub(super) struct ShareGroupRestorePlan {
 /// for each — is testable without an EGL display.
 fn plan_share_group_restore(
     canvases: impl Iterator<Item = (CanvasId, bool, u32, u32)>,
-    had_2d: impl Fn(CanvasId) -> bool,
+    state_2d: impl Fn(CanvasId) -> Option<Canvas2DState>,
 ) -> ShareGroupRestorePlan {
     let onscreen_id = CanvasId::from(1u32);
     let mut offscreen: Vec<OffscreenRestore> = canvases
@@ -5342,14 +5373,14 @@ fn plan_share_group_restore(
             id,
             width,
             height,
-            had_2d: had_2d(id),
+            state_2d: state_2d(id),
         })
         .collect();
     // The caller iterates a HashMap: sort so recovery order — and the failure
     // it reports when one canvas cannot be rebuilt — is reproducible.
     offscreen.sort_unstable_by_key(|spec| spec.id);
     ShareGroupRestorePlan {
-        onscreen_2d: had_2d(onscreen_id),
+        onscreen_2d: state_2d(onscreen_id),
         offscreen,
     }
 }
@@ -5424,6 +5455,112 @@ mod recovery_source_guards {
         );
     }
 
+    /// Every 2D context recovery rebuilds must also get its drawing state back.
+    ///
+    /// The JS setters de-duplicate against a shadow (`if (this._fillStyle ===
+    /// value) return;`) that a GPU reset does not clear, and Canvas2D has no
+    /// context-loss event for content to react to -- browsers restore 2D
+    /// contexts transparently, so no engine listens for one. A context rebuilt
+    /// at spec defaults is therefore permanent: every value the content set
+    /// once and never re-sent is wrong from then on, fills paint opaque black,
+    /// and nothing anywhere reports an error.
+    ///
+    /// The onscreen path learned this as #48. Recovery is the same invariant on
+    /// a different trigger, and it covers the offscreen canvases too, which #48
+    /// never had to think about.
+    #[test]
+    fn recovery_gives_every_rebuilt_2d_context_its_drawing_state_back() {
+        let body = function_body(MGR, "fn restore_share_group");
+        let inits = body.matches("init_skia_for_canvas").count();
+        let adopts = body.matches("adopt_drawing_state").count();
+        assert!(
+            inits > 0,
+            "recovery must re-create the 2D contexts the teardown dropped"
+        );
+        assert_eq!(
+            adopts, inits,
+            "every re-created 2D context must adopt the state it had ({inits} rebuilt, \
+             {adopts} restored) -- a context rebuilt at spec defaults desynchronises \
+             from the content permanently"
+        );
+
+        // The plan has to carry the state, or there would be nothing to adopt.
+        let plan = function_body(MGR, "fn plan_share_group_restore");
+        assert!(
+            plan.contains("state_2d"),
+            "the restore plan must carry the drawing state, not merely a flag"
+        );
+    }
+
+    /// No path may drop a 2D context and re-create it without carrying the
+    /// drawing state -- whatever the trigger is.
+    ///
+    /// This invariant has now been broken three times, each on a different
+    /// trigger and each silent: surface recreate (#48), a background round trip
+    /// where the teardown and the install are separate events, and GPU
+    /// context-loss recovery. The per-site guards each covered the site they
+    /// were written for; this one covers the shape.
+    ///
+    /// `rebuild_2d_context_preserving_state` is the single sequence point, so
+    /// the check is that nothing else pairs a drop with a re-create.
+    #[test]
+    fn no_path_re_creates_a_2d_context_without_carrying_its_state() {
+        let helper = function_body(MGR, "fn rebuild_2d_context_preserving_state");
+        for needle in ["drawing_state()", "drop_2d_context", "init_skia_for_canvas"] {
+            assert!(
+                helper.contains(needle),
+                "the sequence point must still {needle}"
+            );
+        }
+        assert!(
+            helper.find("drawing_state()") < helper.find("drop_2d_context"),
+            "the state must be captured before the context it belongs to is dropped"
+        );
+        assert!(
+            helper.find("init_skia_for_canvas") < helper.find("adopt_drawing_state"),
+            "the state must be adopted by the context that replaces the old one"
+        );
+
+        // Any other function that drops a 2D context and re-creates it in the
+        // same body has bypassed the sequence point. `create_onscreen` is
+        // excluded: it defers the re-create to the obligation it records, which
+        // `onscreen_surface_recreate_carries_the_2d_drawing_state_across` pins,
+        // and `destroy_onscreen_internal` only ever drops.
+        let allowed = [
+            "fn rebuild_2d_context_preserving_state",
+            "pub(crate) fn create_onscreen",
+        ];
+        // Only the production half. `MGR` is this file, so a scan of the whole
+        // of it matches the test module -- including this test's own allow-list
+        // literals, which name both sides of the pair it looks for.
+        let production = MGR
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("mod.rs must have a test module boundary to cut at");
+        let mut offenders = Vec::new();
+        for (index, _) in production.match_indices("fn ") {
+            let tail = &production[index..];
+            let Some(name_end) = tail.find(['(', '<']) else {
+                continue;
+            };
+            let signature = &tail[..name_end];
+            if allowed.iter().any(|a| a.ends_with(signature)) {
+                continue;
+            }
+            let body_end = tail.find("\n    }").unwrap_or(tail.len());
+            let body = &tail[..body_end];
+            if body.contains("drop_2d_context") && body.contains("init_skia_for_canvas") {
+                offenders.push(signature.trim().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these drop and re-create a 2D context without going through \
+             `rebuild_2d_context_preserving_state`, so the content keeps drawing \
+             with state the render side no longer has: {offenders:?}"
+        );
+    }
+
     #[test]
     fn offscreen_restore_failure_keeps_the_context_lost() {
         let body = function_body(MGR, "pub(crate) fn try_recover_context");
@@ -5474,22 +5611,28 @@ mod tests {
     /// live canvas registry.
     const ONSCREEN: (CanvasId, bool, u32, u32) = (1, false, 720, 1280);
 
+    /// A drawing state distinguishable from the spec defaults a rebuilt
+    /// context starts at, so a test cannot pass by accident.
+    fn marked_state() -> Canvas2DState {
+        let mut state = Canvas2DState::default();
+        state.global_alpha = 0.25;
+        state
+    }
+
     #[test]
     fn restore_plan_carries_offscreen_canvases_at_their_current_size() {
         // Regression: recovery used to rebuild only the onscreen canvas, so a
         // game holding an offscreen canvas id (Pixi allocates two at startup)
         // hit `NotFound` on every later op and stopped rendering.
         let plan =
-            plan_share_group_restore([ONSCREEN, (16777217, true, 256, 128)].into_iter(), |_| {
-                false
-            });
+            plan_share_group_restore([ONSCREEN, (16777217, true, 256, 128)].into_iter(), |_| None);
         assert_eq!(
             plan.offscreen,
             vec![OffscreenRestore {
                 id: 16777217,
                 width: 256,
                 height: 128,
-                had_2d: false,
+                state_2d: None,
             }]
         );
     }
@@ -5498,9 +5641,9 @@ mod tests {
     fn restore_plan_excludes_the_onscreen_canvas() {
         // `create_onscreen` owns the onscreen canvas because it needs the
         // window target; re-registering it as a pbuffer would fight that.
-        let plan = plan_share_group_restore([ONSCREEN].into_iter(), |_| false);
+        let plan = plan_share_group_restore([ONSCREEN].into_iter(), |_| None);
         assert!(plan.offscreen.is_empty());
-        assert!(!plan.onscreen_2d);
+        assert!(plan.onscreen_2d.is_none());
     }
 
     #[test]
@@ -5510,15 +5653,41 @@ mod tests {
         // onscreen canvas and any offscreen one that had a context.
         let plan = plan_share_group_restore(
             [ONSCREEN, (16777216, true, 1, 1), (16777217, true, 1, 1)].into_iter(),
-            |id| id == 1 || id == 16777217,
+            |id| (id == 1 || id == 16777217).then(marked_state),
         );
-        assert!(plan.onscreen_2d);
+        assert!(plan.onscreen_2d.is_some());
         assert_eq!(
             plan.offscreen
                 .iter()
-                .map(|spec| (spec.id, spec.had_2d))
+                .map(|spec| (spec.id, spec.state_2d.is_some()))
                 .collect::<Vec<_>>(),
             vec![(16777216, false), (16777217, true)]
+        );
+    }
+
+    /// The plan carries the drawing *state*, not merely the fact that there was
+    /// one.
+    ///
+    /// A context rebuilt at spec defaults desynchronises from the content for
+    /// good: the JS setters de-duplicate against a shadow (`if (this._fillStyle
+    /// === value) return;`) that no GPU reset clears, so every value set once
+    /// and never re-sent is silently wrong from then on -- fills paint opaque
+    /// black, `globalAlpha` snaps back to 1. Recording a bool would rebuild the
+    /// context and still leave the content drawing with someone else's state.
+    #[test]
+    fn restore_plan_carries_the_drawing_state_not_just_a_flag() {
+        let plan = plan_share_group_restore([ONSCREEN, (16777217, true, 1, 1)].into_iter(), |_| {
+            Some(marked_state())
+        });
+        assert_eq!(
+            plan.onscreen_2d.as_ref(),
+            Some(&marked_state()),
+            "the onscreen state must survive the teardown"
+        );
+        assert_eq!(
+            plan.offscreen[0].state_2d.as_ref(),
+            Some(&marked_state()),
+            "offscreen canvases keep their state too -- they have the same JS shadow"
         );
     }
 
@@ -5534,7 +5703,7 @@ mod tests {
                 (16777218, true, 1, 1),
             ]
             .into_iter(),
-            |_| false,
+            |_| None,
         );
         assert_eq!(
             plan.offscreen.iter().map(|s| s.id).collect::<Vec<_>>(),
