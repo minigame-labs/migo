@@ -280,6 +280,20 @@ if [[ "$USE_ALL_ARCH" == true ]]; then
     ARCHITECTURES=("arm64-v8a" "x86_64")
 fi
 
+# A single-ABI build gets its own artifact name so it cannot overwrite the
+# multi-ABI one. Deliberately *not* folded into ARTIFACT_SUFFIX: that also names
+# the jniLibs directory, and the arm64 `.so` is the same file whether or not
+# x86_64 was built alongside it -- separating them there would rebuild Rust for
+# nothing. Gradle's `abiFilters` does the actual filtering.
+#
+# Worth having because the number is a sales objection: 16-17 MB per ABI is the
+# figure a host weighs against its own APK budget, and shipping only the
+# multi-ABI AAR quotes it at double.
+ABI_ARTIFACT_SUFFIX=""
+if [[ ${#ARCHITECTURES[@]} -eq 1 ]]; then
+    ABI_ARTIFACT_SUFFIX="-${ARCHITECTURES[0]}"
+fi
+
 # ------------------------------------------------------------
 # Build Rust (.so)
 # ------------------------------------------------------------
@@ -474,9 +488,9 @@ collect_outputs() {
         print_error "Expected AAR not found: $aar"
         exit 1
     fi
-    local artifact_name="migo-$PRODUCT_PROFILE-$BUILD_TYPE$ARTIFACT_SUFFIX.aar"
+    local artifact_name="migo-$PRODUCT_PROFILE-$BUILD_TYPE$ARTIFACT_SUFFIX$ABI_ARTIFACT_SUFFIX.aar"
     local output_aar="$out_dir/$artifact_name"
-    local version_metadata="$out_dir/version-$PRODUCT_PROFILE$ARTIFACT_SUFFIX.json"
+    local version_metadata="$out_dir/version-$PRODUCT_PROFILE$ARTIFACT_SUFFIX$ABI_ARTIFACT_SUFFIX.json"
     rm -f "$output_aar" "$output_aar.attestation.json" "$version_metadata"
 
     if [[ -f "$MANIFEST_INDEX" ]]; then

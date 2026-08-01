@@ -313,6 +313,16 @@ jobs:
           rm -rf platforms/android/dist
           bash scripts/build-aar.sh --product-profile full release
           bash scripts/build-aar.sh --product-profile slim release
+          # arm64-only variants. The Rust artefacts are already built, so these
+          # only re-run Gradle with abiFilters -- a host shipping arm64 alone
+          # should not have to carry the x86_64 payload, and quoting the
+          # multi-ABI size at an integrator overstates it by roughly double.
+          # Procurement asks what is inside the binary and under what licences.
+          # Generated from the resolved graph, so it describes the tree that was
+          # built rather than what the manifests permit.
+          bash scripts/generate-sbom.sh --out platforms/android/dist/migo-sbom.cdx.json
+          bash scripts/build-aar.sh --product-profile full release arm64-v8a
+          bash scripts/build-aar.sh --product-profile slim release arm64-v8a
 
       # No release may ship a libmigo.so that cannot dlopen on the API 26 floor
       # Migo claims to support. Checks every strong import against the NDK's
@@ -389,6 +399,11 @@ jobs:
             platforms/android/dist/migo-full-release.aar.attestation.json \
             platforms/android/dist/migo-slim-release.aar \
             platforms/android/dist/migo-slim-release.aar.attestation.json \
+            platforms/android/dist/migo-sbom.cdx.json \
+            platforms/android/dist/migo-full-release-arm64-v8a.aar \
+            platforms/android/dist/migo-full-release-arm64-v8a.aar.attestation.json \
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar \
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json \
             platforms/android/dist/version.json \
             platforms/android/dist/version-full.json \
             platforms/android/dist/version-slim.json \
@@ -428,6 +443,11 @@ jobs:
           files: |
             platforms/android/dist/migo-full-release.aar
             platforms/android/dist/migo-full-release.aar.attestation.json
+            platforms/android/dist/migo-sbom.cdx.json
+            platforms/android/dist/migo-full-release-arm64-v8a.aar
+            platforms/android/dist/migo-full-release-arm64-v8a.aar.attestation.json
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json
             platforms/android/dist/migo-slim-release.aar
             platforms/android/dist/migo-slim-release.aar.attestation.json
             platforms/android/dist/version.json
