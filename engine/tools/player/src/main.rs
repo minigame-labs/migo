@@ -27,6 +27,7 @@ use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 #[cfg(target_os = "windows")]
 use migo_core::{HostId, host_ingress};
 use migo_core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
+use platform::host_window::HostWindowMetrics;
 #[cfg(target_os = "linux")]
 use platform::linux::platform::LinuxPlatform as HostPlatform;
 #[cfg(target_os = "linux")]
@@ -194,14 +195,22 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
             offscreen_graphics_platform().map_err(|e| format!("graphics platform: {e:?}"))?;
         (surface, platform)
     };
-    let host_kit: Arc<dyn PlatformServices> = Arc::new(HostPlatform::new());
-
     let mode = if windowed { "window" } else { "offscreen" };
     // The requested size is not always what the surface got: a window manager
     // may clamp a frame that does not fit the display, and the engine renders
     // into the client area it actually has. Logging the constants instead of the
     // real extent made the line disagree with the pixels captured from it.
     let (surface_w, surface_h) = surface.size();
+
+    // Tell the platform what content should see from `wx.getSystemInfoSync()`.
+    //
+    // Read from the surface rather than the requested constants for the same
+    // reason the log line above is: content laying itself out from a size the
+    // window manager refused is content laying itself out wrong. The player has
+    // no HiDPI notion, so one physical pixel is one CSS pixel.
+    let host_kit: Arc<dyn PlatformServices> = Arc::new(
+        HostPlatform::new().with_window(HostWindowMetrics::new(surface_w, surface_h, 1.0)),
+    );
     tracing::info!("spawning host thread ({surface_w}x{surface_h} {mode})");
     let host_id = spawn_host_thread(surface, graphics_platform, host_kit, opt)
         .map_err(|e| format!("spawn_host_thread: {e:?}"))?;

@@ -7,6 +7,7 @@
 
 mod ad_reward_integrity;
 mod binary_helper;
+mod canvas_follows_surface;
 mod global_surface;
 mod host_bridge_dispatch;
 mod install_receipt;
