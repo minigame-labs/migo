@@ -1083,7 +1083,7 @@ impl CanvasManager {
                                 ((physical_h as f32 * obh as f32 / oph).round() as u32).max(1),
                             )
                         };
-                        self.resize_canvas(id, Some(backing_w), Some(backing_h))
+                        self.resize_canvas_for_surface_change(id, backing_w, backing_h)
                             .map_err(|error| {
                                 SurfaceInstallFailure::from_phase(
                                     error,
@@ -1614,6 +1614,40 @@ impl CanvasManager {
                 .purge_wrappers_for_context(tag);
         }
         context_2d_impl::init_skia_for_canvas(self, id)?;
+        if let (Some(state), Some(ctx)) = (state, self.contexts_2d.get_mut(&id)) {
+            ctx.adopt_drawing_state(state);
+        }
+        Ok(())
+    }
+
+    /// Resize a canvas because the *surface* moved, not because the content
+    /// asked it to.
+    ///
+    /// The distinction decides what happens to the 2D drawing state, and the
+    /// two answers are opposites:
+    ///
+    ///   * `canvas.width = N` — the spec resets the context, and the JS setters
+    ///     reset their shadow to match. `resize_canvas` doing the same is
+    ///     correct.
+    ///   * the platform hands us a different surface — the content did not ask
+    ///     for anything and nothing about its context was reset, so the state
+    ///     has to survive.
+    ///
+    /// `resize_canvas` cannot tell the two apart, and its rebuild comes up at
+    /// spec defaults either way. Left alone here, a content that set its fill
+    /// style once at start-up would draw in opaque black from the first system
+    /// bar hide onwards: the JS setters de-duplicate against a shadow no
+    /// surface change clears, so it believes the value is already in force and
+    /// will never send it again. Same invariant as `ShareGroupRestorePlan` and
+    /// `stash_onscreen_2d_restore`, reached by a third route.
+    fn resize_canvas_for_surface_change(
+        &mut self,
+        id: CanvasId,
+        width: u32,
+        height: u32,
+    ) -> EngineResult<()> {
+        let state = self.contexts_2d.get(&id).map(|ctx| ctx.drawing_state());
+        self.resize_canvas(id, Some(width), Some(height))?;
         if let (Some(state), Some(ctx)) = (state, self.contexts_2d.get_mut(&id)) {
             ctx.adopt_drawing_state(state);
         }

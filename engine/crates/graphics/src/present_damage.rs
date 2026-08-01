@@ -1114,6 +1114,94 @@ mod wiring_source_guards {
         );
     }
 
+    /// A resize the content did not ask for must not reset its 2D state.
+    ///
+    /// `Canvas2DContext::resize` returns the state machine to spec defaults --
+    /// right for `canvas.width = N`, wrong for a surface the platform swapped
+    /// underneath a running game. The JS setters de-duplicate against a shadow
+    /// no surface change clears, so a context that came back at defaults stays
+    /// there: the content believes its fill style is already in force and never
+    /// sends it again. Nothing reports an error; the game just draws in black.
+    ///
+    /// Asserted over EVERY caller rather than the one that was wrong, because
+    /// whoever adds the next surface-driven resize will not have read this.
+    #[test]
+    fn a_resize_the_content_did_not_ask_for_keeps_its_2d_drawing_state() {
+        let helper = function_body(MGR, "fn resize_canvas_for_surface_change");
+        let capture = helper
+            .find("drawing_state()")
+            .expect("the surface-driven resize must capture the drawing state");
+        let resize = helper
+            .find("self.resize_canvas(")
+            .expect("the surface-driven resize must delegate the resize itself");
+        let adopt = helper
+            .find("adopt_drawing_state")
+            .expect("the surface-driven resize must give the state back");
+        assert!(
+            capture < resize && resize < adopt,
+            "capture the state, resize, then adopt it back -- in that order"
+        );
+
+        // Every surface-install path that resizes must go through that helper.
+        // `create_onscreen`'s fast path called `resize_canvas` directly and is
+        // why this test exists.
+        let production = MGR
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("mod.rs must have a test module boundary to cut at");
+        let allowed = [
+            "fn resize_canvas_for_surface_change",
+            // The content-driven entry point: resetting is what the spec says
+            // `canvas.width = N` does, and the JS shadow resets to match.
+            "pub(crate) fn resize_canvas",
+        ];
+        let mut offenders = Vec::new();
+        for (index, _) in production.match_indices("fn ") {
+            let tail = &production[index..];
+            let Some(name_end) = tail.find(['(', '<']) else {
+                continue;
+            };
+            let signature = &tail[..name_end];
+            if allowed.iter().any(|a| a.ends_with(signature)) {
+                continue;
+            }
+            let body_end = tail.find("\n    }").unwrap_or(tail.len());
+            let body = &tail[..body_end];
+            if body.contains("self.resize_canvas(") {
+                offenders.push(signature.trim().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these resize a canvas without carrying the content's 2D drawing \
+             state across, so it keeps drawing with values the render side no \
+             longer has: {offenders:?}"
+        );
+    }
+
+    /// Adopting the state must put the transform back on the Skia canvas.
+    ///
+    /// `Canvas2DState::ctm` is a mirror of `SkCanvas`'s CTM, not the thing Skia
+    /// draws with, and a replacement surface starts at identity. Copying the
+    /// mirror alone leaves the damage classifier transforming rectangles with a
+    /// matrix Skia is not using -- and silently drops a transform the content
+    /// set once at start-up, which is the same de-duplication trap in a field
+    /// that looks like bookkeeping.
+    #[test]
+    fn adopting_2d_state_reapplies_the_transform_to_skia() {
+        const SURFACE: &str = include_str!("backend/gl/surface.rs");
+        let adopt = function_body(SURFACE, "pub fn adopt_drawing_state");
+        assert!(
+            adopt.contains("state.ctm"),
+            "adopting the state must read the transform out of it"
+        );
+        assert!(
+            adopt.contains("set_matrix"),
+            "adopting the state must re-apply the transform to the Skia canvas, \
+             which comes up at identity behind a replacement surface"
+        );
+    }
+
     #[test]
     fn swap_failure_preserves_accumulated_damage_for_retry() {
         let body = function_body(MGR, "pub(crate) fn swap_buffers_no_restore");

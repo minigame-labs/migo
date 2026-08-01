@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 
 use skia_safe::{
-    Canvas as SkCanvas, ColorType, Paint, Rect as SkRect, SamplingOptions, Shader,
+    Canvas as SkCanvas, ColorType, Matrix, Paint, Rect as SkRect, SamplingOptions, Shader,
     Surface as SkSurface, TileMode,
     gpu::{
         self, DirectContext, SurfaceOrigin, backend_render_targets, direct_contexts, gl as sk_gl,
@@ -726,10 +726,15 @@ impl Canvas2DContext {
         // a `GrDirectContext` pointer that's about to be dropped, and
         // reusing them post-swap is undefined behaviour inside Skia.
         image_store.purge_wrappers_for_context(self.ctx_tag);
-        // Preserve the state-machine state so JS-side style / transform
-        // persist across a resize.  Path + CTM + clip are canvas-local
-        // and must reset (matches browser behaviour: writing to
-        // canvas.width clears content and resets the context).
+        // `renderer.reset()` below returns the whole state machine to spec
+        // defaults, which is what `canvas.width = N` is defined to do and what
+        // the JS setters assume when they reset their shadow to match.
+        //
+        // A caller resizing for any OTHER reason -- the platform handed us a
+        // different surface -- has to carry the state across itself, because
+        // the content did not ask for a reset and will never re-send a value it
+        // believes is still in force. `resize_canvas_for_surface_change` is
+        // that caller.
         self.gr_ctx = new_self.gr_ctx;
         self.surface = new_self.surface;
         self.fbo_id = fbo_id;
@@ -753,14 +758,25 @@ impl Canvas2DContext {
     /// defaults desynchronises the two halves permanently, because the content
     /// has no way to learn its state was discarded and will never re-send it.
     /// `resize` preserves this by keeping `renderer`; a destroy-and-recreate
-    /// has to ask for it explicitly.
+    /// has to ask for it explicitly -- and so does `resize`, which resets it.
     pub fn drawing_state(&self) -> Canvas2DState {
         self.renderer.state.clone()
     }
 
     /// Adopt drawing state captured from the context this one replaces.
+    ///
+    /// Re-applies the transform as well, because `Canvas2DState::ctm` is a
+    /// mirror of `SkCanvas`'s own CTM rather than the thing Skia draws with,
+    /// and the `SkCanvas` behind a replacement surface starts at identity.
+    /// Adopting the mirror alone would leave the two disagreeing -- the damage
+    /// classifier transforms rectangles with the mirror -- and would drop a
+    /// transform the content set once and, like every other de-duplicated
+    /// setter, will never send again.
     pub fn adopt_drawing_state(&mut self, state: Canvas2DState) {
+        let [a, b, c, d, e, f] = state.ctm;
         self.renderer.state = state;
+        let m = Matrix::new_all(a, c, e, b, d, f, 0.0, 0.0, 1.0);
+        self.surface.canvas().set_matrix(&skia_safe::M44::from(m));
     }
 
     /// Clear the entire surface to transparent — spec'd fallout of
