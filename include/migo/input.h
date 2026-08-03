@@ -15,6 +15,22 @@
 MIGO_BEGIN_DECLS
 
 /*
+ * Input acceptance and backpressure.
+ *
+ * Every migo_session_send_* input call is nonblocking. MIGO_OK means the event
+ * was either enqueued or safely coalesced with an older pending state from the
+ * same stream. MIGO_ERROR_WOULD_BLOCK means the event was not accepted; the
+ * host may retry while it is still current.
+ *
+ * High-rate motion/state samples are coalesced. State transitions use a
+ * separate reliable reserve so they remain deliverable when normal input is
+ * full, but that reserve is intentionally bounded: a producer that ignores
+ * backpressure can exhaust it. The first refusal in a saturation episode is
+ * also reported through MigoOnErrorFn; a later successful input call rearms
+ * that notification.
+ */
+
+/*
  * Touch, including on desktop. wx mini-game content listens for
  * touchstart/touchmove/touchend and nothing else, so a host with a mouse maps it
  * to a single touch point with id 0 rather than expecting a separate pointer
@@ -94,7 +110,8 @@ MIGO_STATIC_ASSERT(offsetof(MigoTouchEvent, points) == 24, "MigoTouchEvent.point
  * one thread.
  *
  * Returns MIGO_ERROR_INVALID_STATE when no surface is attached -- there is
- * nothing to deliver to -- and MIGO_ERROR_WOULD_BLOCK when the queue is full.
+ * nothing to deliver to -- and MIGO_ERROR_WOULD_BLOCK when the event was not
+ * accepted.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_touch(
     MigoSession *session,
@@ -158,8 +175,8 @@ MIGO_STATIC_ASSERT(offsetof(MigoPointerEvent, timestamp_ms) == 24,
  * between concurrent calls is the host's to guarantee.
  *
  * Returns MIGO_ERROR_INVALID_STATE when no surface is attached and
- * MIGO_ERROR_WOULD_BLOCK when the queue is full. A dropped UP leaves content
- * believing the button is still held, and no later event corrects it.
+ * MIGO_ERROR_WOULD_BLOCK when the event was not accepted. DOWN and UP use the
+ * reliable reserve; MOVE is coalescible.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_pointer_event(
     MigoSession *session,
@@ -261,9 +278,8 @@ MIGO_STATIC_ASSERT(offsetof(MigoKeyboardEvent, height_css_px) == 24,
  * concurrent calls is the host's to guarantee.
  *
  * Returns MIGO_ERROR_INVALID_STATE when no surface is attached and
- * MIGO_ERROR_WOULD_BLOCK when the queue is full. A full queue is reported
- * rather than swallowed: a dropped COMPLETE leaves content believing the
- * keyboard is still open, and no later event corrects it.
+ * MIGO_ERROR_WOULD_BLOCK when the event was not accepted. COMPLETE uses the
+ * reliable reserve.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_keyboard_event(
     MigoSession *session,
@@ -361,9 +377,8 @@ MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, flags) == 44, "MigoKeyEvent.flags move
  * Deliver one key press or release. Callable from any thread; ordering between
  * concurrent calls is the host's to guarantee.
  *
- * A full queue is reported as MIGO_ERROR_WOULD_BLOCK rather than swallowed: a
- * dropped UP leaves content believing the key is still held, and no later event
- * corrects it.
+ * MIGO_ERROR_WOULD_BLOCK means the event was not accepted. Key UP uses the
+ * reliable reserve so it is not silently lost behind ordinary input.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_key_event(
     MigoSession *session,
@@ -414,8 +429,8 @@ MIGO_STATIC_ASSERT(offsetof(MigoCompositionEvent, data_utf8) == 16,
 /*
  * Deliver one composition event.
  *
- * A full queue is MIGO_ERROR_WOULD_BLOCK rather than a silent drop: a dropped
- * END leaves content drawing a preedit that will never be cleared.
+ * MIGO_ERROR_WOULD_BLOCK means the event was not accepted. UPDATE is
+ * coalescible; START and END use the reliable reserve.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_composition_event(
     MigoSession *session,
@@ -535,7 +550,11 @@ MIGO_API MigoResult MIGO_CALL migo_session_set_gamepad_connected(
     const MigoGamepadInfo *info,
     uint32_t connected);
 
-/* Push one sample for a connected pad. */
+/*
+ * Push one sample for a connected pad. Samples are coalesced independently by
+ * gamepad index. MIGO_OK includes safe coalescing; MIGO_ERROR_WOULD_BLOCK means
+ * this sample was not accepted.
+ */
 MIGO_API MigoResult MIGO_CALL migo_session_send_gamepad_state(
     MigoSession *session,
     const MigoGamepadStateEvent *event);

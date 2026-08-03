@@ -41,6 +41,10 @@ pub struct RenderMetricsSnapshot {
     pub canvas2d_snapshot_fallbacks: u32,
     pub canvas2d_snapshot_uploads: u32,
     pub canvas2d_snapshot_forced_readbacks: u32,
+    // ---- bounded input transport observability (v6) ----
+    pub input_coalesced: u32,
+    pub input_reliable_reserve_uses: u32,
+    pub input_saturation_events: u32,
 }
 
 impl RenderMetricsSnapshot {
@@ -59,11 +63,14 @@ impl RenderMetricsSnapshot {
     ///   (offsets 116-131).  Adds four fields:
     ///   canvas2d_snapshots_taken, canvas2d_snapshot_fallbacks,
     ///   canvas2d_snapshot_uploads, canvas2d_snapshot_forced_readbacks.
-    pub const VERSION: u16 = 5;
-    /// 4-byte header (2 magic + 2 version) + 128 bytes payload = 132.
+    /// * v6 - bounded input transport counters appended (offsets 132-143).
+    ///   Adds input_coalesced, input_reliable_reserve_uses, and
+    ///   input_saturation_events.
+    pub const VERSION: u16 = 6;
+    /// 4-byte header (2 magic + 2 version) + 140 bytes payload = 144.
     pub const HEADER_LEN: usize = 4;
-    pub const PAYLOAD_LEN: usize = 128;
-    pub const BYTE_LEN: usize = Self::HEADER_LEN + Self::PAYLOAD_LEN; // 132
+    pub const PAYLOAD_LEN: usize = 140;
+    pub const BYTE_LEN: usize = Self::HEADER_LEN + Self::PAYLOAD_LEN; // 144
 
     pub fn as_le_bytes(&self) -> [u8; Self::BYTE_LEN] {
         let mut bytes = [0u8; Self::BYTE_LEN];
@@ -106,6 +113,10 @@ impl RenderMetricsSnapshot {
         bytes[120..124].copy_from_slice(&self.canvas2d_snapshot_fallbacks.to_le_bytes());
         bytes[124..128].copy_from_slice(&self.canvas2d_snapshot_uploads.to_le_bytes());
         bytes[128..132].copy_from_slice(&self.canvas2d_snapshot_forced_readbacks.to_le_bytes());
+        // ---- v6 appended: bounded input transport ----
+        bytes[132..136].copy_from_slice(&self.input_coalesced.to_le_bytes());
+        bytes[136..140].copy_from_slice(&self.input_reliable_reserve_uses.to_le_bytes());
+        bytes[140..144].copy_from_slice(&self.input_saturation_events.to_le_bytes());
         bytes
     }
 }
@@ -132,6 +143,12 @@ pub struct DebugStats {
     /// (cumulative, per session). Trusted lifecycle/surface commands bypass
     /// this quota and are not counted in this field.
     pub command_drops: AtomicU32,
+    /// Cumulative replace-in-place operations in the bounded input queue.
+    pub input_coalesced: AtomicU32,
+    /// Cumulative accepted transitions that consumed reliable input reserve.
+    pub input_reliable_reserve_uses: AtomicU32,
+    /// Cumulative input commands refused after every eligible lane was full.
+    pub input_saturation_events: AtomicU32,
     /// Last measured RAF scheduling latency in microseconds.
     pub raf_latency_us: AtomicU32,
     /// Last measured swap/present blocking time in microseconds.
@@ -421,6 +438,9 @@ impl DebugStats {
             canvas2d_snapshot_forced_readbacks: self
                 .canvas2d_snapshot_forced_readbacks
                 .load(Ordering::Relaxed),
+            input_coalesced: self.input_coalesced.load(Ordering::Relaxed),
+            input_reliable_reserve_uses: self.input_reliable_reserve_uses.load(Ordering::Relaxed),
+            input_saturation_events: self.input_saturation_events.load(Ordering::Relaxed),
         }
         .as_le_bytes()
     }
@@ -707,14 +727,19 @@ mod tests {
         stats.swap_block_us.store(888, Ordering::Relaxed);
         stats.upload_queue_depth.store(9, Ordering::Relaxed);
         stats.glyph_atlas_miss.store(10, Ordering::Relaxed);
+        stats.input_coalesced.store(11, Ordering::Relaxed);
+        stats
+            .input_reliable_reserve_uses
+            .store(12, Ordering::Relaxed);
+        stats.input_saturation_events.store(13, Ordering::Relaxed);
 
         let bytes = stats.snapshot();
 
-        // v5 payload = 128 bytes (60 legacy + 32 IO + 20 queue/cache + 16 snapshot) + 4 header = 132.
+        // v6 payload = 140 bytes (v5's 128 + 12 input) + 4 header = 144.
         assert_eq!(bytes.len(), RenderMetricsSnapshot::BYTE_LEN);
-        assert_eq!(RenderMetricsSnapshot::BYTE_LEN, 132);
+        assert_eq!(RenderMetricsSnapshot::BYTE_LEN, 144);
 
-        // Header: magic 'MG' (0x4D47) at [0..2], version 4 at [2..4].
+        // Header: magic 'MG' (0x4D47) at [0..2], version 6 at [2..4].
         assert_eq!(
             u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
             RenderMetricsSnapshot::MAGIC
@@ -723,7 +748,7 @@ mod tests {
             u16::from_le_bytes(bytes[2..4].try_into().unwrap()),
             RenderMetricsSnapshot::VERSION
         );
-        assert_eq!(RenderMetricsSnapshot::VERSION, 5);
+        assert_eq!(RenderMetricsSnapshot::VERSION, 6);
 
         // Payload fields — all offsets shifted by +4 (HEADER_LEN).
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 600);
@@ -737,6 +762,9 @@ mod tests {
         // Render optimization fields default to 0 at offsets 44-63.
         assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(bytes[132..136].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(bytes[136..140].try_into().unwrap()), 12);
+        assert_eq!(u32::from_le_bytes(bytes[140..144].try_into().unwrap()), 13);
     }
 
     #[test]
@@ -750,7 +778,7 @@ mod tests {
 
         let bytes = stats.snapshot();
 
-        assert_eq!(bytes.len(), 132);
+        assert_eq!(bytes.len(), 144);
         // Payload offsets shifted by +4 (HEADER_LEN).
         assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 42);
         assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 7);
@@ -776,7 +804,7 @@ mod tests {
         stats.deferred_uploads.store(5, Ordering::Relaxed);
 
         let bytes = stats.snapshot();
-        assert_eq!(bytes.len(), 132);
+        assert_eq!(bytes.len(), 144);
         assert_eq!(u32::from_le_bytes(bytes[96..100].try_into().unwrap()), 321);
         assert_eq!(
             u32::from_le_bytes(bytes[100..104].try_into().unwrap()),

@@ -1,4 +1,8 @@
-use std::{panic, sync::Arc};
+use std::{
+    panic,
+    sync::Arc,
+    thread::{self, JoinHandle},
+};
 
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info, warn};
@@ -23,8 +27,119 @@ const HOST_BLOCKING_FALLBACK_THREADS: usize = 4;
 /// Result of starting a Host whose initial Surface belongs to a public
 /// embedding attachment.
 pub struct SpawnedSurfaceHost {
-    pub host_id: HostId,
+    pub host: HostThread,
     pub resource: SurfaceResourceLease,
+}
+
+/// Owning handle for one Migo Host thread.
+///
+/// Command producers may copy [`HostId`], but a native host must retain this
+/// value until it can request shutdown and join. Dropping it is a synchronous
+/// fail-safe, not a detach operation.
+#[must_use = "a spawned Host must be shut down and joined"]
+#[derive(Debug)]
+pub struct HostThread {
+    host_id: HostId,
+    join: Option<JoinHandle<()>>,
+}
+
+impl HostThread {
+    fn new(host_id: HostId, join: JoinHandle<()>) -> Self {
+        Self {
+            host_id,
+            join: Some(join),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn from_join_handle_for_test(host_id: HostId, join: JoinHandle<()>) -> Self {
+        Self::new(host_id, join)
+    }
+
+    #[inline]
+    pub const fn id(&self) -> HostId {
+        self.host_id
+    }
+
+    #[inline]
+    pub fn is_current_thread(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_some_and(|join| join.thread().id() == thread::current().id())
+    }
+
+    pub fn request_shutdown(&self) -> Result<(), String> {
+        registry::shutdown_host(self.host_id)
+    }
+
+    pub fn join(&mut self) -> EngineResult<()> {
+        self.join_inner()
+    }
+
+    pub fn shutdown_and_join(&mut self) -> EngineResult<()> {
+        if self.join.is_none() {
+            return Ok(());
+        }
+        self.request_shutdown().map_err(|error| {
+            EngineError::new(ErrorCode::Internal)
+                .with_msg("failed to request Host shutdown")
+                .with_detail(format!("Host {}: {error}", self.host_id))
+        })?;
+        self.join_inner()
+    }
+
+    fn join_inner(&mut self) -> EngineResult<()> {
+        if self.join.is_none() {
+            return Ok(());
+        }
+        if self.is_current_thread() {
+            return Err(EngineError::new(ErrorCode::Internal)
+                .with_msg("Host thread cannot join itself")
+                .with_detail(format!("Host {}", self.host_id)));
+        }
+
+        let join = self.join.take().expect("join presence checked above");
+        join.join().map_err(|payload| {
+            EngineError::new(ErrorCode::Internal)
+                .with_msg("Host thread panicked outside its panic barrier")
+                .with_detail(format!(
+                    "Host {}: {}",
+                    self.host_id,
+                    panic_payload_message(payload.as_ref())
+                ))
+        })
+    }
+}
+
+impl Drop for HostThread {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        if self.is_current_thread() {
+            error!(
+                "[Host {}] owning HostThread was dropped on its own thread",
+                self.host_id
+            );
+            std::process::abort();
+        }
+
+        if let Err(error) = self.request_shutdown() {
+            error!(
+                "[Host {}] shutdown request from HostThread::drop failed: {}",
+                self.host_id, error
+            );
+        }
+        let join = self.join.take().expect("join presence checked above");
+        if let Err(payload) = join.join() {
+            error!(
+                "[Host {}] join from HostThread::drop observed panic: {}",
+                self.host_id,
+                panic_payload_message(payload.as_ref())
+            );
+        }
+    }
 }
 
 pub fn spawn_host_thread(
@@ -32,9 +147,9 @@ pub fn spawn_host_thread(
     graphics_platform: graphics::egl_platform::GraphicsPlatform,
     platform: Arc<dyn PlatformServices>,
     opt: InitOptions,
-) -> EngineResult<HostId> {
+) -> EngineResult<HostThread> {
     spawn_host_thread_inner(surface, graphics_platform, platform, opt, None)
-        .map(|started| started.host_id)
+        .map(|started| started.host)
 }
 
 /// Start a Host while preserving the embedding host's generation and a
@@ -83,8 +198,10 @@ fn spawn_host_thread_inner(
     // Bound all normal/game-controlled traffic while allowing the four trusted
     // lifecycle/surface callbacks to share the same FIFO without consuming
     // that quota. This preserves the old 512 pending-normal-command limit.
-    let (host_tx, critical_host_tx, mut host_rx) =
-        shared::host_channel::channel(registry::HOST_NORMAL_COMMAND_CAPACITY);
+    let (host_tx, critical_host_tx, mut host_rx) = shared::host_channel::channel_with_reserve(
+        registry::HOST_NORMAL_COMMAND_CAPACITY,
+        registry::HOST_RELIABLE_INPUT_RESERVE,
+    );
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
     // Authoritative shutdown signal, independent of the normal-command budget:
@@ -101,7 +218,7 @@ fn spawn_host_thread_inner(
     // to notify Java about errors from any context (host loop, panic, etc.).
     let platform_for_error = platform.clone();
 
-    let spawn_result = std::thread::Builder::new()
+    let spawn_result = thread::Builder::new()
         .name(format!("Migo-Main-{}", id))
         .spawn(move || {
             let run = || {
@@ -130,16 +247,10 @@ fn spawn_host_thread_inner(
                     }
                 };
 
-                // Signal that we successfully created the Host and are about to enter runtime.
-                if ready_tx.send(()).is_err() {
-                    error!("[Host {}] ready signal send failed (receiver dropped)", id);
-                    // receiver dropped -> caller likely already returned; still proceed to run loop.
-                }
-
-                let runtime = match create_basic_runtime() {
+                let runtime = match create_runtime_before_ready(ready_tx, create_basic_runtime) {
                     Ok(rt) => rt,
                     Err(e) => {
-                        error!("[Host {}] failed to create tokio runtime: {}", id, e);
+                        error!("[Host {}] failed to enter tokio runtime: {}", id, e);
                         platform_for_error.notify_error(
                             id,
                             e.code.as_u16(),
@@ -352,26 +463,61 @@ fn spawn_host_thread_inner(
             registry::unregister_sender(id);
         });
 
-    if let Err(e) = spawn_result {
-        error!("[Host {}] failed to spawn thread: {}", id, e);
-        registry::unregister_sender(id);
-        return Err(EngineError::new(ErrorCode::Internal)
-            .with_msg("failed to spawn host thread")
-            .with_detail(e.to_string()));
-    }
+    let join = match spawn_result {
+        Ok(join) => join,
+        Err(error) => {
+            error!("[Host {}] failed to spawn thread: {}", id, error);
+            registry::unregister_sender(id);
+            return Err(EngineError::new(ErrorCode::Internal)
+                .with_msg("failed to spawn host thread")
+                .with_detail(error.to_string()));
+        }
+    };
+    let host = HostThread::new(id, join);
 
     if ready_rx.recv().is_err() {
         error!("[Host {}] failed to start (init panic / early exit)", id);
         registry::unregister_sender(id);
-        return Err(EngineError::new(ErrorCode::Internal)
+        let error = EngineError::new(ErrorCode::Internal)
             .with_msg("host thread failed to start")
-            .with_detail("init panic / early exit".to_string()));
+            .with_detail("init panic / early exit".to_string());
+        return Err(join_failed_start(host, error));
     }
 
     Ok(SpawnedSurfaceHost {
-        host_id: id,
+        host,
         resource: initial_resource,
     })
+}
+
+fn join_failed_start(mut host: HostThread, startup_error: EngineError) -> EngineError {
+    match host.join() {
+        Ok(()) => startup_error,
+        Err(join_error) => EngineError::new(ErrorCode::Internal)
+            .with_msg("Host startup failed and its thread could not be joined")
+            .with_detail(format!("startup={startup_error}; join={join_error}")),
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+fn create_runtime_before_ready(
+    ready_tx: crossbeam_channel::Sender<()>,
+    create_runtime: impl FnOnce() -> EngineResult<Runtime>,
+) -> EngineResult<Runtime> {
+    let runtime = create_runtime()?;
+    ready_tx.send(()).map_err(|_| {
+        EngineError::new(ErrorCode::Internal)
+            .with_msg("failed to publish Host startup readiness")
+            .with_detail("startup receiver dropped before the runtime became ready")
+    })?;
+    Ok(runtime)
 }
 
 fn create_basic_runtime() -> EngineResult<Runtime> {
@@ -437,4 +583,139 @@ fn classify_termination_error(host: &Host, original: &EngineError) -> Option<Eng
             .with_msg("execution terminated")
             .with_detail("V8 isolate was terminated by unknown source"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        thread,
+    };
+
+    use shared::error::{EngineError, ErrorCode};
+
+    use super::{HostThread, create_runtime_before_ready, join_failed_start};
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn join_waits_for_named_host_and_observes_sentinel_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sentinel = DropSentinel(Arc::clone(&dropped));
+        let join = thread::Builder::new()
+            .name("Migo-Main-test-join".to_owned())
+            .spawn(move || {
+                let _sentinel = sentinel;
+                started_tx
+                    .send(thread::current().name().map(str::to_owned))
+                    .expect("publish thread name");
+                release_rx.recv().expect("release test host");
+            })
+            .expect("spawn test host");
+        let mut host = HostThread::new(41, join);
+        let (joined_tx, joined_rx) = mpsc::channel();
+
+        let joiner = thread::spawn(move || {
+            joined_tx.send(host.join()).expect("publish join result");
+        });
+
+        assert_eq!(
+            started_rx.recv().expect("test host started").as_deref(),
+            Some("Migo-Main-test-join")
+        );
+        assert!(
+            joined_rx.try_recv().is_err(),
+            "join returned while the named Host was still blocked"
+        );
+        assert!(!dropped.load(Ordering::Acquire));
+
+        release_tx.send(()).expect("release test host");
+        joined_rx
+            .recv()
+            .expect("join result")
+            .expect("Host join succeeds");
+        joiner.join().expect("join caller");
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_start_joins_the_spawned_thread() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sentinel = DropSentinel(Arc::clone(&dropped));
+        let join = thread::Builder::new()
+            .name("Migo-Main-test-failed-start".to_owned())
+            .spawn(move || drop(sentinel))
+            .expect("spawn failed-start test host");
+        let original =
+            EngineError::new(ErrorCode::Internal).with_msg("host thread failed to start");
+
+        let error = join_failed_start(HostThread::new(42, join), original);
+
+        assert_eq!(error.msg, "host thread failed to start");
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn runtime_creation_failure_is_not_published_as_ready() {
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let original =
+            EngineError::new(ErrorCode::Internal).with_msg("injected runtime construction failure");
+
+        let error = create_runtime_before_ready(ready_tx, || Err(original))
+            .expect_err("runtime construction must fail");
+
+        assert_eq!(error.msg, "injected runtime construction failure");
+        assert!(
+            ready_rx.recv().is_err(),
+            "startup readiness was published before runtime construction"
+        );
+    }
+
+    #[test]
+    fn host_thread_id_is_stable() {
+        let join = thread::Builder::new()
+            .name("Migo-Main-test-id".to_owned())
+            .spawn(|| {})
+            .expect("spawn ID test host");
+        let mut host = HostThread::new(73, join);
+
+        assert_eq!(host.id(), 73);
+        host.join().expect("Host join succeeds");
+    }
+
+    #[test]
+    fn self_join_rejection_preserves_owner_for_another_thread() {
+        let (owner_tx, owner_rx) = mpsc::channel();
+        let (error_tx, error_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("Migo-Main-test-self-join".to_owned())
+            .spawn(move || {
+                let mut host: HostThread = owner_rx.recv().expect("receive own Host owner");
+                let error = host.join().expect_err("self-join must be rejected");
+                error_tx.send(error).expect("publish self-join error");
+                returned_tx.send(host).expect("return Host owner");
+            })
+            .expect("spawn self-join test host");
+        owner_tx
+            .send(HostThread::new(74, join))
+            .expect("transfer owner to its Host");
+
+        let error = error_rx.recv().expect("self-join result");
+        assert_eq!(error.code, ErrorCode::Internal);
+        let mut host = returned_rx.recv().expect("returned Host owner");
+        host.join().expect("another thread joins the Host");
+    }
 }

@@ -80,6 +80,12 @@ typedef MigoResult(MIGO_CALL *MigoDispatchFn)(void *dispatcher_context,
 
 typedef void(MIGO_CALL *MigoOnReadyFn)(void *user_data,
                                        MigoSession *session);
+/*
+ * Runtime errors and recoverable pressure notifications. In particular,
+ * MIGO_ERROR_WOULD_BLOCK reports the first refused input in one saturation
+ * episode; a successful input rearms it. The callback runs through dispatch
+ * without Migo engine/session/attachment locks held.
+ */
 typedef void(MIGO_CALL *MigoOnErrorFn)(void *user_data,
                                        MigoSession *session,
                                        const MigoError *error);
@@ -231,6 +237,12 @@ migo_engine_create(const MigoEngineConfig *config, MigoEngine **out_engine);
 /*
  * All child sessions must be destroyed before engine destruction. MIGO_OK
  * consumes and releases the Engine handle; the pointer is invalid afterward.
+ * Successful Engine destruction is a thread-completion barrier. It does not
+ * return until every Migo-owned worker transferred by its Sessions has exited.
+ * Calling from one of those workers returns MIGO_ERROR_INVALID_STATE without
+ * consuming the Engine; retry from a host thread after the callback unwinds.
+ * Only after it returns may the host destroy native display/window resources or
+ * unload the Migo library.
  */
 MIGO_API MigoResult MIGO_CALL migo_engine_destroy(MigoEngine *engine);
 
@@ -260,6 +272,13 @@ MIGO_API MigoResult MIGO_CALL migo_session_set_lifecycle(
 MIGO_API MigoResult MIGO_CALL
 migo_session_set_visibility(MigoSession *session, uint8_t visible);
 
+/*
+ * Report host focus changes. Hosts must call this when their native window or
+ * view gains or loses input focus. Before delivering focused=0 to content,
+ * Migo retracts every previously accepted active touch, pointer button,
+ * physical key, and IME composition in FIFO order. Repeated focus loss emits
+ * no duplicate retractions.
+ */
 MIGO_API MigoResult MIGO_CALL
 migo_session_set_focus(MigoSession *session, uint8_t focused);
 
@@ -282,7 +301,10 @@ migo_session_notify_vsync(MigoSession *session, int64_t frame_time_nanos);
  * MIGO_ERROR_INVALID_STATE while a Surface transition is active, an attachment
  * is still live, or any retired Surface is still PENDING; ownership remains
  * with the caller and the Session can be retried after release. MIGO_OK consumes
- * and releases the Session handle; its pointer is invalid afterward.
+ * and releases the Session handle, requests shutdown of its Host, and transfers
+ * that exiting worker to the Engine for joining. Its pointer is invalid
+ * afterward. Reentrant destruction does not wait for the current callback
+ * frame; that stack may unwind before the Engine's final completion barrier.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_destroy(MigoSession *session);
 

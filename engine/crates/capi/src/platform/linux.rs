@@ -6,28 +6,54 @@ use std::{
     sync::Arc,
 };
 
+use graphics::egl_platform::GraphicsPlatform;
 use migo_capi_abi::surface::{
     MIGO_PLATFORM_WAYLAND_SURFACE, MIGO_PLATFORM_X11_WINDOW, SurfaceDescriptorRef,
     ValidatedPlatformSurface,
 };
+use platform::linux::presenter::{
+    LinuxWaylandSurface, LinuxX11Context, linux_wayland_graphics_platform,
+};
 use shared::surface::SurfaceRef;
 
-use migo_capi_abi::{MIGO_ERROR_INTERNAL, MIGO_ERROR_UNSUPPORTED_PLATFORM, MigoResult};
+use migo_capi_abi::{
+    MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_UNSUPPORTED_PLATFORM, MigoResult,
+};
+
+/// Immutable platform construction state retained for every Host lifetime.
+#[derive(Clone, Debug)]
+pub(crate) enum PlatformContext {
+    X11(LinuxX11Context),
+    Wayland {
+        display: NonNull<c_void>,
+        graphics_platform: GraphicsPlatform,
+    },
+    #[cfg(test)]
+    TestOnly,
+}
+
+// SAFETY: X11 owns its thread-compatible private connection. The Wayland
+// display is an opaque host-owned token whose lifetime contract spans every
+// attachment; EGL access remains on Migo's graphics threads.
+unsafe impl Send for PlatformContext {}
+unsafe impl Sync for PlatformContext {}
 
 /// Native identity retained for a later resize.
 ///
 /// These are copied tokens, never pointers into caller-owned descriptor
 /// storage. The host owns the X11/Wayland objects and their event loops.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum PlatformTarget {
     X11 {
-        display: NonNull<c_void>,
+        context: LinuxX11Context,
         window: c_ulong,
     },
     Wayland {
         surface: NonNull<c_void>,
         display: NonNull<c_void>,
     },
+    #[cfg(test)]
+    TestOnly,
 }
 
 // SAFETY: these are copied native identity tokens, never Rust references and
@@ -46,23 +72,25 @@ pub(crate) fn rebuild_surface(
     height: u32,
 ) -> Result<SurfaceRef, MigoResult> {
     match target {
-        PlatformTarget::X11 { display, window } => Ok(Arc::new(
-            platform::linux::presenter::LinuxX11Surface::new(display, window, width, height),
-        )),
-        PlatformTarget::Wayland { surface, display } => Ok(Arc::new(
-            platform::linux::presenter::LinuxWaylandSurface::new(display, surface, width, height),
-        )),
+        PlatformTarget::X11 { context, window } => Ok(context.surface(window, width, height)),
+        PlatformTarget::Wayland { surface, display } => Ok(Arc::new(LinuxWaylandSurface::new(
+            display, surface, width, height,
+        ))),
+        #[cfg(test)]
+        PlatformTarget::TestOnly => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
     }
 }
 
 /// Turn a fully copied and validated ABI value into Linux engine objects.
 pub(crate) fn build_target(
     descriptor: SurfaceDescriptorRef,
+    existing: Option<&PlatformContext>,
 ) -> Result<
     (
         SurfaceRef,
-        graphics::egl_platform::GraphicsPlatform,
+        GraphicsPlatform,
         PlatformTarget,
+        PlatformContext,
     ),
     MigoResult,
 > {
@@ -72,44 +100,62 @@ pub(crate) fn build_target(
             display, window, ..
         } => {
             let window = window as c_ulong;
-            let surface: SurfaceRef = Arc::new(platform::linux::presenter::LinuxX11Surface::new(
-                display,
+            let context = match existing {
+                Some(PlatformContext::X11(context)) => {
+                    if let Err(error) = unsafe { context.supports_host_display(display) } {
+                        tracing::error!("build_target: X11 context cannot be reused: {error:?}");
+                        return Err(MIGO_ERROR_INVALID_STATE);
+                    }
+                    context.clone()
+                }
+                Some(_) => return Err(MIGO_ERROR_INVALID_STATE),
+                None => unsafe { LinuxX11Context::open(display) }.map_err(|error| {
+                    tracing::error!("build_target: open owned X11 context: {error:?}");
+                    MIGO_ERROR_INTERNAL
+                })?,
+            };
+            let graphics_platform = context.graphics_platform();
+            let surface = context.surface(
                 window,
                 configuration.width_pixels(),
                 configuration.height_pixels(),
-            ));
-            let graphics_platform = platform::linux::presenter::linux_x11_graphics_platform(
-                display,
-            )
-            .map_err(|error| {
-                tracing::error!("build_target: X11 graphics platform: {error:?}");
-                MIGO_ERROR_INTERNAL
-            })?;
+            );
             Ok((
                 surface,
                 graphics_platform,
-                PlatformTarget::X11 { display, window },
+                PlatformTarget::X11 {
+                    context: context.clone(),
+                    window,
+                },
+                PlatformContext::X11(context),
             ))
         }
         ValidatedPlatformSurface::Wayland { display, surface } => {
-            let surface_ref: SurfaceRef =
-                Arc::new(platform::linux::presenter::LinuxWaylandSurface::new(
-                    display,
-                    surface,
-                    configuration.width_pixels(),
-                    configuration.height_pixels(),
-                ));
-            let graphics_platform = platform::linux::presenter::linux_wayland_graphics_platform(
+            let graphics_platform = match existing {
+                Some(PlatformContext::Wayland {
+                    display: installed,
+                    graphics_platform,
+                }) if *installed == display => graphics_platform.clone(),
+                Some(_) => return Err(MIGO_ERROR_INVALID_STATE),
+                None => linux_wayland_graphics_platform(display).map_err(|error| {
+                    tracing::error!("build_target: Wayland graphics platform: {error:?}");
+                    MIGO_ERROR_INTERNAL
+                })?,
+            };
+            let surface_ref: SurfaceRef = Arc::new(LinuxWaylandSurface::new(
                 display,
-            )
-            .map_err(|error| {
-                tracing::error!("build_target: Wayland graphics platform: {error:?}");
-                MIGO_ERROR_INTERNAL
-            })?;
+                surface,
+                configuration.width_pixels(),
+                configuration.height_pixels(),
+            ));
             Ok((
                 surface_ref,
-                graphics_platform,
+                graphics_platform.clone(),
                 PlatformTarget::Wayland { surface, display },
+                PlatformContext::Wayland {
+                    display,
+                    graphics_platform,
+                },
             ))
         }
         // Listed rather than matched with a wildcard: a new platform payload
@@ -122,8 +168,86 @@ pub(crate) fn build_target(
 }
 
 #[cfg(test)]
+pub(crate) fn test_platform_target() -> PlatformTarget {
+    PlatformTarget::TestOnly
+}
+
+#[cfg(test)]
+pub(crate) fn test_platform_context() -> PlatformContext {
+    PlatformContext::TestOnly
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::{ffi::c_void, mem::size_of};
+
+    use migo_capi_abi::{
+        MIGO_ABI_VERSION_CURRENT, VersionedHeader,
+        surface::{MigoSurfaceDescriptor, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor},
+    };
+
+    fn envelope(kind: u32, payload_size: usize, payload: *const c_void) -> MigoSurfaceDescriptor {
+        MigoSurfaceDescriptor {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoSurfaceDescriptor>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            generation: 1,
+            platform_kind: kind,
+            flags: 0,
+            width_pixels: 640,
+            height_pixels: 480,
+            scale_factor: 1.0,
+            color_space: 0,
+            alpha_mode: 0,
+            preferred_presentation_mode: 0,
+            capability_flags: 0,
+            platform_descriptor_size: payload_size as u32,
+            reserved0: 0,
+            platform_descriptor: payload,
+        }
+    }
+
+    fn wayland_descriptor(display: usize, surface: usize) -> SurfaceDescriptorRef {
+        let payload = MigoWaylandSurfaceDescriptor {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoWaylandSurfaceDescriptor>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            platform_kind: MIGO_PLATFORM_WAYLAND_SURFACE,
+            flags: 0,
+            display: display as *mut c_void,
+            surface: surface as *mut c_void,
+        };
+        let descriptor = envelope(
+            MIGO_PLATFORM_WAYLAND_SURFACE,
+            size_of::<MigoWaylandSurfaceDescriptor>(),
+            (&payload as *const MigoWaylandSurfaceDescriptor).cast(),
+        );
+        unsafe { SurfaceDescriptorRef::parse(&descriptor) }.expect("valid Wayland descriptor")
+    }
+
+    fn x11_descriptor(display: usize) -> SurfaceDescriptorRef {
+        let payload = MigoX11WindowDescriptor {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoX11WindowDescriptor>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            platform_kind: MIGO_PLATFORM_X11_WINDOW,
+            flags: 0,
+            display: display as *mut c_void,
+            window: 0x2a0_0001,
+            screen: 0,
+            reserved0: 0,
+        };
+        let descriptor = envelope(
+            MIGO_PLATFORM_X11_WINDOW,
+            size_of::<MigoX11WindowDescriptor>(),
+            (&payload as *const MigoX11WindowDescriptor).cast(),
+        );
+        unsafe { SurfaceDescriptorRef::parse(&descriptor) }.expect("valid X11 descriptor")
+    }
 
     #[test]
     fn linux_capability_mask_has_exactly_x11_and_wayland() {
@@ -131,5 +255,54 @@ mod tests {
             supported_platform_kinds(),
             (1u64 << MIGO_PLATFORM_X11_WINDOW) | (1u64 << MIGO_PLATFORM_WAYLAND_SURFACE)
         );
+    }
+
+    #[test]
+    fn platform_context_reuses_the_exact_wayland_graphics_domain() {
+        let (_, first_platform, _, context) =
+            build_target(wayland_descriptor(0x1000, 0x2000), None).expect("cold Wayland target");
+        let (_, reused_platform, _, returned_context) =
+            build_target(wayland_descriptor(0x1000, 0x3000), Some(&context))
+                .expect("same Wayland display must reuse its context");
+
+        assert_eq!(
+            first_platform.platform_identity(),
+            reused_platform.platform_identity()
+        );
+        assert!(Arc::ptr_eq(
+            first_platform.egl_provider(),
+            reused_platform.egl_provider()
+        ));
+        assert!(Arc::ptr_eq(
+            first_platform.surface_factory(),
+            reused_platform.surface_factory()
+        ));
+        let PlatformContext::Wayland {
+            display,
+            graphics_platform,
+        } = returned_context
+        else {
+            panic!("returned context changed platform kind");
+        };
+        assert_eq!(display.as_ptr() as usize, 0x1000);
+        assert!(Arc::ptr_eq(
+            first_platform.egl_provider(),
+            graphics_platform.egl_provider()
+        ));
+    }
+
+    #[test]
+    fn platform_context_rejects_display_or_kind_change_before_native_access() {
+        let (_, _, _, context) =
+            build_target(wayland_descriptor(0x1000, 0x2000), None).expect("cold Wayland target");
+
+        let different_display =
+            build_target(wayland_descriptor(0x1001, 0x3000), Some(&context)).err();
+        assert_eq!(different_display, Some(MIGO_ERROR_INVALID_STATE));
+
+        // The X11 token is intentionally synthetic. A kind switch must fail
+        // from the stored context before Xlib can inspect that pointer.
+        let different_kind = build_target(x11_descriptor(0x4000), Some(&context)).err();
+        assert_eq!(different_kind, Some(MIGO_ERROR_INVALID_STATE));
     }
 }

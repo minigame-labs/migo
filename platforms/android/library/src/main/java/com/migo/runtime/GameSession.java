@@ -20,6 +20,8 @@ import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeContext;
 import com.migo.runtime.internal.RuntimeRegistry;
+import com.migo.runtime.internal.ResourceCleanup;
+import com.migo.runtime.internal.TerminalCleanupState;
 import com.migo.runtime.internal.ThreadCheck;
 import com.migo.runtime.internal.TouchEventHandler;
 import com.migo.runtime.internal.VsyncScheduler;
@@ -96,6 +98,8 @@ public final class GameSession implements Closeable {
     private final VsyncScheduler vsyncScheduler;
     private final Handler mainHandler;
     private final Object lock = new Object();
+    private final TerminalCleanupState terminalCleanup = new TerminalCleanupState();
+    private boolean nativeShutdownComplete;
 
     private final AtomicReference<SessionState> state = new AtomicReference<>(SessionState.CREATED);
     private volatile boolean showDispatched = false;
@@ -178,11 +182,10 @@ public final class GameSession implements Closeable {
         NativeExports.registerErrorCallback(sessionId, new NativeExports.NativeErrorCallback() {
             @Override
             public void onNativeError(int errorCode, String message, String detail) {
-                // All native fatal errors are non-recoverable
                 String fullMessage = detail != null && !detail.isEmpty()
                         ? message + " — " + detail
                         : message;
-                notifyError(errorCode, fullMessage, /* recoverable */ false);
+                notifyError(errorCode, fullMessage, ErrorCode.isRecoverable(errorCode));
             }
 
             @Override
@@ -282,30 +285,7 @@ public final class GameSession implements Closeable {
     public PerformanceSnapshot getPerformanceSnapshot() {
         if (state.get() == SessionState.DESTROYED) return null;
         byte[] data = NativeBridge.getDebugStats(sessionId);
-        if (data == null) return null;
-
-        // Parse binary protocol: 4-byte header (magic + version) + payload
-        // See engine/crates/shared/stats.rs for layout
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(data).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        if (data.length < 16) return null;  // need at least header + 3 fields
-
-        int magic = buf.getShort(0) & 0xFFFF;
-        if (magic != 0x4D47) return null;  // 'M','G' stats protocol magic
-
-        int h = 4;  // header offset
-        int fpsX10 = buf.getInt(h);
-        int frameTimeUs = buf.getInt(h + 4);
-        int dropped = buf.getInt(h + 8);
-        int firstFrameMs = data.length >= h + 20 ? buf.getInt(h + 16) : 0;
-        int cmdDrops = data.length >= h + 24 ? buf.getInt(h + 20) : 0;
-
-        return new PerformanceSnapshot(
-            (fpsX10 & 0xFFFFFFFFL) / 10f,
-            (frameTimeUs & 0xFFFFFFFFL) / 1000f,
-            dropped,
-            firstFrameMs,
-            cmdDrops
-        );
+        return PerformanceSnapshot.fromStatsPacket(data);
     }
 
     // ==================== Game Control ====================
@@ -570,7 +550,8 @@ public final class GameSession implements Closeable {
      * Destroy this session and release all resources.
      * <p>
      * After calling this method, the session cannot be used anymore.
-     * This method is idempotent - calling it multiple times has no effect.
+     * Successful cleanup is idempotent. If cleanup fails, a later explicit call
+     * retries the retained resources.
      * <p>
      * Temporary files are automatically cleaned up.
      */
@@ -578,42 +559,77 @@ public final class GameSession implements Closeable {
     public void close() {
         ThreadCheck.ensureMainThread();
         SessionState prev;
+        boolean firstClose;
         synchronized (lock) {
             prev = state.getAndSet(SessionState.DESTROYED);
-            if (prev == SessionState.DESTROYED) {
-                return;
+            firstClose = prev != SessionState.DESTROYED;
+            if (firstClose) {
+                Log.d("MigoSession", "Session " + sessionId + " state: "
+                        + prev + " -> DESTROYED");
             }
-            Log.d("MigoSession", "Session " + sessionId + " state: " + prev + " -> DESTROYED");
         }
-        notifyStateChange(prev, SessionState.DESTROYED);
-
-        NativeExports.suspendPowerSensitiveManagers(sessionId);
-        vsyncScheduler.setSurfaceReady(false);
-        vsyncScheduler.stop();
-        if (debugOverlay != null) {
-            debugOverlay.stopMonitoring();
-            debugOverlay.detachFromWindow();
-        }
-        if (consoleLogView != null) {
-            consoleLogView.detach();
-        }
-        if (audioFocusManager != null) {
-            audioFocusManager.stop();
+        if (firstClose) {
+            notifyStateChange(prev, SessionState.DESTROYED);
         }
 
-        // Destroy all per-session managers (unified cleanup)
-        NativeExports.destroyAllManagers(sessionId);
-        NativeExports.unregisterSession(sessionId);
+        TerminalCleanupState.Result result = terminalCleanup.attempt(
+                () -> ResourceCleanup.runAll(
+                        () -> NativeExports.suspendPowerSensitiveManagers(sessionId),
+                        () -> {
+                            vsyncScheduler.setSurfaceReady(false);
+                            vsyncScheduler.stop();
+                        },
+                        () -> {
+                            if (debugOverlay != null) {
+                                debugOverlay.stopMonitoring();
+                                debugOverlay.detachFromWindow();
+                            }
+                        },
+                        () -> {
+                            if (consoleLogView != null) consoleLogView.detach();
+                        },
+                        () -> {
+                            if (audioFocusManager != null) audioFocusManager.stop();
+                        },
+                        () -> NativeExports.closePermissionOperations(sessionId),
+                        () -> NativeExports.destroyAllManagers(sessionId)),
+                this::shutdownNativeOnce,
+                () -> RuntimeRegistry.unregister(sessionId),
+                paths::cleanupTemp,
+                () -> NativeExports.unregisterSession(sessionId));
 
-        runWithTimeout("shutdown", () -> NativeMethods.shutdown(sessionId), 4000);
-        RuntimeRegistry.unregister(sessionId);
+        RuntimeException cleanupFailure = result.failure();
+        if (cleanupFailure != null) {
+            Log.e(TAG, "terminal_cleanup_failed session=" + sessionId
+                    + " retryable=true", cleanupFailure);
+            notifyError(ErrorCode.ERR_CLEANUP_FAILED,
+                    ErrorCode.getMessage(ErrorCode.ERR_CLEANUP_FAILED)
+                            + ": " + cleanupFailure.getMessage(),
+                    false);
+        }
 
-        // Clean up temporary files
-        paths.cleanupTemp();
+        if (firstClose) {
+            GameSessionListener l = listener;
+            if (l != null) {
+                try {
+                    l.onDestroyed();
+                } catch (RuntimeException listenerFailure) {
+                    Log.e(TAG, "session_destroy_listener_failed session=" + sessionId,
+                            listenerFailure);
+                }
+            }
+        }
+    }
 
-        GameSessionListener l = listener;
-        if (l != null) {
-            l.onDestroyed();
+    private void shutdownNativeOnce() {
+        synchronized (lock) {
+            if (nativeShutdownComplete) return;
+        }
+        if (!NativeMethods.shutdown(sessionId)) {
+            throw new IllegalStateException("native shutdown/join failed");
+        }
+        synchronized (lock) {
+            nativeShutdownComplete = true;
         }
     }
 
@@ -671,8 +687,7 @@ public final class GameSession implements Closeable {
         ThreadCheck.ensureMainThread();
         if (event == null) return false;
         if (state.get() == SessionState.DESTROYED) return false;
-        touchHandler.dispatch(sessionId, event);
-        return true;
+        return touchHandler.dispatch(sessionId, event);
     }
 
     // ==================== Callback ====================
@@ -878,33 +893,6 @@ public final class GameSession implements Closeable {
     }
 
     // ==================== Helpers ====================
-
-    /**
-     * Run a native call with a timeout to prevent ANR.
-     * If the call doesn't complete within the timeout, log a warning and continue.
-     * The background thread is allowed to finish on its own — the main thread is
-     * unblocked after {@code timeoutMs} regardless.
-     */
-    private void runWithTimeout(String operationName, Runnable nativeCall, long timeoutMs) {
-        Thread worker = new Thread(() -> {
-            try {
-                nativeCall.run();
-            } catch (Exception e) {
-                Log.e("MigoSession", operationName + " failed: " + e.getMessage());
-            }
-        }, "migo-" + operationName);
-        worker.start();
-        try {
-            worker.join(timeoutMs);
-            if (worker.isAlive()) {
-                Log.w("MigoSession", operationName + " timed out after " + timeoutMs
-                        + "ms (potential ANR avoided)");
-                // Do not interrupt — let it finish in background, but don't block main thread
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
 
     private void tryAttachDebugOverlay() {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);

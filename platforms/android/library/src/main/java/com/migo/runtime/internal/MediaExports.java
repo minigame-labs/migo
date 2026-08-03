@@ -7,8 +7,6 @@ import com.migo.runtime.internal.platform.CameraManager;
 import com.migo.runtime.internal.platform.ImageApiManager;
 import com.migo.runtime.internal.platform.VideoManager;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -21,15 +19,46 @@ public final class MediaExports {
     private MediaExports() {}
 
     private static final Object sRecorderLock = new Object();
-    private static final Object sCameraLock = new Object();
     private static final Object sImageApiLock = new Object();
     private static final Object sVideoLock = new Object();
 
     private static final ConcurrentHashMap<Integer, AudioRecorderManager> sRecorderManagers =
             new ConcurrentHashMap<>();
 
+    static final class CameraSlot<T> {
+        private final ResourceCleanup.DestroyAction<T> destroy;
+        private final ResourceCleanup.Retained<T> retained =
+                new ResourceCleanup.Retained<>(null);
+
+        CameraSlot(ResourceCleanup.DestroyAction<T> destroy) {
+            this.destroy = destroy;
+        }
+
+        T get() {
+            return retained.get();
+        }
+
+        void replace(T replacement) {
+            try {
+                retained.replace(replacement, destroy);
+            } catch (RuntimeException replacementFailure) {
+                try {
+                    destroy.destroy(replacement);
+                } catch (RuntimeException replacementCleanupFailure) {
+                    replacementFailure.addSuppressed(replacementCleanupFailure);
+                }
+                throw replacementFailure;
+            }
+        }
+
+        void destroy() {
+            retained.destroy(destroy);
+        }
+    }
+
     /** Per-session camera managers, keyed by "sessionId:cameraId". */
-    private static final ConcurrentHashMap<String, CameraManager> sCameraManagers =
+    private static final ConcurrentHashMap<String, CameraSlot<CameraManager>>
+            sCameraManagers =
             new ConcurrentHashMap<>();
 
     private static final ConcurrentHashMap<Integer, ImageApiManager> sImageApiManagers =
@@ -89,10 +118,10 @@ public final class MediaExports {
     }
 
     public static void destroyRecorderManager(int sessionId) {
-        AudioRecorderManager mgr = sRecorderManagers.remove(sessionId);
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sRecorderManagers,
+                id -> id == sessionId,
+                AudioRecorderManager::destroy);
     }
 
     // ==================== Camera ====================
@@ -119,7 +148,9 @@ public final class MediaExports {
     }
 
     private static CameraManager getCameraManager(int sessionId, int cameraId) {
-        CameraManager manager = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraSlot<CameraManager> retained =
+                sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraManager manager = retained != null ? retained.get() : null;
         if (manager != null) {
             syncCameraLifecycle(sessionId, manager);
         }
@@ -143,18 +174,18 @@ public final class MediaExports {
         } catch (Exception ignored) {}
 
         String key = cameraKey(sessionId, cameraId);
-        CameraManager existing;
-        CameraManager mgr;
-        synchronized (sCameraLock) {
-            if (NativeExports.isSessionTerminated(sessionId)) {
-                return "{\"_error\":{\"errMsg\":\"createCamera:fail session destroyed\"}}";
-            }
-            existing = sCameraManagers.remove(key);
-            boolean suspended = NativeExports.isSessionResourceSuspended(sessionId);
-            mgr = new CameraManager(sessionId, cameraId, activity, suspended);
-            sCameraManagers.put(key, mgr);
+        if (NativeExports.isSessionTerminated(sessionId)) {
+            return "{\"_error\":{\"errMsg\":\"createCamera:fail session destroyed\"}}";
         }
-        if (existing != null) existing.destroy();
+        boolean suspended = NativeExports.isSessionResourceSuspended(sessionId);
+        CameraManager mgr = new CameraManager(sessionId, cameraId, activity, suspended);
+        sCameraManagers.compute(key, (ignored, existing) -> {
+            CameraSlot<CameraManager> retained = existing != null
+                    ? existing
+                    : new CameraSlot<>(CameraManager::destroy);
+            retained.replace(mgr);
+            return retained;
+        });
         syncCameraLifecycle(sessionId, mgr);
         String result = mgr.create(optionsJson);
         syncCameraLifecycle(sessionId, mgr);
@@ -163,13 +194,10 @@ public final class MediaExports {
 
     public static void cameraDestroy(int sessionId, int cameraId) {
         String key = cameraKey(sessionId, cameraId);
-        CameraManager mgr;
-        synchronized (sCameraLock) {
-            mgr = sCameraManagers.remove(key);
-        }
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        sCameraManagers.computeIfPresent(key, (ignored, retained) -> {
+            retained.destroy();
+            return null;
+        });
     }
 
     public static String cameraTakePhoto(int sessionId, String optionsJson) {
@@ -224,16 +252,10 @@ public final class MediaExports {
 
     public static void destroyCameraManagers(int sessionId) {
         String prefix = sessionId + ":";
-        List<CameraManager> removed = new ArrayList<>();
-        synchronized (sCameraLock) {
-            for (String key : sCameraManagers.keySet()) {
-                if (key.startsWith(prefix)) {
-                    CameraManager mgr = sCameraManagers.remove(key);
-                    if (mgr != null) removed.add(mgr);
-                }
-            }
-        }
-        for (CameraManager mgr : removed) mgr.destroy();
+        ResourceCleanup.destroyMatching(
+                sCameraManagers,
+                key -> key.startsWith(prefix),
+                CameraSlot::destroy);
     }
 
     // ==================== Image API ====================
@@ -295,10 +317,10 @@ public final class MediaExports {
     }
 
     public static void destroyImageApiManager(int sessionId) {
-        ImageApiManager mgr = sImageApiManagers.remove(sessionId);
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sImageApiManagers,
+                id -> id == sessionId,
+                ImageApiManager::destroy);
     }
 
     // ==================== Video ====================
@@ -390,20 +412,18 @@ public final class MediaExports {
     }
 
     public static void destroyVideoManager(int sessionId) {
-        VideoManager mgr;
-        synchronized (sVideoLock) {
-            mgr = sVideoManagers.remove(sessionId);
-        }
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sVideoManagers,
+                id -> id == sessionId,
+                VideoManager::destroy);
     }
 
     public static void suspendPowerSensitiveManagers(int sessionId) {
         String cameraPrefix = sessionId + ":";
         for (String key : sCameraManagers.keySet()) {
             if (key.startsWith(cameraPrefix)) {
-                CameraManager camera = sCameraManagers.get(key);
+                CameraSlot<CameraManager> retained = sCameraManagers.get(key);
+                CameraManager camera = retained != null ? retained.get() : null;
                 if (camera != null) {
                     camera.suspendForLifecycle();
                 }
@@ -420,7 +440,8 @@ public final class MediaExports {
         String cameraPrefix = sessionId + ":";
         for (String key : sCameraManagers.keySet()) {
             if (key.startsWith(cameraPrefix)) {
-                CameraManager camera = sCameraManagers.get(key);
+                CameraSlot<CameraManager> retained = sCameraManagers.get(key);
+                CameraManager camera = retained != null ? retained.get() : null;
                 if (camera != null) {
                     camera.resumeForLifecycle();
                 }
@@ -436,9 +457,10 @@ public final class MediaExports {
     // ==================== Bulk Destroy ====================
 
     public static void destroyAll(int sessionId) {
-        destroyRecorderManager(sessionId);
-        destroyCameraManagers(sessionId);
-        destroyImageApiManager(sessionId);
-        destroyVideoManager(sessionId);
+        ResourceCleanup.runAll(
+                () -> destroyRecorderManager(sessionId),
+                () -> destroyCameraManagers(sessionId),
+                () -> destroyImageApiManager(sessionId),
+                () -> destroyVideoManager(sessionId));
     }
 }

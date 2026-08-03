@@ -133,6 +133,40 @@ require_literal "$CRATES/graphics/src/render_thread.rs" \
 require_literal "$CRATES/graphics/src/render_thread.rs" \
     ".validate_prepared(prepared.as_ref())" \
     "prepared presenter backend is not revalidated inside installation"
+require_literal "$CRATES/graphics/src/egl_platform.rs" \
+    "pub struct PlatformIdentity" \
+    "graphics platforms have no immutable native-domain identity"
+require_literal "$CRATES/graphics/src/egl_platform.rs" \
+    "provider_identity != factory_identity" \
+    "graphics platform construction does not reject provider/factory identity mismatch"
+identity_check_line="$(
+    rg -n 'if let Err\(error\) = validate_platform_identity\(' \
+        "$CRATES/capi/src/surface.rs" | cut -d: -f1
+)"
+context_state_line="$(
+    rg -n 'if let Err\(error\) = validate_platform_context_state\(' \
+        "$CRATES/capi/src/surface.rs" | cut -d: -f1
+)"
+context_build_line="$(
+    rg -n 'build_target\(descriptor, existing_platform_context\.as_ref\(\)\)' \
+        "$CRATES/capi/src/surface.rs" | cut -d: -f1
+)"
+first_lease_line="$(
+    rg -n 'let lease = match lease_surface_tracked\(' \
+        "$CRATES/capi/src/surface.rs" | cut -d: -f1
+)"
+if [[ -z "$identity_check_line" || -z "$first_lease_line" ]] \
+    || (( identity_check_line >= first_lease_line )); then
+    fail "C ABI reattachment identity is not rejected before Surface lease/enqueue"
+fi
+if [[ -z "$context_state_line" || -z "$context_build_line" || -z "$first_lease_line" ]] \
+    || (( context_state_line >= context_build_line )) \
+    || (( context_build_line >= first_lease_line )); then
+    fail "C ABI platform context is not validated/reused before Surface lease/enqueue"
+fi
+require_literal "$CRATES/capi/src/lib.rs" \
+    "platform_context: Option<platform::PlatformContext>" \
+    "Session does not retain target-specific platform construction state"
 require_literal "$CRATES/graphics/src/canvas/manager/mod.rs" \
     "installed_surface: Option<PreparedEglSurfaceRef>" \
     "CanvasManager does not retain the prepared presentation target"
@@ -183,6 +217,25 @@ fi
 require_literal "$CRATES/platform/src/android/jni/inbound.rs" \
     "android_graphics_platform()" \
     "Android bootstrap does not inject its matched graphics platform"
+
+OHOS_PRESENTER="$CRATES/platform/src/ohos/presenter.rs"
+require_literal "$OHOS_PRESENTER" \
+    "EglConcurrency::SharedContexts" \
+    "OpenHarmony system EGL does not declare its cross-thread context policy"
+require_literal "$OHOS_PRESENTER" \
+    "PlatformIdentity::new::<OhosProcessEglDomain>" \
+    "OpenHarmony provider/factory have no stable process-EGL identity"
+require_literal "$OHOS_PRESENTER" \
+    "platform_identity_is_stable_for_ohos_process_egl" \
+    "OpenHarmony process-EGL identity has no regression test"
+
+OHOS_CAPI_PLATFORM="$CRATES/capi/src/platform/ohos.rs"
+require_literal "$OHOS_CAPI_PLATFORM" \
+    "pub(crate) enum PlatformContext" \
+    "OpenHarmony C ABI does not retain its graphics platform context"
+require_literal "$OHOS_CAPI_PLATFORM" \
+    "Some(PlatformContext::Graphics(graphics_platform)) => graphics_platform.clone()" \
+    "OpenHarmony C ABI rebuilds rather than reuses its graphics platform context"
 
 # The ABI is no longer compile-only: desktop Linux and Android each ship a
 # linkable runtime. What must hold now is that the macro answers per target

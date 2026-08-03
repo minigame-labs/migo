@@ -30,3 +30,6 @@ tracing-subscriber = { workspace = true }
 # a host should not have to link a parser to open a keyboard, so the boundary
 # translates it into `MigoKeyboardShowOptions`.
 serde_json = { workspace = true }
+
+[dev-dependencies]
+migo-core = { path = "../core", default-features = false, features = ["test-support"] }

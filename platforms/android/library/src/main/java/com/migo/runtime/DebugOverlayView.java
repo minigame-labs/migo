@@ -305,6 +305,10 @@ public class DebugOverlayView extends LinearLayout {
         int snapFallback        = data.length >= h + 120 ? buf.getInt(h + 116) : 0;
         int snapUpload          = data.length >= h + 124 ? buf.getInt(h + 120) : 0;
         int snapForcedReadback  = data.length >= h + 128 ? buf.getInt(h + 124) : 0;
+        // v6 bounded input transport counters at payload offsets 128..140.
+        int inputCoalesced      = data.length >= h + 132 ? buf.getInt(h + 128) : 0;
+        int inputReserveUses    = data.length >= h + 136 ? buf.getInt(h + 132) : 0;
+        int inputSaturation     = data.length >= h + 140 ? buf.getInt(h + 136) : 0;
 
         float fps     = (fpsX10 & 0xFFFFFFFFL) / 10f;
         float frameMs = (frameTimeUs & 0xFFFFFFFFL) / 1000f;
@@ -320,8 +324,15 @@ public class DebugOverlayView extends LinearLayout {
         if (cmdDrops > 0) {
             sb.append(String.format("  CD:%d", cmdDrops & 0xFFFFFFFFL));
         }
+        if (inputCoalesced > 0 || inputReserveUses > 0 || inputSaturation > 0) {
+            sb.append(String.format(
+                    "  I:%d/%d/%d",
+                    inputCoalesced & 0xFFFFFFFFL,
+                    inputReserveUses & 0xFFFFFFFFL,
+                    inputSaturation & 0xFFFFFFFFL));
+        }
         rowFps.setText(sb.toString());
-        rowFps.setTextColor(fps < 25 ? WARN_COLOR : TEXT_COLOR);
+        rowFps.setTextColor(fps < 25 || inputSaturation > 0 ? WARN_COLOR : TEXT_COLOR);
 
         // Row 2: rendering latency + damage/upload optimization counters
         long totalDmgFrames = (partialDamageFrames & 0xFFFFFFFFL) + (fullSurfaceFrames & 0xFFFFFFFFL);

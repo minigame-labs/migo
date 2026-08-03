@@ -21,8 +21,8 @@
 use std::{any::Any, ffi::c_void, ptr::NonNull, sync::Arc};
 
 use graphics::egl_platform::{
-    EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId, GraphicsPlatform,
-    PreparedEglSurface, PreparedEglSurfaceRef,
+    EglConcurrency, EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId,
+    GraphicsPlatform, PlatformIdentity, PreparedEglSurface, PreparedEglSurfaceRef,
 };
 use khronos_egl as egl;
 use shared::{
@@ -42,6 +42,7 @@ const WINDOWS_EGL_LIBRARY: &str = "libEGL.dll";
 /// Separate from Linux's marker so a surface prepared by one platform can never
 /// be accepted by the other's factory.
 struct WindowsAngleEglBackend;
+struct WindowsAngleDeviceDomain;
 
 /// EGL provider backed by ANGLE.
 ///
@@ -61,6 +62,14 @@ impl WindowsEglProvider {
 impl EglProvider for WindowsEglProvider {
     fn backend_id(&self) -> GraphicsBackendId {
         GraphicsBackendId::of::<WindowsAngleEglBackend>()
+    }
+
+    fn concurrency(&self) -> EglConcurrency {
+        EglConcurrency::SharedContexts
+    }
+
+    fn platform_identity(&self) -> PlatformIdentity {
+        PlatformIdentity::new::<WindowsAngleDeviceDomain>(self.backend_id(), 0)
     }
 
     fn label(&self) -> &str {
@@ -195,6 +204,10 @@ impl WindowsEglSurfaceFactory {
 impl EglSurfaceFactory for WindowsEglSurfaceFactory {
     fn backend_id(&self) -> GraphicsBackendId {
         GraphicsBackendId::of::<WindowsAngleEglBackend>()
+    }
+
+    fn platform_identity(&self) -> PlatformIdentity {
+        PlatformIdentity::new::<WindowsAngleDeviceDomain>(self.backend_id(), 0)
     }
 
     fn prepare(&self, surface: &dyn Surface) -> EngineResult<PreparedEglSurfaceRef> {
@@ -349,6 +362,18 @@ mod tests {
 
     fn hwnd(value: usize) -> NonNull<c_void> {
         NonNull::new(value as *mut c_void).expect("test handle must be non-null")
+    }
+
+    #[test]
+    fn platform_identity_is_stable_for_windows_angle_device() {
+        assert_eq!(
+            windows_graphics_platform()
+                .expect("offscreen ANGLE platform")
+                .platform_identity(),
+            windows_hwnd_graphics_platform()
+                .expect("HWND ANGLE platform")
+                .platform_identity(),
+        );
     }
 
     #[test]

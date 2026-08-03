@@ -74,6 +74,7 @@ jobs:
         run: |
           command -v rg >/dev/null 2>&1 || sudo apt-get install -y ripgrep
           bash scripts/test-surface-attachment-contract.sh
+          bash scripts/test-x11-owned-connection-contract.sh
 
       - name: Platform/V8 dependency boundary contract
         run: bash scripts/test-platform-v8-boundary-contract.sh
@@ -143,6 +144,12 @@ jobs:
       # it does not follow turns into a confident "everything is supported".
       - name: Prescreen scanner contract
         run: bash scripts/test-prescreen-scanner.sh
+
+      - name: Bounded input transport contract
+        run: bash scripts/test-input-transport-contract.sh
+
+      - name: Android owned Host shutdown contract
+        run: bash scripts/test-android-owned-host-shutdown-contract.sh
 
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh

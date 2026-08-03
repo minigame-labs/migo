@@ -507,7 +507,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use crate::egl_platform::{EglInstance, EglProvider, GraphicsBackendId};
+    use crate::egl_platform::{EglConcurrency, EglInstance, EglProvider, GraphicsBackendId};
     use shared::error::{EngineError, EngineResult, ErrorCode};
 
     use super::init_egl;
@@ -522,6 +522,14 @@ mod tests {
     impl EglProvider for InjectedFailureProvider {
         fn backend_id(&self) -> GraphicsBackendId {
             GraphicsBackendId::of::<Self>()
+        }
+
+        fn concurrency(&self) -> EglConcurrency {
+            EglConcurrency::SharedContexts
+        }
+
+        fn platform_identity(&self) -> crate::egl_platform::PlatformIdentity {
+            crate::egl_platform::PlatformIdentity::new::<Self>(self.backend_id(), 0)
         }
 
         fn label(&self) -> &str {

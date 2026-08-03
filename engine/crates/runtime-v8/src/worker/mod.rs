@@ -142,26 +142,11 @@ impl WorkerModuleLoader {
         &self,
         url: &deno_core::ModuleSpecifier,
     ) -> Result<(), deno_core::error::ModuleLoaderError> {
-        // Fail-closed: a worker with no /code mount table has no sandbox to
-        // enforce against, so refuse module loading rather than fall through to
-        // the raw filesystem loader. `op_worker_create` also requires a mount
-        // table, so reaching here with `None` should be impossible — this is
-        // defense in depth against a future caller that skips that check.
-        let Some(mt) = self.mount_table.as_ref() else {
-            return Err(deno_core::error::ModuleLoaderError::generic(
-                "Worker module load blocked: no /code mount table (sandbox unavailable)",
-            ));
-        };
-        let Ok(path) = url.to_file_path() else {
-            return Ok(());
-        };
-        if mt.is_allowed_path(&path) {
-            return Ok(());
-        }
-        Err(deno_core::error::ModuleLoaderError::generic(format!(
-            "Worker module import blocked: path escapes /code sandbox: {}",
-            path.display()
-        )))
+        crate::loader::validate_content_module_url(
+            url,
+            self.mount_table.as_deref(),
+            "Worker content",
+        )
     }
 }
 
@@ -274,6 +259,32 @@ fn patch_amd(
         source.code = deno_core::ModuleSourceCode::String(patched.into());
     }
     Ok(source)
+}
+
+#[cfg(test)]
+mod module_loader_security_tests {
+    use super::*;
+    use deno_core::ResolutionKind;
+
+    #[test]
+    fn worker_content_loader_rejects_internal_schemes_for_all_import_kinds() {
+        let root = std::env::temp_dir().join("migo-worker-loader-sandbox");
+        let loader = WorkerModuleLoader {
+            inner: FsModuleLoader,
+            mount_table: Some(Arc::new(shared::vfs::MountTable::new(root))),
+        };
+        let referrer = "file:///tmp/migo-worker-loader-sandbox/main.js";
+
+        for kind in [ResolutionKind::Import, ResolutionKind::DynamicImport] {
+            let error = loader
+                .resolve("ext:core/mod.js", referrer, kind)
+                .expect_err("worker content must not resolve runtime extension modules");
+            assert!(
+                error.to_string().contains("file"),
+                "unexpected rejection: {error}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

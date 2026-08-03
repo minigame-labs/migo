@@ -376,9 +376,17 @@ mod tests {
         task: MigoTaskFn,
         context: *mut c_void,
     ) -> MigoResult {
-        DISPATCH_CALLS.fetch_add(1, Ordering::SeqCst);
         unsafe { task(context) };
         MIGO_OK
+    }
+
+    unsafe extern "C" fn counting_inline_dispatch(
+        dispatcher: *mut c_void,
+        task: MigoTaskFn,
+        context: *mut c_void,
+    ) -> MigoResult {
+        DISPATCH_CALLS.fetch_add(1, Ordering::SeqCst);
+        unsafe { inline_dispatch(dispatcher, task, context) }
     }
 
     unsafe extern "C" fn rejecting_dispatch(
@@ -386,8 +394,16 @@ mod tests {
         _task: MigoTaskFn,
         _context: *mut c_void,
     ) -> MigoResult {
-        DISPATCH_CALLS.fetch_add(1, Ordering::SeqCst);
         MIGO_ERROR_INVALID_ARGUMENT
+    }
+
+    unsafe extern "C" fn counting_rejecting_dispatch(
+        dispatcher: *mut c_void,
+        task: MigoTaskFn,
+        context: *mut c_void,
+    ) -> MigoResult {
+        DISPATCH_CALLS.fetch_add(1, Ordering::SeqCst);
+        unsafe { rejecting_dispatch(dispatcher, task, context) }
     }
 
     unsafe extern "C" fn queued_dispatch(
@@ -761,7 +777,7 @@ mod tests {
         let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         READY_CALLS.store(0, Ordering::SeqCst);
         DISPATCH_CALLS.store(0, Ordering::SeqCst);
-        let notifier = notifier(inline_dispatch);
+        let notifier = notifier(counting_inline_dispatch);
         notifier.ready();
         assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(READY_CALLS.load(Ordering::SeqCst), 1);
@@ -887,9 +903,10 @@ mod tests {
 
     #[test]
     fn a_rejected_dispatch_drops_the_task_instead_of_leaking_or_running() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         READY_CALLS.store(0, Ordering::SeqCst);
         DISPATCH_CALLS.store(0, Ordering::SeqCst);
-        let notifier = notifier(rejecting_dispatch);
+        let notifier = notifier(counting_rejecting_dispatch);
         notifier.ready();
         assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(READY_CALLS.load(Ordering::SeqCst), 0);

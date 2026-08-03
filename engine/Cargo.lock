@@ -1737,6 +1737,7 @@ dependencies = [
  "futures",
  "jni",
  "khronos-egl",
+ "libc",
  "libloading",
  "migo-core",
  "migo-graphics",

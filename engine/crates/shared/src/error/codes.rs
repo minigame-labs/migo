@@ -19,6 +19,8 @@ pub enum ErrorCode {
     /// Cross-thread / channel disconnected, sender dropped, etc.
     Disconnected = 9,
     InvalidOperation = 10,
+    /// Bounded input transport refused an event. The host may retry later.
+    InputSaturated = 11,
 
     // IO / FS (100..199)
     IoError = 100,
@@ -86,6 +88,7 @@ impl ErrorCode {
             ErrorCode::Cancelled => "cancelled",
             ErrorCode::Disconnected => "disconnected",
             ErrorCode::InvalidOperation => "invalid operation",
+            ErrorCode::InputSaturated => "input transport saturated",
 
             ErrorCode::IoError => "io error",
             ErrorCode::BadFileDescriptor => "bad file descriptor",
@@ -157,6 +160,7 @@ impl TryFrom<u16> for ErrorCode {
             8 => ErrorCode::Cancelled,
             9 => ErrorCode::Disconnected,
             10 => ErrorCode::InvalidOperation,
+            11 => ErrorCode::InputSaturated,
 
             100 => ErrorCode::IoError,
             101 => ErrorCode::BadFileDescriptor,
@@ -243,6 +247,7 @@ mod tests {
         assert_eq!(ErrorCode::try_from(8u16), Ok(ErrorCode::Cancelled));
         assert_eq!(ErrorCode::try_from(9u16), Ok(ErrorCode::Disconnected));
         assert_eq!(ErrorCode::try_from(10u16), Ok(ErrorCode::InvalidOperation));
+        assert_eq!(ErrorCode::try_from(11u16), Ok(ErrorCode::InputSaturated));
     }
 
     #[test]
@@ -300,7 +305,7 @@ mod tests {
         // new variant is added.
         assert_eq!(ErrorCode::Ok as u16, 0);
 
-        // General 1..=10
+        // General 1..=11
         assert_eq!(ErrorCode::Internal as u16, 1);
         assert_eq!(ErrorCode::InvalidArgument as u16, 2);
         assert_eq!(ErrorCode::NotFound as u16, 3);
@@ -311,6 +316,7 @@ mod tests {
         assert_eq!(ErrorCode::Cancelled as u16, 8);
         assert_eq!(ErrorCode::Disconnected as u16, 9);
         assert_eq!(ErrorCode::InvalidOperation as u16, 10);
+        assert_eq!(ErrorCode::InputSaturated as u16, 11);
 
         // IO / FS
         assert_eq!(ErrorCode::IoError as u16, 100);

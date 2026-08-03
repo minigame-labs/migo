@@ -16,10 +16,11 @@ use std::{
 };
 
 #[cfg(test)]
-use std::{ffi::c_void, mem::size_of};
+use std::{mem::size_of, thread};
 
+use graphics::egl_platform::PlatformIdentity;
 use migo_core::{
-    PlatformServices, host_ingress, lease_surface_tracked, lease_surface_with_resource,
+    HostThread, PlatformServices, host_ingress, lease_surface_tracked, lease_surface_with_resource,
     retire_surface, send_critical_command_to_host, spawn_host_thread_tracked,
 };
 use shared::{
@@ -35,6 +36,7 @@ use crate::panic_barrier::guard;
 use crate::{
     MigoSession, SurfaceTransition, callbacks, host_kit, pin_session,
     platform::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds},
+    platform_state_is_consistent,
 };
 use migo_capi_abi::{
     MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
@@ -62,6 +64,33 @@ pub struct MigoSurfaceAttachment {
     pixel_ratio: PixelRatio,
     window_state: Arc<host_kit::CapiWindowState>,
     lost: bool,
+}
+
+fn validate_platform_identity(
+    existing_host: Option<migo_core::HostId>,
+    existing_identity: Option<PlatformIdentity>,
+    candidate_identity: PlatformIdentity,
+) -> Result<(), MigoResult> {
+    match (existing_host, existing_identity) {
+        (None, None) => Ok(()),
+        (Some(_), Some(identity)) if identity == candidate_identity => Ok(()),
+        (Some(_), Some(_)) => Err(MIGO_ERROR_INVALID_STATE),
+        (None, Some(_)) | (Some(_), None) => Err(MIGO_ERROR_INTERNAL),
+    }
+}
+
+fn validate_platform_context_state(
+    existing_host: Option<migo_core::HostId>,
+    existing_identity: Option<PlatformIdentity>,
+    has_context: bool,
+) -> Result<(), MigoResult> {
+    platform_state_is_consistent(
+        existing_host.is_some(),
+        existing_identity.is_some(),
+        has_context,
+    )
+    .then_some(())
+    .ok_or(MIGO_ERROR_INTERNAL)
 }
 
 // SAFETY: the self-Session pointer is opaque identity produced from the Arc
@@ -201,7 +230,13 @@ pub unsafe extern "C" fn migo_session_attach_surface(
         let public_generation = PublicSurfaceGeneration::new(descriptor.public_generation())
             .expect("the ABI validator rejects generation zero");
 
-        let (existing_host, configured_callbacks, existing_window_state) = {
+        let (
+            existing_host,
+            existing_platform_identity,
+            existing_platform_context,
+            configured_callbacks,
+            existing_window_state,
+        ) = {
             let Ok(mut state) = session.state.lock() else {
                 return MIGO_ERROR_INTERNAL;
             };
@@ -216,135 +251,166 @@ pub unsafe extern "C" fn migo_session_attach_surface(
             ) {
                 return error;
             }
+            let existing_host = state.host.as_ref().map(HostThread::id);
+            if let Err(error) = validate_platform_context_state(
+                existing_host,
+                state.platform_identity,
+                state.platform_context.is_some(),
+            ) {
+                return error;
+            }
             // Reserve this cold transition, then release SessionControl before
             // native construction, Host startup, and any callback-capable work.
             state.surface_transition = SurfaceTransition::Attaching;
             state.surface_transition_generation = Some(public_generation.get());
             debug_assert!(state.pending_surface_loss.is_none());
             state.callbacks_frozen = true;
-            (state.host, state.callbacks, state.window_state.clone())
+            (
+                existing_host,
+                state.platform_identity,
+                state.platform_context.clone(),
+                state.callbacks,
+                state.window_state.clone(),
+            )
         };
 
-        let (surface, graphics_platform, target) = match build_target(descriptor) {
-            Ok(built) => built,
-            Err(error) => {
-                rollback_surface_transition(&session);
-                return error;
-            }
-        };
+        let (surface, graphics_platform, target, candidate_platform_context) =
+            match build_target(descriptor, existing_platform_context.as_ref()) {
+                Ok(built) => built,
+                Err(error) => {
+                    rollback_surface_transition(&session);
+                    return error;
+                }
+            };
+        let candidate_platform_identity = graphics_platform.platform_identity();
+        if let Err(error) = validate_platform_identity(
+            existing_host,
+            existing_platform_identity,
+            candidate_platform_identity,
+        ) {
+            rollback_surface_transition(&session);
+            return error;
+        }
 
-        let (host, resource, notifier, new_ingress, window_state) = match existing_host {
-            Some(host) => {
-                let Some(window_state) = existing_window_state else {
-                    tracing::error!(
-                        "migo_session_attach_surface: existing Host has no window state"
-                    );
-                    rollback_surface_transition(&session);
-                    return MIGO_ERROR_INTERNAL;
-                };
-                let Some(ingress) = session.ingress.get() else {
-                    tracing::error!(
-                        "migo_session_attach_surface: existing Host has no direct ingress"
-                    );
-                    rollback_surface_transition(&session);
-                    return MIGO_ERROR_INTERNAL;
-                };
-                if ingress.host_id() != host {
-                    tracing::error!(
-                        "migo_session_attach_surface: Session ingress Host {} does not match {}",
-                        ingress.host_id(),
+        let (host, resource, notifier, new_ingress, window_state, mut new_host) =
+            match existing_host {
+                Some(host) => {
+                    let Some(window_state) = existing_window_state else {
+                        tracing::error!(
+                            "migo_session_attach_surface: existing Host has no window state"
+                        );
+                        rollback_surface_transition(&session);
+                        return MIGO_ERROR_INTERNAL;
+                    };
+                    let Some(ingress) = session.ingress.get() else {
+                        tracing::error!(
+                            "migo_session_attach_surface: existing Host has no direct ingress"
+                        );
+                        rollback_surface_transition(&session);
+                        return MIGO_ERROR_INTERNAL;
+                    };
+                    if ingress.host_id() != host {
+                        tracing::error!(
+                            "migo_session_attach_surface: Session ingress Host {} does not match {}",
+                            ingress.host_id(),
+                            host,
+                        );
+                        rollback_surface_transition(&session);
+                        return MIGO_ERROR_INTERNAL;
+                    }
+                    let lease = match lease_surface_tracked(host, surface, public_generation) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            tracing::error!("migo_session_attach_surface: lease failed: {error}");
+                            rollback_surface_transition(&session);
+                            return MIGO_ERROR_INTERNAL;
+                        }
+                    };
+                    let resource = lease.resource_lease();
+                    // Publish before enqueue so a render-complete resize event can
+                    // never race ahead of the window metrics it announces.
+                    let previous_metrics = window_state.replace(window_metrics);
+                    if let Err(error) = send_critical_command_to_host(
                         host,
-                    );
-                    rollback_surface_transition(&session);
-                    return MIGO_ERROR_INTERNAL;
-                }
-                let lease = match lease_surface_tracked(host, surface, public_generation) {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        tracing::error!("migo_session_attach_surface: lease failed: {error}");
+                        HostCommand::UpdateSurface {
+                            lease,
+                            pixel_ratio: Some(pixel_ratio),
+                        },
+                    ) {
+                        window_state.replace(previous_metrics);
+                        // A token was issued but no Host owner accepted it. Retire
+                        // it immediately so a failed attach cannot leave a hidden
+                        // live generation behind.
+                        let _ = retire_surface(host);
+                        tracing::error!("migo_session_attach_surface: send failed: {error}");
                         rollback_surface_transition(&session);
                         return MIGO_ERROR_INTERNAL;
                     }
-                };
-                let resource = lease.resource_lease();
-                // Publish before enqueue so a render-complete resize event can
-                // never race ahead of the window metrics it announces.
-                let previous_metrics = window_state.replace(window_metrics);
-                if let Err(error) = send_critical_command_to_host(
-                    host,
-                    HostCommand::UpdateSurface {
-                        lease,
-                        pixel_ratio: Some(pixel_ratio),
-                    },
-                ) {
-                    window_state.replace(previous_metrics);
-                    // A token was issued but no Host owner accepted it. Retire
-                    // it immediately so a failed attach cannot leave a hidden
-                    // live generation behind.
-                    let _ = retire_surface(host);
-                    tracing::error!("migo_session_attach_surface: send failed: {error}");
-                    rollback_surface_transition(&session);
-                    return MIGO_ERROR_INTERNAL;
+                    (host, resource, None, None, window_state, None)
                 }
-                (host, resource, None, None, window_state)
-            }
-            None => {
-                debug_assert!(existing_window_state.is_none());
-                let window_state = Arc::new(host_kit::CapiWindowState::new(window_metrics));
-                let notifier = configured_callbacks.map(|callbacks| {
-                    Arc::new(callbacks::Notifier::new(
-                        callbacks,
+                None => {
+                    debug_assert!(existing_window_state.is_none());
+                    let window_state = Arc::new(host_kit::CapiWindowState::new(window_metrics));
+                    let notifier = configured_callbacks.map(|callbacks| {
+                        Arc::new(callbacks::Notifier::new(
+                            callbacks,
+                            Arc::downgrade(&session),
+                        ))
+                    });
+                    let host_kit: Arc<dyn PlatformServices> = Arc::new(host_kit::CapiHostKit::new(
+                        notifier.clone(),
                         Arc::downgrade(&session),
-                    ))
-                });
-                let host_kit: Arc<dyn PlatformServices> = Arc::new(host_kit::CapiHostKit::new(
-                    notifier.clone(),
-                    Arc::downgrade(&session),
-                    Arc::clone(&window_state),
-                ));
-                let options = InitOptions::new()
-                    .with_files_dir(session.engine.files_dir.clone())
-                    .with_cache_dir(session.engine.cache_dir.clone())
-                    .with_code_cache_dir(session.engine.code_cache_dir.clone())
-                    .with_pixel_ratio(configuration.scale_factor())
-                    .with_target_fps(60)
-                    .with_code_signing_enabled(!session.engine.allow_unsigned_content);
-                match spawn_host_thread_tracked(
-                    surface,
-                    public_generation,
-                    graphics_platform,
-                    host_kit,
-                    options,
-                ) {
-                    Ok(started) => {
-                        let ingress = match host_ingress(started.host_id) {
-                            Ok(ingress) => ingress,
-                            Err(error) => {
-                                tracing::error!(
-                                    "migo_session_attach_surface: ingress capture failed: {error}"
-                                );
-                                let _ = retire_surface(started.host_id);
-                                let _ = migo_core::shutdown_host(started.host_id);
-                                rollback_surface_transition(&session);
-                                return MIGO_ERROR_INTERNAL;
-                            }
-                        };
-                        (
-                            started.host_id,
-                            started.resource,
-                            notifier,
-                            Some(ingress),
-                            window_state,
-                        )
-                    }
-                    Err(error) => {
-                        tracing::error!("migo_session_attach_surface: spawn failed: {error:?}");
-                        rollback_surface_transition(&session);
-                        return MIGO_ERROR_INTERNAL;
+                        Arc::clone(&window_state),
+                    ));
+                    let options = InitOptions::new()
+                        .with_files_dir(session.engine.files_dir.clone())
+                        .with_cache_dir(session.engine.cache_dir.clone())
+                        .with_code_cache_dir(session.engine.code_cache_dir.clone())
+                        .with_pixel_ratio(configuration.scale_factor())
+                        .with_target_fps(60)
+                        .with_code_signing_enabled(!session.engine.allow_unsigned_content);
+                    match spawn_host_thread_tracked(
+                        surface,
+                        public_generation,
+                        graphics_platform,
+                        host_kit,
+                        options,
+                    ) {
+                        Ok(mut started) => {
+                            let host = started.host.id();
+                            let ingress = match host_ingress(host) {
+                                Ok(ingress) => ingress,
+                                Err(error) => {
+                                    tracing::error!(
+                                        "migo_session_attach_surface: ingress capture failed: {error}"
+                                    );
+                                    let _ = retire_surface(host);
+                                    if let Err(error) = started.host.shutdown_and_join() {
+                                        tracing::error!(
+                                            "migo_session_attach_surface: rollback join failed: {error}"
+                                        );
+                                    }
+                                    rollback_surface_transition(&session);
+                                    return MIGO_ERROR_INTERNAL;
+                                }
+                            };
+                            (
+                                host,
+                                started.resource,
+                                notifier,
+                                Some(ingress),
+                                window_state,
+                                Some(started.host),
+                            )
+                        }
+                        Err(error) => {
+                            tracing::error!("migo_session_attach_surface: spawn failed: {error:?}");
+                            rollback_surface_transition(&session);
+                            return MIGO_ERROR_INTERNAL;
+                        }
                     }
                 }
-            }
-        };
+            };
 
         let attachment = Box::new(MigoSurfaceAttachment {
             session: session_ptr,
@@ -364,7 +430,11 @@ pub unsafe extern "C" fn migo_session_attach_surface(
         {
             tracing::error!("migo_session_attach_surface: direct ingress was installed twice");
             let _ = retire_surface(host);
-            let _ = migo_core::shutdown_host(host);
+            if let Some(mut owner) = new_host.take()
+                && let Err(error) = owner.shutdown_and_join()
+            {
+                tracing::error!("migo_session_attach_surface: rollback join failed: {error}");
+            }
             rollback_surface_transition(&session);
             return MIGO_ERROR_INTERNAL;
         }
@@ -372,16 +442,24 @@ pub unsafe extern "C" fn migo_session_attach_surface(
         let (visibility, focused, deferred_loss) = {
             let Ok(mut state) = session.state.lock() else {
                 let _ = retire_surface(host);
-                let _ = shutdown_new_host(existing_host, host);
+                if let Some(mut owner) = new_host.take()
+                    && let Err(error) = owner.shutdown_and_join()
+                {
+                    tracing::error!("migo_session_attach_surface: rollback join failed: {error}");
+                }
                 return MIGO_ERROR_INTERNAL;
             };
             debug_assert_eq!(state.surface_transition, SurfaceTransition::Attaching);
             debug_assert!(state.active_attachment.is_none());
             if existing_host.is_none() {
-                state.host = Some(host);
+                state.host = new_host.take();
+                debug_assert!(state.host.is_some());
+                state.platform_identity = Some(candidate_platform_identity);
+                state.platform_context = Some(candidate_platform_context);
                 state.notifier = notifier;
                 state.window_state = Some(window_state);
             } else {
+                debug_assert!(state.platform_context.is_some());
                 debug_assert!(
                     state
                         .window_state
@@ -437,14 +515,6 @@ pub unsafe extern "C" fn migo_session_attach_surface(
     })
 }
 
-fn shutdown_new_host(existing_host: Option<i32>, host: i32) -> Result<(), String> {
-    if existing_host.is_none() {
-        migo_core::shutdown_host(host)
-    } else {
-        Ok(())
-    }
-}
-
 /// Report a resize or a presentation-parameter change.
 ///
 /// # Safety
@@ -493,13 +563,13 @@ pub unsafe extern "C" fn migo_surface_update(
             ) {
                 return error;
             }
-            let Some(host) = state.host else {
+            let Some(host) = state.host.as_ref().map(HostThread::id) else {
                 return MIGO_ERROR_INVALID_STATE;
             };
             let transition_generation = active.public_generation();
             let snapshot = (
                 host,
-                active.target,
+                active.target.clone(),
                 active.resource.clone(),
                 Arc::clone(&active.window_state),
             );
@@ -624,7 +694,7 @@ pub unsafe extern "C" fn migo_surface_begin_detach(
             if !std::ptr::eq(active.as_ref(), attachment_ref) {
                 return MIGO_ERROR_STALE_SURFACE;
             }
-            let Some(host) = state.host else {
+            let Some(host) = state.host.as_ref().map(HostThread::id) else {
                 return MIGO_ERROR_INVALID_STATE;
             };
             let notification = release_notification(state.notifier.as_ref());
@@ -767,13 +837,19 @@ mod tests {
     use super::*;
     use crate::{
         migo_session_create, migo_session_destroy,
+        platform::{test_platform_context, test_platform_target},
         test_support::{session_config, with_engine, with_session},
     };
+    use graphics::egl_platform::{GraphicsBackendId, PlatformIdentity};
     use migo_capi_abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI, VersionedHeader};
     use shared::surface::{Surface, SurfaceControl, SurfaceLease, SurfaceResourceLease};
 
     #[derive(Debug)]
     struct TestSurface;
+    struct TestBackend;
+    struct TestOtherBackend;
+    struct TestDomain;
+    struct TestOtherDomain;
 
     impl Surface for TestSurface {
         fn as_any(&self) -> &dyn std::any::Any {
@@ -782,6 +858,79 @@ mod tests {
 
         fn size(&self) -> (u32, u32) {
             (640, 480)
+        }
+    }
+
+    #[test]
+    fn platform_identity_validation_fails_closed_before_reattach() {
+        let backend = GraphicsBackendId::of::<TestBackend>();
+        let original = PlatformIdentity::new::<TestDomain>(backend, 0x1000);
+
+        assert_eq!(validate_platform_identity(None, None, original), Ok(()));
+        assert_eq!(
+            validate_platform_identity(Some(7), Some(original), original),
+            Ok(())
+        );
+        assert_eq!(
+            validate_platform_identity(
+                Some(7),
+                Some(original),
+                PlatformIdentity::new::<TestDomain>(backend, 0x2000),
+            ),
+            Err(MIGO_ERROR_INVALID_STATE)
+        );
+        assert_eq!(
+            validate_platform_identity(
+                Some(7),
+                Some(original),
+                PlatformIdentity::new::<TestOtherDomain>(backend, 0x1000),
+            ),
+            Err(MIGO_ERROR_INVALID_STATE)
+        );
+        assert_eq!(
+            validate_platform_identity(
+                Some(7),
+                Some(original),
+                PlatformIdentity::new::<TestOtherBackend>(
+                    GraphicsBackendId::of::<TestOtherBackend>(),
+                    0x1000,
+                ),
+            ),
+            Err(MIGO_ERROR_INVALID_STATE)
+        );
+        assert_eq!(
+            validate_platform_identity(Some(7), None, original),
+            Err(MIGO_ERROR_INTERNAL)
+        );
+        assert_eq!(
+            validate_platform_identity(None, Some(original), original),
+            Err(MIGO_ERROR_INTERNAL)
+        );
+    }
+
+    #[test]
+    fn platform_context_state_is_all_absent_or_all_committed() {
+        let identity =
+            PlatformIdentity::new::<TestDomain>(GraphicsBackendId::of::<TestBackend>(), 0x1000);
+
+        assert_eq!(validate_platform_context_state(None, None, false), Ok(()));
+        assert_eq!(
+            validate_platform_context_state(Some(7), Some(identity), true),
+            Ok(())
+        );
+
+        for inconsistent in [
+            (Some(7), Some(identity), false),
+            (Some(7), None, true),
+            (Some(7), None, false),
+            (None, Some(identity), true),
+            (None, Some(identity), false),
+            (None, None, true),
+        ] {
+            assert_eq!(
+                validate_platform_context_state(inconsistent.0, inconsistent.1, inconsistent.2),
+                Err(MIGO_ERROR_INTERNAL)
+            );
         }
     }
 
@@ -843,7 +992,16 @@ mod tests {
         let pointer = NonNull::from(attachment.as_ref()).as_ptr();
         let session = unsafe { &*session };
         let mut state = session.state.lock().expect("SessionControl");
-        state.host = Some(i32::MAX);
+        let join = thread::Builder::new()
+            .name("Migo-Main-capi-surface-test".to_owned())
+            .spawn(|| {})
+            .expect("spawn inert test Host");
+        state.host = Some(HostThread::from_join_handle_for_test(i32::MAX, join));
+        state.platform_identity = Some(PlatformIdentity::new::<TestDomain>(
+            GraphicsBackendId::of::<TestBackend>(),
+            0,
+        ));
+        state.platform_context = Some(test_platform_context());
         state.last_public_generation = 1;
         state.active_attachment = Some(attachment);
         session
@@ -982,37 +1140,6 @@ mod tests {
             assert!(state.pending_surface_loss.is_none());
             assert!(state.surface_transition_generation.is_none());
         });
-    }
-
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    fn test_platform_target() -> PlatformTarget {
-        PlatformTarget::X11 {
-            display: NonNull::new(0x1usize as *mut c_void).expect("display"),
-            window: 0x2a0_0001,
-        }
-    }
-
-    #[cfg(target_os = "android")]
-    fn test_platform_target() -> PlatformTarget {
-        PlatformTarget::NativeWindow {
-            window: 0x2a0_0001usize as *mut c_void,
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn test_platform_target() -> PlatformTarget {
-        PlatformTarget::Win32 {
-            hwnd: NonNull::new(0x2a0_0001usize as *mut c_void).expect("hwnd"),
-        }
-    }
-
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "windows",
-        all(target_os = "linux", not(target_env = "ohos"))
-    )))]
-    fn test_platform_target() -> PlatformTarget {
-        PlatformTarget::TestOnly
     }
 
     #[test]

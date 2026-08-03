@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
 };
 
@@ -11,7 +11,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
 use shared::{
-    host_channel::CriticalHostCommandSender,
+    host_channel::{CriticalHostCommandSender, InputSendOutcome, InputStream},
     op_state::HostTx,
     payload_pool::PayloadPool,
     protocol::host_cmd::{GamepadState, HostCommand, TouchData},
@@ -23,11 +23,13 @@ use shared::{
 
 use crate::runtime::HostId;
 
-/// Pending normal commands allowed per Host. Payload pools carry one extra
-/// slot because the receiver releases a queue permit before it finishes
-/// processing the command it just removed.
+/// Pending normal commands allowed per Host. Payload pools carry two extra
+/// slots: one for a command held by the consumer after dequeue, and one for the
+/// producer candidate inspected by queue coalescing or terminal supersession.
 pub(crate) const HOST_NORMAL_COMMAND_CAPACITY: usize = 512;
-const HOST_PAYLOAD_POOL_CAPACITY: usize = HOST_NORMAL_COMMAND_CAPACITY + 1;
+pub(crate) const HOST_RELIABLE_INPUT_RESERVE: usize = 64;
+const HOST_PAYLOAD_POOL_CAPACITY: usize =
+    HOST_NORMAL_COMMAND_CAPACITY + HOST_RELIABLE_INPUT_RESERVE + 2;
 
 /// Allocation-free error returned by a direct per-Session Host ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,12 +48,23 @@ pub struct HostIngress {
     vsync_tx: Option<crossbeam_channel::Sender<f64>>,
     touch_pool: PayloadPool<TouchData>,
     gamepad_pool: PayloadPool<GamepadState>,
+    input_saturation_notified: Arc<AtomicBool>,
 }
 
 impl HostIngress {
     #[inline]
     pub const fn host_id(&self) -> HostId {
         self.host_id
+    }
+
+    /// Claim the adapter notification for the current input-saturation episode.
+    ///
+    /// All clones share this gate. A successful semantic input send rearms it.
+    #[inline]
+    pub fn claim_input_saturation_notification(&self) -> bool {
+        self.input_saturation_notified
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     #[inline]
@@ -70,28 +83,190 @@ impl HostIngress {
 
     /// Enqueue a touch batch in a preallocated payload slot.
     #[inline]
-    pub fn try_send_touch(&self, touch: TouchData) -> Result<(), HostIngressSendError> {
+    pub fn try_send_touch(
+        &self,
+        touch: TouchData,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        let touch_type = touch.touch_type;
         let payload = self.touch_pool.try_insert(touch).map_err(|_| {
-            self.record_command_drop();
+            self.record_input_saturation();
             HostIngressSendError::Full
         })?;
-        self.try_send(HostCommand::OnTouch(payload))
+        let command = HostCommand::OnTouch(payload);
+        let result = match touch_type {
+            shared::protocol::host_cmd::TouchType::Move => {
+                self.tx.try_send_coalescible(InputStream::Touch, command)
+            }
+            shared::protocol::host_cmd::TouchType::Start => {
+                self.tx.try_send_reliable(Some(InputStream::Touch), command)
+            }
+            shared::protocol::host_cmd::TouchType::End
+            | shared::protocol::host_cmd::TouchType::Cancel => {
+                self.tx.try_send_terminal(Some(InputStream::Touch), command)
+            }
+        };
+        self.map_input_result(result)
+    }
+
+    /// Enqueue one desktop pointer transition or motion sample.
+    #[inline]
+    pub fn try_send_pointer(
+        &self,
+        command: HostCommand,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        let result = match command {
+            command @ HostCommand::OnMouseMove { .. } => {
+                self.tx.try_send_coalescible(InputStream::Pointer, command)
+            }
+            command @ HostCommand::OnMouseDown { .. } => self
+                .tx
+                .try_send_reliable(Some(InputStream::Pointer), command),
+            command @ HostCommand::OnMouseUp { .. } => self
+                .tx
+                .try_send_terminal(Some(InputStream::Pointer), command),
+            command => self
+                .tx
+                .try_send(command)
+                .map(|()| InputSendOutcome::Enqueued),
+        };
+        self.map_input_result(result)
+    }
+
+    /// Enqueue one physical keyboard transition.
+    #[inline]
+    pub fn try_send_key(
+        &self,
+        command: HostCommand,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        let result = match command {
+            command @ HostCommand::OnKeyUp { .. } => self.tx.try_send_terminal(None, command),
+            command => self
+                .tx
+                .try_send(command)
+                .map(|()| InputSendOutcome::Enqueued),
+        };
+        self.map_input_result(result)
+    }
+
+    /// Enqueue one soft-keyboard event.
+    #[inline]
+    pub fn try_send_keyboard(
+        &self,
+        command: HostCommand,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        let result = match command {
+            command @ HostCommand::OnKeyboardComplete { .. } => {
+                self.tx.try_send_terminal(None, command)
+            }
+            command => self
+                .tx
+                .try_send(command)
+                .map(|()| InputSendOutcome::Enqueued),
+        };
+        self.map_input_result(result)
+    }
+
+    /// Enqueue one IME composition transition or replaceable preedit state.
+    #[inline]
+    pub fn try_send_composition(
+        &self,
+        command: HostCommand,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        let result = match command {
+            command @ HostCommand::OnCompositionUpdate { .. } => self
+                .tx
+                .try_send_coalescible(InputStream::Composition, command),
+            command @ HostCommand::OnCompositionStart { .. } => self
+                .tx
+                .try_send_reliable(Some(InputStream::Composition), command),
+            command @ HostCommand::OnCompositionEnd { .. } => self
+                .tx
+                .try_send_terminal(Some(InputStream::Composition), command),
+            command => self
+                .tx
+                .try_send(command)
+                .map(|()| InputSendOutcome::Enqueued),
+        };
+        self.map_input_result(result)
+    }
+
+    /// Enqueue one gamepad topology transition.
+    #[inline]
+    pub fn try_send_gamepad_connection(
+        &self,
+        command: HostCommand,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        let result = match command {
+            command @ HostCommand::OnGamepadConnected { index, .. } => self
+                .tx
+                .try_send_reliable(Some(InputStream::Gamepad(index)), command),
+            command @ HostCommand::OnGamepadDisconnected { index } => self
+                .tx
+                .try_send_terminal(Some(InputStream::Gamepad(index)), command),
+            command => self
+                .tx
+                .try_send(command)
+                .map(|()| InputSendOutcome::Enqueued),
+        };
+        self.map_input_result(result)
     }
 
     /// Enqueue a gamepad sample in a preallocated payload slot.
     #[inline]
-    pub fn try_send_gamepad_state(&self, state: GamepadState) -> Result<(), HostIngressSendError> {
+    pub fn try_send_gamepad_state(
+        &self,
+        state: GamepadState,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        let stream = InputStream::Gamepad(state.index);
         let payload = self.gamepad_pool.try_insert(state).map_err(|_| {
-            self.record_command_drop();
+            self.record_input_saturation();
             HostIngressSendError::Full
         })?;
-        self.try_send(HostCommand::OnGamepadState(payload))
+        let result = self
+            .tx
+            .try_send_coalescible(stream, HostCommand::OnGamepadState(payload));
+        self.map_input_result(result)
     }
 
     #[inline]
-    fn record_command_drop(&self) {
+    fn map_input_result(
+        &self,
+        result: Result<InputSendOutcome, TrySendError<HostCommand>>,
+    ) -> Result<InputSendOutcome, HostIngressSendError> {
+        match result {
+            Ok(outcome) => {
+                self.input_saturation_notified
+                    .store(false, Ordering::Release);
+                if let Some(stats) = shared::stats::get_stats(self.host_id) {
+                    match outcome {
+                        InputSendOutcome::Enqueued => {}
+                        InputSendOutcome::Coalesced => {
+                            stats.input_coalesced.fetch_add(1, Ordering::Relaxed);
+                        }
+                        InputSendOutcome::Reserved => {
+                            stats
+                                .input_reliable_reserve_uses
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Ok(outcome)
+            }
+            Err(TrySendError::Full(_)) => {
+                self.record_input_saturation();
+                Err(HostIngressSendError::Full)
+            }
+            Err(TrySendError::Closed(_)) => Err(HostIngressSendError::Closed),
+        }
+    }
+
+    #[inline]
+    fn record_input_saturation(&self) {
         if let Some(stats) = shared::stats::get_stats(self.host_id) {
             stats.command_drops.fetch_add(1, Ordering::Relaxed);
+            stats
+                .input_saturation_events
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -130,6 +305,7 @@ pub(crate) struct HostHandle {
     surface_control: Arc<SurfaceControl>,
     touch_pool: PayloadPool<TouchData>,
     gamepad_pool: PayloadPool<GamepadState>,
+    input_saturation_notified: Arc<AtomicBool>,
 }
 
 static HOST_SENDERS: OnceLock<RwLock<HashMap<HostId, HostHandle>>> = OnceLock::new();
@@ -160,6 +336,7 @@ pub(crate) fn register_sender(
             surface_control,
             touch_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
             gamepad_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
+            input_saturation_notified: Arc::new(AtomicBool::new(false)),
         },
     )
 }
@@ -188,13 +365,14 @@ fn registered_surface_control(host_id: HostId) -> Result<Arc<SurfaceControl>, St
 
 /// Capture direct data-plane handles after Host initialization completes.
 pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
-    let (tx, touch_pool, gamepad_pool) = {
+    let (tx, touch_pool, gamepad_pool, input_saturation_notified) = {
         let map = host_senders().read();
         map.get(&host_id).map(|handle| {
             (
                 handle.tx.clone(),
                 handle.touch_pool.clone(),
                 handle.gamepad_pool.clone(),
+                Arc::clone(&handle.input_saturation_notified),
             )
         })
     }
@@ -206,6 +384,7 @@ pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
         vsync_tx: crate::runtime::vsync::sender(host_id),
         touch_pool,
         gamepad_pool,
+        input_saturation_notified,
     })
 }
 
@@ -291,23 +470,21 @@ pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), Str
     }
 }
 
-/// Send a lifecycle/surface command that must not be silently dropped.
+/// Send a trusted asynchronous result that must not be silently dropped.
 ///
 /// `send_command_to_host` is best-effort (`try_send`) and drops on a full queue.
-/// That is fine for high-frequency, coalescible commands (touch, vsync) but not
-/// for surface/lifecycle transitions (UpdateSurface, SurfaceDestroyed, OnShow,
-/// OnHide): dropping one permanently desyncs Java's lifecycle state from the
-/// host/render/JS state. Critical commands share the ordered host channel but
-/// bypass its normal-command quota, so enqueue never waits for normal backlog
-/// capacity.
-pub fn send_critical_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
+/// Host-owned callback results share the ordered host channel but bypass its
+/// normal-command quota, so an accepted platform result cannot disappear just
+/// because input filled the data-plane budget. This capability is deliberately
+/// held by the registry rather than exposed on `HostIngress`.
+pub fn send_reliable_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
     let sender = {
         let map = host_senders().read();
         map.get(&host_id).map(|handle| handle.critical_tx.clone())
     }
     .ok_or_else(|| {
         debug!(
-            "send_critical_command_to_host: host_id={host_id} not found (likely already shut down)"
+            "send_reliable_command_to_host: host_id={host_id} not found (likely already shut down)"
         );
         format!("Cannot find host_id={host_id} sender")
     })?;
@@ -317,10 +494,18 @@ pub fn send_critical_command_to_host(host_id: HostId, cmd: HostCommand) -> Resul
         Err(_error) => {
             let _ = unregister_sender(host_id);
             Err(format!(
-                "Failed to send critical command to host {host_id}: channel is closed"
+                "Failed to send reliable command to host {host_id}: channel is closed"
             ))
         }
     }
+}
+
+/// Send a lifecycle/surface command that must not be silently dropped.
+///
+/// Lifecycle transitions use the same trusted reliable lane as host callback
+/// results, preserving one FIFO across every non-droppable command class.
+pub fn send_critical_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
+    send_reliable_command_to_host(host_id, cmd)
 }
 
 pub fn shutdown_host(id: HostId) -> Result<(), String> {
@@ -353,6 +538,7 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use shared::host_channel::InputSendOutcome;
     use shared::surface::{Surface, SurfaceControl, SurfaceRef};
     use std::sync::atomic::AtomicUsize;
 
@@ -398,6 +584,44 @@ mod tests {
         let control = Arc::new(SurfaceControl::new());
         assert!(register_sender(id, tx, critical_tx, control).is_none());
         RegisteredHost(id)
+    }
+
+    struct RegisteredStats(HostId);
+
+    impl Drop for RegisteredStats {
+        fn drop(&mut self) {
+            shared::stats::unregister_stats(self.0);
+        }
+    }
+
+    fn test_ingress(
+        normal_capacity: usize,
+        reliable_capacity: usize,
+    ) -> (
+        HostIngress,
+        shared::host_channel::CriticalHostCommandSender,
+        shared::host_channel::HostCommandReceiver,
+        Arc<shared::stats::DebugStats>,
+        RegisteredStats,
+    ) {
+        let id = alloc_host_id();
+        let stats = shared::stats::register_stats(id);
+        let (tx, critical_tx, rx) =
+            shared::host_channel::channel_with_reserve(normal_capacity, reliable_capacity);
+        (
+            HostIngress {
+                host_id: id,
+                tx,
+                vsync_tx: None,
+                touch_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
+                gamepad_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
+                input_saturation_notified: Arc::new(AtomicBool::new(false)),
+            },
+            critical_tx,
+            rx,
+            stats,
+            RegisteredStats(id),
+        )
     }
 
     #[test]
@@ -470,41 +694,308 @@ mod tests {
     }
 
     #[test]
-    fn direct_touch_ingress_reuses_preallocated_payloads_and_preserves_backpressure() {
+    fn reliable_host_callback_bypasses_saturated_normal_budget() {
+        let id = alloc_host_id();
+        let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
+        assert!(register_sender(id, tx, critical_tx, Arc::new(SurfaceControl::new()),).is_none());
+        let _registration = RegisteredHost(id);
+
+        send_command_to_host(id, HostCommand::Restart).unwrap();
+        send_reliable_command_to_host(
+            id,
+            HostCommand::InvokeHostHook {
+                hook: "_internalOnAuthorizeResult",
+                args_json: "[]".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(rx.try_recv(), Ok(HostCommand::Restart)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::InvokeHostHook {
+                hook: "_internalOnAuthorizeResult",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn direct_touch_ingress_coalesces_moves_and_terminal_supersedes_them() {
         use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
 
-        fn touch(timestamp_ms: i64) -> TouchData {
+        fn touch(touch_type: TouchType, timestamp_ms: i64) -> TouchData {
             TouchData {
-                touch_type: TouchType::Move,
+                touch_type,
                 count: 1,
                 points: [TouchPoint::default(); 10],
                 timestamp_ms,
             }
         }
 
-        let id = alloc_host_id();
-        let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
-        assert!(register_sender(id, tx, critical_tx, Arc::new(SurfaceControl::new())).is_none());
-        let _registration = RegisteredHost(id);
-        let ingress = host_ingress(id).expect("registered Host has direct ingress");
+        let (ingress, _critical_tx, mut rx, stats, _registered_stats) = test_ingress(1, 1);
 
-        assert_eq!(ingress.try_send_touch(touch(1)), Ok(()));
+        assert!(matches!(
+            ingress.try_send_touch(touch(TouchType::Move, 1)),
+            Ok(InputSendOutcome::Enqueued)
+        ));
+        assert!(matches!(
+            ingress.try_send_touch(touch(TouchType::Move, 2)),
+            Ok(InputSendOutcome::Coalesced)
+        ));
+        assert!(matches!(
+            ingress.try_send_touch(touch(TouchType::End, 3)),
+            Ok(InputSendOutcome::Enqueued)
+        ));
+        match rx.try_recv() {
+            Ok(HostCommand::OnTouch(payload)) => {
+                assert_eq!(payload.touch_type, TouchType::End);
+                assert_eq!(payload.timestamp_ms, 3);
+            }
+            other => panic!("unexpected terminal command: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.input_coalesced.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.input_reliable_reserve_uses.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.input_saturation_events.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn terminal_touch_has_a_candidate_slot_at_peak_payload_occupancy() {
+        use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
+
+        fn touch(touch_type: TouchType, timestamp_ms: i64) -> TouchData {
+            TouchData {
+                touch_type,
+                count: 1,
+                points: [TouchPoint::default(); 10],
+                timestamp_ms,
+            }
+        }
+
+        let (ingress, _critical_tx, mut rx, stats, _registered_stats) = test_ingress(2, 1);
+        ingress.try_send_touch(touch(TouchType::Move, 0)).unwrap();
+        let held_by_consumer = match rx.try_recv().unwrap() {
+            HostCommand::OnTouch(payload) => payload,
+            command => panic!("unexpected command held by consumer: {command:?}"),
+        };
+
+        ingress.try_send_touch(touch(TouchType::Start, 1)).unwrap();
+        ingress.try_send_touch(touch(TouchType::Move, 2)).unwrap();
         assert_eq!(
-            ingress.try_send_touch(touch(2)),
+            ingress.try_send_touch(touch(TouchType::Start, 3)),
+            Ok(InputSendOutcome::Reserved)
+        );
+
+        assert_eq!(
+            ingress.try_send_touch(touch(TouchType::End, 4)),
+            Ok(InputSendOutcome::Enqueued),
+            "terminal input must acquire a candidate slot before superseding queued motion"
+        );
+        assert_eq!(stats.input_saturation_events.load(Ordering::Relaxed), 0);
+        drop(held_by_consumer);
+    }
+
+    #[test]
+    fn reliable_input_uses_reserve_and_reports_only_actual_refusal() {
+        let (ingress, _critical_tx, _rx, stats, _registered_stats) = test_ingress(1, 1);
+        ingress.try_send(HostCommand::Restart).unwrap();
+
+        assert!(matches!(
+            ingress.try_send_pointer(HostCommand::OnMouseDown {
+                x: 1.0,
+                y: 2.0,
+                button: 0,
+                timestamp_ms: 3.0,
+            }),
+            Ok(InputSendOutcome::Reserved)
+        ));
+        assert_eq!(
+            ingress.try_send_pointer(HostCommand::OnMouseUp {
+                x: 1.0,
+                y: 2.0,
+                button: 0,
+                timestamp_ms: 4.0,
+            }),
             Err(HostIngressSendError::Full)
         );
-        match rx.try_recv() {
-            Ok(HostCommand::OnTouch(payload)) => assert_eq!(payload.timestamp_ms, 1),
-            other => panic!("unexpected first command: {other:?}"),
+        assert_eq!(stats.input_reliable_reserve_uses.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.input_saturation_events.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.command_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn composition_updates_coalesce_and_end_preserves_the_transition_pair() {
+        let (ingress, _critical_tx, mut rx, stats, _registered_stats) = test_ingress(2, 1);
+        ingress
+            .try_send_composition(HostCommand::OnCompositionStart {
+                data: String::new(),
+            })
+            .unwrap();
+        ingress
+            .try_send_composition(HostCommand::OnCompositionUpdate {
+                data: "n".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            ingress.try_send_composition(HostCommand::OnCompositionUpdate {
+                data: "ni".to_owned(),
+            }),
+            Ok(InputSendOutcome::Coalesced)
+        );
+        ingress
+            .try_send_composition(HostCommand::OnCompositionEnd {
+                data: "ni".to_owned(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::OnCompositionStart { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::OnCompositionEnd { data }) if data == "ni"
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.input_coalesced.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn key_up_and_keyboard_complete_each_use_the_reliable_reserve() {
+        let key_up = HostCommand::OnKeyUp {
+            key: "a".to_owned(),
+            code: "KeyA".to_owned(),
+            timestamp_ms: 1.0,
+            modifiers: 0,
+            repeat: false,
+        };
+        let (key_ingress, _critical_tx, _rx, key_stats, _registered_stats) = test_ingress(1, 1);
+        key_ingress.try_send(HostCommand::Restart).unwrap();
+        assert_eq!(
+            key_ingress.try_send_key(key_up),
+            Ok(InputSendOutcome::Reserved)
+        );
+        assert_eq!(
+            key_stats
+                .input_reliable_reserve_uses
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let (keyboard_ingress, _critical_tx, _rx, keyboard_stats, _registered_stats) =
+            test_ingress(1, 1);
+        keyboard_ingress.try_send(HostCommand::Restart).unwrap();
+        assert_eq!(
+            keyboard_ingress.try_send_keyboard(HostCommand::OnKeyboardComplete {
+                value: "done".to_owned(),
+            }),
+            Ok(InputSendOutcome::Reserved)
+        );
+        assert_eq!(
+            keyboard_stats
+                .input_reliable_reserve_uses
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn gamepad_samples_coalesce_by_index_and_disconnect_supersedes_its_sample() {
+        use shared::protocol::host_cmd::{
+            GAMEPAD_MAX_AXES, GAMEPAD_MAX_BUTTONS, GamepadButtonState, GamepadState,
+        };
+
+        fn state(index: u32, timestamp_ms: f64) -> GamepadState {
+            GamepadState {
+                index,
+                axis_count: 0,
+                button_count: 0,
+                axes: [0.0; GAMEPAD_MAX_AXES],
+                buttons: [GamepadButtonState::default(); GAMEPAD_MAX_BUTTONS],
+                timestamp_ms,
+            }
         }
 
-        // Receiving and dropping the first command returns both its queue
-        // permit and its payload slot, so the same bounded resources work
-        // again without a heap fallback.
-        assert_eq!(ingress.try_send_touch(touch(3)), Ok(()));
+        let (ingress, _critical_tx, mut rx, stats, _registered_stats) = test_ingress(3, 1);
+        ingress.try_send_gamepad_state(state(0, 1.0)).unwrap();
+        ingress.try_send_gamepad_state(state(1, 2.0)).unwrap();
+        assert_eq!(
+            ingress.try_send_gamepad_state(state(0, 3.0)),
+            Ok(InputSendOutcome::Coalesced)
+        );
+        ingress
+            .try_send_gamepad_connection(HostCommand::OnGamepadDisconnected { index: 0 })
+            .unwrap();
+
         match rx.try_recv() {
-            Ok(HostCommand::OnTouch(payload)) => assert_eq!(payload.timestamp_ms, 3),
-            other => panic!("unexpected reused command: {other:?}"),
+            Ok(HostCommand::OnGamepadState(sample)) => {
+                assert_eq!(sample.index, 1);
+                assert_eq!(sample.timestamp_ms, 2.0);
+            }
+            other => panic!("unexpected gamepad sample: {other:?}"),
         }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::OnGamepadDisconnected { index: 0 })
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.input_coalesced.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn saturation_notification_is_shared_and_rearmed_by_success() {
+        let (ingress, _critical_tx, mut rx, _stats, _registered_stats) = test_ingress(1, 1);
+        let clone = ingress.clone();
+        ingress.try_send(HostCommand::Restart).unwrap();
+        ingress
+            .try_send_pointer(HostCommand::OnMouseDown {
+                x: 1.0,
+                y: 2.0,
+                button: 0,
+                timestamp_ms: 2.0,
+            })
+            .unwrap();
+
+        assert_eq!(
+            ingress.try_send_pointer(HostCommand::OnMouseUp {
+                x: 1.0,
+                y: 2.0,
+                button: 0,
+                timestamp_ms: 3.0,
+            }),
+            Err(HostIngressSendError::Full)
+        );
+        assert!(ingress.claim_input_saturation_notification());
+        assert!(!clone.claim_input_saturation_notification());
+
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        ingress
+            .try_send_pointer(HostCommand::OnMouseDown {
+                x: 2.0,
+                y: 3.0,
+                button: 0,
+                timestamp_ms: 4.0,
+            })
+            .unwrap();
+        ingress
+            .try_send_pointer(HostCommand::OnMouseDown {
+                x: 2.0,
+                y: 3.0,
+                button: 0,
+                timestamp_ms: 4.5,
+            })
+            .unwrap();
+        assert_eq!(
+            ingress.try_send_pointer(HostCommand::OnMouseUp {
+                x: 2.0,
+                y: 3.0,
+                button: 0,
+                timestamp_ms: 5.0,
+            }),
+            Err(HostIngressSendError::Full)
+        );
+        assert!(clone.claim_input_saturation_notification());
     }
 }

@@ -1224,8 +1224,6 @@ pub fn op_recorder_resume(state: &mut OpState) -> Result<(), AudioError> {
 /// Stop recording. Results delivered asynchronously via RecorderEvent.
 #[op2(fast)]
 pub fn op_recorder_stop(state: &mut OpState) -> Result<(), AudioError> {
-    crate::permission::require_scope(state, Scope::Record)
-        .map_err(|denied| audio_err(denied.to_string()))?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(recorder) = services.recorder() {

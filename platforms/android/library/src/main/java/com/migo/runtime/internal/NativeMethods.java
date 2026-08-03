@@ -22,6 +22,19 @@ import org.json.JSONObject;
  * @hide
  */
 public final class NativeMethods {
+    interface PermissionUpdater {
+        boolean update(int sessionId, String scope, boolean granted);
+    }
+
+    interface SessionShutdown {
+        boolean shutdown(int sessionId);
+    }
+
+    private static final PermissionUpdater NATIVE_PERMISSION_UPDATER =
+            NativeBridge::updatePermission;
+    private static volatile PermissionUpdater sPermissionUpdater = NATIVE_PERMISSION_UPDATER;
+    private static final SessionShutdown NATIVE_SESSION_SHUTDOWN = NativeBridge::shutdown;
+    private static volatile SessionShutdown sSessionShutdown = NATIVE_SESSION_SHUTDOWN;
 
     /**
      * Size of a single TouchPoint structure in bytes.
@@ -98,10 +111,8 @@ public final class NativeMethods {
      *
      * @param sessionId The session ID to shut down
      */
-    public static void shutdown(int sessionId) {
-        if (sessionId >= 0) {
-            NativeBridge.shutdown(sessionId);
-        }
+    public static boolean shutdown(int sessionId) {
+        return sessionId >= 0 && sSessionShutdown.shutdown(sessionId);
     }
 
     // ==================== Surface Management ====================
@@ -380,10 +391,10 @@ public final class NativeMethods {
      * @param forces    Array of pressure values (0.0-1.0)
      * @param flags     Array of flags (1 = changed pointer)
      */
-    public static void onTouch(int sessionId, int action, long time,
-                               int[] ids, float[] xs, float[] ys, float[] forces, int[] flags) {
+    public static boolean onTouch(int sessionId, int action, long time,
+                                  int[] ids, float[] xs, float[] ys, float[] forces, int[] flags) {
         if (sessionId < 0 || ids == null || ids.length == 0) {
-            return;
+            return false;
         }
 
         int count = Math.min(ids.length, MAX_TOUCH_POINTS);
@@ -399,7 +410,7 @@ public final class NativeMethods {
         }
 
         buffer.flip();
-        NativeBridge.onTouchEvent(sessionId, action, time, count, buffer);
+        return NativeBridge.onTouchEvent(sessionId, action, time, count, buffer);
     }
 
     /**
@@ -411,10 +422,12 @@ public final class NativeMethods {
      * @param count     Number of touch points
      * @param buffer    Pre-packed DirectByteBuffer
      */
-    public static void onTouchRaw(int sessionId, int action, long time, int count, ByteBuffer buffer) {
+    public static boolean onTouchRaw(int sessionId, int action, long time, int count,
+                                     ByteBuffer buffer) {
         if (sessionId >= 0 && count > 0 && buffer != null) {
-            NativeBridge.onTouchEvent(sessionId, action, time, count, buffer);
+            return NativeBridge.onTouchEvent(sessionId, action, time, count, buffer);
         }
+        return false;
     }
 
     // ==================== Game Loading ====================
@@ -921,10 +934,27 @@ public final class NativeMethods {
      * @param scope     wx scope name, e.g. "scope.camera"
      * @param granted   whether the game may use it
      */
-    public static void updatePermission(int sessionId, String scope, boolean granted) {
+    public static boolean updatePermission(int sessionId, String scope, boolean granted) {
         if (sessionId >= 0 && scope != null && !scope.isEmpty()) {
-            NativeBridge.updatePermission(sessionId, scope, granted);
+            return sPermissionUpdater.update(sessionId, scope, granted);
         }
+        return false;
+    }
+
+    static void setPermissionUpdaterForTests(PermissionUpdater updater) {
+        sPermissionUpdater = updater;
+    }
+
+    static void resetPermissionUpdaterForTests() {
+        sPermissionUpdater = NATIVE_PERMISSION_UPDATER;
+    }
+
+    static void setSessionShutdownForTests(SessionShutdown shutdown) {
+        sSessionShutdown = shutdown;
+    }
+
+    static void resetSessionShutdownForTests() {
+        sSessionShutdown = NATIVE_SESSION_SHUTDOWN;
     }
 
     // ==================== Ad Callbacks ====================

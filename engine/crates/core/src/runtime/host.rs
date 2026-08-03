@@ -24,7 +24,11 @@ use shared::{
 };
 
 use crate::{
-    runtime::{HostId, vsync},
+    runtime::{
+        HostId,
+        input_state::{InputRetraction, InputState},
+        vsync,
+    },
     services::{AudioService, PlatformServices, RenderService},
 };
 
@@ -192,6 +196,10 @@ pub(crate) struct Host {
     /// dispatch visibility callbacks only once the page can render again; doing
     /// it earlier lets game code run against a paused render/audio subsystem.
     pending_on_show_args: Option<Cow<'static, str>>,
+
+    /// Accepted input state retained at the sole FIFO consumer so focus loss
+    /// can retract it without sending synthetic work through a saturated queue.
+    input_state: InputState,
 
     /// Per-session GPU caps shared with the render thread.
     /// Survives JS runtime restarts (same GL context).
@@ -525,6 +533,7 @@ impl Host {
             last_context_epoch: 0,
             render_error_throttle: HashMap::new(),
             pending_on_show_args: None,
+            input_state: InputState::default(),
             gpu_caps,
             render_notify,
         };
@@ -754,6 +763,9 @@ impl Host {
             }
 
             HostCommand::OnFocusChanged { focused } => {
+                if !focused {
+                    self.retract_input_for_focus_loss();
+                }
                 self.js.dispatch_focus_changed(focused);
                 Ok(())
             }
@@ -772,6 +784,7 @@ impl Host {
 
             HostCommand::OnTouch(touch) => {
                 let count = (touch.count as usize).min(touch.points.len());
+                self.input_state.observe_touch(&touch);
                 self.js.dispatch_touch(
                     touch.touch_type,
                     &touch.points[..count],
@@ -903,6 +916,7 @@ impl Host {
 
             HostCommand::OnCompositionStart { data } => {
                 self.js.dispatch_composition_start(&data);
+                self.input_state.observe_composition_start();
                 Ok(())
             }
 
@@ -913,6 +927,7 @@ impl Host {
 
             HostCommand::OnCompositionEnd { data } => {
                 self.js.dispatch_composition_end(&data);
+                self.input_state.observe_composition_end();
                 Ok(())
             }
 
@@ -947,6 +962,8 @@ impl Host {
             } => {
                 self.js
                     .dispatch_key_down(&key, &code, timestamp_ms, modifiers, repeat);
+                self.input_state
+                    .observe_key_down(key, code, timestamp_ms, modifiers);
                 Ok(())
             }
 
@@ -959,6 +976,7 @@ impl Host {
             } => {
                 self.js
                     .dispatch_key_up(&key, &code, timestamp_ms, modifiers, repeat);
+                self.input_state.observe_key_up(&code);
                 Ok(())
             }
 
@@ -968,6 +986,8 @@ impl Host {
                 button,
                 timestamp_ms,
             } => {
+                self.input_state
+                    .observe_mouse_down(x, y, button, timestamp_ms);
                 self.js.dispatch_mouse_down(x, y, button, timestamp_ms);
                 Ok(())
             }
@@ -978,6 +998,8 @@ impl Host {
                 button,
                 timestamp_ms,
             } => {
+                self.input_state
+                    .observe_mouse_move(x, y, button, timestamp_ms);
                 self.js.dispatch_mouse_move(x, y, button, timestamp_ms);
                 Ok(())
             }
@@ -988,6 +1010,8 @@ impl Host {
                 button,
                 timestamp_ms,
             } => {
+                self.input_state
+                    .observe_mouse_up(x, y, button, timestamp_ms);
                 self.js.dispatch_mouse_up(x, y, button, timestamp_ms);
                 Ok(())
             }
@@ -1307,10 +1331,35 @@ impl Host {
         result
     }
 
+    fn retract_input_for_focus_loss(&mut self) {
+        let js = &mut self.js;
+        self.input_state
+            .retract_for_focus_loss(|retraction| match retraction {
+                InputRetraction::TouchCancel(touch) => {
+                    let count = usize::from(touch.count).min(touch.points.len());
+                    js.dispatch_touch(touch.touch_type, &touch.points[..count], touch.timestamp_ms);
+                }
+                InputRetraction::MouseUp {
+                    x,
+                    y,
+                    button,
+                    timestamp_ms,
+                } => js.dispatch_mouse_up(x, y, button, timestamp_ms),
+                InputRetraction::KeyUp {
+                    key,
+                    code,
+                    timestamp_ms,
+                    modifiers,
+                } => js.dispatch_key_up(&key, &code, timestamp_ms, modifiers, false),
+                InputRetraction::CompositionEnd => js.dispatch_composition_end(""),
+            });
+    }
+
     async fn on_restart(&mut self) -> EngineResult<()> {
         // Pause subsystems to ensure a clean restart
         self.render.pause();
         self.audio.pause();
+        self.input_state = InputState::default();
 
         // Bump the RAF session ticket so the fresh isolate ignores any signal
         // (stale timestamp) produced for the old one on the shared eventfd, and

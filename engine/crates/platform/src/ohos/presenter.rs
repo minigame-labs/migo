@@ -15,8 +15,8 @@
 use std::{any::Any, fmt, ptr::NonNull, sync::Arc};
 
 use graphics::egl_platform::{
-    EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId, GraphicsPlatform,
-    PreparedEglSurface, PreparedEglSurfaceRef,
+    EglConcurrency, EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId,
+    GraphicsPlatform, PlatformIdentity, PreparedEglSurface, PreparedEglSurfaceRef,
 };
 use khronos_egl as egl;
 use shared::{
@@ -30,6 +30,7 @@ const OHOS_EGL_LIBRARY: &str = "libEGL.so";
 
 #[derive(Debug)]
 struct OhosSystemEglBackend;
+struct OhosProcessEglDomain;
 
 #[derive(Debug, Default)]
 pub struct OhosEglProvider;
@@ -37,6 +38,14 @@ pub struct OhosEglProvider;
 impl EglProvider for OhosEglProvider {
     fn backend_id(&self) -> GraphicsBackendId {
         GraphicsBackendId::of::<OhosSystemEglBackend>()
+    }
+
+    fn concurrency(&self) -> EglConcurrency {
+        EglConcurrency::SharedContexts
+    }
+
+    fn platform_identity(&self) -> PlatformIdentity {
+        PlatformIdentity::new::<OhosProcessEglDomain>(self.backend_id(), 0)
     }
 
     fn label(&self) -> &str {
@@ -71,6 +80,10 @@ pub struct OhosEglSurfaceFactory;
 impl EglSurfaceFactory for OhosEglSurfaceFactory {
     fn backend_id(&self) -> GraphicsBackendId {
         GraphicsBackendId::of::<OhosSystemEglBackend>()
+    }
+
+    fn platform_identity(&self) -> PlatformIdentity {
+        PlatformIdentity::new::<OhosProcessEglDomain>(self.backend_id(), 0)
     }
 
     fn prepare(&self, surface: &dyn Surface) -> EngineResult<PreparedEglSurfaceRef> {
@@ -152,4 +165,29 @@ impl PreparedEglSurface for OhosPreparedSurface {
 
 pub fn ohos_graphics_platform() -> EngineResult<GraphicsPlatform> {
     GraphicsPlatform::try_new(Arc::new(OhosEglProvider), Arc::new(OhosEglSurfaceFactory))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_identity_is_stable_for_ohos_process_egl() {
+        assert_eq!(
+            ohos_graphics_platform()
+                .expect("first OpenHarmony platform")
+                .platform_identity(),
+            ohos_graphics_platform()
+                .expect("second OpenHarmony platform")
+                .platform_identity(),
+        );
+    }
+
+    #[test]
+    fn system_egl_supports_shared_context_threads() {
+        assert_eq!(
+            OhosEglProvider.concurrency(),
+            EglConcurrency::SharedContexts
+        );
+    }
 }

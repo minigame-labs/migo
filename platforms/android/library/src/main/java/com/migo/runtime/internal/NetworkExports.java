@@ -110,10 +110,10 @@ public final class NetworkExports {
     }
 
     public static void destroyNetworkMonitor(int sessionId) {
-        NetworkMonitor mgr = sNetworkMonitors.remove(sessionId);
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sNetworkMonitors,
+                id -> id == sessionId,
+                NetworkMonitor::destroy);
     }
 
     public static void destroyAll(int sessionId) {

@@ -265,6 +265,52 @@ mod host_bridge_dispatch_tests {
         );
     }
 
+    #[test]
+    fn poisoned_function_apply_cannot_recover_the_retired_holder() {
+        let mut rt = boot();
+        exec(&mut rt, PROBE);
+        let bindings = JsBindings::new(&mut rt, 1);
+
+        exec(
+            &mut rt,
+            "globalThis.__leakedBridge = undefined; \
+             Function.prototype.apply = function (receiver) { \
+                 globalThis.__leakedBridge = receiver; \
+             };",
+        );
+        bindings.invoke_host_hook(&mut rt, "_internalProbe", r#"["after poison"]"#);
+
+        assert_js(
+            &mut rt,
+            "const c = globalThis.__calls; \
+             let __ok = globalThis.__leakedBridge === undefined \
+                 && c.length === 1 && c[0][0] === 'after poison'; \
+             let __msg = 'holder leaked=' + (globalThis.__leakedBridge !== undefined) \
+                 + ', calls=' + c.length",
+        );
+    }
+
+    #[test]
+    fn poisoned_json_and_array_intrinsics_cannot_block_host_dispatch() {
+        let mut rt = boot();
+        exec(&mut rt, PROBE);
+        let bindings = JsBindings::new(&mut rt, 1);
+
+        exec(
+            &mut rt,
+            "JSON.parse = function () { throw new Error('content JSON.parse'); }; \
+             Array.isArray = function () { throw new Error('content Array.isArray'); };",
+        );
+        bindings.invoke_host_hook(&mut rt, "_internalProbe", r#"["after poison"]"#);
+
+        assert_js(
+            &mut rt,
+            "const c = globalThis.__calls; \
+             let __ok = c.length === 1 && c[0][0] === 'after poison'; \
+             let __msg = 'host callback count=' + c.length",
+        );
+    }
+
     /// A reload re-resolves every hook, and by then the name is gone -- so it
     /// has to work from what was retained the first time.
     ///

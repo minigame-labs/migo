@@ -7,11 +7,14 @@ use shared::protocol::error::ServiceError;
 use shared::services::{CameraService, ImageApiService, Scope, VideoService};
 
 /// Look up the camera service and call `f` on it.
-fn with_camera<F, T>(state: &mut OpState, err_msg: &'static str, f: F) -> Result<T, JsErrorBox>
+fn with_camera_service<F, T>(
+    state: &mut OpState,
+    err_msg: &'static str,
+    f: F,
+) -> Result<T, JsErrorBox>
 where
     F: FnOnce(&dyn CameraService) -> Result<T, ServiceError>,
 {
-    crate::permission::require_scope(state, Scope::Camera)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(svc) = services.camera() {
@@ -58,7 +61,8 @@ pub fn op_camera_create(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "createCamera:fail not supported", |c| {
+    crate::permission::require_scope(state, Scope::Camera)?;
+    with_camera_service(state, "createCamera:fail not supported", |c| {
         c.create(options_json)
     })
 }
@@ -66,7 +70,7 @@ pub fn op_camera_create(
 /// Destroy a camera instance and release all resources.
 #[op2(fast)]
 pub fn op_camera_destroy(state: &mut OpState, #[smi] camera_id: u32) -> Result<(), JsErrorBox> {
-    with_camera(state, "camera.destroy:fail not supported", |c| {
+    with_camera_service(state, "camera.destroy:fail not supported", |c| {
         c.destroy(camera_id)
     })
 }
@@ -78,7 +82,8 @@ pub fn op_camera_take_photo(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.takePhoto:fail not supported", |c| {
+    crate::permission::require_scope(state, Scope::Camera)?;
+    with_camera_service(state, "camera.takePhoto:fail not supported", |c| {
         c.take_photo(options_json)
     })
 }
@@ -90,7 +95,8 @@ pub fn op_camera_start_record(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.startRecord:fail not supported", |c| {
+    crate::permission::require_scope(state, Scope::Camera)?;
+    with_camera_service(state, "camera.startRecord:fail not supported", |c| {
         c.start_record(options_json)
     })
 }
@@ -102,7 +108,7 @@ pub fn op_camera_stop_record(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.stopRecord:fail not supported", |c| {
+    with_camera_service(state, "camera.stopRecord:fail not supported", |c| {
         c.stop_record(options_json)
     })
 }
@@ -114,7 +120,8 @@ pub fn op_camera_set_zoom(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.setZoom:fail not supported", |c| {
+    crate::permission::require_scope(state, Scope::Camera)?;
+    with_camera_service(state, "camera.setZoom:fail not supported", |c| {
         c.set_zoom(options_json)
     })
 }
@@ -125,7 +132,8 @@ pub fn op_camera_listen_frame_change(
     state: &mut OpState,
     #[smi] camera_id: u32,
 ) -> Result<(), JsErrorBox> {
-    with_camera(state, "camera.listenFrameChange:fail not supported", |c| {
+    crate::permission::require_scope(state, Scope::Camera)?;
+    with_camera_service(state, "camera.listenFrameChange:fail not supported", |c| {
         c.listen_frame_change(camera_id)
     })
 }
@@ -136,7 +144,7 @@ pub fn op_camera_close_frame_change(
     state: &mut OpState,
     #[smi] camera_id: u32,
 ) -> Result<(), JsErrorBox> {
-    with_camera(state, "camera.closeFrameChange:fail not supported", |c| {
+    with_camera_service(state, "camera.closeFrameChange:fail not supported", |c| {
         c.close_frame_change(camera_id)
     })
 }
@@ -149,6 +157,7 @@ pub fn op_save_image_to_photos_album(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::WritePhotosAlbum)?;
     with_image_api(state, "saveImageToPhotosAlbum:fail not supported", |svc| {
         svc.save_image_to_photos_album(options_json)
     })

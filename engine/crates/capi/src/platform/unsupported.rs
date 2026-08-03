@@ -16,6 +16,12 @@ pub(crate) enum PlatformTarget {
     TestOnly,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum PlatformContext {
+    #[cfg(test)]
+    TestOnly,
+}
+
 pub(crate) const fn supported_platform_kinds() -> u64 {
     0
 }
@@ -33,13 +39,25 @@ pub(crate) fn rebuild_surface(
 
 pub(crate) fn build_target(
     _descriptor: SurfaceDescriptorRef,
+    _existing: Option<&PlatformContext>,
 ) -> Result<
     (
         SurfaceRef,
         graphics::egl_platform::GraphicsPlatform,
         PlatformTarget,
+        PlatformContext,
     ),
     MigoResult,
 > {
     Err(MIGO_ERROR_UNSUPPORTED_PLATFORM)
+}
+
+#[cfg(test)]
+pub(crate) fn test_platform_target() -> PlatformTarget {
+    PlatformTarget::TestOnly
+}
+
+#[cfg(test)]
+pub(crate) fn test_platform_context() -> PlatformContext {
+    PlatformContext::TestOnly
 }

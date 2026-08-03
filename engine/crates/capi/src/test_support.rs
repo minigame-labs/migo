@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
     },
 };
 
@@ -30,6 +30,7 @@ pub(crate) fn callback_session_pin() -> Arc<MigoSession> {
             code_cache_dir: PathBuf::new(),
             allow_unsigned_content: false,
             live_sessions: Mutex::new(0),
+            retired_hosts: Mutex::new(Vec::new()),
         }),
         state: Mutex::new(SessionState::default()),
         callback_gate: crate::callback_gate::CallbackGate::new(),
@@ -37,6 +38,7 @@ pub(crate) fn callback_session_pin() -> Arc<MigoSession> {
         ingress: OnceLock::new(),
         active_surface_generation: AtomicU64::new(0),
         gamepad_topology: crate::gamepad::GamepadTopology::new(),
+        input_saturation_reported: AtomicBool::new(false),
     })
 }
 

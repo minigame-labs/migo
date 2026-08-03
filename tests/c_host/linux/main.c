@@ -367,10 +367,8 @@ int main(int argc, char **argv) {
     }
 
     /* ---- Host-owned window. Migo never creates one. ---- */
-    if (!XInitThreads()) {
-        fprintf(stderr, "[c-host] XInitThreads failed\n");
-        return 1;
-    }
+    /* Migo borrows this connection only during attach, then renders through
+     * its own X11 connection. This event loop remains single-threaded. */
     Display *display = XOpenDisplay(NULL);
     if (!display) {
         fprintf(stderr, "[c-host] XOpenDisplay failed (DISPLAY=%s)\n",

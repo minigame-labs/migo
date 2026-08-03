@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
-use crate::egl_platform::{EglInstance, EglProvider, GraphicsBackendId};
+use crate::egl_platform::{EglConcurrency, EglInstance, EglProvider, GraphicsBackendId};
 use shared::error::{EngineError, EngineResult, ErrorCode};
 
 /// A single upload that completed on the upload thread but whose result
@@ -98,6 +98,22 @@ const MAX_FAILURES_BEFORE_DEGRADE: u32 = 3;
 /// Queue capacity for pending upload jobs.
 const JOB_QUEUE_CAPACITY: usize = 16;
 
+#[inline]
+fn provider_allows_background_context(provider: &dyn EglProvider) -> bool {
+    provider.concurrency() == EglConcurrency::SharedContexts
+}
+
+fn with_background_context<T>(provider: &dyn EglProvider, create: impl FnOnce() -> T) -> Option<T> {
+    if !provider_allows_background_context(provider) {
+        info!(
+            provider = provider.label(),
+            "background EGL upload disabled by provider concurrency policy"
+        );
+        return None;
+    }
+    Some(create())
+}
+
 impl UploadThreadHandle {
     /// Try to spawn the upload thread with a shared EGL context.
     ///
@@ -119,6 +135,8 @@ impl UploadThreadHandle {
         has_robust_context: bool,
         surfaceless: bool,
     ) -> Option<Self> {
+        with_background_context(egl_provider.as_ref(), || ())?;
+
         // Create shared context matching the render context's GLES
         // version.  R-3: mirror the render context's robustness
         // setting so the shared context also reports reset via
@@ -579,6 +597,7 @@ fn do_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egl_platform::EglConcurrency;
 
     #[derive(Debug)]
     struct InjectedFailureProvider {
@@ -588,6 +607,14 @@ mod tests {
     impl EglProvider for InjectedFailureProvider {
         fn backend_id(&self) -> GraphicsBackendId {
             GraphicsBackendId::of::<Self>()
+        }
+
+        fn concurrency(&self) -> EglConcurrency {
+            EglConcurrency::RenderThreadOnly
+        }
+
+        fn platform_identity(&self) -> crate::egl_platform::PlatformIdentity {
+            crate::egl_platform::PlatformIdentity::new::<Self>(self.backend_id(), 0)
         }
 
         fn label(&self) -> &str {
@@ -603,6 +630,22 @@ mod tests {
         fn display(&self, _egl: &EglInstance) -> EngineResult<khronos_egl::Display> {
             panic!("upload worker must only load before reconstructing raw handles")
         }
+    }
+
+    #[test]
+    fn render_thread_only_provider_never_spawns_upload_worker() {
+        let create_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = InjectedFailureProvider {
+            loads: Arc::new(AtomicU32::new(0)),
+        };
+
+        let called = Arc::clone(&create_called);
+        let result = with_background_context(&provider, move || {
+            called.store(true, Ordering::Relaxed);
+        });
+
+        assert!(result.is_none());
+        assert!(!create_called.load(Ordering::Relaxed));
     }
 
     #[test]

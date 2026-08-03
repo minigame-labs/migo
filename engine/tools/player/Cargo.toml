@@ -37,6 +37,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 png = "0.17"
 
+[dev-dependencies]
+migo-core = { path = "../../crates/core", default-features = false, features = ["test-support"] }
+
 # X11 is only used by the Linux windowed path (src/x11_window.rs). Left
 # unconditional it breaks every other target: x11-dl calls libc's dlopen family,
 # which does not exist on Windows, so the player failed to build there long

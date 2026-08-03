@@ -58,13 +58,13 @@ const NATIVE_CORE: &[JniMethod] = methods![
         "init",
         "(Ljava/lang/Object;Lcom/migo/runtime/RuntimeConfig;)I"
     ),
-    ("shutdown", "(I)V"),
+    ("shutdown", "(I)Z"),
     ("onShow", "(ILjava/lang/String;)V"),
     ("onHide", "(I)V"),
     ("onRestart", "(I)V"),
     ("updateSurface", "(ILjava/lang/Object;IIF)V"),
     ("onSurfaceDestroyed", "(I)V"),
-    ("onTouchEvent", "(IIJILjava/nio/ByteBuffer;)V"),
+    ("onTouchEvent", "(IIJILjava/nio/ByteBuffer;)Z"),
     ("modMain", "(ILjava/lang/String;Ljava/lang/String;)I"),
     ("executeScript", "(ILjava/lang/String;)I"),
     ("onVsync", "(IJ)V"),
@@ -147,7 +147,7 @@ const NATIVE_COMMERCE: &[JniMethod] = methods![
 
 const NATIVE_SYSTEM: &[JniMethod] = methods![
     ("onAuthorizeResult", "(ILjava/lang/String;)V"),
-    ("updatePermission", "(ILjava/lang/String;Z)V"),
+    ("updatePermission", "(ILjava/lang/String;Z)Z"),
     ("onModalResult", "(III)V"),
     ("onActionSheetResult", "(II)V"),
 ];
@@ -313,6 +313,7 @@ const JAVA_COMMERCE: &[JniMethod] = methods![
 
 const JAVA_SYSTEM: &[JniMethod] = methods![
     ("permissionRequest", "(ILjava/lang/String;)V"),
+    ("revokePermissionResources", "(ILjava/lang/String;)V"),
     ("showToast", "(ILjava/lang/String;)V"),
     ("hideToast", "(I)V"),
     ("showModal", "(ILjava/lang/String;)V"),
@@ -427,9 +428,10 @@ mod tests {
         // and +6 Java (`adCreate`/`adLoad`/`adShow`/`adHide`/`adUpdateStyle`/
         // `adDestroy`). Then by host-decided permissions: +2 native
         // (`onAuthorizeResult`, `updatePermission`) and +1 Java
-        // (`permissionRequest`).
+        // (`permissionRequest`). Permission revocation adds +1 Java
+        // (`revokePermissionResources`) for synchronous targeted teardown.
         assert_eq!(native.len(), 69, "full NativeBridge surface changed");
-        assert_eq!(java.len(), 124, "full NativeExports surface changed");
+        assert_eq!(java.len(), 125, "full NativeExports surface changed");
         assert_unique(&native);
         assert_unique(&java);
     }

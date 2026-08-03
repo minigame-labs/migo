@@ -37,6 +37,8 @@ public final class ErrorCode {
     public static final int ERR_ENTRY_NOT_FOUND = -2003;
     /** JavaScript execution error */
     public static final int ERR_JS_EXECUTION = -2004;
+    /** Terminal platform resource cleanup did not fully complete */
+    public static final int ERR_CLEANUP_FAILED = -2005;
 
     // ==================== Platform Errors (-5xxx) ====================
     /** Activity is null or finishing */
@@ -73,6 +75,9 @@ public final class ErrorCode {
     /** Code file hash does not match manifest. */
     public static final int NATIVE_CODE_INTEGRITY_FAILED = 208;
 
+    /** Bounded input transport refused an event; the session remains usable. */
+    public static final int NATIVE_INPUT_SATURATED = 11;
+
     /**
      * Get a human-readable message for an error code.
      *
@@ -92,6 +97,7 @@ public final class ErrorCode {
             case ERR_CODE_DIR_NOT_FOUND: return "Code directory not found";
             case ERR_ENTRY_NOT_FOUND: return "Entry point not found";
             case ERR_JS_EXECUTION: return "JavaScript execution error";
+            case ERR_CLEANUP_FAILED: return "Terminal resource cleanup failed";
             case ERR_INVALID_ACTIVITY: return "Invalid activity";
             // Native engine errors
             case NATIVE_OUT_OF_MEMORY: return "V8 out of memory";
@@ -100,6 +106,7 @@ public final class ErrorCode {
             case NATIVE_ANR: return "Application not responding (ANR)";
             case NATIVE_CODE_SIGNATURE_INVALID: return "Code signature invalid";
             case NATIVE_CODE_INTEGRITY_FAILED: return "Code integrity check failed";
+            case NATIVE_INPUT_SATURATED: return "Input transport saturated";
             default: return "Unknown error (" + code + ")";
         }
     }
@@ -125,6 +132,7 @@ public final class ErrorCode {
     public static boolean isRecoverable(int code) {
         switch (code) {
             case NATIVE_JS_EXECUTION_TIMEOUT:  // watchdog can restart JS isolate
+            case NATIVE_INPUT_SATURATED:
                 return true;
             default:
                 return false;

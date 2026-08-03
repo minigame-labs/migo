@@ -1,5 +1,6 @@
 package com.migo.runtime.internal.platform;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
@@ -22,7 +23,9 @@ import android.os.Build;
 import android.os.ParcelUuid;
 import android.util.Log;
 
+import com.migo.runtime.internal.NativeExports;
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.ResourceCleanup;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -34,6 +37,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 
 /**
  * Manages Bluetooth adapter, BLE device discovery, pairing, and Beacon operations.
@@ -46,6 +50,104 @@ public class BluetoothManager {
     private final int sessionId;
     private final WeakReference<Activity> activityRef;
     private final BluetoothAdapter adapter;
+    private final CleanupFailureReporter cleanupFailureReporter;
+    private final ConnectionStateReporter connectionStateReporter;
+    private final GattCallbackAdmission gattCallbackAdmission;
+    private final BooleanSupplier gattConnectPermissionGranted;
+    private final BooleanSupplier gattSessionTerminated;
+    private final GattEventReporter gattEventReporter;
+
+    interface CleanupFailureReporter {
+        void report(String operation, RuntimeException failure);
+    }
+
+    interface ConnectionStateReporter {
+        void report(String deviceId, boolean connected);
+    }
+
+    interface GattCallbackAdmission {
+        boolean run(BooleanSupplier callback);
+    }
+
+    interface GattEventReporter {
+        void characteristic(
+                String deviceId,
+                String serviceId,
+                String characteristicId,
+                byte[] value);
+        void mtu(String deviceId, int mtu);
+    }
+
+    interface GattConnection {
+        BluetoothGatt raw();
+        boolean discoverServices();
+        void disconnect();
+        void close();
+    }
+
+    private static final class AndroidGattConnection implements GattConnection {
+        private final BluetoothGatt gatt;
+
+        AndroidGattConnection(BluetoothGatt gatt) {
+            this.gatt = gatt;
+        }
+
+        @Override public BluetoothGatt raw() {
+            return gatt;
+        }
+
+        @Override public boolean discoverServices() {
+            return gatt.discoverServices();
+        }
+
+        @Override public void disconnect() {
+            gatt.disconnect();
+        }
+
+        @Override public void close() {
+            gatt.close();
+        }
+    }
+
+    static final class GattAttempt {
+        private GattConnection connection;
+        private boolean acceptingCallbacks = true;
+
+        synchronized boolean attach(GattConnection candidate) {
+            if (!acceptingCallbacks) return false;
+            if (connection == null) connection = candidate;
+            return matches(candidate);
+        }
+
+        synchronized GattConnection connection() {
+            return connection;
+        }
+
+        synchronized GattConnection beginClose() {
+            acceptingCallbacks = false;
+            return connection;
+        }
+
+        synchronized boolean dispatchIfActive(
+                GattConnection candidate,
+                BooleanSupplier connectPermissionGranted,
+                BooleanSupplier sessionTerminated,
+                Runnable callback) {
+            if (!acceptingCallbacks || !matches(candidate)
+                    || !connectPermissionGranted.getAsBoolean()
+                    || sessionTerminated.getAsBoolean()) {
+                return false;
+            }
+            callback.run();
+            return true;
+        }
+
+        private boolean matches(GattConnection candidate) {
+            if (connection == candidate) return true;
+            BluetoothGatt raw = connection != null ? connection.raw() : null;
+            return raw != null && raw == candidate.raw();
+        }
+    }
 
     private boolean adapterOpened = false;
     private volatile boolean discovering = false;
@@ -54,7 +156,8 @@ public class BluetoothManager {
     private final ConcurrentHashMap<String, JSONObject> discoveredDevices = new ConcurrentHashMap<>();
 
     /** Active GATT connections keyed by device address. */
-    private final ConcurrentHashMap<String, BluetoothGatt> gattConnections = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, GattAttempt> gattConnections =
+            new ConcurrentHashMap<>();
 
     /** Cached negotiated MTU per device. Updated by onMtuChanged callback. */
     private final ConcurrentHashMap<String, Integer> negotiatedMtu = new ConcurrentHashMap<>();
@@ -79,12 +182,174 @@ public class BluetoothManager {
         this.sessionId = sessionId;
         this.activityRef = new WeakReference<>(activity);
         this.adapter = getAdapter(activity);
+        this.cleanupFailureReporter = (operation, failure) ->
+                NativeExports.reportCleanupFailureAndScheduleTerminalClose(
+                        sessionId, operation, failure);
+        this.connectionStateReporter = (deviceId, connected) ->
+                NativeMethods.onBLEConnectionStateChange(
+                        sessionId, deviceId, connected);
+        this.gattCallbackAdmission = callback -> NativeExports.runIfPermissionGranted(
+                sessionId, "scope.bluetooth", callback);
+        this.gattConnectPermissionGranted = this::hasConnectPermission;
+        this.gattSessionTerminated = () -> NativeExports.isSessionTerminated(sessionId);
+        this.gattEventReporter = new GattEventReporter() {
+            @Override public void characteristic(
+                    String deviceId,
+                    String serviceId,
+                    String characteristicId,
+                    byte[] value) {
+                NativeMethods.onBLECharacteristicValueChange(
+                        sessionId, deviceId, serviceId, characteristicId, value);
+            }
+
+            @Override public void mtu(String deviceId, int mtu) {
+                NativeMethods.onBLEMTUChange(sessionId, deviceId, mtu);
+            }
+        };
         this.discoveryRequest = new LifecycleRequestState<>(lifecycleSuspended);
         this.beaconRequest = new LifecycleRequestState<>(lifecycleSuspended);
     }
 
+    BluetoothManager(
+            int sessionId,
+            CleanupFailureReporter cleanupFailureReporter,
+            ConnectionStateReporter connectionStateReporter) {
+        this(
+                sessionId,
+                cleanupFailureReporter,
+                connectionStateReporter,
+                callback -> callback.getAsBoolean(),
+                () -> true,
+                () -> false,
+                new GattEventReporter() {
+                    @Override public void characteristic(
+                            String deviceId,
+                            String serviceId,
+                            String characteristicId,
+                            byte[] value) {}
+
+                    @Override public void mtu(String deviceId, int mtu) {}
+                });
+    }
+
+    BluetoothManager(
+            int sessionId,
+            CleanupFailureReporter cleanupFailureReporter,
+            ConnectionStateReporter connectionStateReporter,
+            BooleanSupplier gattConnectPermissionGranted,
+            BooleanSupplier gattSessionTerminated,
+            GattEventReporter gattEventReporter) {
+        this(
+                sessionId,
+                cleanupFailureReporter,
+                connectionStateReporter,
+                callback -> callback.getAsBoolean(),
+                gattConnectPermissionGranted,
+                gattSessionTerminated,
+                gattEventReporter);
+    }
+
+    BluetoothManager(
+            int sessionId,
+            CleanupFailureReporter cleanupFailureReporter,
+            ConnectionStateReporter connectionStateReporter,
+            GattCallbackAdmission gattCallbackAdmission,
+            BooleanSupplier gattConnectPermissionGranted,
+            BooleanSupplier gattSessionTerminated,
+            GattEventReporter gattEventReporter) {
+        this.sessionId = sessionId;
+        this.activityRef = new WeakReference<>(null);
+        this.adapter = null;
+        this.cleanupFailureReporter = cleanupFailureReporter;
+        this.connectionStateReporter = connectionStateReporter;
+        this.gattCallbackAdmission = gattCallbackAdmission;
+        this.gattConnectPermissionGranted = gattConnectPermissionGranted;
+        this.gattSessionTerminated = gattSessionTerminated;
+        this.gattEventReporter = gattEventReporter;
+        this.discoveryRequest = new LifecycleRequestState<>(false);
+        this.beaconRequest = new LifecycleRequestState<>(false);
+    }
+
     private Activity getActivity() {
         return activityRef.get();
+    }
+
+    private boolean hasConnectPermission() {
+        Activity activity = getActivity();
+        boolean granted = activity != null
+                && Permissions.isGranted(activity, Permissions.BLUETOOTH_CONNECT);
+        return BluetoothPermissionPolicy.canConnect(Build.VERSION.SDK_INT, granted);
+    }
+
+    private boolean hasScanPermission() {
+        Activity activity = getActivity();
+        boolean scanGranted = activity != null
+                && Permissions.isGranted(activity, Permissions.BLUETOOTH_SCAN);
+        boolean locationGranted = activity != null
+                && Permissions.isGranted(activity, Permissions.FINE_LOCATION);
+        return BluetoothPermissionPolicy.canScan(
+                Build.VERSION.SDK_INT, scanGranted, locationGranted);
+    }
+
+    private void requireConnectPermission(String operation) {
+        if (!hasConnectPermission()) {
+            throw new SecurityException(
+                    operation + ":fail permission denied (BLUETOOTH_CONNECT)");
+        }
+    }
+
+    private void requireScanPermission(String operation) {
+        if (!hasScanPermission()) {
+            String permission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    ? "BLUETOOTH_SCAN"
+                    : "ACCESS_FINE_LOCATION";
+            throw new SecurityException(
+                    operation + ":fail permission denied (" + permission + ")");
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private boolean isAdapterEnabled() {
+        if (adapter == null || !hasConnectPermission()) {
+            return false;
+        }
+        try {
+            return adapter.isEnabled();
+        } catch (SecurityException e) {
+            return false;
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void stopScanner(BluetoothLeScanner scanner, ScanCallback callback) {
+        if (scanner == null || callback == null) {
+            return;
+        }
+        scanner.stopScan(callback);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void closeGatt(GattConnection connection, boolean disconnect) {
+        if (connection == null) return;
+        RuntimeException disconnectFailure = null;
+        if (disconnect && hasConnectPermission()) {
+            try {
+                connection.disconnect();
+            } catch (RuntimeException failure) {
+                disconnectFailure = failure;
+            }
+        }
+        try {
+            connection.close();
+        } catch (RuntimeException closeFailure) {
+            if (disconnectFailure != null) closeFailure.addSuppressed(disconnectFailure);
+            throw closeFailure;
+        }
+        // close() released the handle, so ownership must transfer even when disconnect
+        // failed; reporting instead of throwing keeps a closed GATT from staying mapped.
+        if (disconnectFailure != null) {
+            reportGattCleanupFailure("BLE disconnect", disconnectFailure);
+        }
     }
 
     private static BluetoothAdapter getAdapter(Context context) {
@@ -102,7 +367,8 @@ public class BluetoothManager {
         if (adapter == null) {
             throw new RuntimeException("openBluetoothAdapter:fail not available");
         }
-        if (!adapter.isEnabled()) {
+        requireConnectPermission("openBluetoothAdapter");
+        if (!isAdapterEnabled()) {
             throw new RuntimeException("openBluetoothAdapter:fail not available");
         }
         adapterOpened = true;
@@ -111,23 +377,19 @@ public class BluetoothManager {
 
     public void closeAdapter() {
         adapterOpened = false;
-        stopDiscovery();
-        unregisterAdapterStateReceiver();
-        discoveredDevices.clear();
-        // Close all GATT connections when adapter is closed
-        for (BluetoothGatt gatt : gattConnections.values()) {
-            try {
-                gatt.disconnect();
-                gatt.close();
-            } catch (Exception ignored) {}
-        }
-        gattConnections.clear();
-        negotiatedMtu.clear();
-        cachedRssi.clear();
+        ResourceCleanup.runAll(
+                this::stopDiscoveryInternal,
+                this::unregisterAdapterStateReceiver,
+                discoveredDevices::clear,
+                () -> ResourceCleanup.destroyMatching(
+                        gattConnections, ignored -> true,
+                        attempt -> closeGatt(attempt.beginClose(), true)),
+                negotiatedMtu::clear,
+                cachedRssi::clear);
     }
 
     public String getAdapterState() {
-        boolean available = adapter != null && adapter.isEnabled();
+        boolean available = isAdapterEnabled();
         JSONObject obj = new JSONObject();
         try {
             obj.put("discovering", discovering);
@@ -156,7 +418,7 @@ public class BluetoothManager {
         try {
             startDiscoveryInternal(optionsJson);
             discovering = true;
-            NativeMethods.onBluetoothAdapterStateChange(sessionId, adapter.isEnabled(), true);
+            NativeMethods.onBluetoothAdapterStateChange(sessionId, isAdapterEnabled(), true);
         } catch (RuntimeException e) {
             stopDiscoveryInternal();
             discovering = false;
@@ -165,8 +427,11 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private void startDiscoveryInternal(String optionsJson) {
-        if (adapter == null || !adapterOpened || !adapter.isEnabled()) {
+        requireConnectPermission("startBluetoothDevicesDiscovery");
+        requireScanPermission("startBluetoothDevicesDiscovery");
+        if (adapter == null || !adapterOpened || !isAdapterEnabled()) {
             throw new RuntimeException("startBluetoothDevicesDiscovery:fail adapter not opened");
         }
 
@@ -217,6 +482,13 @@ public class BluetoothManager {
             public void onScanResult(int callbackType, ScanResult result) {
                 synchronized (BluetoothManager.this) {
                     if (leScanCallback != this || !discoveryRequest.isActive()) return;
+                    if (!hasConnectPermission() || !hasScanPermission()) {
+                        stopDiscoveryInternal();
+                        discovering = false;
+                        discoveryRequest.startFailed(false);
+                        NativeMethods.onBluetoothAdapterStateChange(sessionId, false, false);
+                        return;
+                    }
                     handleScanResult(result);
                 }
             }
@@ -225,6 +497,13 @@ public class BluetoothManager {
             public void onBatchScanResults(List<ScanResult> results) {
                 synchronized (BluetoothManager.this) {
                     if (leScanCallback != this || !discoveryRequest.isActive()) return;
+                    if (!hasConnectPermission() || !hasScanPermission()) {
+                        stopDiscoveryInternal();
+                        discovering = false;
+                        discoveryRequest.startFailed(false);
+                        NativeMethods.onBluetoothAdapterStateChange(sessionId, false, false);
+                        return;
+                    }
                     for (ScanResult result : results) {
                         handleScanResult(result);
                     }
@@ -240,7 +519,7 @@ public class BluetoothManager {
                     discovering = false;
                     discoveryRequest.startFailed(false);
                     NativeMethods.onBluetoothAdapterStateChange(sessionId,
-                            adapter.isEnabled(), false);
+                            isAdapterEnabled(), false);
                 }
             }
         };
@@ -256,21 +535,16 @@ public class BluetoothManager {
         }
         if (wasDiscovering && adapter != null) {
             NativeMethods.onBluetoothAdapterStateChange(sessionId,
-                    adapter.isEnabled(), false);
+                    isAdapterEnabled(), false);
         }
     }
 
     private void stopDiscoveryInternal() {
         BluetoothLeScanner scanner = leScanner;
         ScanCallback callback = leScanCallback;
-        leScanCallback = null;
-        if (scanner != null && callback != null) {
-            try {
-                scanner.stopScan(callback);
-            } catch (Exception e) {
-                Log.w(TAG, "stopScan error: " + e.getMessage());
-            }
-        }
+        stopScanner(scanner, callback);
+        if (leScanCallback == callback) leScanCallback = null;
+        if (leScanner == scanner) leScanner = null;
     }
 
     public String getDevices() {
@@ -298,10 +572,12 @@ public class BluetoothManager {
 
     // ==================== Pairing ====================
 
+    @SuppressLint("MissingPermission")
     public void makePair(String optionsJson) {
         if (adapter == null) {
             throw new RuntimeException("makeBluetoothPair:fail not available");
         }
+        requireConnectPermission("makeBluetoothPair");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
@@ -313,10 +589,12 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     public void isDevicePaired(String optionsJson) {
         if (adapter == null) {
             throw new RuntimeException("isBluetoothDevicePaired:fail not available");
         }
+        requireConnectPermission("isBluetoothDevicePaired");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
@@ -343,7 +621,9 @@ public class BluetoothManager {
     private final ConcurrentHashMap<String, JSONObject> discoveredBeacons = new ConcurrentHashMap<>();
 
     public synchronized void startBeaconDiscovery(String optionsJson) {
-        if (adapter == null || !adapter.isEnabled()) {
+        requireConnectPermission("startBeaconDiscovery");
+        requireScanPermission("startBeaconDiscovery");
+        if (adapter == null || !isAdapterEnabled()) {
             throw new RuntimeException("startBeaconDiscovery:fail not available");
         }
 
@@ -369,8 +649,11 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private void startBeaconDiscoveryInternal() {
-        if (adapter == null || !adapter.isEnabled()) {
+        requireConnectPermission("startBeaconDiscovery");
+        requireScanPermission("startBeaconDiscovery");
+        if (adapter == null || !isAdapterEnabled()) {
             throw new RuntimeException("startBeaconDiscovery:fail not available");
         }
 
@@ -388,6 +671,13 @@ public class BluetoothManager {
             public void onScanResult(int callbackType, ScanResult result) {
                 synchronized (BluetoothManager.this) {
                     if (beaconScanCallback != this || !beaconRequest.isActive()) return;
+                    if (!hasConnectPermission() || !hasScanPermission()) {
+                        stopBeaconDiscoveryInternal();
+                        beaconDiscovering = false;
+                        beaconRequest.startFailed(false);
+                        NativeMethods.onBeaconServiceChange(sessionId, false, false);
+                        return;
+                    }
                     handleBeaconResult(result);
                 }
             }
@@ -396,6 +686,13 @@ public class BluetoothManager {
             public void onBatchScanResults(List<ScanResult> results) {
                 synchronized (BluetoothManager.this) {
                     if (beaconScanCallback != this || !beaconRequest.isActive()) return;
+                    if (!hasConnectPermission() || !hasScanPermission()) {
+                        stopBeaconDiscoveryInternal();
+                        beaconDiscovering = false;
+                        beaconRequest.startFailed(false);
+                        NativeMethods.onBeaconServiceChange(sessionId, false, false);
+                        return;
+                    }
                     for (ScanResult r : results) {
                         handleBeaconResult(r);
                     }
@@ -426,21 +723,16 @@ public class BluetoothManager {
         }
         if (wasDiscovering) {
             NativeMethods.onBeaconServiceChange(sessionId,
-                    adapter != null && adapter.isEnabled(), false);
+                    isAdapterEnabled(), false);
         }
     }
 
     private void stopBeaconDiscoveryInternal() {
         BluetoothLeScanner scanner = beaconScanner;
         ScanCallback callback = beaconScanCallback;
-        beaconScanCallback = null;
-        if (scanner != null && callback != null) {
-            try {
-                scanner.stopScan(callback);
-            } catch (Exception e) {
-                Log.w(TAG, "stopBeaconScan error: " + e.getMessage());
-            }
-        }
+        stopScanner(scanner, callback);
+        if (beaconScanCallback == callback) beaconScanCallback = null;
+        if (beaconScanner == scanner) beaconScanner = null;
     }
 
     public String getBeacons() {
@@ -457,84 +749,115 @@ public class BluetoothManager {
 
     // ==================== BLE GATT ====================
 
+    @SuppressLint("MissingPermission")
     public void createBLEConnection(String optionsJson) {
         if (adapter == null) {
             throw new RuntimeException("createBLEConnection:fail adapter not available");
         }
+        requireConnectPermission("createBLEConnection");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
 
-            if (gattConnections.containsKey(deviceId)) {
+            GattAttempt attempt = new GattAttempt();
+            if (gattConnections.putIfAbsent(deviceId, attempt) != null) {
                 return; // already connected
             }
 
-            BluetoothDevice device = adapter.getRemoteDevice(deviceId);
-            Activity activity = getActivity();
-            Context ctx = activity != null ? activity : null;
-            if (ctx == null) {
-                throw new RuntimeException("createBLEConnection:fail no context");
-            }
+            try {
+                BluetoothDevice device = adapter.getRemoteDevice(deviceId);
+                Activity activity = getActivity();
+                Context ctx = activity != null ? activity : null;
+                if (ctx == null) {
+                    throw new RuntimeException("createBLEConnection:fail no context");
+                }
 
-            BluetoothGattCallback callback = new BluetoothGattCallback() {
-                @Override
-                public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-                    boolean connected = (newState == BluetoothProfile.STATE_CONNECTED);
-                    if (connected) {
-                        gattConnections.put(deviceId, gatt);
-                        gatt.discoverServices();
-                    } else {
-                        gattConnections.remove(deviceId);
-                        gatt.close();
+                BluetoothGattCallback callback = new BluetoothGattCallback() {
+                    @Override
+                    public void onConnectionStateChange(
+                            BluetoothGatt gatt, int status, int newState) {
+                        boolean connected = newState == BluetoothProfile.STATE_CONNECTED
+                                && hasConnectPermission();
+                        handleGattConnectionStateChange(
+                                deviceId, attempt, new AndroidGattConnection(gatt), connected);
                     }
-                    NativeMethods.onBLEConnectionStateChange(sessionId, deviceId, connected);
-                }
 
-                @Override
-                public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-                    // Services cached in the BluetoothGatt object, retrieved via getServices()
-                }
+                    @Override
+                    public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+                        // Services are cached in the BluetoothGatt object.
+                    }
 
-                @Override
-                public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                    @Override
+                    public void onCharacteristicRead(
+                            BluetoothGatt gatt,
+                            BluetoothGattCharacteristic characteristic,
+                            int status) {
+                        if (status != BluetoothGatt.GATT_SUCCESS) return;
                         byte[] value = characteristic.getValue();
                         if (value == null) value = new byte[0];
                         String serviceId = characteristic.getService().getUuid().toString();
                         String charId = characteristic.getUuid().toString();
-                        NativeMethods.onBLECharacteristicValueChange(sessionId, deviceId, serviceId, charId, value);
+                        handleGattCharacteristicRead(
+                                deviceId,
+                                attempt,
+                                new AndroidGattConnection(gatt),
+                                serviceId,
+                                charId,
+                                value);
                     }
-                }
 
-                @Override
-                public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
-                    byte[] value = characteristic.getValue();
-                    if (value == null) value = new byte[0];
-                    String serviceId = characteristic.getService().getUuid().toString();
-                    String charId = characteristic.getUuid().toString();
-                    NativeMethods.onBLECharacteristicValueChange(sessionId, deviceId, serviceId, charId, value);
-                }
-
-                @Override
-                public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        negotiatedMtu.put(deviceId, mtu);
-                        NativeMethods.onBLEMTUChange(sessionId, deviceId, mtu);
+                    @Override
+                    public void onCharacteristicChanged(
+                            BluetoothGatt gatt,
+                            BluetoothGattCharacteristic characteristic) {
+                        byte[] value = characteristic.getValue();
+                        if (value == null) value = new byte[0];
+                        String serviceId = characteristic.getService().getUuid().toString();
+                        String charId = characteristic.getUuid().toString();
+                        handleGattCharacteristicChanged(
+                                deviceId,
+                                attempt,
+                                new AndroidGattConnection(gatt),
+                                serviceId,
+                                charId,
+                                value);
                     }
-                }
 
-                @Override
-                public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        cachedRssi.put(deviceId, rssi);
+                    @Override
+                    public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+                        if (status == BluetoothGatt.GATT_SUCCESS) {
+                            handleGattMtuChanged(
+                                    deviceId,
+                                    attempt,
+                                    new AndroidGattConnection(gatt),
+                                    mtu);
+                        }
                     }
-                }
-            };
 
-            BluetoothGatt gatt = device.connectGatt(
-                    ctx, false, callback, BluetoothDevice.TRANSPORT_LE);
-            if (gatt == null) {
-                throw new RuntimeException("createBLEConnection:fail connect failed");
+                    @Override
+                    public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
+                        if (status == BluetoothGatt.GATT_SUCCESS) {
+                            handleGattRssiChanged(
+                                    deviceId,
+                                    attempt,
+                                    new AndroidGattConnection(gatt),
+                                    rssi);
+                        }
+                    }
+                };
+
+                BluetoothGatt gatt = device.connectGatt(
+                        ctx, false, callback, BluetoothDevice.TRANSPORT_LE);
+                if (gatt == null) {
+                    throw new RuntimeException("createBLEConnection:fail connect failed");
+                }
+                if (!publishGattConnection(
+                        deviceId, attempt, new AndroidGattConnection(gatt))) {
+                    throw new RuntimeException("createBLEConnection:fail connection cancelled");
+                }
+            } catch (RuntimeException failure) {
+                if (attempt.connection() == null) abandonGattAttempt(deviceId, attempt);
+                throw failure;
             }
         } catch (JSONException e) {
             throw new RuntimeException("createBLEConnection:fail invalid options");
@@ -547,23 +870,220 @@ public class BluetoothManager {
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
-            BluetoothGatt gatt = gattConnections.remove(deviceId);
-            negotiatedMtu.remove(deviceId);
-            cachedRssi.remove(deviceId);
-            if (gatt != null) {
-                gatt.disconnect();
-                gatt.close();
-            }
+            closeGattConnection(deviceId);
         } catch (JSONException e) {
             throw new RuntimeException("closeBLEConnection:fail invalid options");
         }
     }
 
+    void closeGattConnection(String deviceId) {
+        GattAttempt attempt = gattConnections.get(deviceId);
+        closeAndRemoveGatt(deviceId, attempt, true);
+    }
+
+    void handleGattConnectionStateChange(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection,
+            boolean connected) {
+        if (!publishGattConnection(deviceId, attempt, connection)) {
+            reportRetiredAttemptDisconnected(deviceId, attempt);
+            return;
+        }
+        if (!connected) {
+            try {
+                closeAndRemoveGatt(deviceId, attempt, false);
+            } catch (RuntimeException cleanupFailure) {
+                reportGattCleanupFailure("BLE disconnect cleanup", cleanupFailure);
+            }
+            reportRetiredAttemptDisconnected(deviceId, attempt);
+            return;
+        }
+        boolean admitted = gattCallbackAdmission.run(() ->
+                gattConnections.get(deviceId) == attempt
+                        && attempt.dispatchIfActive(
+                                connection,
+                                gattConnectPermissionGranted,
+                                gattSessionTerminated,
+                                () -> discoverGattServicesAndReport(deviceId, attempt, connection)));
+        if (!admitted) reportRetiredAttemptDisconnected(deviceId, attempt);
+    }
+
+    /**
+     * Reports a failed or retired attempt as disconnected. A live replacement owns the
+     * device's observable state, so a superseded attempt must never overwrite it.
+     */
+    private void reportRetiredAttemptDisconnected(String deviceId, GattAttempt attempt) {
+        GattAttempt current = gattConnections.get(deviceId);
+        if (current != null && current != attempt) return;
+        connectionStateReporter.report(deviceId, false);
+    }
+
+    private void discoverGattServicesAndReport(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection) {
+        boolean discovered;
+        try {
+            discovered = connection.discoverServices();
+        } catch (RuntimeException discoverFailure) {
+            discovered = false;
+            Log.w(TAG, "discoverServices failed for " + deviceId, discoverFailure);
+        }
+        if (!discovered) {
+            try {
+                closeAndRemoveGatt(deviceId, attempt, true);
+            } catch (RuntimeException cleanupFailure) {
+                reportGattCleanupFailure(
+                        "BLE service discovery cleanup", cleanupFailure);
+            }
+        }
+        connectionStateReporter.report(deviceId, discovered);
+    }
+
+    boolean hasGattConnection(String deviceId, GattConnection connection) {
+        GattAttempt attempt = gattConnections.get(deviceId);
+        return attempt != null && attempt.connection() == connection;
+    }
+
+    boolean handleGattCharacteristicRead(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection,
+            String serviceId,
+            String characteristicId,
+            byte[] value) {
+        return dispatchGattCallback(
+                deviceId,
+                attempt,
+                connection,
+                () -> gattEventReporter.characteristic(
+                        deviceId, serviceId, characteristicId, value));
+    }
+
+    boolean handleGattCharacteristicChanged(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection,
+            String serviceId,
+            String characteristicId,
+            byte[] value) {
+        return dispatchGattCallback(
+                deviceId,
+                attempt,
+                connection,
+                () -> gattEventReporter.characteristic(
+                        deviceId, serviceId, characteristicId, value));
+    }
+
+    boolean handleGattMtuChanged(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection,
+            int mtu) {
+        return dispatchGattCallback(deviceId, attempt, connection, () -> {
+            negotiatedMtu.put(deviceId, mtu);
+            gattEventReporter.mtu(deviceId, mtu);
+        });
+    }
+
+    boolean handleGattRssiChanged(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection,
+            int rssi) {
+        return dispatchGattCallback(
+                deviceId,
+                attempt,
+                connection,
+                () -> cachedRssi.put(deviceId, rssi));
+    }
+
+    Integer cachedMtuForTests(String deviceId) {
+        return negotiatedMtu.get(deviceId);
+    }
+
+    Integer cachedRssiForTests(String deviceId) {
+        return cachedRssi.get(deviceId);
+    }
+
+    private boolean dispatchGattCallback(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection,
+            Runnable callback) {
+        if (attempt == null) return false;
+        return gattCallbackAdmission.run(() ->
+                gattConnections.get(deviceId) == attempt
+                        && attempt.dispatchIfActive(
+                                connection,
+                                gattConnectPermissionGranted,
+                                gattSessionTerminated,
+                                callback));
+    }
+
+    private BluetoothGatt rawGatt(String deviceId) {
+        GattAttempt attempt = gattConnections.get(deviceId);
+        GattConnection connection = attempt != null ? attempt.connection() : null;
+        return connection != null ? connection.raw() : null;
+    }
+
+    private void closeAndRemoveGatt(
+            String deviceId,
+            GattAttempt attempt,
+            boolean disconnect) {
+        if (attempt == null) return;
+        GattConnection connection = attempt.beginClose();
+        closeGatt(connection, disconnect);
+        if (gattConnections.remove(deviceId, attempt)) {
+            negotiatedMtu.remove(deviceId);
+            cachedRssi.remove(deviceId);
+        }
+    }
+
+    GattAttempt beginGattAttempt(String deviceId) {
+        GattAttempt attempt = new GattAttempt();
+        return gattConnections.putIfAbsent(deviceId, attempt) == null ? attempt : null;
+    }
+
+    void abandonGattAttempt(String deviceId, GattAttempt attempt) {
+        if (attempt == null) return;
+        attempt.beginClose();
+        gattConnections.remove(deviceId, attempt);
+    }
+
+    boolean publishGattConnection(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection) {
+        if (attempt != null
+                && gattConnections.get(deviceId) == attempt
+                && attempt.attach(connection)) {
+            return true;
+        }
+        try {
+            closeGatt(connection, false);
+        } catch (RuntimeException cleanupFailure) {
+            reportGattCleanupFailure("BLE late callback cleanup", cleanupFailure);
+        }
+        return false;
+    }
+
+    private void reportGattCleanupFailure(String operation, RuntimeException failure) {
+        try {
+            cleanupFailureReporter.report(operation, failure);
+        } catch (RuntimeException reportFailure) {
+            failure.addSuppressed(reportFailure);
+            Log.e(TAG, "GATT cleanup failure reporting failed", failure);
+        }
+    }
+
     public String getBLEDeviceServices(String optionsJson) {
+        requireConnectPermission("getBLEDeviceServices");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
-            BluetoothGatt gatt = gattConnections.get(deviceId);
+            BluetoothGatt gatt = rawGatt(deviceId);
             if (gatt == null) {
                 throw new RuntimeException("getBLEDeviceServices:fail not connected");
             }
@@ -584,11 +1104,12 @@ public class BluetoothManager {
     }
 
     public String getBLEDeviceCharacteristics(String optionsJson) {
+        requireConnectPermission("getBLEDeviceCharacteristics");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
             String serviceId = opts.getString("serviceId");
-            BluetoothGatt gatt = gattConnections.get(deviceId);
+            BluetoothGatt gatt = rawGatt(deviceId);
             if (gatt == null) {
                 throw new RuntimeException("getBLEDeviceCharacteristics:fail not connected");
             }
@@ -617,13 +1138,15 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     public void readBLECharacteristicValue(String optionsJson) {
+        requireConnectPermission("readBLECharacteristicValue");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
             String serviceId = opts.getString("serviceId");
             String characteristicId = opts.getString("characteristicId");
-            BluetoothGatt gatt = gattConnections.get(deviceId);
+            BluetoothGatt gatt = rawGatt(deviceId);
             if (gatt == null) {
                 throw new RuntimeException("readBLECharacteristicValue:fail not connected");
             }
@@ -640,15 +1163,17 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     @SuppressWarnings("deprecation")
     public void writeBLECharacteristicValue(String optionsJson) {
+        requireConnectPermission("writeBLECharacteristicValue");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
             String serviceId = opts.getString("serviceId");
             String characteristicId = opts.getString("characteristicId");
             String valueHex = opts.optString("value", "");
-            BluetoothGatt gatt = gattConnections.get(deviceId);
+            BluetoothGatt gatt = rawGatt(deviceId);
             if (gatt == null) {
                 throw new RuntimeException("writeBLECharacteristicValue:fail not connected");
             }
@@ -678,15 +1203,17 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     @SuppressWarnings("deprecation")
     public void notifyBLECharacteristicValueChange(String optionsJson) {
+        requireConnectPermission("notifyBLECharacteristicValueChange");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
             String serviceId = opts.getString("serviceId");
             String characteristicId = opts.getString("characteristicId");
             boolean state = opts.optBoolean("state", true);
-            BluetoothGatt gatt = gattConnections.get(deviceId);
+            BluetoothGatt gatt = rawGatt(deviceId);
             if (gatt == null) {
                 throw new RuntimeException("notifyBLECharacteristicValueChange:fail not connected");
             }
@@ -723,11 +1250,13 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     public String getBLEDeviceRSSI(String optionsJson) {
+        requireConnectPermission("getBLEDeviceRSSI");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
-            BluetoothGatt gatt = gattConnections.get(deviceId);
+            BluetoothGatt gatt = rawGatt(deviceId);
             if (gatt == null) {
                 throw new RuntimeException("getBLEDeviceRSSI:fail not connected");
             }
@@ -743,12 +1272,14 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
     public void setBLEMTU(String optionsJson) {
+        requireConnectPermission("setBLEMTU");
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String deviceId = opts.getString("deviceId");
             int mtu = opts.optInt("mtu", 23);
-            BluetoothGatt gatt = gattConnections.get(deviceId);
+            BluetoothGatt gatt = rawGatt(deviceId);
             if (gatt == null) {
                 throw new RuntimeException("setBLEMTU:fail not connected");
             }
@@ -832,7 +1363,7 @@ public class BluetoothManager {
                 discovering = false;
                 discoveryRequest.startFailed(false);
                 NativeMethods.onBluetoothAdapterStateChange(sessionId,
-                        adapter != null && adapter.isEnabled(), false);
+                        isAdapterEnabled(), false);
             }
         }
 
@@ -846,45 +1377,48 @@ public class BluetoothManager {
                 beaconDiscovering = false;
                 beaconRequest.startFailed(false);
                 NativeMethods.onBeaconServiceChange(sessionId,
-                        adapter != null && adapter.isEnabled(), false);
+                        isAdapterEnabled(), false);
             }
         }
     }
 
     public synchronized void destroy() {
-        if (discoveryRequest.destroy() == LifecycleRequestState.Action.STOP) {
-            stopDiscoveryInternal();
-        }
-        if (beaconRequest.destroy() == LifecycleRequestState.Action.STOP) {
-            stopBeaconDiscoveryInternal();
-        }
+        discoveryRequest.destroy();
+        beaconRequest.destroy();
         discovering = false;
         beaconDiscovering = false;
-        closeAdapter();
-        stopBeaconDiscoveryInternal();
-        discoveredBeacons.clear();
-        // Close all GATT connections
-        for (BluetoothGatt gatt : gattConnections.values()) {
-            try {
-                gatt.disconnect();
-                gatt.close();
-            } catch (Exception ignored) {}
-        }
-        gattConnections.clear();
-        negotiatedMtu.clear();
-        cachedRssi.clear();
+        ResourceCleanup.runAll(
+                this::stopDiscoveryInternal,
+                this::stopBeaconDiscoveryInternal,
+                this::closeAdapter,
+                discoveredBeacons::clear,
+                () -> ResourceCleanup.destroyMatching(
+                        gattConnections, ignored -> true,
+                        attempt -> closeGatt(attempt.beginClose(), true)),
+                negotiatedMtu::clear,
+                cachedRssi::clear);
     }
 
     // ==================== Internal ====================
 
+    @SuppressLint("MissingPermission")
     private void handleScanResult(ScanResult result) {
         BluetoothDevice device = result.getDevice();
         String address = device.getAddress();
+        String name = "";
+        if (hasConnectPermission()) {
+            try {
+                String reportedName = device.getName();
+                name = reportedName != null ? reportedName : "";
+            } catch (SecurityException ignored) {
+                // Permission may be revoked between the check and framework call.
+            }
+        }
 
         JSONObject devJson = new JSONObject();
         try {
             devJson.put("deviceId", address);
-            devJson.put("name", device.getName() != null ? device.getName() : "");
+            devJson.put("name", name);
             devJson.put("RSSI", result.getRssi());
             // advertisData as hex string
             if (result.getScanRecord() != null && result.getScanRecord().getBytes() != null) {
@@ -997,15 +1531,14 @@ public class BluetoothManager {
     }
 
     private void unregisterAdapterStateReceiver() {
-        if (adapterStateReceiver != null) {
-            Activity activity = getActivity();
-            if (activity != null) {
-                try {
-                    activity.unregisterReceiver(adapterStateReceiver);
-                } catch (Exception ignored) {}
-            }
-            adapterStateReceiver = null;
+        BroadcastReceiver receiver = adapterStateReceiver;
+        if (receiver == null) return;
+        Activity activity = getActivity();
+        if (activity == null) {
+            throw new IllegalStateException("cannot unregister Bluetooth receiver without activity");
         }
+        activity.unregisterReceiver(receiver);
+        if (adapterStateReceiver == receiver) adapterStateReceiver = null;
     }
 
     private static JSONArray getServiceUuids(ScanResult result) {

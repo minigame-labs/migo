@@ -136,6 +136,12 @@ static_assert(std::is_same<decltype(&migo_session_set_focus), SetFocusFn>::value
 static_assert(std::is_same<decltype(&migo_session_destroy), SessionDestroyFn>::value,
               "session destroy declaration");
 
+void migo_core_cpp_teardown_contract(MigoSession *session, MigoEngine *engine) {
+    static_cast<void>(migo_session_destroy(session));
+    static_cast<void>(migo_engine_destroy(engine));
+    /* Native display/window teardown and library unload are legal only here. */
+}
+
 int migo_core_cpp_contract() {
     MigoEngineConfig engine_config{};
     MigoSessionConfig session_config{};

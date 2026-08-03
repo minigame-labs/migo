@@ -14,8 +14,7 @@ use shared::protocol::host_cmd::{
 use crate::panic_barrier::guard;
 use crate::{MigoSession, map_ingress_result, pin_session};
 use migo_capi_abi::{
-    MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_WOULD_BLOCK, MIGO_OK,
-    MigoResult,
+    MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_WOULD_BLOCK, MigoResult,
 };
 
 pub(crate) use migo_capi_abi::input::MIGO_GAMEPAD_MAX_COUNT;
@@ -227,6 +226,7 @@ fn validated_to_gamepad_state(event: ValidatedGamepadState) -> GamepadState {
 
 /// # Safety
 /// `axes` and `buttons` must hold at least their announced counts.
+#[cfg(test)]
 unsafe fn to_gamepad_state(event: &MigoGamepadStateEvent) -> Result<GamepadState, MigoResult> {
     unsafe { event.validate() }.map(validated_to_gamepad_state)
 }
@@ -290,13 +290,11 @@ pub unsafe extern "C" fn migo_session_set_gamepad_connected(
                 )
             }
         };
-        match ingress.try_send(command) {
-            Ok(()) => {
-                reservation.commit();
-                MIGO_OK
-            }
-            Err(error) => map_ingress_result("migo_session_set_gamepad_connected", Err(error)),
+        let result = ingress.try_send_gamepad_connection(command);
+        if result.is_ok() {
+            reservation.commit();
         }
+        map_ingress_result(&session, "migo_session_set_gamepad_connected", result)
     })
 }
 
@@ -335,6 +333,7 @@ pub unsafe extern "C" fn migo_session_send_gamepad_state(
         // replaces it wholesale. Reported anyway, because a host seeing this
         // every frame is sampling faster than the engine drains.
         map_ingress_result(
+            &session,
             "migo_session_send_gamepad_state",
             ingress.try_send_gamepad_state(state),
         )

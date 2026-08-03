@@ -24,11 +24,17 @@ mod unsupported;
 mod windows;
 
 #[cfg(target_os = "android")]
-pub(crate) use android::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
+pub(crate) use android::{
+    PlatformContext, PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
+};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub(crate) use linux::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
+pub(crate) use linux::{
+    PlatformContext, PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
+};
 #[cfg(all(target_os = "linux", target_env = "ohos"))]
-pub(crate) use ohos::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
+pub(crate) use ohos::{
+    PlatformContext, PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
+};
 #[cfg(not(any(
     target_os = "android",
     target_os = "windows",
@@ -36,10 +42,31 @@ pub(crate) use ohos::{PlatformTarget, build_target, rebuild_surface, supported_p
     all(target_os = "linux", target_env = "ohos")
 )))]
 pub(crate) use unsupported::{
-    PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
+    PlatformContext, PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
 };
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
+pub(crate) use windows::{
+    PlatformContext, PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
+};
+
+#[cfg(all(test, target_os = "android"))]
+pub(crate) use android::{test_platform_context, test_platform_target};
+#[cfg(all(test, target_os = "linux", not(target_env = "ohos")))]
+pub(crate) use linux::{test_platform_context, test_platform_target};
+#[cfg(all(test, target_os = "linux", target_env = "ohos"))]
+pub(crate) use ohos::{test_platform_context, test_platform_target};
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "android",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos")),
+        all(target_os = "linux", target_env = "ohos")
+    ))
+))]
+pub(crate) use unsupported::{test_platform_context, test_platform_target};
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use windows::{test_platform_context, test_platform_target};
 
 #[cfg(test)]
 mod contract_tests {
@@ -70,6 +97,7 @@ mod contract_tests {
 /// The single test both the attach path and the capability query go through. A
 /// kind outside the bitmask's width is unsupported by definition rather than by
 /// arithmetic accident.
+#[cfg(test)]
 pub(crate) fn kind_is_supported(platform_kind: u32) -> bool {
     if platform_kind >= u64::BITS {
         return false;

@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(any(target_os = "android", test))]
+mod android_permission_gate;
 
 // Desktop platforms only: Android measures its own window through the JVM.
 #[cfg(any(
@@ -7,6 +9,9 @@ pub mod android;
     target_os = "windows"
 ))]
 pub mod host_window;
+
+#[cfg(any(target_os = "android", test))]
+mod host_owners;
 
 #[path = "android/jni/profile_contract.rs"]
 pub(crate) mod jni_profile_contract;
