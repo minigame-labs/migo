@@ -1470,6 +1470,108 @@ mod r5_executor_tests {
         );
     }
 
+    /// Section 6.4 lists per-host fairness on the shared IO executor among the
+    /// properties that are "already enforced", and Section 7.3 records it as the
+    /// one of those with no gate named against it. `QueueState`'s own tests drive
+    /// the policy directly; this drives it the way a Session does -- through
+    /// `submit`, real workers, and the dispatch that follows a completion.
+    ///
+    /// The property: while two hosts both have work queued, a worker that frees
+    /// goes to the host that is not already over its contended cap. Without it,
+    /// one game's queue depth decides when another game's IO runs.
+    #[test]
+    fn a_worker_freed_under_contention_goes_to_the_host_that_is_not_hogging_it() {
+        // Four workers, so the contended cap is two: the flooding host holding
+        // three when one frees is unambiguously over it.
+        const WORKERS: usize = 4;
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(WORKERS));
+        let flooder = executor.register_host(51);
+        let neighbour = executor.register_host(52);
+
+        // Exit permits rather than a broadcast gate, because the test has to free
+        // *exactly one* worker. Releasing them all would let the neighbour run on
+        // whichever worker happened to be idle, which is the question rather than
+        // the answer. The permits are the test's alone and share no deadline with
+        // the neighbour's wait below: a timeout that freed a worker would hand an
+        // unfair executor the very thing the neighbour was waiting for.
+        let permits = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let mut flood = Vec::new();
+        for _ in 0..WORKERS + 2 {
+            let permits = Arc::clone(&permits);
+            let started_tx = started_tx.clone();
+            flood.push(
+                executor
+                    .submit(
+                        &flooder,
+                        PoolKind::Fs,
+                        PriorityClass::ForegroundAsync,
+                        move || {
+                            started_tx.send(()).unwrap();
+                            let (lock, condvar) = &*permits;
+                            let mut left = lock.lock().unwrap();
+                            while *left == 0 {
+                                left = condvar.wait(left).unwrap();
+                            }
+                            *left -= 1;
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+
+        // The neighbour must arrive at a *full* executor. Handed an idle worker it
+        // would run whatever the policy said, and the gate would pass having
+        // observed nothing -- so saturation is asserted, not assumed.
+        for _ in 0..WORKERS {
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the flooding host must occupy every worker before the neighbour submits");
+        }
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "more than {WORKERS} flooding jobs are running, so this executor is not              saturated the way the rest of this test assumes"
+        );
+
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let neighbour_job = executor
+            .submit(
+                &neighbour,
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                move || ran_tx.send(()).unwrap(),
+            )
+            .unwrap();
+
+        // Free exactly one worker. The flooding host still holds three of the four
+        // and still has two jobs queued, so the freed one is the neighbour's.
+        {
+            let (lock, condvar) = &*permits;
+            *lock.lock().unwrap() += 1;
+            condvar.notify_one();
+        }
+        let neighbour_ran = ran_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+        // Drain before asserting: on failure the flooding jobs are still parked,
+        // and a bare assertion here would leave the suite deadlocked on the joins
+        // instead of reporting the starvation.
+        {
+            let (lock, condvar) = &*permits;
+            *lock.lock().unwrap() += flood.len();
+            condvar.notify_all();
+        }
+        for job in flood {
+            job.join().unwrap();
+        }
+        neighbour_job.join().unwrap();
+
+        assert!(
+            neighbour_ran,
+            "the worker freed under contention went to the flooding host's backlog,              so one game's queue depth decides when another game's IO runs"
+        );
+    }
+
     #[test]
     fn io_pools_share_one_process_executor_but_not_registration_tokens() {
         let first = IoPools::new(30);

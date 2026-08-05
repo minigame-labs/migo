@@ -883,6 +883,12 @@ review. A commit alone is not completion evidence.
   Still uncovered by it, and named rather than implied: the shared IO executor's
   per-host fairness, which Section 6.4 records as enforced by reading.
 
+  **Closed under task 0.37, and not by this probe.** Reading the executor first is
+  what settled it: it is a fixed set of OS worker threads behind a condvar, not a
+  tokio runtime, and the property is fairness under contention rather than
+  occupancy by CPU work — so the probe's shape does not fit and forcing it would
+  have produced a gate on the wrong question.
+
 - [x] 0.34 Measure `io::image_cache`'s per-frame paths with the allocation gate.
   **Measured, and the prediction was half right**, which is the half worth recording:
   the pin/unpin pair allocated exactly as expected and the lookup did not.
@@ -962,6 +968,46 @@ review. A commit alone is not completion evidence.
   lookup-plus-pin-plus-unpin at steady state. If it allocates, the fix is the one the
   text cache took — the count belongs on the entry — and it must land with its gate,
   not as a note.
+
+- [x] 0.37 Gate the shared IO executor's per-host fairness. Section 6.4 lists it
+  among the properties "already enforced" and Section 7.3 recorded it as the only
+  one of those with no gate named against it — the last item task 0.35's probe
+  left open.
+
+  **The probe does not fit, and reading the executor is what established that
+  rather than an attempt to force it.** `engine/testing/executor-probe` spawns onto
+  a tokio runtime and asks whether a step occupies a shared worker with CPU-bound
+  work. The IO executor is neither: it is a fixed set of OS worker threads behind a
+  condvar (`crates/io/src/pools.rs`), with a round-robin lane per host and
+  `host_cap_when_contended` bounding how many workers one host may hold while
+  another has work queued. The property is *fairness under contention*, not
+  occupancy. Applying the probe here would have gated the wrong question.
+
+  What was built instead shares no code with the two probes and every principle:
+  manufacture the adversarial condition rather than wait for it. One host fills all
+  four workers and keeps two more queued, the neighbour submits one job, and
+  exactly one worker is freed — which must go to the neighbour, because the flooder
+  then holds three against a contended cap of two. Three load-bearing details, two
+  of them the probes' lessons restated: the flooding jobs are released by the test
+  alone and share no deadline with the neighbour's wait, or a timeout would free
+  the very worker the neighbour was waiting for and an unfair executor would pass;
+  saturation is asserted rather than assumed, since a neighbour handed an idle
+  worker observes nothing; and one permit is released rather than a broadcast,
+  because freeing every worker asks the dispatcher nothing.
+
+  **The duplication question was asked before the test was kept, not after.**
+  `QueueState`'s own tests already drive this policy directly, so a second gate had
+  to pin something they cannot. It does: giving every submitted job one host token
+  — the plumbing between a registration and the queue — fails only the new test,
+  because a test that pushes tokens by hand never traverses `submit` → worker →
+  dispatch. Removing the cap fails both, which is one policy seen at two levels
+  rather than two guards on one case.
+
+  **A third mutant is recorded rather than counted.** Making a completion stop
+  releasing its host and class slots deadlocks the executor's own shutdown —
+  workers park holding pending work that can never dispatch, and `close` cannot
+  drain them — so the suite hangs instead of reporting. No test can report on that
+  mutant, this one included.
 
 - [ ] 0.36 Decide whether `texImage2D(image)`'s CPU-bytes path needs its two owned
   keys. Found while measuring task 0.34: `resolve_cached_image_rgba` clones the key

@@ -374,8 +374,9 @@ single Session remain serialised by the host.
 **Properties already enforced, which become gated requirements:** one V8 isolate
 per Session, with a fresh isolate on restart and no `SharedArrayBuffer` store
 crossing sessions; per-game filesystem, key-value, and quota isolation derived
-from the game identity; per-host fairness on the shared IO executor; an Engine
-that refuses destruction while any Session is live; per-session platform manager
+from the game identity; per-host fairness on the shared IO executor — **now gated
+against the real executor rather than read, see Section 7.3**; an Engine that
+refuses destruction while any Session is live; per-session platform manager
 registries; and per-session permission monitors.
 
 **Defects that must be fixed before multi-game support is claimed:**
@@ -756,9 +757,41 @@ These are enforced by tests, not by inspection:
   which owns the decoder behind a private field with no accessor: reaching it outside a
   blocking step is a compile error rather than a rule.
 
-  **Not covered:** the shared IO executor's per-host fairness, which Section 6.4
-  records as enforced by reading. No path may be recorded as satisfying this
-  requirement without a gate named against it.
+  **The shared IO executor's per-host fairness needed a different mechanism, and
+  saying which took reading it rather than assuming.** That executor is not a
+  tokio runtime — it is a fixed set of OS worker threads behind a condvar, with a
+  round-robin lane per host and a cap on how many workers one host may hold while
+  another has work queued. So the probe above does not apply: it spawns onto a
+  runtime, and its property is *occupancy by CPU work*, which is not the property
+  here. The property here is that a worker freed under contention goes to the host
+  that is not already over its cap.
+
+  It is now gated by a test against the real executor —
+  `a_worker_freed_under_contention_goes_to_the_host_that_is_not_hogging_it` — built
+  on the same principle as the two probes even though it shares no code with them:
+  manufacture the adversarial condition rather than wait for it. One host fills
+  every worker and keeps a backlog, the other submits one job, and exactly one
+  worker is freed. Three details are load-bearing, and two are the probes' lessons
+  restated: the flooding jobs are released by the test alone and share no deadline
+  with the neighbour's wait, because a timeout that freed a worker would hand an
+  unfair executor the very thing the neighbour was waiting for; saturation is
+  *asserted* before the neighbour submits, since a neighbour handed an idle worker
+  proves nothing; and exactly one permit is released rather than a broadcast,
+  because freeing every worker asks the dispatcher nothing.
+
+  The queue's own tests already drove this policy directly against `QueueState`,
+  so the question was whether a second gate pins anything. It does, and one mutant
+  separates them: giving every submitted job the same host token — the plumbing
+  between a registration and the queue — fails only the new test, because a test
+  that pushes tokens by hand cannot see the path from `submit` to dispatch.
+  Removing the cap fails both, which is the same policy seen at two levels rather
+  than two guards on one case.
+
+  **One mutant is not usable here, and that is a fact about the harness.** Making
+  a completion stop releasing its host and class slots deadlocks the executor's own
+  shutdown — workers park with pending work that can never dispatch, and `close`
+  cannot drain them — so the suite hangs instead of reporting. It is recorded
+  rather than counted.
 - **Idle quiescence.** No polling loop and no fixed-interval wakeup when idle.
   Frame delivery is demand-driven. Measured as wakeups per second at idle,
   against a per-platform ceiling recorded in the versioned threshold file
