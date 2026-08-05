@@ -43,12 +43,18 @@ khronos-egl = { workspace = true }
 libloading = "^0.8"
 parking_lot = { workspace = true }
 
+[dev-dependencies]
+migo-core = { path = "../core", default-features = false, features = ["test-support"] }
+
 # On non-Android platforms, enable Rust-native implementations:
 # - zip-extract: Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
 # - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]
 migo-io = { path = "../io", default-features = false, features = ["zip-extract", "rust-image-decode"] }
 shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["codec-gbk"] }
+
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

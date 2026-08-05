@@ -13,6 +13,9 @@ import java.util.regex.Pattern;
  *   <li>{@code /code} → Game code - read only</li>
  *   <li>{@code /tmp} → Temporary files - cleared on session end</li>
  * </ul>
+ * <p>
+ * {@link #getCacheDir()} is the per-game cache root rather than the directory
+ * {@code /cache} resolves to; see its documentation.
  *
  */
 public final class GamePaths {
@@ -85,7 +88,13 @@ public final class GamePaths {
      * <p>
      * Use for downloaded resources, decoded images, etc.
      * May be cleared by the system when storage is low.
-     * Maps to virtual path: /cache
+     * <p>
+     * This is the per-game cache root, and the game does not see it directly:
+     * it also holds runtime state — the subpackage install store and record, and
+     * install staging directories — so the virtual path {@code /cache} is mapped
+     * to a dedicated subdirectory of it instead. A game that could write the
+     * install record would decide which package bytes a later session mounts as
+     * {@code /code}.
      */
     public File getCacheDir() {
         return cacheDir;

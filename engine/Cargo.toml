@@ -11,18 +11,26 @@ members = [
  "crates/platform",
  "crates/runtime-v8",
  "crates/shared",
+ "testing/alloc-probe",
+ "testing/contention-probe",
+ "testing/executor-probe",
  "tools/c-host-example",
  "tools/player",
  "tools/snapshot-gen",
 ]
 
-# `crates/` is the engine; `tools/` is what builds or drives it. The split is
-# not cosmetic: the two desktop tools link X11/GL/Xlib, so a bare
-# `cargo build`/`cargo test` used to fail on any machine (and every Android
-# cross-check) that has no desktop graphics stack, which is why the contract
-# scripts all carried `--exclude` lists. `default-members` keeps them in the
-# workspace -- one lockfile, one `cargo update`, still buildable with `-p` --
-# while leaving them out of the default set.
+# `crates/` is the engine; `tools/` is what builds or drives it; `testing/` is
+# what measures it and ships nowhere. The engine/tools split is not cosmetic: the
+# two desktop tools link X11/GL/Xlib, so a bare `cargo build`/`cargo test` used to
+# fail on any machine (and every Android cross-check) that has no desktop graphics
+# stack, which is why the contract scripts all carried `--exclude` lists.
+# `default-members` keeps them in the workspace -- one lockfile, one `cargo update`,
+# still buildable with `-p` -- while leaving them out of the default set.
+#
+# `testing/alloc-probe` is third-category on purpose. It declares a
+# `#[global_allocator]`, which is unique per binary, so it must never be reachable
+# from a shipped crate's `[dependencies]`; being a separate crate consumed only
+# through `[dev-dependencies]` is what makes that cargo's rule instead of a promise.
 default-members = [
  "crates/android-jni",
  "crates/audio",
@@ -34,6 +42,9 @@ default-members = [
  "crates/platform",
  "crates/runtime-v8",
  "crates/shared",
+ "testing/alloc-probe",
+ "testing/contention-probe",
+ "testing/executor-probe",
  "tools/snapshot-gen",
 ]
 

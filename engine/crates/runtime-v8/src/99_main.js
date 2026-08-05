@@ -5,7 +5,12 @@ import { installApiNamespaces } from "ext:runtime/97_wx_namespace.js";
 import { initializeEventHandlers } from "ext:host_v8_event/01_event.js";
 import { _perf, _perfEnable, _perfDisable } from "ext:host_v8_base/05_perf.js";
 
-const { ObjectDefineProperties } = primordials;
+const {
+    ArrayIsArray,
+    JSONParse,
+    ObjectDefineProperties,
+    ReflectApply,
+} = primordials;
 
 ObjectDefineProperties(globalThis, windowOrWorkerGlobalScope);
 ObjectDefineProperties(globalThis, WindowGlobalScope);
@@ -96,14 +101,14 @@ Object.defineProperty(_hostBridge, "_internalDispatch", {
         if (typeof hook !== "function") return;
         let args;
         try {
-            args = JSON.parse(argsJson);
+            args = JSONParse(argsJson);
         } catch (_) {
             // A malformed payload is dropped rather than guessed at: calling a
             // host hook with the wrong arguments is worse than not calling it.
             return;
         }
-        if (!Array.isArray(args)) return;
-        hook.apply(_hostBridge, args);
+        if (!ArrayIsArray(args)) return;
+        ReflectApply(hook, _hostBridge, args);
     },
     enumerable: false,
     configurable: false,

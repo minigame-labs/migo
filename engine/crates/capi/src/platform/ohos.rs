@@ -2,12 +2,20 @@
 
 use std::{ffi::c_void, sync::Arc};
 
+use graphics::egl_platform::GraphicsPlatform;
 use migo_capi_abi::surface::{
     MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW, SurfaceDescriptorRef, ValidatedPlatformSurface,
 };
 use shared::surface::SurfaceRef;
 
 use migo_capi_abi::{MIGO_ERROR_INTERNAL, MIGO_ERROR_UNSUPPORTED_PLATFORM, MigoResult};
+
+#[derive(Clone, Debug)]
+pub(crate) enum PlatformContext {
+    Graphics(GraphicsPlatform),
+    #[cfg(test)]
+    TestOnly,
+}
 
 /// Native identity retained for a later resize.
 ///
@@ -16,7 +24,11 @@ use migo_capi_abi::{MIGO_ERROR_INTERNAL, MIGO_ERROR_UNSUPPORTED_PLATFORM, MigoRe
 /// reference, so overlapping old/new GPU generations never share one.
 #[derive(Clone, Copy)]
 pub(crate) enum PlatformTarget {
-    NativeWindow { window: *mut c_void },
+    NativeWindow {
+        window: *mut c_void,
+    },
+    #[cfg(test)]
+    TestOnly,
 }
 
 // OpenHarmony's native window reference counting and buffer APIs are internally
@@ -52,17 +64,21 @@ pub(crate) fn rebuild_surface(
             })?;
             Ok(Arc::new(wrapper))
         }
+        #[cfg(test)]
+        PlatformTarget::TestOnly => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
     }
 }
 
 /// Turn a fully copied and validated ABI value into OpenHarmony engine objects.
 pub(crate) fn build_target(
     descriptor: SurfaceDescriptorRef,
+    existing: Option<&PlatformContext>,
 ) -> Result<
     (
         SurfaceRef,
-        graphics::egl_platform::GraphicsPlatform,
+        GraphicsPlatform,
         PlatformTarget,
+        PlatformContext,
     ),
     MigoResult,
 > {
@@ -85,19 +101,34 @@ pub(crate) fn build_target(
         migo_capi_abi::MIGO_ERROR_INVALID_ARGUMENT
     })?;
 
-    let graphics_platform =
-        platform::ohos::presenter::ohos_graphics_platform().map_err(|error| {
+    let graphics_platform = match existing {
+        Some(PlatformContext::Graphics(graphics_platform)) => graphics_platform.clone(),
+        #[cfg(test)]
+        Some(PlatformContext::TestOnly) => return Err(MIGO_ERROR_INTERNAL),
+        None => platform::ohos::presenter::ohos_graphics_platform().map_err(|error| {
             tracing::error!("build_target: graphics platform: {error:?}");
             MIGO_ERROR_INTERNAL
-        })?;
+        })?,
+    };
 
     Ok((
         Arc::new(wrapper),
-        graphics_platform,
+        graphics_platform.clone(),
         PlatformTarget::NativeWindow {
             window: native_window.as_ptr(),
         },
+        PlatformContext::Graphics(graphics_platform),
     ))
+}
+
+#[cfg(test)]
+pub(crate) fn test_platform_target() -> PlatformTarget {
+    PlatformTarget::TestOnly
+}
+
+#[cfg(test)]
+pub(crate) fn test_platform_context() -> PlatformContext {
+    PlatformContext::TestOnly
 }
 
 #[cfg(test)]

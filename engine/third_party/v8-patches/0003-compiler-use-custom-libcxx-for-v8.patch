@@ -9,7 +9,7 @@
  declare_args() {
    # Use in-tree libc++ (buildtools/third_party/libc++ and
    # buildtools/third_party/libc++abi) instead of the system C++ library for C++
-@@ -52,6 +54,8 @@
+@@ -52,6 +54,17 @@
  
  use_custom_libcxx =
      use_custom_libcxx || (use_custom_libcxx_for_host && !is_a_target_toolchain)

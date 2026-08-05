@@ -12,9 +12,12 @@ import android.os.Handler;
 import android.os.Looper;
 
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.PermissionOperationGate;
 
 import org.json.JSONException;
 import org.json.JSONObject;
+
+import java.util.function.Consumer;
 
 /**
  * Async location provider for getLocation / getFuzzyLocation.
@@ -39,6 +42,145 @@ public final class LocationProvider {
 
     private LocationProvider() {}
 
+    interface RequestRemoval {
+        void removeListener();
+        void removeTimeout();
+    }
+
+    /** Retains cleanup handles and the first result until both removals succeed. */
+    static final class RetainedRequest<T> {
+        private final RequestRemoval removal;
+        private final Runnable finish;
+        private final Consumer<T> deliver;
+        private final Consumer<RuntimeException> failureReporter;
+        private boolean listenerRemoved;
+        private boolean timeoutRemoved;
+        private boolean resultSet;
+        private boolean released;
+        private boolean cleanupRunning;
+        private long cleanupGeneration;
+        private RuntimeException lastCleanupFailure;
+        private T result;
+        private boolean cancelled;
+        private T cancellationResult;
+
+        RetainedRequest(
+                RequestRemoval removal,
+                Runnable finish,
+                Consumer<T> deliver,
+                Consumer<RuntimeException> failureReporter) {
+            this.removal = removal;
+            this.finish = finish;
+            this.deliver = deliver;
+            this.failureReporter = failureReporter;
+        }
+
+        void complete(T candidate) {
+            attempt(candidate, false);
+        }
+
+        void cancel(T fallback) {
+            attempt(fallback, true);
+        }
+
+        private void attempt(T candidate, boolean cancellation) {
+            boolean removeListener;
+            boolean removeTimeout;
+            synchronized (this) {
+                if (released) return;
+                if (!resultSet) {
+                    result = candidate;
+                    resultSet = true;
+                }
+                if (cancellation) {
+                    cancellationResult = candidate;
+                    cancelled = true;
+                }
+                if (cleanupRunning) {
+                    if (!cancellation) return;
+                    long observedGeneration = cleanupGeneration;
+                    while (cleanupRunning) {
+                        try {
+                            wait();
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException(
+                                    "interrupted while waiting for location request cleanup",
+                                    interrupted);
+                        }
+                    }
+                    if (released) return;
+                    if (cleanupGeneration != observedGeneration
+                            && lastCleanupFailure != null) {
+                        throw lastCleanupFailure;
+                    }
+                }
+                cleanupRunning = true;
+                lastCleanupFailure = null;
+                removeListener = !listenerRemoved;
+                removeTimeout = !timeoutRemoved;
+            }
+
+            RuntimeException failure = null;
+            boolean listenerRemovalSucceeded = false;
+            if (removeListener) {
+                try {
+                    removal.removeListener();
+                    listenerRemovalSucceeded = true;
+                } catch (RuntimeException error) {
+                    failure = error;
+                }
+            }
+            boolean timeoutRemovalSucceeded = false;
+            if (removeTimeout) {
+                try {
+                    removal.removeTimeout();
+                    timeoutRemovalSucceeded = true;
+                } catch (RuntimeException error) {
+                    if (failure == null) {
+                        failure = error;
+                    } else {
+                        failure.addSuppressed(error);
+                    }
+                }
+            }
+
+            boolean release;
+            T deliveryResult;
+            synchronized (this) {
+                if (listenerRemovalSucceeded) listenerRemoved = true;
+                if (timeoutRemovalSucceeded) timeoutRemoved = true;
+                cleanupRunning = false;
+                cleanupGeneration++;
+                lastCleanupFailure = failure;
+                release = failure == null && listenerRemoved && timeoutRemoved;
+                if (release) released = true;
+                deliveryResult = cancelled ? cancellationResult : result;
+                notifyAll();
+            }
+
+            if (failure != null) {
+                try {
+                    failureReporter.accept(failure);
+                } catch (RuntimeException reportFailure) {
+                    failure.addSuppressed(reportFailure);
+                    android.util.Log.e("LocationProvider",
+                            "location_cleanup_failure_reporting_failed", failure);
+                }
+                if (cancellation) throw failure;
+                return;
+            }
+            if (release) {
+                finish.run();
+                deliver.accept(deliveryResult);
+            }
+        }
+
+        synchronized boolean isReleased() {
+            return released;
+        }
+    }
+
     // ==================== Public async entry points ====================
 
     /**
@@ -49,7 +191,14 @@ public final class LocationProvider {
      * @param sessionId   Session ID for the callback
      * @param optionsJson JSON with: type, altitude, isHighAccuracy, highAccuracyExpireTime
      */
-    public static void getLocationAsync(Context context, int sessionId, String optionsJson) {
+    public static void getLocationAsync(
+            Context context,
+            int sessionId,
+            String optionsJson,
+            PermissionOperationGate gate,
+            PermissionOperationGate.Pending pending,
+            Consumer<RuntimeException> cleanupFailureReporter) {
+        boolean[] async = {false};
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String type = opts.optString("type", "wgs84");
@@ -98,6 +247,8 @@ public final class LocationProvider {
 
             // Async path: request a single update with timeout
             requestSingleUpdateAsync(lm, useGps, useNetwork, timeoutMs, lastKnown,
+                    gate, pending,
+                    cleanupFailureReporter,
                     (location) -> {
                         if (location != null) {
                             NativeMethods.onLocationResult(sessionId,
@@ -107,10 +258,13 @@ public final class LocationProvider {
                                     errorJson("getLocation", "unable to get location"));
                         }
                     });
+            async[0] = true;
 
         } catch (Exception e) {
             NativeMethods.onLocationResult(sessionId,
                     errorJson("getLocation", e.getMessage()));
+        } finally {
+            if (!async[0]) gate.finish(pending);
         }
     }
 
@@ -122,7 +276,14 @@ public final class LocationProvider {
      * @param sessionId   Session ID for the callback
      * @param optionsJson JSON with: type
      */
-    public static void getFuzzyLocationAsync(Context context, int sessionId, String optionsJson) {
+    public static void getFuzzyLocationAsync(
+            Context context,
+            int sessionId,
+            String optionsJson,
+            PermissionOperationGate gate,
+            PermissionOperationGate.Pending pending,
+            Consumer<RuntimeException> cleanupFailureReporter) {
+        boolean[] async = {false};
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String type = opts.optString("type", "wgs84");
@@ -167,6 +328,8 @@ public final class LocationProvider {
 
             // Async path
             requestSingleUpdateAsync(lm, false, useNetwork, DEFAULT_TIMEOUT_MS, null,
+                    gate, pending,
+                    cleanupFailureReporter,
                     (location) -> {
                         if (location != null) {
                             NativeMethods.onFuzzyLocationResult(sessionId,
@@ -176,10 +339,13 @@ public final class LocationProvider {
                                     errorJson("getFuzzyLocation", "unable to get location"));
                         }
                     });
+            async[0] = true;
 
         } catch (Exception e) {
             NativeMethods.onFuzzyLocationResult(sessionId,
                     errorJson("getFuzzyLocation", e.getMessage()));
+        } finally {
+            if (!async[0]) gate.finish(pending);
         }
     }
 
@@ -197,22 +363,24 @@ public final class LocationProvider {
     @SuppressWarnings("MissingPermission")
     private static void requestSingleUpdateAsync(
             LocationManager lm, boolean useGps, boolean useNetwork,
-            long timeoutMs, Location fallback, LocationCallback callback) {
+            long timeoutMs, Location fallback,
+            PermissionOperationGate gate,
+            PermissionOperationGate.Pending pending,
+            Consumer<RuntimeException> cleanupFailureReporter,
+            LocationCallback callback) {
 
         final Location[] best = new Location[]{ null };
-        final boolean[] done = new boolean[]{ false };
+        final Runnable[] timeout = new Runnable[1];
+        @SuppressWarnings("unchecked")
+        final RetainedRequest<Location>[] request = new RetainedRequest[1];
 
         LocationListener listener = new LocationListener() {
             @Override
             public void onLocationChanged(Location location) {
-                if (done[0]) return;
                 if (best[0] == null || isBetter(location, best[0])) {
                     best[0] = location;
                 }
-                // Deliver immediately on first fix
-                done[0] = true;
-                lm.removeUpdates(this);
-                callback.onResult(best[0]);
+                request[0].complete(best[0]);
             }
 
             @Override
@@ -223,39 +391,64 @@ public final class LocationProvider {
 
             @Override
             public void onProviderDisabled(String provider) {
-                if (done[0]) return;
-                done[0] = true;
-                lm.removeUpdates(this);
-                callback.onResult(fallback);
+                request[0].complete(fallback);
             }
         };
 
-        // Timeout: if no location received within timeoutMs, return fallback
-        MAIN_HANDLER.postDelayed(() -> {
-            if (done[0]) return;
-            done[0] = true;
-            try {
-                lm.removeUpdates(listener);
-            } catch (Exception ignored) {}
-            callback.onResult(fallback);
-        }, timeoutMs);
+        timeout[0] = () -> request[0].complete(fallback);
+        request[0] = new RetainedRequest<>(
+                new RequestRemoval() {
+                    @Override public void removeListener() {
+                        lm.removeUpdates(listener);
+                    }
+
+                    @Override public void removeTimeout() {
+                        MAIN_HANDLER.removeCallbacks(timeout[0]);
+                    }
+                },
+                () -> gate.finish(pending),
+                callback::onResult,
+                cleanupFailureReporter);
+        pending.setCancellation(() -> request[0].cancel(fallback));
+
+        boolean timeoutPosted;
+        try {
+            timeoutPosted = MAIN_HANDLER.postDelayed(timeout[0], timeoutMs);
+        } catch (RuntimeException postFailure) {
+            request[0].complete(fallback);
+            return;
+        }
+        if (!timeoutPosted) {
+            request[0].complete(fallback);
+            return;
+        }
 
         // Request updates on main thread (requires Looper)
-        MAIN_HANDLER.post(() -> {
-            try {
-                if (useGps && isProviderEnabled(lm, LocationManager.GPS_PROVIDER)) {
-                    lm.requestSingleUpdate(LocationManager.GPS_PROVIDER, listener, Looper.getMainLooper());
+        boolean posted;
+        try {
+            posted = MAIN_HANDLER.post(() -> {
+                try {
+                    gate.enter(pending, () -> {
+                        if (useGps && isProviderEnabled(lm, LocationManager.GPS_PROVIDER)) {
+                            lm.requestSingleUpdate(LocationManager.GPS_PROVIDER, listener,
+                                    Looper.getMainLooper());
+                        }
+                        if (useNetwork && isProviderEnabled(lm, LocationManager.NETWORK_PROVIDER)) {
+                            lm.requestSingleUpdate(LocationManager.NETWORK_PROVIDER, listener,
+                                    Looper.getMainLooper());
+                        }
+                    });
+                } catch (RuntimeException requestFailure) {
+                    request[0].complete(fallback);
                 }
-                if (useNetwork && isProviderEnabled(lm, LocationManager.NETWORK_PROVIDER)) {
-                    lm.requestSingleUpdate(LocationManager.NETWORK_PROVIDER, listener, Looper.getMainLooper());
-                }
-            } catch (SecurityException e) {
-                if (!done[0]) {
-                    done[0] = true;
-                    callback.onResult(fallback);
-                }
-            }
-        });
+            });
+        } catch (RuntimeException postFailure) {
+            request[0].complete(fallback);
+            return;
+        }
+        if (!posted) {
+            request[0].complete(fallback);
+        }
     }
 
     // ==================== Result builders ====================

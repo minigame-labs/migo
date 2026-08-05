@@ -91,13 +91,11 @@ const SKIA_RESOURCE_CACHE_MAX_RESOURCES: usize = 1 << 14;
 static SKIA_RESOURCE_CACHE_BUDGET_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(DEFAULT_SKIA_RESOURCE_CACHE_BUDGET_BYTES);
 
-/// Tune the aggregate resource-cache budget at runtime.  Typical
-/// call sites:
+/// Tune the aggregate resource-cache budget at runtime.
 ///
-///   * Engine init, once device tier has been detected:
-///     `set_skia_resource_cache_budget(tier_budget(tier))`.
-///   * `onTrimMemory` callback from the Android host:
-///     `set_skia_resource_cache_budget(low_memory_budget())`.
+/// One call site: engine init, once the device tier has been detected, as
+/// `set_skia_resource_cache_budget(tier_budget(tier))`. A low-memory signal
+/// deliberately does *not* come through here — see [`low_memory_per_ctx_bytes`].
 ///
 /// Existing contexts pick up the new cap the next time
 /// [`Canvas2DContext::rebalance_resource_cache`] runs (driven by
@@ -122,21 +120,82 @@ pub fn tier_budget(tier: crate::device_caps::DeviceTier) -> usize {
     }
 }
 
-/// Aggressive cap used on `onTrimMemory` / device low-memory
-/// signals.  Dropping below `MIN_PER_CTX_BYTES` wouldn't be
-/// useful — Skia would re-evict on the very next draw.
-pub fn low_memory_budget() -> usize {
-    16 * 1024 * 1024
+/// Aggregate ceiling a low-memory signal squeezes Skia down to.  Dropping below
+/// `MIN_PER_CTX_BYTES` per context wouldn't be useful — Skia would re-evict on the
+/// very next draw.
+const LOW_MEMORY_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Compute the per-context byte cap for the number of live
+/// `Canvas2DContext`s **in the process**.
+///
+/// The count has to be process-wide because the budget is. It used to be passed in
+/// as one `CanvasManager`'s own `contexts_2d.len()`, and there is one manager per
+/// Session — so two Sessions each holding one canvas each divided the whole
+/// aggregate budget by one, and the process handed Skia twice the ceiling this
+/// module says it is willing to hand out. N Sessions meant N times.
+///
+/// Convergence is lazy, and that is forced rather than chosen: a Skia
+/// `DirectContext` may only be touched from the render thread that owns it, so a
+/// Session cannot rebalance another Session's contexts. A newly created context
+/// takes the smaller share at once; already-live contexts in other Sessions keep
+/// their larger cap until their own next canvas create or destroy. The overshoot is
+/// bounded by what those contexts had already been granted.
+#[inline]
+pub(crate) fn per_ctx_resource_cache_bytes() -> usize {
+    per_ctx_share(SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Compute the per-context byte cap for the current number of live
-/// `Canvas2DContext`s.  `live_ctxs == 0` is treated as 1 to avoid
-/// divide-by-zero during the initial context's construction.
+/// The per-context cap a low-memory signal squeezes to.
+///
+/// **Not a budget, and that is the whole point.** A memory warning arrives per
+/// Session — the host relays one Android `onTrimMemory` once for each — and it used
+/// to be answered by *storing* 16 MiB as the process budget, which only engine init
+/// ever raised again. So one game's warning capped every other game's canvases for
+/// the life of the process. What a warning actually needs is a release, and Skia
+/// releases when a lower cap is installed, so this figure is handed to
+/// [`Canvas2DContext::trim_resource_cache`] and the ordinary share is restored in the
+/// same call. Nothing outside that call is left capped, and a second Session relaying
+/// the same signal finds nothing left to free rather than compounding the first.
 #[inline]
-pub(crate) fn per_ctx_resource_cache_bytes(live_ctxs: usize) -> usize {
-    let n = live_ctxs.max(1);
-    let budget = SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-    (budget / n).max(MIN_PER_CTX_BYTES)
+pub(crate) fn low_memory_per_ctx_bytes() -> usize {
+    per_ctx_share(LOW_MEMORY_AGGREGATE_BYTES)
+}
+
+/// One aggregate ceiling's share, for the contexts the process actually has.
+///
+/// Private, and takes no count: a caller that could pass the divisor is how the
+/// numerator and the denominator came to have different scopes.
+#[inline]
+fn per_ctx_share(aggregate: usize) -> usize {
+    let n = LIVE_CANVAS_CONTEXTS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    (aggregate / n).max(MIN_PER_CTX_BYTES)
+}
+
+/// Live `Canvas2DContext` count, across every Session in the process.
+static LIVE_CANVAS_CONTEXTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Membership in [`LIVE_CANVAS_CONTEXTS`], tied to a context's lifetime.
+///
+/// A field of `Canvas2DContext` rather than a pair of manual calls: the compiler
+/// then refuses to build a context that is not counted, and the decrement cannot be
+/// forgotten on any exit path — including a construction that fails after the
+/// counter was raised.
+pub(crate) struct LiveContextCount;
+
+impl LiveContextCount {
+    fn enrol() -> Self {
+        LIVE_CANVAS_CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for LiveContextCount {
+    fn drop(&mut self) {
+        LIVE_CANVAS_CONTEXTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Monotonic allocator for `Canvas2DContext` identity tags.  Used by
@@ -270,6 +329,9 @@ pub mod gr_state_bits {
 
 /// Per-canvas Skia surface + state.
 pub struct Canvas2DContext {
+    /// Keeps this context in the process-wide live count for as long as it exists,
+    /// which is what makes the Skia budget's denominator match its numerator.
+    _counted: LiveContextCount,
     pub gr_ctx: DirectContext,
     pub surface: SkSurface,
     /// The assembled GL interface this context's `GrDirectContext` was built
@@ -390,12 +452,15 @@ impl Canvas2DContext {
         // as additional canvases come online.  See
         // `per_ctx_resource_cache_bytes` and
         // <https://api.skia.org/classGrDirectContext.html>.
+        // Enrolled before the cap is computed so this context is in its own divisor.
+        let counted = LiveContextCount::enrol();
         gr_ctx.set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
             max_resources: SKIA_RESOURCE_CACHE_MAX_RESOURCES,
-            max_resource_bytes: per_ctx_resource_cache_bytes(1),
+            max_resource_bytes: per_ctx_resource_cache_bytes(),
         });
 
         Some(Self {
+            _counted: counted,
             gr_ctx,
             surface,
             interface,
@@ -452,12 +517,31 @@ impl Canvas2DContext {
     /// [`SKIA_RESOURCE_CACHE_BUDGET_BYTES`] regardless of how
     /// many contexts are live.
     #[inline]
-    pub fn rebalance_resource_cache(&mut self, live_ctxs: usize) {
+    pub fn rebalance_resource_cache(&mut self) {
         self.gr_ctx
             .set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
                 max_resources: SKIA_RESOURCE_CACHE_MAX_RESOURCES,
-                max_resource_bytes: per_ctx_resource_cache_bytes(live_ctxs),
+                max_resource_bytes: per_ctx_resource_cache_bytes(),
             });
+    }
+
+    /// Squeeze this context to the low-memory share, then restore the share the
+    /// aggregate budget allows.
+    ///
+    /// Installing a lower cap is what makes Skia purge: `setResourceCacheLimits`
+    /// evicts down to the new figure before returning, so the release lands inside
+    /// this call and the cap does not have to stay behind to have had its effect.
+    /// That is the difference from what this replaced — a *stored* low budget, which
+    /// no signal ever lifted and which therefore capped every Session in the process,
+    /// not just the one that was asked to trim.
+    #[inline]
+    pub fn trim_resource_cache(&mut self) {
+        self.gr_ctx
+            .set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
+                max_resources: SKIA_RESOURCE_CACHE_MAX_RESOURCES,
+                max_resource_bytes: low_memory_per_ctx_bytes(),
+            });
+        self.rebalance_resource_cache();
     }
 
     /// Idempotent lazy reset — issues `reset_context(bits)` only
@@ -953,8 +1037,18 @@ pub(crate) fn read_surface_rgba_unpremul(
 
 #[cfg(test)]
 mod tests {
-    use super::read_surface_rgba_unpremul;
+    use super::{
+        LiveContextCount, MIN_PER_CTX_BYTES, SKIA_RESOURCE_CACHE_BUDGET_BYTES,
+        low_memory_per_ctx_bytes, per_ctx_resource_cache_bytes, read_surface_rgba_unpremul,
+        set_skia_resource_cache_budget,
+    };
     use skia_safe::{AlphaType, Color, ColorType, ISize, ImageInfo, Paint, Rect, surfaces};
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    /// The budget and the live count are process-wide, so two tests moving them
+    /// concurrently would read each other's values.
+    static BUDGET_TESTS: Mutex<()> = Mutex::new(());
 
     #[test]
     fn read_surface_rgba_unpremul_returns_painted_pixels() {
@@ -977,5 +1071,112 @@ mod tests {
             read_surface_rgba_unpremul(&mut surface, 0, 0, 1, 1).expect("readback should work");
 
         assert_eq!(pixels, vec![10, 20, 30, 255]);
+    }
+
+    /// Section 6.5: the Skia budget's denominator has to span the process, because
+    /// its numerator does.
+    ///
+    /// The guard is exercised directly rather than through `Canvas2DContext::new`,
+    /// which needs an EGL context and a GPU. What that leaves uncovered is only
+    /// whether a context is enrolled at all, and that is not a convention to test:
+    /// `LiveContextCount` is a required field, so a context which is not counted does
+    /// not compile.
+    ///
+    /// Serialised against the other budget test: both move process-wide state.
+    #[test]
+    fn the_per_context_cap_divides_the_budget_across_every_session_s_contexts() {
+        let _serialised = BUDGET_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let restore = SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(Ordering::Relaxed);
+        set_skia_resource_cache_budget(64 * 1024 * 1024);
+
+        // No contexts anywhere: the divisor floors at one rather than dividing by zero.
+        assert_eq!(per_ctx_resource_cache_bytes(), 64 * 1024 * 1024);
+
+        // One context in this Session.
+        let first = LiveContextCount::enrol();
+        assert_eq!(per_ctx_resource_cache_bytes(), 64 * 1024 * 1024);
+
+        // A second Session brings up its own. Before this counted process-wide, each
+        // Session divided the whole budget by its own single context and the process
+        // handed Skia 128 MiB against a 64 MiB ceiling.
+        let second = LiveContextCount::enrol();
+        assert_eq!(per_ctx_resource_cache_bytes(), 32 * 1024 * 1024);
+
+        let third = LiveContextCount::enrol();
+        let fourth = LiveContextCount::enrol();
+        assert_eq!(per_ctx_resource_cache_bytes(), 16 * 1024 * 1024);
+
+        // Deep enough that the per-context floor takes over from the share.
+        let many: Vec<LiveContextCount> = (0..60).map(|_| LiveContextCount::enrol()).collect();
+        assert_eq!(per_ctx_resource_cache_bytes(), MIN_PER_CTX_BYTES);
+        drop(many);
+
+        // The count is released by dropping, on every path, because it is a guard.
+        drop((second, third, fourth));
+        assert_eq!(per_ctx_resource_cache_bytes(), 64 * 1024 * 1024);
+        drop(first);
+        assert_eq!(per_ctx_resource_cache_bytes(), 64 * 1024 * 1024);
+
+        set_skia_resource_cache_budget(restore);
+    }
+
+    #[test]
+    fn the_budget_never_drops_below_one_context_s_floor() {
+        let _serialised = BUDGET_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let restore = SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(Ordering::Relaxed);
+
+        set_skia_resource_cache_budget(1);
+        assert_eq!(per_ctx_resource_cache_bytes(), MIN_PER_CTX_BYTES);
+
+        set_skia_resource_cache_budget(restore);
+    }
+
+    /// A memory warning must release bytes without capping anyone.
+    ///
+    /// The defect: one Session's `onTrimMemory` stored 16 MiB as *the* process
+    /// budget, and only engine init ever raised it again — so one game's warning
+    /// capped every other game's canvases for the life of the process. The squeeze is
+    /// now a figure handed to Skia and immediately superseded, so what a Session's
+    /// warning changes is what Skia holds, not what the process may hold.
+    ///
+    /// What this cannot see, stated rather than implied: whether
+    /// `Canvas2DContext::trim_resource_cache` really installs the low cap before
+    /// restoring the ordinary one, since a `DirectContext` needs an EGL context and a
+    /// GPU. What it does cover is that no path can store the low figure — there is no
+    /// longer a function that yields one.
+    #[test]
+    fn a_low_memory_squeeze_leaves_no_ceiling_behind() {
+        let _serialised = BUDGET_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let restore = SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(Ordering::Relaxed);
+        set_skia_resource_cache_budget(64 * 1024 * 1024);
+
+        let ordinary = per_ctx_resource_cache_bytes();
+        let squeezed = low_memory_per_ctx_bytes();
+        assert!(
+            squeezed < ordinary,
+            "a squeeze that asks for {squeezed} of an allowed {ordinary} frees nothing"
+        );
+        assert_eq!(
+            per_ctx_resource_cache_bytes(),
+            ordinary,
+            "asking for the squeeze changed what the process may hold, so it outlived \
+             the call that asked for it"
+        );
+
+        // The same, with two Sessions' contexts live: both figures divide by the same
+        // process-wide count, so the squeeze stays proportional rather than becoming
+        // the floor as soon as a second game starts.
+        let contexts = [LiveContextCount::enrol(), LiveContextCount::enrol()];
+        assert_eq!(low_memory_per_ctx_bytes(), 8 * 1024 * 1024);
+        assert_eq!(per_ctx_resource_cache_bytes(), 32 * 1024 * 1024);
+        drop(contexts);
+
+        set_skia_resource_cache_budget(restore);
     }
 }

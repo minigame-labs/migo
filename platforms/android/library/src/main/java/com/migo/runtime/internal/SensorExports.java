@@ -115,13 +115,10 @@ public final class SensorExports {
     }
 
     public static void destroySensorManager(int sessionId) {
-        DeviceSensorManager mgr;
-        synchronized (sSensorLock) {
-            mgr = sSensorManagers.remove(sessionId);
-        }
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sSensorManagers,
+                id -> id == sessionId,
+                DeviceSensorManager::destroy);
     }
 
     public static void suspendPowerSensitiveManagers(int sessionId) {
@@ -165,14 +162,15 @@ public final class SensorExports {
     }
 
     public static void destroyCaptureObserver(int sessionId) {
-        ScreenCaptureObserver observer = sCaptureObservers.remove(sessionId);
-        if (observer != null) {
-            observer.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sCaptureObservers,
+                id -> id == sessionId,
+                ScreenCaptureObserver::destroy);
     }
 
     public static void destroyAll(int sessionId) {
-        destroySensorManager(sessionId);
-        destroyCaptureObserver(sessionId);
+        ResourceCleanup.runAll(
+                () -> destroySensorManager(sessionId),
+                () -> destroyCaptureObserver(sessionId));
     }
 }

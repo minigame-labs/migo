@@ -7,8 +7,8 @@
 use std::{any::Any, fmt, ptr::NonNull, sync::Arc};
 
 use graphics::egl_platform::{
-    EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId, GraphicsPlatform,
-    PreparedEglSurface, PreparedEglSurfaceRef,
+    EglConcurrency, EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId,
+    GraphicsPlatform, PlatformIdentity, PreparedEglSurface, PreparedEglSurfaceRef,
 };
 use khronos_egl as egl;
 use shared::{
@@ -22,6 +22,7 @@ const ANDROID_EGL_LIBRARY: &str = "libEGL.so";
 
 #[derive(Debug)]
 struct AndroidSystemEglBackend;
+struct AndroidProcessEglDomain;
 
 #[derive(Debug, Default)]
 pub struct AndroidEglProvider;
@@ -29,6 +30,14 @@ pub struct AndroidEglProvider;
 impl EglProvider for AndroidEglProvider {
     fn backend_id(&self) -> GraphicsBackendId {
         GraphicsBackendId::of::<AndroidSystemEglBackend>()
+    }
+
+    fn concurrency(&self) -> EglConcurrency {
+        EglConcurrency::SharedContexts
+    }
+
+    fn platform_identity(&self) -> PlatformIdentity {
+        PlatformIdentity::new::<AndroidProcessEglDomain>(self.backend_id(), 0)
     }
 
     fn label(&self) -> &str {
@@ -64,6 +73,10 @@ pub struct AndroidEglSurfaceFactory;
 impl EglSurfaceFactory for AndroidEglSurfaceFactory {
     fn backend_id(&self) -> GraphicsBackendId {
         GraphicsBackendId::of::<AndroidSystemEglBackend>()
+    }
+
+    fn platform_identity(&self) -> PlatformIdentity {
+        PlatformIdentity::new::<AndroidProcessEglDomain>(self.backend_id(), 0)
     }
 
     fn prepare(&self, surface: &dyn Surface) -> EngineResult<PreparedEglSurfaceRef> {
@@ -141,4 +154,21 @@ pub fn android_graphics_platform() -> EngineResult<GraphicsPlatform> {
         Arc::new(AndroidEglProvider),
         Arc::new(AndroidEglSurfaceFactory),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_identity_is_stable_for_android_process_egl() {
+        assert_eq!(
+            android_graphics_platform()
+                .expect("first Android platform")
+                .platform_identity(),
+            android_graphics_platform()
+                .expect("second Android platform")
+                .platform_identity(),
+        );
+    }
 }

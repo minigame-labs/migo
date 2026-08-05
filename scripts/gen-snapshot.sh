@@ -87,8 +87,11 @@ esac
 # ---- paths / tools ----------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/engine"
-NDK="${ANDROID_NDK_HOME:-$HOME/Android/Ndk}"
-[[ -d "$NDK" ]] || die "NDK not found at '$NDK' (set ANDROID_NDK_HOME)"
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/android-ndk.sh"
+android_ndk_read_pin "$ROOT/contracts/artifact-manifest/android-v8.lock.json" || exit 1
+android_ndk_resolve || die "cannot resolve the pinned Android NDK"
+NDK="$ANDROID_NDK_HOME"
 
 ADB="${ADB:-$HOME/Android/Sdk/platform-tools/adb}"
 [[ -x "$ADB" ]] || ADB="$(command -v adb || true)"

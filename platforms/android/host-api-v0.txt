@@ -65,6 +65,7 @@
   public com.migo.runtime.MigoRuntime$Result<com.migo.runtime.GameSession> createSessionSafe(android.app.Activity, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
   public com.migo.runtime.PerformanceSnapshot getPerformanceSnapshot();
   public com.migo.runtime.PerformanceSnapshot(float, float, int, int, int);
+  public com.migo.runtime.PerformanceSnapshot(float, float, int, int, int, int, int, int);
   public com.migo.runtime.RuntimeConfig build();
   public com.migo.runtime.RuntimeConfig$Builder addPreludeScript(java.lang.String, java.lang.String);
   public com.migo.runtime.RuntimeConfig$Builder addSubPackage(java.lang.String, java.lang.String);
@@ -106,6 +107,9 @@
   public final int commandDrops;
   public final int droppedFrames;
   public final int firstFrameMs;
+  public final int inputCoalesced;
+  public final int inputReliableReserveUses;
+  public final int inputSaturationEvents;
   public final java.lang.String name;
   public final java.lang.String root;
   public float getDisplayDensity();
@@ -179,6 +183,7 @@
   public static final com.migo.runtime.SessionState DESTROYED;
   public static final com.migo.runtime.SessionState PAUSED;
   public static final com.migo.runtime.SessionState RUNNING;
+  public static final int ERR_CLEANUP_FAILED;
   public static final int ERR_CODE_DIR_NOT_FOUND;
   public static final int ERR_ENTRY_NOT_FOUND;
   public static final int ERR_INIT_FAILED;
@@ -194,6 +199,7 @@
   public static final int NATIVE_CODE_INTEGRITY_FAILED;
   public static final int NATIVE_CODE_SIGNATURE_INVALID;
   public static final int NATIVE_HOST_PANIC;
+  public static final int NATIVE_INPUT_SATURATED;
   public static final int NATIVE_JS_EXECUTION_TIMEOUT;
   public static final int NATIVE_OUT_OF_MEMORY;
   public static final int SUCCESS;

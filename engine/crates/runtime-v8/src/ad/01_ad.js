@@ -18,6 +18,7 @@
 // must not call ops at module scope (there is no HostOpState at snapshot time).
 
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { primordials } from "ext:core/mod.js";
 import {
   op_ad_is_supported,
   op_ad_create,
@@ -27,6 +28,13 @@ import {
   op_ad_update_style,
   op_ad_destroy,
 } from "ext:core/ops";
+
+const {
+  JSONParse,
+  Number,
+  NumberIsFinite,
+  SafeMap,
+} = primordials;
 
 const FALLBACK_LOAD_DELAY_MS = 100;
 const FALLBACK_INTERSTITIAL_DURATION_MS = 100;
@@ -62,13 +70,15 @@ function _hostAdsAvailable() {
 
 let _nextAdId = 1;
 
-// adId -> ad object. Strong references on purpose, and not a WeakRef registry:
+// adId -> private event ingress closure. Strong references on purpose, and not
+// a WeakRef registry:
 // the host holds native resources for every live ad and may deliver an event at
 // any moment, so an ad must stay routable until content destroys it. Letting GC
 // reclaim one early would drop the host's events on the floor -- including a
 // reward verdict -- with no way for either side to notice. Entries are released
 // in `_markDestroyed`, which is also where the host is told to let go.
-const _adRegistry = new Map();
+const _adRegistry = new SafeMap();
+const _adCapabilities = new SafeMap();
 
 function _allocAdId() {
   const id = _nextAdId;
@@ -79,7 +89,7 @@ function _allocAdId() {
 function _parseEventJson(json) {
   if (typeof json !== "string" || json.length === 0) return null;
   try {
-    const parsed = JSON.parse(json);
+    const parsed = JSONParse(json);
     return parsed && typeof parsed === "object" ? parsed : null;
   } catch (_) {
     return null;
@@ -94,15 +104,15 @@ function _internalOnAdEvent(eventJson) {
   if (!event) return;
 
   const adId = Number(event.adId);
-  if (!Number.isFinite(adId)) return;
+  if (!NumberIsFinite(adId)) return;
 
-  const ad = _adRegistry.get(adId);
-  if (!ad) return;
+  const dispatch = _adRegistry.get(adId);
+  if (!dispatch) return;
 
   const type = typeof event.event === "string" ? event.event : "";
   if (!type) return;
 
-  ad._handleHostEvent(type, event);
+  dispatch(type, event);
 }
 
 // ==================== Direct ad status ====================
@@ -147,6 +157,16 @@ function _internalTriggerDirectAdStatusChange(status) {
 
 // ==================== AdBase ====================
 
+function _fireAdEvent(ad, type, arg) {
+  const capability = _adCapabilities.get(ad);
+  if (capability) capability.fire(type, arg);
+}
+
+function _setAdHostEventObserver(ad, observer) {
+  const capability = _adCapabilities.get(ad);
+  if (capability) capability.observe = observer;
+}
+
 class AdBase {
   #listeners = {};
   #destroyed = false;
@@ -161,7 +181,14 @@ class AdBase {
     }
     this.#adId = _allocAdId();
     this.#hosted = _hostAdsAvailable();
-    _adRegistry.set(this.#adId, this);
+    const capability = {
+      fire: (type, arg) => this.#fire(type, arg),
+      observe: null,
+    };
+    _adCapabilities.set(this, capability);
+    _adRegistry.set(this.#adId, (type, event) => {
+      this.#handleHostEvent(type, event);
+    });
 
     if (this.#hosted) {
       this._command(op_ad_create, {
@@ -193,7 +220,7 @@ class AdBase {
     group.off(listener);
   }
 
-  _fire(type, arg) {
+  #fire(type, arg) {
     const group = this.#listeners[type];
     if (!group) return;
     group.trigger(arg);
@@ -206,6 +233,7 @@ class AdBase {
   _markDestroyed() {
     this.#destroyed = true;
     _adRegistry.delete(this.#adId);
+    _adCapabilities.delete(this);
     for (const type in this.#listeners) {
       this.#listeners[type].off();
     }
@@ -228,7 +256,7 @@ class AdBase {
       const message = error && error.message ? error.message : String(error);
       queueMicrotask(() => {
         if (!this.#destroyed) {
-          this._fire("error", { errCode: -1, errMsg: message });
+          this.#fire("error", { errCode: -1, errMsg: message });
         }
       });
     }
@@ -278,31 +306,33 @@ class AdBase {
   // field by field rather than forwarded wholesale so that content can never
   // observe transport-level fields, and so that every value crossing into
   // content has a known type.
-  _handleHostEvent(type, event) {
+  #handleHostEvent(type, event) {
     if (this.#destroyed) return;
+    const observer = _adCapabilities.get(this)?.observe;
+    if (observer) observer(type, event);
     switch (type) {
       case "load":
-        this._fire("load", this._loadPayload(event));
+        this.#fire("load", this._loadPayload(event));
         break;
       case "error":
-        this._fire("error", {
-          errCode: Number.isFinite(Number(event.errCode))
+        this.#fire("error", {
+          errCode: NumberIsFinite(Number(event.errCode))
             ? Number(event.errCode)
             : -1,
           errMsg: typeof event.errMsg === "string" ? event.errMsg : "ad error",
         });
         break;
       case "close":
-        this._fire("close", this._closePayload(event));
+        this.#fire("close", this._closePayload(event));
         break;
       case "resize":
-        this._fire("resize", {
+        this.#fire("resize", {
           width: Number(event.width) || 0,
           height: Number(event.height) || 0,
         });
         break;
       case "hide":
-        this._fire("hide");
+        this.#fire("hide");
         break;
       default:
         break;
@@ -325,7 +355,7 @@ class AdBase {
     if (this.#hosted) return;
     setTimeout(() => {
       if (!this.#destroyed) {
-        this._fire("load", this._loadPayload({}));
+        this.#fire("load", this._loadPayload({}));
       }
     }, FALLBACK_LOAD_DELAY_MS);
   }
@@ -372,7 +402,7 @@ class BannerAd extends AdBase {
       this._command(op_ad_show);
       return Promise.resolve();
     }
-    this._fire("resize", {
+    _fireAdEvent(this, "resize", {
       width: this.#style.realWidth,
       height: this.#style.realHeight,
     });
@@ -428,6 +458,9 @@ class CustomAd extends AdBase {
       top: style.top || 0,
       fixed: style.fixed || false,
     }, ["left", "top"]);
+    _setAdHostEventObserver(this, (type) => {
+      if (type === "hide") this.#visible = false;
+    });
     this._scheduleFallbackLoad();
   }
 
@@ -463,7 +496,7 @@ class CustomAd extends AdBase {
       if (this._hosted) {
         this._command(op_ad_hide);
       } else {
-        this._fire("hide");
+        _fireAdEvent(this, "hide");
       }
     }
     return Promise.resolve();
@@ -481,13 +514,6 @@ class CustomAd extends AdBase {
     this.#visible = false;
     this._command(op_ad_destroy);
     this._markDestroyed();
-  }
-
-  _handleHostEvent(type, event) {
-    if (type === "hide") {
-      this.#visible = false;
-    }
-    super._handleHostEvent(type, event);
   }
 
   onClose(listener) { this._on("close", listener); }
@@ -556,7 +582,7 @@ class GridAd extends AdBase {
       this._command(op_ad_show);
       return Promise.resolve();
     }
-    this._fire("resize", {
+    _fireAdEvent(this, "resize", {
       width: this.#style.realWidth,
       height: this.#style.realHeight,
     });
@@ -612,7 +638,7 @@ class InterstitialAd extends AdBase {
     return new Promise((resolve) => {
       setTimeout(() => {
         if (!this._isDestroyed()) {
-          this._fire("load");
+          _fireAdEvent(this, "load");
         }
         resolve();
       }, FALLBACK_LOAD_DELAY_MS);
@@ -631,7 +657,7 @@ class InterstitialAd extends AdBase {
     // continues instead of stalling on a modal that never appears.
     setTimeout(() => {
       if (!this._isDestroyed()) {
-        this._fire("close");
+        _fireAdEvent(this, "close");
       }
     }, FALLBACK_INTERSTITIAL_DURATION_MS);
     return Promise.resolve();
@@ -652,7 +678,7 @@ class InterstitialAd extends AdBase {
 
 // ==================== RewardedVideoAd ====================
 
-const _rewardedVideoSingletons = new Map();
+const _rewardedVideoSingletons = new SafeMap();
 
 class RewardedVideoAd extends AdBase {
   #adUnitId;
@@ -686,7 +712,7 @@ class RewardedVideoAd extends AdBase {
     return new Promise((resolve) => {
       setTimeout(() => {
         if (!this._isDestroyed()) {
-          this._fire("load", this._loadPayload({}));
+          _fireAdEvent(this, "load", this._loadPayload({}));
         }
         resolve();
       }, FALLBACK_LOAD_DELAY_MS);
@@ -707,7 +733,7 @@ class RewardedVideoAd extends AdBase {
     // cannot mint rewards.
     setTimeout(() => {
       if (!this._isDestroyed()) {
-        this._fire("close", this._closePayload({}));
+        _fireAdEvent(this, "close", this._closePayload({}));
       }
     }, FALLBACK_REWARDED_VIDEO_DURATION_MS);
     return Promise.resolve();
@@ -847,7 +873,7 @@ class GameBanner extends AdBase {
       this._command(op_ad_show);
       return Promise.resolve();
     }
-    this._fire("resize", { width: this.#style.realWidth, height: this.#style.realHeight });
+    _fireAdEvent(this, "resize", { width: this.#style.realWidth, height: this.#style.realHeight });
     return Promise.resolve();
   }
 
@@ -907,7 +933,7 @@ class GameIcon extends AdBase {
       this._command(op_ad_show);
       return Promise.resolve();
     }
-    this._fire("resize", { width: this.#style.width, height: this.#style.height });
+    _fireAdEvent(this, "resize", { width: this.#style.width, height: this.#style.height });
     return Promise.resolve();
   }
 
@@ -955,7 +981,7 @@ class GamePortal extends AdBase {
     return new Promise((resolve) => {
       setTimeout(() => {
         if (!this._isDestroyed()) {
-          this._fire("load");
+          _fireAdEvent(this, "load");
         }
         resolve();
       }, FALLBACK_LOAD_DELAY_MS);
@@ -970,7 +996,7 @@ class GamePortal extends AdBase {
     }
     setTimeout(() => {
       if (!this._isDestroyed()) {
-        this._fire("close");
+        _fireAdEvent(this, "close");
       }
     }, FALLBACK_INTERSTITIAL_DURATION_MS);
     return Promise.resolve();

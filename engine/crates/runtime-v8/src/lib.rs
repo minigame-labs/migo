@@ -162,7 +162,9 @@ pub use host_runtime::V8LimitsConfig;
 
 #[cfg(test)]
 mod tests;
-pub use rendering::image::cache::{clear_shared_image_cache, drain_shared_image_cache};
+pub use rendering::image::cache::{
+    drain_shared_image_cache, image_cache_registered, unregister_image_cache,
+};
 
 deno_core::extension!(
     runtime,

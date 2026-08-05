@@ -1,6 +1,7 @@
 package com.migo.runtime.internal.platform;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageManager;
@@ -23,7 +24,9 @@ import android.os.Looper;
 import android.util.Log;
 import android.util.Size;
 
+import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.ResourceCleanup;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -147,6 +150,12 @@ public final class CameraManager {
             fireEvent("authCancel", "{}");
             return errorJson("createCamera:fail auth deny");
         }
+        // Keyed by position, not by "camera": a device has several physical cameras
+        // and two games using different ones is legitimate.
+        if (!ExclusiveDeviceArbiter.tryAcquire(
+                ExclusiveDeviceArbiter.camera(position), sessionId)) {
+            return errorJson("createCamera:fail in use by another game");
+        }
         Log.d(TAG, "create() permission check passed");
 
         cameraManager = (android.hardware.camera2.CameraManager)
@@ -217,9 +226,12 @@ public final class CameraManager {
         Log.d(TAG, "destroy() called");
         cameraActivityRequest.destroy();
         synchronized (initializationLock) {
-            state.set(STATE_CLOSED);
-            closeCamera();
-            stopBackgroundThread();
+            boolean wasRecording = state.getAndSet(STATE_CLOSED) == STATE_RECORDING;
+            ResourceCleanup.runAll(
+                    () -> closeCamera(wasRecording),
+                    this::stopBackgroundThread,
+                    () -> ExclusiveDeviceArbiter.release(
+                            ExclusiveDeviceArbiter.camera(position), sessionId));
         }
         fireEvent("stop", "{}");
         Log.d(TAG, "destroy() completed");
@@ -649,8 +661,18 @@ public final class CameraManager {
     // Camera2 internals
     // ========================================================================
 
+    // Slim intentionally omits CAMERA from its manifest; the check remains
+    // necessary for revocation after create() validated the original grant.
+    @SuppressLint("MissingPermission")
     private void openCamera() throws CameraAccessException, InterruptedException {
         Log.d(TAG, "openCamera() called");
+        // The grant may have been revoked since create() checked it.
+        if (activity.checkSelfPermission(Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            fireEvent("authCancel", "{}");
+            throw new CameraAccessException(
+                    CameraAccessException.CAMERA_ERROR, "Camera permission denied");
+        }
         if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
             Log.e(TAG, "openCamera() timeout waiting for camera lock");
             throw new RuntimeException("Timeout waiting to acquire camera lock");
@@ -733,66 +755,83 @@ public final class CameraManager {
         }
     }
 
-    private void closeCamera() {
+    private void closeCamera(boolean stopRecorder) {
         Log.d(TAG, "closeCamera() called");
         recordingPausedForLifecycle = false;
         sessionNeedsReconfigure = false;
+        boolean acquired;
         try {
-            cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS);
+            acquired = cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
-            Log.w(TAG, "closeCamera() interrupted while waiting for lock");
-            // proceed anyway
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while closing camera", e);
         }
+        if (!acquired) throw new IllegalStateException("timed out waiting to close camera");
 
         try {
-            if (mediaRecorder != null) {
-                Log.d(TAG, "closeCamera() stopping media recorder");
-                try {
-                    if (state.get() == STATE_RECORDING) {
-                        mediaRecorder.stop();
-                    }
-                } catch (Exception ignored) {}
-                mediaRecorder.reset();
-                mediaRecorder.release();
-                mediaRecorder = null;
-            }
-
-            closeSession();
-
-            if (cameraDevice != null) {
-                Log.d(TAG, "closeCamera() closing camera device");
-                cameraDevice.close();
-                cameraDevice = null;
-            }
-
-            closeFrameReader();
-
-            if (photoReader != null) {
-                Log.d(TAG, "closeCamera() closing photo reader");
-                photoReader.close();
-                photoReader = null;
-            }
+            ResourceCleanup.runAll(
+                    () -> releaseMediaRecorder(stopRecorder),
+                    this::closeSession,
+                    this::closeCameraDevice,
+                    this::closeFrameReader,
+                    this::closePhotoReader);
             Log.d(TAG, "closeCamera() all resources released");
         } finally {
             cameraOpenCloseLock.release();
         }
     }
 
+    private void releaseMediaRecorder(boolean stopRecorder) {
+        MediaRecorder recorder = mediaRecorder;
+        if (recorder == null) return;
+        ResourceCleanup.runAll(
+                () -> {
+                    if (stopRecorder) recorder.stop();
+                },
+                recorder::reset,
+                () -> {
+                    recorder.release();
+                    if (mediaRecorder == recorder) mediaRecorder = null;
+                });
+    }
+
+    private void closeCameraDevice() {
+        CameraDevice device = cameraDevice;
+        if (device == null) return;
+        device.close();
+        if (cameraDevice == device) cameraDevice = null;
+    }
+
+    private void closePhotoReader() {
+        ImageReader reader = photoReader;
+        if (reader == null) return;
+        reader.close();
+        if (photoReader == reader) photoReader = null;
+    }
+
     private void closeSession() {
-        if (captureSession != null) {
-            try {
-                captureSession.close();
-            } catch (Exception ignored) {}
-            captureSession = null;
-        }
-        if (previewSurface != null) {
-            previewSurface.release();
-            previewSurface = null;
-        }
-        if (previewTexture != null) {
-            previewTexture.release();
-            previewTexture = null;
-        }
+        CameraCaptureSession session = captureSession;
+        android.view.Surface surface = previewSurface;
+        SurfaceTexture texture = previewTexture;
+        ResourceCleanup.runAll(
+                () -> {
+                    if (session != null) {
+                        session.close();
+                        if (captureSession == session) captureSession = null;
+                    }
+                },
+                () -> {
+                    if (surface != null) {
+                        surface.release();
+                        if (previewSurface == surface) previewSurface = null;
+                    }
+                },
+                () -> {
+                    if (texture != null) {
+                        texture.release();
+                        if (previewTexture == texture) previewTexture = null;
+                    }
+                });
     }
 
     private void startPreviewSession() throws CameraAccessException {
@@ -907,10 +946,10 @@ public final class CameraManager {
      * {@code frameReader.close()} must go through this helper.
      */
     private synchronized void closeFrameReader() {
-        if (frameReader != null) {
-            frameReader.close();
-            frameReader = null;
-        }
+        ImageReader reader = frameReader;
+        if (reader == null) return;
+        reader.close();
+        if (frameReader == reader) frameReader = null;
     }
 
     private synchronized void createFrameReader() {
@@ -1243,7 +1282,14 @@ public final class CameraManager {
             backgroundThread.quitSafely();
             try {
                 backgroundThread.join(1000);
-            } catch (InterruptedException ignored) {}
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while stopping camera thread",
+                        interrupted);
+            }
+            if (backgroundThread.isAlive()) {
+                throw new IllegalStateException("camera background thread did not stop");
+            }
             backgroundThread = null;
             backgroundHandler = null;
             Log.d(TAG, "stopBackgroundThread() background thread stopped");

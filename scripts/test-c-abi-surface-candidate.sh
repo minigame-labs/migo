@@ -53,6 +53,9 @@ compile_core() {
     # a same-type field swap that size and header pins cannot see.
     compile_c "$ROOT/tests/c_abi/old_client_outbound_contract.c" \
         "$TMP_ROOT/old_client_outbound_contract.o"
+    require_literal "$INCLUDE_DIR/migo/session.h" \
+        "Successful Engine destruction is a thread-completion barrier." \
+        "Engine destruction thread-completion barrier"
 }
 
 # The ILP32 lane.

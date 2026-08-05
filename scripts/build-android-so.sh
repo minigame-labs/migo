@@ -65,6 +65,9 @@ TARGET_DIR="$ENGINE_ROOT/target"
 JNI_LIBS_DIR="$ENGINE_ROOT/jniLibs"
 V8_LIBS_DIR="$ENGINE_ROOT/third_party/rusty_v8"
 
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$SCRIPT_DIR/lib/android-ndk.sh"
+
 if [[ ! -d "$ENGINE_ROOT" ]]; then
     print_error "engine directory not found at $ENGINE_ROOT"
     exit 1
@@ -88,12 +91,22 @@ show_help() {
     echo ""
     echo "Usage:"
     echo "  ./build-android-so.sh [arm64-v8a|x86_64|all] [release|debug]"
-    echo "  ./build-android-so.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--build-type release|debug] [architectures...]"
+    echo "  ./build-android-so.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--build-type release|debug] [--compile-only] [architectures...]"
     echo ""
     echo "Examples:"
     echo "  ./build-android-so.sh"
     echo "  ./build-android-so.sh arm64-v8a release"
     echo "  ./build-android-so.sh all --product-profile slim --codegen-profile 2 --build-type release"
+    echo "  ./build-android-so.sh --compile-only arm64-v8a"
+    echo ""
+    echo "  --compile-only  compile the engine crates for the target and stop before"
+    echo "                  the cdylib. This is what answers \"does this change compile"
+    echo "                  for Android\" in about a minute warm, against the several"
+    echo "                  minutes a full .so link costs. It builds migo-capi, which"
+    echo "                  pulls core, graphics and platform -- the four crates whose"
+    echo "                  only compile gate is the Android build. It does NOT cover"
+    echo "                  the cdylib itself, so a change under crates/android-jni"
+    echo "                  still needs a full build."
     exit 0
 }
 
@@ -120,10 +133,8 @@ check_dependencies() {
         exit 1
     fi
 
-    if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
-        print_error "ANDROID_NDK_HOME is not set"
-        exit 1
-    fi
+    android_ndk_read_pin "$PROJECT_ROOT/contracts/artifact-manifest/android-v8.lock.json" || exit 1
+    android_ndk_resolve || { print_error "cannot resolve the pinned Android NDK"; exit 1; }
 
     # skia-bindings' build script reads ANDROID_NDK (not _HOME).  Keep
     # them in sync so Skia cross-compile picks the same toolchain as
@@ -410,9 +421,20 @@ build_platform() {
     # a stale .so on disk made the later `cp` succeed.  Capture the exit
     # code explicitly so we can propagate the real failure upward.
     local cargo_rc=0
+    local -a package_args=()
+    local features_argument="$cargo_features"
+    if [[ "$compile_only" == true ]]; then
+        # `migo-capi` is the single package that pulls core, graphics and platform,
+        # so selecting it compiles all four crates whose only compile gate is this
+        # build. The feature is qualified because the package cargo would otherwise
+        # apply a bare feature name to is this directory's cdylib, which is not
+        # selected.
+        package_args=(-p migo-capi)
+        features_argument="migo-capi/profile-$product_profile"
+    fi
     cargo ndk --target "$target_triple" --platform "$ANDROID_API" -- build \
-        --target-dir "$TARGET_DIR" "${profile_args[@]}" \
-        --no-default-features --features "$cargo_features" \
+        --target-dir "$TARGET_DIR" "${profile_args[@]}" "${package_args[@]}" \
+        --no-default-features --features "$features_argument" \
         || cargo_rc=$?
 
     popd > /dev/null
@@ -421,6 +443,12 @@ build_platform() {
         print_error "cargo build failed for $platform (rc=$cargo_rc)"
         export RUSTFLAGS="$orig_rustflags"
         return $cargo_rc
+    fi
+
+    if [[ "$compile_only" == true ]]; then
+        export RUSTFLAGS="$orig_rustflags"
+        print_success "Compiled core+graphics+platform+capi for $target_triple"
+        return 0
     fi
 
     # --------------------------------------------------------
@@ -510,6 +538,7 @@ build_type="release"
 product_profile="full"
 codegen_profile="z"
 worker_snapshot=false
+compile_only=false
 platforms=()
 use_all=false
 
@@ -555,6 +584,9 @@ while [[ $# -gt 0 ]]; do
         --worker-snapshot)
             worker_snapshot=true
             ;;
+        --compile-only)
+            compile_only=true
+            ;;
         release)
             build_type="release"
             ;;
@@ -595,6 +627,13 @@ if [[ "$worker_snapshot" == true && ( "$build_type" != "release" || "$product_pr
     print_error "Worker snapshot requires a full release build"
     exit 1
 fi
+# Rejected rather than ignored: the worker snapshot is embedded by the cdylib this
+# mode deliberately does not build, so accepting both would report a compile that
+# never covered the requested configuration.
+if [[ "$compile_only" == true && "$worker_snapshot" == true ]]; then
+    print_error "--compile-only does not build the cdylib, so it cannot honour --worker-snapshot"
+    exit 1
+fi
 
 check_dependencies
 
@@ -611,6 +650,7 @@ print_info "Build type : $build_type"
 print_info "Product    : $product_profile"
 print_info "Codegen    : $codegen_profile"
 print_info "Worker snap: $worker_snapshot"
+print_info "Mode       : $([[ "$compile_only" == true ]] && echo "compile-only (no cdylib)" || echo "full .so")"
 print_info "Platforms  : ${platforms[*]}"
 
 # Stage-2: ensure the embedded ICU blob is the slim variant before building.

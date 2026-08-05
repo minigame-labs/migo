@@ -347,13 +347,13 @@ async fn cached_preload_result_with_scheduler(
     let key = image_cache::full_res_key(pg_key.0, pg_key.1);
     let cached = {
         let mut cache = image_cache::global_cache();
-        cache.get(&key)
+        cache.get(&key, scheduler.host_id())
     };
 
     match cached {
         Some(cached) => {
-            let dims = (cached.image.width, cached.image.height);
-            let encoded_bytes = cached.image.rgba.len();
+            let dims = (cached.width, cached.height);
+            let encoded_bytes = cached.rgba.len();
             match run_image_job_with_scheduler(scheduler, encoded_bytes, true, source, move || dims)
                 .await
             {
@@ -435,7 +435,7 @@ fn worker_image_source(
                     source: ImageSource::Pack {
                         relative_path: relative_path.clone(),
                     },
-                    source_generation: resolved.source_mounted_at,
+                    source_generation: resolved.source_identity,
                 }),
             }
         }
@@ -454,7 +454,15 @@ fn worker_image_source(
                     cache_path: path.to_string(),
                     read_path: real_path.to_string_lossy().into_owned(),
                     source: ImageSource::Filesystem,
-                    source_generation: resolved.source_mounted_at,
+                    // A real path is globally meaningful, so key on it the way the
+                    // directory-backed branch above does. The mount position this
+                    // used to carry has the same cross-Session collision as the
+                    // pack case: it is `1` for every Session's base mount.
+                    source_generation: mounted_variant_source_version_token(
+                        &real_path,
+                        path,
+                        mount_table,
+                    ),
                 }),
                 None => Ok(WorkerImageSource {
                     cache_path: path.to_string(),
@@ -462,7 +470,7 @@ fn worker_image_source(
                     source: ImageSource::Pack {
                         relative_path: relative_path.clone(),
                     },
-                    source_generation: resolved.source_mounted_at,
+                    source_generation: resolved.source_identity,
                 }),
             }
         }
@@ -592,6 +600,10 @@ pub async fn read_image_rgba8(
     mount_table: Option<Arc<MountTable>>,
     decode_policy: ImageDecodePolicy,
 ) -> Result<ReadImageResult, EngineError> {
+    // Taken before `scheduler` is moved into a job. The scheduler is built per
+    // Session, so the decode path already knows who it is decoding for and no
+    // caller needs a new argument.
+    let session = scheduler.host_id();
     let has_resize = target_width.is_some() && target_height.is_some();
     let pg_key = current_image_cache_key(&path, cache_generation, &source, mount_table.as_deref())?;
     // LRU cache fast path: full-resolution hits as before, and
@@ -600,12 +612,12 @@ pub async fn read_image_rgba8(
     // repeatedly draw the same sprite at the same resized dimensions
     // no longer re-decode every frame.
     let io_cache_key = compose_lru_key(&pg_key, target_width, target_height);
-    if let Some(cached) = image_cache::global_cache().get(&io_cache_key) {
+    if let Some(cached) = image_cache::global_cache().get(&io_cache_key, scheduler.host_id()) {
         debug!(
             "read_image_rgba8 cache hit: {} g{} resize={}x{}",
             io_cache_key.0, io_cache_key.1, io_cache_key.2, io_cache_key.3
         );
-        let cached_image = cached.image;
+        let cached_image = cached;
         let encoded_bytes = cached_image.rgba.len();
         return run_image_job_with_scheduler(scheduler, encoded_bytes, true, source, move || {
             ReadImageResult {
@@ -764,6 +776,7 @@ pub async fn read_image_rgba8(
                         target_height.unwrap_or(0),
                     ),
                     rgba_img.clone(),
+                    session,
                 );
             }
             debug!(
@@ -811,6 +824,7 @@ async fn decode_preload_result_with_scheduler(
     let _budget = io_budget().acquire(pre_estimate).await;
     let _permit = image_decode_semaphore().acquire().await.unwrap();
 
+    let session = scheduler.host_id();
     run_image_job_with_scheduler(scheduler, primary_size, false, source.clone(), move || {
         let worker_source =
             match worker_image_source(&path, cache_generation, &source, mount_table.as_deref()) {
@@ -852,6 +866,7 @@ async fn decode_preload_result_with_scheduler(
                                     worker_source.source_generation,
                                 ),
                                 rgba.clone(),
+                                session,
                             );
                         }
                         return (path, Ok(dims));
@@ -875,6 +890,7 @@ async fn decode_preload_result_with_scheduler(
                     image_cache::global_cache().insert(
                         image_cache::full_res_key(path.clone(), worker_source.source_generation),
                         rgba.clone(),
+                        session,
                     );
                 }
                 if let Some(ref cache_dir) = game_cache_dir {
@@ -983,8 +999,8 @@ pub async fn preload_images(
 /// Clear all image caches.
 ///
 /// Clears the in-memory LRU cache and the per-game derived texture disk cache.
-pub fn clear_image_cache(game_cache_dir: Option<&str>) {
-    image_cache::global_cache().clear();
+pub fn clear_image_cache(game_cache_dir: Option<&str>, session: i32) {
+    image_cache::global_cache().clear_for_session(session);
     if let Some(dir) = game_cache_dir {
         let derived = derived_cache::derived_cache_dir(std::path::Path::new(dir));
         if derived.exists() {
@@ -996,8 +1012,8 @@ pub fn clear_image_cache(game_cache_dir: Option<&str>) {
 }
 
 /// Get image cache statistics.
-pub fn get_image_cache_stats() -> ImageCacheStats {
-    let stats = image_cache::global_cache().stats();
+pub fn get_image_cache_stats(session: i32) -> ImageCacheStats {
+    let stats = image_cache::global_cache().stats_for_session(session);
     ImageCacheStats {
         entries: stats.entries,
         size_bytes: stats.size_bytes,
@@ -1331,6 +1347,8 @@ fn decode_selected_variant_rgba_only(
 
 #[cfg(test)]
 mod tests {
+    /// The Session these tests load as; none of them is about Session isolation.
+    const ONE_SESSION: i32 = 1;
     use std::sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -1428,6 +1446,24 @@ mod tests {
         let mut writer = PackageWriter::new(std::io::BufWriter::new(file)).unwrap();
         writer.add_entry(entry, data).unwrap();
         writer.finish("test", "1.0").unwrap();
+    }
+
+    /// A package with enough entries that the reader's `HashMap` has a meaningful
+    /// iteration order. A single-entry package has only one, so it cannot detect an
+    /// identity that depends on that order.
+    fn write_multi_entry_package(path: &std::path::Path, name: &str, marker: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = PackageWriter::new(std::io::BufWriter::new(file)).unwrap();
+        writer.add_entry("tex.png", marker).unwrap();
+        for i in 0..12u32 {
+            writer
+                .add_entry(
+                    &format!("assets/a{i}.bin"),
+                    format!("{i}-{name}").as_bytes(),
+                )
+                .unwrap();
+        }
+        writer.finish(name, "1.0").unwrap();
     }
 
     fn tiny_png() -> [u8; 70] {
@@ -1546,6 +1582,7 @@ mod tests {
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key(path.clone(), cache_generation),
             cached.clone(),
+            ONE_SESSION,
         );
 
         let result = runtime.block_on(read_image_rgba8(
@@ -1605,8 +1642,11 @@ mod tests {
         let cache_key = crate::image_cache::full_res_key(cached_path.clone(), 1);
         let cache_pin = CachePin::new(cache_key.clone());
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache()
-            .insert(cache_key, NormalizedImage::new(2, 2, vec![255; 2 * 2 * 4]));
+        crate::image_cache::global_cache().insert(
+            cache_key,
+            NormalizedImage::new(2, 2, vec![255; 2 * 2 * 4]),
+            ONE_SESSION,
+        );
 
         let (classified, resume) = install_preload_cache_hook();
         let decode_started = install_preload_decode_started_hook();
@@ -1664,6 +1704,7 @@ mod tests {
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key(path.clone(), cache_generation),
             cached,
+            ONE_SESSION,
         );
 
         let results = runtime.block_on(preload_images(
@@ -1712,6 +1753,7 @@ mod tests {
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key(path.clone(), cache_generation),
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
+            ONE_SESSION,
         );
 
         let (classified, resume) = install_preload_cache_hook();
@@ -1738,6 +1780,199 @@ mod tests {
         assert_eq!(scheduler_run_count(&scheduler), 1);
         assert_eq!(scheduler.pools().started_thread_count_for_test(), 2);
         crate::image_cache::global_cache().clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two games ship different packages and both address `/code/tex.png`. The
+    /// decoded-bytes cache is shared between them on purpose, so the key has to tell
+    /// the packages apart -- and it could not: it fell back on `source_mounted_at`,
+    /// which counts mounts inside one `MountTable`, and a base mount is `1` in every
+    /// Session's own table. The second game was served the first's pixels.
+    /// The loader pre-pins the decoded-bytes slot before the decode inserts into it,
+    /// keying that pin off the resolution it did on the JS side. If this side keys
+    /// the insert off anything else the pin lands on an empty slot, the admission
+    /// filter is free to reject the real entry, and a later WebGL
+    /// `texImage2D(image)` finds no bytes and leaves a black texture. So the two
+    /// sides must read the *same* field, not merely equivalent-looking ones.
+    /// The same subpackage, mounted in a different order by each Session, must still
+    /// share its decoded bytes. Installed packages are restored by iterating a
+    /// `HashMap`, so the order genuinely differs per Session and each mount lands at
+    /// a different position in its own table. Anything derived from that position
+    /// therefore cannot be part of a key two Sessions are meant to agree on -- which
+    /// is why the key is the package identity alone.
+    #[test]
+    fn the_same_subpackage_shares_despite_a_different_mount_order() {
+        let dir = std::env::temp_dir().join("migo_pack_mount_order");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stage = dir.join("stage.mpkg");
+        let other = dir.join("other.mpkg");
+        write_multi_entry_package(&stage, "stage", b"stage-pixels");
+        write_multi_entry_package(&other, "other", b"other-pixels");
+
+        let session_a = MountTable::new(dir.clone());
+        let session_b = MountTable::new(dir.clone());
+        // Same two subpackages, opposite order -- so `stage` sits at a different
+        // mount position in each table.
+        for (table, first, second) in [(&session_a, &stage, &other), (&session_b, &other, &stage)] {
+            let (n1, n2) = if first == &stage {
+                ("stage", "other")
+            } else {
+                ("other", "stage")
+            };
+            table.mount_overlay(
+                format!("subpackage:{n1}"),
+                n1.to_string(),
+                Arc::new(PackSource::open(first, n1, "1.0").unwrap()),
+            );
+            table.mount_overlay(
+                format!("subpackage:{n2}"),
+                n2.to_string(),
+                Arc::new(PackSource::open(second, n2, "1.0").unwrap()),
+            );
+        }
+
+        let resolved_a = session_a.resolve_code_path("/code/stage/tex.png").unwrap();
+        let resolved_b = session_b.resolve_code_path("/code/stage/tex.png").unwrap();
+        assert_ne!(
+            resolved_a.source_mounted_at, resolved_b.source_mounted_at,
+            "the fixture must give the same package different mount positions, or it \
+             proves nothing"
+        );
+
+        let source = ImageSource::Pack {
+            relative_path: "tex.png".to_string(),
+        };
+        let key_a =
+            super::current_image_cache_key("/code/stage/tex.png", 0, &source, Some(&session_a))
+                .unwrap();
+        let key_b =
+            super::current_image_cache_key("/code/stage/tex.png", 0, &source, Some(&session_b))
+                .unwrap();
+        assert_eq!(
+            key_a, key_b,
+            "one subpackage's assets are decoded twice because the two Sessions \
+             mounted it in a different order"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pack_backed_key_uses_the_resolution_field_the_loader_pre_pins_on() {
+        let dir = std::env::temp_dir().join("migo_pack_key_agreement");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkg = dir.join("game.mpkg");
+        write_multi_entry_package(&pkg, "game", b"pixels");
+
+        let mount_table = MountTable::new(dir.clone());
+        mount_table.swap_base(Arc::new(PackSource::open(&pkg, "game", "1.0").unwrap()));
+        let resolved = mount_table.resolve_code_path("/code/tex.png").unwrap();
+        assert!(
+            resolved.real_path.is_none(),
+            "the fixture must resolve inside the package"
+        );
+
+        let key = super::current_image_cache_key(
+            "/code/tex.png",
+            0,
+            &ImageSource::Pack {
+                relative_path: "tex.png".to_string(),
+            },
+            Some(&mount_table),
+        )
+        .unwrap();
+
+        assert_eq!(
+            key.1, resolved.source_identity,
+            "the decoded-bytes key drifted from the resolution field the loader \
+             pre-pins on, so the pin protects a slot nothing is inserted into"
+        );
+    }
+
+    #[test]
+    fn two_sessions_different_packages_do_not_share_a_cache_key() {
+        let dir = std::env::temp_dir().join("migo_pack_cross_session_key");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let game_a_pkg = dir.join("game_a.mpkg");
+        let game_b_pkg = dir.join("game_b.mpkg");
+        write_test_package(&game_a_pkg, "tex.png", b"game-a-pixels");
+        write_test_package(&game_b_pkg, "tex.png", b"game-b-pixels");
+
+        // A Session owns its own MountTable, which is the whole problem.
+        let session_a = MountTable::new(dir.clone());
+        let session_b = MountTable::new(dir.clone());
+        // Same name and version deliberately: those are labels the installing app
+        // chooses, so a package claiming another's identity must still be told apart
+        // by what it actually contains.
+        session_a.swap_base(Arc::new(
+            PackSource::open(&game_a_pkg, "shared-name", "1.0").unwrap(),
+        ));
+        session_b.swap_base(Arc::new(
+            PackSource::open(&game_b_pkg, "shared-name", "1.0").unwrap(),
+        ));
+
+        let source = ImageSource::Pack {
+            relative_path: "tex.png".to_string(),
+        };
+        let key_a =
+            super::current_image_cache_key("/code/tex.png", 0, &source, Some(&session_a)).unwrap();
+        let key_b =
+            super::current_image_cache_key("/code/tex.png", 0, &source, Some(&session_b)).unwrap();
+
+        assert_eq!(
+            key_a.0, key_b.0,
+            "the fixture must have both games addressing one virtual path, or it \
+             proves nothing"
+        );
+        assert_ne!(
+            key_a.1, key_b.1,
+            "two games' different packages produced the same cache key for \
+             /code/tex.png, so the second is served the first's decoded pixels"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same key: two Sessions that mounted *byte-identical*
+    /// packages should still share one decoded copy, which is what a shared cache is
+    /// for. Guards against fixing the collision by making every mount unique.
+    #[test]
+    fn two_sessions_identical_packages_still_share_a_cache_key() {
+        let dir = std::env::temp_dir().join("migo_pack_cross_session_share");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Multi-entry on purpose: the reader derives a package's identity from a
+        // `HashMap` of its entries, and every `HashMap` instance iterates in its own
+        // order, so a one-entry package cannot catch an identity that depends on it.
+        let pkg_a = dir.join("same_a.mpkg");
+        let pkg_b = dir.join("same_b.mpkg");
+        write_multi_entry_package(&pkg_a, "shared", b"identical-pixels");
+        write_multi_entry_package(&pkg_b, "shared", b"identical-pixels");
+
+        let session_a = MountTable::new(dir.clone());
+        let session_b = MountTable::new(dir.clone());
+        session_a.swap_base(Arc::new(PackSource::open(&pkg_a, "shared", "1.0").unwrap()));
+        session_b.swap_base(Arc::new(PackSource::open(&pkg_b, "shared", "1.0").unwrap()));
+
+        let source = ImageSource::Pack {
+            relative_path: "tex.png".to_string(),
+        };
+        let key_a =
+            super::current_image_cache_key("/code/tex.png", 0, &source, Some(&session_a)).unwrap();
+        let key_b =
+            super::current_image_cache_key("/code/tex.png", 0, &source, Some(&session_b)).unwrap();
+
+        assert_eq!(
+            key_a, key_b,
+            "identical packages must agree, or two games running the same content \
+             each decode their own copy of every asset"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1775,7 +2010,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(worker_source.source_generation > generation_v1);
+        assert_ne!(
+            worker_source.source_generation, generation_v1,
+            "a remount of a changed package must yield a different cache generation"
+        );
         assert_eq!(bytes, b"v2-bytes-longer");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1817,7 +2055,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(worker_source.cache_path, "/code/tex.png");
-        assert!(worker_source.source_generation > generation_v1);
+        assert_ne!(
+            worker_source.source_generation, generation_v1,
+            "a remount of a changed package must yield a different cache generation"
+        );
         assert_eq!(bytes, b"dir-v2-longer");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1921,6 +2162,7 @@ mod tests {
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation),
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
+            ONE_SESSION,
         );
 
         mount_table.swap_base(Arc::new(DirSource::new(v2.clone())));
@@ -1983,6 +2225,7 @@ mod tests {
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation),
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
+            ONE_SESSION,
         );
 
         mount_table.swap_base(Arc::new(DirSource::new(v2.clone())));
@@ -2040,8 +2283,11 @@ mod tests {
             crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation);
         let cache_pin = CachePin::new(cache_key.clone());
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache()
-            .insert(cache_key, NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]));
+        crate::image_cache::global_cache().insert(
+            cache_key,
+            NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
+            ONE_SESSION,
+        );
 
         let (classified, resume) = install_preload_cache_hook();
         let results = runtime.block_on(async {

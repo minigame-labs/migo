@@ -2,12 +2,20 @@
 
 use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
+use graphics::egl_platform::GraphicsPlatform;
 use migo_capi_abi::surface::{
     MIGO_PLATFORM_WIN32_HWND, SurfaceDescriptorRef, ValidatedPlatformSurface,
 };
 use shared::surface::SurfaceRef;
 
 use migo_capi_abi::{MIGO_ERROR_INTERNAL, MIGO_ERROR_UNSUPPORTED_PLATFORM, MigoResult};
+
+#[derive(Clone, Debug)]
+pub(crate) enum PlatformContext {
+    Graphics(GraphicsPlatform),
+    #[cfg(test)]
+    TestOnly,
+}
 
 /// Native identity retained for a later resize.
 ///
@@ -16,7 +24,11 @@ use migo_capi_abi::{MIGO_ERROR_INTERNAL, MIGO_ERROR_UNSUPPORTED_PLATFORM, MigoRe
 /// nor pumps messages for it.
 #[derive(Clone, Copy)]
 pub(crate) enum PlatformTarget {
-    Win32 { hwnd: NonNull<c_void> },
+    Win32 {
+        hwnd: NonNull<c_void>,
+    },
+    #[cfg(test)]
+    TestOnly,
 }
 
 // SAFETY: this is a copied native identity token, never a Rust reference and
@@ -41,17 +53,21 @@ pub(crate) fn rebuild_surface(
         PlatformTarget::Win32 { hwnd } => Ok(Arc::new(unsafe {
             platform::windows::presenter::WindowsHwndSurface::new(hwnd, width, height)
         })),
+        #[cfg(test)]
+        PlatformTarget::TestOnly => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
     }
 }
 
 /// Turn a fully copied and validated ABI value into Windows engine objects.
 pub(crate) fn build_target(
     descriptor: SurfaceDescriptorRef,
+    existing: Option<&PlatformContext>,
 ) -> Result<
     (
         SurfaceRef,
-        graphics::egl_platform::GraphicsPlatform,
+        GraphicsPlatform,
         PlatformTarget,
+        PlatformContext,
     ),
     MigoResult,
 > {
@@ -67,12 +83,23 @@ pub(crate) fn build_target(
                     configuration.height_pixels(),
                 )
             });
-            let graphics_platform = platform::windows::presenter::windows_hwnd_graphics_platform()
-                .map_err(|error| {
-                    tracing::error!("build_target: Win32 graphics platform: {error:?}");
-                    MIGO_ERROR_INTERNAL
-                })?;
-            Ok((surface, graphics_platform, PlatformTarget::Win32 { hwnd }))
+            let graphics_platform = match existing {
+                Some(PlatformContext::Graphics(graphics_platform)) => graphics_platform.clone(),
+                #[cfg(test)]
+                Some(PlatformContext::TestOnly) => return Err(MIGO_ERROR_INTERNAL),
+                None => platform::windows::presenter::windows_hwnd_graphics_platform().map_err(
+                    |error| {
+                        tracing::error!("build_target: Win32 graphics platform: {error:?}");
+                        MIGO_ERROR_INTERNAL
+                    },
+                )?,
+            };
+            Ok((
+                surface,
+                graphics_platform.clone(),
+                PlatformTarget::Win32 { hwnd },
+                PlatformContext::Graphics(graphics_platform),
+            ))
         }
         // Listed rather than matched with a wildcard: a new platform payload
         // must not compile until every platform module has taken a position on
@@ -83,6 +110,16 @@ pub(crate) fn build_target(
         | ValidatedPlatformSurface::Wayland { .. }
         | ValidatedPlatformSurface::OpenHarmony { .. } => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_platform_target() -> PlatformTarget {
+    PlatformTarget::TestOnly
+}
+
+#[cfg(test)]
+pub(crate) fn test_platform_context() -> PlatformContext {
+    PlatformContext::TestOnly
 }
 
 #[cfg(test)]

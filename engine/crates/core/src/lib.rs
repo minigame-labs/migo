@@ -59,7 +59,8 @@
 //! use shared::protocol::host_cmd::HostCommand;
 //!
 //! // 1. Spawn the host thread
-//! let host_id = spawn_host_thread(surface, graphics_platform, platform, init_options)?;
+//! let mut host = spawn_host_thread(surface, graphics_platform, platform, init_options)?;
+//! let host_id = host.id();
 //!
 //! // 2. Send commands to run a game
 //! send_command_to_host(host_id, HostCommand::EvaluateModule {
@@ -71,7 +72,7 @@
 //! send_command_to_host(host_id, HostCommand::OnTouch(Box::new(...)))?;
 //!
 //! // 4. Shutdown when done
-//! shutdown_host(host_id)?;
+//! host.shutdown_and_join()?;
 //! ```
 //!
 //! ## Thread Model
@@ -102,7 +103,6 @@
 mod runtime;
 pub mod services;
 
-pub use runtime::vsync::send_vsync;
 pub use runtime::{
     // Exported because it is already part of the public signature of
     // `host_ingress`, `send_command_to_host` and `shutdown_host`. Without it a
@@ -112,6 +112,7 @@ pub use runtime::{
     HostId,
     HostIngress,
     HostIngressSendError,
+    HostThread,
     SpawnedSurfaceHost,
     host_ingress,
     lease_surface,
@@ -120,6 +121,7 @@ pub use runtime::{
     retire_surface,
     send_command_to_host,
     send_critical_command_to_host,
+    send_reliable_command_to_host,
     shutdown_host,
     spawn_host_thread,
     spawn_host_thread_tracked,

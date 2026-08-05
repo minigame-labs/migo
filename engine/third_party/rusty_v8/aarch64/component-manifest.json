@@ -1,6 +1,6 @@
 {
   "schema": "migo-v8-component-manifest/v1",
-  "component_id": "3f52da8d25988949d31ce7f48b7b6723006c4dfd49c9da3287aa3c6b6e4d34e4",
+  "component_id": "ee0fb437a33fcd9cde8f90faa8fbbf093be083ada05bec9e708efb73a36d27e1",
   "target": {
     "triple": "aarch64-linux-android",
     "os": "android",
@@ -15,8 +15,8 @@
     }
   },
   "toolchain": {
-    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) | binary: rustc | commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860 | commit-date: 2026-04-14 | host: x86_64-unknown-linux-gnu | release: 1.95.0 | LLVM version: 22.1.2",
-    "compiler": "Android (8481493, based on r416183c2) clang version 12.0.9 (https://android.googlesource.com/toolchain/llvm-project c935d99d7cf2016289302412d708641d52d2f7ee) | Target: aarch64-unknown-linux-android26 | Thread model: posix | InstalledDir: /home/xg/Android/Ndk/toolchains/llvm/prebuilt/linux-x86_64/bin",
+    "rustc": "rustc 1.89.0 (29483883e 2025-08-04) | binary: rustc | commit-hash: 29483883eed69d5fb4db01964cdf2af4d86e9cb2 | commit-date: 2025-08-04 | host: x86_64-unknown-linux-gnu | release: 1.89.0 | LLVM version: 20.1.7",
+    "compiler": "Android (8481493, based on r416183c2) clang version 12.0.9 (https://android.googlesource.com/toolchain/llvm-project c935d99d7cf2016289302412d708641d52d2f7ee) | Target: aarch64-unknown-linux-android26 | Thread model: posix | InstalledDir: ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin",
     "sdk": "Android NDK 23.2.8568313; API 26 sysroot; source.properties sha256=db78b6fa43a79ad75699e147ef90b6996e423f577ce5bd9cbdeff2ab98bdf798",
     "linker": "LLD 12.0.9 (/buildbot/src/android/llvm-r416183/out/llvm-project/lld c935d99d7cf2016289302412d708641d52d2f7ee) (compatible with GNU linkers)"
   },
@@ -50,7 +50,11 @@
       },
       {
         "id": "0003-custom-libcxx-for-snapshot-toolchain",
-        "sha256": "91322bd709eac0aee6e1c5d19db9e13b2db9953172f92359fa147e334de62e2e"
+        "sha256": "9c68fd6110b6a1b2549f731816defa1cf20cb204fe96d488c433dc7ec7e1f368"
+      },
+      {
+        "id": "migo-prebuilt-binding",
+        "sha256": "db9f843bb8a3d9b9c86c5ae87272a33efacd32a238a00f576d052a82a54b3389"
       }
     ]
   },
@@ -61,7 +65,7 @@
   "provenance": {
     "source_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
     "build_recipe": "scripts/build-v8-android.sh",
-    "build_recipe_sha256": "55c4bc2ee5d15be4293e5679813f64a7089a0bb4def8b95d0e583d094a4fd033",
+    "build_recipe_sha256": "7ebd3eeebd34ec7ac822c6936d4083eae9ec1e0e4e2858abf9400aee57102ec6",
     "licenses": [
       "BSD-3-Clause",
       "MIT"

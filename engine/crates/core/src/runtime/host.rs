@@ -24,7 +24,11 @@ use shared::{
 };
 
 use crate::{
-    runtime::{HostId, vsync},
+    runtime::{
+        HostId,
+        input_state::{InputRetraction, InputState},
+        vsync,
+    },
     services::{AudioService, PlatformServices, RenderService},
 };
 
@@ -87,6 +91,7 @@ impl std::ops::DerefMut for JsRuntimeSlot {
 /// transfers to the fully assembled `Host` and its normal `Drop` path.
 struct HostStartupGuard {
     id: HostId,
+    armed: bool,
     vsync_registered: bool,
     console_registered: bool,
 }
@@ -95,6 +100,7 @@ impl HostStartupGuard {
     fn new(id: HostId) -> Self {
         Self {
             id,
+            armed: true,
             vsync_registered: false,
             console_registered: false,
         }
@@ -109,6 +115,7 @@ impl HostStartupGuard {
     }
 
     fn disarm(&mut self) {
+        self.armed = false;
         self.vsync_registered = false;
         self.console_registered = false;
     }
@@ -121,6 +128,23 @@ impl Drop for HostStartupGuard {
         }
         if self.vsync_registered {
             vsync::unregister_vsync_sender(self.id);
+        }
+        // The text texture cache registers itself lazily, from whichever
+        // of the render thread or the JS extension reaches this session
+        // first, so there is no `mark_*_registered` edge to hang this on.
+        // A `Host::new` that failed after either could have created it and
+        // there is no assembled `Host` to run the normal teardown, so
+        // clear it whenever the guard is still armed. Unregistering an id
+        // that was never registered is a no-op.
+        //
+        // The image alias table is registered from one place only — the JS
+        // extension's bring-up — but leaks the same way for the same reason, and
+        // this guard drops after the runtime it would have been registered by,
+        // so nothing can register it again behind us.
+        if self.armed {
+            shared::text_texture_cache::unregister_text_cache(self.id);
+            runtime_v8::unregister_image_cache(self.id);
+            shared::services::forget_downloaded_zips(self.id);
         }
     }
 }
@@ -193,6 +217,10 @@ pub(crate) struct Host {
     /// it earlier lets game code run against a paused render/audio subsystem.
     pending_on_show_args: Option<Cow<'static, str>>,
 
+    /// Accepted input state retained at the sole FIFO consumer so focus loss
+    /// can retract it without sending synthetic work through a saturated queue.
+    input_state: InputState,
+
     /// Per-session GPU caps shared with the render thread.
     /// Survives JS runtime restarts (same GL context).
     gpu_caps: Arc<shared::device::gpu_caps::GpuCaps>,
@@ -226,10 +254,55 @@ impl Drop for Host {
         // panic). Do not call unregister_stats here to avoid a double-free.
         shared::console_log::unregister_console_log(self.id);
 
-        // Clear process-global caches to prevent stale state leaking into
-        // the next session (host_id increments, but caches are static).
-        runtime_v8::clear_shared_image_cache();
-        migo_io::global_cache().clear();
+        // Drop this session's text texture cache. Both holders of the
+        // handle are gone by now — the JS `CanvasOpState` with the
+        // isolate above, the render thread's `CanvasManager` when
+        // `render.shutdown()` joined — so this releases the last
+        // reference. Its entries hold GL texture names from an EGL
+        // context that no longer exists plus their byte accounting;
+        // neither may be retained for process life or inherited by a
+        // later session that reuses this id.
+        shared::text_texture_cache::unregister_text_cache(self.id);
+
+        // This session's GPU image aliases. `IMAGE_CACHE` maps src to a shared
+        // image id, and those ids name textures in an EGL context that is gone, so
+        // like the text cache they are session-owned and must not outlive it.
+        //
+        // Only this session's table goes: it is keyed per host, so another live
+        // game's aliases are not reachable from here to discard. No `DestroyImage`
+        // dispatch accompanies it either, because `render.shutdown()` above has
+        // already joined the thread that owned the context these ids named. The
+        // io-side pins those aliases held are released as the table drains, which
+        // matters precisely because the decoded bytes they pin are shared and do
+        // survive this session.
+        runtime_v8::unregister_image_cache(self.id);
+
+        // The decoded-bytes cache is deliberately NOT cleared. Its entries are
+        // context-independent RGBA and its key carries the resource's real identity
+        // -- resolved path, size, mtime, mount origin -- so a later session loading
+        // the same file legitimately reuses them and a changed file gets a different
+        // key. That invalidation is what the token tests
+        // (`extensionless_primary_size_change_invalidates_token` and its siblings)
+        // cover, and it is what makes clearing unnecessary.
+        //
+        // Clearing here was written for a single-session world -- the comment it
+        // replaced reasoned about "the next session" -- and with concurrent games it
+        // threw away every *live* session's decoded images too. Total memory stays
+        // bounded by the cache's own LRU byte budget either way, so not clearing
+        // costs nothing in the worst case and keeps the sharing that running several
+        // games in one process is for.
+        //
+        // What is dropped is this session's *claim* on those entries, so its bytes
+        // stop being attributed to a game that no longer exists. Nothing is evicted:
+        // an entry no one claims still serves the next session to ask for the same
+        // unchanged file, and ages out through the LRU like any other.
+        migo_io::image_cache::global_cache().release_session(self.id);
+
+        // Paths the host reported for downloads this session never installed. They
+        // are this session's alone -- the store is keyed per host so no live game's
+        // pending download is reachable from here -- and a path outlives its file,
+        // so keeping one would name a host temp file that is already gone.
+        shared::services::forget_downloaded_zips(self.id);
 
         info!("[Host {}] host cleanup complete.", self.id);
     }
@@ -525,6 +598,7 @@ impl Host {
             last_context_epoch: 0,
             render_error_throttle: HashMap::new(),
             pending_on_show_args: None,
+            input_state: InputState::default(),
             gpu_caps,
             render_notify,
         };
@@ -754,6 +828,9 @@ impl Host {
             }
 
             HostCommand::OnFocusChanged { focused } => {
+                if !focused {
+                    self.retract_input_for_focus_loss();
+                }
                 self.js.dispatch_focus_changed(focused);
                 Ok(())
             }
@@ -772,6 +849,7 @@ impl Host {
 
             HostCommand::OnTouch(touch) => {
                 let count = (touch.count as usize).min(touch.points.len());
+                self.input_state.observe_touch(&touch);
                 self.js.dispatch_touch(
                     touch.touch_type,
                     &touch.points[..count],
@@ -903,6 +981,7 @@ impl Host {
 
             HostCommand::OnCompositionStart { data } => {
                 self.js.dispatch_composition_start(&data);
+                self.input_state.observe_composition_start();
                 Ok(())
             }
 
@@ -913,6 +992,7 @@ impl Host {
 
             HostCommand::OnCompositionEnd { data } => {
                 self.js.dispatch_composition_end(&data);
+                self.input_state.observe_composition_end();
                 Ok(())
             }
 
@@ -947,6 +1027,8 @@ impl Host {
             } => {
                 self.js
                     .dispatch_key_down(&key, &code, timestamp_ms, modifiers, repeat);
+                self.input_state
+                    .observe_key_down(key, code, timestamp_ms, modifiers);
                 Ok(())
             }
 
@@ -959,6 +1041,7 @@ impl Host {
             } => {
                 self.js
                     .dispatch_key_up(&key, &code, timestamp_ms, modifiers, repeat);
+                self.input_state.observe_key_up(&code);
                 Ok(())
             }
 
@@ -968,6 +1051,8 @@ impl Host {
                 button,
                 timestamp_ms,
             } => {
+                self.input_state
+                    .observe_mouse_down(x, y, button, timestamp_ms);
                 self.js.dispatch_mouse_down(x, y, button, timestamp_ms);
                 Ok(())
             }
@@ -978,6 +1063,8 @@ impl Host {
                 button,
                 timestamp_ms,
             } => {
+                self.input_state
+                    .observe_mouse_move(x, y, button, timestamp_ms);
                 self.js.dispatch_mouse_move(x, y, button, timestamp_ms);
                 Ok(())
             }
@@ -988,6 +1075,8 @@ impl Host {
                 button,
                 timestamp_ms,
             } => {
+                self.input_state
+                    .observe_mouse_up(x, y, button, timestamp_ms);
                 self.js.dispatch_mouse_up(x, y, button, timestamp_ms);
                 Ok(())
             }
@@ -1307,10 +1396,35 @@ impl Host {
         result
     }
 
+    fn retract_input_for_focus_loss(&mut self) {
+        let js = &mut self.js;
+        self.input_state
+            .retract_for_focus_loss(|retraction| match retraction {
+                InputRetraction::TouchCancel(touch) => {
+                    let count = usize::from(touch.count).min(touch.points.len());
+                    js.dispatch_touch(touch.touch_type, &touch.points[..count], touch.timestamp_ms);
+                }
+                InputRetraction::MouseUp {
+                    x,
+                    y,
+                    button,
+                    timestamp_ms,
+                } => js.dispatch_mouse_up(x, y, button, timestamp_ms),
+                InputRetraction::KeyUp {
+                    key,
+                    code,
+                    timestamp_ms,
+                    modifiers,
+                } => js.dispatch_key_up(&key, &code, timestamp_ms, modifiers, false),
+                InputRetraction::CompositionEnd => js.dispatch_composition_end(""),
+            });
+    }
+
     async fn on_restart(&mut self) -> EngineResult<()> {
         // Pause subsystems to ensure a clean restart
         self.render.pause();
         self.audio.pause();
+        self.input_state = InputState::default();
 
         // Bump the RAF session ticket so the fresh isolate ignores any signal
         // (stale timestamp) produced for the old one on the shared eventfd, and
@@ -1351,13 +1465,15 @@ impl Host {
             gpu_caps: self.gpu_caps.clone(),
         };
 
-        // drain_shared_image_cache() returns shared IDs and clears the JS-side
-        // bookkeeping (process-global).  We must send DestroyImage for each ID
+        // drain_shared_image_cache() returns this session's shared IDs and clears
+        // its JS-side bookkeeping.  We must send DestroyImage for each ID
         // *before* clearing the IO cache — otherwise the render thread holds
         // orphaned GPU textures that no one will ever release. Batch them into a
         // single must-deliver command so a large image set doesn't block restart
-        // up to the send deadline per image.
-        let shared_ids = runtime_v8::drain_shared_image_cache();
+        // up to the send deadline per image. The registration survives the drain
+        // because the isolate this restart is about to build resolves the same
+        // handle.
+        let shared_ids = runtime_v8::drain_shared_image_cache(self.id);
         if !shared_ids.is_empty() {
             if let Err(e) =
                 self.render
@@ -1372,7 +1488,13 @@ impl Host {
                 );
             }
         }
-        migo_io::global_cache().clear();
+        // Not cleared, for the reason given in the teardown path: the decoded-bytes
+        // key carries real identity, so a restart reloading the same unchanged files
+        // should reuse them rather than pay to decode again, and clearing would have
+        // discarded every other running game's images as well.
+        //
+        // This session's *claim* on those entries is dropped further down, once the
+        // IO scheduler is closed.
 
         // ---- V8 limits config ----
         #[cfg(feature = "v8-limits")]
@@ -1382,6 +1504,22 @@ impl Host {
         // in-flight async IO tasks are rejected immediately rather than racing
         // with the new session's scheduler after the old runtime is gone.
         self.js.close_io_scheduler();
+
+        // Drop this session's claim on the decoded bytes, so what it is reported as
+        // holding reflects what its new isolate has actually loaded rather than what
+        // the previous one did. Nothing is evicted.
+        //
+        // Ordered after the scheduler closes rather than before, because a decode
+        // queued by the old isolate would otherwise insert after this scan and hand
+        // the new isolate a claim it never made. Closing first rejects the queued
+        // work; a closure already running in a worker can still land afterwards, and
+        // that residue is accepted rather than designed against. A host id names the
+        // *session*, not the isolate, so such an entry is attributed to the same game
+        // that decoded it either way -- it cannot cross to another game. What it can
+        // do is make a restart boundary slightly untidy in that game's own figures,
+        // and incarnation-tagged owner identity is a large amount of plumbing to buy
+        // exactness in a diagnostic.
+        migo_io::image_cache::global_cache().release_session(self.id);
 
         // CRITICAL: Drop the old JsRuntime BEFORE creating the new one.
         // Two v8 isolates on the same thread during drop cleanup causes

@@ -1612,6 +1612,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "migo-alloc-probe"
+version = "0.1.0"
+
+[[package]]
 name = "migo-android-jni"
 version = "0.1.0"
 dependencies = [
@@ -1627,6 +1631,7 @@ dependencies = [
  "futures-util",
  "hound",
  "lewton",
+ "migo-executor-probe",
  "migo-shared",
  "minimp3",
  "ndk-context",
@@ -1663,12 +1668,20 @@ name = "migo-capi-abi"
 version = "0.1.0"
 
 [[package]]
+name = "migo-contention-probe"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "migo-core"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "futures",
  "migo-audio",
+ "migo-contention-probe",
  "migo-graphics",
  "migo-io",
  "migo-runtime-v8",
@@ -1680,6 +1693,14 @@ dependencies = [
  "tracing",
  "tracing-android",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "migo-executor-probe"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "tokio",
 ]
 
 [[package]]
@@ -1737,6 +1758,7 @@ dependencies = [
  "futures",
  "jni",
  "khronos-egl",
+ "libc",
  "libloading",
  "migo-core",
  "migo-graphics",
@@ -1813,6 +1835,8 @@ dependencies = [
  "libc",
  "lru",
  "md-5",
+ "migo-alloc-probe",
+ "migo-contention-probe",
  "parking_lot",
  "serde",
  "serde_json",

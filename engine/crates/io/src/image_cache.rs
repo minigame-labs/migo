@@ -68,18 +68,57 @@ pub fn resized_key(path: String, generation: u64, target_w: u32, target_h: u32) 
     (path, generation, target_w, target_h)
 }
 
-/// Cached image entry with reference counting.
-#[derive(Clone)]
-pub struct CachedImage {
-    pub image: NormalizedImage,
+/// Cached image entry.
+///
+/// `owners` records which Sessions have asked for these bytes, and it is the
+/// reason this type is no longer handed out: [`ImageCache::get`] returns the
+/// `NormalizedImage` instead, whose clone is an `Arc` bump and two `u32`. That
+/// call sits on the `texImage2D` frame path, so cloning a `Vec` alongside it
+/// would put a heap allocation there — what Section 7.3 forbids.
+///
+/// One entry can have several owners, because two games loading the same file
+/// share one decoded copy on purpose. Bytes are therefore attributed to every
+/// owner rather than split between them: per-Session totals can exceed the
+/// resident total, and that overlap is the sharing working.
+struct CachedImage {
+    image: NormalizedImage,
     size_bytes: usize,
+    owners: Vec<i32>,
 }
 
 impl CachedImage {
-    fn new(image: NormalizedImage) -> Self {
+    fn new(image: NormalizedImage, session: i32) -> Self {
         let size_bytes = image.rgba.len();
-        Self { image, size_bytes }
+        let mut owners = Vec::with_capacity(1);
+        owners.push(session);
+        Self {
+            image,
+            size_bytes,
+            owners,
+        }
     }
+
+    #[inline]
+    fn owned_by(&self, session: i32) -> bool {
+        self.owners.contains(&session)
+    }
+
+    /// Record `session` as depending on these bytes. Allocates only the first
+    /// time a given Session touches a given entry, never in steady state.
+    #[inline]
+    fn add_owner(&mut self, session: i32) {
+        if !self.owned_by(session) {
+            self.owners.push(session);
+        }
+    }
+}
+
+/// One Session's own lookup outcomes. Kept per Session because a shared
+/// aggregate let one game watch another's asset loading.
+#[derive(Default, Clone, Copy)]
+struct SessionCounters {
+    hits: u64,
+    misses: u64,
 }
 
 /// Cache statistics for monitoring.
@@ -153,15 +192,28 @@ impl TrimLevel {
         }
     }
 
-    /// Fraction of the *current* byte usage to release. `1.0` means
-    /// clear the cache.
-    fn release_fraction(self) -> f64 {
+    /// Bytes the cache may keep at this level, as a ceiling on the budget.
+    ///
+    /// A ceiling, deliberately, rather than a fraction of *current* usage. The
+    /// pressure signal is delivered per Session — a host app running two games calls
+    /// `notifyMemoryWarning` once for each from a single Android `onTrimMemory` — and
+    /// this cache is shared between them, so a "release a quarter of what is left"
+    /// rule compounded: N Sessions released `1 - (1 - f)^N`, about 58% at moderate
+    /// pressure with three games instead of 25%. Against a ceiling the second and
+    /// third calls find the cache already under it and do nothing, so the level means
+    /// the same thing however many Sessions relay it.
+    ///
+    /// It also stops a cache sitting well inside its budget from being churned: at
+    /// 20 MB of a 64 MB budget, moderate pressure asks for nothing, where the old
+    /// rule paid for 5 MB of re-decodes to relieve nothing that mattered.
+    fn retained_bytes(self, budget: usize) -> usize {
         match self {
-            TrimLevel::RunningModerate => 0.25,
-            TrimLevel::RunningLow => 0.50,
-            TrimLevel::UiHidden => 0.50,
-            TrimLevel::RunningCritical => 1.0,
-            TrimLevel::Background => 1.0,
+            TrimLevel::RunningModerate => budget / 4 * 3,
+            TrimLevel::RunningLow | TrimLevel::UiHidden => budget / 2,
+            // Nothing is retained under critical or background pressure; pinned
+            // entries survive anyway, since dropping a live alias's bytes trades a
+            // memory saving for a black texture.
+            TrimLevel::RunningCritical | TrimLevel::Background => 0,
         }
     }
 }
@@ -217,6 +269,10 @@ pub struct ImageCache {
     /// Sized small (one u32 per live key); memory cost is
     /// negligible vs. the bitmap bytes the cache gates access to.
     pins: HashMap<ImageCacheKey, u32>,
+    /// Per-Session lookup outcomes, beside the process aggregate rather than
+    /// replacing it: the aggregate still describes the one cache that exists,
+    /// while a game may only be told about its own traffic.
+    sessions: HashMap<i32, SessionCounters>,
 }
 
 impl ImageCache {
@@ -242,6 +298,7 @@ impl ImageCache {
             admissions_rejected: 0,
             trim_bytes_released: 0,
             pins: HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
 
@@ -350,22 +407,31 @@ impl ImageCache {
         Some(victim.size_bytes)
     }
 
-    /// Get an image from cache. Hitting a key still bumps the
-    /// frequency counter so long-lived entries keep their admission
+    /// Get an image from cache on behalf of `session`. Hitting a key still bumps
+    /// the frequency counter so long-lived entries keep their admission
     /// advantage.
-    pub fn get(&mut self, key: &ImageCacheKey) -> Option<CachedImage> {
+    ///
+    /// A hit records `session` as an owner. Reading an entry another game decoded
+    /// is exactly how sharing pays off, and it also makes this Session depend on
+    /// those bytes — so `clear_for_session` must not drop them while it still
+    /// does, and `stats_for_session` should count them.
+    pub fn get(&mut self, key: &ImageCacheKey, session: i32) -> Option<NormalizedImage> {
         // Frequency accounting runs for every lookup, hit or miss,
         // so the sketch reflects "how popular is this key" not "how
         // often did it hit the cache" — the latter would feedback-
         // lock cold-but-hot paths out forever.
         self.sketch.increment(key);
-        match self.cache.get(key) {
+        let counters = self.sessions.entry(session).or_default();
+        match self.cache.get_mut(key) {
             Some(cached) => {
                 self.hits += 1;
-                Some(cached.clone())
+                counters.hits += 1;
+                cached.add_owner(session);
+                Some(cached.image.clone())
             }
             None => {
                 self.misses += 1;
+                counters.misses += 1;
                 None
             }
         }
@@ -388,9 +454,9 @@ impl ImageCache {
     ///     access, so a repeated request will cross the threshold.
     ///  4. Otherwise evict LRU victims until there's room, then
     ///     insert.
-    pub fn insert(&mut self, key: ImageCacheKey, image: NormalizedImage) {
+    pub fn insert(&mut self, key: ImageCacheKey, image: NormalizedImage, session: i32) {
         let new_freq = self.sketch.increment(&key);
-        let cached = CachedImage::new(image);
+        let mut cached = CachedImage::new(image, session);
         let new_size = cached.size_bytes;
 
         // Refuse unusable entries up front.
@@ -414,7 +480,22 @@ impl ImageCache {
         // prevent.  We also skip the admission check when the key
         // is already resident (replace-in-place path).
         let newcomer_pinned = self.pins.contains_key(&key);
-        let already_resident = self.cache.contains(&key);
+        // Re-decoding a resident key must not forget who already depended on it,
+        // and the owners are carried across **here**, before the eviction loop
+        // below. That loop can pop this very key when it is the coldest unpinned
+        // entry — two Sessions finishing a decode of the same image into a cache
+        // with no spare room is enough — and reading the owners afterwards would
+        // then find nothing and silently drop the first Session's claim, leaving
+        // its bytes evictable by the second Session's `clear_for_session`.
+        let already_resident = match self.cache.peek(&key) {
+            Some(resident) => {
+                for owner in &resident.owners {
+                    cached.add_owner(*owner);
+                }
+                true
+            }
+            None => false,
+        };
         if self.current_size + new_size > self.max_size && !newcomer_pinned && !already_resident {
             if let Some((victim_key, _)) = self.cache.peek_lru() {
                 // Only count the true LRU tail as the victim when
@@ -487,7 +568,11 @@ impl ImageCache {
     /// Pinned entries survive because the app still holds live
     /// references to them; wiping them out would leave dangling
     /// aliases whose later `texImage2D` upload would black-screen.
-    pub fn clear(&mut self) {
+    /// Not reachable from a Session, and deliberately so: this discards entries
+    /// every live game may be depending on, which is why the game-visible
+    /// `ImageCache.clear()` routes through [`Self::clear_for_session`] instead.
+    /// Retained at crate visibility for the cache's own tests.
+    pub(crate) fn clear(&mut self) {
         // Fast path: no pins → full clear as before.
         if self.pins.is_empty() {
             self.cache.clear();
@@ -515,6 +600,50 @@ impl ImageCache {
         // to re-earn their admission.
     }
 
+    /// Drop `session`'s claim on every entry, and evict the entries left with no
+    /// claim at all.
+    ///
+    /// This backs the game-visible `ImageCache.clear()`. A game may discard what
+    /// it is holding; it may not discard what another game is holding, which the
+    /// process-wide [`Self::clear`] did. An entry two games own therefore survives
+    /// with the caller's ownership dropped, and pins still win over eviction for
+    /// the same reason they do everywhere else: the alternative is a live alias
+    /// whose next upload reads no bytes and renders black.
+    pub fn clear_for_session(&mut self, session: i32) {
+        let orphaned: Vec<ImageCacheKey> = self
+            .cache
+            .iter()
+            .filter(|(k, v)| {
+                v.owned_by(session) && v.owners.len() == 1 && !self.pins.contains_key(*k)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for (_, entry) in self.cache.iter_mut() {
+            entry.owners.retain(|owner| *owner != session);
+        }
+
+        for key in orphaned {
+            if let Some(removed) = self.cache.pop(&key) {
+                self.current_size = self.current_size.saturating_sub(removed.size_bytes);
+            }
+        }
+        // The sketch is left alone. Its counts describe the shared cache, and the
+        // entries other games still own have earned their admission.
+    }
+
+    /// Forget `session` entirely at teardown: its claims and its counters.
+    ///
+    /// Nothing is evicted. The bytes are context-independent and shared on
+    /// purpose, so a later Session loading the same unchanged file should still
+    /// get them for free; they age out through the LRU like any other entry.
+    pub fn release_session(&mut self, session: i32) {
+        for (_, entry) in self.cache.iter_mut() {
+            entry.owners.retain(|owner| *owner != session);
+        }
+        self.sessions.remove(&session);
+    }
+
     /// Release a fraction of the cache in response to OS memory
     /// pressure. Returns the number of bytes actually freed.
     ///
@@ -529,32 +658,14 @@ impl ImageCache {
         }
 
         let start_size = self.current_size;
-        let fraction = level.release_fraction();
-        if fraction >= 1.0 {
-            // Aggressive path: drop non-pinned entries only.
-            // Pinned entries are live references; wiping them
-            // would leave dangling aliases whose next
-            // `texImage2D` upload would render black.  This is
-            // the same contract Flutter's ImageCache.clear()
-            // exposes — live images survive even the most
-            // aggressive memory pressure, because the
-            // alternative is visible breakage instead of
-            // memory saving.
-            let pre_size = self.current_size;
-            while self.pop_unpinned_lru().is_some() {}
-            let freed = pre_size.saturating_sub(self.current_size);
-            self.trim_bytes_released += freed as u64;
-            shared::stats::io_metrics_global()
-                .image_cache_trim_bytes
-                .fetch_add(freed as u32, std::sync::atomic::Ordering::Relaxed);
-            return freed;
-        }
-
-        let target_size = ((start_size as f64) * (1.0 - fraction)).round() as usize;
+        let target_size = level.retained_bytes(self.max_size);
         while self.current_size > target_size {
             if self.pop_unpinned_lru().is_none() {
-                // Only pinned entries remain; cannot free more
-                // without violating live-reference invariant.
+                // Only pinned entries remain; cannot free more without violating the
+                // live-reference invariant. Pinned bytes are what an alias's next
+                // `texImage2D` will read, so the alternative to keeping them over
+                // budget is a black texture — the same contract Flutter's
+                // `ImageCache.clear()` exposes.
                 break;
             }
         }
@@ -566,7 +677,40 @@ impl ImageCache {
         freed
     }
 
-    /// Get cache statistics.
+    /// What `session` is told about the cache.
+    ///
+    /// `hits` and `misses` are its own lookups. `entries` and `size_bytes` cover
+    /// the entries it owns, counting a shared entry's bytes in full for each
+    /// owner: two games holding one 4 MB atlas are each told 4 MB, so per-Session
+    /// totals can exceed the resident total. Splitting the bytes would need an
+    /// arbitrary rule, and under-reporting what a game depends on is the more
+    /// misleading of the two. `max_bytes` is the one shared budget, reported as
+    /// such.
+    ///
+    /// Nothing here varies with another Session's traffic, which is the point:
+    /// the process-wide figures let one game observe another's asset loading.
+    pub fn stats_for_session(&self, session: i32) -> CacheStats {
+        let counters = self.sessions.get(&session).copied().unwrap_or_default();
+        let (entries, size_bytes) = self
+            .cache
+            .iter()
+            .filter(|(_, v)| v.owned_by(session))
+            .fold((0usize, 0usize), |(n, bytes), (_, v)| {
+                (n + 1, bytes + v.size_bytes)
+            });
+        CacheStats {
+            entries,
+            size_bytes,
+            max_bytes: self.max_size,
+            hits: counters.hits,
+            misses: counters.misses,
+            admissions_rejected: 0,
+            trim_bytes_released: 0,
+        }
+    }
+
+    /// Process-wide statistics, for diagnostics that are allowed to see the whole
+    /// cache. Never hand these to a game: see [`Self::stats_for_session`].
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             entries: self.cache.len(),
@@ -597,6 +741,11 @@ pub fn global_cache() -> parking_lot::MutexGuard<'static, ImageCache> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Session these mechanics tests load as. They exercise LRU, admission and
+    /// pin behaviour, none of which is per-Session; the tests that *are* about
+    /// Session isolation name their own ids.
+    const ONE_SESSION: i32 = 1;
     use shared::protocol::io_cmd::NormalizedImage;
     use std::sync::Arc;
 
@@ -620,13 +769,13 @@ mod tests {
         let r128 = resized_key("/code/sprite.png".into(), 3, 128, 128);
         let r64 = resized_key("/code/sprite.png".into(), 3, 64, 64);
 
-        cache.insert(full.clone(), rgba(256, 256));
-        cache.insert(r128.clone(), rgba(128, 128));
-        cache.insert(r64.clone(), rgba(64, 64));
+        cache.insert(full.clone(), rgba(256, 256), ONE_SESSION);
+        cache.insert(r128.clone(), rgba(128, 128), ONE_SESSION);
+        cache.insert(r64.clone(), rgba(64, 64), ONE_SESSION);
 
-        assert_eq!(cache.get(&full).unwrap().image.width, 256);
-        assert_eq!(cache.get(&r128).unwrap().image.width, 128);
-        assert_eq!(cache.get(&r64).unwrap().image.width, 64);
+        assert_eq!(cache.get(&full, ONE_SESSION).unwrap().width, 256);
+        assert_eq!(cache.get(&r128, ONE_SESSION).unwrap().width, 128);
+        assert_eq!(cache.get(&r64, ONE_SESSION).unwrap().width, 64);
         let stats = cache.stats();
         assert_eq!(stats.entries, 3);
         assert!(stats.hits >= 3);
@@ -639,13 +788,25 @@ mod tests {
         // keying on generation: gen=9 entries simply never collide
         // with gen=10 lookups.
         let mut cache = ImageCache::with_limits(16, 16 * 1024 * 1024);
-        cache.insert(full_res_key("/code/t.png".into(), 9), rgba(32, 32));
-        cache.insert(resized_key("/code/t.png".into(), 9, 16, 16), rgba(16, 16));
+        cache.insert(
+            full_res_key("/code/t.png".into(), 9),
+            rgba(32, 32),
+            ONE_SESSION,
+        );
+        cache.insert(
+            resized_key("/code/t.png".into(), 9, 16, 16),
+            rgba(16, 16),
+            ONE_SESSION,
+        );
 
-        assert!(cache.get(&full_res_key("/code/t.png".into(), 10)).is_none());
         assert!(
             cache
-                .get(&resized_key("/code/t.png".into(), 10, 16, 16))
+                .get(&full_res_key("/code/t.png".into(), 10), ONE_SESSION)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&resized_key("/code/t.png".into(), 10, 16, 16), ONE_SESSION)
                 .is_none()
         );
     }
@@ -655,8 +816,8 @@ mod tests {
         // The admission filter must only kick in when the cache is
         // full. Empty-cache inserts always succeed.
         let mut cache = ImageCache::with_limits(16, 1024 * 1024);
-        cache.insert(full_res_key("/a.png".into(), 1), rgba(16, 16));
-        cache.insert(full_res_key("/b.png".into(), 1), rgba(16, 16));
+        cache.insert(full_res_key("/a.png".into(), 1), rgba(16, 16), ONE_SESSION);
+        cache.insert(full_res_key("/b.png".into(), 1), rgba(16, 16), ONE_SESSION);
         let s = cache.stats();
         assert_eq!(s.entries, 2);
         assert_eq!(s.admissions_rejected, 0);
@@ -676,18 +837,18 @@ mod tests {
         let hot = full_res_key("/hot.png".into(), 1);
         // Warm up "hot": multiple accesses bump its sketch count.
         for _ in 0..8 {
-            let _ = cache.get(&hot); // miss, bumps sketch
+            let _ = cache.get(&hot, ONE_SESSION); // miss, bumps sketch
         }
-        cache.insert(hot.clone(), rgba(64, 64));
+        cache.insert(hot.clone(), rgba(64, 64), ONE_SESSION);
         // Each subsequent get bumps hot's count further.
         for _ in 0..8 {
-            let _ = cache.get(&hot);
+            let _ = cache.get(&hot, ONE_SESSION);
         }
 
         // Flood with cold one-shot images.
         for i in 0..200u32 {
             let k = full_res_key(format!("/cold_{i}.png"), 1);
-            cache.insert(k, rgba(64, 64));
+            cache.insert(k, rgba(64, 64), ONE_SESSION);
         }
 
         // The hot entry should still be cached; the admission
@@ -706,12 +867,98 @@ mod tests {
         );
     }
 
+    /// One Android `onTrimMemory` reaches this cache once per live Session, because
+    /// the host app relays it through each `GameSession` and the cache is shared. A
+    /// level that meant "release a quarter of what is left" therefore compounded --
+    /// three games turned a 25% request into about 58%, evicting a working set the OS
+    /// never asked for.
+    #[test]
+    fn a_pressure_signal_relayed_by_every_session_trims_once() {
+        let img_bytes = 32 * 32 * 4;
+        let budget = 8 * img_bytes;
+        let mut cache = ImageCache::with_limits(16, budget);
+        for i in 0..8u32 {
+            cache.insert(
+                full_res_key(format!("/p{i}.png"), 1),
+                rgba(32, 32),
+                ONE_SESSION,
+            );
+        }
+        assert_eq!(
+            cache.stats().size_bytes,
+            budget,
+            "the fixture must start full"
+        );
+
+        let first = cache.trim(TrimLevel::RunningModerate);
+        let after_first = cache.stats().size_bytes;
+        assert!(
+            first > 0,
+            "the first relay of the signal must actually free bytes"
+        );
+
+        // The second and third Sessions relay the same signal.
+        let second = cache.trim(TrimLevel::RunningModerate);
+        let third = cache.trim(TrimLevel::RunningModerate);
+        assert_eq!(
+            (second, third),
+            (0, 0),
+            "the same pressure signal freed more each time another Session relayed \
+             it, so N games multiply one request into N"
+        );
+        assert_eq!(
+            cache.stats().size_bytes,
+            after_first,
+            "repeated relays of one signal must leave the cache where the first put it"
+        );
+        assert_eq!(
+            after_first,
+            budget / 4 * 3,
+            "moderate pressure must land on its ceiling, not on a fraction of \
+             whatever happened to be resident"
+        );
+    }
+
+    /// The other half of reading a level as a ceiling: a cache already well inside
+    /// its budget is asked for nothing. Evicting a quarter of it would buy the OS a
+    /// few megabytes and cost a re-decode of every entry dropped.
+    #[test]
+    fn moderate_pressure_leaves_a_cache_inside_its_budget_alone() {
+        let img_bytes = 32 * 32 * 4;
+        let mut cache = ImageCache::with_limits(16, 8 * img_bytes);
+        for i in 0..2u32 {
+            cache.insert(
+                full_res_key(format!("/q{i}.png"), 1),
+                rgba(32, 32),
+                ONE_SESSION,
+            );
+        }
+        let before = cache.stats().size_bytes;
+        assert_eq!(cache.trim(TrimLevel::RunningModerate), 0);
+        assert_eq!(cache.stats().size_bytes, before);
+    }
+
+    /// Aggressive levels stay absolute: everything unpinned goes, whatever the
+    /// resident size was.
+    #[test]
+    fn background_pressure_still_empties_an_underfull_cache() {
+        let img_bytes = 32 * 32 * 4;
+        let mut cache = ImageCache::with_limits(16, 8 * img_bytes);
+        cache.insert(full_res_key("/r.png".into(), 1), rgba(32, 32), ONE_SESSION);
+        assert_eq!(cache.trim(TrimLevel::Background), img_bytes);
+        assert_eq!(cache.stats().size_bytes, 0);
+    }
+
     #[test]
     fn trim_running_low_frees_about_half() {
         let img_bytes = 32 * 32 * 4;
         let mut cache = ImageCache::with_limits(16, 8 * img_bytes);
         for i in 0..8u32 {
-            cache.insert(full_res_key(format!("/p{i}.png"), 1), rgba(32, 32));
+            cache.insert(
+                full_res_key(format!("/p{i}.png"), 1),
+                rgba(32, 32),
+                ONE_SESSION,
+            );
         }
         let before = cache.stats().size_bytes;
         let freed = cache.trim(TrimLevel::RunningLow);
@@ -731,9 +978,13 @@ mod tests {
     fn trim_background_clears_entries_but_keeps_sketch() {
         let mut cache = ImageCache::with_limits(16, 4 * 1024 * 1024);
         for _ in 0..10 {
-            let _ = cache.get(&full_res_key("/hot.png".into(), 1));
+            let _ = cache.get(&full_res_key("/hot.png".into(), 1), ONE_SESSION);
         }
-        cache.insert(full_res_key("/hot.png".into(), 1), rgba(64, 64));
+        cache.insert(
+            full_res_key("/hot.png".into(), 1),
+            rgba(64, 64),
+            ONE_SESSION,
+        );
 
         let freed = cache.trim(TrimLevel::Background);
         let s = cache.stats();
@@ -765,7 +1016,7 @@ mod tests {
     fn clear_resets_sketch() {
         let mut cache = ImageCache::with_limits(4, 1024 * 1024);
         for _ in 0..10 {
-            let _ = cache.get(&full_res_key("/k.png".into(), 1));
+            let _ = cache.get(&full_res_key("/k.png".into(), 1), ONE_SESSION);
         }
         cache.clear();
         assert_eq!(cache.sketch.estimate(&full_res_key("/k.png".into(), 1)), 0);
@@ -776,7 +1027,11 @@ mod tests {
         // One image bigger than the whole cache must neither be
         // stored nor trigger an eviction storm.
         let mut cache = ImageCache::with_limits(4, 1024);
-        cache.insert(full_res_key("/big.png".into(), 1), rgba(64, 64)); // 16KB
+        cache.insert(
+            full_res_key("/big.png".into(), 1),
+            rgba(64, 64),
+            ONE_SESSION,
+        ); // 16KB
         let s = cache.stats();
         assert_eq!(s.entries, 0);
         assert_eq!(s.size_bytes, 0);
@@ -794,7 +1049,7 @@ mod tests {
         let mut cache = ImageCache::with_limits(32, cap_bytes);
 
         let live = full_res_key("/avatar.png".into(), 1);
-        cache.insert(live.clone(), rgba(64, 64));
+        cache.insert(live.clone(), rgba(64, 64), ONE_SESSION);
         cache.pin(&live);
         assert_eq!(cache.pin_count(&live), 1);
 
@@ -805,7 +1060,7 @@ mod tests {
         // but the pin must override the filter decision.
         for i in 0..200u32 {
             let k = full_res_key(format!("/cold_{i}.png"), 1);
-            cache.insert(k, rgba(64, 64));
+            cache.insert(k, rgba(64, 64), ONE_SESSION);
         }
 
         assert!(
@@ -821,7 +1076,7 @@ mod tests {
         assert_eq!(cache.pin_count(&live), 0);
         for i in 200..400u32 {
             let k = full_res_key(format!("/cold_{i}.png"), 1);
-            cache.insert(k, rgba(64, 64));
+            cache.insert(k, rgba(64, 64), ONE_SESSION);
         }
         assert!(
             !cache.contains(&live),
@@ -838,8 +1093,8 @@ mod tests {
 
         let pinned = full_res_key("/live.png".into(), 1);
         let idle = full_res_key("/idle.png".into(), 1);
-        cache.insert(pinned.clone(), rgba(64, 64));
-        cache.insert(idle.clone(), rgba(64, 64));
+        cache.insert(pinned.clone(), rgba(64, 64), ONE_SESSION);
+        cache.insert(idle.clone(), rgba(64, 64), ONE_SESSION);
         cache.pin(&pinned);
 
         let freed = cache.trim(TrimLevel::Background);
@@ -861,13 +1116,188 @@ mod tests {
         let mut cache = ImageCache::with_limits(4, 2 * 64 * 64 * 4);
         let k = full_res_key("/pre.png".into(), 1);
         cache.pin(&k);
-        cache.insert(k.clone(), rgba(64, 64));
+        cache.insert(k.clone(), rgba(64, 64), ONE_SESSION);
 
         // Evict-flood: the pinned entry must survive.
         for i in 0..50u32 {
             let kc = full_res_key(format!("/flood_{i}.png"), 1);
-            cache.insert(kc, rgba(64, 64));
+            cache.insert(kc, rgba(64, 64), ONE_SESSION);
         }
         assert!(cache.contains(&k));
+    }
+
+    // ── Per-Session attribution ─────────────────────────────────────────────
+    //
+    // This cache is shared between Sessions on purpose: its entries are decoded
+    // RGBA under a key carrying the file's real identity, so two games loading one
+    // asset hold one copy. What each game may *do* to it, and be told about it, is
+    // the part that has to be its own.
+
+    fn key(path: &str) -> ImageCacheKey {
+        full_res_key(path.to_string(), 1)
+    }
+
+    #[test]
+    fn one_games_clear_keeps_what_another_game_is_using() {
+        let mut cache = ImageCache::new();
+        let (a, b) = (11, 22);
+        cache.insert(key("/a-only.png"), rgba(16, 16), a);
+        cache.insert(key("/b-only.png"), rgba(16, 16), b);
+
+        // Reached from game script through `ImageCache.clear()`.
+        cache.clear_for_session(a);
+
+        assert!(
+            !cache.contains(&key("/a-only.png")),
+            "a game clearing its own cache must actually drop its own entries"
+        );
+        assert!(
+            cache.contains(&key("/b-only.png")),
+            "one game's script cleared another game's decoded bytes"
+        );
+    }
+
+    #[test]
+    fn clearing_spares_an_entry_the_other_game_also_loaded() {
+        let mut cache = ImageCache::new();
+        let (a, b) = (33, 44);
+        let shared = key("/shared-atlas.png");
+        cache.insert(shared.clone(), rgba(32, 32), a);
+        // B loading the same file is served the copy A decoded -- that is the
+        // sharing working -- and depends on those bytes from here on.
+        assert!(cache.get(&shared, b).is_some());
+
+        cache.clear_for_session(a);
+        assert!(
+            cache.contains(&shared),
+            "an entry two games hold was dropped when only one of them cleared"
+        );
+
+        // With A's claim gone, B clearing is the last claim and the bytes may go.
+        cache.clear_for_session(b);
+        assert!(!cache.contains(&shared));
+    }
+
+    #[test]
+    fn a_game_is_told_only_about_its_own_traffic() {
+        let mut cache = ImageCache::new();
+        let (a, b) = (55, 66);
+        cache.insert(key("/a1.png"), rgba(16, 16), a);
+        cache.insert(key("/b1.png"), rgba(16, 16), b);
+        cache.insert(key("/b2.png"), rgba(16, 16), b);
+        // One hit and one miss for B, none for A.
+        assert!(cache.get(&key("/b1.png"), b).is_some());
+        assert!(cache.get(&key("/absent.png"), b).is_none());
+
+        let seen_by_a = cache.stats_for_session(a);
+        assert_eq!(seen_by_a.entries, 1, "game A sees another game's entries");
+        assert_eq!(
+            seen_by_a.hits, 0,
+            "game A is told about lookups it never made"
+        );
+        assert_eq!(
+            seen_by_a.misses, 0,
+            "game A can watch another game's cache misses"
+        );
+        assert_eq!(
+            seen_by_a.size_bytes,
+            16 * 16 * 4,
+            "game A's byte total includes bytes only another game asked for"
+        );
+
+        let seen_by_b = cache.stats_for_session(b);
+        assert_eq!(seen_by_b.entries, 2);
+        assert_eq!(seen_by_b.hits, 1);
+        assert_eq!(seen_by_b.misses, 1);
+    }
+
+    #[test]
+    fn shared_bytes_are_reported_in_full_to_each_owner() {
+        // The decided semantics, asserted rather than left implicit: an entry two
+        // games own has no non-arbitrary split, so each is told the whole size and
+        // per-Session totals legitimately exceed the resident total. Under-reporting
+        // what a game depends on would be the more misleading choice.
+        let mut cache = ImageCache::new();
+        let (a, b) = (77, 88);
+        let shared = key("/one-copy.png");
+        cache.insert(shared.clone(), rgba(64, 64), a);
+        assert!(cache.get(&shared, b).is_some());
+
+        let bytes = 64 * 64 * 4;
+        assert_eq!(cache.stats_for_session(a).size_bytes, bytes);
+        assert_eq!(cache.stats_for_session(b).size_bytes, bytes);
+        assert_eq!(
+            cache.stats().size_bytes,
+            bytes,
+            "the resident total must stay one copy, whatever the owners are told"
+        );
+    }
+
+    #[test]
+    fn a_departed_game_stops_being_charged_but_its_bytes_stay() {
+        let mut cache = ImageCache::new();
+        let (a, b) = (99, 111);
+        let shared = key("/survives-teardown.png");
+        cache.insert(shared.clone(), rgba(32, 32), a);
+        assert!(cache.get(&shared, b).is_some());
+        cache.insert(key("/a-alone.png"), rgba(32, 32), a);
+
+        cache.release_session(a);
+
+        assert!(
+            cache.contains(&shared) && cache.contains(&key("/a-alone.png")),
+            "teardown evicted decoded bytes; they are context-independent and a \
+             later session loading the same unchanged file should get them free"
+        );
+        let orphaned = cache.stats_for_session(a);
+        assert_eq!(
+            orphaned.entries, 0,
+            "a departed game is still charged bytes"
+        );
+        assert_eq!(orphaned.size_bytes, 0);
+        assert_eq!(
+            cache.stats_for_session(b).entries,
+            1,
+            "one game's teardown disturbed another's attribution"
+        );
+    }
+
+    #[test]
+    fn a_pinned_entry_survives_its_owners_clear() {
+        // Same precedence as everywhere else in this cache: a pin means a live alias
+        // will read these bytes, and the alternative to keeping them is a texture
+        // upload that finds nothing and renders black.
+        let mut cache = ImageCache::new();
+        let a = 123;
+        let pinned = key("/live.png");
+        cache.pin(&pinned);
+        cache.insert(pinned.clone(), rgba(16, 16), a);
+
+        cache.clear_for_session(a);
+        assert!(cache.contains(&pinned));
+    }
+
+    #[test]
+    fn a_replaced_entry_keeps_the_first_games_claim_even_under_pressure() {
+        // Two Sessions both miss, both decode, and the second insert lands on a key
+        // the first already made resident. With no spare room the eviction loop can
+        // pop that very key before the replacement goes in, and if the owners are
+        // read after the loop the first game's claim vanishes -- leaving its bytes
+        // for the second game's `clear_for_session` to evict.
+        let one_image = 32 * 32 * 4;
+        let mut cache = ImageCache::with_limits(16, one_image);
+        let (a, b) = (211, 222);
+        let contended = key("/both-decoded-it.png");
+
+        cache.insert(contended.clone(), rgba(32, 32), a);
+        cache.insert(contended.clone(), rgba(32, 32), b);
+
+        cache.clear_for_session(b);
+        assert!(
+            cache.contains(&contended),
+            "the first game's claim was lost when its entry was replaced, so the \
+             second game's clear evicted bytes the first is still using"
+        );
+        assert_eq!(cache.stats_for_session(a).entries, 1);
     }
 }

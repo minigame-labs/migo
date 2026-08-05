@@ -187,35 +187,14 @@ check_ready || { err "prerequisites unmet; run --check for the list"; exit 1; }
 PATCH_DIR="$ENGINE_ROOT/third_party/v8-patches"
 EXPORTS_DEF="$PATCH_DIR/rusty_v8-windows-exports.def"
 
+# shellcheck source=scripts/lib/v8-patch-apply.sh
+source "$SCRIPT_DIR/lib/v8-patch-apply.sh"
+
 apply_windows_patches() {
-    # target_file|sentinel|patch_glob
-    local specs=(
-        "src/binding.cc|v8__register_host_callback|0005-*.patch"
-        "BUILD.gn|shared_library(\"rusty_v8\")|0006-*.patch"
-        "src/V8.rs|register_host_callbacks_once|0007-*.patch"
-    )
-    local spec
-    for spec in "${specs[@]}"; do
-        local tgt="${spec%%|*}"; local rest="${spec#*|}"
-        local sentinel="${rest%%|*}"; local glob="${rest##*|}"
-        local -a matches=("$PATCH_DIR"/$glob)
-        local pf="${matches[0]}"
-        [[ -f "$pf" ]] || { err "missing patch: $glob"; return 1; }
-        if grep -qF "$sentinel" "$SRC_UNIX/$tgt" 2>/dev/null; then
-            echo "  = already in effect: $(basename "$pf")"
-            continue
-        fi
-        # No `</dev/null` here: a second redirect on the same descriptor wins,
-        # so it would feed patch an empty stdin -- it then exits 0 having done
-        # nothing, which the sentinel check below is what catches. `--batch`
-        # already suppresses the prompting that redirect was meant to avoid.
-        if ! patch -p1 -d "$SRC_UNIX" --batch --forward < "$pf"; then
-            err "patch failed: $(basename "$pf")"; return 1
-        fi
-        if ! grep -qF "$sentinel" "$SRC_UNIX/$tgt" 2>/dev/null; then
-            err "patch ran but sentinel missing in $tgt: $(basename "$pf")"; return 1
-        fi
-        echo "  ✓ applied $(basename "$pf")"
+    # 0007 spans five files, so applied-ness may not key off any single one.
+    local glob
+    for glob in '0005-*.patch' '0006-*.patch' '0007-*.patch'; do
+        v8_require_patch "$SRC_UNIX" "$PATCH_DIR" "$glob" || return 1
     done
 
     # The DLL exports exactly the C binding surface, listed in a generated file

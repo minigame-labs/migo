@@ -6,5 +6,6 @@
 //! about the same thread, and splitting them hid the fact that they overlap.
 
 mod blocking_pool_policy;
+mod session_teardown_caches;
 mod startup_ordering;
 mod thread_wiring;

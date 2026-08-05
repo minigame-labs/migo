@@ -53,6 +53,8 @@ A future implementation copies every retained structure, rejects an unsupported 
 
 The host chooses a non-zero generation that increases monotonically within a Session. Only one attachment is active at a time. Resize/DPI/color/presentation updates repeat the generation; a stale generation is rejected. Replacing a native target means detaching, waiting for release, then attaching with a newer generation.
 
+The first successful attach fixes an immutable graphics platform identity for the Session. Replacement is supported only inside that domain: Android in the same process, X11 on the same server using the Session's private render connection, Wayland on the same `wl_display`, and HWND under the same ANGLE device. Switching backend or display returns `MIGO_ERROR_INVALID_STATE` synchronously before a Surface lease is published or a render command is enqueued; the existing Session remains unchanged and retryable.
+
 `MigoSurfaceAttachment*` is a unique handle; callers must not create independently owned aliases. Retirement is a cold-path boundary and it is **asynchronous**, because the GPU cannot be made to forget a Surface synchronously: driver-side references outlive the call, and no return value can honestly claim otherwise.
 
 `migo_surface_begin_detach` returning `MIGO_OK` consumes the attachment — its pointer is invalid, and no future GPU call or present references that generation — and produces a `MigoSurfaceRelease*` observer. A non-success result consumes nothing and changes nothing: `MIGO_ERROR_INVALID_ARGUMENT` for a NULL argument, `MIGO_ERROR_INVALID_STATE` when another Surface transition is running or the Session has no live host, `MIGO_ERROR_STALE_SURFACE` when the handle is not the active attachment.
@@ -76,7 +78,7 @@ Losing a Surface is not detaching it. After a loss the attachment is still live 
 | macOS `NSView*` / `CAMetalLayer*` | Migo retains the Objective-C object until retirement completes; the two target kinds remain distinct. |
 | WinUI native SwapChainPanel interface | Migo keeps its own COM reference until retirement completes; this is not modeled as an HWND. |
 | Win32 child `HWND` | Host-owned and valid until `RELEASED`; Migo neither destroys it nor owns the message loop. |
-| X11 `Display*` + `Window` | Host-owned and valid until `RELEASED`; Migo does not close/destroy them. |
+| X11 `Display*` + `Window` | `Display*` is borrowed synchronously during attach. Migo opens a private render connection and never closes or dispatches the host connection. The host connection and `Window` remain valid until `RELEASED`. |
 | Wayland `wl_display*` + `wl_surface*` | Host-owned and valid until `RELEASED`; the host owns the role and dispatch loop. |
 
 ## Dispatcher, callbacks, and destruction
@@ -85,7 +87,9 @@ A callback record is copied according to `struct_size`; it is never borrowed. Ca
 
 User callbacks execute only inside the dispatched task, with no Migo engine/session/attachment lock held. They may re-enter lifecycle, visibility, focus, detach, or destroy. Session destruction cancels queued user callbacks. A queued internal task may later run only to release its own storage; it cannot touch `user_data` after destruction. Reentrant destruction invalidates the Session immediately and permits only the current callback stack to unwind.
 
-Successful `migo_session_destroy` and `migo_engine_destroy` calls consume and release their respective handles; those pointers are invalid afterward. All child Sessions must be destroyed before their Engine.
+Successful `migo_session_destroy` and `migo_engine_destroy` calls consume and release their respective handles; those pointers are invalid afterward. All child Sessions must be destroyed before their Engine. Session destruction requests Host shutdown and transfers the exiting worker to the Engine; it does not self-join a callback that destroys its own Session.
+
+Successful Engine destruction is the final thread-completion barrier. It joins every Migo-owned worker transferred by its Sessions without holding an Engine, Session, attachment, callback, or retirement lock. Calling it from one of those workers returns `MIGO_ERROR_INVALID_STATE` without consuming the Engine; the host must retry from another thread after the callback unwinds. After successful return, no Migo thread can access the host's native display/window resources, and the host may destroy those resources and unload the Migo library. Before it returns, neither action is valid even if every Surface release has reached `MIGO_SURFACE_RELEASE_RELEASED`: Surface release proves that generation is no longer used, while Engine destruction proves that no Migo code is still executing.
 
 ## Asynchronous operations
 
@@ -134,8 +138,8 @@ way to get memory safety wrong:
 
 | Handle | Uniqueness | Concurrency | Destruction |
 |---|---|---|---|
-| `MigoEngine*` | Unique, owned by the host | Entry points are thread-safe; the host serializes its own calls | `migo_engine_destroy` after every child Session is destroyed |
-| `MigoSession*` | Unique, owned by the host | Calls through one Session must be serialized by the host | `migo_session_destroy` consumes it and cancels queued callbacks, but **refuses** while an attachment is live, a transition is running, or a release is pending |
+| `MigoEngine*` | Unique, owned by the host | Entry points are thread-safe; the host serializes its own calls | `migo_engine_destroy` after every child Session is destroyed; successful return joins all Migo-owned workers |
+| `MigoSession*` | Unique, owned by the host | Calls through one Session must be serialized by the host | `migo_session_destroy` consumes it, cancels queued callbacks, and transfers its exiting Host to the Engine, but **refuses** while an attachment is live, a transition is running, or a release is pending |
 | `MigoSurfaceAttachment*` | Unique; aliases are forbidden | Serialized with its Session; only one is active at a time | Consumed by `migo_surface_begin_detach` only. Destroying the Session does not consume it — it fails instead |
 | `MigoSurfaceRelease*` | Unique, owned by the host | Queryable from any thread the host serializes; holds no lease | `migo_surface_release_destroy`, and only once `RELEASED` |
 

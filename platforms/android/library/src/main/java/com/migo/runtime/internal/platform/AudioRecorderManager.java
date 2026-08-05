@@ -1,6 +1,8 @@
 package com.migo.runtime.internal.platform;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.pm.PackageManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
@@ -11,7 +13,9 @@ import android.os.ParcelFileDescriptor;
 
 import android.util.Log;
 
+import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.ResourceCleanup;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -113,6 +117,15 @@ public final class AudioRecorderManager {
 
         if (state.get() != STATE_IDLE) {
             stopInternal(false);
+        }
+
+        // One microphone, one owner. Refusing the newcomer keeps the running
+        // capture intact; a silent takeover would corrupt it with nothing for the
+        // incumbent to observe.
+        if (!ExclusiveDeviceArbiter.tryAcquire(ExclusiveDeviceArbiter.MICROPHONE, sessionId)) {
+            fireEvent("error",
+                    "{\"errMsg\":\"recorderManager.start:fail in use by another game\"}");
+            return;
         }
 
         parseOptions(optionsJson);
@@ -243,7 +256,18 @@ public final class AudioRecorderManager {
     // Mode 2: PCM frame mode (AudioRecord, raw PCM frame callbacks)
     // ========================================================================
 
+    // Slim intentionally omits RECORD_AUDIO from its manifest; this guard also
+    // handles revocation between the public start() check and construction.
+    @SuppressLint("MissingPermission")
     private void startPcmFrameMode() {
+        // Permission can be revoked after start() validates it.
+        if (activity.checkSelfPermission(Permissions.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            fireEvent("error",
+                    "{\"errMsg\":\"recorderManager.start:fail auth deny, permission RECORD_AUDIO is required\"}");
+            return;
+        }
+
         int channelConfig = (numberOfChannels == 1)
                 ? AudioFormat.CHANNEL_IN_MONO
                 : AudioFormat.CHANNEL_IN_STEREO;
@@ -517,9 +541,18 @@ public final class AudioRecorderManager {
     // Stop / cleanup
     // ========================================================================
 
-    private void stopInternal(boolean notifyStop) {
-        int prevState = state.getAndSet(STATE_IDLE);
-        if (prevState == STATE_IDLE) return;
+    private synchronized void stopInternal(boolean notifyStop) {
+        // Released here rather than only in destroy(), so a session that stops
+        // recording without being torn down does not hold the microphone.
+        ExclusiveDeviceArbiter.release(ExclusiveDeviceArbiter.MICROPHONE, sessionId);
+        int prevState = state.get();
+        if (prevState == STATE_IDLE
+                && mediaRecorder == null
+                && audioRecord == null
+                && captureThread == null
+                && outputFileStream == null
+                && pipeReadFd == null
+                && pipeWriteFd == null) return;
 
         cancelAutoStop();
 
@@ -527,27 +560,32 @@ public final class AudioRecorderManager {
             recordedDuration += System.currentTimeMillis() - recordStartTime;
         }
 
-        switch (frameMode) {
-            case FRAME_PCM:
-                stopCaptureThread();
-                releaseAudioRecord();
-                closeOutputStream();
-                break;
-            case FRAME_ENCODED:
-                // Stop MediaRecorder first; this closes the pipe write end,
-                // which causes the capture thread's read to return -1 and exit.
-                stopMediaRecorderSafe();
-                closePipeWriteFd();
-                stopCaptureThread();
-                closePipeReadFd();
-                closeOutputStream();
-                break;
-            default:
-                stopMediaRecorderSafe();
-                break;
+        if (frameMode == FRAME_PCM) {
+            ResourceCleanup.runAll(
+                    this::stopCaptureThread,
+                    this::releaseAudioRecord,
+                    this::closeOutputStream,
+                    this::resetMediaRecorder,
+                    this::closePipe);
+        } else if (frameMode == FRAME_ENCODED) {
+            ResourceCleanup.runAll(
+                    this::stopMediaRecorderSafe,
+                    this::closePipeWriteFd,
+                    this::stopCaptureThread,
+                    this::closePipeReadFd,
+                    this::closeOutputStream,
+                    this::resetMediaRecorder,
+                    this::releaseAudioRecord);
+        } else {
+            ResourceCleanup.runAll(
+                    this::stopMediaRecorderSafe,
+                    this::resetMediaRecorder,
+                    this::releaseAudioRecord,
+                    this::stopCaptureThread,
+                    this::closeOutputStream,
+                    this::closePipe);
         }
-
-        resetMediaRecorder();
+        state.set(STATE_IDLE);
 
         if (notifyStop && outputFilePath != null) {
             File file = new File(outputFilePath);
@@ -565,13 +603,8 @@ public final class AudioRecorderManager {
     }
 
     private void stopMediaRecorderSafe() {
-        if (mediaRecorder != null) {
-            try {
-                mediaRecorder.stop();
-            } catch (Exception ignored) {
-                // May throw if no data was recorded yet
-            }
-        }
+        MediaRecorder recorder = mediaRecorder;
+        if (recorder != null) recorder.stop();
     }
 
     private void stopCaptureThread() {
@@ -580,59 +613,88 @@ public final class AudioRecorderManager {
             captureThread.interrupt();
             try {
                 captureThread.join(1000);
-            } catch (InterruptedException ignored) {}
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while stopping audio capture",
+                        interrupted);
+            }
+            if (captureThread.isAlive()) {
+                throw new IllegalStateException("audio capture thread did not stop");
+            }
             captureThread = null;
         }
     }
 
     private void releaseAudioRecord() {
-        if (audioRecord != null) {
-            try {
-                if (audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
-                    audioRecord.stop();
-                }
-                audioRecord.release();
-            } catch (Exception ignored) {}
-            audioRecord = null;
-        }
+        AudioRecord recorder = audioRecord;
+        if (recorder == null) return;
+        ResourceCleanup.runAll(
+                () -> {
+                    if (recorder.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                        recorder.stop();
+                    }
+                },
+                () -> {
+                    recorder.release();
+                    if (audioRecord == recorder) audioRecord = null;
+                });
     }
 
     private void closeOutputStream() {
-        if (outputFileStream != null) {
-            try {
-                outputFileStream.flush();
-                outputFileStream.close();
-            } catch (IOException ignored) {}
-            outputFileStream = null;
-        }
+        FileOutputStream stream = outputFileStream;
+        if (stream == null) return;
+        ResourceCleanup.runAll(
+                () -> {
+                    try {
+                        stream.flush();
+                    } catch (IOException error) {
+                        throw new IllegalStateException("failed to flush recorder output", error);
+                    }
+                },
+                () -> {
+                    try {
+                        stream.close();
+                        if (outputFileStream == stream) outputFileStream = null;
+                    } catch (IOException error) {
+                        throw new IllegalStateException("failed to close recorder output", error);
+                    }
+                });
     }
 
     private void resetMediaRecorder() {
-        if (mediaRecorder != null) {
-            try {
-                mediaRecorder.reset();
-                mediaRecorder.release();
-            } catch (Exception ignored) {}
-            mediaRecorder = null;
-        }
+        MediaRecorder recorder = mediaRecorder;
+        if (recorder == null) return;
+        ResourceCleanup.runAll(
+                recorder::reset,
+                () -> {
+                    recorder.release();
+                    if (mediaRecorder == recorder) mediaRecorder = null;
+                });
     }
 
     private void closePipe() {
-        closePipeReadFd();
-        closePipeWriteFd();
+        ResourceCleanup.runAll(this::closePipeReadFd, this::closePipeWriteFd);
     }
 
     private void closePipeReadFd() {
-        if (pipeReadFd != null) {
-            try { pipeReadFd.close(); } catch (IOException ignored) {}
-            pipeReadFd = null;
+        ParcelFileDescriptor descriptor = pipeReadFd;
+        if (descriptor == null) return;
+        try {
+            descriptor.close();
+            if (pipeReadFd == descriptor) pipeReadFd = null;
+        } catch (IOException error) {
+            throw new IllegalStateException("failed to close recorder pipe read end", error);
         }
     }
 
     private void closePipeWriteFd() {
-        if (pipeWriteFd != null) {
-            try { pipeWriteFd.close(); } catch (IOException ignored) {}
-            pipeWriteFd = null;
+        ParcelFileDescriptor descriptor = pipeWriteFd;
+        if (descriptor == null) return;
+        try {
+            descriptor.close();
+            if (pipeWriteFd == descriptor) pipeWriteFd = null;
+        } catch (IOException error) {
+            throw new IllegalStateException("failed to close recorder pipe write end", error);
         }
     }
 

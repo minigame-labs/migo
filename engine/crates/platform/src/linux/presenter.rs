@@ -18,16 +18,16 @@ use std::{
 };
 
 use graphics::egl_platform::{
-    EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId, GraphicsPlatform,
-    PreparedEglSurface, PreparedEglSurfaceRef,
+    EglConcurrency, EglInstance, EglProvider, EglSurfaceFactory, GraphicsBackendId,
+    GraphicsPlatform, PlatformIdentity, PreparedEglSurface, PreparedEglSurfaceRef,
 };
 use khronos_egl as egl;
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
-    surface::Surface,
+    surface::{Surface, SurfaceRef},
 };
 
-use super::egl_fallback;
+use super::{egl_fallback, x11_connection::X11RenderConnection};
 
 /// System EGL shared object on glibc Linux. The unversioned `libEGL.so` symlink
 /// ships only with `-dev` packages, so the runtime `.so.1` is loaded directly.
@@ -234,28 +234,27 @@ fn create_native_window_surface(
 
 #[derive(Debug)]
 struct LinuxSystemEglBackend;
+struct LinuxOffscreenEglDomain;
+struct LinuxX11EglDomain;
+struct LinuxWaylandEglDomain;
 
 /// Which native display the provider binds EGL to.
 ///
-/// The X11 variant carries a handle the **host** owns. It is only ever handed
-/// to `eglGetPlatformDisplay`; this crate never dereferences it, and never
-/// opens or closes the connection.
-#[derive(Debug, Clone, Copy)]
+/// X11 carries Migo's private render connection; Wayland retains the
+/// caller-owned display under its separate public lifetime contract.
+#[derive(Debug, Clone)]
 enum LinuxDisplayTarget {
     /// Headless: the default display, no window server involved.
     Offscreen,
-    /// Onscreen X11: the host's `Display*`.
-    X11(NonNull<c_void>),
+    /// Onscreen X11: Migo's private render connection.
+    X11(Arc<X11RenderConnection>),
     /// Onscreen Wayland: the host's `wl_display*`.
     Wayland(NonNull<c_void>),
 }
 
-// SAFETY: the pointer is an opaque token passed to EGL, never dereferenced
-// here, so moving it between threads adds no aliasing of its own. The render
-// thread resolves the display, while the host opened it on another thread —
-// which is sound because the host guarantees (documented on
-// `linux_x11_graphics_platform`) that it called `XInitThreads` and keeps the
-// connection alive for the whole session.
+// SAFETY: the only raw pointer arm is the host-owned Wayland display, whose
+// client library and public descriptor contract permit this EGL use. X11's
+// cross-thread invariant is owned and documented by X11RenderConnection.
 unsafe impl Send for LinuxDisplayTarget {}
 unsafe impl Sync for LinuxDisplayTarget {}
 
@@ -278,10 +277,10 @@ impl LinuxEglProvider {
         Self::default()
     }
 
-    /// Onscreen provider bound to a host-owned X11 `Display*`.
-    pub fn x11(display: NonNull<c_void>) -> Self {
+    /// Onscreen provider bound to Migo's private X11 render connection.
+    fn x11(connection: Arc<X11RenderConnection>) -> Self {
         Self {
-            target: LinuxDisplayTarget::X11(display),
+            target: LinuxDisplayTarget::X11(connection),
         }
     }
 
@@ -298,8 +297,34 @@ impl EglProvider for LinuxEglProvider {
         GraphicsBackendId::of::<LinuxSystemEglBackend>()
     }
 
+    fn concurrency(&self) -> EglConcurrency {
+        match &self.target {
+            LinuxDisplayTarget::X11(_) => EglConcurrency::RenderThreadOnly,
+            LinuxDisplayTarget::Offscreen | LinuxDisplayTarget::Wayland(_) => {
+                EglConcurrency::SharedContexts
+            }
+        }
+    }
+
+    fn platform_identity(&self) -> PlatformIdentity {
+        let backend_id = self.backend_id();
+        match &self.target {
+            LinuxDisplayTarget::Offscreen => {
+                PlatformIdentity::new::<LinuxOffscreenEglDomain>(backend_id, 0)
+            }
+            LinuxDisplayTarget::X11(connection) => PlatformIdentity::new::<LinuxX11EglDomain>(
+                backend_id,
+                connection.display().as_ptr() as usize,
+            ),
+            LinuxDisplayTarget::Wayland(display) => PlatformIdentity::new::<LinuxWaylandEglDomain>(
+                backend_id,
+                display.as_ptr() as usize,
+            ),
+        }
+    }
+
     fn label(&self) -> &str {
-        match self.target {
+        match &self.target {
             LinuxDisplayTarget::Offscreen => "linux-system-egl",
             LinuxDisplayTarget::X11(_) => "linux-system-egl-x11",
             LinuxDisplayTarget::Wayland(_) => "linux-system-egl-wayland",
@@ -320,7 +345,7 @@ impl EglProvider for LinuxEglProvider {
     }
 
     fn display(&self, egl: &EglInstance) -> EngineResult<egl::Display> {
-        match self.target {
+        match &self.target {
             LinuxDisplayTarget::Offscreen => unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }
                 .ok_or_else(|| {
                     EngineError::new(ErrorCode::RenderInitializeError)
@@ -331,14 +356,14 @@ impl EglProvider for LinuxEglProvider {
             // from the pointer. A non-null proc address can still be a loader
             // stub for an unsupported platform, so failure also falls through
             // to the EGL 1.4 native X11 binding.
-            LinuxDisplayTarget::X11(display) => {
-                native_platform_display(egl, EGL_PLATFORM_X11_EXT, display, "X11")
+            LinuxDisplayTarget::X11(connection) => {
+                native_platform_display(egl, EGL_PLATFORM_X11_EXT, connection.display(), "X11")
             }
             // EGL 1.4 Wayland bindings define EGLNativeDisplayType as
             // wl_display*, which is the compatibility path when the preferred
             // EGL 1.5/EXT platform call is absent or returns NO_DISPLAY.
             LinuxDisplayTarget::Wayland(display) => {
-                native_platform_display(egl, EGL_PLATFORM_WAYLAND_EXT, display, "Wayland")
+                native_platform_display(egl, EGL_PLATFORM_WAYLAND_EXT, *display, "Wayland")
             }
         }
     }
@@ -371,35 +396,27 @@ impl Surface for LinuxOffscreenSurface {
 /// Onscreen X11 render target. Carries the host's window and the physical size
 /// the host mapped it at.
 ///
-/// Both the `Window` and the `Display*` the platform was built with belong to
-/// the host: it creates them, resizes them and destroys them. The engine only
-/// renders into them, which is what keeps §7.2's "the SDK does not own the
-/// window" rule true in code.
+/// The host creates, resizes and destroys the `Window`; Migo renders through
+/// its private connection to the same X11 server. The caller's `Display*` is
+/// never retained here.
 #[derive(Debug)]
 pub struct LinuxX11Surface {
-    display: NonNull<c_void>,
+    connection: Arc<X11RenderConnection>,
     window: c_ulong,
     width: u32,
     height: u32,
 }
 
 impl LinuxX11Surface {
-    /// `window` is an X11 `Window` XID belonging to the host, already mapped
-    /// and sized to `width` x `height` physical pixels.
-    pub fn new(display: NonNull<c_void>, window: c_ulong, width: u32, height: u32) -> Self {
+    fn new(connection: Arc<X11RenderConnection>, window: c_ulong, width: u32, height: u32) -> Self {
         Self {
-            display,
+            connection,
             window,
             width,
             height,
         }
     }
 }
-
-// SAFETY: Display* is an opaque identity token. The host has called
-// XInitThreads and keeps the connection alive through asynchronous release.
-unsafe impl Send for LinuxX11Surface {}
-unsafe impl Sync for LinuxX11Surface {}
 
 impl Surface for LinuxX11Surface {
     fn as_any(&self) -> &dyn Any {
@@ -746,10 +763,10 @@ impl PreparedEglSurface for LinuxWaylandPreparedSurface {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum LinuxSurfaceFactoryTarget {
     Offscreen,
-    X11(NonNull<c_void>),
+    X11(Arc<X11RenderConnection>),
     Wayland(NonNull<c_void>),
 }
 
@@ -768,9 +785,9 @@ impl LinuxEglSurfaceFactory {
         }
     }
 
-    fn x11(display: NonNull<c_void>) -> Self {
+    fn x11(connection: Arc<X11RenderConnection>) -> Self {
         Self {
-            target: LinuxSurfaceFactoryTarget::X11(display),
+            target: LinuxSurfaceFactoryTarget::X11(connection),
         }
     }
 
@@ -786,32 +803,52 @@ impl EglSurfaceFactory for LinuxEglSurfaceFactory {
         GraphicsBackendId::of::<LinuxSystemEglBackend>()
     }
 
+    fn platform_identity(&self) -> PlatformIdentity {
+        let backend_id = self.backend_id();
+        match &self.target {
+            LinuxSurfaceFactoryTarget::Offscreen => {
+                PlatformIdentity::new::<LinuxOffscreenEglDomain>(backend_id, 0)
+            }
+            LinuxSurfaceFactoryTarget::X11(connection) => {
+                PlatformIdentity::new::<LinuxX11EglDomain>(
+                    backend_id,
+                    connection.display().as_ptr() as usize,
+                )
+            }
+            LinuxSurfaceFactoryTarget::Wayland(display) => PlatformIdentity::new::<
+                LinuxWaylandEglDomain,
+            >(
+                backend_id, display.as_ptr() as usize
+            ),
+        }
+    }
+
     fn prepare(&self, surface: &dyn Surface) -> EngineResult<PreparedEglSurfaceRef> {
         let any = surface.as_any();
         if let (LinuxSurfaceFactoryTarget::Offscreen, Some(offscreen)) =
-            (self.target, any.downcast_ref::<LinuxOffscreenSurface>())
+            (&self.target, any.downcast_ref::<LinuxOffscreenSurface>())
         {
             return Ok(Arc::new(LinuxPreparedSurface {
                 width: offscreen.width,
                 height: offscreen.height,
             }));
         }
-        if let (LinuxSurfaceFactoryTarget::X11(display), Some(x11)) =
-            (self.target, any.downcast_ref::<LinuxX11Surface>())
+        if let (LinuxSurfaceFactoryTarget::X11(connection), Some(x11)) =
+            (&self.target, any.downcast_ref::<LinuxX11Surface>())
         {
-            if display != x11.display {
+            if !Arc::ptr_eq(connection, &x11.connection) {
                 return Err(EngineError::new(ErrorCode::InvalidOperation)
-                    .with_msg("X11 Surface Display does not match EGL platform Display"));
+                    .with_msg("X11 Surface does not belong to this render connection"));
             }
             return Ok(Arc::new(LinuxX11PreparedSurface {
-                display,
+                connection: Arc::clone(connection),
                 window: x11.window,
             }));
         }
         if let (LinuxSurfaceFactoryTarget::Wayland(display), Some(wayland)) =
-            (self.target, any.downcast_ref::<LinuxWaylandSurface>())
+            (&self.target, any.downcast_ref::<LinuxWaylandSurface>())
         {
-            if display != wayland.display {
+            if *display != wayland.display {
                 return Err(EngineError::new(ErrorCode::InvalidOperation)
                     .with_msg("Wayland Surface display does not match EGL platform display"));
             }
@@ -821,7 +858,7 @@ impl EglSurfaceFactory for LinuxEglSurfaceFactory {
                     .with_detail(format!("{LINUX_WAYLAND_EGL_LIBRARY} could not be loaded"))
             })?;
             return Ok(Arc::new(LinuxWaylandPreparedSurface::new(
-                display,
+                *display,
                 wayland.surface,
                 wayland.width,
                 wayland.height,
@@ -838,12 +875,9 @@ impl EglSurfaceFactory for LinuxEglSurfaceFactory {
 /// to a connection and cannot be compared safely without that Display.
 #[derive(Debug)]
 pub struct LinuxX11PreparedSurface {
-    display: NonNull<c_void>,
+    connection: Arc<X11RenderConnection>,
     window: c_ulong,
 }
-
-unsafe impl Send for LinuxX11PreparedSurface {}
-unsafe impl Sync for LinuxX11PreparedSurface {}
 
 impl PreparedEglSurface for LinuxX11PreparedSurface {
     fn backend_id(&self) -> GraphicsBackendId {
@@ -858,7 +892,9 @@ impl PreparedEglSurface for LinuxX11PreparedSurface {
         other
             .as_any()
             .downcast_ref::<LinuxX11PreparedSurface>()
-            .is_some_and(|other| self.display == other.display && self.window == other.window)
+            .is_some_and(|other| {
+                Arc::ptr_eq(&self.connection, &other.connection) && self.window == other.window
+            })
     }
 
     fn create_window_surface(
@@ -939,17 +975,74 @@ pub fn linux_graphics_platform() -> EngineResult<GraphicsPlatform> {
     )
 }
 
-/// Onscreen Linux graphics platform bound to a host-owned X11 connection.
+/// Session-scoped owner for one private X11 render connection.
 ///
-/// The caller keeps ownership of the display: it must stay open for the whole
-/// engine session, and must have been opened after `XInitThreads`, because the
-/// render thread resolves the EGL display from it while the host services the
-/// window on another thread.
-pub fn linux_x11_graphics_platform(display: NonNull<c_void>) -> EngineResult<GraphicsPlatform> {
-    GraphicsPlatform::try_new(
-        Arc::new(LinuxEglProvider::x11(display)),
-        Arc::new(LinuxEglSurfaceFactory::x11(display)),
-    )
+/// The host's event connection is borrowed only while `open` or
+/// `supports_host_display` executes. Surfaces created here retain the private
+/// connection structurally, so no EGL target can outlive it.
+#[derive(Clone, Debug)]
+pub struct LinuxX11Context {
+    connection: Arc<X11RenderConnection>,
+    graphics_platform: GraphicsPlatform,
+}
+
+impl LinuxX11Context {
+    fn from_connection(connection: Arc<X11RenderConnection>) -> EngineResult<Self> {
+        let graphics_platform = GraphicsPlatform::try_new(
+            Arc::new(LinuxEglProvider::x11(Arc::clone(&connection))),
+            Arc::new(LinuxEglSurfaceFactory::x11(Arc::clone(&connection))),
+        )?;
+        Ok(Self {
+            connection,
+            graphics_platform,
+        })
+    }
+
+    /// Resolve the host connection's server and open Migo's render connection.
+    ///
+    /// # Safety
+    /// `host_display` must be a live Xlib `Display*` for this call.
+    pub unsafe fn open(host_display: NonNull<c_void>) -> EngineResult<Self> {
+        let connection = unsafe { X11RenderConnection::open(host_display) }?;
+        Self::from_connection(connection)
+    }
+
+    /// Check that a later host connection reaches the same live X11 server.
+    ///
+    /// # Safety
+    /// `host_display` must be a live Xlib `Display*` for this call.
+    pub unsafe fn supports_host_display(&self, host_display: NonNull<c_void>) -> EngineResult<()> {
+        unsafe { self.connection.supports_host_display(host_display) }
+    }
+
+    pub fn graphics_platform(&self) -> GraphicsPlatform {
+        self.graphics_platform.clone()
+    }
+
+    pub fn surface(&self, window: c_ulong, width: u32, height: u32) -> SurfaceRef {
+        Arc::new(LinuxX11Surface::new(
+            Arc::clone(&self.connection),
+            window,
+            width,
+            height,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_display_for_test(&self) -> NonNull<c_void> {
+        self.connection.display()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_fd_for_test(&self) -> std::os::fd::RawFd {
+        self.connection.fd_for_test()
+    }
+
+    #[cfg(test)]
+    fn from_render_display_for_test(display: NonNull<c_void>) -> Self {
+        Self::from_connection(X11RenderConnection::from_display_for_test(display))
+            .expect("test X11 context")
+    }
 }
 
 /// Onscreen Wayland platform bound to a host-owned `wl_display*`.
@@ -969,6 +1062,10 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+
+    fn test_x11_context(display: NonNull<c_void>) -> LinuxX11Context {
+        LinuxX11Context::from_render_display_for_test(display)
+    }
 
     #[test]
     fn egl15_core_entry_points_are_preferred_before_ext_aliases() {
@@ -1087,7 +1184,7 @@ mod tests {
             640,
             480,
         );
-        let x11 = LinuxX11Surface::new(display, 0x2a0_0001, 640, 480);
+        let x11 = test_x11_context(display).surface(0x2a0_0001, 640, 480);
 
         assert!(wayland.as_any().downcast_ref::<LinuxX11Surface>().is_none());
         assert!(x11.as_any().downcast_ref::<LinuxWaylandSurface>().is_none());
@@ -1102,6 +1199,42 @@ mod tests {
             platform.surface_factory().backend_id(),
         );
         assert_eq!(platform.egl_provider().label(), "linux-system-egl-wayland");
+    }
+
+    #[test]
+    fn platform_identity_distinguishes_linux_domain_and_display() {
+        let display = NonNull::new(0xdead_beefusize as *mut c_void).expect("display");
+        let other_display = NonNull::new(0xcafe_babeusize as *mut c_void).expect("other display");
+        let offscreen = linux_graphics_platform()
+            .expect("offscreen platform")
+            .platform_identity();
+        let context = test_x11_context(display);
+        let x11 = context.graphics_platform().platform_identity();
+        let same_x11 = context.graphics_platform().platform_identity();
+        let other_x11 = test_x11_context(other_display)
+            .graphics_platform()
+            .platform_identity();
+        let wayland = linux_wayland_graphics_platform(display)
+            .expect("Wayland platform")
+            .platform_identity();
+
+        assert_eq!(x11, same_x11);
+        assert_ne!(x11, other_x11);
+        assert_ne!(x11, wayland);
+        assert_ne!(offscreen, x11);
+        assert_ne!(offscreen, wayland);
+    }
+
+    #[test]
+    fn platform_identity_rejects_mixed_linux_provider_and_factory() {
+        let display = NonNull::new(0xdead_beefusize as *mut c_void).expect("display");
+        let context = test_x11_context(display);
+        let result = GraphicsPlatform::try_new(
+            Arc::new(LinuxEglProvider::x11(Arc::clone(&context.connection))),
+            Arc::new(LinuxEglSurfaceFactory::wayland(display)),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1129,12 +1262,47 @@ mod tests {
     // ---- X11 onscreen target ----
 
     #[test]
+    fn x11_context_binds_identity_surface_and_factory_to_one_owned_connection() {
+        let render_display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("render display");
+        let other_render_display =
+            NonNull::new(0x5a5a_2000usize as *mut c_void).expect("other render display");
+        let context = test_x11_context(render_display);
+        let same_context = context.clone();
+        let other_context = test_x11_context(other_render_display);
+
+        let platform = context.graphics_platform();
+        let same_platform = same_context.graphics_platform();
+        let surface = context.surface(0x2a0_0001, 800, 600);
+        let prepared = platform
+            .prepare_surface(surface.as_ref())
+            .expect("owned surface must prepare");
+
+        assert_eq!(
+            platform.egl_provider().concurrency(),
+            EglConcurrency::RenderThreadOnly
+        );
+        assert_eq!(
+            platform.platform_identity(),
+            same_platform.platform_identity()
+        );
+        assert_eq!(surface.size(), (800, 600));
+        assert!(prepared.same_native_surface(prepared.as_ref()));
+
+        let foreign_surface = other_context.surface(0x2a0_0001, 800, 600);
+        let error = platform
+            .prepare_surface(foreign_surface.as_ref())
+            .expect_err("another owned connection must fail closed");
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+    }
+
+    #[test]
     fn x11_surface_prepares_and_reports_its_size() {
         let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
-        let surface = LinuxX11Surface::new(display, 0x2a0_0001, 800, 600);
+        let context = test_x11_context(display);
+        let surface = context.surface(0x2a0_0001, 800, 600);
         assert_eq!(surface.size(), (800, 600));
-        let prepared = LinuxEglSurfaceFactory::x11(display)
-            .prepare(&surface)
+        let prepared = LinuxEglSurfaceFactory::x11(Arc::clone(&context.connection))
+            .prepare(surface.as_ref())
             .expect("prepare x11");
         assert!(prepared.same_native_surface(prepared.as_ref()));
     }
@@ -1146,33 +1314,33 @@ mod tests {
         // wrong would let the render binding reuse a dead EGLSurface.
         let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
         let other_display = NonNull::new(0x5a5a_2000usize as *mut c_void).expect("other display");
-        let prepare = |factory_display, surface_display, window, w, h| {
-            LinuxEglSurfaceFactory::x11(factory_display)
-                .prepare(&LinuxX11Surface::new(surface_display, window, w, h))
+        let context = test_x11_context(display);
+        let other_context = test_x11_context(other_display);
+        let prepare = |context: &LinuxX11Context, window, w, h| {
+            LinuxEglSurfaceFactory::x11(Arc::clone(&context.connection))
+                .prepare(context.surface(window, w, h).as_ref())
                 .expect("prepare x11")
         };
-        let resized = prepare(display, display, 0x2a0_0001, 1024, 768);
+        let resized = prepare(&context, 0x2a0_0001, 1024, 768);
+        assert!(prepare(&context, 0x2a0_0001, 800, 600).same_native_surface(resized.as_ref()));
         assert!(
-            prepare(display, display, 0x2a0_0001, 800, 600).same_native_surface(resized.as_ref())
+            !prepare(&context, 0x2a0_0002, 800, 600)
+                .same_native_surface(prepare(&context, 0x2a0_0001, 800, 600).as_ref())
         );
         assert!(
-            !prepare(display, display, 0x2a0_0002, 800, 600)
-                .same_native_surface(prepare(display, display, 0x2a0_0001, 800, 600).as_ref())
-        );
-        assert!(
-            !prepare(other_display, other_display, 0x2a0_0001, 800, 600)
-                .same_native_surface(resized.as_ref())
+            !prepare(&other_context, 0x2a0_0001, 800, 600).same_native_surface(resized.as_ref())
         );
     }
 
     #[test]
     fn offscreen_and_x11_targets_are_never_the_same_surface() {
         let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
+        let context = test_x11_context(display);
         let offscreen = LinuxEglSurfaceFactory::offscreen()
             .prepare(&LinuxOffscreenSurface::new(800, 600))
             .expect("prepare offscreen");
-        let x11 = LinuxEglSurfaceFactory::x11(display)
-            .prepare(&LinuxX11Surface::new(display, 0x2a0_0001, 800, 600))
+        let x11 = LinuxEglSurfaceFactory::x11(Arc::clone(&context.connection))
+            .prepare(context.surface(0x2a0_0001, 800, 600).as_ref())
             .expect("prepare x11");
         assert!(!offscreen.same_native_surface(x11.as_ref()));
         assert!(!x11.same_native_surface(offscreen.as_ref()));
@@ -1203,7 +1371,7 @@ mod tests {
         // Same fail-closed pairing check as the offscreen platform: a mismatched
         // backend id would make GraphicsPlatform::try_new refuse.
         let display = NonNull::new(0xdead_beef_usize as *mut c_void).expect("non-null");
-        let platform = linux_x11_graphics_platform(display).expect("x11 graphics platform");
+        let platform = test_x11_context(display).graphics_platform();
         assert_eq!(
             platform.egl_provider().backend_id(),
             platform.surface_factory().backend_id(),

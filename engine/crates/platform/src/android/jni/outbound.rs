@@ -1082,6 +1082,7 @@ jni_void_json!(ad_destroy, "adDestroy");
 // comes back on the `onAuthorizeResult` channel rather than as a return value.
 
 jni_void_json!(permission_request, "permissionRequest");
+jni_void_json!(permission_revoke_resources, "revokePermissionResources");
 
 // ==================== Auth ====================
 

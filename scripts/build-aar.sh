@@ -73,6 +73,9 @@ MANIFEST_INDEX="$MANIFEST_ASSET_ROOT/package-index.json"
 MANIFEST_TOOL=""
 OUTPUT_DIR="dist"
 
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$SCRIPT_DIR/lib/android-ndk.sh"
+
 echo "========================================"
 echo "MiniGame Android AAR Builder"
 echo "========================================"
@@ -365,7 +368,9 @@ resolve_source_revision() {
 generate_verified_artifact_manifests() {
     command -v cargo >/dev/null 2>&1 || { print_error "cargo is required for artifact manifests"; return 1; }
     command -v python3 >/dev/null 2>&1 || { print_error "python3 is required for artifact manifests"; return 1; }
-    [[ -n "${ANDROID_NDK_HOME:-}" ]] || { print_error "ANDROID_NDK_HOME is required for artifact manifests"; return 1; }
+    android_ndk_read_pin "$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json" \
+        || { print_error "cannot read NDK pin"; return 1; }
+    android_ndk_resolve || { print_error "cannot resolve the pinned Android NDK"; return 1; }
     [[ -f "$MANIFEST_GENERATOR" ]] || { print_error "Missing manifest generator: $MANIFEST_GENERATOR"; return 1; }
     [[ -f "$BUILD_METADATA_WRITER" ]] || { print_error "Missing build metadata writer: $BUILD_METADATA_WRITER"; return 1; }
     [[ -f "$AAR_MANIFEST_VERIFIER" ]] || { print_error "Missing AAR manifest verifier: $AAR_MANIFEST_VERIFIER"; return 1; }

@@ -26,14 +26,14 @@ use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
 #[cfg(target_os = "windows")]
 use migo_core::{HostId, host_ingress};
-use migo_core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
+use migo_core::{PlatformServices, send_command_to_host, spawn_host_thread};
 use platform::host_window::HostWindowMetrics;
 #[cfg(target_os = "linux")]
 use platform::linux::platform::LinuxPlatform as HostPlatform;
 #[cfg(target_os = "linux")]
 use platform::linux::presenter::{
-    LinuxOffscreenSurface as OffscreenSurface, LinuxX11Surface,
-    linux_graphics_platform as offscreen_graphics_platform, linux_x11_graphics_platform,
+    LinuxOffscreenSurface as OffscreenSurface, LinuxX11Context,
+    linux_graphics_platform as offscreen_graphics_platform,
 };
 #[cfg(target_os = "windows")]
 use platform::windows::platform::WindowsPlatform as HostPlatform;
@@ -125,7 +125,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // ---- Render target: a real X11 window, or an offscreen pbuffer ----
     // The window (when present) must outlive the engine session: the render
     // thread holds an EGL surface built from its handles, so it is dropped only
-    // after `shutdown_host` below.
+    // after the owning Host handle has been joined below.
     #[cfg(target_os = "linux")]
     let mut window = if windowed {
         Some(X11Window::open("migo-player", SURFACE_W, SURFACE_H)?)
@@ -151,14 +151,10 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     let (surface, graphics_platform) = match window.as_ref() {
         Some(window) => {
             let (width, height) = window.size();
-            let surface: SurfaceRef = Arc::new(LinuxX11Surface::new(
-                window.display(),
-                window.window(),
-                width,
-                height,
-            ));
-            let platform = linux_x11_graphics_platform(window.display())
-                .map_err(|e| format!("x11 graphics platform: {e:?}"))?;
+            let context = unsafe { LinuxX11Context::open(window.display()) }
+                .map_err(|e| format!("open owned X11 render context: {e:?}"))?;
+            let surface = context.surface(window.window(), width, height);
+            let platform = context.graphics_platform();
             (surface, platform)
         }
         None => {
@@ -173,7 +169,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
         Some(window) => {
             let (width, height) = window.size();
             // SAFETY: the window outlives the session -- it is dropped only
-            // after `shutdown_host` below, by which point the render thread has
+            // after the Host join below, by which point the render thread has
             // let go of the EGL surface built from this handle.
             let surface: SurfaceRef =
                 Arc::new(unsafe { WindowsHwndSurface::new(window.hwnd(), width, height) });
@@ -212,8 +208,9 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
         HostPlatform::new().with_window(HostWindowMetrics::new(surface_w, surface_h, 1.0)),
     );
     tracing::info!("spawning host thread ({surface_w}x{surface_h} {mode})");
-    let host_id = spawn_host_thread(surface, graphics_platform, host_kit, opt)
+    let host = spawn_host_thread(surface, graphics_platform, host_kit, opt)
         .map_err(|e| format!("spawn_host_thread: {e:?}"))?;
+    let host_id = host.id();
     tracing::info!("host {host_id} spawned; loading game");
 
     send_command_to_host(
@@ -259,14 +256,26 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     }
 
     tracing::info!("shutting down host {host_id}");
-    shutdown_host(host_id).map_err(|e| format!("shutdown_host: {e}"))?;
-    thread::sleep(Duration::from_millis(300));
-    // Only now may the window go: the render thread has stopped touching the
-    // EGL surface built from its handles.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    drop(window);
+    shutdown_before_drop(host, window)?;
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    shutdown_before_drop(host, ())?;
     tracing::info!("player done");
     Ok(())
+}
+
+fn shutdown_before_drop<T>(
+    mut host: migo_core::HostThread,
+    native_resource: T,
+) -> Result<(), String> {
+    let result = host
+        .shutdown_and_join()
+        .map_err(|error| format!("shutdown_and_join: {error}"));
+    // A failed shutdown request leaves ownership intact. Dropping the owner
+    // still performs the synchronous fail-safe join before native teardown.
+    drop(host);
+    drop(native_resource);
+    result
 }
 
 /// Wait for `total`, servicing window events when running windowed.
@@ -478,4 +487,71 @@ fn write_png(
         .write_image_data(&top_down)
         .map_err(|e| format!("png data: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        thread,
+    };
+
+    use super::shutdown_before_drop;
+
+    struct DropRecorder {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropRecorder {
+        fn drop(&mut self) {
+            self.events.lock().expect("event log").push("window");
+        }
+    }
+
+    #[test]
+    fn teardown_joins_host_before_dropping_native_resource() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let host_events = Arc::clone(&events);
+        let join = thread::Builder::new()
+            .name("Migo-Main-player-teardown".to_owned())
+            .spawn(move || {
+                host_events.lock().expect("event log").push("host");
+            })
+            .expect("spawn test Host");
+        let host = migo_core::HostThread::from_join_handle_for_test(9_001, join);
+
+        shutdown_before_drop(
+            host,
+            DropRecorder {
+                events: Arc::clone(&events),
+            },
+        )
+        .expect("teardown");
+
+        assert_eq!(*events.lock().expect("event log"), ["host", "window"]);
+    }
+
+    #[test]
+    fn teardown_drops_native_resource_only_after_observing_host_panic() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let host_events = Arc::clone(&events);
+        let join = thread::Builder::new()
+            .name("Migo-Main-player-panic".to_owned())
+            .spawn(move || {
+                host_events.lock().expect("event log").push("host");
+                panic!("test Host panic");
+            })
+            .expect("spawn test Host");
+        let host = migo_core::HostThread::from_join_handle_for_test(9_002, join);
+
+        let result = shutdown_before_drop(
+            host,
+            DropRecorder {
+                events: Arc::clone(&events),
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*events.lock().expect("event log"), ["host", "window"]);
+    }
 }

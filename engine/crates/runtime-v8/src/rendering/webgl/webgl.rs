@@ -3,7 +3,7 @@ use std::sync::Arc;
 use deno_core::{OpState, op2};
 use tracing::{error, warn};
 
-use crate::rendering::image::cache::IMAGE_CACHE;
+use crate::rendering::image::ImageCacheState;
 
 use shared::{
     error::EngineError,
@@ -3416,7 +3416,7 @@ enum RgbaSource {
 }
 
 #[inline]
-fn resolve_cached_image_rgba(image_id: u32) -> RgbaLookup {
+fn resolve_cached_image_rgba(images: &ImageCacheState, image_id: u32) -> RgbaLookup {
     // H-5: the migo_io::global_cache is now the single source of truth
     // for decoded RGBA bytes, with `pin()` / `unpin()` keeping
     // actively referenced entries exempt from LRU eviction.  The
@@ -3431,7 +3431,7 @@ fn resolve_cached_image_rgba(image_id: u32) -> RgbaLookup {
     // manually, or a pin-mismatch bug — both of which we want to
     // surface in the warn log rather than paper over silently).
     let key = {
-        let c = IMAGE_CACHE.lock();
+        let c = images.aliases.lock();
         c.cache_key_for_image_id(image_id)
     };
     let Some(key) = key else {
@@ -3440,7 +3440,10 @@ fn resolve_cached_image_rgba(image_id: u32) -> RgbaLookup {
 
     let cached = {
         let mut cache = migo_io::global_cache();
-        cache.get(&crate::rendering::image::cache::to_io_cache_key(&key))
+        cache.get(
+            &crate::rendering::image::cache::to_io_cache_key(&key),
+            images.session,
+        )
     };
     match cached {
         Some(entry) => {
@@ -3453,31 +3456,18 @@ fn resolve_cached_image_rgba(image_id: u32) -> RgbaLookup {
                 image_id,
                 path = key.0.as_str(),
                 gen = key.1,
-                width = entry.image.width,
-                height = entry.image.height,
+                width = entry.width,
+                height = entry.height,
                 "resolve_cached_image_rgba hit"
             );
             RgbaLookup::Found {
-                width: entry.image.width as i32,
-                height: entry.image.height as i32,
-                data: Arc::clone(&entry.image.rgba),
+                width: entry.width as i32,
+                height: entry.height as i32,
+                data: Arc::clone(&entry.rgba),
                 source: RgbaSource::IoCache,
             }
         }
         None => RgbaLookup::AliasKnownButEvicted { cache_key: key },
-    }
-}
-
-#[inline]
-fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Arc<Vec<u8>>)> {
-    match resolve_cached_image_rgba(image_id) {
-        RgbaLookup::Found {
-            width,
-            height,
-            data,
-            ..
-        } => Some((width, height, data)),
-        _ => None,
     }
 }
 
@@ -4191,7 +4181,7 @@ pub fn op_tex_image_2d_from_image(
     // gl.texImage2D after the bitmap has been promoted to a GPU
     // texture.
     let shared = {
-        let c = crate::rendering::image::cache::IMAGE_CACHE.lock();
+        let c = state.borrow::<ImageCacheState>().aliases.lock();
         c.shared_for_image_id(image_id)
     };
     if let Some((source_shared_id, (w, h))) = shared {
@@ -4216,28 +4206,29 @@ pub fn op_tex_image_2d_from_image(
     // store but the decoded RGBA bytes are still in the io cache —
     // re-upload from CPU bytes.  Also covers the diagnostic miss
     // classes (unknown alias / evicted bytes).
-    let (width, height, data) = match resolve_cached_image_rgba(image_id) {
-        RgbaLookup::Found {
-            width,
-            height,
-            data,
-            ..
-        } => (width, height, data),
-        RgbaLookup::UnknownAlias => {
-            warn!(
-                "op_tex_image_2d_from_image miss (unknown alias): image_id={}",
-                image_id
-            );
-            return;
-        }
-        RgbaLookup::AliasKnownButEvicted { cache_key } => {
-            warn!(
-                "op_tex_image_2d_from_image miss (bytes evicted): image_id={}, src={}, gen={}",
-                image_id, cache_key.0, cache_key.1
-            );
-            return;
-        }
-    };
+    let (width, height, data) =
+        match resolve_cached_image_rgba(state.borrow::<ImageCacheState>(), image_id) {
+            RgbaLookup::Found {
+                width,
+                height,
+                data,
+                ..
+            } => (width, height, data),
+            RgbaLookup::UnknownAlias => {
+                warn!(
+                    "op_tex_image_2d_from_image miss (unknown alias): image_id={}",
+                    image_id
+                );
+                return;
+            }
+            RgbaLookup::AliasKnownButEvicted { cache_key } => {
+                warn!(
+                    "op_tex_image_2d_from_image miss (bytes evicted): image_id={}, src={}, gen={}",
+                    image_id, cache_key.0, cache_key.1
+                );
+                return;
+            }
+        };
 
     queue_gl_fire_and_forget(
         state,
@@ -4447,7 +4438,10 @@ pub fn op_tex_sub_image_2d_from_image(
     #[smi] type_: u32,
     #[smi] image_id: u32,
 ) {
-    let (width, height, data) = match resolve_cached_image_rgba(image_id) {
+    let (width, height, data) = match resolve_cached_image_rgba(
+        state.borrow::<ImageCacheState>(),
+        image_id,
+    ) {
         RgbaLookup::Found {
             width,
             height,

@@ -198,13 +198,10 @@ public final class BluetoothExports {
     }
 
     public static void destroyBluetoothManager(int sessionId) {
-        BluetoothManager mgr;
-        synchronized (sBluetoothLock) {
-            mgr = sBluetoothManagers.remove(sessionId);
-        }
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sBluetoothManagers,
+                id -> id == sessionId,
+                BluetoothManager::destroy);
     }
 
     public static void suspendPowerSensitiveManagers(int sessionId) {

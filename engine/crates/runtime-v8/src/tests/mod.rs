@@ -12,6 +12,7 @@ mod global_surface;
 mod host_bridge_dispatch;
 mod install_receipt;
 mod permission_reporting;
+mod permission_revocation;
 mod prelude;
 mod published_namespace_isolation;
 mod snapshot_fingerprint;

@@ -226,6 +226,15 @@ mod tests {
     }
 
     #[test]
+    fn touch_descriptor_returns_acceptance_boolean() {
+        let method = group_methods(MethodGroup::Core, MethodDirection::JavaToNative)
+            .iter()
+            .find(|method| method.name == "onTouchEvent")
+            .expect("core touch contract");
+        assert_eq!(method.sig, "(IIJILjava/nio/ByteBuffer;)Z");
+    }
+
+    #[test]
     fn on_camera_frame_data_descriptor_shape() {
         let method = group_methods(MethodGroup::Media, MethodDirection::JavaToNative)
             .iter()

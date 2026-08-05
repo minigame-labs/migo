@@ -1,14 +1,31 @@
+Let build.rs consume a pre-generated src_binding.rs.
+
+Bindgen's top-level run over V8's vendored libc++ needs a Clang 19+
+libclang. When none is available the binding cannot be produced locally,
+so allow an externally supplied, content-addressed one to stand in.
+
+The build recipe verifies that file against the component manifest's
+hashes.rust_binding and runtime.rusty_v8_revision before exporting
+V8_PREBUILT_BINDING, so this branch never widens what the build trusts.
+
+This diff deliberately carries ONE hunk. It used to also carry the
+`target_os == "android"` sysroot hunk that 0002-install-sysroot.patch
+already applies; that made the two patches collide (patch --forward
+refuses an already-applied hunk) and, worse, forced any sentinel taken
+from the last hunk to be 0002's sentinel, which is present before this
+patch runs and would therefore report it as applied when it is not.
+
 diff --git a/build.rs b/build.rs
 index 970e88b..a968545 100644
 --- a/build.rs
 +++ b/build.rs
 @@ -141,6 +141,26 @@ fn acquire_lock() -> LockFile {
  }
- 
+
  fn build_binding() {
 +  // MIGO: allow reusing a pre-generated src_binding.rs (same bindgen
 +  // 0.72 + same V8 14.5.201 = identical FFI ABI) to skip the local
-+  // bindgen step, which would otherwise require a Clang 20+ libclang to
++  // bindgen step, which would otherwise require a Clang 19+ libclang to
 +  // parse V8's vendored libc++ headers. Set V8_PREBUILT_BINDING to the
 +  // path of a known-good src_binding.rs.
 +  if let Ok(prebuilt) = env::var("V8_PREBUILT_BINDING") {
@@ -29,12 +46,3 @@ index 970e88b..a968545 100644
    // Bindgen needs Clang 19+ for V8's libc++ builtin type traits.
    if env::var("LIBCLANG_PATH").is_err() {
      eprintln!("Warning: LIBCLANG_PATH not set. Bindgen requires Clang 19+.");
-@@ -352,7 +372,7 @@ fn build_v8(is_asan: bool) {
-   // cross-compilation setup
-   if target_arch == "aarch64" {
-     gn_args.push(r#"target_cpu="arm64""#.to_string());
--    if target_os == "linux" {
-+    if target_os == "linux" || target_os == "android" {
-       gn_args.push("use_sysroot=true".to_string());
-       maybe_install_sysroot("arm64");
-       maybe_install_sysroot("amd64");

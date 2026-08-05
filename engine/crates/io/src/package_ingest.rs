@@ -506,7 +506,7 @@ mod tests {
 
         // 4. Atomic install: validates, renames, mounts.
         let final_pkg = dir.join("packages").join("stage1.mpkg");
-        let identity = staging
+        let installed = staging
             .install_package(
                 &mt,
                 pkg_filename,
@@ -517,7 +517,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(identity.name, "stage1");
+        assert_eq!(installed.identity.name, "stage1");
 
         // 5. Verify mount works.
         assert!(mt.exists("subpackages/stage1/main.js"));
@@ -715,7 +715,7 @@ mod tests {
             let staging = StagingArea::create(&game_cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join("stage1.mpkg");
             ingest_zip_to_package(&zip_path, &staged_pkg, "stage1", "1.0").unwrap();
-            staging
+            let installed = staging
                 .install_package(
                     &mt,
                     "stage1.mpkg",
@@ -728,7 +728,12 @@ mod tests {
 
             // Write manifest.
             let mut manifest = PackageManifest::load(&store);
-            manifest.record("stage1".into(), "subpackages/stage1".into(), "1.0".into());
+            manifest.record(
+                "stage1".into(),
+                "subpackages/stage1".into(),
+                "1.0".into(),
+                &installed.digest,
+            );
             manifest.save(&store).unwrap();
 
             // Verify readable in session 1.
@@ -805,7 +810,7 @@ mod tests {
             let staging = StagingArea::create(&game_cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join("stage1.mpkg");
             ingest_zip_to_package(&zip_path, &staged_pkg, "stage1", "1.0").unwrap();
-            staging
+            let installed = staging
                 .install_package(
                     &mt,
                     "stage1.mpkg",
@@ -817,7 +822,12 @@ mod tests {
                 .unwrap();
 
             let mut manifest = PackageManifest::load(&store);
-            manifest.record("stage1".into(), "subpackages/stage1".into(), "1.0".into());
+            manifest.record(
+                "stage1".into(),
+                "subpackages/stage1".into(),
+                "1.0".into(),
+                &installed.digest,
+            );
             manifest.save(&store).unwrap();
         }
 

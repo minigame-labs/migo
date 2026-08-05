@@ -360,6 +360,41 @@ mod ad_reward_integrity_tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ad_event_ingress_is_absent_from_the_content_object_graph() {
+        let (mut rt, _calls) = boot_hosted();
+        exec(&mut rt, WATCH_REWARDED);
+        assert_js(
+            &mut rt,
+            "(() => { \
+                 const names = []; \
+                 for (let p = globalThis.__ad; p && p !== Object.prototype; \
+                      p = Object.getPrototypeOf(p)) { \
+                   names.push(...Object.getOwnPropertyNames(p)); \
+                 } \
+                 return names.indexOf('_fire') === -1 \
+                   && names.indexOf('_handleHostEvent') === -1; \
+             })()",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn content_object_methods_cannot_synthesize_ad_events() {
+        let (mut rt, _calls) = boot_hosted();
+        exec(&mut rt, WATCH_REWARDED);
+        exec(
+            &mut rt,
+            "if (typeof globalThis.__ad._fire === 'function') { \
+                 globalThis.__ad._fire('close', { isEnded: true }); \
+             } \
+             if (typeof globalThis.__ad._handleHostEvent === 'function') { \
+                 globalThis.__ad._handleHostEvent('close', { isEnded: true }); \
+             }",
+        );
+        drain_ready(&mut rt).await;
+        assert_js(&mut rt, "globalThis.__closes.length === 0");
+    }
+
     // ---------------------------------------------------------------
     // 4. Routing robustness -- a stray event must not pay out.
     // ---------------------------------------------------------------

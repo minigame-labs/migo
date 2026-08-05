@@ -121,13 +121,10 @@ impl Scope {
 
 /// Device-service accessors that may only be used with a granted scope.
 ///
-/// The enforcement surface is derived from this, not listed alongside it: an op
-/// is subject to a check because it reaches for a gated capability, so
-/// `scripts/test-permission-coverage-contract.sh` finds every function that
-/// calls one of these accessors and requires the matching check inside it. Add
-/// an op that uses the camera and the gate demands the guard without anyone
-/// remembering to register it -- which is the property a hand-maintained op
-/// list does not have.
+/// The runtime coverage contract derives service-wide permission surfaces from
+/// this table, then requires each operation to be explicitly classified as a
+/// gate or a cleanup exemption in the runtime layer. This keeps service
+/// ownership here without making `shared` know runtime operation names.
 ///
 /// Only capabilities wx itself gates appear here. `clipboard` and `scan_code`
 /// are absent because wx does not put them behind a scope, and inventing scopes
@@ -137,13 +134,23 @@ impl Scope {
 /// `image_api` is deliberately absent despite `saveImageToPhotosAlbum` needing
 /// `scope.writePhotosAlbum`: the accessor also serves `compressImage` and
 /// friends, which need nothing, and gating the accessor would gate those too.
-/// It needs a per-op check rather than an accessor-level one; until that
-/// exists, claiming it here would describe a guard that is not there.
+/// It has a per-op check rather than an accessor-level one.
+#[allow(dead_code)]
 pub const GATED_ACCESSORS: &[(&str, Scope)] = &[
     ("camera", Scope::Camera),
     ("recorder", Scope::Record),
     ("location", Scope::UserLocation),
     ("bluetooth", Scope::Bluetooth),
+];
+
+/// Permission-sensitive methods on services whose other methods are unscoped.
+///
+/// The service layer owns these method names; the runtime coverage contract
+/// derives their caller ops and checks the runtime-owned policy classification.
+#[allow(dead_code)]
+pub const GATED_SERVICE_METHODS: &[(&str, Scope)] = &[
+    ("save_image_to_photos_album", Scope::WritePhotosAlbum),
+    ("get_user_info", Scope::UserInfo),
 ];
 
 /// What the host has decided about one scope.

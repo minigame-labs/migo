@@ -325,6 +325,14 @@ pub struct CanvasOpState {
     /// can leave this `None` and the ops fall back to the
     /// cross-thread sync-op path.
     pub text_measurer: Option<crate::text_measurer::SharedTextMeasurer>,
+    /// This session's text texture cache.  Taken once at bring-up from
+    /// `text_texture_cache::text_cache_for_host(host_id)` so the
+    /// per-frame `fillText` path locks only this session's cache and
+    /// never a lock shared with another session, and so a GL texture
+    /// name minted in this session's EGL context is unreachable from
+    /// any other session.  Harnesses that build a `CanvasOpState`
+    /// directly via [`Self::new`] get an unregistered standalone cache.
+    pub text_cache: crate::text_texture_cache::SharedTextCache,
 }
 
 impl std::fmt::Debug for CanvasOpState {
@@ -338,16 +346,22 @@ impl std::fmt::Debug for CanvasOpState {
                     .as_ref()
                     .map(|_| "Some(<dyn TextMeasurer>)"),
             )
+            .field("text_cache", &self.text_cache)
             .finish()
     }
 }
 
 impl CanvasOpState {
+    /// Build a state bound to `host_id`'s text texture cache.  The
+    /// render thread for the same host resolves the same handle, so the
+    /// JS and render sides of the cache protocol agree while staying
+    /// isolated from every other session.
     #[inline]
-    pub fn new(tx: RenderTx) -> Self {
+    pub fn for_host(tx: RenderTx, host_id: i32) -> Self {
         Self {
             tx,
             text_measurer: None,
+            text_cache: crate::text_texture_cache::text_cache_for_host(host_id),
         }
     }
 

@@ -136,6 +136,12 @@ _Static_assert(offsetof(MigoHostCallbacks, on_surface_released) == 52,
 #error "unsupported pointer width"
 #endif
 
+void migo_core_c_teardown_contract(MigoSession *session, MigoEngine *engine) {
+    (void)migo_session_destroy(session);
+    (void)migo_engine_destroy(engine);
+    /* Native display/window teardown and library unload are legal only here. */
+}
+
 int migo_core_c_contract(void) {
     MigoEngineConfig engine_config = {0};
     MigoSessionConfig session_config = {0};

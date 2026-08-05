@@ -149,6 +149,15 @@ MIGO_STATIC_ASSERT(offsetof(MigoSurfaceReleaseStatus, state) == 16,
 
 MIGO_BEGIN_DECLS
 
+/*
+ * The first successful attach fixes the Session's graphics platform identity.
+ * Later native-target replacement is supported only within that identity:
+ * Android in the same process, X11 on the same server using the Session's
+ * private render connection, Wayland on the same wl_display, or HWND under the
+ * same ANGLE device. A different
+ * backend/display returns MIGO_ERROR_INVALID_STATE synchronously, publishes no
+ * attachment, and enqueues no render command; the Session remains retryable.
+ */
 MIGO_API MigoResult MIGO_CALL migo_session_attach_surface(
     MigoSession *session,
     const MigoSurfaceDescriptor *descriptor,

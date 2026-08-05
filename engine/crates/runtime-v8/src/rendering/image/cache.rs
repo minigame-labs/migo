@@ -1,5 +1,6 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::oneshot;
@@ -368,59 +369,124 @@ impl ImageCache {
         let entry = self.by_src.get(key)?;
         Some((shared_id, entry.dims))
     }
-}
 
-pub static IMAGE_CACHE: LazyLock<Mutex<ImageCache>> =
-    LazyLock::new(|| Mutex::new(ImageCache::new()));
-
-/// Clear all shared image tracking state.
-///
-/// Must be called during host shutdown to prevent stale entries from
-/// leaking into the next session (IMAGE_CACHE is process-global).
-pub fn drain_shared_image_cache() -> Vec<u32> {
-    use std::collections::HashSet;
-    let mut c = IMAGE_CACHE.lock();
-    let mut seen = HashSet::new();
-    let mut shared_ids: Vec<u32> = Vec::new();
-    for id in c
-        .by_src
-        .values()
-        .map(|e| e.shared_image_id)
-        .chain(c.alias_to_shared.values().copied())
-    {
-        if seen.insert(id) {
-            shared_ids.push(id);
-        }
-    }
-    // H-5: release every pin we ever took before wiping the
-    // tracking maps.  Each (key, entry) pair held one pin per
-    // `refs` unit; draining must undo them all so the io cache
-    // doesn't carry dead pins into the next session (which
-    // would make those entries permanently un-evictable even
-    // after their aliases are gone).
-    let pin_releases: Vec<(migo_io::image_cache::ImageCacheKey, usize)> = c
-        .by_src
-        .iter()
-        .map(|(k, v)| (to_io_cache_key(k), v.refs))
-        .collect();
-    {
-        let mut io_cache = migo_io::image_cache::global_cache();
-        for (io_key, refs) in pin_releases {
-            for _ in 0..refs {
-                io_cache.unpin(&io_key);
+    /// Drop every alias this table holds, returning the shared image ids whose
+    /// GPU textures the caller is now responsible for destroying.
+    ///
+    /// The io-side pins go back first.  Each `refs` unit on an entry stands for
+    /// one pin taken on the decoded-RGBA cache, and that cache outlives this
+    /// table — its entries are context-independent bytes shared with every
+    /// other Session — so a pin left behind here would keep those bytes
+    /// un-evictable for the life of the process rather than just of this
+    /// Session.
+    #[must_use = "the returned shared image ids own GPU textures that still need destroying"]
+    pub fn drain(&mut self) -> Vec<u32> {
+        use std::collections::HashSet;
+        let upper_bound = self.by_src.len() + self.alias_to_shared.len();
+        let mut seen = HashSet::with_capacity(upper_bound);
+        let mut shared_ids: Vec<u32> = Vec::with_capacity(upper_bound);
+        for id in self
+            .by_src
+            .values()
+            .map(|e| e.shared_image_id)
+            .chain(self.alias_to_shared.values().copied())
+        {
+            if seen.insert(id) {
+                shared_ids.push(id);
             }
         }
+
+        {
+            let mut io_cache = migo_io::image_cache::global_cache();
+            for (key, entry) in self.by_src.iter() {
+                let io_key = to_io_cache_key(key);
+                for _ in 0..entry.refs {
+                    io_cache.unpin(&io_key);
+                }
+            }
+        }
+
+        self.by_src.clear();
+        self.alias_to_shared.clear();
+        self.shared_to_key.clear();
+        self.loading_map.clear();
+        self.pending_alias_to_key.clear();
+        shared_ids
     }
-    c.by_src.clear();
-    c.alias_to_shared.clear();
-    c.shared_to_key.clear();
-    c.loading_map.clear();
-    c.pending_alias_to_key.clear();
-    shared_ids
 }
 
-pub fn clear_shared_image_cache() {
-    let _ = drain_shared_image_cache();
+/// One Session's alias table.
+///
+/// Handed out as an `Arc` so every op reaches it through the handle its own
+/// isolate resolved at bring-up and locks only this Session's `Mutex`.  A
+/// `texImage2D` on one game's frame path therefore never waits behind another
+/// game's image load, which is what Section 7.3's "no cross-session lock on a
+/// per-event path" asks for.
+pub type SharedImageCache = Arc<Mutex<ImageCache>>;
+
+/// Per-session registry.
+///
+/// This table maps a source to a *shared image id*, and such an id names a GPU
+/// texture inside one Session's EGL context — each Session builds its own, with
+/// no sharing between them.  An id minted by one Session therefore means
+/// nothing in another's namespace, which puts this cache in tier one of
+/// specification Section 6.5: it must be per-session.  The decoded-RGBA cache
+/// one layer below it is the opposite case and stays shared on purpose, because
+/// its entries are context-independent bytes under a key that carries the
+/// file's real identity.
+///
+/// The outer `RwLock` is read at isolate bring-up and written at session
+/// teardown, and nowhere else: per-event paths hold the `Arc` they resolved at
+/// bring-up rather than consulting this map again.
+static SESSION_IMAGE_CACHES: LazyLock<RwLock<HashMap<i32, SharedImageCache>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Get (or create) the alias table belonging to `host_id`.
+///
+/// Total by construction, so no caller has to care which of a Session's
+/// isolates — the main one or a worker — reaches it first; each keeps the
+/// returned `Arc` for as long as it runs.
+pub fn image_cache_for_host(host_id: i32) -> SharedImageCache {
+    if let Some(existing) = SESSION_IMAGE_CACHES.read().get(&host_id) {
+        return existing.clone();
+    }
+    SESSION_IMAGE_CACHES
+        .write()
+        .entry(host_id)
+        .or_insert_with(|| Arc::new(Mutex::new(ImageCache::new())))
+        .clone()
+}
+
+/// Whether `host_id` currently has a registered alias table.  Diagnostics and
+/// teardown assertions only.
+pub fn image_cache_registered(host_id: i32) -> bool {
+    SESSION_IMAGE_CACHES.read().contains_key(&host_id)
+}
+
+/// Drain `host_id`'s alias table, returning the shared image ids whose textures
+/// the caller must destroy on the render thread.
+///
+/// Registration survives, because the caller is the restart path: the same
+/// Session is about to build a fresh isolate that will resolve this same
+/// handle.
+pub fn drain_shared_image_cache(host_id: i32) -> Vec<u32> {
+    let Some(cache) = SESSION_IMAGE_CACHES.read().get(&host_id).cloned() else {
+        return Vec::new();
+    };
+    cache.lock().drain()
+}
+
+/// Drop `host_id`'s alias table at session teardown.
+///
+/// No `DestroyImage` dispatch goes with it and none is needed: the render
+/// thread has already joined and its EGL context is gone, so every texture
+/// these ids named died with the context.  The io-side pins are the part that
+/// does still matter, and [`ImageCache::drain`] releases them.
+pub fn unregister_image_cache(host_id: i32) {
+    let Some(cache) = SESSION_IMAGE_CACHES.write().remove(&host_id) else {
+        return;
+    };
+    let _ids_naming_textures_of_a_dead_context = cache.lock().drain();
 }
 
 #[cfg(test)]
@@ -512,5 +578,209 @@ mod tests {
         assert!(!cache.alias_to_shared.contains_key(&1));
         assert!(!cache.pending_alias_to_key.contains_key(&2));
         assert!(!cache.loading_map.contains_key(&requested));
+    }
+
+    // ── Per-session isolation ───────────────────────────────────────────────
+    //
+    // The entries here are `src → shared_image_id`, and a shared image id names a
+    // GPU texture inside one Session's EGL context.  Reached across Sessions, this
+    // table hands game B a name minted in game A's context — a texture B cannot
+    // draw and, on destroy, a name whose deletion B has no business ordering.
+
+    use super::{
+        BeginLoadResult, drain_shared_image_cache, image_cache_for_host, image_cache_registered,
+        to_io_cache_key, unregister_image_cache,
+    };
+
+    /// Distinct ids per test, so the shared registry can be asserted without one
+    /// test's registrations leaking into another's.
+    fn unique_host_pair() -> (i32, i32) {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        static NEXT: AtomicI32 = AtomicI32::new(7_000);
+        let base = NEXT.fetch_add(2, Ordering::Relaxed);
+        (base, base + 1)
+    }
+
+    struct HostCacheGuard(i32);
+
+    impl Drop for HostCacheGuard {
+        fn drop(&mut self) {
+            unregister_image_cache(self.0);
+        }
+    }
+
+    /// Load `key` to completion in `cache` under caller id 1, landing on
+    /// `shared_id`.  Mirrors the op's own order: claim, register the in-flight
+    /// alias, settle.
+    ///
+    /// Deliberately asserts nothing.  An earlier version required `begin_load` to
+    /// answer `StartLoading` here, which meant three of the tests below died in
+    /// this helper under a shared-table mutant and never reached the claim in their
+    /// own name — the second session's load simply joined the first's entry. Each
+    /// test instead asserts the state it depends on, so a failure lands on the
+    /// property it is about.
+    fn complete_load(cache: &super::SharedImageCache, key: &ImageCacheKey, shared_id: u32) {
+        let mut c = cache.lock();
+        let _ = c.begin_load(1, key);
+        c.register_inflight_alias(1, shared_id);
+        let _ = c.finish_load(1, shared_id, key, key, Ok((64, 64)));
+    }
+
+    #[test]
+    fn both_isolates_of_one_session_reach_the_same_alias_table() {
+        let (id, _) = unique_host_pair();
+        let _g = HostCacheGuard(id);
+        // A Session runs more than one isolate — the main one and any Worker — and
+        // each resolves this handle for itself.  Handing them separate tables would
+        // let a texture loaded in one be invisible, and so undestroyable, in the
+        // other.
+        assert!(std::sync::Arc::ptr_eq(
+            &image_cache_for_host(id),
+            &image_cache_for_host(id)
+        ));
+    }
+
+    #[test]
+    fn one_sessions_load_does_not_become_another_sessions_alias() {
+        let (a_id, b_id) = unique_host_pair();
+        let (_ga, _gb) = (HostCacheGuard(a_id), HostCacheGuard(b_id));
+        let a = image_cache_for_host(a_id);
+        let b = image_cache_for_host(b_id);
+
+        // The same asset, the same caller-side image id: exactly what two games
+        // built on the same engine template ask for.
+        let key: ImageCacheKey = ("/code/logo.png".into(), 7);
+        complete_load(&a, &key, 100);
+
+        // Session B asking for it must be told to load it itself.  A shared table
+        // answers `AlreadyLoaded(100)`, and 100 is a texture name in A's context.
+        let b_verdict = b.lock().begin_load(1, &key);
+        assert!(
+            matches!(b_verdict, BeginLoadResult::StartLoading),
+            "session B was handed session A's shared image id for {key:?}; that id \
+             names a texture in A's EGL context"
+        );
+        b.lock().register_inflight_alias(1, 200);
+        assert_eq!(b.lock().finish_load(1, 200, &key, &key, Ok((64, 64))), None);
+
+        assert_eq!(
+            a.lock().shared_for_image_id(1).map(|(id, _)| id),
+            Some(100),
+            "session A must still resolve to the texture it minted"
+        );
+        assert_eq!(
+            b.lock().shared_for_image_id(1).map(|(id, _)| id),
+            Some(200),
+            "session B must resolve to its own texture, never A's"
+        );
+    }
+
+    #[test]
+    fn destroying_an_image_in_one_session_spares_the_other_sessions_texture() {
+        let (a_id, b_id) = unique_host_pair();
+        let (_ga, _gb) = (HostCacheGuard(a_id), HostCacheGuard(b_id));
+        let a = image_cache_for_host(a_id);
+        let b = image_cache_for_host(b_id);
+
+        let key: ImageCacheKey = ("/code/atlas.png".into(), 3);
+        complete_load(&a, &key, 100);
+        complete_load(&b, &key, 200);
+
+        // B drops its Image.  The id it hands back for deletion must be its own.
+        assert_eq!(b.lock().try_release_and_get_destroy_rid(1), Some(200));
+        assert_eq!(
+            a.lock().shared_for_image_id(1).map(|(id, _)| id),
+            Some(100),
+            "session B's destroy released session A's texture"
+        );
+    }
+
+    #[test]
+    fn tearing_down_one_session_leaves_the_others_aliases_reachable() {
+        let (a_id, b_id) = unique_host_pair();
+        let _gb = HostCacheGuard(b_id);
+        let a = image_cache_for_host(a_id);
+        let b = image_cache_for_host(b_id);
+
+        let key: ImageCacheKey = ("/code/ui.png".into(), 5);
+        complete_load(&a, &key, 100);
+        complete_load(&b, &key, 200);
+
+        unregister_image_cache(a_id);
+        assert!(
+            !image_cache_registered(a_id),
+            "a dead session's alias table must not be retained for process life"
+        );
+        assert_eq!(
+            b.lock().shared_for_image_id(1).map(|(id, _)| id),
+            Some(200),
+            "one session's teardown discarded another live session's aliases"
+        );
+
+        // A later session reusing the id inherits nothing: every name the previous
+        // one held belonged to an EGL context that no longer exists.
+        let _ga = HostCacheGuard(a_id);
+        assert!(
+            image_cache_for_host(a_id)
+                .lock()
+                .shared_for_image_id(1)
+                .is_none()
+        );
+        drop(a);
+    }
+
+    #[test]
+    fn restarting_one_session_drains_only_its_own_textures() {
+        let (a_id, b_id) = unique_host_pair();
+        let (_ga, _gb) = (HostCacheGuard(a_id), HostCacheGuard(b_id));
+        let a = image_cache_for_host(a_id);
+        let b = image_cache_for_host(b_id);
+
+        let key: ImageCacheKey = ("/code/tiles.png".into(), 11);
+        complete_load(&a, &key, 100);
+        complete_load(&b, &key, 200);
+
+        // The restart path dispatches a destroy for every id this returns, so an
+        // id belonging to another game would black out its live textures.
+        assert_eq!(
+            drain_shared_image_cache(a_id),
+            vec![100],
+            "the restart drain returned an id this session does not own"
+        );
+        assert_eq!(
+            b.lock().shared_for_image_id(1).map(|(id, _)| id),
+            Some(200),
+            "one session's restart ordered another session's textures destroyed"
+        );
+        assert!(
+            image_cache_registered(a_id),
+            "a restart must keep the registration the new isolate will resolve"
+        );
+        assert!(a.lock().shared_for_image_id(1).is_none());
+    }
+
+    #[test]
+    fn a_torn_down_session_releases_the_decoded_bytes_it_had_pinned() {
+        let (a_id, _) = unique_host_pair();
+        // Unique path: the decoded-bytes cache this asserts against is shared with
+        // every other test in this binary.
+        let key: ImageCacheKey = (format!("/code/pinned-{a_id}.png"), 13);
+        let io_key = to_io_cache_key(&key);
+
+        complete_load(&image_cache_for_host(a_id), &key, 100);
+        assert_eq!(
+            migo_io::image_cache::global_cache().pin_count(&io_key),
+            1,
+            "a live alias must pin the decoded bytes it draws from"
+        );
+
+        unregister_image_cache(a_id);
+        assert_eq!(
+            migo_io::image_cache::global_cache().pin_count(&io_key),
+            0,
+            "the pin outlived the session that took it, so these bytes can never be \
+             evicted again -- the decoded cache is deliberately not cleared on \
+             teardown, which is what makes the leak permanent"
+        );
     }
 }

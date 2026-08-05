@@ -28,6 +28,7 @@ import com.migo.runtime.callback.SubpackageHandler;
 import com.migo.runtime.GameSession;
 import com.migo.runtime.SessionState;
 import com.migo.runtime.BuildConfig;
+import com.migo.runtime.ErrorCode;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -42,6 +43,7 @@ import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 
 /**
  * Static methods exposed to native code via JNI.
@@ -79,6 +81,35 @@ public final class NativeExports {
     /** Per-session permission handlers set via GameSession API. */
     private static final ConcurrentHashMap<Integer, PermissionHandler> sPermissionHandlers =
             new ConcurrentHashMap<>();
+
+    private static final PermissionOperationGate sPermissionOperations =
+            new PermissionOperationGate();
+    private static final TerminalCloseQueue<GameSession> sTerminalCloses =
+            new TerminalCloseQueue<>();
+
+    private static final PermissionRevocation.ResourceTeardown sPermissionResources =
+            new PermissionRevocation.ResourceTeardown() {
+                @Override
+                public void destroyCamera(int sessionId) {
+                    if (BuildConfig.MIGO_API_MEDIA) {
+                        MediaExports.destroyCameraManagers(sessionId);
+                    }
+                }
+
+                @Override
+                public void destroyRecorder(int sessionId) {
+                    if (BuildConfig.MIGO_API_MEDIA) {
+                        MediaExports.destroyRecorderManager(sessionId);
+                    }
+                }
+
+                @Override
+                public void destroyBluetooth(int sessionId) {
+                    if (BuildConfig.MIGO_API_CONNECTIVITY) {
+                        BluetoothExports.destroyBluetoothManager(sessionId);
+                    }
+                }
+            };
 
     /** Per-session ad handlers set via GameSession API. */
     private static final ConcurrentHashMap<Integer, AdHandler> sAdHandlers =
@@ -119,7 +150,7 @@ public final class NativeExports {
     // ==================== Error Notification (from native) ====================
 
     /**
-     * Callback interface for native engine errors.
+     * Callback interface for native engine errors and recoverable pressure.
      * <p>
      * Implemented by the session owner (e.g. {@code GameSession}) to receive
      * fatal error notifications from the Rust engine.
@@ -128,7 +159,7 @@ public final class NativeExports {
      */
     public interface NativeErrorCallback {
         /**
-         * Called when a fatal native engine error occurs.
+         * Called when a native engine error or recoverable pressure event occurs.
          * <p>
          * Always called on the <b>main thread</b>.
          *
@@ -180,6 +211,10 @@ public final class NativeExports {
      */
     public static void registerSession(int sessionId, GameSession session) {
         if (session != null) {
+            if (!sPermissionOperations.open(sessionId)) {
+                throw new IllegalStateException(
+                        "permission lifecycle is already closing for session " + sessionId);
+            }
             sSessions.put(sessionId, session);
         }
     }
@@ -190,6 +225,12 @@ public final class NativeExports {
      */
     public static void unregisterSession(int sessionId) {
         sSessions.remove(sessionId);
+    }
+
+    /** Closes permission operations and retries any retained deferred cancellations. */
+    public static void closePermissionOperations(int sessionId) {
+        PermissionOperationGate.Result result = sPermissionOperations.close(sessionId);
+        if (result.failure() != null) throw result.failure();
     }
 
     /**
@@ -207,6 +248,14 @@ public final class NativeExports {
     public static boolean isSessionTerminated(int sessionId) {
         GameSession session = sSessions.get(sessionId);
         return session == null || session.getState() == SessionState.DESTROYED;
+    }
+
+    /** Runs a callback admitted by the session's current standing scope. */
+    public static boolean runIfPermissionGranted(
+            int sessionId,
+            String scope,
+            BooleanSupplier callback) {
+        return sPermissionOperations.runIfGranted(sessionId, scope, callback);
     }
 
     /** Suspend sensors, BLE scans, camera capture, and video for OnHide. */
@@ -269,7 +318,7 @@ public final class NativeExports {
     }
 
     /**
-     * Called from native code (Rust) when a fatal engine error occurs.
+     * Called from native code (Rust) for engine errors and recoverable pressure.
      * <p>
      * This method is invoked from native threads (host thread, watchdog thread, etc.)
      * and dispatches the error to the registered callback on the <b>main thread</b>.
@@ -278,6 +327,7 @@ public final class NativeExports {
      *
      * @param hostId    Session/host ID
      * @param errorCode Native error code:
+     *                  11 = InputSaturated,
      *                  203 = OutOfMemory, 204 = JsExecutionTimeout,
      *                  205 = HostPanic, 206 = ANR,
      *                  207 = CodeSignatureInvalid, 208 = CodeIntegrityFailed
@@ -287,6 +337,13 @@ public final class NativeExports {
     public static void onError(int hostId, int errorCode, String message, String detail) {
         NativeErrorCallback callback = sErrorCallbacks.get(hostId);
         if (callback != null) {
+            if (errorCode == ErrorCode.ERR_CLEANUP_FAILED) {
+                sMainHandler.post(() -> callback.onNativeError(
+                        errorCode,
+                        message != null ? message : "Permission cleanup failed",
+                        detail != null ? detail : ""));
+                return;
+            }
             // Dispatch to main thread — native calls may come from any thread
             sMainHandler.post(() -> {
                 // Re-check: session may have been destroyed between post and dispatch
@@ -1715,7 +1772,21 @@ public final class NativeExports {
                     "{\"error\":\"getLocation:fail no activity\"}");
             return;
         }
-        LocationProvider.getLocationAsync(activity, sessionId, optionsJson);
+        PermissionOperationGate.Pending pending =
+                sPermissionOperations.register(sessionId, "scope.userLocation");
+        if (pending == null) {
+            NativeMethods.onLocationResult(sessionId,
+                    "{\"error\":\"getLocation:fail permission revoked\"}");
+            return;
+        }
+        if (!sPermissionOperations.enter(pending, () ->
+                LocationProvider.getLocationAsync(
+                        activity, sessionId, optionsJson, sPermissionOperations, pending,
+                        failure -> reportCleanupFailureAndScheduleTerminalClose(
+                                sessionId, "location request cleanup", failure)))) {
+            NativeMethods.onLocationResult(sessionId,
+                    "{\"error\":\"getLocation:fail permission revoked\"}");
+        }
     }
 
     /**
@@ -1739,7 +1810,21 @@ public final class NativeExports {
                     "{\"error\":\"getFuzzyLocation:fail no activity\"}");
             return;
         }
-        LocationProvider.getFuzzyLocationAsync(activity, sessionId, optionsJson);
+        PermissionOperationGate.Pending pending =
+                sPermissionOperations.register(sessionId, "scope.userLocation");
+        if (pending == null) {
+            NativeMethods.onFuzzyLocationResult(sessionId,
+                    "{\"error\":\"getFuzzyLocation:fail permission revoked\"}");
+            return;
+        }
+        if (!sPermissionOperations.enter(pending, () ->
+                LocationProvider.getFuzzyLocationAsync(
+                        activity, sessionId, optionsJson, sPermissionOperations, pending,
+                        failure -> reportCleanupFailureAndScheduleTerminalClose(
+                                sessionId, "fuzzy location request cleanup", failure)))) {
+            NativeMethods.onFuzzyLocationResult(sessionId,
+                    "{\"error\":\"getFuzzyLocation:fail permission revoked\"}");
+        }
     }
 
     // ==================== Scan Code (delegates to InputExports) ====================
@@ -2467,8 +2552,10 @@ public final class NativeExports {
      * @param sessionId The session ID
      */
     public static void destroyAdpfManager(int sessionId) {
-        AdpfManager mgr = sAdpfManagers.remove(sessionId);
-        if (mgr != null) mgr.destroy();
+        ResourceCleanup.destroyMatching(
+                sAdpfManagers,
+                id -> id == sessionId,
+                AdpfManager::destroy);
     }
 
     /**
@@ -2489,23 +2576,30 @@ public final class NativeExports {
      * @param sessionId The session ID
      */
     public static void destroyAllManagers(int sessionId) {
-        if (BuildConfig.MIGO_API_SENSORS) {
-            SensorExports.destroyAll(sessionId);
-            NetworkExports.destroyAll(sessionId);
-        }
-        if (BuildConfig.MIGO_API_MEDIA) {
-            MediaExports.destroyAll(sessionId);
-        }
-        InputExports.destroyAll(sessionId);
-        if (BuildConfig.MIGO_API_CONNECTIVITY) {
-            BluetoothExports.destroyAll(sessionId);
-        }
-        clearGameLogHandler(sessionId);
-        clearAuthHandler(sessionId);
-        clearSubpackageHandler(sessionId);
-        clearMessageHandler(sessionId);
-        unregisterErrorCallback(sessionId);
-        destroyAdpfManager(sessionId);
+        ResourceCleanup.runAll(
+                () -> {
+                    if (BuildConfig.MIGO_API_SENSORS) SensorExports.destroyAll(sessionId);
+                },
+                () -> {
+                    if (BuildConfig.MIGO_API_SENSORS) NetworkExports.destroyAll(sessionId);
+                },
+                () -> {
+                    if (BuildConfig.MIGO_API_MEDIA) MediaExports.destroyAll(sessionId);
+                },
+                () -> InputExports.destroyAll(sessionId),
+                () -> {
+                    if (BuildConfig.MIGO_API_CONNECTIVITY) BluetoothExports.destroyAll(sessionId);
+                },
+                () -> clearGameLogHandler(sessionId),
+                () -> clearAuthHandler(sessionId),
+                () -> clearSubpackageHandler(sessionId),
+                () -> clearMessageHandler(sessionId),
+                () -> clearAdHandler(sessionId),
+                () -> sAdSinks.remove(sessionId),
+                () -> clearPermissionHandler(sessionId),
+                () -> sPermissionSinks.remove(sessionId),
+                () -> unregisterErrorCallback(sessionId),
+                () -> destroyAdpfManager(sessionId));
     }
 
     // ==================== Host <-> JS Message Channel ====================
@@ -2600,6 +2694,7 @@ public final class NativeExports {
         }
 
         private void emit(int adId, String event, JSONObject extra) {
+            if (isSessionTerminated(sessionId)) return;
             try {
                 JSONObject payload = extra != null ? extra : new JSONObject();
                 payload.put("adId", adId);
@@ -2853,21 +2948,81 @@ public final class NativeExports {
     }
 
     /** One sink per session; stateless apart from the id, so sharing is safe. */
-    private static final class SessionPermissionSink implements PermissionSink {
+    static final class SessionPermissionSink implements PermissionSink {
+        interface FailureReporter {
+            void report(String scope, boolean granted, RuntimeException failure);
+        }
+
+        interface CloseScheduler {
+            boolean schedule();
+        }
+
         private final int sessionId;
+        private final PermissionOperationGate operations;
+        private final BooleanSupplier sessionTerminated;
+        private final FailureReporter failureReporter;
+        private final CloseScheduler closeScheduler;
 
         SessionPermissionSink(int sessionId) {
+            this(
+                    sessionId,
+                    sPermissionOperations,
+                    () -> isSessionTerminated(sessionId),
+                    (scope, granted, failure) -> {
+                        android.util.Log.e(TAG, "permission_update_failed session=" + sessionId
+                                + " scope=" + scope + " granted=" + granted, failure);
+                        onError(sessionId, ErrorCode.ERR_CLEANUP_FAILED,
+                                "permission update cleanup failed", failure.toString());
+                    },
+                    () -> scheduleTerminalClose(sessionId));
+        }
+
+        SessionPermissionSink(
+                int sessionId,
+                PermissionOperationGate operations,
+                BooleanSupplier sessionTerminated,
+                FailureReporter failureReporter,
+                CloseScheduler closeScheduler) {
             this.sessionId = sessionId;
+            this.operations = operations;
+            this.sessionTerminated = sessionTerminated;
+            this.failureReporter = failureReporter;
+            this.closeScheduler = closeScheduler;
         }
 
         @Override
         public void setScope(String scope, boolean granted) {
             if (scope == null || scope.isEmpty()) return;
-            NativeMethods.updatePermission(sessionId, scope, granted);
+            if (sessionTerminated.getAsBoolean()) return;
+            PermissionOperationGate.Result result = operations.update(
+                    sessionId,
+                    scope,
+                    granted,
+                    () -> PermissionRevocation.update(
+                            scope,
+                            sessionTerminated,
+                            () -> NativeMethods.updatePermission(sessionId, scope, granted)));
+            RuntimeException failure = result.failure();
+            if (failure == null) return;
+            try {
+                failureReporter.report(scope, granted, failure);
+            } catch (RuntimeException reportFailure) {
+                failure.addSuppressed(reportFailure);
+            }
+            try {
+                if (!closeScheduler.schedule()) {
+                    failure.addSuppressed(new IllegalStateException(
+                            "failed to schedule terminal close"));
+                }
+            } catch (RuntimeException scheduleFailure) {
+                failure.addSuppressed(scheduleFailure);
+            }
+            throw failure;
         }
 
         @Override
         public void resolveRequest(int requestId, boolean granted) {
+            if (isSessionTerminated(sessionId)) return;
             try {
                 JSONObject res = new JSONObject();
                 res.put("requestId", requestId);
@@ -2880,6 +3035,7 @@ public final class NativeExports {
 
         @Override
         public void failRequest(int requestId, String errMsg) {
+            if (isSessionTerminated(sessionId)) return;
             try {
                 JSONObject res = new JSONObject();
                 res.put("requestId", requestId);
@@ -2889,6 +3045,61 @@ public final class NativeExports {
                 NativeMethods.onAuthorizeResult(sessionId,
                         "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
             }
+        }
+    }
+
+    /** Targeted teardown invoked synchronously by native permission revocation. */
+    public static void revokePermissionResources(int sessionId, String scope) {
+        try {
+            ResourceCleanup.runAll(
+                    () -> {
+                        PermissionOperationGate.Result result =
+                                sPermissionOperations.revoke(sessionId, scope);
+                        if (result.failure() != null) throw result.failure();
+                    },
+                    () -> PermissionRevocation.tearDown(
+                            sessionId, scope, sPermissionResources,
+                            () -> requireTerminalCloseScheduled(sessionId)));
+        } catch (RuntimeException cleanupFailure) {
+            if (!scheduleTerminalClose(sessionId)) {
+                cleanupFailure.addSuppressed(new IllegalStateException(
+                        "failed to schedule terminal close"));
+            }
+            throw cleanupFailure;
+        }
+    }
+
+    private static boolean scheduleTerminalClose(int sessionId) {
+        GameSession session = sSessions.get(sessionId);
+        return sTerminalCloses.schedule(session, sMainHandler::post, GameSession::close);
+    }
+
+    /** Reports asynchronous resource cleanup failure without throwing on a Looper callback. */
+    public static void reportCleanupFailureAndScheduleTerminalClose(
+            int sessionId,
+            String operation,
+            RuntimeException failure) {
+        android.util.Log.e(TAG, operation + " failed session=" + sessionId, failure);
+        try {
+            onError(sessionId, ErrorCode.ERR_CLEANUP_FAILED,
+                    operation + " failed", failure.toString());
+        } catch (RuntimeException reportFailure) {
+            failure.addSuppressed(reportFailure);
+        }
+        try {
+            if (!scheduleTerminalClose(sessionId)) {
+                failure.addSuppressed(new IllegalStateException(
+                        "failed to schedule terminal close"));
+            }
+        } catch (RuntimeException scheduleFailure) {
+            failure.addSuppressed(scheduleFailure);
+        }
+    }
+
+    private static void requireTerminalCloseScheduled(int sessionId) {
+        if (!scheduleTerminalClose(sessionId)) {
+            throw new IllegalStateException(
+                    "failed to schedule session termination after permission cleanup");
         }
     }
 

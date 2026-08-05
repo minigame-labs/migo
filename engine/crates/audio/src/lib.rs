@@ -81,6 +81,7 @@ mod decoder;
 mod inner_audio;
 mod limits;
 mod nodes;
+mod off_worker;
 mod output;
 pub mod param;
 pub mod power_manager;

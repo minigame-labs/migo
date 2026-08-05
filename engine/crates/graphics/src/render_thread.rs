@@ -1258,6 +1258,13 @@ impl RenderThread {
         dpi: f32,
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+        // This session's text texture cache, resolved by the host *before* this
+        // thread is spawned. Deliberately not resolved in here: on a GPU startup
+        // timeout the host detaches this thread without joining it and its startup
+        // guard unregisters the cache, so a get-or-create reached afterwards would
+        // recreate an entry with no host left to remove it, and repeated startup
+        // failures would grow the registry for process life.
+        text_cache: shared::text_texture_cache::SharedTextCache,
         // Authoritative GL-context-loss state, shared with the host runtime and
         // JS `op_gl_is_context_lost`. The render thread is the *only* writer and
         // updates it edge-triggered: `lost` false->true on a real reset / EGL
@@ -1345,6 +1352,10 @@ impl RenderThread {
                     dpi,
                     app_cache_dir.as_deref(),
                     gpu_caps.clone(),
+                    // The JS thread resolves the same handle from the same host
+                    // id, so both sides of the cache protocol agree while every
+                    // other session's GL texture names stay unreachable.
+                    text_cache,
                 ) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1440,7 +1451,7 @@ impl RenderThread {
                 let mut render_server = RenderServer::new();
 
                 // ---- FPS stats ----
-                let debug_stats = shared::stats::register_stats(host_id);
+                let debug_stats = shared::stats::stats_for(host_id);
                 crate::render_diagnostics::install(debug_stats.clone());
                 let mut frame_count: u32 = 0;
                 let mut fps_timer = Instant::now();
@@ -1878,15 +1889,17 @@ impl RenderThread {
                         }
 
                         RenderCommand::TrimTextCache { level } => {
-                            // Text texture cache lives process-global but
+                            // The text texture cache is per session, and
                             // its GL textures can only be freed with a
                             // current EGL context, which only this thread
                             // has.  Trim, then delete the returned victim
-                            // textures.
+                            // textures.  Trimming this session's cache
+                            // leaves every other session's entries and
+                            // byte budget untouched.
                             let lvl =
                                 shared::text_texture_cache::TrimLevel::from_android(level);
                             let (victims, stats) = {
-                                let mut tc = shared::text_texture_cache::global_cache();
+                                let mut tc = cm.text_cache().lock();
                                 let v = tc.trim(lvl);
                                 (v, tc.stats())
                             };
@@ -1931,12 +1944,14 @@ impl RenderThread {
                             {
                                 // A newly-registered / replaced typeface
                                 // can change how any cached text rendered:
-                                // bump the global font generation so all
-                                // existing text-texture-cache entries
+                                // bump THIS SESSION's font generation so
+                                // its existing text-texture-cache entries
                                 // (keyed on the prior generation) become
                                 // unreachable and age out via LRU.  New
                                 // fillTexts capture the bumped generation.
-                                let font_gen = shared::text_texture_cache::bump_font_generation();
+                                // Other sessions keep their own generation
+                                // and their own cached text.
+                                let font_gen = cm.text_cache().bump_font_generation();
                                 info!(
                                     "RenderThread: loaded font '{}' aliases={:?} internal_family={:?} ({} bytes), text_cache_generation={}",
                                     family,

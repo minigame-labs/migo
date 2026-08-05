@@ -11,23 +11,20 @@ use shared::protocol::host_cmd::HostCommand;
 
 use crate::panic_barrier::guard;
 use crate::{MigoSession, map_ingress_result, pin_session};
-use migo_capi_abi::{MIGO_ERROR_INVALID_ARGUMENT, MigoResult};
+use migo_capi_abi::MigoResult;
 
+pub use migo_capi_abi::input::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent};
+use migo_capi_abi::input::{ValidatedCompositionEvent, ValidatedKeyEvent, ValidatedKeyboardEvent};
+
+#[cfg(test)]
 use migo_capi_abi::input::{
     MIGO_COMPOSITION_EVENT_END, MIGO_COMPOSITION_EVENT_START, MIGO_COMPOSITION_EVENT_UPDATE,
-    MIGO_KEY_EVENT_DOWN, MIGO_KEY_EVENT_UP, MIGO_KEYBOARD_EVENT_COMPLETE,
+    MIGO_KEY_EVENT_DOWN, MIGO_KEY_EVENT_FLAG_REPEAT, MIGO_KEY_EVENT_UP, MIGO_KEY_MODIFIER_ALT,
+    MIGO_KEY_MODIFIER_CONTROL, MIGO_KEY_MODIFIER_SHIFT, MIGO_KEYBOARD_EVENT_COMPLETE,
     MIGO_KEYBOARD_EVENT_CONFIRM, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, MIGO_KEYBOARD_EVENT_INPUT,
-    ValidatedCompositionEvent, ValidatedKeyEvent, ValidatedKeyboardEvent,
 };
-pub use migo_capi_abi::input::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent};
-
 #[cfg(test)]
-use migo_capi_abi::MIGO_ERROR_INVALID_STATE;
-#[cfg(test)]
-use migo_capi_abi::input::{
-    MIGO_KEY_EVENT_FLAG_REPEAT, MIGO_KEY_MODIFIER_ALT, MIGO_KEY_MODIFIER_CONTROL,
-    MIGO_KEY_MODIFIER_SHIFT,
-};
+use migo_capi_abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE};
 
 /// Translate a validated event into the engine's command.
 ///
@@ -48,6 +45,7 @@ fn validated_keyboard_to_command(event: ValidatedKeyboardEvent) -> HostCommand {
 }
 
 /// Testable composition of pure boundary validation and command conversion.
+#[cfg(test)]
 unsafe fn to_host_command(event: &MigoKeyboardEvent) -> Result<HostCommand, MigoResult> {
     unsafe { event.validate() }.map(validated_keyboard_to_command)
 }
@@ -62,6 +60,7 @@ fn validated_composition_to_command(event: ValidatedCompositionEvent) -> HostCom
     }
 }
 
+#[cfg(test)]
 unsafe fn to_composition_command(event: &MigoCompositionEvent) -> Result<HostCommand, MigoResult> {
     unsafe { event.validate() }.map(validated_composition_to_command)
 }
@@ -94,8 +93,9 @@ pub unsafe extern "C" fn migo_session_send_composition_event(
         // A dropped END leaves content drawing a preedit that will never be
         // cleared, and no later event corrects it.
         map_ingress_result(
+            &session,
             "migo_session_send_composition_event",
-            ingress.try_send(command),
+            ingress.try_send_composition(command),
         )
     })
 }
@@ -136,6 +136,7 @@ fn validated_key_to_command(event: ValidatedKeyEvent) -> HostCommand {
     }
 }
 
+#[cfg(test)]
 unsafe fn to_key_command(event: &MigoKeyEvent) -> Result<HostCommand, MigoResult> {
     unsafe { event.validate() }.map(validated_key_to_command)
 }
@@ -167,7 +168,11 @@ pub unsafe extern "C" fn migo_session_send_key_event(
 
         // A dropped UP leaves content believing the key is still held, and no
         // later event corrects it.
-        map_ingress_result("migo_session_send_key_event", ingress.try_send(command))
+        map_ingress_result(
+            &session,
+            "migo_session_send_key_event",
+            ingress.try_send_key(command),
+        )
     })
 }
 
@@ -203,8 +208,9 @@ pub unsafe extern "C" fn migo_session_send_keyboard_event(
         // still open, and no later event corrects that -- the same reason the
         // touch path refuses to drop an END.
         map_ingress_result(
+            &session,
             "migo_session_send_keyboard_event",
-            ingress.try_send(command),
+            ingress.try_send_keyboard(command),
         )
     })
 }

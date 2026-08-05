@@ -79,7 +79,12 @@ class LinuxV8ComponentWriterTest(unittest.TestCase):
                 declared_source.replace("fn helper() {}", "fn helper() { todo!() }"),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "exactly reproduce"):
+            # An edit beside the declared change, inside a file the patch is allowed
+            # to touch. The message must name the file, because "something drifted"
+            # is not actionable.
+            with self.assertRaisesRegex(
+                RuntimeError, r"build\.rs is not HEAD plus the declared patches"
+            ):
                 writer.verify_source_changes(source, [("declared", patch)])
 
     def test_a_dirty_build_submodule_is_rejected_with_a_clear_message(self):
@@ -104,11 +109,12 @@ class LinuxV8ComponentWriterTest(unittest.TestCase):
             git_in(source, "config", "user.name", "Migo Test")
             git_in(source, "config", "user.email", "migo-test@example.invalid")
             (source / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
-            (source / ".gitignore").write_text("v8/\n", encoding="utf-8")
-            git_in(source, "add", ".gitignore", "build.rs")
+            git_in(source, "add", "build.rs")
             git_in(source, "commit", "--quiet", "-m", "baseline")
 
-            # v8 and build are nested submodule-like checkouts.
+            # Registered as real gitlinks, not merely nested checkouts. Without the
+            # index entries the parent reports a bare `?? build/` and the proof never
+            # descends, so this test would pass while exercising nothing.
             for nested in ("v8", "build"):
                 path = source / nested
                 path.mkdir()
@@ -118,14 +124,30 @@ class LinuxV8ComponentWriterTest(unittest.TestCase):
                 (path / "README").write_text("baseline\n", encoding="utf-8")
                 git_in(path, "add", "README")
                 git_in(path, "commit", "--quiet", "-m", "baseline")
+                revision = subprocess.run(
+                    ["git", "-C", str(path), "rev-parse", "HEAD"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                git_in(
+                    source, "update-index", "--add",
+                    "--cacheinfo", f"160000,{revision},{nested}",
+                )
+            git_in(source, "commit", "--quiet", "-m", "register submodules")
 
-            # Simulate an Android build-submodule patch left in the tree.
+            # An Android build-submodule patch left in a tree the Linux build shares.
             (source / "build" / "config").mkdir(parents=True)
             (source / "build" / "config" / "c++.gni").write_text(
                 "use_custom_libcxx = true\n", encoding="utf-8"
             )
 
-            with self.assertRaisesRegex(RuntimeError, r"`build` submodule"):
+            # The nested path is named, which is the whole point: git reports only a
+            # dirty pointer for `build`, and a Linux build declaring no patches has
+            # no way to act on that.
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"undeclared change .*build/config/c\+\+\.gni.*"
+                r"no declared patch touches",
+            ):
                 writer.verify_source_changes(source, [])
 
     def test_gn_arguments_are_sorted_and_duplicate_keys_are_rejected(self):

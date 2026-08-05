@@ -73,12 +73,12 @@ pub(super) fn init_skia_for_canvas(
         )
     })?;
     cm.contexts_2d.insert(canvas_id, ctx);
-    // Aggregate Skia cache stays pinned at the budget constant
-    // regardless of context count: rebalance every live context's
-    // per-instance cap now that the denominator just changed.
-    let live = cm.contexts_2d.len();
+    // Rebalance this Session's contexts now that the process-wide denominator
+    // changed. Other Sessions' contexts pick the new share up at their own next
+    // create or destroy: a Skia context may only be touched from the render thread
+    // that owns it.
     for ctx in cm.contexts_2d.values_mut() {
-        ctx.rebalance_resource_cache(live);
+        ctx.rebalance_resource_cache();
     }
     // A freshly-created onscreen (id=1) 2D context invalidates DrawingBuffer
     // bypass: Skia renders into the DrawingBuffer FBO, which the bypass path

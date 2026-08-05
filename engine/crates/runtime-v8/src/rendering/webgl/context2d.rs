@@ -630,7 +630,9 @@ pub fn op_force_readback_snapshot(state: &mut OpState, #[smi] snapshot_id: u32) 
 // ============================================================================
 //
 // Three ops bridge the JS-side pattern recognizer in `02_2d_context.js` to
-// `shared::text_texture_cache::global_cache()`:
+// this session's `SessionTextCache`, reached through
+// `CanvasOpState::text_cache` (bound to the host id at extension
+// bring-up, so no op ever touches another session's cache or its lock):
 //   * `op_text_cache_peek_pin` — lookup-and-pin at `fillText` time.
 //     Returns 1 on hit (caller MUST balance with `op_text_cache_unpin` once
 //     the matching `texImage2D` consumes the entry, OR if the pattern
@@ -662,6 +664,10 @@ fn build_text_cache_key(
     text_baseline_u8: u8,
     canvas_w: u32,
     canvas_h: u32,
+    // This session's current font generation, read from its own
+    // `SessionTextCache`.  Another session reloading a font leaves this
+    // value alone, so it cannot invalidate this session's cached text.
+    font_generation: u64,
 ) -> shared::text_texture_cache::TextCacheKey {
     let text_align = match text_align_u8 {
         0 => TextAlign::Start,
@@ -691,13 +697,14 @@ fn build_text_cache_key(
         text_baseline,
         canvas_w,
         canvas_h,
-        font_generation: shared::text_texture_cache::current_font_generation(),
+        font_generation,
     }
 }
 
-/// Look up the text texture cache; on hit, increment the pin count and
-/// return `1` so the caller can safely emit a `TexImage2DFromTextCache`
-/// later in the same frame.  On miss, returns `0` without side effects.
+/// Look up this session's text texture cache; on hit, increment the pin
+/// count and return `1` so the caller can safely emit a
+/// `TexImage2DFromTextCache` later in the same frame.  On miss, returns
+/// `0` without side effects.
 /// The pin acquired on hit MUST be balanced by either
 /// `op_tex_image_2d_from_text_cache` (which the render thread unpins
 /// after executing the copy) or `op_text_cache_unpin` if the JS-side
@@ -705,6 +712,7 @@ fn build_text_cache_key(
 #[op2(fast)]
 #[allow(clippy::too_many_arguments)]
 pub fn op_text_cache_peek_pin(
+    state: &mut OpState,
     #[string] text: String,
     #[string] font_request: String,
     font_size: f32,
@@ -716,6 +724,7 @@ pub fn op_text_cache_peek_pin(
     #[smi] canvas_w: u32,
     #[smi] canvas_h: u32,
 ) -> u8 {
+    let text_cache = state.borrow::<CanvasOpState>().text_cache.clone();
     let key = build_text_cache_key(
         text,
         font_request,
@@ -727,14 +736,12 @@ pub fn op_text_cache_peek_pin(
         text_baseline,
         canvas_w,
         canvas_h,
+        text_cache.font_generation(),
     );
-    let mut cache = shared::text_texture_cache::global_cache();
-    if cache.peek(&key).is_some() {
-        cache.pin(&key);
-        1
-    } else {
-        0
-    }
+    let mut cache = text_cache.lock();
+    // One lookup, not a peek followed by a pin: pinning only succeeds for a
+    // resident entry, so its result *is* the hit answer this op returns.
+    u8::from(cache.pin(&key))
 }
 
 /// Drop a pin previously acquired by `op_text_cache_peek_pin`.  Used on
@@ -744,6 +751,7 @@ pub fn op_text_cache_peek_pin(
 #[op2(fast)]
 #[allow(clippy::too_many_arguments)]
 pub fn op_text_cache_unpin(
+    state: &mut OpState,
     #[string] text: String,
     #[string] font_request: String,
     font_size: f32,
@@ -755,6 +763,7 @@ pub fn op_text_cache_unpin(
     #[smi] canvas_w: u32,
     #[smi] canvas_h: u32,
 ) {
+    let text_cache = state.borrow::<CanvasOpState>().text_cache.clone();
     let key = build_text_cache_key(
         text,
         font_request,
@@ -766,9 +775,9 @@ pub fn op_text_cache_unpin(
         text_baseline,
         canvas_w,
         canvas_h,
+        text_cache.font_generation(),
     );
-    let mut cache = shared::text_texture_cache::global_cache();
-    cache.unpin(&key);
+    text_cache.lock().unpin(&key);
 }
 
 /// Miss-path snapshot capture: identical to `op_capture_canvas2d_snapshot`
@@ -800,6 +809,7 @@ pub fn op_capture_canvas2d_snapshot_for_cache(
     if snapshot_id == 0 {
         return;
     }
+    let font_generation = state.borrow::<CanvasOpState>().text_cache.font_generation();
     let key = build_text_cache_key(
         text,
         font_request,
@@ -811,6 +821,7 @@ pub fn op_capture_canvas2d_snapshot_for_cache(
         text_baseline,
         canvas_w,
         canvas_h,
+        font_generation,
     );
     if let Some(collector) =
         state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
@@ -853,6 +864,7 @@ pub fn op_tex_image_2d_from_text_cache(
     #[smi] canvas_w: u32,
     #[smi] canvas_h: u32,
 ) {
+    let font_generation = state.borrow::<CanvasOpState>().text_cache.font_generation();
     let key = build_text_cache_key(
         text,
         font_request,
@@ -864,6 +876,7 @@ pub fn op_tex_image_2d_from_text_cache(
         text_baseline,
         canvas_w,
         canvas_h,
+        font_generation,
     );
     super::webgl::queue_gl_fire_and_forget(
         state,

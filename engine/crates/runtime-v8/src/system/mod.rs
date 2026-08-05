@@ -45,7 +45,6 @@ pub fn op_open_bluetooth_adapter(
 
 #[op2(fast)]
 pub fn op_close_bluetooth_adapter(state: &mut OpState) -> Result<(), JsErrorBox> {
-    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -93,7 +92,6 @@ pub fn op_start_bluetooth_devices_discovery(
 
 #[op2(fast)]
 pub fn op_stop_bluetooth_devices_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
-    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -200,7 +198,6 @@ pub fn op_close_ble_connection(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
-    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -381,7 +378,6 @@ pub fn op_start_beacon_discovery(
 
 #[op2(fast)]
 pub fn op_stop_beacon_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
-    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -582,6 +578,7 @@ pub fn op_get_user_info(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::UserInfo)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(auth) = services.auth() {

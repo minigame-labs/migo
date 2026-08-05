@@ -74,6 +74,7 @@ jobs:
         run: |
           command -v rg >/dev/null 2>&1 || sudo apt-get install -y ripgrep
           bash scripts/test-surface-attachment-contract.sh
+          bash scripts/test-x11-owned-connection-contract.sh
 
       - name: Platform/V8 dependency boundary contract
         run: bash scripts/test-platform-v8-boundary-contract.sh
@@ -144,6 +145,12 @@ jobs:
       - name: Prescreen scanner contract
         run: bash scripts/test-prescreen-scanner.sh
 
+      - name: Bounded input transport contract
+        run: bash scripts/test-input-transport-contract.sh
+
+      - name: Android owned Host shutdown contract
+        run: bash scripts/test-android-owned-host-shutdown-contract.sh
+
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
 
@@ -156,12 +163,13 @@ jobs:
         # the subtle failures were: a substring match that counted local-dynamic
         # relocations as local-exec, and an export audit that read nm instead of
         # objdump and so reported 190 exports for a library that exports 12.
+        #
+        # Discovered rather than listed. The list this replaced had drifted: it
+        # omitted test_collect_render_metrics.py, test_compare_render_results.py and
+        # test_v8_source_proof.py, so those never ran here -- and the last of them
+        # guards the provenance proof behind every V8 component manifest.
         run: |
-          python3 scripts/ci/tests/test_abi_floor_audit.py
-          python3 scripts/ci/tests/test_gen_linux_package_metadata.py
-          python3 scripts/ci/tests/test_gen_android_package_metadata.py
-          python3 scripts/ci/tests/test_write_linux_build_metadata.py
-          python3 scripts/ci/tests/test_write_linux_v8_component_manifest.py
+          python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'
 
       - name: Artifact manifest tooling and contract
         run: |

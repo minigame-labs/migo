@@ -15,21 +15,55 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "lib"))
+import v8_source_proof  # noqa: E402  (path is set immediately above)
 
-PATCH_FILES = {
-    "0001-unset-bindgen-extra-clang-args": "0001-unset-BINDGEN_EXTRA_CLANG_ARGS-in-v8_s-bindgen.patch",
-    "0002-use-sysroot-on-android": "0002-install-sysroot.patch",
-    "0003-custom-libcxx-for-snapshot-toolchain": "0003-compiler-use-custom-libcxx-for-v8.patch",
-}
+
+def declared_patches(
+    lock: dict, patch_root: pathlib.Path
+) -> tuple[list[dict], list[pathlib.Path]]:
+    """Resolve the lock's declared patch set into hashed identities and paths.
+
+    The lock carries both the id and the file name so that it is the single
+    declaration of what an Android V8 build applies. This writer used to hold its
+    own id-to-file mapping, which meant the lock listed three patches while
+    scripts/build-v8-android.sh applied four -- the prebuilt-binding diff was
+    absent from both this table and the lock, so the sealed manifest recorded a
+    patch set the build had not used.
+    """
+    required = lock.get("required_patches")
+    if not isinstance(required, list) or not required:
+        raise RuntimeError("V8 lock declares no required_patches")
+    identities = []
+    files = []
+    for entry in required:
+        if not isinstance(entry, dict) or "id" not in entry or "file" not in entry:
+            raise RuntimeError(
+                f"required_patches entry must carry an id and a file: {entry!r}"
+            )
+        path = patch_root / entry["file"]
+        if not path.is_file():
+            raise RuntimeError(f"declared patch is missing: {path}")
+        identities.append({"id": entry["id"], "sha256": hash_file(path)})
+        files.append(path)
+    return identities, files
 
 
 def byte_sorted(values: set[str] | list[str]) -> list[str]:
     return sorted(values, key=lambda value: value.encode("utf-8"))
 
 
-def run(command: list[str], label: str, *, allow_empty: bool = False) -> str:
+def run(
+    command: list[str],
+    label: str,
+    *,
+    allow_empty: bool = False,
+    cwd: pathlib.Path | None = None,
+) -> str:
     try:
-        result = subprocess.run(command, check=False, text=True, capture_output=True)
+        result = subprocess.run(
+            command, check=False, text=True, capture_output=True, cwd=cwd
+        )
     except OSError as error:
         raise RuntimeError(f"cannot run {label}: {error}") from error
     if result.returncode != 0:
@@ -46,13 +80,6 @@ def hash_file(path: pathlib.Path) -> str:
         for chunk in iter(lambda: source.read(64 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def git_revision(path: pathlib.Path, label: str) -> str:
-    value = run(["git", "-C", str(path), "rev-parse", "HEAD"], label)
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
-        raise RuntimeError(f"{label} is not a full revision: {value!r}")
-    return value
 
 
 def package_version(cargo_toml: pathlib.Path) -> str:
@@ -88,79 +115,6 @@ def find_prebuilt(ndk: pathlib.Path) -> pathlib.Path:
     return candidates[0]
 
 
-def git_status(path: pathlib.Path, label: str) -> list[tuple[str, str]]:
-    try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(path),
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-            ],
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-    except OSError as error:
-        raise RuntimeError(f"cannot run {label}: {error}") from error
-    if result.returncode != 0:
-        raise RuntimeError(f"{label} failed: {result.stderr.strip()}")
-
-    entries: list[tuple[str, str]] = []
-    for record in result.stdout.split("\0"):
-        if not record:
-            continue
-        if len(record) < 4 or record[2] != " ":
-            entries.append(("invalid", record))
-        else:
-            entries.append((record[:2], record[3:]))
-    return entries
-
-
-def check_allowed_changes(
-    path: pathlib.Path, label: str, allowed_paths: set[str]
-) -> None:
-    allowed_statuses = {" M", "M ", "MM"}
-    unexpected = [
-        f"{status} {changed_path}"
-        for status, changed_path in git_status(path, f"{label} status")
-        if changed_path not in allowed_paths or status not in allowed_statuses
-    ]
-    if unexpected:
-        raise RuntimeError(
-            f"{label} has unrelated tracked or untracked changes: {unexpected}"
-        )
-
-
-def check_source_changes(source: pathlib.Path) -> None:
-    build_source = source / "build"
-    nested_build = (build_source / ".git").exists()
-    top_allowed = {"build.rs"}
-    if nested_build:
-        top_allowed.add("build")
-    else:
-        top_allowed.update(
-            {
-                "build/rust/gni_impl/run_bindgen.py",
-                "build/config/c++/c++.gni",
-            }
-        )
-    check_allowed_changes(source, "rusty_v8 source", top_allowed)
-    check_allowed_changes(source / "v8", "V8 source", set())
-    if nested_build:
-        check_allowed_changes(
-            build_source,
-            "Chromium build source",
-            {
-                "rust/gni_impl/run_bindgen.py",
-                "config/c++/c++.gni",
-            },
-        )
-
-
 def normalized_gn_arguments(value: str, api: int) -> list[str]:
     arguments = []
     keys: set[str] = set()
@@ -180,6 +134,18 @@ def normalized_gn_arguments(value: str, api: int) -> list[str]:
     return arguments
 
 
+def without_ndk_path(value: str, ndk: pathlib.Path) -> str:
+    """Replace the NDK's absolute location with the variable that names it.
+
+    clang and lld print their InstalledDir, which is wherever this machine keeps
+    the NDK, so two machines building the identical archive produced different
+    manifests and therefore different component_ids. `normalized_gn_args` already
+    substitutes ${ANDROID_NDK_HOME} for exactly this reason; the toolchain banners
+    were simply missed.
+    """
+    return value.replace(str(ndk), "${ANDROID_NDK_HOME}")
+
+
 def write_draft(path: pathlib.Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -196,6 +162,11 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--tool", type=pathlib.Path)
     parser.add_argument("--lock", type=pathlib.Path)
+    # Paths whose provenance is established by something other than a patch -- the
+    # pinned gn and its build receipt. Declared by the caller, in the same spelling
+    # scripts/build-v8-android.sh passes to the shell-side proof, so one array in
+    # that script feeds both.
+    parser.add_argument("--accounted", action="append", default=[])
     arguments = parser.parse_args()
 
     try:
@@ -206,8 +177,8 @@ def main() -> int:
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
         if lock.get("schema") != "migo-v8-build-lock/v1":
             raise RuntimeError(f"unsupported V8 source lock: {lock_path}")
-        source_revision = git_revision(source, "rusty_v8 revision")
-        v8_revision = git_revision(source / "v8", "V8 revision")
+        source_revision = v8_source_proof.head_revision(source, "rusty_v8 revision")
+        v8_revision = v8_source_proof.head_revision(source / "v8", "V8 revision")
         version = package_version(source / "Cargo.toml")
         if source_revision != lock.get("rusty_v8_revision"):
             raise RuntimeError("rusty_v8 source revision does not match android-v8.lock.json")
@@ -215,20 +186,20 @@ def main() -> int:
             raise RuntimeError("V8 source revision does not match android-v8.lock.json")
         if version != lock.get("rusty_v8_version"):
             raise RuntimeError("rusty_v8 version does not match android-v8.lock.json")
-        check_source_changes(source)
-
         api = lock.get("android_api")
         target = lock.get("targets", {}).get(arguments.arch)
         if api != 26 or not isinstance(target, dict):
             raise RuntimeError("V8 lock does not contain the Android API 26 target")
-        required_patches = lock.get("required_patches")
-        if required_patches != list(PATCH_FILES):
-            raise RuntimeError("V8 lock patch set/order differs from the supported build recipe")
-        patch_root = repo / "engine/third_party/v8-patches"
-        patches = []
-        for patch_id in required_patches:
-            patch_path = patch_root / PATCH_FILES[patch_id]
-            patches.append({"id": patch_id, "sha256": hash_file(patch_path)})
+        patches, patch_files = declared_patches(
+            lock, repo / "engine/third_party/v8-patches"
+        )
+        # Proves the sources really are HEAD plus exactly the patches this manifest
+        # is about to claim. The previous check compared modified paths against a
+        # hardcoded allowlist, which restated what the patches touch and could not
+        # see an edit inside an allowed file.
+        v8_source_proof.assert_tree_is_exactly_patched(
+            source, patch_files, frozenset(arguments.accounted)
+        )
 
         properties = ndk / "source.properties"
         properties_text = properties.read_text(encoding="utf-8")
@@ -254,13 +225,25 @@ def main() -> int:
                 "runtime_floor": {"android_api": str(api)},
             },
             "toolchain": {
-                "rustc": run(["rustc", "--version", "--verbose"], "rustc"),
-                "compiler": run([str(clang), "--version"], "Android clang"),
+                # Resolved inside the rusty_v8 tree, so rustup reports the
+                # toolchain that tree pins rather than whichever one happens to be
+                # the operator's default. Recording the ambient rustc made the
+                # manifest non-deterministic: the same archive was described as
+                # built with 1.95.0 and later with 1.93.0, while rusty_v8 pins
+                # 1.89.0 and neither ambient version compiled anything in it.
+                "rustc": run(
+                    ["rustc", "--version", "--verbose"], "rustc", cwd=source
+                ),
+                "compiler": without_ndk_path(
+                    run([str(clang), "--version"], "Android clang"), ndk
+                ),
                 "sdk": (
                     f"Android NDK {match.group(1)}; API {api} sysroot; "
                     f"source.properties sha256={hash_file(properties)}"
                 ),
-                "linker": run([str(linker), "--version"], "Android linker"),
+                "linker": without_ndk_path(
+                    run([str(linker), "--version"], "Android linker"), ndk
+                ),
             },
             "runtime": {
                 "backend": "v8",

@@ -1,0 +1,74 @@
+# shellcheck shell=bash
+# Resolving the pinned Android NDK, wherever the SDK happens to live.
+# Location: scripts/lib/android-ndk.sh
+#
+# Seven scripts independently defaulted ANDROID_NDK_HOME to `$HOME/Android/Ndk`, a
+# path that exists on none of the machines this has been built on: every successful
+# build depended on the variable already being set in the environment. Nothing
+# asserted which NDK it pointed at either, so the V8 archive and the AAR could be
+# produced by different NDKs with nothing noticing -- and the NDK is recorded in the
+# component manifest as part of the artifact's identity.
+#
+# So the version is pinned in the build lock and the path is *found*, in the
+# standard SDK layouts, rather than guessed. An explicit ANDROID_NDK_HOME still
+# wins, because a caller may have the pinned NDK somewhere unusual -- but it is
+# checked against the pin like any other candidate, so an override cannot silently
+# substitute a different toolchain.
+
+_android_ndk_err() { printf '  ✗ %s\n' "$*" >&2; }
+
+# The NDK's own record of what it is. `Pkg.Revision` is the identity the component
+# manifest already stores, so this is the same fact the artifact is stamped with
+# rather than a directory name that happens to look like a version.
+android_ndk_revision() {
+    local ndk="$1" properties="$1/source.properties"
+    [[ -f "$properties" ]] || return 1
+    sed -n 's/^Pkg\.Revision[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' \
+        "$properties" | head -1
+}
+
+# Reads the pinned version out of a build lock into ANDROID_NDK_PIN.
+android_ndk_read_pin() {
+    local lock="$1"
+    [[ -f "$lock" ]] || { _android_ndk_err "missing build lock: $lock"; return 1; }
+    ANDROID_NDK_PIN="$(python3 - "$lock" <<'PY'
+import json, sys
+
+lock = json.load(open(sys.argv[1]))
+try:
+    print(lock["ndk"]["version"])
+except KeyError as missing:
+    sys.exit(f"build lock has no ndk {missing}")
+PY
+)" || { _android_ndk_err "cannot read the ndk pin from $lock"; return 1; }
+}
+
+# Sets ANDROID_NDK_HOME to an NDK whose own Pkg.Revision equals the pin.
+# android_ndk_read_pin must have run.
+android_ndk_resolve() {
+    local -a candidates=()
+    [[ -n "${ANDROID_NDK_HOME:-}" ]] && candidates+=("$ANDROID_NDK_HOME")
+    [[ -n "${ANDROID_NDK_ROOT:-}" ]] && candidates+=("$ANDROID_NDK_ROOT")
+    local root
+    for root in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Android/Sdk" \
+                "$HOME/Library/Android/sdk"; do
+        [[ -n "$root" ]] && candidates+=("$root/ndk/$ANDROID_NDK_PIN")
+    done
+
+    local candidate revision
+    for candidate in "${candidates[@]}"; do
+        [[ -d "$candidate" ]] || continue
+        revision="$(android_ndk_revision "$candidate")" || continue
+        if [[ "$revision" == "$ANDROID_NDK_PIN" ]]; then
+            ANDROID_NDK_HOME="$candidate"
+            export ANDROID_NDK_HOME
+            return 0
+        fi
+        _android_ndk_err "$candidate is NDK $revision, the lock pins $ANDROID_NDK_PIN"
+    done
+    _android_ndk_err "no Android NDK $ANDROID_NDK_PIN found"
+    _android_ndk_err "looked at: ${candidates[*]:-(nothing)}"
+    _android_ndk_err "install it with: sdkmanager 'ndk;$ANDROID_NDK_PIN'"
+    _android_ndk_err "or set ANDROID_NDK_HOME to that NDK"
+    return 1
+}

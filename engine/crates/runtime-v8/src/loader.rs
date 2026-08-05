@@ -15,6 +15,36 @@ use crate::code_cache::SharedCodeCache;
 /// resolve/load for sandbox enforcement.
 pub(crate) type SharedMountTableRef = Rc<RefCell<Option<Arc<MountTable>>>>;
 
+pub(crate) fn validate_content_module_url(
+    url: &ModuleSpecifier,
+    mount_table: Option<&MountTable>,
+    loader_name: &str,
+) -> Result<(), ModuleLoaderError> {
+    let Some(mount_table) = mount_table else {
+        return Err(ModuleLoaderError::generic(format!(
+            "{loader_name} module load blocked: no /code mount table (sandbox unavailable)"
+        )));
+    };
+    if url.scheme() != "file" {
+        return Err(ModuleLoaderError::generic(format!(
+            "{loader_name} module import blocked: game content may load only file URLs"
+        )));
+    }
+    let path = url.to_file_path().map_err(|_| {
+        ModuleLoaderError::generic(format!(
+            "{loader_name} module import blocked: invalid file URL"
+        ))
+    })?;
+    if mount_table.is_allowed_path(&path) {
+        return Ok(());
+    }
+
+    Err(ModuleLoaderError::generic(format!(
+        "{loader_name} module import blocked: path escapes /code sandbox: {}",
+        path.display()
+    )))
+}
+
 pub(crate) struct MyModuleLoader {
     inner: FsModuleLoader,
     code_cache: Option<SharedCodeCache>,
@@ -95,25 +125,7 @@ impl MyModuleLoader {
     /// the mount boundaries.
     fn validate_sandbox(&self, url: &ModuleSpecifier) -> Result<(), ModuleLoaderError> {
         let mt_ref = self.mount_table.borrow();
-        let Some(mt) = mt_ref.as_ref() else {
-            // Mount table not yet set (before evaluate_module) — allow.
-            // In practice, no game modules are loaded before evaluate_module.
-            return Ok(());
-        };
-
-        let Ok(path) = url.to_file_path() else {
-            // Not a file:// URL (e.g., built-in modules) — allow.
-            return Ok(());
-        };
-
-        if mt.is_allowed_path(&path) {
-            return Ok(());
-        }
-
-        Err(ModuleLoaderError::generic(format!(
-            "Module import blocked: path escapes /code sandbox: {}",
-            path.display()
-        )))
+        validate_content_module_url(url, mt_ref.as_deref(), "Main-thread content")
     }
 }
 
@@ -343,5 +355,47 @@ impl ModuleLoader for MyModuleLoader {
     fn purge_and_prevent_code_cache(&self, _module_specifier: &str) {
         // No per-specifier tracking; stale entries are evicted by hash mismatch
         // or LRU eviction.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loader(mount_table: Option<Arc<MountTable>>) -> MyModuleLoader {
+        MyModuleLoader::new(None, Rc::new(RefCell::new(mount_table)))
+    }
+
+    #[test]
+    fn content_loader_rejects_internal_schemes_for_all_import_kinds() {
+        let root = std::env::temp_dir().join("migo-main-loader-sandbox");
+        let loader = loader(Some(Arc::new(MountTable::new(root))));
+        let referrer = "file:///tmp/migo-main-loader-sandbox/main.js";
+
+        for kind in [ResolutionKind::Import, ResolutionKind::DynamicImport] {
+            let error = loader
+                .resolve("ext:core/mod.js", referrer, kind)
+                .expect_err("game content must not resolve runtime extension modules");
+            assert!(
+                error.to_string().contains("file"),
+                "unexpected rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_loader_fails_closed_without_a_mount_table() {
+        let loader = loader(None);
+        let error = loader
+            .resolve(
+                "./dependency.js",
+                "file:///tmp/migo-main-loader-sandbox/main.js",
+                ResolutionKind::Import,
+            )
+            .expect_err("game content must not load before its sandbox exists");
+        assert!(
+            error.to_string().contains("mount table"),
+            "unexpected rejection: {error}"
+        );
     }
 }

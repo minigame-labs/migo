@@ -64,10 +64,10 @@ public final class InputExports {
     }
 
     public static void destroyKeyboardManager(int sessionId) {
-        KeyboardManager mgr = sKeyboardManagers.remove(sessionId);
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sKeyboardManagers,
+                id -> id == sessionId,
+                KeyboardManager::destroy);
     }
 
     // ==================== Scan Code ====================
@@ -99,16 +99,17 @@ public final class InputExports {
     }
 
     public static void destroyScanCodeManager(int sessionId) {
-        ScanCodeManager mgr = sScanCodeManagers.remove(sessionId);
-        if (mgr != null) {
-            mgr.destroy();
-        }
+        ResourceCleanup.destroyMatching(
+                sScanCodeManagers,
+                id -> id == sessionId,
+                ScanCodeManager::destroy);
     }
 
     // ==================== Bulk Destroy ====================
 
     public static void destroyAll(int sessionId) {
-        destroyKeyboardManager(sessionId);
-        destroyScanCodeManager(sessionId);
+        ResourceCleanup.runAll(
+                () -> destroyKeyboardManager(sessionId),
+                () -> destroyScanCodeManager(sessionId));
     }
 }

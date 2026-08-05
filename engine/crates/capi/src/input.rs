@@ -12,7 +12,7 @@ use shared::protocol::host_cmd::{HostCommand, TouchData, TouchPoint, TouchType};
 
 use crate::panic_barrier::guard;
 use crate::{MigoSession, map_ingress_result, pin_session};
-use migo_capi_abi::{MIGO_ERROR_INVALID_ARGUMENT, MigoResult};
+use migo_capi_abi::MigoResult;
 
 use migo_capi_abi::input::{
     MIGO_POINTER_EVENT_DOWN, MIGO_POINTER_EVENT_MOVE, MIGO_POINTER_EVENT_UP, MIGO_TOUCH_CANCEL,
@@ -21,9 +21,9 @@ use migo_capi_abi::input::{
 pub use migo_capi_abi::input::{MigoPointerEvent, MigoTouchEvent, MigoTouchPoint, MigoWheelEvent};
 
 #[cfg(test)]
-use migo_capi_abi::MIGO_ERROR_INVALID_STATE;
-#[cfg(test)]
 use migo_capi_abi::input::MIGO_TOUCH_FLAG_CHANGED;
+#[cfg(test)]
+use migo_capi_abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE};
 
 // The C header asserts the same 20 bytes. Both assertions exist because a
 // silent mismatch would corrupt every touch rather than fail loudly.
@@ -81,6 +81,7 @@ fn validated_to_touch_data(event: ValidatedTouchEvent) -> TouchData {
 /// # Safety
 /// `event.points` must hold at least `event.point_count` entries.
 #[inline]
+#[cfg(test)]
 unsafe fn to_touch_data(event: &MigoTouchEvent) -> Result<TouchData, MigoResult> {
     unsafe { event.validate() }.map(validated_to_touch_data)
 }
@@ -113,6 +114,7 @@ pub unsafe extern "C" fn migo_session_send_touch(
             Err(error) => return error,
         };
         map_ingress_result(
+            &session,
             "migo_session_send_touch",
             ingress.try_send_touch(touch_data),
         )
@@ -149,7 +151,11 @@ pub unsafe extern "C" fn migo_session_send_pointer_event(
             Ok(ingress) => ingress,
             Err(error) => return error,
         };
-        map_ingress_result("migo_session_send_pointer_event", ingress.try_send(command))
+        map_ingress_result(
+            &session,
+            "migo_session_send_pointer_event",
+            ingress.try_send_pointer(command),
+        )
     })
 }
 
@@ -218,7 +224,11 @@ pub unsafe extern "C" fn migo_session_send_wheel_event(
             Ok(ingress) => ingress,
             Err(error) => return error,
         };
-        map_ingress_result("migo_session_send_wheel_event", ingress.try_send(command))
+        map_ingress_result(
+            &session,
+            "migo_session_send_wheel_event",
+            ingress.try_send(command),
+        )
     })
 }
 

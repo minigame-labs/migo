@@ -8,6 +8,12 @@
 //! - `/code` → Game code - read only
 //! - `/tmp` → Temporary files - read/write
 //!
+//! Each root is a directory of its own. In particular `/cache` is
+//! [`GamePaths::sandbox_cache_dir`], not the per-game cache root: the root also
+//! holds the subpackage install store and staging directories, and a mapping
+//! that contained it would let a game rewrite the record deciding which package
+//! bytes a later session mounts as `/code`.
+//!
 //! # Security model
 //!
 //! Every call to [`VirtualFS::resolve`] performs a **three-phase** check:
@@ -215,7 +221,7 @@ impl VirtualFS {
         Self::with_policy(
             paths.code_dir().to_path_buf(),
             paths.user_data_dir().to_path_buf(),
-            paths.cache_dir().to_path_buf(),
+            paths.sandbox_cache_dir().to_path_buf(),
             paths.temp_dir().to_path_buf(),
             VfsPolicy::default(),
         )
@@ -226,7 +232,7 @@ impl VirtualFS {
         Self::with_policy(
             paths.code_dir().to_path_buf(),
             paths.user_data_dir().to_path_buf(),
-            paths.cache_dir().to_path_buf(),
+            paths.sandbox_cache_dir().to_path_buf(),
             paths.temp_dir().to_path_buf(),
             policy,
         )
@@ -765,6 +771,29 @@ mod tests {
             PathBuf::from("/data/games/test/cache"),
             PathBuf::from("/data/games/test/tmp"),
         )
+    }
+
+    /// The per-game cache root holds runtime state, not game data: the install
+    /// record and `.mpkg` files a later session mounts as `/code`, and the
+    /// staging directories an in-flight install renames from. A mapping that
+    /// contains the root hands the game write access to all of it.
+    #[test]
+    fn no_vfs_mapping_contains_the_runtime_cache_root() {
+        let base = std::env::temp_dir().join("migo_vfs_runtime_state_containment");
+        let paths = GamePaths::new(base.join("files"), base.join("cache"), "game-a").unwrap();
+        let vfs = VirtualFS::from_game_paths(&paths);
+
+        let runtime_root = paths.cache_dir();
+        for mapping in vfs.mappings.values() {
+            assert!(
+                !runtime_root.starts_with(&mapping.real_path),
+                "the cache root {} is writable through {}, which exposes the install \
+                 record at {}",
+                runtime_root.display(),
+                mapping.virtual_prefix,
+                crate::vfs::mount::package_store_dir(runtime_root).display(),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

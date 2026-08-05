@@ -64,6 +64,11 @@ public interface SubpackageHandler {
          * location and provides the path here.  The runtime ingests it into
          * a .mpkg package, validates, and mounts it atomically.
          * The host does NOT need to extract the zip.
+         * <p>
+         * The path is not passed on to the game. The runtime keeps it and the
+         * game's JS names only the download it belongs to, because a path the
+         * game could choose would let it have any zip the app process can read
+         * ingested and then read back through its own {@code /code}.
          *
          * @param zipPath absolute path to the downloaded zip file
          */

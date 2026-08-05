@@ -80,7 +80,7 @@ public final class NativeBridge {
      *
      * @param sessionId The session ID returned by init()
      */
-    public static native void shutdown(int sessionId);
+    public static native boolean shutdown(int sessionId);
 
     // ==================== Surface Management ====================
 
@@ -152,7 +152,8 @@ public final class NativeBridge {
      * @param count     Number of touch points
      * @param buffer    DirectByteBuffer containing packed TouchPoint data
      */
-    public static native void onTouchEvent(int sessionId, int action, long time, int count, ByteBuffer buffer);
+    public static native boolean onTouchEvent(int sessionId, int action, long time, int count,
+                                              ByteBuffer buffer);
 
     // ==================== Game Loading ====================
 
@@ -550,7 +551,7 @@ public final class NativeBridge {
      * @param scope     wx scope name
      * @param granted   whether the game may use it
      */
-    public static native void updatePermission(int sessionId, String scope, boolean granted);
+    public static native boolean updatePermission(int sessionId, String scope, boolean granted);
 
     /**
      * Callback when checkSession operation completes.

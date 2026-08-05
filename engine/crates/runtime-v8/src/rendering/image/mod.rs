@@ -21,6 +21,61 @@ mod inline_src;
 
 const OP_LOAD_IMAGE: &str = "canvas load image";
 
+/// This isolate's handle on its Session's image alias table.
+///
+/// Resolved **once**, by the extension state initializer below, and never again:
+/// finding it means reading a registry shared with every other Session, so doing
+/// that per op would put a cross-session lock on the `texImage2D` frame path —
+/// the trap Section 7.3 names, and the reason the text texture cache is wired
+/// the same way.  WebGL's upload ops read this handle too, which is why it lives
+/// in op state rather than being a private detail of the ops below.
+///
+/// Carries the Session id beside the handle so the decoded-bytes cache below can
+/// be told who is asking without a second op-state lookup on the frame path.
+pub(crate) struct ImageCacheState {
+    pub(crate) aliases: cache::SharedImageCache,
+    pub(crate) session: i32,
+}
+
+/// A pin held on the decoded-bytes cache for a load that has not settled yet.
+///
+/// Releases on drop, and that is the whole point rather than a convenience. Two
+/// `.await` points sit between taking this pin and the load settling — the
+/// decode and the GPU upload — and a Session torn down or restarted while one is
+/// in flight has its op future *dropped*, not resumed. Unpinning on each
+/// explicit exit path cannot cover that, and the pin left behind is permanent:
+/// it makes the entry immune to eviction, to trim and to `clear`, and the
+/// decoded-bytes cache is deliberately not cleared on teardown, so nothing later
+/// reclaims it.
+struct PrePin(migo_io::image_cache::ImageCacheKey);
+
+impl PrePin {
+    /// Pin `key` before the decode inserts bytes under it.
+    ///
+    /// Without this a cold WebGL image can be rejected by the W-TinyLFU
+    /// admission filter before the load has a chance to pin it as a live alias;
+    /// `texImage2D(image)` then misses one frame later even though the `Image`
+    /// object is alive. Taken unconditionally, because the WebGL flag is
+    /// monotonic and sampled again by the decode worker, so a request queued
+    /// before WebGL creation but started afterwards must not have its
+    /// newly-required RGBA backing rejected.
+    fn take(key: migo_io::image_cache::ImageCacheKey) -> Self {
+        migo_io::global_cache().pin(&key);
+        Self(key)
+    }
+
+    #[inline]
+    fn key(&self) -> &migo_io::image_cache::ImageCacheKey {
+        &self.0
+    }
+}
+
+impl Drop for PrePin {
+    fn drop(&mut self) {
+        migo_io::global_cache().unpin(&self.0);
+    }
+}
+
 #[inline]
 fn js_err_from_engine(e: EngineError) -> JsErrorBox {
     match &e.detail {
@@ -201,7 +256,14 @@ fn resolve_local_src(
                     }
                     return Ok(ResolvedSrc {
                         path: effective_src.to_string(),
-                        source_version: resolved.source_mounted_at,
+                        // The same field the io cache keys this path on. It used to
+                        // be `source_mounted_at`, which matched only because the io
+                        // side used it too -- and both collided across Sessions.
+                        // They have to move together: the pre-pin taken here has to
+                        // land on the key the decode inserts under, or the admission
+                        // filter can reject the real entry and `texImage2D(image)`
+                        // reads no bytes.
+                        source_version: resolved.source_identity,
                         source: migo_io::image_ops::ImageSource::MountCode {
                             virtual_path: effective_src.to_string(),
                             relative_path: relative.to_string(),
@@ -308,9 +370,14 @@ async fn op_load_image_inner(
         )
     };
 
-    let canvas_ctx: CanvasOpState = {
+    let (canvas_ctx, image_cache, session) = {
         let op = state.borrow();
-        op.borrow::<CanvasOpState>().clone()
+        let images = op.borrow::<ImageCacheState>();
+        (
+            op.borrow::<CanvasOpState>().clone(),
+            images.aliases.clone(),
+            images.session,
+        )
     };
 
     // `data:` and `http(s)://` scheme short-circuits.  Both feed raw
@@ -324,6 +391,8 @@ async fn op_load_image_inner(
             gpu_caps,
             cpu_backing_required,
             canvas_ctx,
+            image_cache,
+            session,
             image_id,
             src,
             target_width,
@@ -338,6 +407,8 @@ async fn op_load_image_inner(
             gpu_caps,
             cpu_backing_required,
             canvas_ctx,
+            image_cache,
+            session,
             image_id,
             src,
             target_width,
@@ -355,7 +426,7 @@ async fn op_load_image_inner(
 
     // remove previous alias and possibly destroy old shared
     if let Some(to_destroy) = {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.remove_previous_alias(image_id)
     } {
         dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
@@ -365,7 +436,7 @@ async fn op_load_image_inner(
     let cache_key = cache::make_cache_key(&src, target_width, target_height, mount_generation);
 
     match {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.begin_load(image_id, &cache_key)
     } {
         cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => {
@@ -385,7 +456,7 @@ async fn op_load_image_inner(
                 Ok(Ok((actual_cache_key, shared_id, dims))) => {
                     // IMPORTANT: bind alias for this caller image_id so destroy works even if JS does not replace IDs
                     {
-                        let mut c = cache::IMAGE_CACHE.lock();
+                        let mut c = image_cache.lock();
                         c.bind_alias_existing(image_id, &cache_key, &actual_cache_key, shared_id);
                     }
                     info!(
@@ -418,23 +489,11 @@ async fn op_load_image_inner(
             // Register the alias now so that a concurrent op_destroy_image
             // resolves to the correct shared_id during the upload window.
             {
-                let mut c = cache::IMAGE_CACHE.lock();
+                let mut c = image_cache.lock();
                 c.register_inflight_alias(image_id, shared_id);
             }
-            // H-6: pre-pin the migo_io::global_cache slot before decode inserts
-            // RGBA bytes.  Without this, a cold WebGL image can be rejected by
-            // the W-TinyLFU admission filter before `finish_load()` has a
-            // chance to pin it as a live alias; texImage2D(image) then misses
-            // one frame later even though the Image object is alive.
-            // The WebGL flag is monotonic and is sampled again by the actual
-            // decode worker. Pre-pin unconditionally so a request that queued
-            // before WebGL creation but starts afterwards cannot have its
-            // newly-required RGBA backing rejected by W-TinyLFU admission.
-            let pre_pinned_io_key = {
-                let key = cache::to_io_cache_key(&cache_key);
-                migo_io::global_cache().pin(&key);
-                Some(key)
-            };
+            // Held until this arm returns, however it returns: see `PrePin`.
+            let pre_pin = PrePin::take(cache::to_io_cache_key(&cache_key));
             info!(
                 "op_load_image start loader: image_id={}, shared_id={}, src={}, cpu_backing_required={}",
                 image_id,
@@ -466,13 +525,11 @@ async fn op_load_image_inner(
                         "op_load_image io decode failed: image_id={}, src={}, err={}",
                         image_id, src, msg
                     );
-                    let mut c = cache::IMAGE_CACHE.lock();
+                    let mut c = image_cache.lock();
                     let _ = c.finish_load(image_id, shared_id, &cache_key, &cache_key, Err(msg));
-                    // Pre-pin must not survive decode failure: there
-                    // is no live alias and no upload to release it.
-                    if let Some(key) = pre_pinned_io_key.as_ref() {
-                        migo_io::global_cache().unpin(key);
-                    }
+                    // The pre-pin must not survive decode failure — there is no
+                    // live alias and no upload to release it — and it does not:
+                    // returning drops it.
                     return Err(e);
                 }
             };
@@ -495,8 +552,11 @@ async fn op_load_image_inner(
             // happens in `finish_load` below.
             if target_width.is_some() && target_height.is_some() {
                 if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
-                    migo_io::global_cache()
-                        .insert(cache::to_io_cache_key(&actual_cache_key), rgba.clone());
+                    migo_io::global_cache().insert(
+                        cache::to_io_cache_key(&actual_cache_key),
+                        rgba.clone(),
+                        session,
+                    );
                 }
             }
 
@@ -509,8 +569,11 @@ async fn op_load_image_inner(
             // LRU slot keyed on the full-res key.
             if target_width.is_none() && target_height.is_none() {
                 if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
-                    migo_io::global_cache()
-                        .insert(cache::to_io_cache_key(&actual_cache_key), rgba.clone());
+                    migo_io::global_cache().insert(
+                        cache::to_io_cache_key(&actual_cache_key),
+                        rgba.clone(),
+                        session,
+                    );
                 }
             }
 
@@ -526,7 +589,7 @@ async fn op_load_image_inner(
             .await;
 
             let maybe_destroy = {
-                let mut c = cache::IMAGE_CACHE.lock();
+                let mut c = image_cache.lock();
                 let destroy = match &res {
                     Ok((w, h)) => c.finish_load(
                         image_id,
@@ -543,16 +606,13 @@ async fn op_load_image_inner(
                         Err(engine_err_to_text(e)),
                     ),
                 };
-                // Balance the pre-pin taken before decode.  On success,
-                // `finish_load` has already taken the real alias pin (possibly
-                // on `actual_cache_key` if the mounted source remapped it).  On
-                // failure, there is no live alias and the pre-pin must not
-                // survive.
-                if let Some(key) = pre_pinned_io_key.as_ref() {
-                    migo_io::global_cache().unpin(key);
-                }
                 destroy
             };
+            // The pre-pin goes back once this arm is done with it. `finish_load`
+            // has by then taken the real alias pin, on `actual_cache_key` if the
+            // mounted source remapped it, so the bytes never sit unpinned in
+            // between.
+            drop(pre_pin);
 
             if let Some(to_destroy) = maybe_destroy {
                 dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
@@ -587,6 +647,8 @@ async fn op_load_image_inner(
 /// shared bounded image worker path before this upload stage.
 async fn upload_inline_image(
     canvas_ctx: CanvasOpState,
+    image_cache: cache::SharedImageCache,
+    session: i32,
     image_id: u32,
     shared_id: u32,
     cache_key: cache::ImageCacheKey,
@@ -610,16 +672,15 @@ async fn upload_inline_image(
     // → black texture.  We now insert exactly like local-file
     // loads so the pin bookkeeping below covers all three load
     // paths uniformly.
-    let pre_pinned_io_key = if matches!(decoded, DecodedImage::Rgba(_)) {
-        let key = cache::to_io_cache_key(&cache_key);
+    let pre_pin = if matches!(decoded, DecodedImage::Rgba(_)) {
         // Same live-resource invariant as the local-file path: pin before
         // inserting so the admission filter cannot reject bytes for an Image
         // that is already being loaded for WebGL use.
-        migo_io::global_cache().pin(&key);
+        let pre_pin = PrePin::take(cache::to_io_cache_key(&cache_key));
         if let DecodedImage::Rgba(ref rgba) = decoded {
-            migo_io::global_cache().insert(key.clone(), rgba.clone());
+            migo_io::global_cache().insert(pre_pin.key().clone(), rgba.clone(), session);
         }
-        Some(key)
+        Some(pre_pin)
     } else {
         None
     };
@@ -635,7 +696,7 @@ async fn upload_inline_image(
     .await;
 
     let maybe_destroy = {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         let destroy = match &res {
             Ok((actual_w, actual_h)) => c.finish_load(
                 image_id,
@@ -652,11 +713,9 @@ async fn upload_inline_image(
                 Err(engine_err_to_text(e)),
             ),
         };
-        if let Some(key) = pre_pinned_io_key.as_ref() {
-            migo_io::global_cache().unpin(key);
-        }
         destroy
     };
+    drop(pre_pin);
 
     if let Some(to_destroy) = maybe_destroy {
         dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
@@ -689,6 +748,8 @@ async fn load_image_from_inline_bytes(
     gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     cpu_backing_required: std::sync::Arc<std::sync::atomic::AtomicBool>,
     canvas_ctx: CanvasOpState,
+    image_cache: cache::SharedImageCache,
+    session: i32,
     image_id: u32,
     src: String,
     target_width: Option<u32>,
@@ -710,20 +771,20 @@ async fn load_image_from_inline_bytes(
 
     // Replace any prior alias (mirrors the local-file flow).
     if let Some(to_destroy) = {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.remove_previous_alias(image_id)
     } {
         dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     match {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.begin_load(image_id, &cache_key)
     } {
         cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => Ok((shared_id, dims)),
         cache::BeginLoadResult::Join(rx) => match rx.await {
             Ok(Ok((actual_key, shared_id, dims))) => {
-                let mut c = cache::IMAGE_CACHE.lock();
+                let mut c = image_cache.lock();
                 c.bind_alias_existing(image_id, &cache_key, &actual_key, shared_id);
                 Ok((shared_id, dims))
             }
@@ -735,7 +796,7 @@ async fn load_image_from_inline_bytes(
         cache::BeginLoadResult::StartLoading => {
             let shared_id = cache::alloc_shared_id();
             {
-                let mut c = cache::IMAGE_CACHE.lock();
+                let mut c = image_cache.lock();
                 c.register_inflight_alias(image_id, shared_id);
             }
 
@@ -774,11 +835,20 @@ async fn load_image_from_inline_bytes(
             match result {
                 Ok((decoded, payload_len)) => {
                     let label = format!("data:[{}b]", payload_len);
-                    upload_inline_image(canvas_ctx, image_id, shared_id, cache_key, decoded, &label)
-                        .await
+                    upload_inline_image(
+                        canvas_ctx,
+                        image_cache,
+                        session,
+                        image_id,
+                        shared_id,
+                        cache_key,
+                        decoded,
+                        &label,
+                    )
+                    .await
                 }
                 Err(e) => {
-                    let mut c = cache::IMAGE_CACHE.lock();
+                    let mut c = image_cache.lock();
                     let _ = c.finish_load(
                         image_id,
                         shared_id,
@@ -799,6 +869,8 @@ async fn load_image_from_http(
     gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     cpu_backing_required: std::sync::Arc<std::sync::atomic::AtomicBool>,
     canvas_ctx: CanvasOpState,
+    image_cache: cache::SharedImageCache,
+    session: i32,
     image_id: u32,
     src: String,
     target_width: Option<u32>,
@@ -813,21 +885,21 @@ async fn load_image_from_http(
     let cache_key = cache::make_cache_key(&src, target_width, target_height, 0);
 
     if let Some(to_destroy) = {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.remove_previous_alias(image_id)
     } {
         dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     match {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.begin_load(image_id, &cache_key)
     } {
         cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => return Ok((shared_id, dims)),
         cache::BeginLoadResult::Join(rx) => {
             return match rx.await {
                 Ok(Ok((actual_key, shared_id, dims))) => {
-                    let mut c = cache::IMAGE_CACHE.lock();
+                    let mut c = image_cache.lock();
                     c.bind_alias_existing(image_id, &cache_key, &actual_key, shared_id);
                     Ok((shared_id, dims))
                 }
@@ -840,7 +912,7 @@ async fn load_image_from_http(
 
     let shared_id = cache::alloc_shared_id();
     {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.register_inflight_alias(image_id, shared_id);
     }
 
@@ -868,12 +940,22 @@ async fn load_image_from_http(
 
     match result {
         Ok(decoded) => {
-            upload_inline_image(canvas_ctx, image_id, shared_id, cache_key, decoded, &src).await
+            upload_inline_image(
+                canvas_ctx,
+                image_cache,
+                session,
+                image_id,
+                shared_id,
+                cache_key,
+                decoded,
+                &src,
+            )
+            .await
         }
         Err(e) => {
             let msg = engine_err_to_text(&e);
             // Finish the load with error so any pending joiners unblock.
-            let mut c = cache::IMAGE_CACHE.lock();
+            let mut c = image_cache.lock();
             let _ = c.finish_load(image_id, shared_id, &cache_key, &cache_key, Err(msg));
             Err(e)
         }
@@ -960,7 +1042,7 @@ async fn op_load_image_subrect_inner(
     }
 
     // Pull decoder / VFS / mount table handles in one borrow.
-    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps, canvas_ctx) = {
+    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps, canvas_ctx, image_cache) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
         let gcd = host
@@ -974,6 +1056,7 @@ async fn op_load_image_subrect_inner(
             gcd,
             host.gpu_caps.clone(),
             op.borrow::<CanvasOpState>().clone(),
+            op.borrow::<ImageCacheState>().aliases.clone(),
         )
     };
 
@@ -1007,7 +1090,7 @@ async fn op_load_image_subrect_inner(
     // new subrect slot — matches the local-file flow's semantic
     // where reassigning `img.src` drops the previous texture.
     if let Some(to_destroy) = {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.remove_previous_alias(image_id)
     } {
         dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
@@ -1018,14 +1101,14 @@ async fn op_load_image_subrect_inner(
     // awaits the first caller's finish_load so N simultaneous
     // identical subrect requests do the decode+upload once.
     match {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.begin_load(image_id, &cache_key)
     } {
         cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => return Ok((shared_id, dims)),
         cache::BeginLoadResult::Join(rx) => {
             return match rx.await {
                 Ok(Ok((actual_key, shared_id, dims))) => {
-                    let mut c = cache::IMAGE_CACHE.lock();
+                    let mut c = image_cache.lock();
                     c.bind_alias_existing(image_id, &cache_key, &actual_key, shared_id);
                     Ok((shared_id, dims))
                 }
@@ -1091,7 +1174,7 @@ async fn op_load_image_subrect_inner(
     // the JS-side bitmap refcount-decrements the texture correctly.
     let shared_id = cache::alloc_shared_id();
     {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         c.register_inflight_alias(image_id, shared_id);
     }
 
@@ -1109,7 +1192,7 @@ async fn op_load_image_subrect_inner(
     // uses it to settle any waiters that joined our StartLoading.
 
     let maybe_destroy = {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = image_cache.lock();
         match &send_res {
             Ok((w, h)) => c.finish_load(
                 image_id,
@@ -1176,7 +1259,7 @@ fn dispatch_destroy_images(
 #[op2(fast)]
 pub fn op_destroy_image(state: &mut OpState, #[smi] image_id: u32) -> bool {
     let to_destroy = {
-        let mut c = cache::IMAGE_CACHE.lock();
+        let mut c = state.borrow::<ImageCacheState>().aliases.lock();
         c.try_release_and_get_destroy_rid(image_id)
     };
 
@@ -1283,25 +1366,31 @@ pub fn op_clear_image_cache(state: &mut OpState) -> Result<(), JsErrorBox> {
             .map(|gp| gp.cache_dir().to_string_lossy().into_owned())
     };
     let render_tx = state.borrow::<HostOpState>().render_tx.clone();
+    // Content reaches this op through `ImageCache.clear()`, so everything it
+    // discards has to be this game's own: clearing every Session's would let one
+    // game's script black out another's textures and throw away its decoded bytes.
+    let session = state.borrow::<ImageCacheState>().session;
+    let dead_shared_ids = state.borrow::<ImageCacheState>().aliases.lock().drain();
 
     // Batch the whole shared-image set into one must-deliver command so a large
     // cache doesn't block the caller up to the send deadline per image.
-    dispatch_destroy_images(
-        &render_tx,
-        cache::drain_shared_image_cache(),
-        "op_clear_image_cache",
-    );
+    dispatch_destroy_images(&render_tx, dead_shared_ids, "op_clear_image_cache");
 
-    // 2. Clear IO in-memory cache + derived disk cache directly.
-    migo_io::image_ops::clear_image_cache(gcd.as_deref());
+    // 2. Clear this Session's decoded bytes and its derived disk cache. The disk
+    // half is rooted at this game's own cache dir; the in-memory half drops this
+    // Session's claim on each entry and evicts only what no other Session still
+    // holds, because those bytes are shared on purpose.
+    migo_io::image_ops::clear_image_cache(gcd.as_deref(), session);
     Ok(())
 }
 
 /// Get image cache statistics
 #[op2]
 #[serde]
-pub fn op_get_image_cache_stats(_state: &mut OpState) -> shared::protocol::io_cmd::ImageCacheStats {
-    migo_io::image_ops::get_image_cache_stats()
+pub fn op_get_image_cache_stats(state: &mut OpState) -> shared::protocol::io_cmd::ImageCacheStats {
+    // This game's own figures. The process-wide ones let it watch another game's
+    // asset loading, which is an isolation defect and not a diagnostic.
+    migo_io::image_ops::get_image_cache_stats(state.borrow::<ImageCacheState>().session)
 }
 
 extension!(host_v8_image,
@@ -1320,6 +1409,13 @@ extension!(host_v8_image,
         "01_image.js",
         "01_image_data.js",
     ],
+    state = |state| {
+        let host_id = state.borrow::<HostOpState>().id;
+        state.put(ImageCacheState {
+            aliases: cache::image_cache_for_host(host_id),
+            session: host_id,
+        });
+    },
 );
 
 pub(super) fn image_extensions() -> Vec<deno_core::Extension> {
@@ -1332,7 +1428,45 @@ pub(super) fn image_lazy_extensions() -> Vec<deno_core::Extension> {
 
 #[cfg(test)]
 mod tests {
-    use super::{data_url_cache_identity, resized_rgba_io_cache_key, variant_source_version_token};
+    use super::{
+        PrePin, data_url_cache_identity, resized_rgba_io_cache_key, variant_source_version_token,
+    };
+
+    /// A Session torn down or restarted with a load in flight has that op's future
+    /// dropped rather than resumed, so nothing on the load path runs again. The pin
+    /// it took before the decode has to come back anyway: nothing else can return
+    /// it, and the decoded-bytes cache is deliberately not cleared on teardown, so a
+    /// pin left here makes those bytes immune to eviction, to trim and to `clear`
+    /// for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_abandoned_mid_flight_releases_its_pre_pin() {
+        let key: migo_io::image_cache::ImageCacheKey =
+            ("/code/abandoned-mid-load.png".into(), 21, 0, 0);
+
+        let abandoned = tokio::time::timeout(std::time::Duration::from_millis(20), async {
+            let _pre_pin = PrePin::take(key.clone());
+            assert_eq!(
+                migo_io::global_cache().pin_count(&key),
+                1,
+                "the fixture must actually hold the pin it is about to abandon"
+            );
+            // Stands in for the decode or the GPU upload never coming back.
+            std::future::pending::<()>().await;
+        })
+        .await;
+
+        assert!(
+            abandoned.is_err(),
+            "the fixture must abandon the load rather than complete it, or it proves \
+             nothing about cancellation"
+        );
+        assert_eq!(
+            migo_io::global_cache().pin_count(&key),
+            0,
+            "an abandoned load left its pin behind; those decoded bytes can now never \
+             be evicted, trimmed or cleared"
+        );
+    }
 
     #[test]
     fn data_url_cache_identity_is_fixed_size_and_content_addressed() {

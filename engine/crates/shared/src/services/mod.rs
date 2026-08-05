@@ -54,7 +54,9 @@ pub use payment::PaymentService;
 pub use permission::{PermissionService, Scope, ScopeState};
 pub use scan_code::ScanCodeService;
 pub use share::ShareService;
-pub use subpackage::SubpackageService;
+pub use subpackage::{
+    SubpackageService, forget_downloaded_zips, intercept_download_result, take_downloaded_zip,
+};
 pub use system_info::SystemInfoService;
 pub use video::VideoService;
 

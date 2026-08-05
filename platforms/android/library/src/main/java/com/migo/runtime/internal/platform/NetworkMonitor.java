@@ -195,53 +195,12 @@ public final class NetworkMonitor {
         if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
             return "wifi";
         } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-            return getCellularNetworkType();
+            // Android protects radio-generation details with phone permissions.
+            // Connectivity itself does not require that privacy-sensitive grant.
+            return "unknown";
         } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
             return "wifi"; // Treat ethernet as wifi for simplicity
         } else {
-            return "unknown";
-        }
-    }
-
-    /**
-     * Determine cellular network generation (2g/3g/4g/5g) using TelephonyManager.
-     */
-    @SuppressWarnings("deprecation")
-    private String getCellularNetworkType() {
-        try {
-            TelephonyManager tm = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
-            if (tm == null) return "unknown";
-
-            int networkType = tm.getDataNetworkType();
-
-            switch (networkType) {
-                case TelephonyManager.NETWORK_TYPE_GPRS:
-                case TelephonyManager.NETWORK_TYPE_EDGE:
-                case TelephonyManager.NETWORK_TYPE_CDMA:
-                case TelephonyManager.NETWORK_TYPE_1xRTT:
-                case TelephonyManager.NETWORK_TYPE_IDEN:
-                    return "2g";
-                case TelephonyManager.NETWORK_TYPE_UMTS:
-                case TelephonyManager.NETWORK_TYPE_EVDO_0:
-                case TelephonyManager.NETWORK_TYPE_EVDO_A:
-                case TelephonyManager.NETWORK_TYPE_HSDPA:
-                case TelephonyManager.NETWORK_TYPE_HSUPA:
-                case TelephonyManager.NETWORK_TYPE_HSPA:
-                case TelephonyManager.NETWORK_TYPE_EVDO_B:
-                case TelephonyManager.NETWORK_TYPE_EHRPD:
-                case TelephonyManager.NETWORK_TYPE_HSPAP:
-                    return "3g";
-                case TelephonyManager.NETWORK_TYPE_LTE:
-                    return "4g";
-                case TelephonyManager.NETWORK_TYPE_NR:
-                    return "5g";
-                default:
-                    return "unknown";
-            }
-        } catch (SecurityException e) {
-            // READ_PHONE_STATE permission may be required on some devices
-            return "unknown";
-        } catch (Exception e) {
             return "unknown";
         }
     }

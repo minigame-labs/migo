@@ -8,6 +8,11 @@
 #
 # Usage:
 #   scripts/dev-run-c-host.sh [GAME_BUNDLE_DIR] [SECONDS]
+#
+# Env overrides:
+#   MIGO_HOST_V8_DIR     gn_out dir holding obj/librusty_v8.a + src_binding.rs
+#   MIGO_HOST_V8_ARCHIVE explicit linux-gnu librusty_v8.a path
+#   MIGO_HOST_V8_BINDING explicit linux-gnu src_binding.rs path
 
 set -euo pipefail
 
@@ -25,11 +30,18 @@ RUN_ROOT="${MIGO_C_HOST_ROOT:-/tmp/migo-c-host}"
 
 # ---- host V8 + Skia toolchain env (same as scripts/dev-test-host.sh) ----
 V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out}"
-[[ -f "$V8_DIR/obj/librusty_v8.a" ]] || { c_err "linux-gnu V8 missing: $V8_DIR/obj/librusty_v8.a"; exit 1; }
+V8_ARCHIVE="${MIGO_HOST_V8_ARCHIVE:-$V8_DIR/obj/librusty_v8.a}"
+V8_BINDING="${MIGO_HOST_V8_BINDING:-$V8_DIR/src_binding.rs}"
+[[ -f "$V8_ARCHIVE" ]] || { c_err "linux-gnu V8 archive missing: $V8_ARCHIVE"; exit 1; }
+[[ -f "$V8_BINDING" ]] || { c_err "linux-gnu V8 binding missing: $V8_BINDING"; exit 1; }
+[[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] || {
+    c_err "V8 archive looks like an LFS pointer: $V8_ARCHIVE"
+    exit 1
+}
 bash "$SCRIPT_DIR/dev-setup-skia.sh" >/dev/null
 
-export RUSTY_V8_ARCHIVE="$V8_DIR/obj/librusty_v8.a"
-export RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs"
+export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING"
 export CC="${CC_HOST:-/usr/bin/clang}"
 export CXX="${CXX_HOST:-/usr/bin/clang++}"
 export CPATH="$HOME/.local/skia-headers${CPATH:+:$CPATH}"

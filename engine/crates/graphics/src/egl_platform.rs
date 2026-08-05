@@ -17,6 +17,18 @@ use shared::{
 
 pub type EglInstance = egl::DynamicInstance<egl::EGL1_4>;
 
+/// Whether one provider may back EGL contexts used by multiple Migo threads.
+///
+/// This is a cold-path construction policy, not a driver capability inferred
+/// at runtime. Providers must choose explicitly because using a native display
+/// connection from a second thread can be unsound even when EGL itself exposes
+/// shared contexts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EglConcurrency {
+    RenderThreadOnly,
+    SharedContexts,
+}
+
 /// Process-local backend identity derived only from a private concrete marker.
 /// It is deliberately not a serialized/public ABI identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,8 +40,38 @@ impl GraphicsBackendId {
     }
 }
 
+/// Immutable process-local identity for one compatible graphics domain.
+///
+/// The domain marker distinguishes native API families that share a backend
+/// implementation, while `native_instance` distinguishes concrete displays or
+/// devices within that family. This value is intentionally opaque and never
+/// serialized across processes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlatformIdentity {
+    backend_id: GraphicsBackendId,
+    domain_id: TypeId,
+    native_instance: usize,
+}
+
+impl PlatformIdentity {
+    pub fn new<Domain: 'static>(backend_id: GraphicsBackendId, native_instance: usize) -> Self {
+        Self {
+            backend_id,
+            domain_id: TypeId::of::<Domain>(),
+            native_instance,
+        }
+    }
+
+    #[inline]
+    pub const fn backend_id(self) -> GraphicsBackendId {
+        self.backend_id
+    }
+}
+
 pub trait EglProvider: Debug + Send + Sync {
     fn backend_id(&self) -> GraphicsBackendId;
+    fn concurrency(&self) -> EglConcurrency;
+    fn platform_identity(&self) -> PlatformIdentity;
     fn label(&self) -> &str;
     fn load(&self) -> EngineResult<EglInstance>;
     fn display(&self, egl: &EglInstance) -> EngineResult<egl::Display>;
@@ -37,6 +79,7 @@ pub trait EglProvider: Debug + Send + Sync {
 
 pub trait EglSurfaceFactory: Debug + Send + Sync {
     fn backend_id(&self) -> GraphicsBackendId;
+    fn platform_identity(&self) -> PlatformIdentity;
 
     /// Convert the platform Surface into a non-owning presenter target.
     /// A failed concrete downcast must return `Unsupported`.
@@ -128,6 +171,7 @@ pub struct GraphicsPlatform {
     egl_provider: Arc<dyn EglProvider>,
     surface_factory: Arc<dyn EglSurfaceFactory>,
     backend_id: GraphicsBackendId,
+    platform_identity: PlatformIdentity,
 }
 
 impl GraphicsPlatform {
@@ -137,24 +181,36 @@ impl GraphicsPlatform {
     ) -> EngineResult<Self> {
         let provider_id = egl_provider.backend_id();
         let factory_id = surface_factory.backend_id();
-        if provider_id != factory_id {
+        let provider_identity = egl_provider.platform_identity();
+        let factory_identity = surface_factory.platform_identity();
+        if provider_id != factory_id
+            || provider_identity.backend_id() != provider_id
+            || factory_identity.backend_id() != factory_id
+            || provider_identity != factory_identity
+        {
             return Err(EngineError::new(ErrorCode::InvalidOperation)
-                .with_msg("incompatible EGL provider and surface factory")
+                .with_msg("incompatible EGL provider and surface factory identity")
                 .with_detail(format!(
-                    "provider={} ({provider_id:?}), factory={factory_id:?}",
-                    egl_provider.label()
+                    "provider={} ({provider_id:?}, {provider_identity:?}), factory=({factory_id:?}, {factory_identity:?})",
+                    egl_provider.label(),
                 )));
         }
         Ok(Self {
             egl_provider,
             surface_factory,
             backend_id: provider_id,
+            platform_identity: provider_identity,
         })
     }
 
     #[inline]
     pub fn backend_id(&self) -> GraphicsBackendId {
         self.backend_id
+    }
+
+    #[inline]
+    pub const fn platform_identity(&self) -> PlatformIdentity {
+        self.platform_identity
     }
 
     #[inline]
@@ -216,6 +272,10 @@ mod tests {
     struct BackendA;
     #[derive(Debug)]
     struct BackendB;
+    #[derive(Debug)]
+    struct DomainA;
+    #[derive(Debug)]
+    struct DomainB;
 
     #[derive(Debug)]
     struct FakeProvider<T> {
@@ -233,6 +293,14 @@ mod tests {
     impl<T: 'static + Debug> EglProvider for FakeProvider<T> {
         fn backend_id(&self) -> GraphicsBackendId {
             GraphicsBackendId::of::<T>()
+        }
+
+        fn concurrency(&self) -> EglConcurrency {
+            EglConcurrency::SharedContexts
+        }
+
+        fn platform_identity(&self) -> PlatformIdentity {
+            PlatformIdentity::new::<T>(self.backend_id(), 0)
         }
 
         fn label(&self) -> &str {
@@ -266,6 +334,10 @@ mod tests {
     impl<F: 'static + Debug, T: 'static + Debug> EglSurfaceFactory for FakeFactory<F, T> {
         fn backend_id(&self) -> GraphicsBackendId {
             GraphicsBackendId::of::<F>()
+        }
+
+        fn platform_identity(&self) -> PlatformIdentity {
+            PlatformIdentity::new::<F>(self.backend_id(), 0)
         }
 
         fn prepare(&self, _surface: &dyn Surface) -> EngineResult<PreparedEglSurfaceRef> {
@@ -320,6 +392,20 @@ mod tests {
     }
 
     #[test]
+    fn platform_identity_distinguishes_native_domain_and_instance() {
+        let backend = GraphicsBackendId::of::<BackendA>();
+        let original = PlatformIdentity::new::<DomainA>(backend, 0x1000);
+        let same = PlatformIdentity::new::<DomainA>(backend, 0x1000);
+        let other_instance = PlatformIdentity::new::<DomainA>(backend, 0x2000);
+        let other_domain = PlatformIdentity::new::<DomainB>(backend, 0x1000);
+
+        assert_eq!(original, same);
+        assert_ne!(original, other_instance);
+        assert_ne!(original, other_domain);
+        assert_eq!(original.backend_id(), backend);
+    }
+
+    #[test]
     fn rejects_mismatched_provider_and_factory_identity() {
         let err = GraphicsPlatform::try_new(
             Arc::new(FakeProvider::<BackendA>::new()),
@@ -343,6 +429,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(platform.backend_id(), GraphicsBackendId::of::<BackendA>());
+        assert_eq!(
+            platform.platform_identity(),
+            PlatformIdentity::new::<BackendA>(GraphicsBackendId::of::<BackendA>(), 0)
+        );
         assert!(platform.egl_provider().label().ends_with("BackendA"));
     }
 

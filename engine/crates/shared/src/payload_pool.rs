@@ -120,3 +120,58 @@ impl<T> Drop for Pooled<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{PayloadPool, Pooled};
+    use crate::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+
+    fn touch_sample() -> TouchData {
+        TouchData {
+            touch_type: TouchType::Move,
+            count: 1,
+            points: [TouchPoint::default(); 10],
+            timestamp_ms: 0,
+        }
+    }
+
+    /// Section 7.3, and the claim `TouchData`'s own documentation makes: a single
+    /// memcpy into a preallocated slot keeps steady-state input allocation-free.
+    ///
+    /// The burst runs at full occupancy and then asks for one slot too many, because
+    /// exhaustion is where a pool is most tempted to allocate a replacement.
+    #[test]
+    fn steady_state_payload_traffic_never_reaches_the_heap() {
+        const IN_FLIGHT: usize = 4;
+        let pool: PayloadPool<TouchData> = PayloadPool::new(IN_FLIGHT);
+        // Reserved outside the burst: this is the harness's own bookkeeping, and a
+        // growth here would be attributed to the pool.
+        let mut in_flight: Vec<Pooled<TouchData>> = Vec::with_capacity(IN_FLIGHT);
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "payload_pool: acquire, read and return at full occupancy",
+                warmup: 2,
+                measured: 64,
+            },
+            |_| {
+                for _ in 0..IN_FLIGHT {
+                    in_flight.push(
+                        pool.try_insert(touch_sample())
+                            .expect("a returned slot is reusable"),
+                    );
+                }
+                assert!(
+                    pool.try_insert(touch_sample()).is_err(),
+                    "an exhausted pool must refuse, not grow"
+                );
+
+                let points: usize = in_flight.iter().map(|held| usize::from(held.count)).sum();
+                assert_eq!(points, IN_FLIGHT);
+                in_flight.clear();
+                points
+            },
+        );
+    }
+}

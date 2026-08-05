@@ -71,6 +71,7 @@ jobs:
         run: |
           command -v rg >/dev/null 2>&1 || sudo apt-get install -y ripgrep
           bash scripts/test-surface-attachment-contract.sh
+          bash scripts/test-x11-owned-connection-contract.sh
 
       - name: Platform/V8 dependency boundary contract
         run: bash scripts/test-platform-v8-boundary-contract.sh
@@ -158,6 +159,12 @@ jobs:
       - name: Prescreen scanner contract
         run: bash scripts/test-prescreen-scanner.sh
 
+      - name: Bounded input transport contract
+        run: bash scripts/test-input-transport-contract.sh
+
+      - name: Android owned Host shutdown contract
+        run: bash scripts/test-android-owned-host-shutdown-contract.sh
+
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
 
@@ -170,12 +177,13 @@ jobs:
         # the subtle failures were: a substring match that counted local-dynamic
         # relocations as local-exec, and an export audit that read nm instead of
         # objdump and so reported 190 exports for a library that exports 12.
+        #
+        # Discovered rather than listed. The list this replaced had drifted: it
+        # omitted test_collect_render_metrics.py, test_compare_render_results.py and
+        # test_v8_source_proof.py, so those never ran here -- and the last of them
+        # guards the provenance proof behind every V8 component manifest.
         run: |
-          python3 scripts/ci/tests/test_abi_floor_audit.py
-          python3 scripts/ci/tests/test_gen_linux_package_metadata.py
-          python3 scripts/ci/tests/test_gen_android_package_metadata.py
-          python3 scripts/ci/tests/test_write_linux_build_metadata.py
-          python3 scripts/ci/tests/test_write_linux_v8_component_manifest.py
+          python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'
 
       - name: Artifact manifest tooling and contract
         run: |
@@ -183,13 +191,13 @@ jobs:
           cargo test --manifest-path tools/artifact-manifest/Cargo.toml --locked
           bash scripts/test-artifact-manifest-contract.sh
 
-      # Host clippy/test are SCOPED to the crates that build on a plain Linux
-      # host: shared, io, runtime-v8. The graphics (skia → needs EGL/GLES dev
-      # headers) and audio (alsa-sys → needs libasound) crates only build with
-      # their system deps, which this fast gate does not install — they are
-      # compiled for the real target by the Android `build` job below
-      # (build-aar.sh via the NDK). Running them here would fail on missing
-      # system headers (this gate never passed on master for that reason).
+      # Host clippy is SCOPED to the crates that build on a plain Linux host with
+      # no extra system packages: shared, io, runtime-v8. graphics needs Skia's
+      # EGL/GLES headers and audio needs libasound, which this fast gate does not
+      # install — the `host-engine-tests` job below installs them and runs those
+      # crates' test suites. It does NOT run clippy on them, so clippy coverage for
+      # graphics, core, capi and platform is still missing everywhere; that is a
+      # known gap, not something the Android build covers.
       #
       # Lints are capped to `warn` (incl. deny-by-default correctness lints like
       # clippy::erasing_op / await_holding_lock): pinning to 1.95.0 (frozen V8
@@ -199,17 +207,20 @@ jobs:
       # backlog blocking. Remove the cap after the dedicated lint-cleanup PR.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets -- --cap-lints warn
 
-      # Blocking gate for the host-buildable crates (shared + io + runtime-v8).
-      # All their lib tests must pass. Previously-masked failures have been
-      # fixed at the root: shared/runtime-v8 had 5 real defects / stale
+      # Blocking gate for the crates that need no extra system packages (shared +
+      # io + runtime-v8). All their lib tests must pass. Previously-masked failures
+      # have been fixed at the root: shared/runtime-v8 had 5 real defects / stale
       # assertions; io had test-only global state (domain/scheduler hooks + an
       # image-run counter) that deadlocked or raced under parallel execution and
       # is now per-instance. The handful of io tests needing image fixtures
-      # absent in CI stay #[ignore]d. graphics/audio still can't build here (skia
-      # EGL / alsa system deps) — android build-aar.sh is their real gate, and
-      # core/capi inherit that limitation through their graphics dependency.
+      # absent in CI stay #[ignore]d.
+      #
+      # graphics, core, capi and platform are NOT here, and the Android AAR build
+      # is not their gate either: it proves they compile for the target and runs
+      # none of their tests. Their 240 lib tests ran in no job at all until the
+      # `host-engine-tests` job below existed.
       #
       # `migo-capi-abi` has no dependencies at all, which is why it was split out
       # of `capi` in the first place: the ABI validation rules are exactly the
@@ -217,11 +228,20 @@ jobs:
       # tests run with `--all-targets`, not `--lib`, because the boundary rules
       # live in `tests/` (struct prefixes, versioned-copy truncation, output
       # policy) and `--lib` would silently skip all 50 of them.
+      #
+      # `migo-alloc-probe` is the counting allocator behind Section 7.3's
+      # steady-state allocation gates. It runs without `--lib` for the same
+      # reason: half its controls are integration tests, because whether a
+      # counting `#[global_allocator]` is installed is a property of a binary and
+      # its own unit-test binary deliberately installs none.
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
         run: |
           cargo test -p migo-shared -p migo-io -p migo-runtime-v8 --lib
           cargo test -p migo-capi-abi --all-targets
+          cargo test -p migo-alloc-probe
+          cargo test -p migo-contention-probe
+          cargo test -p migo-executor-probe
         env:
           RUST_BACKTRACE: 1
 
@@ -232,6 +252,13 @@ jobs:
         run: |
           bash scripts/test-product-profiles.sh
           bash scripts/test-r8-profile-contract.sh
+
+      # The local verification entry point decides which target builds a change
+      # needs. Its own answer has to be checked: an under-reporting selector reads
+      # as "this change needs nothing", which is how three Android compile errors
+      # rode a green host loop for several sessions.
+      - name: Local verification entry point contract
+        run: bash scripts/test-local-verification-contract.sh
 
       - name: Python script syntax check
         run: |
@@ -440,3 +467,66 @@ jobs:
             platforms/android/dist/*
             reports/*.json
           if-no-files-found: warn
+
+  # ── Job 5: host engine tests — graphics, core, capi, platform ────────
+  # These four crates' 240 lib tests ran in no job. The reason given for excluding
+  # them was that the Android AAR build is "their real gate", which is true for
+  # compilation and false for tests: build-aar.sh cross-compiles them and runs
+  # nothing. A test that runs nowhere is not a gate, so they run here.
+  #
+  # Its own job rather than a step in quality-gate, because Skia is built from
+  # source for the host (the skia-safe feature set has no matching prebuilt), which
+  # does not fit that job's 20-minute budget. Runs in parallel with the Android
+  # job, so the wall clock is unchanged.
+  #
+  # NO Rust cache, for the same reason the Android and snapshot jobs refuse it:
+  # Swatinem/rust-cache prunes large files out of each build script's OUT_DIR while
+  # keeping the fingerprint fresh, so on a cache hit the `v8` crate's
+  # `librusty_v8.a` is gone and the link fails on the second run rather than the
+  # first. These crates link V8 through runtime-v8.
+  host-engine-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      # Each package answers a link or include request the build actually makes,
+      # confirmed against the build script output rather than guessed:
+      #   ninja-build          Skia's GN/ninja source build
+      #   libgl-dev            KHR/khrplatform.h, which the EGL and GLES headers include
+      #   libegl-dev           EGL/*, for Skia's GL interface
+      #   libgles-dev          GLES2/*, GLES3/*
+      #   libfontconfig1-dev   skia-bindings emits `cargo:rustc-link-lib=fontconfig`
+      #   libfreetype-dev      skia-bindings emits `cargo:rustc-link-lib=freetype`
+      #   libasound2-dev       alsa-sys emits `cargo:rustc-link-lib=asound`
+      # The last three are needed at link time even though the finished binaries do
+      # not end up depending on them: `-l` has to resolve before `--as-needed` can
+      # drop it.
+      - name: Install the engine's host build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ninja-build \
+            libgl-dev libegl-dev libgles-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libasound2-dev
+
+      - name: Run Rust tests (graphics, core, capi, platform, audio)
+        working-directory: engine
+        run: |
+          cargo test -p migo-graphics --lib
+          cargo test -p migo-core --lib
+          cargo test -p migo-capi --lib
+          cargo test -p migo-platform --lib
+          # Here rather than in the no-extra-packages job: cpal links ALSA, which
+          # only this job installs.
+          cargo test -p migo-audio --lib
+        env:
+          RUST_BACKTRACE: 1

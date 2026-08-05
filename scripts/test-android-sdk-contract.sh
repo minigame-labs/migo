@@ -34,14 +34,23 @@ STATIC_LIB="$PREFIX/lib/libmigo_capi.a"
 MANIFEST="$PREFIX/share/migo/android-$ABI-manifest.json"
 MANIFEST_TOOL="$REPO_ROOT/tools/artifact-manifest"
 
-ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Ndk}"
-NDK_BIN="$(echo "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin 2>/dev/null)"
-
 FAILURES=0
 SKIPS=0
 pass() { echo -e "\033[0;32mPASS\033[0m  $*"; }
 fail() { echo -e "\033[0;31mFAIL\033[0m  $*"; FAILURES=$((FAILURES + 1)); }
 skip() { echo -e "\033[0;33mSKIP\033[0m  $*"; SKIPS=$((SKIPS + 1)); }
+
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$SCRIPT_DIR/lib/android-ndk.sh"
+android_ndk_read_pin "$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json" || exit 1
+# An absent pinned NDK leaves NDK_BIN empty rather than aborting: the checks that
+# need it already treat it as a skip, and --strict is what turns a skip into a
+# failure. Exiting here would take the manifest, export and snapshot checks -- none
+# of which need an NDK -- down with it.
+NDK_BIN=""
+if android_ndk_resolve; then
+    NDK_BIN="$(echo "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin 2>/dev/null)"
+fi
 
 [[ -d "$PREFIX" ]] || {
     echo "no staged package at $PREFIX; run scripts/build-android-sdk.sh --arch $ARCH" >&2

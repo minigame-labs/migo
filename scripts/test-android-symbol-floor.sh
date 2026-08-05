@@ -30,13 +30,17 @@
 set -euo pipefail
 
 MIN_API="${MIGO_MIN_API:-26}"
-ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Ndk}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 err() { echo -e "\033[0;31m[floor] $*\033[0m" >&2; }
 ok()  { echo -e "\033[0;32m[floor] $*\033[0m"; }
 info(){ echo -e "\033[0;36m[floor] $*\033[0m"; }
 
-[[ -d "$ANDROID_NDK_HOME" ]] || { err "ANDROID_NDK_HOME not found: $ANDROID_NDK_HOME"; exit 1; }
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$SCRIPT_DIR/lib/android-ndk.sh"
+android_ndk_read_pin "$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json" || exit 1
+android_ndk_resolve || { err "cannot resolve the pinned Android NDK"; exit 1; }
 NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 NM="$NDK_BIN/llvm-nm"
 [[ -x "$NM" ]] || { err "llvm-nm not found at $NM"; exit 1; }
@@ -110,7 +114,6 @@ check_one() {
 
 TARGETS=("$@")
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     mapfile -t TARGETS < <(find "$REPO_ROOT/engine/jniLibs" -name libmigo.so 2>/dev/null)
     [[ ${#TARGETS[@]} -gt 0 ]] || { err "no libmigo.so given and none staged under engine/jniLibs"; exit 1; }
     info "checking staged libraries: ${TARGETS[*]}"

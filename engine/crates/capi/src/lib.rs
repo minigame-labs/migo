@@ -17,6 +17,8 @@
 mod callback_gate;
 mod callbacks;
 mod capabilities;
+#[cfg(test)]
+mod concurrent_sessions;
 mod gamepad;
 mod host_kit;
 mod input;
@@ -57,15 +59,16 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
+use graphics::egl_platform::PlatformIdentity;
 use migo_capi_abi::{
     MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
     MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult,
 };
-use migo_core::{send_command_to_host, shutdown_host};
+use migo_core::{HostThread, send_command_to_host};
 use panic_barrier::guard;
 use shared::{protocol::host_cmd::HostCommand, surface::SurfaceLossReason};
 
@@ -81,6 +84,30 @@ struct EngineInner {
     /// `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT`: opt-in, never a default.
     allow_unsigned_content: bool,
     live_sessions: Mutex<usize>,
+    retired_hosts: Mutex<Vec<HostThread>>,
+}
+
+impl EngineInner {
+    fn retire_host(&self, host: HostThread) {
+        if let Err(error) = host.request_shutdown() {
+            tracing::error!("failed to request shutdown for Host {}: {error}", host.id());
+        }
+        self.retired_hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(host);
+    }
+
+    fn take_retired_hosts(&self) -> Result<Vec<HostThread>, ()> {
+        let mut retired = self
+            .retired_hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if retired.iter().any(HostThread::is_current_thread) {
+            return Err(());
+        }
+        Ok(std::mem::take(&mut *retired))
+    }
 }
 
 pub struct MigoEngine {
@@ -110,6 +137,14 @@ struct PendingSurfaceLoss {
     reason: SurfaceLossReason,
 }
 
+const fn platform_state_is_consistent(
+    host_present: bool,
+    identity_present: bool,
+    context_present: bool,
+) -> bool {
+    host_present == identity_present && identity_present == context_present
+}
+
 struct SessionState {
     lifecycle: LifecycleState,
     /// Installed once, before the first attach, per the header's rule that a
@@ -121,7 +156,15 @@ struct SessionState {
     callbacks_frozen: bool,
     /// Set once a surface has been attached; the engine host thread owns the
     /// render loop from that point.
-    host: Option<i32>,
+    host: Option<HostThread>,
+    /// Immutable graphics domain committed atomically with `host`.
+    platform_identity: Option<PlatformIdentity>,
+    /// Target-specific construction owner committed atomically with `host`.
+    ///
+    /// Reattachment clones this state to validate and reuse the exact EGL
+    /// domain. In particular, Linux X11 stores Migo's private connection here
+    /// rather than rebuilding from a caller-owned `Display*`.
+    platform_context: Option<platform::PlatformContext>,
     content_loaded: bool,
     /// Unique attachment allocation. The public pointer is borrowed identity;
     /// only this slot owns and may drop the Box.
@@ -166,6 +209,8 @@ impl Default for SessionState {
             callbacks_configured: false,
             callbacks_frozen: false,
             host: None,
+            platform_identity: None,
+            platform_context: None,
             content_loaded: false,
             active_attachment: None,
             last_public_generation: 0,
@@ -200,6 +245,9 @@ pub struct MigoSession {
     /// Connected gamepad topology packed per stable Web index. Publication is
     /// ordered after successful command enqueue.
     gamepad_topology: gamepad::GamepadTopology,
+    /// Suppress repeated host notifications while bounded input ingress stays
+    /// saturated. The next successful input enqueue opens a new episode.
+    input_saturation_reported: AtomicBool,
 }
 
 impl MigoSession {
@@ -272,14 +320,39 @@ impl MigoSession {
 }
 
 #[inline]
-pub(crate) fn map_ingress_result(
+pub(crate) fn map_ingress_result<T>(
+    session: &Arc<MigoSession>,
     entry: &'static str,
-    result: Result<(), migo_core::HostIngressSendError>,
+    result: Result<T, migo_core::HostIngressSendError>,
 ) -> MigoResult {
     match result {
-        Ok(()) => MIGO_OK,
+        Ok(_) => {
+            session
+                .input_saturation_reported
+                .store(false, Ordering::Release);
+            MIGO_OK
+        }
         Err(migo_core::HostIngressSendError::Full) => {
-            tracing::debug!("{entry}: Host queue or payload pool is full");
+            tracing::debug!("{entry}: bounded input transport is saturated");
+            if session
+                .input_saturation_reported
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let notifier = session
+                    .state
+                    .lock()
+                    .map(|state| state.notifier.clone())
+                    .unwrap_or_else(|error| error.into_inner().notifier.clone());
+                if let Some(notifier) = notifier {
+                    notifier.error(
+                        MIGO_ERROR_WOULD_BLOCK,
+                        format!(
+                            "{entry}: bounded input transport saturated; event was not accepted"
+                        ),
+                    );
+                }
+            }
             MIGO_ERROR_WOULD_BLOCK
         }
         Err(migo_core::HostIngressSendError::Closed) => {
@@ -350,6 +423,7 @@ pub unsafe extern "C" fn migo_engine_create(
                 code_cache_dir: PathBuf::from(config.code_cache_dir),
                 allow_unsigned_content: config.allow_unsigned_content,
                 live_sessions: Mutex::new(0),
+                retired_hosts: Mutex::new(Vec::new()),
             }),
         });
         *out_engine = Box::into_raw(engine);
@@ -371,6 +445,26 @@ pub unsafe extern "C" fn migo_engine_destroy(engine: *mut MigoEngine) -> MigoRes
             Ok(live) if *live > 0 => return MIGO_ERROR_INVALID_STATE,
             Ok(_) => {}
             Err(_) => return MIGO_ERROR_INTERNAL,
+        }
+
+        let retired_hosts = match engine_ref.inner.take_retired_hosts() {
+            Ok(hosts) => hosts,
+            Err(()) => {
+                tracing::error!(
+                    "migo_engine_destroy: cannot join a retired Host from that Host thread"
+                );
+                return MIGO_ERROR_INVALID_STATE;
+            }
+        };
+        let mut join_failed = false;
+        for mut host in retired_hosts {
+            if let Err(error) = host.join() {
+                tracing::error!("migo_engine_destroy: {error}");
+                join_failed = true;
+            }
+        }
+        if join_failed {
+            return MIGO_ERROR_INTERNAL;
         }
         drop(unsafe { Box::from_raw(engine) });
         MIGO_OK
@@ -411,6 +505,7 @@ pub unsafe extern "C" fn migo_session_create(
             ingress: OnceLock::new(),
             active_surface_generation: AtomicU64::new(0),
             gamepad_topology: gamepad::GamepadTopology::new(),
+            input_saturation_reported: AtomicBool::new(false),
         });
         *out_session = Arc::into_raw(session).cast_mut();
         MIGO_OK
@@ -442,6 +537,14 @@ pub unsafe extern "C" fn migo_session_destroy(session: *mut MigoSession) -> Migo
         {
             return MIGO_ERROR_INVALID_STATE;
         }
+        if !platform_state_is_consistent(
+            state.host.is_some(),
+            state.platform_identity.is_some(),
+            state.platform_context.is_some(),
+        ) {
+            tracing::error!("migo_session_destroy: inconsistent committed platform state");
+            return MIGO_ERROR_INTERNAL;
+        }
         if *live_sessions == 0 {
             return MIGO_ERROR_INTERNAL;
         }
@@ -455,19 +558,24 @@ pub unsafe extern "C" fn migo_session_destroy(session: *mut MigoSession) -> Migo
             Err(_) => return MIGO_ERROR_INVALID_STATE,
         };
         let host = state.host.take();
+        state.platform_identity.take();
+        let platform_context = state.platform_context.take();
         state.notifier.take();
+        if let Some(host) = host {
+            // Publish ownership before the live count reaches zero. An Engine
+            // destroy racing this call can therefore never miss an exiting
+            // Host after it observes that no Session remains.
+            pinned.engine.retire_host(host);
+        }
         *live_sessions -= 1;
         drop(state);
         drop(live_sessions);
+        drop(platform_context);
 
         // Never wait while holding a Migo lock: an already-started callback may
         // be finishing an ABI call. Callback frames on this thread are exempt,
         // which preserves documented reentrant destruction.
         callback_drain.wait();
-
-        if let Some(host) = host {
-            let _ = shutdown_host(host);
-        }
 
         // Consume exactly the one strong reference exported as the C handle.
         // `pinned` (and any currently executing callback) keeps the allocation
@@ -500,7 +608,7 @@ pub unsafe extern "C" fn migo_session_load_content(
         };
         // Content needs a render target: without one there is no host thread to
         // evaluate it on.
-        let Some(host) = state.host else {
+        let Some(host) = state.host.as_ref().map(HostThread::id) else {
             return MIGO_ERROR_INVALID_STATE;
         };
         if state.content_loaded {
@@ -607,10 +715,14 @@ fn drive_visibility_locked(state: &mut SessionState, visible: bool) -> MigoResul
     // Before a surface exists (including an in-progress attach/detach) there
     // is nothing to show or hide yet, but the host is not wrong to have said
     // so: remember it for the next completed attach.
-    let Some(host) = state.host.filter(|_| {
-        state.active_attachment.is_some()
-            && state.surface_transition != SurfaceTransition::Detaching
-    }) else {
+    let can_dispatch = state.active_attachment.is_some()
+        && state.surface_transition != SurfaceTransition::Detaching;
+    let Some(host) = state
+        .host
+        .as_ref()
+        .filter(|_| can_dispatch)
+        .map(HostThread::id)
+    else {
         state.visibility = Some(visible);
         return MIGO_OK;
     };
@@ -723,10 +835,14 @@ pub unsafe extern "C" fn migo_session_set_focus(
         // No surface requirement: focus is a Session property, and Android can
         // report it before its window exists. Retain it for attach in that
         // case. It never drives show/hide, render pause, or audio pause.
-        let Some(host) = state.host.filter(|_| {
-            state.active_attachment.is_some()
-                && state.surface_transition != SurfaceTransition::Detaching
-        }) else {
+        let can_dispatch = state.active_attachment.is_some()
+            && state.surface_transition != SurfaceTransition::Detaching;
+        let Some(host) = state
+            .host
+            .as_ref()
+            .filter(|_| can_dispatch)
+            .map(HostThread::id)
+        else {
             state.focused = Some(focused);
             return MIGO_OK;
         };
@@ -778,9 +894,110 @@ fn init_dev_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{engine_config, scratch_dirs, session_config, with_engine};
+    use crate::{
+        platform::test_platform_context,
+        test_support::{
+            callback_session_pin, engine_config, scratch_dirs, session_config, with_engine,
+        },
+    };
+    use graphics::egl_platform::GraphicsBackendId;
     use migo_capi_abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI, VersionedHeader};
-    use std::ffi::{CString, c_void};
+    use shared::host_channel::InputSendOutcome;
+    use std::{
+        ffi::{CString, c_void},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+    };
+
+    struct DropSentinel(Arc<AtomicBool>);
+    struct TestPlatformBackend;
+    struct TestPlatformDomain;
+
+    fn install_test_host(state: &mut SessionState, host: HostThread) {
+        state.host = Some(host);
+        state.platform_identity = Some(PlatformIdentity::new::<TestPlatformDomain>(
+            GraphicsBackendId::of::<TestPlatformBackend>(),
+            0,
+        ));
+        state.platform_context = Some(test_platform_context());
+    }
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn input_saturation_callback_is_once_per_episode() {
+        static CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        unsafe extern "C" fn dispatch(
+            _dispatcher: *mut c_void,
+            task: callbacks::MigoTaskFn,
+            context: *mut c_void,
+        ) -> MigoResult {
+            unsafe { task(context) };
+            MIGO_OK
+        }
+
+        unsafe extern "C" fn on_error(
+            _user: *mut c_void,
+            _session: *mut c_void,
+            error: *const callbacks::MigoError,
+        ) {
+            assert_eq!(unsafe { &*error }.code, MIGO_ERROR_WOULD_BLOCK);
+            CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let _serial = LOCK.lock().unwrap();
+        CALLBACKS.store(0, Ordering::SeqCst);
+        let session = callback_session_pin();
+        let host_callbacks = callbacks::HostCallbacks {
+            user_data: std::ptr::null_mut(),
+            dispatcher_data: std::ptr::null_mut(),
+            dispatch,
+            on_ready: None,
+            on_error: Some(on_error),
+            on_exit_requested: None,
+            on_surface_lost: None,
+            on_request_frame: None,
+            on_show_keyboard: None,
+            on_hide_keyboard: None,
+            on_update_keyboard: None,
+            on_surface_released: None,
+        };
+        session.state.lock().unwrap().notifier = Some(Arc::new(callbacks::Notifier::new(
+            host_callbacks,
+            Arc::downgrade(&session),
+        )));
+
+        let full = || Err::<InputSendOutcome, _>(migo_core::HostIngressSendError::Full);
+        assert_eq!(
+            map_ingress_result(&session, "test_input", full()),
+            MIGO_ERROR_WOULD_BLOCK
+        );
+        assert_eq!(
+            map_ingress_result(&session, "test_input", full()),
+            MIGO_ERROR_WOULD_BLOCK
+        );
+        assert_eq!(CALLBACKS.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            map_ingress_result(&session, "test_input", Ok(InputSendOutcome::Coalesced),),
+            MIGO_OK
+        );
+        assert_eq!(
+            map_ingress_result(&session, "test_input", full()),
+            MIGO_ERROR_WOULD_BLOCK
+        );
+        assert_eq!(CALLBACKS.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn engine_rejects_a_config_from_a_different_abi() {
@@ -877,6 +1094,280 @@ mod tests {
 
         assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
         assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+    }
+
+    #[test]
+    fn engine_destroy_waits_for_retired_host_sentinel() {
+        let dirs = scratch_dirs("engine-retired-host");
+        let config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sentinel = DropSentinel(Arc::clone(&dropped));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("Migo-Main-capi-retired-host".to_owned())
+            .spawn(move || {
+                let _sentinel = sentinel;
+                started_tx.send(()).expect("publish Host start");
+                release_rx.recv().expect("release retired Host");
+            })
+            .expect("spawn retired Host");
+        let host = migo_core::HostThread::from_join_handle_for_test(8_001, join);
+        unsafe { &*engine }.inner.retire_host(host);
+
+        started_rx.recv().expect("retired Host started");
+        let (destroyed_tx, destroyed_rx) = mpsc::channel();
+        let engine_address = engine as usize;
+        let destroyer = thread::spawn(move || {
+            let engine = engine_address as *mut MigoEngine;
+            destroyed_tx
+                .send(unsafe { migo_engine_destroy(engine) })
+                .expect("publish Engine destruction");
+        });
+
+        assert!(
+            destroyed_rx.try_recv().is_err(),
+            "Engine destruction returned while a retired Host was live"
+        );
+        assert!(!dropped.load(Ordering::Acquire));
+
+        release_tx.send(()).expect("release retired Host");
+        assert_eq!(destroyed_rx.recv().expect("Engine result"), MIGO_OK);
+        destroyer.join().expect("Engine destroyer");
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn engine_destroy_from_its_retired_host_is_rejected_and_retryable() {
+        let dirs = scratch_dirs("engine-self-join");
+        let config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+
+        let (owner_tx, owner_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let engine_address = engine as usize;
+        let join = thread::Builder::new()
+            .name("Migo-Main-capi-self-join".to_owned())
+            .spawn(move || {
+                let host = owner_rx.recv().expect("receive own Host owner");
+                let engine = engine_address as *mut MigoEngine;
+                unsafe { &*engine }.inner.retire_host(host);
+                result_tx
+                    .send(unsafe { migo_engine_destroy(engine) })
+                    .expect("publish self-join rejection");
+            })
+            .expect("spawn self-join Host");
+        let host = migo_core::HostThread::from_join_handle_for_test(8_002, join);
+        owner_tx.send(host).expect("transfer owner to Host");
+
+        assert_eq!(
+            result_rx.recv().expect("self-join result"),
+            MIGO_ERROR_INVALID_STATE
+        );
+        assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+    }
+
+    #[test]
+    fn session_destroy_transfers_host_without_joining_it() {
+        let dirs = scratch_dirs("session-retire-host");
+        let config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+        let mut session: *mut MigoSession = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { migo_session_create(engine, &session_config(), &mut session) },
+            MIGO_OK
+        );
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sentinel = DropSentinel(Arc::clone(&dropped));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("Migo-Main-capi-session-retire".to_owned())
+            .spawn(move || {
+                let _sentinel = sentinel;
+                started_tx.send(()).expect("publish Host start");
+                release_rx.recv().expect("release retired Host");
+            })
+            .expect("spawn Session Host");
+        install_test_host(
+            &mut unsafe { &*session }.state.lock().expect("Session state"),
+            migo_core::HostThread::from_join_handle_for_test(8_003, join),
+        );
+        started_rx.recv().expect("Session Host started");
+
+        assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "Session destruction must not join its Host"
+        );
+        assert_eq!(
+            unsafe { &*engine }
+                .inner
+                .live_sessions
+                .lock()
+                .expect("live Sessions")
+                .to_owned(),
+            0
+        );
+        assert_eq!(
+            unsafe { &*engine }
+                .inner
+                .retired_hosts
+                .lock()
+                .expect("retired Hosts")
+                .len(),
+            1
+        );
+
+        release_tx.send(()).expect("release retired Host");
+        assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rejected_session_destroy_preserves_host_ownership_for_retry() {
+        let dirs = scratch_dirs("session-destroy-retry");
+        let config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+        let mut session: *mut MigoSession = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { migo_session_create(engine, &session_config(), &mut session) },
+            MIGO_OK
+        );
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("Migo-Main-capi-destroy-retry".to_owned())
+            .spawn(move || {
+                release_rx.recv().expect("release retry Host");
+            })
+            .expect("spawn retry Host");
+        {
+            let mut state = unsafe { &*session }.state.lock().expect("Session state");
+            install_test_host(
+                &mut state,
+                migo_core::HostThread::from_join_handle_for_test(8_004, join),
+            );
+            state.surface_transition = SurfaceTransition::Attaching;
+        }
+
+        assert_eq!(
+            unsafe { migo_session_destroy(session) },
+            MIGO_ERROR_INVALID_STATE
+        );
+        assert_eq!(
+            unsafe { &*session }
+                .state
+                .lock()
+                .expect("Session state")
+                .host
+                .as_ref()
+                .map(HostThread::id),
+            Some(8_004)
+        );
+        assert_eq!(
+            unsafe { &*engine }
+                .inner
+                .live_sessions
+                .lock()
+                .expect("live Sessions")
+                .to_owned(),
+            1
+        );
+        assert!(
+            unsafe { &*engine }
+                .inner
+                .retired_hosts
+                .lock()
+                .expect("retired Hosts")
+                .is_empty()
+        );
+
+        unsafe { &*session }
+            .state
+            .lock()
+            .expect("Session state")
+            .surface_transition = SurfaceTransition::Idle;
+        assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        release_tx.send(()).expect("release retry Host");
+        assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+    }
+
+    #[test]
+    fn engine_destroy_holds_no_engine_lock_while_joining() {
+        let dirs = scratch_dirs("engine-join-locks");
+        let config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+
+        let inner = Arc::clone(&unsafe { &*engine }.inner);
+        let (release_tx, release_rx) = mpsc::channel();
+        let (locks_tx, locks_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("Migo-Main-capi-lock-probe".to_owned())
+            .spawn(move || {
+                release_rx.recv().expect("release lock probe");
+                let live_unlocked = inner.live_sessions.try_lock().is_ok();
+                let retired_unlocked = inner.retired_hosts.try_lock().is_ok();
+                locks_tx
+                    .send((live_unlocked, retired_unlocked))
+                    .expect("publish lock probe");
+            })
+            .expect("spawn lock-probe Host");
+        unsafe { &*engine }
+            .inner
+            .retire_host(migo_core::HostThread::from_join_handle_for_test(
+                8_005, join,
+            ));
+
+        let (destroyed_tx, destroyed_rx) = mpsc::channel();
+        let engine_address = engine as usize;
+        let destroyer = thread::spawn(move || {
+            let engine = engine_address as *mut MigoEngine;
+            destroyed_tx
+                .send(unsafe { migo_engine_destroy(engine) })
+                .expect("publish Engine result");
+        });
+        assert!(
+            destroyed_rx.try_recv().is_err(),
+            "Engine destruction must wait for its Host"
+        );
+
+        release_tx.send(()).expect("release lock probe");
+        assert_eq!(
+            locks_rx.recv().expect("lock probe result"),
+            (true, true),
+            "Engine destroy held a Migo lock while joining"
+        );
+        assert_eq!(destroyed_rx.recv().expect("Engine result"), MIGO_OK);
+        destroyer.join().expect("Engine destroyer");
     }
 
     #[test]

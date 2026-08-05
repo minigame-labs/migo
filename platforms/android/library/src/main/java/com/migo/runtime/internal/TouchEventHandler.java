@@ -22,6 +22,42 @@ import java.nio.ByteOrder;
  * @hide
  */
 public final class TouchEventHandler {
+    @FunctionalInterface
+    interface NativeTouchSink {
+        boolean send(int sessionId, int action, long time, int count, ByteBuffer buffer);
+    }
+
+    interface TouchEvent {
+        int actionMasked();
+        int actionIndex();
+        long eventTime();
+        int pointerCount();
+        int pointerId(int index);
+        float x(int index);
+        float y(int index);
+        float pressure(int index);
+    }
+
+    private static final class MotionTouchEvent implements TouchEvent {
+        private MotionEvent event;
+
+        void bind(MotionEvent event) {
+            this.event = event;
+        }
+
+        void clear() {
+            event = null;
+        }
+
+        @Override public int actionMasked() { return event.getActionMasked(); }
+        @Override public int actionIndex() { return event.getActionIndex(); }
+        @Override public long eventTime() { return event.getEventTime(); }
+        @Override public int pointerCount() { return event.getPointerCount(); }
+        @Override public int pointerId(int index) { return event.getPointerId(index); }
+        @Override public float x(int index) { return event.getX(index); }
+        @Override public float y(int index) { return event.getY(index); }
+        @Override public float pressure(int index) { return event.getPressure(index); }
+    }
 
     /**
      * Size of a single touch point in bytes.
@@ -49,6 +85,8 @@ public final class TouchEventHandler {
     // main-thread confined, so ordinary field access is sufficient.
     private float inverseDensity;
     private final ByteBuffer buffer;
+    private final NativeTouchSink nativeTouchSink;
+    private final MotionTouchEvent motionTouchEvent;
 
     /**
      * Create a new touch event handler.
@@ -56,9 +94,18 @@ public final class TouchEventHandler {
      * @param density Display density for coordinate scaling (physical → CSS pixels)
      */
     public TouchEventHandler(float density) {
+        this(density, NativeMethods::onTouchRaw);
+    }
+
+    TouchEventHandler(float density, NativeTouchSink nativeTouchSink) {
+        if (nativeTouchSink == null) {
+            throw new IllegalArgumentException("nativeTouchSink must not be null");
+        }
         updateDensity(density);
         this.buffer = ByteBuffer.allocateDirect(MAX_POINTERS * TOUCH_POINT_SIZE);
         this.buffer.order(ByteOrder.nativeOrder());
+        this.nativeTouchSink = nativeTouchSink;
+        this.motionTouchEvent = new MotionTouchEvent();
     }
 
     /**
@@ -81,12 +128,24 @@ public final class TouchEventHandler {
      * @param sessionId The session ID
      * @param event     The MotionEvent
      */
-    public void dispatch(int sessionId, MotionEvent event) {
+    public boolean dispatch(int sessionId, MotionEvent event) {
+        if (event == null) {
+            return false;
+        }
+        motionTouchEvent.bind(event);
+        try {
+            return dispatch(sessionId, motionTouchEvent);
+        } finally {
+            motionTouchEvent.clear();
+        }
+    }
+
+    boolean dispatch(int sessionId, TouchEvent event) {
         if (sessionId < 0 || event == null) {
-            return;
+            return false;
         }
 
-        final int actionMasked = event.getActionMasked();
+        final int actionMasked = event.actionMasked();
 
         // Early reject: only process touch actions, skip HOVER_MOVE, SCROLL, etc.
         switch (actionMasked) {
@@ -98,7 +157,7 @@ public final class TouchEventHandler {
             case MotionEvent.ACTION_CANCEL:
                 break;
             default:
-                return;
+                return false;
         }
 
         // Drop a pointer-down/up whose triggering pointer was truncated beyond
@@ -107,13 +166,16 @@ public final class TouchEventHandler {
         // state is unchanged by this pointer's transition, so nothing is lost.)
         if (actionMasked == MotionEvent.ACTION_POINTER_DOWN
                 || actionMasked == MotionEvent.ACTION_POINTER_UP) {
-            if (event.getActionIndex() >= MAX_POINTERS) {
-                return;
+            if (event.actionIndex() >= MAX_POINTERS) {
+                return false;
             }
         }
 
         final int count = flatten(event, actionMasked);
-        NativeMethods.onTouchRaw(sessionId, actionMasked, event.getEventTime(), count, buffer);
+        if (count == 0) {
+            return false;
+        }
+        return nativeTouchSink.send(sessionId, actionMasked, event.eventTime(), count, buffer);
     }
 
     /**
@@ -123,11 +185,11 @@ public final class TouchEventHandler {
      * @param actionMasked Pre-extracted masked action (avoids redundant call)
      * @return Number of touch points packed
      */
-    private int flatten(MotionEvent event, int actionMasked) {
+    private int flatten(TouchEvent event, int actionMasked) {
         buffer.clear();
 
-        final int count = Math.min(event.getPointerCount(), MAX_POINTERS);
-        final int actionIndex = event.getActionIndex();
+        final int count = Math.min(event.pointerCount(), MAX_POINTERS);
+        final int actionIndex = event.actionIndex();
         final float scale = inverseDensity;
 
         // For POINTER_DOWN/UP only the triggering pointer changed;
@@ -148,10 +210,10 @@ public final class TouchEventHandler {
         // Games sample input once per frame, so the newest position is what
         // matters, and coalescing minimizes per-event work and latency.
         for (int i = 0; i < count; i++) {
-            buffer.putInt(event.getPointerId(i));
-            buffer.putFloat(event.getX(i) * scale);
-            buffer.putFloat(event.getY(i) * scale);
-            buffer.putFloat(TouchInputNormalizer.pressure(event.getPressure(i)));
+            buffer.putInt(event.pointerId(i));
+            buffer.putFloat(event.x(i) * scale);
+            buffer.putFloat(event.y(i) * scale);
+            buffer.putFloat(TouchInputNormalizer.pressure(event.pressure(i)));
             int flags = (!perPointer || i == actionIndex) ? FLAG_CHANGED : 0;
             if (cancel || (up && i == actionIndex)) {
                 flags |= FLAG_REMOVED;

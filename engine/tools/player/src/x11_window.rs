@@ -4,7 +4,7 @@
 //! renders into a host-provided surface and never creates a window itself,
 //! which `scripts/test-surface-attachment-contract.sh` enforces. Here the player
 //! *is* the host: it opens the display, creates the window, and hands the two
-//! opaque handles to `linux_x11_graphics_platform` / `LinuxX11Surface`.
+//! opaque handles to `LinuxX11Context`.
 //!
 //! Xlib is loaded at runtime through `x11-dl`, so neither the player nor the
 //! SDK gains a link-time X11 dependency — the same posture the desktop
@@ -40,21 +40,13 @@ pub struct X11Window {
 
 impl X11Window {
     /// Open a display, create a window of `width` x `height`, and map it.
-    ///
-    /// `XInitThreads` is called before anything else because the engine's
-    /// render thread resolves the EGL display from this connection while this
-    /// thread services window events — the exact contract
-    /// `linux_x11_graphics_platform` documents.
     pub fn open(title: &str, width: u32, height: u32) -> Result<Self, String> {
         let xlib = xlib::Xlib::open().map_err(|error| format!("load Xlib: {error}"))?;
 
         // SAFETY: every call below is a plain Xlib call with the arguments its
-        // manual page specifies. `XInitThreads` comes first, as required, and
-        // the display pointer is checked for null before any use.
+        // manual page specifies, and the display pointer is checked for null
+        // before any use. Migo opens a separate render connection.
         unsafe {
-            if (xlib.XInitThreads)() == 0 {
-                return Err("XInitThreads failed; Xlib is not thread-safe here".to_string());
-            }
             let display = NonNull::new((xlib.XOpenDisplay)(std::ptr::null())).ok_or_else(|| {
                 let target = std::env::var("DISPLAY").unwrap_or_else(|_| "(DISPLAY unset)".into());
                 format!("XOpenDisplay failed for {target}")
@@ -92,12 +84,12 @@ impl X11Window {
         }
     }
 
-    /// The X11 `Display*`, for `linux_x11_graphics_platform`.
+    /// The X11 `Display*`, borrowed synchronously by `LinuxX11Context::open`.
     pub fn display(&self) -> NonNull<c_void> {
         self.display.cast()
     }
 
-    /// The window XID, for `LinuxX11Surface`.
+    /// The host-owned window XID.
     pub fn window(&self) -> c_ulong {
         self.window
     }

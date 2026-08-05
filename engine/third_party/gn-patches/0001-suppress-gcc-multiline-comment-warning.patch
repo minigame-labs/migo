@@ -1,0 +1,14 @@
+diff --git a/build/gen.py b/build/gen.py
+index eacd28a0..8f150c9f 100755
+--- a/build/gen.py
++++ b/build/gen.py
+@@ -566,6 +566,9 @@ def WriteGNNinja(path, platform, host, options, args_list):
+       cflags.append('-Wno-redundant-move')
+       # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=104336
+       cflags.append('-Wno-restrict')
++      # ASCII art in header_checker.h ends a line with a backslash, which GCC
++      # alone reports as a multi-line comment.
++      cflags.append('-Wno-comment')
+     # flags not supported by gcc/g++.
+     else:
+       cflags.extend(['-Wrange-loop-analysis', '-Wextra-semi-stmt'])

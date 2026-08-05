@@ -5,7 +5,7 @@ use shared::js_escape::{hook_args_one, hook_args_two};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use jni::objects::{JByteBuffer, JClass, JObject, JString};
 
@@ -76,6 +76,23 @@ fn jni_string_to_cow(
 // need to invoke a global `_internalOn*('escaped_json')` function in V8.
 // ---------------------------------------------------------------------------
 
+fn read_json_result(env: &mut JNIEnv, result_json: &JString, fallback_json: &str) -> String {
+    env.get_string(result_json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| fallback_json.to_string())
+}
+
+fn send_json_result_to_js(host_id: jint, json: &str, js_callback: &'static str) {
+    // The hook is handed the JSON *string* and parses it itself, which is what
+    // it has always received. Decoding here would change the argument every
+    // one of these callbacks sees.
+    let cmd = HostCommand::InvokeHostHook {
+        hook: js_callback,
+        args_json: hook_args_one(json),
+    };
+    let _ = send_reliable_command_to_host(host_id, cmd);
+}
+
 fn forward_json_result_to_js(
     env: &mut JNIEnv,
     host_id: jint,
@@ -83,18 +100,8 @@ fn forward_json_result_to_js(
     js_callback: &'static str,
     fallback_json: &str,
 ) {
-    let json: String = env
-        .get_string(result_json)
-        .map(|s| s.into())
-        .unwrap_or_else(|_| fallback_json.to_string());
-    // The hook is handed the JSON *string* and parses it itself, which is what
-    // it has always received. Decoding here would change the argument every
-    // one of these callbacks sees.
-    let cmd = HostCommand::InvokeHostHook {
-        hook: js_callback,
-        args_json: hook_args_one(json.as_str()),
-    };
-    let _ = send_command_to_host(host_id, cmd);
+    let json = read_json_result(env, result_json, fallback_json);
+    send_json_result_to_js(host_id, &json, js_callback);
 }
 
 /// Generate a JNI `extern "system"` callback that forwards a JSON string
@@ -120,14 +127,15 @@ macro_rules! jni_json_callback {
         }
     };
 }
-use jni::sys::{jdouble, jfloat, jint, jlong, jobject, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jdouble, jfloat, jint, jlong, jobject, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use tracing::{error, info};
 
 use migo_core::{
     HostIngress, HostIngressSendError, host_ingress, lease_surface, retire_surface,
-    send_command_to_host, send_critical_command_to_host, shutdown_host, spawn_host_thread,
+    send_command_to_host, send_critical_command_to_host, send_reliable_command_to_host,
+    spawn_host_thread,
 };
 use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
 use shared::protocol::host_cmd::{
@@ -136,6 +144,7 @@ use shared::protocol::host_cmd::{
 use shared::surface::{PixelRatio, SurfaceRef};
 
 use shared::config::InitOptions;
+use shared::error::ErrorCode;
 
 use crate::android::jni::init_jni_env;
 use crate::android::jni::jni_safe;
@@ -145,6 +154,13 @@ use crate::android::surface::{
     ANativeWindow_fromSurface, ANativeWindow_getHeight, ANativeWindow_getWidth,
     ANativeWindow_release, ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
 };
+use crate::host_owners::HostOwners;
+
+static HOST_OWNERS: OnceLock<HostOwners> = OnceLock::new();
+
+fn host_owners() -> &'static HostOwners {
+    HOST_OWNERS.get_or_init(HostOwners::new)
+}
 
 thread_local! {
     /// Android touch and Choreographer callbacks normally share the UI thread.
@@ -456,9 +472,21 @@ pub(crate) extern "system" fn init(
         // early returns release it); hand it to the host.
         let surface_ref: SurfaceRef = Arc::new(android_surface);
 
-        let host_id = spawn_host_thread(surface_ref, graphics_platform, platform, init_options);
-        match host_id {
-            Ok(id) => id,
+        let host = spawn_host_thread(surface_ref, graphics_platform, platform, init_options);
+        match host {
+            Ok(host) => match host_owners().insert(host) {
+                Ok(host_id) => host_id,
+                Err(mut host) => {
+                    error!(
+                        "duplicate Android Host ID {}; refusing ownership",
+                        host.id()
+                    );
+                    if let Err(join_error) = host.shutdown_and_join() {
+                        error!("failed to join rejected Android Host: {join_error}");
+                    }
+                    -1
+                }
+            },
             Err(e) => {
                 error!("Host initialized failed: err={e}");
                 -1
@@ -621,7 +649,7 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
             hook: "_internalOnOpenBluetoothSettingResult",
             args_json: hook_args_one(json.as_str()),
         };
-        let _ = send_command_to_host(host_id, cmd);
+        let _ = send_reliable_command_to_host(host_id, cmd);
     });
 }
 
@@ -636,7 +664,7 @@ pub(crate) extern "system" fn onOpenAppAuthorizeSetting<'local>(
             hook: "_internalOnOpenAppAuthorizeSettingFinished",
             args_json: hook_args_one(code),
         };
-        let _ = send_command_to_host(host_id, cmd);
+        let _ = send_reliable_command_to_host(host_id, cmd);
     });
 }
 
@@ -648,10 +676,10 @@ pub(crate) extern "system" fn onTouch(
     time: jlong,
     count: jint,
     buffer: JObject,
-) {
-    jni_safe!("onTouch", {
+) -> jboolean {
+    jni_safe!("onTouch", JNI_FALSE, {
         if count <= 0 || count > 10 {
-            return;
+            return JNI_FALSE;
         }
 
         let buf = JByteBuffer::from(buffer);
@@ -660,7 +688,7 @@ pub(crate) extern "system" fn onTouch(
             Ok(p) => p,
             Err(e) => {
                 error!("onTouch failed: get_direct_buffer_address error: {:?}", e);
-                return;
+                return JNI_FALSE;
             }
         };
 
@@ -672,7 +700,7 @@ pub(crate) extern "system" fn onTouch(
             Ok(cap) => cap,
             Err(e) => {
                 error!("onTouch failed: get_direct_buffer_capacity error: {:?}", e);
-                return;
+                return JNI_FALSE;
             }
         };
 
@@ -681,7 +709,7 @@ pub(crate) extern "system" fn onTouch(
                 "onTouch failed: buffer underflow - expected {} bytes, got {} bytes",
                 expected_size, capacity
             );
-            return;
+            return JNI_FALSE;
         }
 
         // Single memcpy from DirectByteBuffer into fixed inline array — no heap allocation.
@@ -699,7 +727,7 @@ pub(crate) extern "system" fn onTouch(
             3 => TouchType::Cancel,
             _ => {
                 tracing::warn!("onTouch rejected unsupported action {action}");
-                return;
+                return JNI_FALSE;
             }
         };
 
@@ -710,16 +738,36 @@ pub(crate) extern "system" fn onTouch(
             timestamp_ms: time as i64,
         };
 
-        match with_hot_ingress(host_id, |ingress| ingress.try_send_touch(touch)) {
-            Some(Ok(())) => {}
-            Some(Err(HostIngressSendError::Full)) => {
+        let result = with_hot_ingress(host_id, |ingress| {
+            let result = ingress.try_send_touch(touch);
+            let notify = matches!(result, Err(HostIngressSendError::Full))
+                && ingress.claim_input_saturation_notification();
+            (result, notify)
+        });
+        match result {
+            Some((Ok(_), _)) => JNI_TRUE,
+            Some((Err(HostIngressSendError::Full), notify)) => {
                 tracing::debug!("Host {host_id} touch ingress is saturated");
+                if notify {
+                    if let Err(error) = crate::android::jni::notify_error(
+                        host_id,
+                        ErrorCode::InputSaturated.as_u16(),
+                        ErrorCode::InputSaturated.default_message(),
+                        "bounded touch transport refused an event; reduce host sampling rate",
+                    ) {
+                        tracing::debug!(
+                            "Host {host_id} input saturation notification failed: {error}"
+                        );
+                    }
+                }
+                JNI_FALSE
             }
-            Some(Err(HostIngressSendError::Closed)) | None => {
+            Some((Err(HostIngressSendError::Closed), _)) | None => {
                 invalidate_hot_ingress(host_id);
+                JNI_FALSE
             }
         }
-    });
+    })
 }
 
 pub(crate) extern "system" fn executeScript<'local>(
@@ -787,15 +835,28 @@ pub(crate) extern "system" fn shutdown<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
-) {
-    jni_safe!("shutdown", {
-        if let Err(e) = shutdown_host(host_id) {
-            error!("shutdown failed: host_id={}, error={}", host_id, e);
-        } else {
-            info!("Host {} shut down successfully", host_id);
-        }
+) -> jboolean {
+    jni_safe!("shutdown", JNI_FALSE, {
         invalidate_hot_ingress(host_id);
-    });
+        match host_owners().shutdown_with(host_id, |host| host.shutdown_and_join()) {
+            Ok(had_owner) => {
+                crate::android::services::clear_permissions(host_id);
+                if had_owner {
+                    info!("Host {} shut down and joined successfully", host_id);
+                } else {
+                    info!("Host {} is already shut down", host_id);
+                }
+                JNI_TRUE
+            }
+            Err(error) => {
+                error!(
+                    "shutdown failed and remains retryable: host_id={}, error={}",
+                    host_id, error
+                );
+                JNI_FALSE
+            }
+        }
+    })
 }
 
 pub(crate) extern "system" fn onShow<'local>(
@@ -879,7 +940,7 @@ pub(crate) extern "system" fn onModalResult<'local>(
             hook: "_internalOnModalResult",
             args_json: hook_args_two(confirm, cancel),
         };
-        let _ = send_command_to_host(host_id, cmd);
+        let _ = send_reliable_command_to_host(host_id, cmd);
     });
 }
 
@@ -894,7 +955,7 @@ pub(crate) extern "system" fn onActionSheetResult<'local>(
             hook: "_internalOnActionSheetResult",
             args_json: hook_args_one(tap_index),
         };
-        let _ = send_command_to_host(host_id, cmd);
+        let _ = send_reliable_command_to_host(host_id, cmd);
     });
 }
 
@@ -1269,14 +1330,47 @@ pub(crate) extern "system" fn updatePermission<'local>(
     host_id: jint,
     scope: JString<'local>,
     granted: jni::sys::jboolean,
-) {
-    jni_safe!("updatePermission", {
+) -> jboolean {
+    jni_safe!("updatePermission", JNI_FALSE, {
+        if host_ingress(host_id).is_err() {
+            tracing::debug!(host_id, "ignoring permission update for ended session");
+            return JNI_FALSE;
+        }
         let scope: String = match env.get_string(&scope) {
             Ok(s) => s.into(),
-            Err(_) => return,
+            Err(_) => return JNI_FALSE,
         };
-        crate::android::services::set_permission(host_id, &scope, granted != 0);
-    });
+        let Some(scope) = shared::services::Scope::from_wx_str(&scope) else {
+            tracing::warn!(host_id, "ignoring unknown permission scope");
+            return JNI_FALSE;
+        };
+        match crate::android::services::update_permission(host_id, scope, granted != 0, || {
+            crate::android::jni::permission_revoke_resources(host_id, scope.as_wx_str())
+        }) {
+            Ok(()) => JNI_TRUE,
+            Err(crate::android_permission_gate::UpdateError::Closed) => {
+                tracing::debug!(host_id, "ignoring permission update for closing session");
+                JNI_FALSE
+            }
+            Err(crate::android_permission_gate::UpdateError::Cleanup(error)) => {
+                tracing::error!(
+                    host_id,
+                    scope = scope.as_wx_str(),
+                    %error,
+                    "permission revocation cleanup failed"
+                );
+                if let Err(notify_error) = crate::android::jni::notify_error(
+                    host_id,
+                    ErrorCode::Internal.as_u16(),
+                    "permission revocation cleanup failed",
+                    &error,
+                ) {
+                    tracing::error!(host_id, %notify_error, "cleanup failure callback failed");
+                }
+                JNI_FALSE
+            }
+        }
+    })
 }
 
 pub(crate) extern "system" fn onBeaconServiceChange(
@@ -1507,11 +1601,27 @@ jni_json_callback!(
     "_internalOnSubpackageProgress",
     r#"{"requestId":0}"#
 );
-jni_json_callback!(
-    onSubpackageResult,
-    "_internalOnSubpackageResult",
-    r#"{"requestId":0,"error":"failed to read result"}"#
-);
+
+/// The one JSON callback that does not forward its payload verbatim: the host
+/// reports where it downloaded the subpackage, and that path is kept in the
+/// runtime rather than handed to the game. `op_install_subpackage` takes it back
+/// by request id, so a game cannot name a file for the installer to ingest.
+pub(crate) extern "system" fn onSubpackageResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    jni_safe!("onSubpackageResult", {
+        let json = read_json_result(
+            &mut env,
+            &result_json,
+            r#"{"requestId":0,"error":"failed to read result"}"#,
+        );
+        let for_js = shared::services::intercept_download_result(host_id, &json);
+        send_json_result_to_js(host_id, &for_js, "_internalOnSubpackageResult");
+    });
+}
 
 // ==================== VSync (Choreographer) ====================
 
