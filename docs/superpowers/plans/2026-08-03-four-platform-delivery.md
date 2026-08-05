@@ -1324,6 +1324,35 @@ review. A commit alone is not completion evidence.
   **Verified.** runtime-v8 515 from 514; every other crate unchanged;
   `scripts/verify-change.sh --base HEAD` every host step PASS.
 
+- [ ] 0.45 Decide whether `console.log` may keep taking the process-wide console
+  registry lock. Found by sweeping every per-session registry behind a shared lock
+  after task 0.44, asking of each whether a per-event path consults it. Most came
+  back clean: `HOST_SENDERS` is already gated, `SESSION_CACHES` and `STATS` were
+  gated by tasks 0.16 and 0.27, and `VSYNC_SENDERS` resolves once into the host
+  handle — its "intentionally a cold attach-time operation" comment is true, and
+  the structure enforces it. This one did not.
+
+  `push_console_log(id, ..)` calls `get_console_log(id)`, which takes a read guard
+  on the process-wide `CONSOLE_LOGS` map — **on every `console.log` the content
+  makes**, from `runtime-v8/src/console/mod.rs`. In production the map is empty and
+  the guard is uncontended, so the cost is nanoseconds; what the rule in Section
+  7.3 is about is the coupling, and this path does couple to every other Session's
+  bring-up and teardown, which take the same lock for writing.
+
+  **Not fixed here, because the obvious fix has a correctness trap and the win is
+  small.** The op already caches `HOST_ID` in a thread-local set once at bring-up,
+  so caching the `Arc<Mutex<ConsoleLogBuffer>>` beside it is the same shape as the
+  text texture cache and image cache fixes. But the buffer is registered only when
+  debug is enabled, and the restart path unregisters and re-registers, so a
+  bring-up-time resolve can miss it and a lazily cached `None` would miss it
+  permanently — trading a nanosecond for a silently empty devtools console.
+
+  So the decision this task owes is which of three: resolve at bring-up and prove
+  the ordering holds across restart; cache only a successful resolve and accept
+  that an unregistered session pays the lookup; or record the read as an accepted
+  exception, on the grounds that a debug-only buffer is not a hot path, and say so
+  in Section 7.3 rather than leaving the rule looking violated.
+
 - [ ] 0.41 Guard the batched submit's obligation to return its vector to the
   pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
   `recycle_gl_command_vec` instead of returning the emptied vector **failed no
