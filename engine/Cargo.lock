@@ -1631,6 +1631,7 @@ dependencies = [
  "futures-util",
  "hound",
  "lewton",
+ "migo-alloc-probe",
  "migo-executor-probe",
  "migo-shared",
  "minimp3",
