@@ -70,6 +70,17 @@ if rg -n 'unbounded_channel|Semaphore' "$CHANNEL"; then
     fail "legacy unbounded/semaphore host transport remains"
 fi
 
+# Everything above reads the source for properties the code was *written* to have,
+# which cannot fail when an allocation appears. These two require the tests that
+# can: `cargo test -p migo-shared --lib` counts real allocations across a burst on
+# both halves of the transport and fails on a non-zero count. Deleting a gate is
+# the one failure mode those tests cannot report about themselves, so it is checked
+# here.
+require_literal "$CHANNEL" "assert_no_steady_state_allocation(" \
+    "the ordered host queue has no allocation-count gate, only structural checks"
+require_literal "$CRATES/shared/src/payload_pool.rs" "assert_no_steady_state_allocation(" \
+    "the input payload pool has no allocation-count gate, only structural checks"
+
 require_literal "$REGISTRY" "pub(crate) const HOST_RELIABLE_INPUT_RESERVE: usize = 64;" \
     "reliable input reserve is missing or no longer non-zero"
 require_multiline_regex "$REGISTRY" \

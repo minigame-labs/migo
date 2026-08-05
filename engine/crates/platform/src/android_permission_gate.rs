@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
@@ -29,19 +29,16 @@ struct HostControl {
 
 type HostState = Arc<HostControl>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Hosts {
-    highest_opened_host_id: i32,
+    /// Ids whose session has been cleared. A tombstone must reject exactly the
+    /// ids that were retired -- not every id at or below the highest ever
+    /// opened. Ids are allocated on the caller thread but opened from each
+    /// session's own thread, so they do not arrive here in allocation order,
+    /// and a high-water mark would refuse a live lower-id session outright.
+    /// Bounded by the number of sessions the process ever created.
+    retired: HashSet<i32>,
     live: HashMap<i32, HostState>,
-}
-
-impl Default for Hosts {
-    fn default() -> Self {
-        Self {
-            highest_opened_host_id: -1,
-            live: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -83,12 +80,17 @@ impl PermissionGate {
         self.hosts.lock().live.get(&host_id).cloned()
     }
 
+    /// Admit a session id, or refuse one that is already live or was retired.
+    ///
+    /// Refusal is not advisory: no `HostControl` exists for a refused id, so
+    /// every later permission check for it is denied. Callers must not discard
+    /// the answer.
+    #[must_use]
     pub(crate) fn open(&self, host_id: i32) -> bool {
         let mut hosts = self.hosts.lock();
-        if host_id <= hosts.highest_opened_host_id || hosts.live.contains_key(&host_id) {
+        if hosts.retired.contains(&host_id) || hosts.live.contains_key(&host_id) {
             return false;
         }
-        hosts.highest_opened_host_id = host_id;
         hosts.live.insert(
             host_id,
             Arc::new(HostControl {
@@ -190,6 +192,38 @@ impl PermissionGate {
             .is_some_and(|current| Arc::ptr_eq(current, &host))
         {
             hosts.live.remove(&host_id);
+            hosts.retired.insert(host_id);
+        }
+    }
+
+    /// Whether `host_id` belonged to a session that has been cleared.
+    ///
+    /// Retirement is monotonic, so reading it after a refusal cannot turn a
+    /// retired id back into a live one.
+    fn is_retired(&self, host_id: i32) -> bool {
+        self.hosts.lock().retired.contains(&host_id)
+    }
+
+    /// Admit a session id, reporting the one refusal that is a bug.
+    ///
+    /// A refusal is legitimate when the id is still live: a session restart
+    /// rebuilds device services for a host whose grants must survive. A
+    /// *retired* id is not -- no `HostControl` will ever exist for it, so every
+    /// permission check that session makes is denied for its whole life, which
+    /// content cannot distinguish from the user refusing. That is silent, so it
+    /// is logged loudly and trips a debug build.
+    pub(crate) fn open_or_report(&self, host_id: i32) {
+        if !self.open(host_id) && self.is_retired(host_id) {
+            tracing::error!(
+                host_id,
+                "permission gate refused a retired host id; every permission \
+                 check for this session will be denied"
+            );
+            debug_assert!(
+                false,
+                "permission gate refused retired host id {host_id}; \
+                 permissions will be denied for this session"
+            );
         }
     }
 
@@ -210,7 +244,7 @@ mod tests {
     #[test]
     fn revocation_waits_for_admitted_operation_then_tears_it_down() {
         let gate = Arc::new(PermissionGate::default());
-        gate.open(41);
+        assert!(gate.open(41), "test setup failed to open the host");
         gate.update(41, Scope::Camera, true, || Ok::<(), ()>(()))
             .unwrap();
 
@@ -262,7 +296,7 @@ mod tests {
     #[test]
     fn caught_operation_panic_does_not_block_later_cleanup() {
         let gate = PermissionGate::default();
-        gate.open(51);
+        assert!(gate.open(51), "test setup failed to open the host");
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = gate.run(51, None, || panic!("operation failed"));
@@ -281,7 +315,7 @@ mod tests {
     #[test]
     fn protected_operation_does_not_hold_host_mutex_across_external_code() {
         let gate = PermissionGate::default();
-        gate.open(56);
+        assert!(gate.open(56), "test setup failed to open the host");
         gate.update(56, Scope::Camera, true, || Ok::<(), ()>(()))
             .unwrap();
         let host = gate.host_state(56).expect("open host");
@@ -298,7 +332,7 @@ mod tests {
     #[test]
     fn clear_waits_for_inflight_update_then_leaves_a_tombstone() {
         let gate = Arc::new(PermissionGate::default());
-        gate.open(61);
+        assert!(gate.open(61), "test setup failed to open the host");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
@@ -333,7 +367,7 @@ mod tests {
     #[test]
     fn update_waiting_behind_clear_cannot_recreate_the_host() {
         let gate = Arc::new(PermissionGate::default());
-        gate.open(71);
+        assert!(gate.open(71), "test setup failed to open the host");
         let (closing_tx, closing_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
@@ -359,6 +393,112 @@ mod tests {
         assert!(updated_rx.recv().unwrap().is_err());
         update.join().unwrap();
         assert_eq!(gate.scope_state(71, Scope::Camera), None);
+    }
+
+    #[test]
+    fn a_lower_host_id_opened_after_a_higher_one_still_gets_its_permissions() {
+        // Host ids are allocated on the caller thread but opened from each
+        // session's own thread, so two sessions starting together can arrive
+        // here in the opposite order. Neither is retired, so both must open.
+        let gate = PermissionGate::default();
+        assert!(gate.open(7), "the first session was refused");
+        assert!(
+            gate.open(5),
+            "a live session was refused because a higher id opened first"
+        );
+
+        gate.update(5, Scope::Camera, true, || Ok::<(), ()>(()))
+            .expect("granting a scope on an open host");
+        assert_eq!(
+            gate.run(5, Some(Scope::Camera), || ()),
+            Ok(()),
+            "a granted scope surfaced as a denial"
+        );
+        assert_eq!(gate.scope_state(5, Scope::Camera), Some(true));
+    }
+
+    #[test]
+    fn a_cleared_id_stays_retired_when_a_higher_id_opens_afterwards() {
+        let gate = PermissionGate::default();
+        assert!(gate.open(11));
+        gate.clear(11);
+
+        // A later, unrelated session must not resurrect the retired id.
+        assert!(gate.open(12));
+        assert!(!gate.open(11), "a retired id was reopened");
+        assert_eq!(gate.run(11, None, || ()), Err(Denied));
+        assert_eq!(gate.scope_state(11, Scope::Camera), None);
+    }
+
+    #[test]
+    fn clearing_one_host_leaves_another_live_host_untouched() {
+        let gate = PermissionGate::default();
+        assert!(gate.open(22));
+        assert!(gate.open(21));
+        gate.update(21, Scope::Camera, true, || Ok::<(), ()>(()))
+            .expect("granting a scope on an open host");
+
+        gate.clear(22);
+
+        assert_eq!(
+            gate.run(21, Some(Scope::Camera), || ()),
+            Ok(()),
+            "clearing a sibling host denied a live host"
+        );
+        // A fresh id below the cleared one is still admissible.
+        assert!(gate.open(20));
+        assert_eq!(gate.run(20, None, || ()), Ok(()));
+        assert_eq!(gate.live_host_count_for_tests(), 2);
+    }
+
+    #[test]
+    fn reopening_a_live_host_is_tolerated_because_a_restart_rebuilds_services() {
+        // `on_restart` rebuilds device services for the same, still-live id and
+        // does not clear permissions, so its grants must survive untouched.
+        let gate = PermissionGate::default();
+        gate.open_or_report(31);
+        gate.update(31, Scope::Camera, true, || Ok::<(), ()>(()))
+            .expect("granting a scope on an open host");
+
+        gate.open_or_report(31);
+
+        assert_eq!(
+            gate.scope_state(31, Scope::Camera),
+            Some(true),
+            "rebuilding services for a live host dropped its grants"
+        );
+        assert_eq!(gate.run(31, Some(Scope::Camera), || ()), Ok(()));
+        assert_eq!(gate.live_host_count_for_tests(), 1);
+    }
+
+    /// The report is a `debug_assert!`, so what "reported" means differs by
+    /// profile and both are asserted here. A single unconditional
+    /// `#[should_panic]` failed the release suite outright, which is worse than
+    /// the silence it was written to catch: it makes `cargo test --release`
+    /// unusable and so stops anyone running the rest of these tests in the
+    /// profile that ships.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "refused retired host id")]
+    fn reopening_a_retired_host_trips_a_debug_build() {
+        let gate = PermissionGate::default();
+        gate.open_or_report(32);
+        gate.clear(32);
+        gate.open_or_report(32);
+    }
+
+    /// In release the report is a log line, so the observable contract is that
+    /// the call returns and the retired id is still refused. Without this the
+    /// release profile would assert nothing at all about this case.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn reopening_a_retired_host_returns_without_admitting_it_in_release() {
+        let gate = PermissionGate::default();
+        gate.open_or_report(32);
+        gate.clear(32);
+        gate.open_or_report(32);
+        assert_eq!(gate.live_host_count_for_tests(), 0);
+        assert!(!gate.open(32));
     }
 
     #[test]

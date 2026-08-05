@@ -55,7 +55,7 @@ impl AndroidDeviceServices {
         host_id: i32,
         host_keyboard: Option<Arc<dyn KeyboardService>>,
     ) -> Self {
-        permission_gate().open(host_id);
+        permission_gate().open_or_report(host_id);
         Self {
             host_id,
             host_keyboard,

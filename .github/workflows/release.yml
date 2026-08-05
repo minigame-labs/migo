@@ -163,12 +163,13 @@ jobs:
         # the subtle failures were: a substring match that counted local-dynamic
         # relocations as local-exec, and an export audit that read nm instead of
         # objdump and so reported 190 exports for a library that exports 12.
+        #
+        # Discovered rather than listed. The list this replaced had drifted: it
+        # omitted test_collect_render_metrics.py, test_compare_render_results.py and
+        # test_v8_source_proof.py, so those never ran here -- and the last of them
+        # guards the provenance proof behind every V8 component manifest.
         run: |
-          python3 scripts/ci/tests/test_abi_floor_audit.py
-          python3 scripts/ci/tests/test_gen_linux_package_metadata.py
-          python3 scripts/ci/tests/test_gen_android_package_metadata.py
-          python3 scripts/ci/tests/test_write_linux_build_metadata.py
-          python3 scripts/ci/tests/test_write_linux_v8_component_manifest.py
+          python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'
 
       - name: Artifact manifest tooling and contract
         run: |

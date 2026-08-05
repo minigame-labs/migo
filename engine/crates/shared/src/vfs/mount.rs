@@ -58,6 +58,20 @@ pub trait MountBackend: Send + Sync + fmt::Debug {
     /// Root directory of this source, if directory-backed.
     fn root_dir(&self) -> Option<&Path>;
 
+    /// An identity for this source's contents that means the same thing in every
+    /// Session, for backends whose files have no real path of their own.
+    ///
+    /// Directory-backed sources return `None` and want nothing here: a caller can
+    /// key on the resolved real path, which is already globally meaningful. A
+    /// package has no such path, so without this a cache key can only fall back on
+    /// the mount table position -- which is per-Session and identical across
+    /// Sessions, and so collides. Returning `None` is always safe: callers must
+    /// substitute [`ResolvedCode::source_identity`]'s per-mount fallback rather
+    /// than share.
+    fn source_identity(&self) -> Option<u64> {
+        None
+    }
+
     /// Compute file size + digest for a file entry.
     fn get_file_info(&self, _relative_path: &str, _algorithm: &str) -> io::Result<(u64, String)> {
         Err(io::Error::new(
@@ -261,11 +275,35 @@ pub struct ResolvedCode {
     /// Generation when the specific source (overlay or base) was mounted.
     /// Changes only when THIS source is replaced, not when other sources change.
     pub source_mounted_at: u64,
+    /// Identity of the mount that served this path, meaningful across Sessions.
+    ///
+    /// [`source_mounted_at`](Self::source_mounted_at) is **not** usable for that:
+    /// it counts mounts within one `MountTable`, every Session owns its own, and a
+    /// base mount is `1` in all of them -- so two Sessions resolving the same
+    /// virtual path out of different packages produce the same value. Any cache
+    /// shared between Sessions must key on this instead.
+    ///
+    /// It is the backend's own [`MountBackend::source_identity`] when it has one,
+    /// so two Sessions mounting byte-identical packages agree and can share the
+    /// bytes; otherwise it is an id unique to this mount within the process, so
+    /// they cannot be confused for one another. Correct by construction either
+    /// way, rather than contingent on every backend implementing the accessor.
+    pub source_identity: u64,
 }
 
 // ---------------------------------------------------------------------------
 // MountEntry (internal)
 // ---------------------------------------------------------------------------
+
+/// Hands out an id unique to each mount for the life of the process.
+///
+/// The per-table `mounted_at` generation cannot do this job: it starts at the same
+/// value in every `MountTable`, so two Sessions' base mounts share it.
+static NEXT_MOUNT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_mount_uid() -> u64 {
+    NEXT_MOUNT_UID.fetch_add(1, Ordering::Relaxed)
+}
 
 struct MountEntry {
     /// Human-readable name (e.g. `"base"`, `"subpackage:stage1"`).
@@ -277,6 +315,17 @@ struct MountEntry {
     /// Generation counter value when this entry was mounted.
     /// Used as part of the replace-sensitive identity token.
     mounted_at: u64,
+    /// Process-unique id for this mount, used as the cross-Session identity
+    /// fallback when the backend offers none of its own.
+    uid: u64,
+}
+
+impl MountEntry {
+    /// What a cross-Session cache may key on. See
+    /// [`ResolvedCode::source_identity`].
+    fn source_identity(&self) -> u64 {
+        self.backend.source_identity().unwrap_or(self.uid)
+    }
 }
 
 impl fmt::Debug for MountEntry {
@@ -355,6 +404,7 @@ impl MountTable {
                     prefix: String::new(),
                     backend: Arc::new(DirSource::new(base_dir)),
                     mounted_at: 1,
+                    uid: next_mount_uid(),
                 },
                 overlays: Vec::new(),
             }),
@@ -428,6 +478,7 @@ impl MountTable {
                         mount_name: overlay.name.clone(),
                         mount_generation: current_gen,
                         source_mounted_at: overlay.mounted_at,
+                        source_identity: overlay.source_identity(),
                     });
                 }
                 None => {
@@ -437,6 +488,7 @@ impl MountTable {
                             mount_name: overlay.name.clone(),
                             mount_generation: current_gen,
                             source_mounted_at: overlay.mounted_at,
+                            source_identity: overlay.source_identity(),
                         });
                     }
                     if !normalized.is_empty() {
@@ -449,6 +501,7 @@ impl MountTable {
                                     mount_name: "virtual-dir".to_string(),
                                     mount_generation: current_gen,
                                     source_mounted_at: candidate.mounted_at,
+                                    source_identity: candidate.source_identity(),
                                 });
                             }
                         }
@@ -460,6 +513,7 @@ impl MountTable {
 
         // Base mount.
         let base_mounted_at = inner.base.mounted_at;
+        let base_identity = inner.base.source_identity();
         match inner.base.backend.real_path(&normalized) {
             Some(real) => {
                 if let Some(root) = inner.base.backend.root_dir() {
@@ -472,6 +526,7 @@ impl MountTable {
                     mount_name: inner.base.name.clone(),
                     mount_generation: current_gen,
                     source_mounted_at: base_mounted_at,
+                    source_identity: base_identity,
                 });
             }
             None => {
@@ -482,6 +537,7 @@ impl MountTable {
                         mount_name: inner.base.name.clone(),
                         mount_generation: current_gen,
                         source_mounted_at: base_mounted_at,
+                        source_identity: base_identity,
                     });
                 }
             }
@@ -498,6 +554,7 @@ impl MountTable {
                         mount_name: "virtual-dir".to_string(),
                         mount_generation: current_gen,
                         source_mounted_at: overlay.mounted_at,
+                        source_identity: overlay.source_identity(),
                     });
                 }
             }
@@ -867,6 +924,7 @@ impl MountTable {
             prefix: normalized_prefix,
             backend,
             mounted_at: new_gen,
+            uid: next_mount_uid(),
         });
         true
     }
@@ -894,6 +952,7 @@ impl MountTable {
             prefix: String::new(),
             backend: new_backend,
             mounted_at: new_gen,
+            uid: next_mount_uid(),
         };
     }
 
@@ -919,6 +978,17 @@ impl MountTable {
 // ---------------------------------------------------------------------------
 // StagingArea — atomic subpackage installation
 // ---------------------------------------------------------------------------
+
+/// What a completed package install produced.
+///
+/// The digest is here rather than derived later because the install already held
+/// the whole package in memory; recovering it afterwards would mean reading the
+/// file again.
+#[derive(Debug, Clone)]
+pub struct InstalledPackage {
+    pub identity: super::package::PackageIdentity,
+    pub digest: super::package::PackageDigest,
+}
 
 /// RAII helper for atomic subpackage installation.
 ///
@@ -1067,7 +1137,7 @@ impl StagingArea {
         mount_prefix: &str,
         package_name: &str,
         package_version: &str,
-    ) -> Result<super::package::PackageIdentity, io::Error> {
+    ) -> Result<InstalledPackage, io::Error> {
         self.install_package_signed(
             mount_table,
             pkg_filename,
@@ -1097,7 +1167,7 @@ impl StagingArea {
         package_version: &str,
         manifest: Option<&[u8]>,
         signature: Option<&[u8]>,
-    ) -> Result<super::package::PackageIdentity, io::Error> {
+    ) -> Result<InstalledPackage, io::Error> {
         let staged_pkg = self.staging_dir.join(pkg_filename);
         if !staged_pkg.exists() {
             return Err(io::Error::new(
@@ -1123,9 +1193,22 @@ impl StagingArea {
         super::package::verify_package_signature(&pkg_bytes, manifest, signature)
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
 
+        // Taken from the bytes the read above already produced, so the identity a
+        // shared cache keys this package's entries on costs no second pass. It
+        // describes the bytes that are about to be renamed into place, which the
+        // game cannot substitute: the staging directory is outside every VFS
+        // mapping. See `GamePaths::sandbox_cache_dir`.
+        let digest = super::package::PackageDigest::of_bytes(&pkg_bytes);
+
         // Ensure parent directory of final_path exists.
         if let Some(parent) = final_path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Before the replacement, not after a successful one, and refused
+            // rather than warned about: the window this closes is a process kill
+            // between the rename and the caller's record write, and if the record
+            // cannot be made to stop describing the outgoing file then the file
+            // must not be replaced.
+            PackageManifest::forget_digest_for(parent, final_path)?;
         }
 
         // Move old file out of the way if it exists.
@@ -1149,10 +1232,11 @@ impl StagingArea {
                 // Open and mount.  If open fails after rename succeeded,
                 // restore the old package from trash to avoid leaving the
                 // system in a half-failed state.
-                let source = match super::package::PackSource::open(
+                let source = match super::package::PackSource::open_with_recorded_digest(
                     final_path,
                     package_name,
                     package_version,
+                    &digest,
                 ) {
                     Ok(s) => s,
                     Err(open_err) => {
@@ -1203,7 +1287,7 @@ impl StagingArea {
                 }
                 self.cleanup();
 
-                Ok(identity)
+                Ok(InstalledPackage { identity, digest })
             }
             Err(rename_err) => {
                 // Restore old file.
@@ -1247,6 +1331,14 @@ pub struct ManifestEntry {
     pub prefix: String,
     /// Package version string.
     pub version: String,
+    /// Hex [`super::package::PackageDigest`] of the installed package file.
+    ///
+    /// A cache identity, not a trust anchor: it lets a session start key
+    /// pack-backed entries on the package's bytes without reading them again.
+    /// Optional because a record written before the field existed has none, and
+    /// because it is always recomputable from the file it describes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
 }
 
 /// Per-game manifest mapping package name → install metadata.
@@ -1279,9 +1371,48 @@ impl PackageManifest {
     }
 
     /// Record a newly installed package.
-    pub fn record(&mut self, name: String, prefix: String, version: String) {
-        self.packages
-            .insert(name, ManifestEntry { prefix, version });
+    pub fn record(
+        &mut self,
+        name: String,
+        prefix: String,
+        version: String,
+        digest: &super::package::PackageDigest,
+    ) {
+        self.packages.insert(
+            name,
+            ManifestEntry {
+                prefix,
+                version,
+                content_digest: Some(digest.to_hex()),
+            },
+        );
+    }
+
+    /// Stop any record from describing the bytes at `pkg_path` before they are
+    /// replaced.
+    ///
+    /// A digest describes a file, so it has to be dropped before that file
+    /// changes. The intermediate state — a record with no digest — is always
+    /// safe, because a restore digests the package it finds. The state this
+    /// avoids is not: a replacement whose own record never lands (the manifest
+    /// write is only a warning for `loadSubpackage`) would leave the previous
+    /// digest naming the new bytes, and a Session still holding the previous
+    /// package would then share a decoded entry with them.
+    fn forget_digest_for(store_dir: &Path, pkg_path: &Path) -> io::Result<()> {
+        let mut manifest = Self::load(store_dir);
+        let mut changed = false;
+        for (name, entry) in manifest.packages.iter_mut() {
+            if entry.content_digest.is_some() && store_dir.join(format!("{name}.mpkg")) == pkg_path
+            {
+                entry.content_digest = None;
+                changed = true;
+            }
+        }
+        if changed {
+            manifest.save(store_dir)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1299,6 +1430,11 @@ pub fn package_store_dir(game_cache_dir: &Path) -> PathBuf {
 /// MountTable.  Reads `manifest.json`, opens each `.mpkg`, and mounts
 /// as overlay.  Silently skips packages that no longer exist on disk.
 ///
+/// Each mount is keyed on the digest the install recorded, so a session start
+/// costs the package index and nothing more. A record that predates the field is
+/// digested here and the result written back, paying once per installed package
+/// instead of once per session.
+///
 /// When `code_signing_enabled` is true, skips restoration entirely —
 /// downloaded subpackages lack Ed25519 signatures and must not be loaded.
 pub fn restore_installed_packages(
@@ -1311,7 +1447,8 @@ pub fn restore_installed_packages(
         return;
     }
     let store = package_store_dir(game_cache_dir);
-    let manifest = PackageManifest::load(&store);
+    let mut manifest = PackageManifest::load(&store);
+    let mut digested_here: Vec<(String, super::package::PackageDigest)> = Vec::new();
 
     for (name, entry) in &manifest.packages {
         let pkg_path = store.join(format!("{name}.mpkg"));
@@ -1322,7 +1459,29 @@ pub fn restore_installed_packages(
             );
             continue;
         }
-        match super::package::PackSource::open(&pkg_path, name, &entry.version) {
+        let digest = match entry
+            .content_digest
+            .as_deref()
+            .and_then(super::package::PackageDigest::parse_hex)
+        {
+            Some(recorded) => recorded,
+            None => match super::package::PackageDigest::of_file(&pkg_path) {
+                Ok(computed) => {
+                    digested_here.push((name.clone(), computed));
+                    computed
+                }
+                Err(e) => {
+                    tracing::warn!("failed to digest package '{name}': {e}");
+                    continue;
+                }
+            },
+        };
+        match super::package::PackSource::open_with_recorded_digest(
+            &pkg_path,
+            name,
+            &entry.version,
+            &digest,
+        ) {
             Ok(source) => {
                 if mount_table.mount_overlay(
                     format!("subpackage:{name}"),
@@ -1340,6 +1499,17 @@ pub fn restore_installed_packages(
             Err(e) => {
                 tracing::warn!("failed to open package '{name}': {e}");
             }
+        }
+    }
+
+    if !digested_here.is_empty() {
+        for (name, digest) in digested_here {
+            if let Some(entry) = manifest.packages.get_mut(&name) {
+                entry.content_digest = Some(digest.to_hex());
+            }
+        }
+        if let Err(e) = manifest.save(&store) {
+            tracing::warn!("failed to persist package digests (recomputed next session): {e}");
         }
     }
 }
@@ -1416,6 +1586,7 @@ fn highest_matching_overlay<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::package;
     use std::fs;
 
     // -----------------------------------------------------------------------
@@ -1801,6 +1972,162 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&overlay_v1);
         let _ = fs::remove_dir_all(&overlay_v2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Install record — the digest a shared cache keys pack-backed entries on
+    // -----------------------------------------------------------------------
+
+    fn write_package(path: &Path, entry: &str, content: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let file = fs::File::create(path).unwrap();
+        let mut writer = package::PackageWriter::new(io::BufWriter::new(file)).unwrap();
+        writer.add_entry(entry, content).unwrap();
+        writer.finish("stage1", "1.0").unwrap();
+    }
+
+    /// Install a package built in a staging area, returning the install result.
+    fn install_staged_package(
+        mount_table: &MountTable,
+        cache_root: &Path,
+        content: &[u8],
+    ) -> InstalledPackage {
+        let staging = StagingArea::create(cache_root, "stage1").unwrap();
+        write_package(&staging.dir().join("stage1.mpkg"), "main.js", content);
+        staging
+            .install_package(
+                mount_table,
+                "stage1.mpkg",
+                &package_store_dir(cache_root).join("stage1.mpkg"),
+                "subpackages/stage1",
+                "stage1",
+                "1.0",
+            )
+            .unwrap()
+    }
+
+    fn mounted_identity(mount_table: &MountTable) -> u64 {
+        mount_table
+            .resolve_code_path("/code/subpackages/stage1/main.js")
+            .expect("subpackage entry must resolve")
+            .source_identity
+    }
+
+    #[test]
+    fn install_reports_the_digest_of_the_bytes_it_installed() {
+        let root = make_test_dir("install_digest");
+        let cache_root = root.join("cache");
+        let mt = MountTable::new(root.join("code"));
+
+        let installed = install_staged_package(&mt, &cache_root, b"// stage one");
+
+        let final_path = package_store_dir(&cache_root).join("stage1.mpkg");
+        assert_eq!(
+            installed.digest,
+            package::PackageDigest::of_file(&final_path).unwrap(),
+        );
+        assert_eq!(mounted_identity(&mt), installed.digest.cache_identity());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacing_a_package_drops_the_digest_recorded_for_the_old_one() {
+        let root = make_test_dir("replace_invalidates_digest");
+        let cache_root = root.join("cache");
+        let store = package_store_dir(&cache_root);
+        let mt = MountTable::new(root.join("code"));
+
+        let first = install_staged_package(&mt, &cache_root, b"// one");
+        let mut manifest = PackageManifest::load(&store);
+        manifest.record(
+            "stage1".into(),
+            "subpackages/stage1".into(),
+            "1.0".into(),
+            &first.digest,
+        );
+        manifest.save(&store).unwrap();
+
+        // A replacement whose record never lands: the manifest write is a warning
+        // for `loadSubpackage`, so a full disk leaves exactly this state. The old
+        // record must not survive it, or the next session mounts these bytes under
+        // the previous package's identity and shares a cache entry with whoever
+        // still has that package.
+        let second = install_staged_package(&mt, &cache_root, b"// two, larger");
+        assert_ne!(first.digest, second.digest);
+
+        let next_session = MountTable::new(root.join("code"));
+        restore_installed_packages(&next_session, &cache_root, false);
+
+        assert_eq!(
+            mounted_identity(&next_session),
+            second.digest.cache_identity()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recorded_digest_is_the_identity_without_re_reading_the_package() {
+        let root = make_test_dir("restore_recorded_digest");
+        let cache_root = root.join("cache");
+        let store = package_store_dir(&cache_root);
+
+        install_staged_package(&MountTable::new(root.join("code")), &cache_root, b"// one");
+
+        // Only the runtime can write this record -- the store is outside every VFS
+        // mapping, which `no_vfs_mapping_contains_the_runtime_cache_root` pins. So
+        // restore may take the recorded digest as the identity, and that is what
+        // keeps a session start free of a pass over every installed package.
+        let recorded = package::PackageDigest::of_bytes(b"recorded by the runtime");
+        let mut manifest = PackageManifest::load(&store);
+        manifest.record(
+            "stage1".into(),
+            "subpackages/stage1".into(),
+            "1.0".into(),
+            &recorded,
+        );
+        manifest.save(&store).unwrap();
+
+        let next_session = MountTable::new(root.join("code"));
+        restore_installed_packages(&next_session, &cache_root, false);
+
+        assert_eq!(mounted_identity(&next_session), recorded.cache_identity());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_record_without_a_digest_mounts_the_bytes_own_identity_and_persists_it() {
+        let root = make_test_dir("restore_legacy_record");
+        let cache_root = root.join("cache");
+        let store = package_store_dir(&cache_root);
+
+        install_staged_package(&MountTable::new(root.join("code")), &cache_root, b"// one");
+
+        // The shape a record written before the field existed has.
+        fs::write(
+            store.join("manifest.json"),
+            r#"{"packages":{"stage1":{"prefix":"subpackages/stage1","version":"1.0"}}}"#,
+        )
+        .unwrap();
+
+        let next_session = MountTable::new(root.join("code"));
+        restore_installed_packages(&next_session, &cache_root, false);
+
+        let from_bytes = package::PackageDigest::of_file(&store.join("stage1.mpkg")).unwrap();
+        assert_eq!(mounted_identity(&next_session), from_bytes.cache_identity());
+        assert_eq!(
+            PackageManifest::load(&store).packages["stage1"]
+                .content_digest
+                .as_deref(),
+            Some(from_bytes.to_hex().as_str()),
+            "the digest has to be persisted, or every later session pays for it again",
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     // -----------------------------------------------------------------------

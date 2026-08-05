@@ -14,6 +14,8 @@ use shared::error::{EngineError, EngineResult, ErrorCode};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
+use crate::off_worker::OffWorker;
+
 /// Keep only a small number of decoded chunks ahead of the audio thread.
 /// When the app is backgrounded and stops polling, async sends apply
 /// backpressure to both decoding and the network response body.
@@ -247,7 +249,7 @@ async fn streaming_download_task(
 
     // Stream the response body
     let mut stream = response.bytes_stream();
-    let mut decoder = Mp3StreamDecoder::new(target_sample_rate);
+    let mut decoder = OffWorker::new(Mp3StreamDecoder::new(target_sample_rate));
     let mut ready_sent = false;
 
     use futures_util::StreamExt;
@@ -309,11 +311,16 @@ async fn streaming_download_task(
             }
         }
 
-        // Feed chunk to decoder
-        decoder.push_data(&chunk);
-
-        // Try to decode frames
-        let (new_samples, sample_rate, channels) = decoder.decode_available();
+        // Feed the chunk to the decoder and take whatever frames it completed. Both
+        // are CPU-bound and this task's worker is shared with every other session's
+        // download, so the step runs where the worker is not waiting for it.
+        let (rest, (new_samples, sample_rate, channels)) = decoder
+            .with(move |decoder| {
+                decoder.push_data(&chunk);
+                decoder.decode_available()
+            })
+            .await?;
+        decoder = rest;
 
         // Send ready message once we have format info
         if !ready_sent && sample_rate > 0 && channels > 0 {
@@ -350,7 +357,7 @@ async fn streaming_download_task(
     }
 
     // Flush remaining data
-    let (final_samples, _, _) = decoder.flush();
+    let (_decoder, (final_samples, _, _)) = decoder.with(Mp3StreamDecoder::flush).await?;
     if !final_samples.is_empty() {
         total_decoded_samples += final_samples.len();
         tracing::trace!("Flushed {} final samples", final_samples.len());
@@ -485,8 +492,46 @@ impl Mp3StreamDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use migo_executor_probe::{PATIENCE, SharedExecutor, assert_leaves_the_executor_free};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::mpsc::error::TrySendError;
+
+    /// Not MP3, and deliberately so: the decoder keeps what it cannot yet decode, so
+    /// the buffered length is a value only the real decoder produces.
+    const A_CHUNK: &[u8] = b"bytes no frame ends in";
+
+    #[test]
+    fn the_decode_step_leaves_the_shared_streaming_worker_free() {
+        // `STREAM_RUNTIME` is process-wide and single-worker, so a decode that ran on
+        // it would stall every other session's download for as long as the decode
+        // took -- which is as long as the chunk is, not as long as anyone budgeted.
+        let buffered = assert_leaves_the_executor_free(
+            SharedExecutor {
+                step: "streaming MP3 decode",
+                executor: "the process-wide audio streaming worker",
+                patience: PATIENCE,
+            },
+            get_stream_runtime(),
+            |cpu| async move {
+                let (_decoder, buffered) = OffWorker::new(Mp3StreamDecoder::new(48_000))
+                    .with(move |decoder| {
+                        cpu.occupy();
+                        decoder.push_data(A_CHUNK);
+                        decoder.decode_available();
+                        decoder.buffer.len()
+                    })
+                    .await
+                    .expect("the decode step must complete");
+                buffered
+            },
+        );
+
+        assert_eq!(
+            buffered,
+            A_CHUNK.len(),
+            "the step must have run against the real decoder, not a stand-in"
+        );
+    }
 
     #[test]
     fn stream_channel_applies_backpressure_at_capacity() {

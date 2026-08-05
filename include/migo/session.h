@@ -246,6 +246,23 @@ migo_engine_create(const MigoEngineConfig *config, MigoEngine **out_engine);
  */
 MIGO_API MigoResult MIGO_CALL migo_engine_destroy(MigoEngine *engine);
 
+/*
+ * Concurrency, stated affirmatively rather than left to the absence of a
+ * prohibition:
+ *
+ * An Engine may own any number of live Sessions at once, and a process may
+ * create more than one Engine. Sessions are isolated from each other: each gets
+ * its own V8 isolate, its own platform manager registries, its own permission
+ * monitor, and storage rooted at its own game identity. One Session's teardown
+ * neither disturbs nor drains another's state.
+ *
+ * Two Sessions may be driven concurrently from two host threads. Calls through
+ * any *single* Session remain the host's responsibility to serialise; the
+ * guarantee here is between Sessions, not within one.
+ *
+ * migo_engine_create and migo_session_create may themselves be called
+ * concurrently from different host threads.
+ */
 MIGO_API MigoResult MIGO_CALL migo_session_create(
     MigoEngine *engine,
     const MigoSessionConfig *config,

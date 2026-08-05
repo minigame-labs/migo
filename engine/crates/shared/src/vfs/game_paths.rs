@@ -77,6 +77,8 @@ pub struct GamePaths {
     user_data_dir: PathBuf,
     /// Cache directory (may be cleared by system)
     cache_dir: PathBuf,
+    /// Game-writable subtree of the cache directory (mapped to `/cache`)
+    sandbox_cache_dir: PathBuf,
     /// Temporary directory (cleared when session ends)
     temp_dir: PathBuf,
 }
@@ -115,6 +117,7 @@ impl GamePaths {
             code_dir: files_base.join("code"),
             user_data_dir: files_base.join("user_data"),
             cache_dir: cache_base.clone(),
+            sandbox_cache_dir: cache_base.join("sandbox"),
             temp_dir: cache_base.join("tmp"),
         })
     }
@@ -148,8 +151,25 @@ impl GamePaths {
     }
 
     /// Get the cache directory path.
+    ///
+    /// This is the per-game cache **root**, and it is runtime state rather than
+    /// game data: the package install store, install staging directories and the
+    /// derived-asset cache all live directly under it. It must never be the
+    /// target of a VFS mapping — the game-writable cache is
+    /// [`sandbox_cache_dir`](Self::sandbox_cache_dir), a child of it.
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    /// The subtree of the cache root the game may write, mapped to `/cache`.
+    ///
+    /// Separate from [`cache_dir`](Self::cache_dir) because the root also holds
+    /// the runtime's own records. A game that could write those would decide
+    /// which package bytes a later session mounts as `/code`, what identity a
+    /// shared cache keys them under, and could swap a staged package between the
+    /// moment an install validates it and the moment it is renamed into place.
+    pub fn sandbox_cache_dir(&self) -> &Path {
+        &self.sandbox_cache_dir
     }
 
     /// Get the temporary directory path.
@@ -164,7 +184,7 @@ impl GamePaths {
     /// not by this method.
     pub fn ensure_directories(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.user_data_dir)?;
-        std::fs::create_dir_all(&self.cache_dir)?;
+        std::fs::create_dir_all(&self.sandbox_cache_dir)?;
         std::fs::create_dir_all(&self.temp_dir)?;
         Ok(())
     }
@@ -187,7 +207,7 @@ impl GamePaths {
         if self.cache_dir.exists() {
             std::fs::remove_dir_all(&self.cache_dir)?;
         }
-        std::fs::create_dir_all(&self.cache_dir)?;
+        std::fs::create_dir_all(&self.sandbox_cache_dir)?;
         std::fs::create_dir_all(&self.temp_dir)?;
         Ok(())
     }

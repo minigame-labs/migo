@@ -6,11 +6,14 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 
@@ -256,6 +259,156 @@ public final class PermissionOperationGateTest {
     }
 
     @Test
+    public void aLowerSessionIdOpenedAfterAHigherOneStillGetsItsPermissions() {
+        // Session ids are allocated on the caller thread but opened from each session's own
+        // thread, so two sessions starting together can arrive here in the opposite order.
+        // Neither id was retired, so both must be admitted and both must stay usable.
+        PermissionOperationGate gate = new PermissionOperationGate();
+
+        assertTrue("the first session was refused", gate.open(3007));
+        assertTrue(
+                "a live session was refused because a higher id opened first",
+                gate.open(3005));
+
+        assertNull(gate.update(3005, "scope.camera", true, () -> true).failure());
+        assertNotNull(
+                "a granted scope on a live session surfaced as a denial",
+                gate.register(3005, "scope.camera"));
+        assertNull(gate.update(3007, "scope.camera", true, () -> true).failure());
+        assertNotNull(gate.register(3007, "scope.camera"));
+    }
+
+    @Test
+    public void aClosedIdStaysRetiredWhenAHigherIdOpensAfterwards() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(3011));
+        assertNull(gate.close(3011).failure());
+
+        // A later, unrelated session must not resurrect the retired id.
+        assertTrue(gate.open(3012));
+
+        assertFalse("a retired id was reopened", gate.open(3011));
+        assertNotNull(gate.update(3011, "scope.camera", true, () -> true).failure());
+        assertNull(gate.register(3011, "scope.camera"));
+    }
+
+    @Test
+    public void closingOneSessionLeavesAnotherLiveSessionUntouched() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(3022));
+        assertTrue("a live session was refused because a higher id opened first",
+                gate.open(3021));
+        assertNull(gate.update(3021, "scope.camera", true, () -> true).failure());
+
+        assertNull(gate.close(3022).failure());
+
+        assertNotNull(
+                "closing a sibling session denied a live session",
+                gate.register(3021, "scope.camera"));
+        assertTrue(gate.runIfGranted(3021, "scope.camera", () -> true));
+        // A fresh id below the closed one is still admissible.
+        assertTrue(gate.open(3020));
+        assertNull(gate.update(3020, "scope.camera", true, () -> true).failure());
+        assertEquals(2, gate.retainedSessionCountForTests());
+    }
+
+    @Test
+    public void replacedCancellationRunsExactlyOnceAndAThrowingOneIsRetained() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(3030));
+        assertNull(gate.update(3030, "scope.userLocation", true, () -> true).failure());
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        int[] replacementRuns = {0};
+        PermissionOperationGate.Pending pending = gate.register(
+                3030, "scope.userLocation", () -> events.add("original"));
+        assertNotNull(pending);
+
+        // The replacement is installed from inside the framework entry, exactly as
+        // LocationProvider does once the framework hands back its cancellable request.
+        assertTrue(gate.enter(pending, () -> pending.setCancellation(() -> {
+            replacementRuns[0]++;
+            events.add("replacement");
+            if (replacementRuns[0] == 1) {
+                throw new IllegalStateException("replacement cancel failed");
+            }
+        })));
+
+        PermissionOperationGate.Result denied =
+                gate.update(3030, "scope.userLocation", false, () -> true);
+        assertNotNull("a throwing cancellation was reported as success", denied.failure());
+        assertEquals(
+                "denial ran a cancellation other than the installed replacement",
+                Collections.singletonList("replacement"),
+                events);
+        assertEquals(1, replacementRuns[0]);
+        assertFalse(gate.enter(pending, () -> events.add("late")));
+
+        // The throwing entry is retained, so close retries it and retires it on success.
+        assertNull(gate.close(3030).failure());
+        assertEquals(
+                Arrays.asList("replacement", "replacement"),
+                events);
+        assertEquals(2, replacementRuns[0]);
+
+        assertNull(gate.close(3030).failure());
+        assertEquals(
+                "a retired cancellation ran again after succeeding",
+                2,
+                replacementRuns[0]);
+    }
+
+    /**
+     * The executed cancellation must be the one published under the session monitor when the
+     * pending set was snapshotted. Cancellations run with the monitor released, so a
+     * concurrent {@code setCancellation} can otherwise swap the action of a pending that has
+     * been snapshotted but not yet run, and the action actually invoked stops being the one
+     * the snapshot admitted.
+     */
+    @Test
+    public void aCancellationReplacedWhileAnotherRunsDoesNotSwapTheExecutedAction()
+            throws Exception {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(3031));
+        assertNull(gate.update(3031, "scope.userLocation", true, () -> true).failure());
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        // Snapshotted cancellations run sequentially on the denying thread, so the first one
+        // to run can park while the replacement is installed on the one still queued.
+        ResourceCleanup.Action original = () -> {
+            events.add("original");
+            if (firstEntered.getCount() > 0) {
+                firstEntered.countDown();
+                await(releaseFirst);
+            }
+        };
+        PermissionOperationGate.Pending first =
+                gate.register(3031, "scope.userLocation", original);
+        PermissionOperationGate.Pending second =
+                gate.register(3031, "scope.userLocation", original);
+        assertNotNull(first);
+        assertNotNull(second);
+
+        PermissionOperationGate.Result[] denied = {null};
+        Thread denial = new Thread(
+                () -> denied[0] = gate.update(3031, "scope.userLocation", false, () -> true));
+        denial.start();
+        assertTrue(firstEntered.await(1, TimeUnit.SECONDS));
+
+        first.setCancellation(() -> events.add("replacement"));
+        second.setCancellation(() -> events.add("replacement"));
+        releaseFirst.countDown();
+        joinBounded(denial);
+
+        assertNull(denied[0].failure());
+        assertEquals(
+                "a cancellation installed after the pending snapshot replaced the action the"
+                        + " snapshot admitted",
+                Arrays.asList("original", "original"),
+                events);
+    }
+
+    @Test
     public void denialDrainsAdmittedScopeRunBeforeNativeUpdateAndRejectsLaterRun()
             throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
@@ -418,6 +571,94 @@ public final class PermissionOperationGateTest {
         assertNotNull(denied[0]);
         assertNull(denied[0].failure());
         assertFalse(gate.runIfGranted(2003, "scope.bluetooth", () -> true));
+    }
+
+    @Test
+    public void closeCancellationDoesNotRetainTheSessionMonitor() throws Exception {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(2004));
+        assertNull(gate.update(2004, "scope.bluetooth", true, () -> true).failure());
+        assertNull(gate.update(2004, "scope.camera", true, () -> true).failure());
+        CountDownLatch cancellationEntered = new CountDownLatch(1);
+        CountDownLatch releaseCancellation = new CountDownLatch(1);
+        assertNotNull(gate.register(2004, "scope.bluetooth", () -> {
+            cancellationEntered.countDown();
+            await(releaseCancellation);
+        }));
+
+        Thread close = new Thread(() -> gate.close(2004));
+        close.start();
+        assertTrue(cancellationEntered.await(1, TimeUnit.SECONDS));
+
+        CountDownLatch observed = new CountDownLatch(1);
+        Thread observer = new Thread(() -> {
+            gate.register(2004, "scope.camera");
+            observed.countDown();
+        });
+        observer.setDaemon(true);
+        observer.start();
+
+        try {
+            assertTrue(
+                    "a blocked cancellation retained the permission-session monitor",
+                    observed.await(1, TimeUnit.SECONDS));
+        } finally {
+            releaseCancellation.countDown();
+        }
+        joinBounded(close);
+        joinBounded(observer);
+    }
+
+    /**
+     * Contention on the per-event admission path is a structural property rather than a
+     * behavioural one: every holder of the shared session map releases it in nanoseconds,
+     * so no functional fixture can tell a shared monitor apart from a concurrent map. This
+     * asserts the invariant directly; the sibling test guards the concurrency it enables.
+     */
+    @Test
+    public void perEventSessionLookupTakesNoLockSharedAcrossSessions() throws Exception {
+        Field sessions = PermissionOperationGate.class.getDeclaredField("sessions");
+
+        assertTrue(
+                "per-event admission must resolve a session without a lock shared across"
+                        + " sessions; declared type was " + sessions.getType().getName(),
+                ConcurrentMap.class.isAssignableFrom(sessions.getType()));
+    }
+
+    @Test
+    public void twoSessionsAdmitCallbacksConcurrently() throws Exception {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(2005));
+        assertNull(gate.update(2005, "scope.bluetooth", true, () -> true).failure());
+        assertTrue(gate.open(2006));
+        assertNull(gate.update(2006, "scope.bluetooth", true, () -> true).failure());
+        CyclicBarrier bothInside = new CyclicBarrier(2);
+        boolean[] admitted = {false, false};
+
+        Thread first = new Thread(() -> admitted[0] = gate.runIfGranted(
+                2005, "scope.bluetooth", () -> awaitBarrier(bothInside)));
+        Thread second = new Thread(() -> admitted[1] = gate.runIfGranted(
+                2006, "scope.bluetooth", () -> awaitBarrier(bothInside)));
+        first.setDaemon(true);
+        second.setDaemon(true);
+        first.start();
+        second.start();
+        joinBounded(first);
+        joinBounded(second);
+
+        assertTrue(admitted[0]);
+        assertTrue(admitted[1]);
+    }
+
+    private static boolean awaitBarrier(CyclicBarrier barrier) {
+        try {
+            barrier.await(5, TimeUnit.SECONDS);
+            return true;
+        } catch (Exception failure) {
+            throw new AssertionError(
+                    "two sessions could not hold an admitted callback at the same time",
+                    failure);
+        }
     }
 
     private static void joinBounded(Thread thread) throws InterruptedException {

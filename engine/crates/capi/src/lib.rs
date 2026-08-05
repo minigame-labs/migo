@@ -17,6 +17,8 @@
 mod callback_gate;
 mod callbacks;
 mod capabilities;
+#[cfg(test)]
+mod concurrent_sessions;
 mod gamepad;
 mod host_kit;
 mod input;

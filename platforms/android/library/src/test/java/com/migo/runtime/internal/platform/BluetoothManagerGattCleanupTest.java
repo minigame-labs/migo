@@ -153,6 +153,68 @@ public final class BluetoothManagerGattCleanupTest {
         assertEquals(1, second.closeAttempts);
     }
 
+    /**
+     * A late candidate is never mapped -- the map holds the winning attempt -- so a
+     * failed close has no map entry to keep it alive the way {@code closeAndRemoveGatt}
+     * keeps a failed owned close. Without explicit retention the {@code BluetoothGatt}
+     * is simply dropped: the OS handle stays open for process life and nothing will
+     * ever try again.
+     */
+    @Test
+    public void rejectedCandidateWhoseCloseFailsIsRetainedAndRetriedByTheNextClose() {
+        List<String> failures = new ArrayList<>();
+        BluetoothManager manager = new BluetoothManager(
+                13,
+                (operation, failure) -> failures.add(operation),
+                (deviceId, connected) -> {});
+        BluetoothManager.GattAttempt attempt = manager.beginGattAttempt("77:88");
+        FakeGattConnection owner = new FakeGattConnection();
+        FakeGattConnection candidate = new FakeGattConnection();
+        candidate.failCloseOnce = true;
+
+        assertTrue(manager.publishGattConnection("77:88", attempt, owner));
+        assertFalse(manager.publishGattConnection("77:88", attempt, candidate));
+        assertEquals(1, candidate.closeAttempts);
+        assertEquals(1, failures.size());
+        assertEquals(1, manager.unclosedCandidateCountForTests());
+
+        manager.closeGattConnection("77:88");
+
+        assertEquals("the retained candidate must be retried", 2, candidate.closeAttempts);
+        assertEquals(0, manager.unclosedCandidateCountForTests());
+        assertEquals(1, owner.closeAttempts);
+        assertFalse(manager.hasGattConnection("77:88", owner));
+    }
+
+    /** A retry that fails again keeps the handle rather than dropping it. */
+    @Test
+    public void rejectedCandidateStaysRetainedWhileItsCloseKeepsFailing() {
+        BluetoothManager manager = new BluetoothManager(
+                14,
+                (operation, failure) -> {},
+                (deviceId, connected) -> {});
+        BluetoothManager.GattAttempt attempt = manager.beginGattAttempt("99:aa");
+        FakeGattConnection owner = new FakeGattConnection();
+        FakeGattConnection candidate = new FakeGattConnection();
+        candidate.failCloseAlways = true;
+
+        assertTrue(manager.publishGattConnection("99:aa", attempt, owner));
+        assertFalse(manager.publishGattConnection("99:aa", attempt, candidate));
+        assertEquals(1, manager.unclosedCandidateCountForTests());
+
+        manager.closeGattConnection("99:aa");
+        assertEquals(2, candidate.closeAttempts);
+        assertEquals(
+                "a still-failing candidate must stay retained",
+                1,
+                manager.unclosedCandidateCountForTests());
+
+        candidate.failCloseAlways = false;
+        manager.closeGattConnection("99:aa");
+        assertEquals(3, candidate.closeAttempts);
+        assertEquals(0, manager.unclosedCandidateCountForTests());
+    }
+
     @Test
     public void staleAttemptSensitiveCallbacksAreRejectedAndCurrentAttemptIsDelivered() {
         List<String> characteristicEvents = new ArrayList<>();
@@ -664,6 +726,7 @@ public final class BluetoothManagerGattCleanupTest {
     private static final class FakeGattConnection implements BluetoothManager.GattConnection {
         boolean discoverResult = true;
         boolean failCloseOnce;
+        boolean failCloseAlways;
         boolean failDisconnectOnce;
         int discoverAttempts;
         int disconnectAttempts;
@@ -699,6 +762,9 @@ public final class BluetoothManagerGattCleanupTest {
             closeAttempts++;
             if (dispatchInFlight) closedDuringDispatch = true;
             if (lifecycleEvents != null) lifecycleEvents.add("close");
+            if (failCloseAlways) {
+                throw new IllegalStateException("gatt close failed");
+            }
             if (failCloseOnce) {
                 failCloseOnce = false;
                 throw new IllegalStateException("gatt close failed");

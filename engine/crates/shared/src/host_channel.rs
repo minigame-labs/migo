@@ -470,6 +470,7 @@ mod tests {
 
     use super::{InputSendOutcome, InputStream, channel, channel_with_reserve};
     use crate::protocol::host_cmd::HostCommand;
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
     use tokio::sync::mpsc::error::{SendError, TrySendError};
 
     fn mouse_move(x: f32) -> HostCommand {
@@ -710,5 +711,52 @@ mod tests {
             assert!(rx.recv().await.is_none());
         });
         producer.join().unwrap();
+    }
+
+    /// Section 7.3: zero steady-state allocation on the input transport.
+    ///
+    /// This counts allocations rather than reading the source for
+    /// `VecDeque::with_capacity`, which is what
+    /// `scripts/test-input-transport-contract.sh` does and why that script cannot
+    /// fail when an allocation appears.
+    ///
+    /// The burst covers all three producer entry points plus the drain, and it
+    /// deliberately carries no `String`-bearing command: constructing an
+    /// `OnKeyUp { key, code }` allocates in the *caller*, which says nothing about
+    /// the transport. What is measured is enqueue, coalesce, supersede and dequeue.
+    #[test]
+    fn steady_state_input_burst_never_reaches_the_heap() {
+        let (tx, _critical_tx, mut rx) = channel_with_reserve(8, 4);
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "host_channel: coalescible motion, reliable and terminal transitions, drain",
+                warmup: 4,
+                measured: 64,
+            },
+            |iteration| {
+                let x = iteration as f32;
+                tx.try_send_coalescible(InputStream::Pointer, mouse_move(x))
+                    .unwrap();
+                tx.try_send_coalescible(InputStream::Pointer, mouse_move(x + 1.0))
+                    .unwrap();
+                tx.try_send_reliable(Some(InputStream::Pointer), mouse_down())
+                    .unwrap();
+                tx.try_send_coalescible(InputStream::Pointer, mouse_move(x + 2.0))
+                    .unwrap();
+                tx.try_send_terminal(Some(InputStream::Pointer), mouse_up())
+                    .unwrap();
+
+                let mut drained = 0usize;
+                while rx.try_recv().is_ok() {
+                    drained += 1;
+                }
+                // The terminal transition supersedes both surviving motion entries,
+                // so a burst that drains anything else did not exercise the paths
+                // this measurement claims to cover.
+                assert_eq!(drained, 2);
+                drained
+            },
+        );
     }
 }

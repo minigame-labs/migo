@@ -76,6 +76,72 @@ pub struct PackageIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// PackageDigest
+// ---------------------------------------------------------------------------
+
+/// SHA-256 over a package file's bytes.
+///
+/// This is what a cross-Session cache may key pack-backed entries on, and the
+/// property it has to carry is that **producing the key requires holding the
+/// content**: two mounts agree only if their packages are byte-identical, so
+/// sharing a decoded entry can never hand a Session bytes it did not already
+/// have. Entry metadata cannot carry that property, because the format's
+/// per-entry integrity primitive is a CRC32 and a package can be built to match
+/// another's per-entry paths, sizes and CRC32s.
+///
+/// Packing is deterministic — see `streaming_add_matches_buffered_add_bit_for_bit`
+/// — so the same content packed by the same writer still shares. Content packed
+/// with different chunk sizes does not, which loses sharing rather than safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackageDigest([u8; 32]);
+
+impl PackageDigest {
+    /// Digest bytes already held in memory. The install path reads the whole
+    /// package to hand it to the signature verifier, so it pays no extra I/O.
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        Self(hasher.finalize().into())
+    }
+
+    /// Digest a package file, streaming through a fixed buffer so a large
+    /// package costs one buffer rather than its own size in memory.
+    pub fn of_file(path: &Path) -> io::Result<Self> {
+        const CHUNK: usize = 64 * 1024;
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let read = file.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
+        Ok(Self(hasher.finalize().into()))
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub fn parse_hex(text: &str) -> Option<Self> {
+        let bytes = hex::decode(text).ok()?;
+        Some(Self(bytes.try_into().ok()?))
+    }
+
+    /// The identity a cache keys on, truncated to the width of the key space it
+    /// feeds: [`super::ResolvedCode::source_identity`] is a `u64` and the
+    /// on-disk derived-asset key encodes eight bytes, so a wider value would be
+    /// truncated at the next hop rather than carried.
+    pub fn cache_identity(&self) -> u64 {
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&self.0[..8]);
+        u64::from_le_bytes(head)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PackageError
 // ---------------------------------------------------------------------------
 
@@ -571,8 +637,14 @@ impl<W: Write + Seek> PackageWriter<W> {
         .write_to(&mut self.writer)?;
         self.writer.flush()?;
 
+        // Hashed in sorted path order, and CRC32 is order-dependent, so the rule
+        // has to be the same one the reader uses -- it walks a `HashMap`, whose
+        // iteration order differs per instance. Without a shared rule an identity
+        // computed here and one read back from the same file disagree.
+        let mut ordered: Vec<&EntryMeta> = self.entries.iter().collect();
+        ordered.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         let mut hasher = crc32fast::Hasher::new();
-        for e in &self.entries {
+        for e in ordered {
             hasher.update(&e.crc32.to_le_bytes());
             hasher.update(e.path.as_bytes());
         }
@@ -776,8 +848,15 @@ impl PackageReader {
             }
         }
 
+        // Sorted, because `entries` is a `HashMap` and CRC32 is order-dependent:
+        // iterating it directly made this identity differ between two opens of the
+        // same file, since every `HashMap` instance hashes with its own seed. The
+        // field is documented as deterministic and is used to tell one package from
+        // another, so a per-instance value would be worse than useless.
+        let mut ordered: Vec<(&String, &EntryMeta)> = entries.iter().collect();
+        ordered.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut hasher = crc32fast::Hasher::new();
-        for (p, e) in &entries {
+        for (p, e) in ordered {
             hasher.update(&e.crc32.to_le_bytes());
             hasher.update(p.as_bytes());
         }
@@ -1019,17 +1098,38 @@ impl Clone for PackageReader {
 
 pub struct PackSource {
     reader: PackageReader,
+    /// Computed once at construction, not per lookup: `source_identity` is read
+    /// on every `/code` resolve of a pack-backed path.
+    cache_identity: u64,
 }
 
 impl PackSource {
-    pub fn new(reader: PackageReader) -> Self {
-        Self { reader }
-    }
+    /// Open a package and derive its identity from its bytes.
     pub fn open(path: &Path, name: &str, version: &str) -> Result<Self, PackageError> {
+        let digest = PackageDigest::of_file(path)?;
+        Self::open_with_recorded_digest(path, name, version, &digest)
+    }
+
+    /// Open a package whose digest a runtime-written record already holds, which
+    /// costs no read of the payload.
+    ///
+    /// The digest must be over *this file's* bytes. Only records the runtime owns
+    /// may supply one: a digest the game could write would be a label it chooses,
+    /// which is what [`PackageDigest`] exists to stop being. The install store is
+    /// outside every VFS mapping for that reason — see
+    /// [`GamePaths::sandbox_cache_dir`](super::GamePaths::sandbox_cache_dir).
+    pub fn open_with_recorded_digest(
+        path: &Path,
+        name: &str,
+        version: &str,
+        digest: &PackageDigest,
+    ) -> Result<Self, PackageError> {
         Ok(Self {
             reader: PackageReader::open(path, name, version)?,
+            cache_identity: digest.cache_identity(),
         })
     }
+
     pub fn identity(&self) -> &PackageIdentity {
         self.reader.identity()
     }
@@ -1048,6 +1148,15 @@ impl fmt::Debug for PackSource {
 }
 
 impl super::MountBackend for PackSource {
+    /// A digest of the package's bytes, which means the same thing in every
+    /// Session -- unlike a position in one Session's mount table. Two Sessions
+    /// that mounted byte-identical packages get the same value and may share
+    /// decoded bytes; a package built to resemble another's entry metadata cannot
+    /// reach it without holding that package's bytes.
+    fn source_identity(&self) -> Option<u64> {
+        Some(self.cache_identity)
+    }
+
     fn read(&self, p: &str) -> io::Result<Vec<u8>> {
         self.reader.read_entry(p).map_err(|e| match e {
             PackageError::Io(io_err) => io_err,
@@ -1632,6 +1741,83 @@ mod tests {
 
             assert_ne!(id1.checksum, id2.checksum);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Content whose CRC32 equals another's at the same length, which the
+    /// format's per-entry integrity primitive cannot tell apart. Appending a
+    /// message's own CRC32 in little-endian order drives the CRC of the result
+    /// to a constant, so any two messages of equal length yield equal-length,
+    /// equal-CRC32 contents.
+    fn crc_twin(message: &[u8]) -> Vec<u8> {
+        let mut out = message.to_vec();
+        out.extend_from_slice(&crc32fast::hash(message).to_le_bytes());
+        out
+    }
+
+    fn write_single_entry_package(path: &Path, entry: &str, content: &[u8]) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = PackageWriter::new(io::BufWriter::new(f)).unwrap();
+        w.add_entry(entry, content).unwrap();
+        w.finish("shared-name", "1.0").unwrap();
+    }
+
+    #[test]
+    fn packages_agreeing_on_entry_metadata_do_not_share_an_identity() {
+        use super::super::MountBackend;
+        let dir = make_test_dir("identity_is_content_bound");
+        let victim_pkg = dir.join("victim.mpkg");
+        let forged_pkg = dir.join("forged.mpkg");
+
+        let victim = crc_twin(b"victim!!");
+        let forged = crc_twin(b"forged!!");
+
+        // The fixture is only the defect it claims if the two packages really do
+        // agree on every field a metadata-level identity covers.
+        assert_ne!(victim, forged);
+        assert_eq!(victim.len(), forged.len());
+        assert_eq!(crc32fast::hash(&victim), crc32fast::hash(&forged));
+
+        write_single_entry_package(&victim_pkg, "res/logo.png", &victim);
+        write_single_entry_package(&forged_pkg, "res/logo.png", &forged);
+
+        let victim_src = PackSource::open(&victim_pkg, "shared-name", "1.0").unwrap();
+        let forged_src = PackSource::open(&forged_pkg, "shared-name", "1.0").unwrap();
+        assert_eq!(
+            victim_src.entry_size("res/logo.png"),
+            forged_src.entry_size("res/logo.png"),
+        );
+
+        assert_ne!(
+            victim_src.source_identity(),
+            forged_src.source_identity(),
+            "a package matching another's entry paths, sizes and CRC32s claimed \
+             its identity, so it would be served the other's decoded pixels",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_identical_packages_share_an_identity() {
+        use super::super::MountBackend;
+        let dir = make_test_dir("identity_is_shared");
+        let one = dir.join("one.mpkg");
+        let two = dir.join("two.mpkg");
+
+        write_single_entry_package(&one, "res/logo.png", b"the same pixels");
+        write_single_entry_package(&two, "res/logo.png", b"the same pixels");
+        assert_eq!(std::fs::read(&one).unwrap(), std::fs::read(&two).unwrap());
+
+        let first = PackSource::open(&one, "game-a", "1.0").unwrap();
+        let second = PackSource::open(&two, "game-b", "9.9").unwrap();
+
+        assert_eq!(
+            first.source_identity(),
+            second.source_identity(),
+            "two Sessions holding the same bytes must still share one decoded copy",
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

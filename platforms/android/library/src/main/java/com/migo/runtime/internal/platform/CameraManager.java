@@ -24,6 +24,7 @@ import android.os.Looper;
 import android.util.Log;
 import android.util.Size;
 
+import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.ResourceCleanup;
 
@@ -149,6 +150,12 @@ public final class CameraManager {
             fireEvent("authCancel", "{}");
             return errorJson("createCamera:fail auth deny");
         }
+        // Keyed by position, not by "camera": a device has several physical cameras
+        // and two games using different ones is legitimate.
+        if (!ExclusiveDeviceArbiter.tryAcquire(
+                ExclusiveDeviceArbiter.camera(position), sessionId)) {
+            return errorJson("createCamera:fail in use by another game");
+        }
         Log.d(TAG, "create() permission check passed");
 
         cameraManager = (android.hardware.camera2.CameraManager)
@@ -222,7 +229,9 @@ public final class CameraManager {
             boolean wasRecording = state.getAndSet(STATE_CLOSED) == STATE_RECORDING;
             ResourceCleanup.runAll(
                     () -> closeCamera(wasRecording),
-                    this::stopBackgroundThread);
+                    this::stopBackgroundThread,
+                    () -> ExclusiveDeviceArbiter.release(
+                            ExclusiveDeviceArbiter.camera(position), sessionId));
         }
         fireEvent("stop", "{}");
         Log.d(TAG, "destroy() completed");

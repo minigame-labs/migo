@@ -1,8 +1,10 @@
 //! Global registry for VSync signal senders.
 //!
-//! On Android, the Choreographer fires VSync callbacks on the UI thread.
-//! The JNI callback looks up the sender for the given host_id and sends
-//! the frame timestamp to the render thread.
+//! On Android, the Choreographer fires VSync callbacks on the UI thread. The sender
+//! for a host is cloned out of here once, at attach time, and the per-frame send goes
+//! through that clone — see `HostIngress::try_send_vsync`. Nothing in this module is
+//! on a frame path, which is the point: a per-frame lookup here would be a lock
+//! shared with every other Session on every frame, which Section 7.3 forbids.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -30,18 +32,4 @@ pub fn register_vsync_sender(id: i32, tx: Sender<f64>) {
 /// Unregister the VSync sender (called on host shutdown).
 pub fn unregister_vsync_sender(id: i32) {
     senders().write().remove(&id);
-}
-
-/// Send the Choreographer frame timestamp to the render thread for the given host_id.
-/// Called from the JNI Choreographer callback.
-pub fn send_vsync(id: i32, frame_time_ms: f64) {
-    if let Some(tx) = senders().read().get(&id) {
-        if tx.try_send(frame_time_ms).is_err() {
-            if let Some(stats) = shared::stats::get_stats(id) {
-                stats
-                    .dropped_frames
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
 }

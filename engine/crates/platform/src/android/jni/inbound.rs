@@ -76,6 +76,23 @@ fn jni_string_to_cow(
 // need to invoke a global `_internalOn*('escaped_json')` function in V8.
 // ---------------------------------------------------------------------------
 
+fn read_json_result(env: &mut JNIEnv, result_json: &JString, fallback_json: &str) -> String {
+    env.get_string(result_json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| fallback_json.to_string())
+}
+
+fn send_json_result_to_js(host_id: jint, json: &str, js_callback: &'static str) {
+    // The hook is handed the JSON *string* and parses it itself, which is what
+    // it has always received. Decoding here would change the argument every
+    // one of these callbacks sees.
+    let cmd = HostCommand::InvokeHostHook {
+        hook: js_callback,
+        args_json: hook_args_one(json),
+    };
+    let _ = send_reliable_command_to_host(host_id, cmd);
+}
+
 fn forward_json_result_to_js(
     env: &mut JNIEnv,
     host_id: jint,
@@ -83,18 +100,8 @@ fn forward_json_result_to_js(
     js_callback: &'static str,
     fallback_json: &str,
 ) {
-    let json: String = env
-        .get_string(result_json)
-        .map(|s| s.into())
-        .unwrap_or_else(|_| fallback_json.to_string());
-    // The hook is handed the JSON *string* and parses it itself, which is what
-    // it has always received. Decoding here would change the argument every
-    // one of these callbacks sees.
-    let cmd = HostCommand::InvokeHostHook {
-        hook: js_callback,
-        args_json: hook_args_one(json.as_str()),
-    };
-    let _ = send_reliable_command_to_host(host_id, cmd);
+    let json = read_json_result(env, result_json, fallback_json);
+    send_json_result_to_js(host_id, &json, js_callback);
 }
 
 /// Generate a JNI `extern "system"` callback that forwards a JSON string
@@ -760,7 +767,7 @@ pub(crate) extern "system" fn onTouch(
                 JNI_FALSE
             }
         }
-    });
+    })
 }
 
 pub(crate) extern "system" fn executeScript<'local>(
@@ -849,7 +856,7 @@ pub(crate) extern "system" fn shutdown<'local>(
                 JNI_FALSE
             }
         }
-    });
+    })
 }
 
 pub(crate) extern "system" fn onShow<'local>(
@@ -1363,7 +1370,7 @@ pub(crate) extern "system" fn updatePermission<'local>(
                 JNI_FALSE
             }
         }
-    });
+    })
 }
 
 pub(crate) extern "system" fn onBeaconServiceChange(
@@ -1594,11 +1601,27 @@ jni_json_callback!(
     "_internalOnSubpackageProgress",
     r#"{"requestId":0}"#
 );
-jni_json_callback!(
-    onSubpackageResult,
-    "_internalOnSubpackageResult",
-    r#"{"requestId":0,"error":"failed to read result"}"#
-);
+
+/// The one JSON callback that does not forward its payload verbatim: the host
+/// reports where it downloaded the subpackage, and that path is kept in the
+/// runtime rather than handed to the game. `op_install_subpackage` takes it back
+/// by request id, so a game cannot name a file for the installer to ingest.
+pub(crate) extern "system" fn onSubpackageResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    jni_safe!("onSubpackageResult", {
+        let json = read_json_result(
+            &mut env,
+            &result_json,
+            r#"{"requestId":0,"error":"failed to read result"}"#,
+        );
+        let for_js = shared::services::intercept_download_result(host_id, &json);
+        send_json_result_to_js(host_id, &for_js, "_internalOnSubpackageResult");
+    });
+}
 
 // ==================== VSync (Choreographer) ====================
 

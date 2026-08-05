@@ -13,6 +13,7 @@ import android.os.ParcelFileDescriptor;
 
 import android.util.Log;
 
+import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.ResourceCleanup;
 
@@ -116,6 +117,15 @@ public final class AudioRecorderManager {
 
         if (state.get() != STATE_IDLE) {
             stopInternal(false);
+        }
+
+        // One microphone, one owner. Refusing the newcomer keeps the running
+        // capture intact; a silent takeover would corrupt it with nothing for the
+        // incumbent to observe.
+        if (!ExclusiveDeviceArbiter.tryAcquire(ExclusiveDeviceArbiter.MICROPHONE, sessionId)) {
+            fireEvent("error",
+                    "{\"errMsg\":\"recorderManager.start:fail in use by another game\"}");
+            return;
         }
 
         parseOptions(optionsJson);
@@ -532,6 +542,9 @@ public final class AudioRecorderManager {
     // ========================================================================
 
     private synchronized void stopInternal(boolean notifyStop) {
+        // Released here rather than only in destroy(), so a session that stops
+        // recording without being torn down does not hold the microphone.
+        ExclusiveDeviceArbiter.release(ExclusiveDeviceArbiter.MICROPHONE, sessionId);
         int prevState = state.get();
         if (prevState == STATE_IDLE
                 && mediaRecorder == null

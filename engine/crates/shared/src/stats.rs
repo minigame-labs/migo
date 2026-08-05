@@ -694,11 +694,34 @@ fn stats_map() -> &'static RwLock<HashMap<i32, Arc<DebugStats>>> {
     STATS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Register a new DebugStats for the given host_id. Returns the shared handle.
-pub fn register_stats(id: i32) -> Arc<DebugStats> {
-    let stats = Arc::new(DebugStats::default());
-    stats_map().write().insert(id, stats.clone());
-    stats
+/// The stats registry's lock, for Section 7.3's cross-session contention gate.
+///
+/// Every Session's `DebugStats` lives in one process-wide map so out-of-band
+/// consumers can find a Session by id: the JNI debug poll, and the frame collector's
+/// one-time resolve. That is sound only while no *per-event* path looks it up, which
+/// Section 7.3 requires a test — not an argument — to establish. The per-event paths
+/// live in other crates and cannot hold a private lock, so this hands it over, behind
+/// a feature no shipped build enables.
+#[cfg(any(test, feature = "contention-probe"))]
+pub fn registry_lock_for_contention_probe() -> &'static RwLock<HashMap<i32, Arc<DebugStats>>> {
+    stats_map()
+}
+
+/// The `DebugStats` for `id`, creating it on first ask.
+///
+/// Get-or-create rather than always-fresh because two bring-up paths reach for it —
+/// host registration, so the input path can hold it, and the render thread — and
+/// neither is ordered before the other. Always-fresh would leave whichever ran second
+/// holding a handle the other cannot see, and its counters would simply vanish.
+///
+/// There is no stale entry for a later host to inherit: host ids only ever count up.
+pub fn stats_for(id: i32) -> Arc<DebugStats> {
+    Arc::clone(
+        stats_map()
+            .write()
+            .entry(id)
+            .or_insert_with(|| Arc::new(DebugStats::default())),
+    )
 }
 
 /// Unregister stats for a host_id (cleanup on shutdown).

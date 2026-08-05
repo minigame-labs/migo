@@ -39,3 +39,7 @@ features = ["oboe-shared-stdcxx"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk-context = "0.1"
+
+[dev-dependencies]
+# Occupies the shared streaming worker and requires a co-tenant task to run anyway.
+migo-executor-probe = { path = "../../testing/executor-probe" }

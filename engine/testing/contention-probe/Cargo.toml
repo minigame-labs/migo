@@ -1,0 +1,12 @@
+[package]
+name = "migo-contention-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Holds a cross-session lock and requires a per-event path to run anyway. Test-only."
+
+[lib]
+name = "migo_contention_probe"
+
+[dependencies]
+parking_lot.workspace = true

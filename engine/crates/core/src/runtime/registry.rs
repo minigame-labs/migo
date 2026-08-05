@@ -40,7 +40,10 @@ pub enum HostIngressSendError {
 
 /// Cloneable data-plane handles captured once after Host startup.
 ///
-/// Calls through this value never acquire the global Host/VSync registries.
+/// Calls through this value never acquire the global Host, VSync or debug-stats
+/// registries. The stats handle is held here for that reason: it used to be looked up
+/// by id on every event, which is a lock shared with every other Session on the
+/// hottest path in the engine.
 #[derive(Clone)]
 pub struct HostIngress {
     host_id: HostId,
@@ -49,6 +52,7 @@ pub struct HostIngress {
     touch_pool: PayloadPool<TouchData>,
     gamepad_pool: PayloadPool<GamepadState>,
     input_saturation_notified: Arc<AtomicBool>,
+    stats: Arc<shared::stats::DebugStats>,
 }
 
 impl HostIngress {
@@ -72,9 +76,7 @@ impl HostIngress {
         match self.tx.try_send(command) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                if let Some(stats) = shared::stats::get_stats(self.host_id) {
-                    stats.command_drops.fetch_add(1, Ordering::Relaxed);
-                }
+                self.stats.command_drops.fetch_add(1, Ordering::Relaxed);
                 Err(HostIngressSendError::Full)
             }
             Err(TrySendError::Closed(_)) => Err(HostIngressSendError::Closed),
@@ -237,17 +239,15 @@ impl HostIngress {
             Ok(outcome) => {
                 self.input_saturation_notified
                     .store(false, Ordering::Release);
-                if let Some(stats) = shared::stats::get_stats(self.host_id) {
-                    match outcome {
-                        InputSendOutcome::Enqueued => {}
-                        InputSendOutcome::Coalesced => {
-                            stats.input_coalesced.fetch_add(1, Ordering::Relaxed);
-                        }
-                        InputSendOutcome::Reserved => {
-                            stats
-                                .input_reliable_reserve_uses
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
+                match outcome {
+                    InputSendOutcome::Enqueued => {}
+                    InputSendOutcome::Coalesced => {
+                        self.stats.input_coalesced.fetch_add(1, Ordering::Relaxed);
+                    }
+                    InputSendOutcome::Reserved => {
+                        self.stats
+                            .input_reliable_reserve_uses
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Ok(outcome)
@@ -262,12 +262,10 @@ impl HostIngress {
 
     #[inline]
     fn record_input_saturation(&self) {
-        if let Some(stats) = shared::stats::get_stats(self.host_id) {
-            stats.command_drops.fetch_add(1, Ordering::Relaxed);
-            stats
-                .input_saturation_events
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.stats.command_drops.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .input_saturation_events
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Deliver one externally paced frame timestamp. A Host without external
@@ -280,9 +278,7 @@ impl HostIngress {
         match tx.try_send(frame_time_ms) {
             Ok(()) => Ok(()),
             Err(crossbeam_channel::TrySendError::Full(_)) => {
-                if let Some(stats) = shared::stats::get_stats(self.host_id) {
-                    stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                }
+                self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 Err(HostIngressSendError::Full)
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
@@ -306,6 +302,7 @@ pub(crate) struct HostHandle {
     touch_pool: PayloadPool<TouchData>,
     gamepad_pool: PayloadPool<GamepadState>,
     input_saturation_notified: Arc<AtomicBool>,
+    stats: Arc<shared::stats::DebugStats>,
 }
 
 static HOST_SENDERS: OnceLock<RwLock<HashMap<HostId, HostHandle>>> = OnceLock::new();
@@ -327,6 +324,10 @@ pub(crate) fn register_sender(
     critical_tx: CriticalHostCommandSender,
     surface_control: Arc<SurfaceControl>,
 ) -> Option<HostHandle> {
+    // Resolved before the registry lock is taken. Acquiring one process-wide lock
+    // while holding another is how a lock cycle starts, and these two are reached
+    // from different threads at bring-up.
+    let stats = shared::stats::stats_for(id);
     let mut map = host_senders().write();
     map.insert(
         id,
@@ -337,6 +338,7 @@ pub(crate) fn register_sender(
             touch_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
             gamepad_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
             input_saturation_notified: Arc::new(AtomicBool::new(false)),
+            stats,
         },
     )
 }
@@ -365,7 +367,7 @@ fn registered_surface_control(host_id: HostId) -> Result<Arc<SurfaceControl>, St
 
 /// Capture direct data-plane handles after Host initialization completes.
 pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
-    let (tx, touch_pool, gamepad_pool, input_saturation_notified) = {
+    let (tx, touch_pool, gamepad_pool, input_saturation_notified, stats) = {
         let map = host_senders().read();
         map.get(&host_id).map(|handle| {
             (
@@ -373,6 +375,7 @@ pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
                 handle.touch_pool.clone(),
                 handle.gamepad_pool.clone(),
                 Arc::clone(&handle.input_saturation_notified),
+                Arc::clone(&handle.stats),
             )
         })
     }
@@ -385,6 +388,7 @@ pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
         touch_pool,
         gamepad_pool,
         input_saturation_notified,
+        stats,
     })
 }
 
@@ -605,7 +609,7 @@ mod tests {
         RegisteredStats,
     ) {
         let id = alloc_host_id();
-        let stats = shared::stats::register_stats(id);
+        let stats = shared::stats::stats_for(id);
         let (tx, critical_tx, rx) =
             shared::host_channel::channel_with_reserve(normal_capacity, reliable_capacity);
         (
@@ -616,6 +620,7 @@ mod tests {
                 touch_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
                 gamepad_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
                 input_saturation_notified: Arc::new(AtomicBool::new(false)),
+                stats: Arc::clone(&stats),
             },
             critical_tx,
             rx,
@@ -997,5 +1002,72 @@ mod tests {
             Err(HostIngressSendError::Full)
         );
         assert!(clone.claim_input_saturation_notification());
+    }
+
+    /// Section 7.3: no per-event path acquires a lock shared beyond its own session.
+    ///
+    /// One gate per shared lock rather than one holding both, so a failure names the
+    /// registry the path reached for instead of leaving it to be guessed.
+    mod cross_session_locks {
+        use super::*;
+        use migo_contention_probe::{PATIENCE, PerEventPath, assert_completes_while_locked};
+        use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
+
+        fn touch(touch_type: TouchType) -> TouchData {
+            TouchData {
+                touch_type,
+                count: 1,
+                points: [TouchPoint::default(); 10],
+                timestamp_ms: 1,
+            }
+        }
+
+        #[test]
+        fn a_touch_send_does_not_reach_the_host_registry() {
+            let (ingress, _critical_tx, _rx, stats, _registered_stats) = test_ingress(4, 2);
+
+            let outcome = assert_completes_while_locked(
+                PerEventPath {
+                    path: "HostIngress::try_send_touch",
+                    shared_lock: "runtime::registry HOST_SENDERS",
+                    patience: PATIENCE,
+                },
+                host_senders(),
+                move || {
+                    let first = ingress.try_send_touch(touch(TouchType::Move));
+                    let coalesced = ingress.try_send_touch(touch(TouchType::Move));
+                    (first, coalesced)
+                },
+            );
+
+            assert_eq!(outcome.0, Ok(InputSendOutcome::Enqueued));
+            assert_eq!(outcome.1, Ok(InputSendOutcome::Coalesced));
+            // Proof the send reached the accounting tail rather than returning early:
+            // an operation that did nothing would satisfy the gate.
+            assert_eq!(stats.input_coalesced.load(Ordering::Relaxed), 1);
+        }
+
+        #[test]
+        fn a_touch_send_does_not_reach_the_stats_registry() {
+            let (ingress, _critical_tx, _rx, stats, _registered_stats) = test_ingress(4, 2);
+
+            let outcome = assert_completes_while_locked(
+                PerEventPath {
+                    path: "HostIngress::try_send_touch",
+                    shared_lock: "shared::stats STATS",
+                    patience: PATIENCE,
+                },
+                shared::stats::registry_lock_for_contention_probe(),
+                move || {
+                    let first = ingress.try_send_touch(touch(TouchType::Move));
+                    let coalesced = ingress.try_send_touch(touch(TouchType::Move));
+                    (first, coalesced)
+                },
+            );
+
+            assert_eq!(outcome.0, Ok(InputSendOutcome::Enqueued));
+            assert_eq!(outcome.1, Ok(InputSendOutcome::Coalesced));
+            assert_eq!(stats.input_coalesced.load(Ordering::Relaxed), 1);
+        }
     }
 }

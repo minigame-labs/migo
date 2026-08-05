@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::io_state::IoSchedulerState;
 
 struct InstallSubpackageRequest {
-    zip_path: String,
+    zip_path: PathBuf,
     pkg_key: String,
     root: String,
     version: String,
@@ -30,7 +30,7 @@ fn install_subpackage_blocking(
     let staged_pkg_path = staging.dir().join(&pkg_filename);
 
     migo_io::ingest_zip_to_package(
-        PathBuf::from(&request.zip_path).as_path(),
+        &request.zip_path,
         &staged_pkg_path,
         &request.pkg_key,
         &request.version,
@@ -38,7 +38,7 @@ fn install_subpackage_blocking(
     .map_err(|e| format!("ingest failed: {e}"))?;
 
     let final_pkg_path = store.join(&pkg_filename);
-    let identity = staging
+    let installed = staging
         .install_package(
             &mount_table,
             &pkg_filename,
@@ -48,9 +48,15 @@ fn install_subpackage_blocking(
             &request.version,
         )
         .map_err(|e| format!("install failed: {e}"))?;
+    let identity = &installed.identity;
 
     let mut manifest = PackageManifest::load(&store);
-    manifest.record(request.pkg_key, request.root, identity.version.clone());
+    manifest.record(
+        request.pkg_key,
+        request.root,
+        identity.version.clone(),
+        &installed.digest,
+    );
     if let Err(e) = manifest.save(&store) {
         if request.ensure_persistent {
             return Err(format!(
@@ -446,8 +452,11 @@ mod tests {
     };
     use shared::vfs::mount::MountTable;
 
+    use deno_core::serde_json;
+
     use super::{
-        InstallSubpackageRequest, install_subpackage_blocking, install_subpackage_with_scheduler,
+        InstallOptions, InstallSubpackageRequest, install_subpackage_blocking,
+        install_subpackage_with_scheduler,
     };
 
     fn make_test_dir(name: &str) -> std::path::PathBuf {
@@ -467,6 +476,21 @@ mod tests {
         zip.write_all(b"console.log('subpackage')").unwrap();
         zip.finish().unwrap();
         zip_path
+    }
+
+    #[test]
+    fn an_install_naming_a_zip_instead_of_a_download_is_rejected() {
+        // The payload shape the download callback used to send. The game may name
+        // the download it is installing, never a file: a path from JS would let it
+        // pick any zip the process can read.
+        let with_a_path =
+            r#"{"zipPath":"/data/app/host.apk","name":"stage1","root":"subpackages/stage1"}"#;
+        assert!(serde_json::from_str::<InstallOptions>(with_a_path).is_err());
+
+        let with_a_request =
+            r#"{"requestId":11,"name":"stage1","root":"subpackages/stage1","version":"1.0"}"#;
+        let opts = serde_json::from_str::<InstallOptions>(with_a_request).unwrap();
+        assert_eq!(opts.request_id, 11);
     }
 
     #[test]
@@ -491,7 +515,7 @@ mod tests {
                 Arc::clone(&mount_table),
                 cache_dir.clone(),
                 InstallSubpackageRequest {
-                    zip_path: zip_path.to_string_lossy().into_owned(),
+                    zip_path: zip_path.clone(),
                     pkg_key: "stage1".to_string(),
                     root: "subpackages/stage1".to_string(),
                     version: "1.0".to_string(),
@@ -534,7 +558,7 @@ mod tests {
                     let mount_table = Arc::clone(&mount_table);
                     let cache_dir = cache_dir.clone();
                     let request = InstallSubpackageRequest {
-                        zip_path: zip_path.to_string_lossy().into_owned(),
+                        zip_path: zip_path.clone(),
                         pkg_key: "stage2".to_string(),
                         root: "subpackages/stage2".to_string(),
                         version: "1.0".to_string(),
@@ -561,38 +585,46 @@ mod tests {
     }
 }
 
-/// Install a subpackage from a downloaded zip file.
+/// Install a subpackage the host has downloaded for this session.
 ///
-/// This is the new package-native install path:
-/// 1. Ingest zip → .mpkg (in staging area under cache dir)
-/// 2. Validate the package (full checksum verification)
-/// 3. Atomic rename to final package location
-/// 4. Mount as overlay in the MountTable
+/// 1. Take the zip the host reported for `requestId` — the game names the
+///    request, never a path
+/// 2. Ingest zip → .mpkg (in staging area under cache dir)
+/// 3. Validate the package (full checksum verification)
+/// 4. Atomic rename to final package location
+/// 5. Mount as overlay in the MountTable
 ///
-/// Called by JS after a successful subpackage download provides the zip path.
-/// Returns a JSON string with the package identity on success.
+/// Called by JS after a successful subpackage download. Returns a JSON string
+/// with the package identity on success.
+/// What JS may say about an install.
+///
+/// It names the *download*, never a file. The download result travels through the
+/// game's JS, so a path taken from there would let a game name any zip the
+/// process can read — the host app's own package among them — and read it back
+/// through its own `/code`. The path the host reported is held by
+/// [`shared::services::take_downloaded_zip`] instead.
+#[derive(serde::Deserialize)]
+struct InstallOptions {
+    #[serde(rename = "requestId")]
+    request_id: u64,
+    name: String,
+    root: String,
+    #[serde(default)]
+    version: String,
+    /// When true (preDownloadSubpackage), manifest write failure is a hard
+    /// error — the caller expects durable installation.  When false
+    /// (loadSubpackage), manifest failure is a warning since the package
+    /// is live for the current session.
+    #[serde(default)]
+    ensure_persistent: bool,
+}
+
 #[op2(async(lazy), fast)]
 #[string]
 async fn op_install_subpackage(
     state: std::rc::Rc<std::cell::RefCell<OpState>>,
     #[string] options_json: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    #[derive(serde::Deserialize)]
-    struct InstallOptions {
-        #[serde(rename = "zipPath")]
-        zip_path: String,
-        name: String,
-        root: String,
-        #[serde(default)]
-        version: String,
-        /// When true (preDownloadSubpackage), manifest write failure is a hard
-        /// error — the caller expects durable installation.  When false
-        /// (loadSubpackage), manifest failure is a warning since the package
-        /// is live for the current session.
-        #[serde(default)]
-        ensure_persistent: bool,
-    }
-
     let opts: InstallOptions = serde_json::from_str(&options_json)
         .map_err(|e| deno_error::JsErrorBox::generic(format!("invalid install options: {e}")))?;
 
@@ -616,7 +648,7 @@ async fn op_install_subpackage(
         }
     }
 
-    let (scheduler, mount_table, game_cache_dir) = {
+    let (scheduler, mount_table, game_cache_dir, zip_path) = {
         let st = state.borrow();
         let host = st.borrow::<HostOpState>();
 
@@ -640,7 +672,14 @@ async fn op_install_subpackage(
             .ok_or_else(|| {
                 deno_error::JsErrorBox::generic("installSubpackage:fail game paths not initialized")
             })?;
-        (st.borrow::<IoSchedulerState>().0.clone(), mt, gcd)
+        let zip =
+            shared::services::take_downloaded_zip(host.id, opts.request_id).ok_or_else(|| {
+                deno_error::JsErrorBox::generic(format!(
+                    "installSubpackage:fail no package was downloaded for request {}",
+                    opts.request_id
+                ))
+            })?;
+        (st.borrow::<IoSchedulerState>().0.clone(), mt, gcd, zip)
     };
 
     let version = if opts.version.is_empty() {
@@ -654,7 +693,7 @@ async fn op_install_subpackage(
         mount_table,
         game_cache_dir,
         InstallSubpackageRequest {
-            zip_path: opts.zip_path,
+            zip_path,
             pkg_key,
             root: opts.root,
             version,

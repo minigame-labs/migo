@@ -11,6 +11,10 @@ default = ["v8-limits", "code-signing"]
 codec-gbk = ["dep:encoding_rs"]
 v8-limits = []
 code-signing = ["dep:ed25519-dalek"]
+# Hands the process-wide stats registry's lock to a cross-session contention gate in
+# another crate. Enabled only through `[dev-dependencies]`, so resolver 2 keeps it out
+# of every shipped build.
+contention-probe = []
 
 [dependencies]
 base64 = "0.22.1"
@@ -42,3 +46,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt"] }
+# Test-only by construction: a `[dependencies]` entry here would carry a
+# `#[global_allocator]` into every cdylib that links this crate.
+migo-alloc-probe = { path = "../../testing/alloc-probe" }
+migo-contention-probe = { path = "../../testing/contention-probe" }

@@ -95,10 +95,11 @@ use self::image::ImageRegistry;
 ///
 /// `cache_key` is `Some` for snapshots whose JS-side originator
 /// matched the cocos text pattern and whose key missed the text
-/// texture cache: the drain path hands the texture off to
-/// `shared::text_texture_cache::global_cache()` instead of deleting
-/// it, so a subsequent identical fillText hits the cache.  `None`
-/// for legacy snapshots (`getImageData` readback, generic uploads).
+/// texture cache: the drain path hands the texture off to this
+/// session's text texture cache ([`CanvasManager::text_cache`])
+/// instead of deleting it, so a subsequent identical fillText hits the
+/// cache.  `None` for legacy snapshots (`getImageData` readback,
+/// generic uploads).
 #[derive(Clone)]
 struct Canvas2DSnapshotEntry {
     tex: glow::NativeTexture,
@@ -184,6 +185,17 @@ pub(crate) struct CanvasManager {
     config: egl::Config,
     /// See `EglInitResult::surfaceless`.
     surfaceless: bool,
+
+    /// This session's text texture cache.  Taken once at construction
+    /// from `text_texture_cache::text_cache_for_host(host_id)`, the same
+    /// handle the session's `CanvasOpState` holds.
+    ///
+    /// It must be per session rather than per process because the ids it
+    /// stores are GL texture names minted in *this* manager's EGL
+    /// context (created above with no share list linking it to any other
+    /// manager). A name reachable from another session would be either
+    /// meaningless there or, worse, deletable by it.
+    text_cache: shared::text_texture_cache::SharedTextCache,
 
     pub(super) dpi: PixelRatio,
 
@@ -490,6 +502,13 @@ impl CanvasManager {
         &self.gl
     }
 
+    /// This session's text texture cache.  The render loop uses it for
+    /// the memory-pressure trim and the font-generation bump, both of
+    /// which must stay scoped to this session.
+    pub(crate) fn text_cache(&self) -> &shared::text_texture_cache::SharedTextCache {
+        &self.text_cache
+    }
+
     /// Resolve a GL entry point from the exact EGL implementation injected for
     /// this manager. Used only while constructing render-thread dispatch tables.
     pub(crate) fn gl_proc_address(&self, symbol: &str) -> *const std::ffi::c_void {
@@ -504,6 +523,12 @@ impl CanvasManager {
         dpi: f32,
         cache_dir: Option<&std::path::Path>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+        // This session's text texture cache handle, resolved from the
+        // host id by the render thread.  The same handle the session's
+        // `CanvasOpState` holds, so the JS and render sides of the cache
+        // protocol agree; distinct from every other session's, so the GL
+        // texture names this manager mints stay inside its own context.
+        text_cache: shared::text_texture_cache::SharedTextCache,
     ) -> EngineResult<Self> {
         let dpi = PixelRatio::new(dpi).ok_or_else(|| {
             ee(
@@ -597,9 +622,8 @@ impl CanvasManager {
         // created.  The per-context cap is derived lazily in
         // `per_ctx_resource_cache_bytes`, so updating the global
         // here propagates automatically to every subsequent
-        // canvas creation.  On low-memory signals the manager
-        // can further lower the budget via
-        // `set_skia_resource_cache_budget(low_memory_budget())`
+        // canvas creation.  A low-memory signal does not come
+        // through here: it squeezes and restores within one call
         // — see [`CanvasManager::on_trim_memory`].
         crate::backend::gl::surface::set_skia_resource_cache_budget(
             crate::backend::gl::surface::tier_budget(device_caps.tier()),
@@ -722,6 +746,7 @@ impl CanvasManager {
             display,
             config,
             surfaceless,
+            text_cache,
             dpi,
             resource,
             bound: BoundContext::Resource,
@@ -1695,9 +1720,8 @@ impl CanvasManager {
             }
             // Rebalance Skia resource-cache caps now that one
             // fewer context is sharing the aggregate budget.
-            let live = self.contexts_2d.len();
             for ctx in self.contexts_2d.values_mut() {
-                ctx.rebalance_resource_cache(live);
+                ctx.rebalance_resource_cache();
             }
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
@@ -1817,20 +1841,22 @@ impl CanvasManager {
 
     /// Low-memory signal handler (P1-12).  Called by the host
     /// runtime in response to an Android `onTrimMemory`
-    /// notification or any equivalent platform signal.  Lowers
-    /// the Skia aggregate resource-cache budget to
-    /// [`crate::backend::gl::surface::low_memory_budget`] and
-    /// kicks every live `Canvas2DContext` to rebalance so the
-    /// effect lands within one frame instead of waiting for the
-    /// next canvas create / destroy.  Also runs a deferred-
-    /// resource purge so Skia can drop atlas / glyph entries
-    /// that the new budget no longer fits.
+    /// notification or any equivalent platform signal.  Squeezes
+    /// every live `Canvas2DContext` to
+    /// [`crate::backend::gl::surface::low_memory_per_ctx_bytes`],
+    /// which is what makes Skia release, and restores the ordinary
+    /// share in the same call.  Also runs a deferred-resource purge
+    /// so Skia can drop atlas / glyph entries the squeeze freed.
+    ///
+    /// The signal arrives per Session — the host relays one
+    /// `onTrimMemory` once for each — so what it must not do is
+    /// leave anything behind: this used to store 16 MiB as *the*
+    /// process budget, which only engine init raised again, so one
+    /// game's warning capped every other game's canvases for the
+    /// life of the process.
     pub(crate) fn on_trim_memory(&mut self) {
-        use crate::backend::gl::surface::{low_memory_budget, set_skia_resource_cache_budget};
-        set_skia_resource_cache_budget(low_memory_budget());
-        let live = self.contexts_2d.len();
         for ctx in self.contexts_2d.values_mut() {
-            ctx.rebalance_resource_cache(live);
+            ctx.trim_resource_cache();
         }
         self.perform_deferred_cleanup_all(std::time::Duration::from_millis(200));
     }
@@ -2318,9 +2344,8 @@ impl CanvasManager {
                     .purge_wrappers_for_context(tag);
             }
             // Rebalance Skia caches now that the denominator changed.
-            let live = self.contexts_2d.len();
             for ctx in self.contexts_2d.values_mut() {
-                ctx.rebalance_resource_cache(live);
+                ctx.rebalance_resource_cache();
             }
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
@@ -4165,7 +4190,7 @@ impl CanvasManager {
 
     /// Tag a previously-captured snapshot with a text-cache key so
     /// the next `drain_canvas2d_snapshots` hands its GL texture off
-    /// to the global text texture cache instead of deleting it.
+    /// to this session's text texture cache instead of deleting it.
     /// Called by the dispatcher after a `CaptureSnapshot { cache_key:
     /// Some(_), .. }` succeeded.  No-op when the snapshot is absent
     /// (capture failed earlier in the same packet).
@@ -4323,12 +4348,14 @@ impl CanvasManager {
     }
 
     /// Text texture cache hit path: copy from the cached source
-    /// texture (lives in `shared::text_texture_cache::global_cache()`)
+    /// texture (lives in this session's cache, [`Self::text_cache`])
     /// into the destination texture currently bound to `target` on
     /// `canvas_id`.  Mirrors `tex_image_2d_from_canvas2d_snapshot`'s
     /// FBO + `glCopyTexImage2D` shape — same correctness story, just
-    /// the source texture comes from the global text cache instead
-    /// of the per-frame snapshot pool.
+    /// the source texture comes from the session text cache instead
+    /// of the per-frame snapshot pool.  Because the cache is per
+    /// session, the name it returns was minted in this manager's own
+    /// EGL context.
     ///
     /// Always unpins `key` on return (success OR error path), so a
     /// JS-side pin acquired at fillText time is balanced exactly
@@ -4346,7 +4373,7 @@ impl CanvasManager {
         key: &shared::text_texture_cache::TextCacheKey,
     ) -> EngineResult<bool> {
         let (src_tex_raw, width, height) = {
-            let mut cache = shared::text_texture_cache::global_cache();
+            let mut cache = self.text_cache.lock();
             let lookup = cache.get(key);
             // Always unpin once, regardless of hit/miss — the JS-side
             // pin is balanced by this render-thread call.  Doing it
@@ -4752,12 +4779,13 @@ impl CanvasManager {
     /// GPU-only without leaking textures across frames.
     ///
     /// Snapshots tagged with `cache_key` (the cocos text miss path)
-    /// have their texture transferred to
-    /// `shared::text_texture_cache::global_cache()` instead of being
-    /// deleted, so a subsequent identical fillText resolves through
-    /// `TexImage2DFromTextCache` without a re-render.  The cache's
-    /// own LRU may evict an older entry to make room — any returned
-    /// victim texture ids are deleted here as part of the same drain.
+    /// have their texture transferred to this session's text texture
+    /// cache instead of being deleted, so a subsequent identical
+    /// fillText resolves through `TexImage2DFromTextCache` without a
+    /// re-render.  The cache's own LRU may evict an older entry to make
+    /// room — any returned victim texture ids are deleted here as part
+    /// of the same drain, and they can only ever be this session's own
+    /// names because the cache is per session.
     pub(crate) fn drain_canvas2d_snapshots(&mut self) {
         if self.canvas2d_snapshots.is_empty() {
             return;
@@ -4790,7 +4818,7 @@ impl CanvasManager {
         }
 
         if !to_cache.is_empty() {
-            let mut cache = shared::text_texture_cache::global_cache();
+            let mut cache = self.text_cache.lock();
             for entry in to_cache {
                 let key = entry.cache_key.expect("cache_key checked above");
                 let size_bytes = (entry.width as usize)

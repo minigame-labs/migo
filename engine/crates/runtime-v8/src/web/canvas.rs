@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn send_canvas_sync_times_out_instead_of_dropping_when_queue_is_full() {
         let (tx, _rx) = CommandSender::new();
-        let ctx = CanvasOpState::new(tx);
+        let ctx = CanvasOpState::for_host(tx, 1);
 
         for _ in 0..ctx.tx.capacity() {
             ctx.tx
@@ -258,7 +258,7 @@ mod tests {
     ) -> deno_core::OpState {
         use crate::rendering::webgl::frame_collector::UnifiedFrameCollector;
         let mut state = deno_core::OpState::new(None);
-        state.put(CanvasOpState::new(tx));
+        state.put(CanvasOpState::for_host(tx, 2));
         state.put(UnifiedFrameCollector::new());
         state
     }

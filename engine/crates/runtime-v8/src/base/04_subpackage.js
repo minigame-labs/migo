@@ -346,17 +346,15 @@ function _internalOnSubpackageResult(resultJson) {
         return;
     }
 
-    // Package-native install: ingest zip, validate, mount as overlay.
-    if (!data.zipPath) {
-        _settle(data.requestId, 'missing zipPath in download result');
-        return;
-    }
-
+    // Package-native install: ingest zip, validate, mount as overlay. The zip the
+    // host downloaded is held by the runtime and named by request id -- a path
+    // taken from this payload would let a game install any zip the process can
+    // read, so the payload does not carry one.
     const pending = _pendingTasks.get(data.requestId);
     if (!pending) return;
 
     const installOpts = JSON.stringify({
-        zipPath: data.zipPath,
+        requestId: data.requestId,
         name: pending.pkg.name || '',
         root: pending.pkg.root || '',
         version: data.version || '1.0',

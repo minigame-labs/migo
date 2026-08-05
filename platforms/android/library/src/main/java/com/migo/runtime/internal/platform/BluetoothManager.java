@@ -23,6 +23,7 @@ import android.os.Build;
 import android.os.ParcelUuid;
 import android.util.Log;
 
+import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeExports;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.ResourceCleanup;
@@ -158,6 +159,19 @@ public class BluetoothManager {
     /** Active GATT connections keyed by device address. */
     private final ConcurrentHashMap<String, GattAttempt> gattConnections =
             new ConcurrentHashMap<>();
+
+    /**
+     * Candidate handles whose {@code close()} threw. A late candidate is never in
+     * {@link #gattConnections} -- that map holds the attempt that won -- so a failed
+     * close has no map entry to keep it alive the way a failed owned close does.
+     * Without this the {@code BluetoothGatt} would simply be dropped: the OS handle
+     * stays open for process life and nothing ever tries again.
+     *
+     * <p>Entries leave only when a close succeeds, which is the same
+     * retain-on-failure rule {@code closeAndRemoveGatt} gets by not reaching its
+     * {@code remove} when {@code closeGatt} throws.
+     */
+    private final Set<GattConnection> unclosedCandidates = ConcurrentHashMap.newKeySet();
 
     /** Cached negotiated MTU per device. Updated by onMtuChanged callback. */
     private final ConcurrentHashMap<String, Integer> negotiatedMtu = new ConcurrentHashMap<>();
@@ -371,6 +385,12 @@ public class BluetoothManager {
         if (!isAdapterEnabled()) {
             throw new RuntimeException("openBluetoothAdapter:fail not available");
         }
+        // Claimed before any state is mutated, so a refusal leaves this manager
+        // exactly as it was rather than half-opened.
+        if (!ExclusiveDeviceArbiter.tryAcquire(
+                ExclusiveDeviceArbiter.BLUETOOTH_ADAPTER, sessionId)) {
+            throw new RuntimeException("openBluetoothAdapter:fail in use by another game");
+        }
         adapterOpened = true;
         registerAdapterStateReceiver();
     }
@@ -378,12 +398,15 @@ public class BluetoothManager {
     public void closeAdapter() {
         adapterOpened = false;
         ResourceCleanup.runAll(
+                () -> ExclusiveDeviceArbiter.release(
+                        ExclusiveDeviceArbiter.BLUETOOTH_ADAPTER, sessionId),
                 this::stopDiscoveryInternal,
                 this::unregisterAdapterStateReceiver,
                 discoveredDevices::clear,
                 () -> ResourceCleanup.destroyMatching(
                         gattConnections, ignored -> true,
                         attempt -> closeGatt(attempt.beginClose(), true)),
+                this::retryUnclosedCandidates,
                 negotiatedMtu::clear,
                 cachedRssi::clear);
     }
@@ -877,8 +900,33 @@ public class BluetoothManager {
     }
 
     void closeGattConnection(String deviceId) {
+        // Before closing this device, finish what is already owed. Running first means
+        // a retry failure is reported rather than masking the caller's own close.
+        retryUnclosedCandidates();
         GattAttempt attempt = gattConnections.get(deviceId);
         closeAndRemoveGatt(deviceId, attempt, true);
+    }
+
+    /**
+     * Retries every retained candidate close, keeping the ones that fail again.
+     *
+     * <p>Snapshotted before iterating because a concurrent {@code publishGattConnection}
+     * may add to the set, and a retry is never required to also handle arrivals that
+     * happen while it runs -- the next close will.
+     */
+    private void retryUnclosedCandidates() {
+        for (GattConnection candidate : new ArrayList<>(unclosedCandidates)) {
+            try {
+                closeGatt(candidate, false);
+                unclosedCandidates.remove(candidate);
+            } catch (RuntimeException retryFailure) {
+                reportGattCleanupFailure("BLE candidate close retry", retryFailure);
+            }
+        }
+    }
+
+    int unclosedCandidateCountForTests() {
+        return unclosedCandidates.size();
     }
 
     void handleGattConnectionStateChange(
@@ -1064,6 +1112,7 @@ public class BluetoothManager {
         try {
             closeGatt(connection, false);
         } catch (RuntimeException cleanupFailure) {
+            unclosedCandidates.add(connection);
             reportGattCleanupFailure("BLE late callback cleanup", cleanupFailure);
         }
         return false;

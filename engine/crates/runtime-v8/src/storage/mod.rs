@@ -88,11 +88,15 @@ pub(crate) fn storage_dir(state: &OpState) -> Result<PathBuf, EngineError> {
 /// Same isolation as [`storage_dir`], for the same reason: these are files
 /// written on behalf of one game, and the host app's cache directory is shared
 /// by every game it runs.
+///
+/// Inside the sandbox subtree rather than the cache root: the payload is the
+/// game's own bytes handed back to it, so the path this returns has to stay one
+/// the game can read, and the root is reserved for runtime state.
 #[inline]
 pub(crate) fn buffer_url_dir(state: &OpState) -> Result<PathBuf, EngineError> {
     let host = state.borrow::<HostOpState>();
     match host.game_paths.as_ref() {
-        Some(paths) => Ok(paths.cache_dir().join(BUFFER_URL_DIR)),
+        Some(paths) => Ok(paths.sandbox_cache_dir().join(BUFFER_URL_DIR)),
         None => Err(EngineError::from_detail(
             ErrorCode::InvalidOperation,
             "buffer URLs are unavailable before a game is loaded".to_string(),

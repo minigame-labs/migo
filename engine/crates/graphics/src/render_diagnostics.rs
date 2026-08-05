@@ -336,4 +336,62 @@ mod tests {
         assert_eq!(b.draw_calls.load(Ordering::Relaxed), 1);
         uninstall_for_tests();
     }
+
+    /// Section 6.5's per-session accounting, for the gauges specifically.
+    ///
+    /// `sinks_are_isolated_by_thread` above cannot stand in for this. Counters
+    /// publish with `fetch_add`, so a defect that merged two sessions' *gauges* while
+    /// leaving the counters alone would leave it green: gauges publish with `store`,
+    /// where merging means the session that flushed last silently speaks for both.
+    ///
+    /// The four phases are ordered rather than raced. Two threads setting gauges at
+    /// once would catch a merged gauge only when the interleaving happened to cross,
+    /// which is a coin flip; forcing *set A, set B, flush A, flush B* makes a merge
+    /// certain to show up, because A's flush would then publish B's value.
+    #[test]
+    fn a_gauge_set_before_another_session_sets_its_own_still_reports_its_own() {
+        uninstall_for_tests();
+        let a = Arc::new(DebugStats::default());
+        let b = Arc::new(DebugStats::default());
+        let a_thread = a.clone();
+        let b_thread = b.clone();
+        // Four phases, one thread acting in each.
+        let phase = Arc::new(std::sync::Barrier::new(2));
+        let a_phase = Arc::clone(&phase);
+        let b_phase = Arc::clone(&phase);
+
+        // Deliberately different values: equal ones would pass under a merge.
+        let first = std::thread::spawn(move || {
+            install(a_thread);
+            set_text_cache_gauges(8_192, 12);
+            set_render_queue_len(3);
+            a_phase.wait(); // 1: A has set
+            a_phase.wait(); // 2: B has set
+            flush_frame();
+            a_phase.wait(); // 3: A has flushed
+            a_phase.wait(); // 4: B has flushed
+            uninstall_for_tests();
+        });
+        let second = std::thread::spawn(move || {
+            install(b_thread);
+            b_phase.wait(); // 1
+            set_text_cache_gauges(4_096, 5);
+            set_render_queue_len(9);
+            b_phase.wait(); // 2
+            b_phase.wait(); // 3
+            flush_frame();
+            b_phase.wait(); // 4
+            uninstall_for_tests();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(a.text_cache_bytes.load(Ordering::Relaxed), 8_192);
+        assert_eq!(a.text_cache_entries.load(Ordering::Relaxed), 12);
+        assert_eq!(a.render_queue_len.load(Ordering::Relaxed), 3);
+        assert_eq!(b.text_cache_bytes.load(Ordering::Relaxed), 4_096);
+        assert_eq!(b.text_cache_entries.load(Ordering::Relaxed), 5);
+        assert_eq!(b.render_queue_len.load(Ordering::Relaxed), 9);
+        uninstall_for_tests();
+    }
 }

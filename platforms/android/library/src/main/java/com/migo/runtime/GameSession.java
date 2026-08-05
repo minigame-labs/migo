@@ -15,6 +15,7 @@ import com.migo.runtime.callback.AuthHandler;
 import com.migo.runtime.callback.GameLogHandler;
 import com.migo.runtime.callback.GameSessionListener;
 import com.migo.runtime.callback.SubpackageHandler;
+import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeExports;
 import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
@@ -592,7 +593,13 @@ public final class GameSession implements Closeable {
                             if (audioFocusManager != null) audioFocusManager.stop();
                         },
                         () -> NativeExports.closePermissionOperations(sessionId),
-                        () -> NativeExports.destroyAllManagers(sessionId)),
+                        () -> NativeExports.destroyAllManagers(sessionId),
+                        // Last, and unconditional: a session that dies holding the
+                        // camera or microphone must not keep every other game off it
+                        // for the life of the process. This cannot rely on each
+                        // manager having released cleanly, because a failed release
+                        // may be the reason this session is being torn down.
+                        () -> ExclusiveDeviceArbiter.releaseAll(sessionId)),
                 this::shutdownNativeOnce,
                 () -> RuntimeRegistry.unregister(sessionId),
                 paths::cleanupTemp,

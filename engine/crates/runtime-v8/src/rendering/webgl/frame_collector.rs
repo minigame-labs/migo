@@ -872,7 +872,7 @@ mod tests {
         collector.append_gl_batch(vec![clear_command()], 111);
         assert!(collector.build_frame_packet(true).is_some());
 
-        let stats = shared::stats::register_stats(host_id);
+        let stats = shared::stats::stats_for(host_id);
         collector.append_gl_batch(vec![clear_command()], 333);
         assert!(collector.build_frame_packet(true).is_some());
         assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 333);

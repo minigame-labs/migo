@@ -776,13 +776,16 @@ pub enum GLCmd {
     /// recognizer in `frame_collector` matches the cocos
     /// `(state setters → fillText → texImage2D(canvas))` shape AND
     /// the `(text, font, size, color, ...)` tuple is already
-    /// present in `shared::text_texture_cache::global_cache()`, JS
+    /// present in **this session's** text texture cache (see
+    /// [`crate::text_texture_cache::text_cache_for_host`]), JS
     /// suppresses the offscreen fillText + snapshot pipeline
     /// entirely and emits this command instead.  Render thread
-    /// re-acquires the cache lock, copies the cached source texture
-    /// into the destination texture bound to `target` on
-    /// `canvas_id` (single GPU→GPU copy, no Skia paint, no blit
-    /// from Canvas2D FBO), and unpins the entry.
+    /// re-acquires the same session's cache lock, copies the cached
+    /// source texture into the destination texture bound to `target`
+    /// on `canvas_id` (single GPU→GPU copy, no Skia paint, no blit
+    /// from Canvas2D FBO), and unpins the entry.  Both ends resolve
+    /// the cache from the same host id, so the source name is one
+    /// this session's own EGL context minted.
     ///
     /// `key` is boxed because `TextCacheKey` carries two `String`s;
     /// the unboxed variant would inflate every `GLCmd` instance and

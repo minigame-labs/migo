@@ -118,14 +118,14 @@ fi
 [[ -x "$CHROMIUM_CLANG_BIN/clang++" ]] || { err "Chromium clang unavailable"; exit 1; }
 
 # The toolchain definition lives in the build/ submodule, which is one of the
-# two paths the V8 provenance gate permits modifying.
-TOOLCHAIN_GN="$RUSTY_V8_SRC/build/toolchain/ohos/BUILD.gn"
-if [[ ! -f "$TOOLCHAIN_GN" ]]; then
-    info "applying the OpenHarmony toolchain patch"
-    patch -p1 -d "$RUSTY_V8_SRC" --batch --forward \
-        < "$ENGINE_ROOT/third_party/v8-patches/0008-ohos-toolchain.patch"
-    [[ -f "$TOOLCHAIN_GN" ]] || { err "patch ran but $TOOLCHAIN_GN is absent"; exit 1; }
-fi
+# two paths the V8 provenance gate permits modifying. The patch creates the file,
+# but the path existing does not prove the content is the patch's, so
+# applied-ness is derived from the patch itself.
+# shellcheck source=scripts/lib/v8-patch-apply.sh
+source "$SCRIPT_DIR/lib/v8-patch-apply.sh"
+info "ensuring the OpenHarmony toolchain patch is applied"
+v8_require_patch "$RUSTY_V8_SRC" "$ENGINE_ROOT/third_party/v8-patches" \
+    '0008-ohos-toolchain.patch' || { err "OpenHarmony toolchain patch failed"; exit 1; }
 
 # rusty_v8 pins its own rustc (1.89.0 at the time of writing), which is not
 # migo's. A target installed for migo's toolchain is invisible here.

@@ -81,6 +81,11 @@ impl RenderService {
             pixel_ratio,
             app_cache_dir,
             gpu_caps,
+            // Resolved here rather than inside the render thread: a GPU startup
+            // timeout detaches that thread without joining it, and the host's
+            // startup guard unregisters this cache, so a get-or-create reached
+            // after that point would leak a registry entry per failed startup.
+            shared::text_texture_cache::text_cache_for_host(host_id),
             context_lost,
             wake,
             raf_demand,

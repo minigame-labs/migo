@@ -10,9 +10,12 @@ import os
 import pathlib
 import re
 import shlex
-import stat
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "lib"))
+import v8_source_proof  # noqa: E402  (path is set immediately above)
 
 
 def run(command: list[str], label: str) -> str:
@@ -34,13 +37,6 @@ def hash_file(path: pathlib.Path) -> str:
         for chunk in iter(lambda: source.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def git_revision(path: pathlib.Path, label: str) -> str:
-    revision = run(["git", "-C", str(path), "rev-parse", "HEAD"], label)
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
-        raise RuntimeError(f"{label} is not a full revision: {revision!r}")
-    return revision
 
 
 def package_version(cargo_toml: pathlib.Path) -> str:
@@ -79,197 +75,31 @@ def parse_patch(value: str) -> tuple[str, pathlib.Path]:
     return patch_id, pathlib.Path(path)
 
 
-def changed_paths(path: pathlib.Path) -> list[tuple[str, str]]:
-    result = subprocess.run(
-        [
-            "git", "-C", str(path), "status", "--porcelain=v1", "-z",
-            "--untracked-files=all",
-        ],
-        check=False,
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"git status failed for {path}: {result.stderr.strip()}")
-    records: list[tuple[str, str]] = []
-    for record in result.stdout.split("\0"):
-        if record:
-            records.append((record[:2], record[3:]))
-    return records
-
-
-def patch_paths(path: pathlib.Path) -> set[str]:
-    paths: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        for prefix in ("--- a/", "+++ b/"):
-            if not line.startswith(prefix):
-                continue
-            relative = line.removeprefix(prefix)
-            candidate = pathlib.PurePosixPath(relative)
-            if candidate.is_absolute() or ".." in candidate.parts:
-                raise RuntimeError(f"patch contains unsafe path {relative!r}: {path}")
-            paths.add(relative)
-    if not paths:
-        raise RuntimeError(f"patch declares no changed paths: {path}")
-    return paths
-
-
-def head_blob(source: pathlib.Path, relative: str) -> tuple[bytes, bool] | None:
-    """Return one HEAD regular-file blob and its executable bit."""
-    tree = subprocess.run(
-        ["git", "-C", str(source), "ls-tree", "-z", "HEAD", "--", relative],
-        check=False,
-        capture_output=True,
-    )
-    if tree.returncode != 0:
-        raise RuntimeError(
-            f"git ls-tree failed for {relative}: "
-            f"{tree.stderr.decode(errors='replace').strip()}"
-        )
-    if not tree.stdout:
-        return None
-    record = tree.stdout.rstrip(b"\0")
-    metadata, separator, recorded_path = record.partition(b"\t")
-    if not separator or recorded_path.decode("utf-8") != relative:
-        raise RuntimeError(f"cannot parse HEAD identity for {relative!r}")
-    mode, object_type, object_id = metadata.decode("ascii").split()
-    if object_type != "blob" or mode not in {"100644", "100755"}:
-        raise RuntimeError(
-            f"declared patch path must be a regular tracked file: {relative} ({mode} {object_type})"
-        )
-    blob = subprocess.run(
-        ["git", "-C", str(source), "cat-file", "blob", object_id],
-        check=False,
-        capture_output=True,
-    )
-    if blob.returncode != 0:
-        raise RuntimeError(
-            f"git cat-file failed for {relative}: "
-            f"{blob.stderr.decode(errors='replace').strip()}"
-        )
-    return blob.stdout, mode == "100755"
-
-
-def verify_exact_patch_result(
-    source: pathlib.Path,
-    patch_files: list[pathlib.Path],
-    declared_paths: set[str],
-) -> None:
-    """Rebuild the declared result from HEAD and compare exact file bytes.
-
-    `git apply --reverse --check` proves that each declared patch is present,
-    but it deliberately tolerates unrelated edits elsewhere in the same file.
-    Reconstructing from HEAD closes that provenance gap without modifying the
-    V8 source checkout or its index.
-    """
-    with tempfile.TemporaryDirectory(prefix="migo-v8-patch-check.") as directory:
-        reconstructed = pathlib.Path(directory)
-        for relative in sorted(declared_paths, key=lambda value: value.encode("utf-8")):
-            base = head_blob(source, relative)
-            if base is None:
-                raise RuntimeError(
-                    f"declared patch path is not a regular file in HEAD: {relative}"
-                )
-            contents, executable = base
-            destination = reconstructed / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(contents)
-            destination.chmod(0o755 if executable else 0o644)
-
-        for patch in patch_files:
-            applied = subprocess.run(
-                ["git", "apply", "--unsafe-paths", "--whitespace=nowarn", str(patch)],
-                cwd=reconstructed,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if applied.returncode != 0:
-                raise RuntimeError(
-                    f"cannot reconstruct declared patch result from HEAD ({patch}): "
-                    f"{applied.stderr.strip()}"
-                )
-
-        for relative in sorted(declared_paths, key=lambda value: value.encode("utf-8")):
-            expected = reconstructed / relative
-            actual = source / relative
-            if not expected.is_file() or expected.is_symlink():
-                raise RuntimeError(
-                    f"declared patch result is not a regular file: {relative}"
-                )
-            if not actual.is_file() or actual.is_symlink():
-                raise RuntimeError(
-                    f"rusty_v8 worktree path is not a regular file: {relative}"
-                )
-            expected_executable = bool(expected.stat().st_mode & stat.S_IXUSR)
-            actual_executable = bool(actual.stat().st_mode & stat.S_IXUSR)
-            if (
-                expected.read_bytes() != actual.read_bytes()
-                or expected_executable != actual_executable
-            ):
-                raise RuntimeError(
-                    "declared patches do not exactly reproduce rusty_v8 worktree "
-                    f"bytes and mode for {relative}"
-                )
-
-
 def verify_source_changes(
     source: pathlib.Path, patches: list[tuple[str, pathlib.Path]]
 ) -> list[dict]:
-    allowed: set[str] = set()
+    """Hash the declared patches, having proved the checkout is exactly them.
+
+    The proof lives in scripts/lib/v8_source_proof.py, shared with the Android
+    writer. It descends into submodules, which subsumes what used to be three
+    separate checks here: that the `build` submodule is pristine, that the `v8`
+    submodule is clean, and that top-level changes fall within declared paths. A
+    Linux V8 build declares no build-submodule patches, so any change under
+    `build/` is an undeclared change and is now reported by path rather than as a
+    cryptic dirty-pointer status.
+
+    Declaring no patches at all is meaningful and supported: it asserts the
+    checkout is pristine.
+    """
     identities: list[dict] = []
     patch_files: list[pathlib.Path] = []
     for patch_id, path in patches:
         path = path.resolve()
         if not path.is_file():
             raise RuntimeError(f"missing declared source patch: {path}")
-        allowed.update(patch_paths(path))
         patch_files.append(path)
-        applied = subprocess.run(
-            ["git", "-C", str(source), "apply", "--reverse", "--check", str(path)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if applied.returncode != 0:
-            raise RuntimeError(f"declared patch is not applied: {patch_id} ({path})")
         identities.append({"id": patch_id, "sha256": hash_file(path)})
-
-    # `build` is a nested git submodule. When its working tree carries changes,
-    # git reports the parent's view of it as a dirty pointer (status " m build"
-    # for an in-tree change, " M build" for a moved pointer) -- which no `--patch`
-    # ever declares, because patches touch paths *inside* the submodule. The
-    # Linux build declares no build-submodule patches: it uses the bullseye
-    # sysroot and its own GN args, not the Android sysroot/libcxx patches. So the
-    # correct invariant is that the `build` submodule is pristine, and the check
-    # is separated out to say so instead of surfacing a cryptic " m build".
-    build_submodule = source / "build"
-    if (build_submodule / ".git").exists():
-        build_changes = changed_paths(build_submodule)
-        if build_changes:
-            raise RuntimeError(
-                "the `build` submodule has working-tree changes, but a Linux V8 "
-                "build declares no build-submodule patches (it uses the bullseye "
-                "sysroot, not the Android build patches). Reset it before "
-                f"building: {[f'{s} {p}' for s, p in build_changes]}"
-            )
-
-    # The parent's dirty pointer for a pristine `build` submodule (git can still
-    # report " m build" transiently) is expected and allowed alongside the
-    # declared top-level patches; nothing else is.
-    allowed_top = allowed | {"build"}
-    unexpected = [
-        f"{status} {path}"
-        for status, path in changed_paths(source)
-        if path not in allowed_top or status not in {" M", "M ", "MM", " m", "m "}
-    ]
-    if unexpected:
-        raise RuntimeError(
-            f"rusty_v8 source has changes not represented by --patch: {unexpected}"
-        )
-    verify_exact_patch_result(source, patch_files, allowed)
-    if changed_paths(source / "v8"):
-        raise RuntimeError("V8 source has unrecorded tracked or untracked changes")
+    v8_source_proof.assert_tree_is_exactly_patched(source, patch_files)
     identities.sort(key=lambda item: item["id"].encode("utf-8"))
     return identities
 
@@ -364,8 +194,8 @@ def main() -> int:
     )
     component = build_component(
         rusty_v8_version=package_version(source / "Cargo.toml"),
-        rusty_v8_revision=git_revision(source, "rusty_v8 revision"),
-        v8_revision=git_revision(source / "v8", "V8 revision"),
+        rusty_v8_revision=v8_source_proof.head_revision(source, "rusty_v8 revision"),
+        v8_revision=v8_source_proof.head_revision(source / "v8", "V8 revision"),
         gn_args=normalized_gn_arguments(arguments.gn_args),
         patches=patches,
         archive_sha256=hash_file(archive),

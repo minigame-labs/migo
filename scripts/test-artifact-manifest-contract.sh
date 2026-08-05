@@ -230,18 +230,30 @@ value = {
         },
     },
     "required_patches": [
-        "0001-unset-bindgen-extra-clang-args",
-        "0002-use-sysroot-on-android",
-        "0003-custom-libcxx-for-snapshot-toolchain",
+        {
+            "id": "fixture-source",
+            "file": "fixture-source.patch",
+        },
     ],
 }
 pathlib.Path(sys.argv[1]).write_text(json.dumps(value, indent=2) + "\n")
 PY
+# The writer now proves the source tree is HEAD plus exactly the declared patches,
+# so the fixture has to actually carry a patch. It declares its own one-line patch
+# against build.rs rather than the real V8 patches: those need their real target
+# files at exact revisions, which a fast fixture cannot stage, and what is under
+# test here is the proof mechanics rather than V8's patch contexts.
 mkdir -p "$FIXTURE_ROOT/engine/third_party/v8-patches"
-cp "$ROOT/engine/third_party/v8-patches/0001-unset-BINDGEN_EXTRA_CLANG_ARGS-in-v8_s-bindgen.patch" \
-  "$ROOT/engine/third_party/v8-patches/0002-install-sysroot.patch" \
-  "$ROOT/engine/third_party/v8-patches/0003-compiler-use-custom-libcxx-for-v8.patch" \
-  "$FIXTURE_ROOT/engine/third_party/v8-patches/"
+cat > "$FIXTURE_ROOT/engine/third_party/v8-patches/fixture-source.patch" <<'PATCH'
+--- a/build.rs
++++ b/build.rs
+@@ -1 +1,2 @@
+ fn main() {}
++// fixture patch
+PATCH
+patch -p1 -d "$V8_SOURCE" --batch --forward --fuzz=0 \
+  < "$FIXTURE_ROOT/engine/third_party/v8-patches/fixture-source.patch" >/dev/null \
+  || fail "could not apply the fixture source patch"
 
 printf '%s\n' "untracked source input" > "$V8_SOURCE/untracked-provenance.txt"
 component_root="$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64"
@@ -258,8 +270,10 @@ if python3 "$ROOT/scripts/write-v8-component-manifest.py" \
     --lock "$V8_LOCK" >"$TMP/untracked.out" 2>"$TMP/untracked.err"; then
   fail "V8 component writer accepted an untracked source input"
 fi
-grep -F "unrelated tracked or untracked changes" "$TMP/untracked.err" >/dev/null || \
-  fail "untracked-source error was not actionable"
+grep -F "undeclared change" "$TMP/untracked.err" >/dev/null || \
+  fail "untracked-source error did not say the change was undeclared"
+grep -F "untracked-provenance.txt" "$TMP/untracked.err" >/dev/null || \
+  fail "untracked-source error did not name the offending path"
 rm -f "$V8_SOURCE/untracked-provenance.txt"
 
 for arch in aarch64 x86_64; do

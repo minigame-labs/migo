@@ -103,7 +103,6 @@
 mod runtime;
 pub mod services;
 
-pub use runtime::vsync::send_vsync;
 pub use runtime::{
     // Exported because it is already part of the public signature of
     // `host_ingress`, `send_command_to_host` and `shutdown_host`. Without it a

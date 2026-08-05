@@ -4,6 +4,17 @@
   "rusty_v8_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
   "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921",
   "android_api": 26,
+  "ndk": {
+    "version": "23.2.8568313",
+    "notes": "The NDK supplies the target compiler, sysroot and linker, all three of which the component manifest records, so it is part of the artifact's identity. This is the NDK that produced both verified archives (aarch64 681aaa39... and x86_64 ce14223a...), so it is pinned to what is proven rather than to the newest available. Resolved by scripts/lib/android-ndk.sh, which searches the standard SDK layouts for an NDK whose own Pkg.Revision equals this value; seven scripts previously defaulted ANDROID_NDK_HOME to $HOME/Android/Ndk, a path that exists on none of the machines used here, so every build silently depended on the environment already being right."
+  },
+  "gn": {
+    "version": "2502",
+    "revision": "17b0057970fa2b07a20cbb4289ab78cf93565f35",
+    "required_patches": ["0001-suppress-gcc-multiline-comment-warning"],
+    "source": "https://gn.googlesource.com/gn",
+    "notes": "gn generates the entire build graph, so it is part of the artifact's provenance. V8 14.5 needs path_exists(), added in gn 2315; skia's bundled gn 2175 is too old. The exact version pin above already refuses everything older, so there is no separate minimum. gn's version is a commit position and is unchanged by local modifications, so the revision is pinned as well. Built by scripts/build-gn.sh with the one required patch, which adds -Wno-comment to gn's existing gcc-only suppression list because header_checker.h ends an ASCII-art comment line with a backslash that only gcc reports and gn compiles with -Werror."
+  },
   "targets": {
     "aarch64": {
       "triple": "aarch64-linux-android",
@@ -17,9 +28,26 @@
     }
   },
   "required_patches": [
-    "0001-unset-bindgen-extra-clang-args",
-    "0002-use-sysroot-on-android",
-    "0003-custom-libcxx-for-snapshot-toolchain"
+    {
+      "id": "0001-unset-bindgen-extra-clang-args",
+      "file": "0001-unset-BINDGEN_EXTRA_CLANG_ARGS-in-v8_s-bindgen.patch",
+      "notes": "Strips every BINDGEN_EXTRA_CLANG_ARGS* variable before V8's internal bindgen runs. They are set for rusty_v8's own binding.cc bindgen and must not leak here, or a target override reaches host tools built with --target=x86_64 and clang rejects -msse3 for aarch64-linux-android."
+    },
+    {
+      "id": "0002-use-sysroot-on-android",
+      "file": "0002-install-sysroot.patch",
+      "notes": "Extends rusty_v8's aarch64 sysroot branch to android. The Android cross branch pushes use_sysroot=true unconditionally but only installs the host amd64 sysroot when target_arch is x86_64, so an Android aarch64 build declared a sysroot it never installed and gn asserted. Android target toolchains still take the NDK sysroot: build/config/sysroot.gni tests is_android before the is_linux branch."
+    },
+    {
+      "id": "0003-custom-libcxx-for-snapshot-toolchain",
+      "file": "0003-compiler-use-custom-libcxx-for-v8.patch",
+      "notes": "Gives the V8 snapshot toolchain the custom libc++ only when it is a separate toolchain, i.e. when cross-compiling. On a native build the snapshot toolchain IS the target toolchain, and without that condition the flag ORs back to true for the whole target build, packaging libc++ into the archive so its std::terminate collides with the one Skia carries."
+    },
+    {
+      "id": "migo-prebuilt-binding",
+      "file": "migo-build-rs-prebuilt-binding.diff",
+      "notes": "Lets V8_PREBUILT_BINDING supply a known-good src_binding.rs, skipping the local bindgen step which otherwise needs a Clang 19+ libclang to parse V8's vendored libc++ headers. Verified against this manifest's rust_binding hash before it is reused, and the produced binding is compared byte-for-byte with the input."
+    }
   ],
   "sources": {
     "rusty_v8": "https://github.com/denoland/rusty_v8/tree/e6a88b35dd3d7f2849a0df33a71d338701c55316",

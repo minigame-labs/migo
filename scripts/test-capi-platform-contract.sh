@@ -16,11 +16,10 @@ ARCH_DIR="aarch64"
 info() { echo -e "\033[0;36m[capi-platform] $*\033[0m"; }
 err() { echo -e "\033[0;31m[capi-platform] $*\033[0m" >&2; }
 
-ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Ndk}"
-if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
-    err "NDK not found at $ANDROID_NDK_HOME; set ANDROID_NDK_HOME"
-    exit 1
-fi
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$SCRIPT_DIR/lib/android-ndk.sh"
+android_ndk_read_pin "$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json" || exit 1
+android_ndk_resolve || { err "cannot resolve the pinned Android NDK"; exit 1; }
 NDK_BIN="$(echo "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin)"
 export PATH="$NDK_BIN:$PATH"
 

@@ -31,8 +31,13 @@ extension!(
         // so the JS-thread `op_measure_text_flat` fast path is
         // available without a cross-thread round-trip.
         let measurer = host.text_measurer.clone();
+        // Bind the text texture cache to this session.  The render
+        // thread for the same host id resolves the same handle, so both
+        // sides of the cache protocol agree while staying isolated from
+        // every other session's GL texture namespace.
+        let host_id = host.id;
         state.put(StartTime::default());
-        let mut canvas_state = CanvasOpState::new(render_tx);
+        let mut canvas_state = CanvasOpState::for_host(render_tx, host_id);
         if let Some(m) = measurer {
             canvas_state = canvas_state.with_text_measurer(m);
         }

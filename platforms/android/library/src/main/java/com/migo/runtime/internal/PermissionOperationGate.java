@@ -6,6 +6,8 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.BooleanSupplier;
 
 /** Linearizes permission updates, deferred framework entry, and terminal close per session. */
@@ -62,16 +64,35 @@ public final class PermissionOperationGate {
         final Set<Pending> pending = new HashSet<>();
     }
 
-    private final Map<Integer, Session> sessions = new HashMap<>();
-    private int highestOpenedSessionId = -1;
+    /**
+     * Concurrent so a per-event callback admission resolves its session without taking a
+     * lock shared with every other session. Only admission and retirement need mutual
+     * exclusion, and {@link #openGuard} provides it.
+     */
+    private final ConcurrentMap<Integer, Session> sessions = new ConcurrentHashMap<>();
+    private final Object openGuard = new Object();
+
+    /**
+     * Ids whose session has been closed. A tombstone must refuse exactly the ids that were
+     * retired -- not every id at or below the highest ever opened. Those coincide only when
+     * ids are opened in increasing order, and they are not: ids are allocated on the caller
+     * thread while the gate is opened from each session's own thread, so two sessions
+     * starting together can arrive in the opposite order and a high-water mark would refuse
+     * the live lower-id session outright.
+     *
+     * <p>A plain set guarded by {@link #openGuard} rather than a concurrent one, because
+     * retiring an id and dropping its session must be one step: a concurrent set would let
+     * an {@link #open} of the same id slip between the removal and the retirement and
+     * resurrect it. Bounded by the number of sessions the process ever created.
+     */
+    private final Set<Integer> retiredSessionIds = new HashSet<>();
 
     /** Opens a previously unseen session. A closing tombstone is never reopened. */
     public boolean open(int sessionId) {
-        synchronized (sessions) {
-            if (sessionId <= highestOpenedSessionId || sessions.containsKey(sessionId)) {
+        synchronized (openGuard) {
+            if (retiredSessionIds.contains(sessionId) || sessions.containsKey(sessionId)) {
                 return false;
             }
-            highestOpenedSessionId = sessionId;
             sessions.put(sessionId, new Session());
             return true;
         }
@@ -102,11 +123,7 @@ public final class PermissionOperationGate {
                     }
                 } else {
                     ResourceCleanup.runAll(
-                            () -> {
-                                synchronized (session) {
-                                    cancelAll(entry);
-                                }
-                            },
+                            () -> runCancellations(session, entry),
                             () -> requireNativeSuccess(updateNative));
                 }
                 return new Result(null);
@@ -120,17 +137,18 @@ public final class PermissionOperationGate {
         Session session = session(sessionId);
         if (session == null) return new Result(null);
         synchronized (session.transition) {
+            Entry entry;
             synchronized (session) {
-                Entry entry = session.scopes.get(scope);
+                entry = session.scopes.get(scope);
                 if (entry == null) return new Result(null);
                 entry.granted = false;
                 awaitIdle(session, entry);
-                try {
-                    cancelAll(entry);
-                    return new Result(null);
-                } catch (RuntimeException error) {
-                    return new Result(error);
-                }
+            }
+            try {
+                runCancellations(session, entry);
+                return new Result(null);
+            } catch (RuntimeException error) {
+                return new Result(error);
             }
         }
     }
@@ -141,27 +159,37 @@ public final class PermissionOperationGate {
         if (session == null) return new Result(null);
         synchronized (session.transition) {
             Result result;
+            ArrayList<Entry> entries;
             synchronized (session) {
                 session.lifecycle = Lifecycle.CLOSING;
-                ArrayList<ResourceCleanup.Action> cancellations = new ArrayList<>();
                 for (Entry entry : session.scopes.values()) {
                     entry.granted = false;
                 }
-                for (Entry entry : session.scopes.values()) {
+                entries = new ArrayList<>(session.scopes.values());
+                for (Entry entry : entries) {
                     awaitIdle(session, entry);
-                    cancellations.add(() -> cancelAll(entry));
-                }
-                try {
-                    ResourceCleanup.runAll(
-                            cancellations.toArray(new ResourceCleanup.Action[0]));
-                    result = new Result(null);
-                } catch (RuntimeException error) {
-                    result = new Result(error);
                 }
             }
+            ArrayList<ResourceCleanup.Action> cancellations = new ArrayList<>();
+            for (Entry entry : entries) {
+                cancellations.add(() -> runCancellations(session, entry));
+            }
+            try {
+                ResourceCleanup.runAll(
+                        cancellations.toArray(new ResourceCleanup.Action[0]));
+                result = new Result(null);
+            } catch (RuntimeException error) {
+                result = new Result(error);
+            }
             if (result.failure() == null) {
-                synchronized (sessions) {
-                    sessions.remove(sessionId, session);
+                // Retirement and removal are one step under the admission guard, so no open
+                // can observe the id as neither live nor retired and resurrect it. A failed
+                // close returns above with the session retained for retry and must not
+                // retire an id that is still live.
+                synchronized (openGuard) {
+                    if (sessions.remove(sessionId, session)) {
+                        retiredSessionIds.add(sessionId);
+                    }
                 }
             }
             return result;
@@ -235,15 +263,11 @@ public final class PermissionOperationGate {
     }
 
     int retainedSessionCountForTests() {
-        synchronized (sessions) {
-            return sessions.size();
-        }
+        return sessions.size();
     }
 
     private Session session(int sessionId) {
-        synchronized (sessions) {
-            return sessions.get(sessionId);
-        }
+        return sessions.get(sessionId);
     }
 
     private static Entry entry(Session session, String scope) {
@@ -258,14 +282,31 @@ public final class PermissionOperationGate {
         return new Result(new IllegalStateException(message));
     }
 
-    private static void cancelAll(Entry entry) {
+    /**
+     * Runs each retained cancellation with the session monitor released, so a foreign
+     * cleanup action cannot convoy unrelated scopes. The caller must already hold the
+     * transition lock and have published a denied or closing state, which is what stops a
+     * new lease or registration from appearing while these actions run.
+     *
+     * <p>Each action is captured while the pending set is snapshotted, under the same
+     * monitor {@link Pending#setCancellation} publishes it with, so the action invoked is
+     * unambiguously the one the snapshot admitted rather than whatever the non-final field
+     * happens to hold once the monitor has been released. A pending is retired only after
+     * its action returns normally, so a throwing cancellation stays for a later retry.
+     */
+    private static void runCancellations(Session session, Entry entry) {
         ArrayList<ResourceCleanup.Action> cancellations = new ArrayList<>();
-        for (Pending pending : entry.pending) {
-            cancellations.add(() -> {
-                pending.cancellation.run();
-                pending.active = false;
-                entry.pending.remove(pending);
-            });
+        synchronized (session) {
+            for (Pending pending : new ArrayList<>(entry.pending)) {
+                ResourceCleanup.Action cancellation = pending.cancellation;
+                cancellations.add(() -> {
+                    cancellation.run();
+                    synchronized (session) {
+                        pending.active = false;
+                        entry.pending.remove(pending);
+                    }
+                });
+            }
         }
         ResourceCleanup.runAll(cancellations.toArray(new ResourceCleanup.Action[0]));
     }
