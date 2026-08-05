@@ -650,8 +650,9 @@ These are enforced by tests, not by inspection:
 
   **Covered so far:** the ordered host queue (`host_channel`, across coalescible
   motion, reliable and terminal transitions, and the drain), the input payload pool,
-  the per-`fillText` text texture cache hit, and the decoded-image cache's lookup and
-  its pin/unpin pair. What
+  the per-`fillText` text texture cache hit, the decoded-image cache's lookup and
+  its pin/unpin pair, and the per-call image texture resolve above it that
+  `texSubImage2D(image)` takes. What
   `scripts/test-input-transport-contract.sh` does *not* do is still worth stating,
   because it is the reason this requirement was mis-recorded as satisfied for so
   long: it greps the sources for structural properties — `VecDeque::with_capacity(`,
@@ -665,10 +666,8 @@ These are enforced by tests, not by inspection:
   half is `cfg(target_os = "android")`, so a host test binary never compiles it and
   the gate cannot run there; its Java half needs a JVM mechanism entirely, because a
   Rust allocator observes nothing the JVM allocates. The render command path and the
-  audio path are unmeasured, and so is the key construction *above* the decoded-image
-  cache: `resolve_cached_image_rgba` builds an owned key twice per call before the
-  cache is reached, on `texImage2D(image)`'s CPU-bytes path. No path may be recorded
-  as satisfying this requirement without a burst test named against it.
+  audio path are unmeasured. No path may be recorded as satisfying this requirement
+  without a burst test named against it.
 
   **What applying it to the decoded-image cache found**, since it is the second
   instance of one shape and that is what makes it worth stating: a pin recorded in a
@@ -681,6 +680,20 @@ These are enforced by tests, not by inspection:
   yet, because an alias is established before its decode finishes. So the count on
   the entry is paired with a reservation table for exactly the keys an entry cannot
   hold, with one adoption point and one hand-back point, and a key is never in both.
+
+  **And what the layer above it found, which is the same lesson at a boundary
+  rather than inside one.** The alias table and the decoded-bytes cache spoke two
+  key shapes for the same thing — `(path\0WxH, generation)` above,
+  `(path, generation, w, h)` below — so every crossing rebuilt the key. Two owned
+  keys per call, on a path `texSubImage2D(image)` takes unconditionally: one
+  cloning the alias key out of the table, one parsing the mangled suffix back
+  apart for the cache below. Making the two sides share the *type* deletes the
+  conversion instead of making it cheaper, and leaves the alias key borrowable —
+  so the lookup runs under the alias lock and copies nothing. The lock nesting
+  that makes the borrow live long enough is the order this code already took
+  everywhere else, and it cannot be inverted: `migo-io` does not depend on
+  `runtime-v8`, so nothing holding the decoded-bytes lock can reach an alias
+  table.
 - **No cross-session lock on a per-event path.** Each covered path requires a
   contention regression test that fails when a per-event operation acquires a
   lock shared beyond its own session.

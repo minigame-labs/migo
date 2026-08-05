@@ -18,51 +18,42 @@ pub fn alloc_shared_id() -> u32 {
     NEXT_SHARED_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Structured cache key: `(canonical_src, mount_generation)`.
+/// Structured cache key: `(canonical_src, mount_generation, target_w, target_h)`.
 ///
-/// Using a tuple avoids delimiter collision that string concatenation
-/// would introduce (`:` is a legal path character on Linux).  An optional
-/// resize suffix is encoded in `canonical_src` as `"path\0WxH"` (null byte
-/// is illegal in filesystem paths so cannot collide).
-pub type ImageCacheKey = (String, u64);
+/// **The same type as the decoded-bytes cache's key, not a convertible one.**
+/// This table sits directly above `migo_io::image_cache`, and every alias
+/// operation crosses that boundary: a bind pins, a release unpins, and a
+/// `texSubImage2D(image)` looks the bytes up. While the two sides spoke
+/// different key shapes, each crossing had to rebuild the key, which is a heap
+/// allocation on a path taken per call. Sharing the type deletes the conversion
+/// rather than making it cheaper, and makes an encoding drift between the two
+/// sides impossible to write.
+///
+/// A tuple rather than a concatenated string because `:` is a legal path
+/// character on Linux, so concatenation would admit delimiter collision.
+pub type ImageCacheKey = migo_io::image_cache::ImageCacheKey;
 
 /// Build a cache key from a resolved path, optional resize dimensions,
 /// and mount generation.
 ///
-/// Internally the resize dimensions are folded into the path with a
-/// NUL-delimited suffix (`"{src}\0{tw}x{th}"`) so the runtime-v8-side
-/// alias table can key on a single `(String, u64)` per logical
-/// (path, size) pair.  For boundary lookups into the decoded-RGBA
-/// `migo_io::global_cache` (which uses a native `(path, gen, tw, th)` tuple),
-/// use [`to_io_cache_key`] to decompose the suffix back into its
-/// dimension fields.
+/// A requested size gets a slot of its own: `createImageBitmap` and
+/// `drawImage(…, dw, dh)` ask for pre-resized pixels, and serving them the
+/// full-resolution decode would hand back the wrong bitmap. Absent dimensions
+/// take the `(…, 0, 0)` full-resolution sentinel that
+/// [`migo_io::image_cache::full_res_key`] produces — the op boundary maps a
+/// zero-valued request to `None`, so a zero here always means "unresized".
 pub fn make_cache_key(
     src: &str,
     target_width: Option<u32>,
     target_height: Option<u32>,
     mount_generation: u64,
 ) -> ImageCacheKey {
-    let canonical = match (target_width, target_height) {
-        (Some(tw), Some(th)) => format!("{}\0{}x{}", src, tw, th),
-        _ => src.to_string(),
-    };
-    (canonical, mount_generation)
-}
-
-/// Convert a runtime-v8-side `ImageCacheKey` (mangled-suffix form) into
-/// the native 4-tuple used by `migo_io::global_cache`.  Unmangled keys
-/// (no NUL delimiter) map to the `(path, gen, 0, 0)` full-resolution
-/// slot that [`migo_io::image_cache::full_res_key`] produces.
-pub fn to_io_cache_key(key: &ImageCacheKey) -> migo_io::image_cache::ImageCacheKey {
-    let (canonical, generation) = key;
-    if let Some((path, dims)) = canonical.split_once('\0') {
-        if let Some((tw_s, th_s)) = dims.split_once('x') {
-            if let (Ok(tw), Ok(th)) = (tw_s.parse::<u32>(), th_s.parse::<u32>()) {
-                return (path.to_string(), *generation, tw, th);
-            }
+    match (target_width, target_height) {
+        (Some(tw), Some(th)) => {
+            migo_io::image_cache::resized_key(src.to_string(), mount_generation, tw, th)
         }
+        _ => migo_io::image_cache::full_res_key(src.to_string(), mount_generation),
     }
-    (canonical.clone(), *generation, 0, 0)
 }
 
 pub struct SharedImageEntry {
@@ -72,7 +63,7 @@ pub struct SharedImageEntry {
 }
 
 pub struct ImageCache {
-    // keyed by (canonical src, mount generation)
+    // keyed by (canonical src, mount generation, target w, target h)
     by_src: HashMap<ImageCacheKey, SharedImageEntry>,
     // alias (caller image_id) -> shared_image_id
     alias_to_shared: HashMap<u32, u32>,
@@ -117,7 +108,7 @@ impl ImageCache {
                     // out normally; idle entries don't deserve
                     // permanent residence any more than the caller
                     // deserves a silent black texture.
-                    migo_io::image_cache::global_cache().unpin(&to_io_cache_key(&key));
+                    migo_io::image_cache::global_cache().unpin(&key);
                     if entry.refs == 0 {
                         self.by_src.remove(&key);
                         self.shared_to_key.remove(&shared_id);
@@ -145,7 +136,7 @@ impl ImageCache {
             // side counts pins additively, so two aliases to the
             // same shared image hold two pins; releasing one
             // decrements without making the entry evictable.
-            migo_io::image_cache::global_cache().pin(&to_io_cache_key(key));
+            migo_io::image_cache::global_cache().pin(key);
 
             return BeginLoadResult::AlreadyLoaded((shared_id, entry.dims));
         }
@@ -197,7 +188,7 @@ impl ImageCache {
                 .or_insert_with(|| actual_key.clone());
             // H-5: joiner became a real alias; pin the io entry
             // to keep bytes alive for its texImage2D path.
-            migo_io::image_cache::global_cache().pin(&to_io_cache_key(actual_key));
+            migo_io::image_cache::global_cache().pin(actual_key);
         }
     }
 
@@ -240,7 +231,7 @@ impl ImageCache {
                         self.alias_to_shared
                             .insert(loader_image_id, existing_shared_id);
                         // H-5: loader morphed into a real alias.
-                        migo_io::image_cache::global_cache().pin(&to_io_cache_key(actual_key));
+                        migo_io::image_cache::global_cache().pin(actual_key);
                     }
                     self.shared_to_key
                         .insert(existing_shared_id, actual_key.clone());
@@ -273,7 +264,7 @@ impl ImageCache {
                     // separately when their `bind_alias_existing`
                     // resolves, so each refs++ stays paired with
                     // exactly one pin.
-                    migo_io::image_cache::global_cache().pin(&to_io_cache_key(actual_key));
+                    migo_io::image_cache::global_cache().pin(actual_key);
                 }
                 self.shared_to_key.insert(shared_id, actual_key.clone());
 
@@ -313,7 +304,7 @@ impl ImageCache {
                     // stays live.  When refs hits zero the
                     // final unpin here transitions the entry
                     // to LRU-evictable.
-                    migo_io::image_cache::global_cache().unpin(&to_io_cache_key(&key));
+                    migo_io::image_cache::global_cache().unpin(&key);
                 }
                 if entry.refs == 0 {
                     self.by_src.remove(&key);
@@ -342,17 +333,24 @@ impl ImageCache {
             .unwrap_or(image_id);
         self.shared_to_key
             .get(&shared_id)
-            .map(|(path, _)| path.clone())
+            .map(|(path, ..)| path.clone())
     }
 
-    /// Get the full cache key `(path, generation)` for an image ID.
-    pub fn cache_key_for_image_id(&self, image_id: u32) -> Option<ImageCacheKey> {
+    /// Borrow the full cache key for an image ID.
+    ///
+    /// Borrowed rather than cloned because the only caller is the per-call
+    /// texture upload path, which hands the key straight to the decoded-bytes
+    /// cache and keeps nothing: an owned copy there is one heap allocation per
+    /// `texSubImage2D(image)`. Holding this table's lock across that lookup is
+    /// what makes the borrow live long enough, and is the lock order the rest of
+    /// this file already takes — see [`ImageCache::drain`].
+    pub fn cache_key_for_image_id(&self, image_id: u32) -> Option<&ImageCacheKey> {
         let shared_id = self
             .alias_to_shared
             .get(&image_id)
             .copied()
             .unwrap_or(image_id);
-        self.shared_to_key.get(&shared_id).cloned()
+        self.shared_to_key.get(&shared_id)
     }
 
     /// Resolve a caller-side `image_id` (alias) to the underlying
@@ -399,9 +397,8 @@ impl ImageCache {
         {
             let mut io_cache = migo_io::image_cache::global_cache();
             for (key, entry) in self.by_src.iter() {
-                let io_key = to_io_cache_key(key);
                 for _ in 0..entry.refs {
-                    io_cache.unpin(&io_key);
+                    io_cache.unpin(key);
                 }
             }
         }
@@ -491,14 +488,45 @@ pub fn unregister_image_cache(host_id: i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageCache, ImageCacheKey};
+    use super::{ImageCache, ImageCacheKey, make_cache_key};
+
+    /// A requested size names different pixels, not the same pixels at a
+    /// different scale, and the decoded-bytes cache stores each in a slot of its
+    /// own. A key that forgets the size would make an unsized load and a
+    /// `createImageBitmap(img, {resizeWidth})` share one alias — one of them
+    /// then draws the other's bitmap.
+    ///
+    /// Its own guard because the size now rides in the key's own fields rather
+    /// than in the path: a key built without them is still a well-formed key,
+    /// and every other test in this file uses full-resolution ones.
+    #[test]
+    fn each_requested_size_gets_a_cache_slot_of_its_own() {
+        let unsized_load = make_cache_key("/code/atlas.png", None, None, 4);
+        let square = make_cache_key("/code/atlas.png", Some(64), Some(64), 4);
+        let tall = make_cache_key("/code/atlas.png", Some(64), Some(128), 4);
+
+        assert_ne!(
+            unsized_load, square,
+            "a resized request shares the unsized load's slot"
+        );
+        assert_ne!(square, tall, "two requested sizes share one slot");
+
+        // The decoder writes an unsized decode to the full-resolution slot
+        // (`target_*.unwrap_or(0)`), so an alias keyed anywhere else would miss
+        // its own bytes on every upload.
+        assert_eq!(
+            unsized_load,
+            migo_io::image_cache::full_res_key("/code/atlas.png".into(), 4),
+            "an unsized load must name the slot the decoder writes"
+        );
+    }
 
     #[test]
     fn finish_load_merges_converging_actual_keys_without_losing_refs() {
         let mut cache = ImageCache::new();
-        let requested_a: ImageCacheKey = ("/code/a.png".into(), 10);
-        let requested_b: ImageCacheKey = ("/code/b.png".into(), 11);
-        let actual: ImageCacheKey = ("/code/shared.png".into(), 20);
+        let requested_a: ImageCacheKey = ("/code/a.png".into(), 10, 0, 0);
+        let requested_b: ImageCacheKey = ("/code/b.png".into(), 11, 0, 0);
+        let actual: ImageCacheKey = ("/code/shared.png".into(), 20, 0, 0);
 
         assert!(matches!(
             cache.begin_load(1, &requested_a),
@@ -535,9 +563,9 @@ mod tests {
     #[test]
     fn bind_alias_existing_ignores_stale_waiters_for_replaced_loads() {
         let mut cache = ImageCache::new();
-        let requested_a: ImageCacheKey = ("/code/a.png".into(), 10);
-        let requested_b: ImageCacheKey = ("/code/b.png".into(), 11);
-        let actual_a: ImageCacheKey = ("/code/a.png".into(), 20);
+        let requested_a: ImageCacheKey = ("/code/a.png".into(), 10, 0, 0);
+        let requested_b: ImageCacheKey = ("/code/b.png".into(), 11, 0, 0);
+        let actual_a: ImageCacheKey = ("/code/a.png".into(), 20, 0, 0);
 
         cache.begin_load(7, &requested_a);
         let _ = cache.begin_load(7, &requested_b);
@@ -561,7 +589,7 @@ mod tests {
     #[test]
     fn finish_load_error_clears_loader_and_waiter_bookkeeping() {
         let mut cache = ImageCache::new();
-        let requested: ImageCacheKey = ("/code/a.png".into(), 10);
+        let requested: ImageCacheKey = ("/code/a.png".into(), 10, 0, 0);
 
         assert!(matches!(
             cache.begin_load(1, &requested),
@@ -589,7 +617,7 @@ mod tests {
 
     use super::{
         BeginLoadResult, drain_shared_image_cache, image_cache_for_host, image_cache_registered,
-        to_io_cache_key, unregister_image_cache,
+        unregister_image_cache,
     };
 
     /// Distinct ids per test, so the shared registry can be asserted without one
@@ -649,7 +677,7 @@ mod tests {
 
         // The same asset, the same caller-side image id: exactly what two games
         // built on the same engine template ask for.
-        let key: ImageCacheKey = ("/code/logo.png".into(), 7);
+        let key: ImageCacheKey = ("/code/logo.png".into(), 7, 0, 0);
         complete_load(&a, &key, 100);
 
         // Session B asking for it must be told to load it itself.  A shared table
@@ -682,7 +710,7 @@ mod tests {
         let a = image_cache_for_host(a_id);
         let b = image_cache_for_host(b_id);
 
-        let key: ImageCacheKey = ("/code/atlas.png".into(), 3);
+        let key: ImageCacheKey = ("/code/atlas.png".into(), 3, 0, 0);
         complete_load(&a, &key, 100);
         complete_load(&b, &key, 200);
 
@@ -702,7 +730,7 @@ mod tests {
         let a = image_cache_for_host(a_id);
         let b = image_cache_for_host(b_id);
 
-        let key: ImageCacheKey = ("/code/ui.png".into(), 5);
+        let key: ImageCacheKey = ("/code/ui.png".into(), 5, 0, 0);
         complete_load(&a, &key, 100);
         complete_load(&b, &key, 200);
 
@@ -736,7 +764,7 @@ mod tests {
         let a = image_cache_for_host(a_id);
         let b = image_cache_for_host(b_id);
 
-        let key: ImageCacheKey = ("/code/tiles.png".into(), 11);
+        let key: ImageCacheKey = ("/code/tiles.png".into(), 11, 0, 0);
         complete_load(&a, &key, 100);
         complete_load(&b, &key, 200);
 
@@ -764,19 +792,18 @@ mod tests {
         let (a_id, _) = unique_host_pair();
         // Unique path: the decoded-bytes cache this asserts against is shared with
         // every other test in this binary.
-        let key: ImageCacheKey = (format!("/code/pinned-{a_id}.png"), 13);
-        let io_key = to_io_cache_key(&key);
+        let key: ImageCacheKey = (format!("/code/pinned-{a_id}.png"), 13, 0, 0);
 
         complete_load(&image_cache_for_host(a_id), &key, 100);
         assert_eq!(
-            migo_io::image_cache::global_cache().pin_count(&io_key),
+            migo_io::image_cache::global_cache().pin_count(&key),
             1,
             "a live alias must pin the decoded bytes it draws from"
         );
 
         unregister_image_cache(a_id);
         assert_eq!(
-            migo_io::image_cache::global_cache().pin_count(&io_key),
+            migo_io::image_cache::global_cache().pin_count(&key),
             0,
             "the pin outlived the session that took it, so these bytes can never be \
              evicted again -- the decoded cache is deliberately not cleared on \

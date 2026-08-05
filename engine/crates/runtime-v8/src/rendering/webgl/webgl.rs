@@ -3154,6 +3154,87 @@ mod tests {
             "GL issued before direct gradient apply must remain first; ops={ops:?}"
         );
     }
+
+    // ── Section 7.3: zero steady-state allocation ───────────────────────────
+
+    /// Bind `image_id` to a settled load of `key` in a table of its own, with the
+    /// decoded bytes resident, which is the state a completed `op_load_image`
+    /// leaves behind.
+    ///
+    /// The alias table is built here rather than taken from the per-host registry
+    /// because nothing in this fixture needs the registry, and a table of its own
+    /// cannot collide with another test's host id.
+    fn settled_image_alias(
+        session: i32,
+        image_id: u32,
+        key: &crate::rendering::image::cache::ImageCacheKey,
+    ) -> crate::rendering::image::ImageCacheState {
+        use crate::rendering::image::cache::ImageCache;
+
+        // The alias key *is* the decoded-bytes cache's key, so the bytes go in
+        // under the very key the alias will later be resolved through.
+        migo_io::global_cache().insert(
+            key.clone(),
+            shared::protocol::io_cmd::NormalizedImage::new(16, 16, vec![0xFF; 16 * 16 * 4]),
+            session,
+        );
+
+        let aliases = std::sync::Arc::new(parking_lot::Mutex::new(ImageCache::new()));
+        {
+            let mut c = aliases.lock();
+            let _ = c.begin_load(image_id, key);
+            c.register_inflight_alias(image_id, 0x5000_0001);
+            let _ = c.finish_load(image_id, 0x5000_0001, key, key, Ok((16, 16)));
+        }
+        crate::rendering::image::ImageCacheState { aliases, session }
+    }
+
+    /// Section 7.3, on the path every `texSubImage2D(…, image)` takes.
+    ///
+    /// `op_tex_sub_image_2d_from_image` reaches `resolve_cached_image_rgba`
+    /// unconditionally — there is no `TexSubImage2DFromShared` command and no
+    /// branch above it — so this is a per-call cost of that op rather than a
+    /// fallback, and it does not depend on which game is running.
+    /// `op_tex_image_2d_from_image` reaches the same helper whenever its GPU-side
+    /// copy is unavailable.
+    ///
+    /// What is measured is the resolve — the alias lookup and the decoded-bytes
+    /// lookup — and not the upload behind it, which is the render command path
+    /// Section 7.3 still lists as unmeasured.
+    #[test]
+    fn steady_state_image_texture_resolve_never_reaches_the_heap() {
+        use super::{RgbaLookup, resolve_cached_image_rgba};
+
+        // Unique path: the decoded-bytes cache this fixture inserts into is shared
+        // with every other test in this binary.
+        let key = crate::rendering::image::cache::make_cache_key(
+            "/code/steady-state-texsubimage.png",
+            None,
+            None,
+            17,
+        );
+        let images = settled_image_alias(9_101, 1, &key);
+
+        assert!(
+            matches!(
+                resolve_cached_image_rgba(&images, 1),
+                RgbaLookup::Found { .. }
+            ),
+            "the fixture must resolve to bytes, or the burst measures the miss path"
+        );
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "webgl: per-call image texture resolve for texSubImage2D(image)",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| match resolve_cached_image_rgba(&images, 1) {
+                RgbaLookup::Found { width, .. } => width,
+                _ => panic!("a pinned, resident alias stopped resolving mid-burst"),
+            },
+        );
+    }
 }
 
 // ── Task 3: test-only submit instrumentation ─────────────────────────────────
@@ -3430,21 +3511,24 @@ fn resolve_cached_image_rgba(images: &ImageCacheState, image_id: u32) -> RgbaLoo
     // (e.g. `image_cache::global_cache().clear()` called
     // manually, or a pin-mismatch bug — both of which we want to
     // surface in the warn log rather than paper over silently).
-    let key = {
-        let c = images.aliases.lock();
-        c.cache_key_for_image_id(image_id)
-    };
-    let Some(key) = key else {
+    //
+    // Both lookups run under this Session's alias lock, so the key is borrowed
+    // out of the alias table rather than copied out of it. That is what makes
+    // this path allocation-free: an owned key here is a `String` clone per call,
+    // and `op_tex_sub_image_2d_from_image` reaches this helper unconditionally.
+    //
+    // **Lock order: this Session's alias table, then the process-wide
+    // decoded-bytes cache.** That is the order this file's only other nesting
+    // already takes -- every `pin`/`unpin` in `ImageCache` runs with the alias
+    // lock held, and `ImageCache::drain` holds an io guard inside it -- and the
+    // reverse cannot be written: `migo-io` does not depend on `runtime-v8`, so
+    // no code holding the io lock can reach an alias table at all.
+    let aliases = images.aliases.lock();
+    let Some(key) = aliases.cache_key_for_image_id(image_id) else {
         return RgbaLookup::UnknownAlias;
     };
 
-    let cached = {
-        let mut cache = migo_io::global_cache();
-        cache.get(
-            &crate::rendering::image::cache::to_io_cache_key(&key),
-            images.session,
-        )
-    };
+    let cached = migo_io::global_cache().get(key, images.session);
     match cached {
         Some(entry) => {
             // Diag: trace confirms WebGL texImage2D actually
@@ -3467,7 +3551,12 @@ fn resolve_cached_image_rgba(images: &ImageCacheState, image_id: u32) -> RgbaLoo
                 source: RgbaSource::IoCache,
             }
         }
-        None => RgbaLookup::AliasKnownButEvicted { cache_key: key },
+        // The miss path owns its key: it is a diagnostic that outlives the guard,
+        // and it is not steady state -- reaching it means the pin accounting has
+        // already gone wrong.
+        None => RgbaLookup::AliasKnownButEvicted {
+            cache_key: key.clone(),
+        },
     }
 }
 

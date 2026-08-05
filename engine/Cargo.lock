@@ -1804,6 +1804,7 @@ dependencies = [
  "glow",
  "http",
  "image",
+ "migo-alloc-probe",
  "migo-io",
  "migo-shared",
  "parking_lot",

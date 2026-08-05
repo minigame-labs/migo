@@ -1044,14 +1044,13 @@ review. A commit alone is not completion evidence.
   drain them — so the suite hangs instead of reporting. No test can report on that
   mutant, this one included.
 
-- [ ] 0.36 Decide whether `texImage2D(image)`'s CPU-bytes path needs its two owned
-  keys. Found while measuring task 0.34: `resolve_cached_image_rgba` clones the key
-  out of the alias map and then `to_io_cache_key` builds a second owned copy from it,
-  so the call allocates twice before the decoded-image cache — which now allocates
-  nothing — is reached. Both live in `crates/runtime-v8/src/rendering/webgl/webgl.rs`
-  and `crates/runtime-v8/src/rendering/image/cache.rs`.
+- [x] 0.36 Remove `texSubImage2D(image)`'s two owned keys per call. Found while
+  measuring task 0.34: `resolve_cached_image_rgba` cloned the key out of the alias
+  map and then `to_io_cache_key` built a second owned copy from it, so the call
+  allocated twice before the decoded-image cache — which now allocates nothing —
+  was reached.
 
-  **The hotness question is answered, and by structure rather than by measurement:
+  **The hotness question was answered by structure rather than by measurement:
   there is a second caller with no fast path at all.** Task 0.34 recorded this as
   open on the assumption that `op_tex_image_2d_from_image` was the only way in, and
   for that op the reading was right — it takes a GPU-side copy whenever the alias
@@ -1060,20 +1059,59 @@ review. A commit alone is not completion evidence.
   really is a fallback. But `op_tex_sub_image_2d_from_image` calls
   `resolve_cached_image_rgba` **unconditionally**: there is no
   `TexSubImage2DFromShared` command and no branch above it. Every
-  `texSubImage2D(…, image)` pays both owned keys, every call, with no cheaper route
-  available to the content. That is a per-event allocation on a path Section 7.3
-  governs, and it does not depend on which game is running.
+  `texSubImage2D(…, image)` paid both owned keys, every call, with no cheaper route
+  available to the content, and it does not depend on which game is running.
 
-  So the task is now the fix rather than the question. Two allocations, both
-  avoidable in principle: `cache_key_for_image_id` clones an `ImageCacheKey`
-  (`(String, u64)`) out of `shared_to_key`, and `to_io_cache_key` then parses that
-  string's `path\0WxH` encoding and builds a *second* owned key for the io side.
-  The shape that removes both is to stop deriving the io key per call — the alias
-  table already knows it at bind time — but the choice interacts with lock order,
-  because the io cache is behind its own mutex and the alias table behind another,
-  and the current code releases the first before taking the second. Whatever lands
-  must arrive with its own burst gate, the way 0.34's did, and with the lock order
-  argued rather than assumed.
+  **The gate came first and failed with the counts the defect predicts**: 128 heap
+  allocation events over 64 measured iterations — 128 fresh, 128 releases, 4352
+  bytes — which is exactly two owned keys per call and nothing else. `migo-io`
+  already had the counting allocator; `migo-runtime-v8` did not, so it gained the
+  `[dev-dependencies]` entry and the `#[cfg(test)]` `#[global_allocator]`. No CI
+  list needed editing: `migo-runtime-v8` was already on both the test and the
+  clippy line, which is what the two-list contract exists to keep true.
+
+  **The fix deletes the conversion rather than making it cheaper.** The two owned
+  keys were one defect wearing two faces: the alias table keyed on
+  `(path\0WxH, generation)` and the cache below it on `(path, generation, w, h)`,
+  so the boundary had to be crossed by rebuilding. `cache::ImageCacheKey` is now
+  *the same type* as `migo_io::image_cache::ImageCacheKey` — the mangling, the
+  parse and `to_io_cache_key` are gone from eleven call sites, not just from this
+  one — and `cache_key_for_image_id` hands back a borrow, so the lookup copies
+  nothing. Making the two sides share one type also puts an encoding drift between
+  them beyond writing, which the mangled form could not.
+
+  **Lock order argued, not assumed, and the argument is that it cannot be
+  inverted.** The borrow lives only while the alias lock is held, so the lookup now
+  nests this Session's alias mutex outside the process-wide decoded-bytes mutex.
+  That is the order this code already took everywhere — every `pin`/`unpin` in
+  `ImageCache` runs under the alias lock, and `ImageCache::drain` holds an io guard
+  inside one — and the reverse is unwritable rather than merely absent: `migo-io`
+  does not depend on `migo-runtime-v8`, so no code holding the io lock can reach an
+  alias table. Searched rather than recalled: every `global_cache()` acquisition
+  outside `migo-io` itself is either a statement temporary or the one inside
+  `drain`. No new cross-session lock either — this path already took the shared
+  decoded-bytes lock, which Section 6.5 puts in the deliberately-shared tier.
+
+  **Two mutants, each changing exactly one property, each killing exactly one
+  test.** A single `key.clone()` at the lookup fails the burst gate alone with 64
+  events over 64 iterations — one added allocation per call, so the gate is
+  sensitive to *that* call and not to the shape around it. Making `make_cache_key`
+  ignore the requested size fails
+  `each_requested_size_gets_a_cache_slot_of_its_own` alone, at its own assertion.
+  That second guard earns its place: the size used to ride in the path and now
+  rides in the key's own fields, so a key built without them is still well formed,
+  and every other test in that file uses full-resolution keys — the mutant proves
+  nothing else was covering it, including
+  `resized_rgba_cache_key_uses_decoded_source_generation`, which stayed green.
+
+  **Not done, and named rather than implied.** `remove_previous_alias` and
+  `try_release_and_get_destroy_rid` still clone the key out of `shared_to_key`,
+  because they remove from that same map afterwards and the borrow cannot outlive
+  it. Those run per `img.src =` and per destroy, not per frame; unifying the key
+  type halved them for free, and no gate claims them. The six V8 snapshots were
+  already stale on this branch before this change and remain so — the fingerprint
+  covers every `runtime-v8` `.rs` file, so they are regenerated once for the
+  branch rather than once per task.
 
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing

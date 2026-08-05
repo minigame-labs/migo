@@ -493,7 +493,7 @@ async fn op_load_image_inner(
                 c.register_inflight_alias(image_id, shared_id);
             }
             // Held until this arm returns, however it returns: see `PrePin`.
-            let pre_pin = PrePin::take(cache::to_io_cache_key(&cache_key));
+            let pre_pin = PrePin::take(cache_key.clone());
             info!(
                 "op_load_image start loader: image_id={}, shared_id={}, src={}, cpu_backing_required={}",
                 image_id,
@@ -552,11 +552,7 @@ async fn op_load_image_inner(
             // happens in `finish_load` below.
             if target_width.is_some() && target_height.is_some() {
                 if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
-                    migo_io::global_cache().insert(
-                        cache::to_io_cache_key(&actual_cache_key),
-                        rgba.clone(),
-                        session,
-                    );
+                    migo_io::global_cache().insert(actual_cache_key.clone(), rgba.clone(), session);
                 }
             }
 
@@ -569,11 +565,7 @@ async fn op_load_image_inner(
             // LRU slot keyed on the full-res key.
             if target_width.is_none() && target_height.is_none() {
                 if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
-                    migo_io::global_cache().insert(
-                        cache::to_io_cache_key(&actual_cache_key),
-                        rgba.clone(),
-                        session,
-                    );
+                    migo_io::global_cache().insert(actual_cache_key.clone(), rgba.clone(), session);
                 }
             }
 
@@ -676,7 +668,7 @@ async fn upload_inline_image(
         // Same live-resource invariant as the local-file path: pin before
         // inserting so the admission filter cannot reject bytes for an Image
         // that is already being loaded for WebGL use.
-        let pre_pin = PrePin::take(cache::to_io_cache_key(&cache_key));
+        let pre_pin = PrePin::take(cache_key.clone());
         if let DecodedImage::Rgba(ref rgba) = decoded {
             migo_io::global_cache().insert(pre_pin.key().clone(), rgba.clone(), session);
         }
@@ -1078,7 +1070,11 @@ async fn op_load_image_subrect_inner(
     // the whole game session instead of once per `createImageBitmap`
     // call.  The alias is refcounted like any other `Image` / bitmap,
     // so a bitmap.close() decrements the texture independently.
-    let cache_key: cache::ImageCacheKey = (
+    //
+    // The crop lives in the path rather than in the key's dimension fields:
+    // those name a *resize* of the whole image, and a crop is not one. A NUL
+    // delimiter cannot collide, being illegal in filesystem paths.
+    let cache_key: cache::ImageCacheKey = migo_io::image_cache::full_res_key(
         format!(
             "{}\0subrect={}x{}+{}+{}@{}x{}",
             real_src, sw, sh, sx, sy, resize_w, resize_h
