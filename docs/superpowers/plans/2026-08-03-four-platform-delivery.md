@@ -1253,6 +1253,43 @@ review. A commit alone is not completion evidence.
   against it. The helper now refuses an empty anchor or replacement, and reverts by
   restoring a verified copy rather than by inverse substitution.
 
+- [x] 0.43 Gate the audio graph's real-time path. Section 7.3 listed the audio
+  path as unmeasured, and it is the last steady hot path a host test binary can
+  reach — the BLE halves need an on-target binary and a JVM mechanism.
+
+  **Different stakes from the frame path, which is why it was worth doing even
+  though it passed.** `AudioContext::process` is the output callback's work: once
+  per quantum, on a thread `audio_thread.rs` runs under SCHED_FIFO on Android. An
+  allocation there is not a throughput cost, it is a deadline miss — the allocator
+  can block behind a thread that is not real-time scheduled at all, and the result
+  is an audible dropout rather than a slower frame.
+
+  **It passed against unmodified code**: the mix buffer is a reused field, node
+  output buffers are created on first use, and the finished-node list is a
+  `Vec::new()` that only allocates when a source actually ends. Recorded as a
+  result rather than a non-event, because two mutants show the gate can fail.
+
+  **Mutation-proved, two mutants, both killing this gate alone.** Replacing the
+  reused mix buffer with a per-quantum `vec!` fails with 192 events and 196 608
+  bytes over 64 quanta. The one that matters more is smaller and looks like an
+  improvement: giving the finished-node list `Vec::with_capacity(self.nodes.len())`
+  instead of `Vec::new()` costs exactly one allocation per quantum — 64 over 64,
+  768 bytes — on the real-time thread, for a list that is almost always empty.
+  That is the shape of regression this gate exists to catch, and nothing else in
+  the crate would have.
+
+  **Scope stated rather than implied.** What is measured is the graph render for a
+  source-into-gain-into-destination chain, which is what every buffer-playback
+  plus volume does. The rest of the audio subsystem — `audio_thread`'s scheduling,
+  `output`'s device handoff, `streaming`'s refill — is still unmeasured, so the
+  audio path is not recorded as satisfied, only this part of it.
+
+  **Verified.** migo-audio 49 from a 48 baseline; every other crate unchanged;
+  clippy clean; `scripts/verify-change.sh --base HEAD` every host step PASS.
+  `migo-audio` was already on both the CI test and clippy lists, so wiring the
+  probe into it needed no list change — the two-list contract stayed satisfied
+  without editing it.
+
 - [ ] 0.41 Guard the batched submit's obligation to return its vector to the
   pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
   `recycle_gl_command_vec` instead of returning the emptied vector **failed no
