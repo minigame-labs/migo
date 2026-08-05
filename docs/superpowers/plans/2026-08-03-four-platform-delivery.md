@@ -1380,6 +1380,27 @@ review. A commit alone is not completion evidence.
   times after; the fixture now does the same, which is why the resolve and the
   install are separate functions.
 
+  **Containment of the test-only seam checked rather than asserted, and a guard
+  deliberately not added.** Both this task and 0.44 add a `pub fn` handing out a
+  process-global lock behind `feature = "contention-probe"`, under a comment
+  claiming no shipped build enables it. Cargo feature unification can make that
+  claim false, so it was tested: a `compile_error!` tripwire on
+  `all(feature = "contention-probe", not(test))` **compiles clean** through normal
+  builds of `migo-core` and `migo-runtime-v8`, and fires when the feature is forced
+  on, so it is not vacuous. Resolver 2 keeps dev-dependency features out of normal
+  builds and the claim holds.
+
+  The tripwire was removed rather than kept, because it cannot be made permanent:
+  it fires during `cargo test -p migo-runtime-v8` too, since `shared` is built
+  there as an ordinary dependency of the test binary rather than under `cfg(test)`,
+  so a compile-time check cannot tell a dev-dependency enabling it from a shipping
+  build enabling it. The only mechanism left is a manifest-parsing contract script,
+  and the harm it would guard against is a `pub fn` returning a lock reference in a
+  crate that is not a third-party API surface — real hygiene, no correctness or
+  security consequence. Recorded as verified-not-gated so the next reader knows the
+  claim was measured and why no gate backs it, rather than finding a comment and
+  having to repeat the work.
+
 - [ ] 0.41 Guard the batched submit's obligation to return its vector to the
   pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
   `recycle_gl_command_vec` instead of returning the emptied vector **failed no
