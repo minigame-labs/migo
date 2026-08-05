@@ -410,7 +410,6 @@ impl UnifiedFrameCollector {
             return None;
         }
 
-        let segments = std::mem::take(&mut self.segments);
         self.current = CurrentKind::None;
         self.pending_bytes = 0;
 
@@ -420,7 +419,12 @@ impl UnifiedFrameCollector {
         // Canvas2D segments add to the set; GL segments consume it.
         let mut pending_2d: HashSet<u32> = HashSet::new();
 
-        for seg in segments {
+        // `drain` rather than `mem::take`: the segments belong to the packet, the
+        // list holding them belongs to the next frame.  Taking hands both away and
+        // leaves this vector at zero capacity, so the next frame's first push
+        // allocates it again — once per frame, forever, on the thread running the
+        // game.  Draining moves the segments out and keeps the allocation.
+        for seg in self.segments.drain(..) {
             match seg {
                 FrameSegment::Canvas2D(s) => {
                     pending_2d.insert(s.canvas_id);
@@ -1825,5 +1829,199 @@ mod tests {
             _ => panic!("expected CanvasBatch"),
         };
         assert!(dirty.is_none(), "SetLineWidth must poison scissor hint");
+    }
+}
+
+// ── Section 7.3: zero steady-state allocation on the render command path ────
+
+#[cfg(test)]
+mod steady_state_allocation {
+    use super::*;
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+    use shared::command_vec_pool::take_gl_command_vec;
+
+    const WARMUP: usize = 4;
+    const MEASURED: usize = 64;
+
+    /// A command with no heap payload — the majority of a WebGL frame by count,
+    /// and the only kind `push_gl_fast` accepts.
+    fn scalar_gl_command() -> GLCmd {
+        GLCmd::Clear {
+            canvas_id: 1,
+            bit_field: 0x4000,
+        }
+    }
+
+    fn gl_segment_headroom(collector: &UnifiedFrameCollector) -> Option<usize> {
+        match collector.segments.last() {
+            Some(FrameSegment::GL(seg)) => Some(seg.commands.capacity() - seg.commands.len()),
+            _ => None,
+        }
+    }
+
+    /// Open a GL segment and drive it until it has `headroom` unused slots.
+    ///
+    /// **The reservation is established here rather than by cycling frames
+    /// through the command-vector pool, and that is deliberate.** The pool is
+    /// process-global and `cargo test` runs this binary's tests concurrently, so
+    /// a gate that depended on getting *its own* recycled vector back would fail
+    /// whenever another test took it first — a flaky gate, which is worse than
+    /// none. The pool's own reuse property is covered where it can be tested
+    /// deterministically, against a private instance, by
+    /// `command_vec_pool::tests::recycled_vector_reuses_its_allocation`. What is
+    /// left for these gates is the question that test cannot answer: whether the
+    /// collector reaches the heap on an enqueue into capacity it already holds.
+    ///
+    /// Each push either consumes a reserved slot or doubles the capacity, so the
+    /// loop converges — **while consecutive GL commands share a segment.** The
+    /// bound is what happens when they stop: a collector that opened a segment
+    /// per command would leave the newest one at its minimum capacity forever,
+    /// and an unbounded loop would then allocate until the process died rather
+    /// than report. A fixture that cannot establish its precondition has to say
+    /// so; hanging the suite is not a test result.
+    fn reserve_gl_segment_headroom(collector: &mut UnifiedFrameCollector, headroom: usize) {
+        // Generous: reaching `headroom` needs about `headroom` pushes plus the
+        // doublings, so anything near this bound means the invariant is gone.
+        let ceiling = headroom * 4 + 64;
+        for _ in 0..ceiling {
+            if gl_segment_headroom(collector).is_some_and(|slack| slack >= headroom) {
+                return;
+            }
+            collector.push_gl_fast(scalar_gl_command());
+        }
+        panic!(
+            "could not reserve {headroom} free slots in the open GL segment after \
+             {ceiling} commands: consecutive GL commands are no longer sharing one \
+             segment, so every enqueue takes a fresh vector from the pool"
+        );
+    }
+
+    /// Hand the accumulated commands back the way the render thread does, so a
+    /// gate does not leave the shared pool poorer than it found it.
+    fn end_frame(collector: &mut UnifiedFrameCollector) {
+        let Some(packet) = collector.build_frame_packet(true) else {
+            return;
+        };
+        for op in packet.into_ops() {
+            match op {
+                FrameOp::GlBatch(payload) => {
+                    // `recycle` refuses a non-empty vector, and the render thread
+                    // empties it by draining as it executes.
+                    let mut commands = payload.commands;
+                    commands.clear();
+                    recycle_gl_command_vec(commands);
+                }
+                FrameOp::CanvasBatch(payload) => {
+                    let mut commands = payload.commands;
+                    commands.clear();
+                    shared::command_vec_pool::recycle_canvas_command_vec(commands);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Section 7.3, on the per-event unit of the render command path: one `gl.*`
+    /// call from content becomes one command in the open segment. Cocos and
+    /// three.js emit hundreds of these per frame, so this is the highest-rate
+    /// event the engine handles.
+    ///
+    /// What it measures is everything `push_gl_fast` does around the push — the
+    /// segment lookup, the pending-byte accounting and the peak record — none of
+    /// which may reach the heap once the segment holds capacity.
+    #[test]
+    fn steady_state_gl_command_enqueue_never_reaches_the_heap() {
+        let mut collector = UnifiedFrameCollector::new();
+        reserve_gl_segment_headroom(&mut collector, WARMUP + MEASURED);
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "frame_collector: per-command GL enqueue into an open segment",
+                warmup: WARMUP,
+                measured: MEASURED,
+            },
+            |_| collector.push_gl_fast(scalar_gl_command()),
+        );
+
+        end_frame(&mut collector);
+    }
+
+    /// Building a packet hands the *segments* to the builder. It must not hand
+    /// over the list that held them: that list is refilled from empty on the very
+    /// next frame, so surrendering its allocation means the first push of every
+    /// frame allocates one again, for the life of the process.
+    ///
+    /// Not folded into a burst gate, because the two would not be measuring the
+    /// same thing. A frame boundary still reaches the heap for the frame
+    /// packet's own op vector, which is pooled nowhere and is recorded as its own
+    /// task — so a burst across a frame cycle cannot assert zero yet, while this
+    /// property can be asserted exactly.
+    #[test]
+    fn building_a_packet_keeps_the_segment_lists_allocation() {
+        let mut collector = UnifiedFrameCollector::new();
+        // Several segments, so the list has grown a real allocation to keep.
+        for _ in 0..4 {
+            collector.push_canvas2d(1, Canvas2DCmd::Save);
+            collector.push_gl_fast(scalar_gl_command());
+        }
+        let reserved = collector.segments.capacity();
+        assert!(reserved >= 8, "fixture must produce a list worth keeping");
+
+        end_frame(&mut collector);
+
+        assert_eq!(
+            collector.segments.capacity(),
+            reserved,
+            "the frame gave up the segment list's allocation, so the next frame's \
+             first push has to allocate it again"
+        );
+        assert!(
+            collector.segments.is_empty(),
+            "the segments themselves must still be handed to the packet"
+        );
+    }
+
+    /// Section 7.3, on the batched half of the same path: `op_gl_submit_stream`
+    /// takes a vector from the pool, decodes a stream into it and hands it to
+    /// `append_gl_batch`, which appends and recycles. That is one event per
+    /// submit, and Pixi reaches it twice a frame with every draw batched behind
+    /// it — so it is the path a real game's frame actually takes.
+    ///
+    /// Its own gate rather than a shared one with the enqueue above: they are
+    /// different calls, and a burst covering both could not say which reached the
+    /// heap. The batch is small enough to fit the pool's minimum capacity, so the
+    /// take/recycle round trip here is deterministic even when a concurrent test
+    /// empties the pool.
+    #[test]
+    fn steady_state_gl_batch_append_never_reaches_the_heap() {
+        const BATCH: usize = 8;
+        // Compile-time, because it is a property of the two constants rather than
+        // of this run: a batch larger than the pool's minimum capacity would grow
+        // the vector the pool just handed over, measuring the pool instead of the
+        // append.
+        const {
+            assert!(BATCH <= shared::command_vec_pool::GL_COMMAND_VEC_INITIAL_CAPACITY);
+        }
+
+        let mut collector = UnifiedFrameCollector::new();
+        reserve_gl_segment_headroom(&mut collector, (WARMUP + MEASURED) * BATCH);
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "frame_collector: batched GL submit append and vector recycle",
+                warmup: WARMUP,
+                measured: MEASURED,
+            },
+            |_| {
+                let mut commands = take_gl_command_vec();
+                for _ in 0..BATCH {
+                    commands.push(scalar_gl_command());
+                }
+                let approx = BATCH * std::mem::size_of::<GLCmd>();
+                collector.append_gl_batch(commands, approx)
+            },
+        );
+
+        end_frame(&mut collector);
     }
 }

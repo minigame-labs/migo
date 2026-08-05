@@ -651,8 +651,9 @@ These are enforced by tests, not by inspection:
   **Covered so far:** the ordered host queue (`host_channel`, across coalescible
   motion, reliable and terminal transitions, and the drain), the input payload pool,
   the per-`fillText` text texture cache hit, the decoded-image cache's lookup and
-  its pin/unpin pair, and the per-call image texture resolve above it that
-  `texSubImage2D(image)` takes. What
+  its pin/unpin pair, the per-call image texture resolve above it that
+  `texSubImage2D(image)` takes, and the render command path's two enqueues — the
+  per-command one and the batched submit. What
   `scripts/test-input-transport-contract.sh` does *not* do is still worth stating,
   because it is the reason this requirement was mis-recorded as satisfied for so
   long: it greps the sources for structural properties — `VecDeque::with_capacity(`,
@@ -665,9 +666,15 @@ These are enforced by tests, not by inspection:
   **Not covered, and named rather than implied.** The BLE notification path's Rust
   half is `cfg(target_os = "android")`, so a host test binary never compiles it and
   the gate cannot run there; its Java half needs a JVM mechanism entirely, because a
-  Rust allocator observes nothing the JVM allocates. The render command path and the
-  audio path are unmeasured. No path may be recorded as satisfying this requirement
-  without a burst test named against it.
+  Rust allocator observes nothing the JVM allocates. The audio path is unmeasured.
+  The render command path's *per-event* enqueues are now gated, but its **frame
+  boundary** is not zero and cannot yet be asserted as such: the frame packet's op
+  vector is pooled nowhere, so a frame costs one allocation however little it
+  draws, and the pool's element-based retention ceiling turns a frame above it into
+  six reallocations and 175 KiB of copying — a cliff at one command's width, not a
+  gradient. Both are recorded as their own items with their measurements. No path
+  may be recorded as satisfying this requirement without a burst test named against
+  it.
 
   **What applying it to the decoded-image cache found**, since it is the second
   instance of one shape and that is what makes it worth stating: a pin recorded in a

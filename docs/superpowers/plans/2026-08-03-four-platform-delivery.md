@@ -1117,6 +1117,107 @@ review. A commit alone is not completion evidence.
   covers every `runtime-v8` `.rs` file, so they are regenerated once for the
   branch rather than once per task.
 
+- [x] 0.38 Gate the render command path's steady-state allocation. Section 7.3
+  listed it as unmeasured and it is the highest-rate event the engine handles —
+  one `gl.*` call from content becomes one command in the collector, and Cocos and
+  three.js emit hundreds per frame.
+
+  **Two gates, not one, because they are different calls.** `push_gl_fast` is the
+  per-command enqueue; `append_gl_batch` is what `op_gl_submit_stream` reaches
+  after decoding a stream, which is the path a Pixi frame actually takes. A burst
+  covering both could not say which reached the heap — the lesson task 0.34 paid
+  for. **Both passed against unmodified code**, so the collector and the command
+  vector pool were already doing their job on the per-event path; that is a result
+  rather than a non-event, and the mutants below are what make it one.
+
+  **The reservation is established locally rather than by cycling frames through
+  the pool, and the reason is recorded in the fixture.** The pool is
+  process-global and `cargo test` runs this binary concurrently, so a gate that
+  depended on getting *its own* recycled vector back would fail whenever another
+  test took it first. A flaky gate is worse than none. The pool's reuse property
+  is already covered where it can be deterministic — against a private instance,
+  in `command_vec_pool::tests::recycled_vector_reuses_its_allocation`.
+
+  **One measured defect, fixed here.** `build_frame_packet_inner` took the segment
+  list with `std::mem::take`, which hands away both the segments *and* the vector
+  holding them and leaves it at zero capacity — so the first push of every frame
+  allocated it again, forever, on the thread running the game. `drain(..)` moves
+  the segments out and keeps the allocation. Measured over ten frames after
+  warm-up: **two allocations and two frees per frame became one and one**, at any
+  frame size up to the pool's retention ceiling.
+
+  **Mutation-proved, three mutants.** Dropping `append_gl_batch`'s recycle instead
+  of returning the vector fails the append gate alone with exactly one allocation
+  per event (64 over 64, 90112 bytes) — and **no other test in the binary noticed
+  a leaked pool vector**. Reverting `drain` to `mem::take` fails the segment-list
+  test alone. Making every command open a segment of its own fails both burst
+  gates, at the fixture's own precondition rather than at the burst — and nothing
+  else in the binary, so a segment per command is otherwise invisible.
+
+  **That third mutant is also why the fixture has a bound.** Its first version
+  looped until the segment held enough reserved slots, which under that mutant can
+  never happen: the run allocated until the kernel killed it (exit 137), so the
+  mutant was reported as a hung suite rather than as a failure. A fixture that
+  cannot establish its precondition has to say so. It now stops and names the
+  invariant that broke, which is what turned an unkillable mutant into a killed
+  one.
+
+  **Verified.** runtime-v8 514 from a 511 baseline; shared 392, io 264/5, graphics
+  523, core 51, capi 142, platform 50/1, audio 48 unchanged; python CI 117; both
+  contract scripts; clippy clean on the touched crate — the one warning this
+  change introduced was a constant assertion, and clippy's suggestion was taken
+  rather than silenced, so the fixture's precondition is now a compile-time check.
+  `scripts/verify-change.sh --base HEAD` reports every host step PASS and requires
+  no target build: the changed file carries no conditional, which the selector
+  confirms rather than assumes.
+
+- [ ] 0.39 Decide the command-vector pool's retention rule. Found by task 0.38's
+  measurement, and it is a cliff rather than a gradient. `MAX_RECYCLABLE_COMMAND_CAPACITY`
+  is 512 *elements*, so a frame that grows its vector past that has it refused by
+  the pool and starts the next frame from the 16-element minimum. Measured per
+  frame, after warm-up, on the thread running the game:
+
+  | commands per frame | allocations | reallocations | bytes |
+  | --- | --- | --- | --- |
+  | 512 | 1 | 0 | 224 |
+  | 513 | 2 | 6 | 179 040 |
+
+  **799× more bytes for one more command.** The six reallocations are the regrowth
+  16 → 32 → 64 → 128 → 256 → 512 → 1024, every frame, and `size_of::<GLCmd>()` is
+  88 bytes, so the copying is real work and not just allocator traffic. At 60 Hz
+  that is about 10.5 MB/s on the thread CLAUDE.md Section 7 identifies as the
+  bottleneck.
+
+  Whether content reaches it is the open question — Pixi batches down to a handful
+  of commands per frame, while `push_gl_fast`'s own documentation says Cocos and
+  three.js emit hundreds. 513 is not far above "hundreds".
+
+  Not fixed here, because every cheap fix is a worse rule rather than a smaller
+  one. Raising the constant moves the cliff without removing it. Shrinking an
+  oversized vector before recycling trades the JS thread's six reallocations for
+  one, and loses the capacity anyway. The honest shape is to bound what the pool
+  is actually protecting — total retained bytes across it — rather than the length
+  of any one vector, since a per-vector element cap does not bound memory at all
+  (16 slots × 512 × 88 B already permits 720 KiB). That is a pool redesign with
+  its own tests, and smuggling it into a gate-building commit as a changed
+  constant is how it would get reverted later without the argument.
+
+- [ ] 0.40 Pool the frame packet's op vector, or record why it stays unpooled.
+  The one allocation per frame that survives task 0.38's fix:
+  `FramePacketBuilder::new` starts from `Vec::new()` and the packet carries it to
+  the render thread. The command vectors either side of it are pooled; this one is
+  not, so a frame costs one allocation and one free (224 bytes) no matter how
+  little it draws.
+
+  It is not the same change as the command vector pool, which is why it is its own
+  item. The packet has two consumption sites, and the main one
+  (`render_thread.rs`) already allocates **two more** vectors to reorder the ops
+  into Canvas2D-then-GL phases, then drops the original. So the recycle point is
+  not simply "after execution", and the reorder's own two allocations per frame
+  belong in the same measurement. Until that is settled, a burst across a whole
+  frame cycle cannot assert zero, which is why task 0.38 asserted the segment
+  list's capacity directly instead.
+
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
   0.19's second half, and confirmed in the source rather than inferred. A `/code`
