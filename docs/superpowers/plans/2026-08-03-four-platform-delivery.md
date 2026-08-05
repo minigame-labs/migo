@@ -370,10 +370,14 @@ review. A commit alone is not completion evidence.
   or the allocating core lifted into portable code. Its Java half needs a JVM
   mechanism (`ThreadMXBean.getThreadAllocatedBytes`), because a Rust allocator
   observes nothing the JVM allocates; `platforms/android` has no such usage today.
-  Also unmeasured: the render command path, the audio path, and
-  `io::image_cache`, which uses the same parallel-pin-map shape the text cache just
-  shed and is therefore likely to carry the same per-event key clone on the image
-  path.
+
+  Still unmeasured: the render command path and the audio path. **`io::image_cache`
+  no longer belongs on that list** — the prediction recorded here was right and was
+  acted on: task 0.34 measured it (the pin/unpin pair allocated, the lookup did
+  not) and task 0.36 removed the two owned keys on the layer above it. This
+  sentence named work already done for one session, which is the failure mode a
+  hand-maintained "remaining" list has in this repository; it is corrected rather
+  than left for the next reader to redo.
 - [ ] 0.27 Build the cross-session contention gate Section 7.3 requires.
   **Mechanism built and applied to the Rust per-event paths; the permission gate's
   JVM half stays with task 5.1, so this item stays open.**
