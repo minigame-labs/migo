@@ -1171,36 +1171,130 @@ review. A commit alone is not completion evidence.
   no target build: the changed file carries no conditional, which the selector
   confirms rather than assumes.
 
-- [ ] 0.39 Decide the command-vector pool's retention rule. Found by task 0.38's
-  measurement, and it is a cliff rather than a gradient. `MAX_RECYCLABLE_COMMAND_CAPACITY`
-  is 512 *elements*, so a frame that grows its vector past that has it refused by
-  the pool and starts the next frame from the 16-element minimum. Measured per
-  frame, after warm-up, on the thread running the game:
+  **Amended: the append gate was pool-contention-flaky, and fixing it cost a
+  mutant.** Its first version called `take_gl_command_vec` inside the measured
+  window, reasoning that it recycled a vector every iteration and would get one
+  back. That reasoning fails under concurrency: a concurrent test taking the
+  pool's last vector leaves `take` with nothing to hand back, so it allocates a
+  fresh minimum-capacity one. It passed standalone and failed under
+  `verify-change`'s load with a single 1408-byte allocation — exactly
+  `GL_COMMAND_VEC_INITIAL_CAPACITY * size_of::<GLCmd>()`. The batch vectors now
+  come from a reservoir built before the burst, which is the same rule
+  `reserve_gl_segment_headroom` already carried and which this gate should have
+  had from the start.
+
+  The cost is recorded rather than glossed: with the pool out of the measured
+  window, **the "stops recycling" mutant no longer fails anything** — a dropped
+  vector is a deallocation, and the burst counts allocations. Re-checked against
+  the final code: 514 passed, nothing failed. What still kills this gate is the
+  segment-per-command mutant, via the fixture's precondition. The recycle
+  obligation itself is now unguarded, which is task 0.41.
+
+- [x] 0.39 Bound the command-vector pool by the bytes it retains. Task 0.38
+  measured the old rule as a cliff rather than a gradient: `MAX_RECYCLABLE_COMMAND_CAPACITY`
+  capped a *single* vector at 512 elements, so a frame one command past it had its
+  vector dropped and regrew from the 16-element minimum on every subsequent frame.
 
   | commands per frame | allocations | reallocations | bytes |
   | --- | --- | --- | --- |
   | 512 | 1 | 0 | 224 |
   | 513 | 2 | 6 | 179 040 |
 
-  **799× more bytes for one more command.** The six reallocations are the regrowth
-  16 → 32 → 64 → 128 → 256 → 512 → 1024, every frame, and `size_of::<GLCmd>()` is
-  88 bytes, so the copying is real work and not just allocator traffic. At 60 Hz
-  that is about 10.5 MB/s on the thread CLAUDE.md Section 7 identifies as the
-  bottleneck.
+  799x the bytes for one more command, about 10.5 MB/s of copying at 60 Hz, on the
+  thread CLAUDE.md Section 7 identifies as the bottleneck.
 
-  Whether content reaches it is the open question — Pixi batches down to a handful
-  of commands per frame, while `push_gl_fast`'s own documentation says Cocos and
-  three.js emit hundreds. 513 is not far above "hundreds".
+  **Three defects in one constant, which is why raising it was not the fix.** It
+  was in the wrong unit — elements, so the same number meant 44 KiB of `GLCmd` and
+  a different amount of `Canvas2DCmd`. It bounded the wrong quantity — one vector,
+  not the pool, so it never actually bounded memory: 16 slots times 512 elements
+  was already permitted. And it was a cliff, which a retention rule should not be.
+  Raising the number moves the cliff; shrinking an oversized vector before
+  recycling trades six reallocations for one and loses the capacity anyway.
 
-  Not fixed here, because every cheap fix is a worse rule rather than a smaller
-  one. Raising the constant moves the cliff without removing it. Shrinking an
-  oversized vector before recycling trades the JS thread's six reallocations for
-  one, and loses the capacity anyway. The honest shape is to bound what the pool
-  is actually protecting — total retained bytes across it — rather than the length
-  of any one vector, since a per-vector element cap does not bound memory at all
-  (16 slots × 512 × 88 B already permits 720 KiB). That is a pool redesign with
-  its own tests, and smuggling it into a gate-building commit as a changed
-  constant is how it would get reverted later without the argument.
+  So the pool now bounds exactly what the ceiling was protecting: its own retained
+  bytes, tracked across `take` and `recycle`. **The permitted worst case is
+  unchanged by construction** — the budget is `slots * commands_per_slot *
+  size_of::<T>()`, the same arithmetic the old rule already allowed — but the
+  allowance is now spent on whatever shape the workload has, one large vector or
+  sixteen small ones, and no frame size is special.
+
+  **The unit hazard is designed out rather than documented.** The budget parameter
+  stays in *commands* and the pool converts to bytes itself, because a `usize`
+  byte budget beside a `usize` command count is a mistake the compiler cannot
+  catch — and the first draft of this change made exactly that mistake, handing a
+  byte value to the element parameter and getting a green test that proved
+  nothing.
+
+  **Mutation-proved, four mutants, and the fourth changed the design.** Removing
+  the budget check fails both budget tests. Dropping the reservation rollback on a
+  full channel fails the accounting test. Dropping it in `take` fails the same
+  test. Removing the separate `bytes > budget` early refusal **killed nothing** —
+  so it was a branch that read like a guard while changing no outcome, and it is
+  gone; the one budget check turns away the pathological vector too, since it is
+  over budget from an empty pool.
+
+  **One mutant survived the first version of the accounting test, and the test was
+  wrong rather than the code.** Its "refused by a full pool" case was really being
+  refused by the budget, so the `try_send` rollback it claimed to cover was never
+  reached. The fixture now separates the two limits — one slot, budget to spare —
+  and asserts which limit does the refusing.
+
+  **Verified.** shared 395 from 392; io 264/5, runtime-v8 514, graphics 523, core
+  51, capi 142, platform 50/1, audio 48 unchanged; `scripts/verify-change.sh
+  --base HEAD` every host step PASS.
+
+  **A tooling failure worth recording, because it nearly cost the work.** The
+  mutant-revert helper applied `str.replace(new, old)` with `new` empty when the
+  mutant was a deletion, and in Python `"abc".replace("", X)` inserts `X` between
+  every character — it wrote 12 505 copies of the block into the file, 2.7 MB. The
+  corruption was deterministic and exactly reversible (remove every occurrence of
+  the inserted block, which also removed the one real copy, which was the intent),
+  and the recovered file was confirmed by compiling and by re-running every mutant
+  against it. The helper now refuses an empty anchor or replacement, and reverts by
+  restoring a verified copy rather than by inverse substitution.
+
+- [ ] 0.41 Guard the batched submit's obligation to return its vector to the
+  pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
+  `recycle_gl_command_vec` instead of returning the emptied vector **failed no
+  test in the binary** — the burst gate caught it only while it took from the
+  pool, and that dependency had to go because it made the gate flaky under load.
+
+  A leaked pool vector is a deallocation, not an allocation, so the burst
+  mechanism cannot see it by construction. The two obvious replacements are both
+  unusable as written: asserting on the shared pool's contents is the flakiness
+  that was just removed, and counting deallocations across the burst is defeated
+  by the pool legitimately refusing a recycle once it is full. What would work is
+  an observation point that does not depend on the global pool's state — the
+  question this task has to answer before it writes a guard.
+
+  Worth doing rather than shrugging at: the failure mode is silent. Every caller
+  still gets a vector, just a freshly allocated one, so a forgotten recycle looks
+  exactly like a working pool and shows up only as steady-state allocation nobody
+  is measuring.
+
+- [x] 0.42 Stop the derived-cache prune test depending on the host's wall clock.
+  Found by `scripts/verify-change.sh` failing on a crate this branch had not
+  touched: `prune_respects_budget_and_preserves_newer_files` asserted that the
+  first-written file was evicted, and it survived a prune that removed three newer
+  ones.
+
+  **Diagnosed as far as the evidence allowed, then fixed in a way that does not
+  depend on the diagnosis.** The test spaced six writes 20 ms apart and let the
+  ambient clock supply the ordering; `prune_derived_cache` sorts on mtime with no
+  tie-break, so a clock that does not advance monotonically across those writes
+  inverts the expected order. It reproduced only under load — it passed 12 times
+  in isolation and 8 more across the full suite, and the failing run took 2.10 s
+  against 0.25 s idle. Rather than assert a root cause that could not be pinned
+  down on this host, the fixture now stamps the six modification times explicitly
+  with `File::set_times`, which removes the clock from the test entirely and drops
+  120 ms of sleeps.
+
+  The assertion is not weakened by the change: reversing the eviction order in
+  `prune_derived_cache` still fails this test and nothing else.
+
+  Recorded rather than folded silently into another commit, because an
+  intermittent failure in shared verification is not a nuisance — it is the thing
+  that makes every later "verified" line arguable.
 
 - [ ] 0.40 Pool the frame packet's op vector, or record why it stays unpooled.
   The one allocation per frame that survives task 0.38's fix:
