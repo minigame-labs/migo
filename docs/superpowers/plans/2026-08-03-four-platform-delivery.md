@@ -1690,10 +1690,62 @@ review. A commit alone is not completion evidence.
   parsed per render thread, so N games parsing one font parse it N times. Whether
   sharing them pays is a measurement; the GPU glyph atlas built from them stays
   per-session regardless.
-- [ ] 0.20 Resolve Engine-scoped storage roots. `MigoEngineConfig` takes the
+- [x] 0.20 Resolve Engine-scoped storage roots. `MigoEngineConfig` takes the
   file, cache, and code-cache roots per Engine, so a single-Engine host cannot
   give two games different roots. Either document the shared root as intended or
   move the roots to Session scope.
+
+  **Documented as intended — and the three roots reach that answer by three
+  different arguments, which is why the task insisted they be argued separately.**
+
+  `code_cache_dir` decides itself: Section 6.5 *requires* the on-disk V8 code
+  cache to be shared, its key is `hash(source_bytes, v8_version)` so an entry means
+  the same thing whichever Session compiled it, and task 0.19 moved its budget onto
+  the directory precisely because the directory is one. Session scope would not
+  relocate that cache, it would retract it — each Session paying for its own copy
+  of every compile, and the ceiling that now bounds the directory bounding nothing.
+
+  `files_dir` and `cache_dir` decide themselves too, from what they are: the host
+  application's own directories, granted to it once by the platform. Android gives
+  one `Context.getFilesDir()` per app, iOS one `NSDocumentDirectory`; there is no
+  second one to hand a second game. Session scope would add a *way to get it
+  wrong* rather than a capability — a host can already give two Sessions one root,
+  and would then also have to be trusted not to give them one content id. The host
+  that genuinely needs two volumes creates a second Engine, which the ABI has
+  always allowed and `two_engines_account_for_their_own_sessions` already executes.
+
+  **The obligation this leaves on the host was unstated, and that was the real
+  gap.** Isolation below the root is `<root>/migo/games/<content_id>/…`, the
+  content id comes from `MigoContentDescriptor`, and nothing checks it for
+  uniqueness — so two concurrently live Sessions given one id share one game
+  directory: storage, cache and temp alike. The header now says so where the roots
+  are declared. Refusing a duplicate is deliberately not done: two Sessions of one
+  title is a legitimate thing for a host to want and the engine cannot tell that
+  from a mistake, so the honest move is to name the contract, not to guess.
+
+  **Executed rather than only written**, because Section 6.4 says a property never
+  executed may not be claimed. The single construction site in
+  `capi/src/surface.rs` became `EngineInner::session_init_options`, and
+  `concurrent_sessions.rs` now runs two Sessions of one Engine and asserts all
+  three roots come back exactly as the host named them. One place by construction:
+  there is no second site for a per-Session override to be added to and missed at.
+  Two mutants, each killed at its own assertion — deriving a subdirectory
+  (`files_dir.join("migo")`), which is the "never invents a location" clause, and
+  the copy-paste the extraction invites, `code_cache_dir` reading `cache_dir`.
+
+  **A third test was written and then deleted, and the reason is worth keeping.**
+  It asserted that two Engines' Sessions never carry each other's roots. Every
+  mutant that killed it killed the roots-are-verbatim test first, because "each
+  Engine's Sessions get that Engine's configured roots" already forces two
+  differently configured Engines apart — no mutation makes one pass while the other
+  fails. Two guards on one case pin it no better than one.
+
+  **Still not executed, and not claimed:** the identity half of the split. A
+  Session from `migo_session_create` has no surface, no Host and no bound game
+  identity, so what these tests reach is the roots, and `GamePaths`' own
+  storage-isolation tests in `runtime-v8` reach the `<content_id>` partition below
+  them. Nothing yet drives two live Sessions through content to two directories on
+  disk; that stays task 0.21's open half.
 - [ ] 0.21 Add the first behavioural two-session tests. **First increment landed;
   two of the four property groups still uncovered.** The opening premise is now
   false in the good way: `engine/crates/capi/src/concurrent_sessions.rs` creates two

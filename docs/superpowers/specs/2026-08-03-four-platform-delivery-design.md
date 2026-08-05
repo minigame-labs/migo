@@ -418,6 +418,25 @@ registries; and per-session permission monitors.
    different roots. Isolation below the root is by game identity; the shared root
    must be documented, or the roots must move to Session scope.
 
+   **Resolved under task 0.20 by taking the first option, and the three roots do
+   not share one reason.** `files_dir` and `cache_dir` are the *host
+   application's* directories, granted to it once by the platform — one
+   `getFilesDir()` per Android app — so there is no second one for a second game
+   to be given, and Session scope would add a way to configure isolation wrongly
+   rather than a way to obtain it: a host can already hand two Sessions one root,
+   and would then also have to be trusted not to hand them one content id.
+   `code_cache_dir` is the root that moving would actively damage, because
+   Section 6.5 *requires* it to be shared and defect 4's fix put its budget on the
+   directory precisely because the directory is one; per-Session code caches would
+   give each Session its own copy of every compile.
+
+   The obligation this leaves on the host is now stated where the roots are
+   declared rather than implied: **content ids must be distinct between
+   concurrently live Sessions**, since every per-game path is derived from that id
+   and nothing in the engine enforces uniqueness. Refusing a duplicate is
+   deliberately *not* done — two Sessions of one title is a legitimate thing for a
+   host to want, and the engine cannot tell that apart from a mistake.
+
 **Test requirement.** No test anywhere currently creates two concurrent Sessions.
 Every isolation property above is correct by reading rather than by execution.
 Each enforced property needs a behavioural test that starts two Sessions, loads
@@ -534,6 +553,14 @@ entries. That is the documented degradation rather than an oversight — a share
 is exactly what two games loading the same module should get, attribution would have to
 live on disk to survive a restart, and the cost of losing an entry is one recompile.
 The gate covers the budget, not the fairness.
+
+**Its Engine scope is load-bearing, which task 0.20 settled rather than assumed.**
+"One budget per directory" is only a budget while the directory is one, so the
+question defect 5 raised — whether the roots belong on the Session instead — is
+answered here for this root and answered *differently* from the other two: moving
+`code_cache_dir` to Session scope would silently retract the sharing this section
+requires, not merely relocate a path. Both the header and Section 6.4 defect 5 now
+say so where a host and a maintainer respectively will read it.
 
 ### 6.6 What A Game May Name
 

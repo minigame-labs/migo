@@ -211,3 +211,62 @@ fn two_engines_account_for_their_own_sessions() {
     assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
     assert_eq!(unsafe { migo_engine_destroy(first) }, MIGO_OK);
 }
+
+// ── Storage roots (task 0.20) ───────────────────────────────────────────────
+//
+// The three roots live on the Engine, so every Session of one Engine starts from
+// the same three directories and the split between two games happens *below*
+// them, at the game identity. That is a decision rather than an oversight, and
+// Section 6.4 requires a decision of this shape to be documented rather than
+// left to the absence of a prohibition -- so what the header now states, these
+// execute.
+//
+// What they reach and what they do not: `migo_session_create` binds no game
+// identity, so the identity half of the split is covered where it lives, by
+// `runtime-v8`'s storage-isolation tests over `GamePaths`. This covers the half
+// above it -- that the roots a Session starts from are the host's own, verbatim.
+//
+// A second test asserting two Engines keep their own roots was written and then
+// removed: every mutation that killed it killed the one below first, because
+// "each Engine's Sessions get that Engine's configured roots" already forces two
+// differently configured Engines apart. Two guards on one case pin it no better
+// than one, and `two_engines_account_for_their_own_sessions` above already
+// executes two live Engines.
+
+/// Every Session of one Engine starts from the roots the host named, unchanged.
+///
+/// "Unchanged" is the part worth executing: the header promises Migo "never
+/// invents a location of its own", and a derived subdirectory inserted here
+/// would put every game's data somewhere the host cannot find or clear.
+#[test]
+fn every_session_of_one_engine_starts_from_the_roots_the_host_named() {
+    let dirs = scratch_dirs("engine-scoped-roots");
+    let config = engine_config(
+        &dirs,
+        size_of::<crate::MigoEngineConfig>() as u32,
+        migo_capi_abi::MIGO_ABI_VERSION_CURRENT,
+    );
+    let mut engine: *mut MigoEngine = ptr::null_mut();
+    assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+
+    let first = create_session(engine);
+    let second = create_session(engine);
+
+    let named = |dir: &std::ffi::CString| {
+        std::path::PathBuf::from(dir.to_str().expect("utf-8 path").to_owned())
+    };
+    for session in [first, second] {
+        let options = unsafe { &*session }.engine.session_init_options(1.0_f32);
+        assert_eq!(
+            options.files_dir(),
+            named(&dirs.0),
+            "a session's files root is not the one the host gave the engine"
+        );
+        assert_eq!(options.cache_dir(), named(&dirs.1));
+        assert_eq!(options.code_cache_dir(), named(&dirs.2));
+    }
+
+    assert_eq!(unsafe { migo_session_destroy(first) }, MIGO_OK);
+    assert_eq!(unsafe { migo_session_destroy(second) }, MIGO_OK);
+    assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+}

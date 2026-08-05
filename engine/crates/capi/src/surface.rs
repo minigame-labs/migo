@@ -24,7 +24,6 @@ use migo_core::{
     retire_surface, send_critical_command_to_host, spawn_host_thread_tracked,
 };
 use shared::{
-    config::InitOptions,
     protocol::host_cmd::HostCommand,
     surface::{
         PixelRatio, PublicSurfaceGeneration, SurfaceLossReason, SurfaceReleaseNotification,
@@ -362,13 +361,9 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                         Arc::downgrade(&session),
                         Arc::clone(&window_state),
                     ));
-                    let options = InitOptions::new()
-                        .with_files_dir(session.engine.files_dir.clone())
-                        .with_cache_dir(session.engine.cache_dir.clone())
-                        .with_code_cache_dir(session.engine.code_cache_dir.clone())
-                        .with_pixel_ratio(configuration.scale_factor())
-                        .with_target_fps(60)
-                        .with_code_signing_enabled(!session.engine.allow_unsigned_content);
+                    let options = session
+                        .engine
+                        .session_init_options(configuration.scale_factor());
                     match spawn_host_thread_tracked(
                         surface,
                         public_generation,

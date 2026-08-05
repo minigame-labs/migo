@@ -21,6 +21,34 @@ typedef uint64_t MigoSessionFlags;
  * directories given here and never invents a location of its own. All three are
  * NUL-terminated UTF-8, borrowed for the duration of migo_engine_create, and
  * copied before it returns. Directories are created if missing.
+ *
+ * The roots are per Engine, and every Session the Engine owns starts from all
+ * three. Two games are separated *below* them, by content id: everything a
+ * Session touches is under <root>/migo/games/<content_id>/. This is a decision,
+ * not an omission, and each root has its own reason:
+ *
+ * - files_dir and cache_dir are the host application's own directories, granted
+ *   to it once by the platform -- one Context.getFilesDir() per Android app, one
+ *   NSDocumentDirectory per iOS app. There is no second one for a second game.
+ * - code_cache_dir is shared deliberately. Compiled bytecode is keyed by a hash
+ *   of the source, so it means the same thing whichever Session produced it, and
+ *   two games loading the same module compile it once. Its size budget belongs to
+ *   the directory for the same reason. Per-Session code caches would give each
+ *   Session its own copy of every compile and nothing in return.
+ *
+ * A host that must place two games under different roots creates a second
+ * Engine; a process may hold as many as it likes.
+ *
+ * What the host owes in exchange: content ids that are distinct between
+ * concurrently live Sessions. Every per-game path is derived from that id, so two
+ * live Sessions sharing one id share one game directory -- storage, cache and
+ * temporary files alike. Migo does not reject the second one, because two
+ * Sessions of one title is a legitimate thing for a host to want; it is the
+ * host's call, and it is only isolation if the ids differ.
+ *
+ * Eviction from the shared code cache is least-recently-used across the whole
+ * directory, so a game compiling heavily may drop another game's entries. The
+ * cost of losing one is a recompile, never a wrong result.
  */
 typedef struct MigoEngineConfig {
     uint32_t struct_size;
@@ -253,8 +281,9 @@ MIGO_API MigoResult MIGO_CALL migo_engine_destroy(MigoEngine *engine);
  * An Engine may own any number of live Sessions at once, and a process may
  * create more than one Engine. Sessions are isolated from each other: each gets
  * its own V8 isolate, its own platform manager registries, its own permission
- * monitor, and storage rooted at its own game identity. One Session's teardown
- * neither disturbs nor drains another's state.
+ * monitor, and storage rooted at its own game identity under the Engine's roots
+ * -- see MigoEngineConfig for what that scoping means and what it asks of the
+ * host. One Session's teardown neither disturbs nor drains another's state.
  *
  * Two Sessions may be driven concurrently from two host threads. Calls through
  * any *single* Session remain the host's responsibility to serialise; the
