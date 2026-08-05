@@ -454,6 +454,18 @@ pub fn image_cache_for_host(host_id: i32) -> SharedImageCache {
         .clone()
 }
 
+/// Hand the registry's own lock to Section 7.3's contention gate.
+///
+/// The comment on `SESSION_IMAGE_CACHES` claims per-event paths never consult the
+/// map, and a claim is not what Section 7.3 accepts: the gate holds this lock and
+/// requires a per-event upload to finish anyway. Test-only, so no shipped build
+/// can reach past the handle it resolved at bring-up.
+#[cfg(test)]
+pub(crate) fn session_registry_lock_for_contention_probe()
+-> &'static RwLock<HashMap<i32, SharedImageCache>> {
+    &SESSION_IMAGE_CACHES
+}
+
 /// Whether `host_id` currently has a registered alias table.  Diagnostics and
 /// teardown assertions only.
 pub fn image_cache_registered(host_id: i32) -> bool {
@@ -809,5 +821,71 @@ mod tests {
              evicted again -- the decoded cache is deliberately not cleared on \
              teardown, which is what makes the leak permanent"
         );
+    }
+}
+
+// ── Section 7.3: no cross-session lock on a per-event path ──────────────────
+
+#[cfg(test)]
+mod cross_session_contention {
+    use super::{
+        ImageCacheKey, image_cache_for_host, make_cache_key,
+        session_registry_lock_for_contention_probe, unregister_image_cache,
+    };
+    use migo_contention_probe::{PATIENCE, PerEventPath, assert_completes_while_locked};
+
+    /// Section 7.3, on the upload path's reach for the per-session registry.
+    ///
+    /// `SESSION_IMAGE_CACHES` maps every live Session to its alias table, so it is
+    /// shared beyond any one game. The design says per-event paths never consult
+    /// it — they hold the `Arc` resolved once at isolate bring-up — and until now
+    /// that was a comment. A comment cannot fail when someone adds a lookup, and
+    /// the lookup would even work: it returns the right table, just after queueing
+    /// behind every other Session's bring-up and teardown, on a path that runs per
+    /// `texSubImage2D`.
+    ///
+    /// Contention is manufactured rather than waited for, so this also fails for
+    /// an *uncontended* acquisition — the case a load test cannot see.
+    #[test]
+    fn a_texture_upload_does_not_queue_behind_the_session_registry() {
+        let host_id = 8_100;
+        let _guard = HostCacheGuard(host_id);
+
+        // Resolved at bring-up, exactly as an isolate does, before the registry is
+        // locked out from under it.
+        let aliases = image_cache_for_host(host_id);
+        let key: ImageCacheKey = make_cache_key("/code/contended.png", None, None, 3);
+        {
+            let mut cache = aliases.lock();
+            let _ = cache.begin_load(1, &key);
+            cache.register_inflight_alias(1, 0x6000_0001);
+            let _ = cache.finish_load(1, 0x6000_0001, &key, &key, Ok((8, 8)));
+        }
+
+        let expected = key.clone();
+        let resolved = assert_completes_while_locked(
+            PerEventPath {
+                path: "texture upload resolving its alias table",
+                shared_lock: "SESSION_IMAGE_CACHES (every live Session's alias table)",
+                patience: PATIENCE,
+            },
+            session_registry_lock_for_contention_probe(),
+            move || aliases.lock().cache_key_for_image_id(1).cloned(),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(expected),
+            "the fixture must actually resolve the alias, or a completion proves \
+             nothing about the path"
+        );
+    }
+
+    struct HostCacheGuard(i32);
+
+    impl Drop for HostCacheGuard {
+        fn drop(&mut self) {
+            unregister_image_cache(self.0);
+        }
     }
 }
