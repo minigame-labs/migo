@@ -1051,14 +1051,29 @@ review. A commit alone is not completion evidence.
   nothing — is reached. Both live in `crates/runtime-v8/src/rendering/webgl/webgl.rs`
   and `crates/runtime-v8/src/rendering/image/cache.rs`.
 
-  **What has to be established first is how hot the path is**, and task 0.34
-  deliberately did not answer it. `op_tex_image_2d_from_image` takes a GPU-side copy
-  when the image already has a live shared texture and never reaches this code; the
-  CPU-bytes path is the fallback for an alias whose texture is not (yet) live. If
-  that fallback is ordinary for some content it is a per-draw allocation and Section
-  7.3 governs it; if it is genuinely exceptional, the honest outcome is to record it
-  as such rather than to gate it. Answering that is the task, and a gate written
-  before the answer would be a gate on a path nobody has shown to be steady.
+  **The hotness question is answered, and by structure rather than by measurement:
+  there is a second caller with no fast path at all.** Task 0.34 recorded this as
+  open on the assumption that `op_tex_image_2d_from_image` was the only way in, and
+  for that op the reading was right — it takes a GPU-side copy whenever the alias
+  has a live shared texture, and `shared_for_image_id` misses only in narrow states
+  (a load still in flight, or an alias whose entry is gone), so the CPU-bytes branch
+  really is a fallback. But `op_tex_sub_image_2d_from_image` calls
+  `resolve_cached_image_rgba` **unconditionally**: there is no
+  `TexSubImage2DFromShared` command and no branch above it. Every
+  `texSubImage2D(…, image)` pays both owned keys, every call, with no cheaper route
+  available to the content. That is a per-event allocation on a path Section 7.3
+  governs, and it does not depend on which game is running.
+
+  So the task is now the fix rather than the question. Two allocations, both
+  avoidable in principle: `cache_key_for_image_id` clones an `ImageCacheKey`
+  (`(String, u64)`) out of `shared_to_key`, and `to_io_cache_key` then parses that
+  string's `path\0WxH` encoding and builds a *second* owned key for the io side.
+  The shape that removes both is to stop deriving the io key per call — the alias
+  table already knows it at bind time — but the choice interacts with lock order,
+  because the io cache is behind its own mutex and the alias table behind another,
+  and the current code releases the first before taking the second. Whatever lands
+  must arrive with its own burst gate, the way 0.34's did, and with the lock order
+  argued rather than assumed.
 
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
