@@ -883,7 +883,67 @@ review. A commit alone is not completion evidence.
   Still uncovered by it, and named rather than implied: the shared IO executor's
   per-host fairness, which Section 6.4 records as enforced by reading.
 
-- [ ] 0.34 Measure `io::image_cache`'s per-frame paths with the allocation gate.
+- [x] 0.34 Measure `io::image_cache`'s per-frame paths with the allocation gate.
+  **Measured, and the prediction was half right**, which is the half worth recording:
+  the pin/unpin pair allocated exactly as expected and the lookup did not.
+
+  Two gates, named separately because they are different events and a combined burst
+  could not say which of the three calls reached the heap. The lookup gate —
+  `get` on a hit, including the frequency increment, the per-Session counters and the
+  per-owner attribution task 0.16 left unmeasured — **passed without any fix**, so
+  the `Vec` scan that note was uneasy about costs nothing. The pin/unpin gate failed
+  against the unfixed cache at its own assertion with the counts the defect predicts:
+  64 fresh allocations and 64 frees over 64 iterations, 704 bytes, which is one
+  `String` clone of the key per pin and one free per unpin.
+
+  **The fix is the text cache's, but it is not the text cache's change**, and reading
+  it as one would have regressed this cache. `pin` here must accept a key that is not
+  resident: an alias is established before its decode finishes, so a pin routinely
+  arrives before the bytes (`begin_load` → decode → `insert`), which is what
+  `pin_absent_key_is_honoured_on_later_insert` has always pinned down. Moving the
+  count wholesale onto the entry would have dropped those. So the count lives on
+  `CachedImage` where the entry exists, and a `reservations` table holds exactly the
+  counts an entry cannot — one adoption point in `insert`, one hand-back point, and a
+  key never in both homes.
+
+  The hand-back exists because `LruCache`'s **entry** cap is inside the crate and
+  cannot be taught about pins, so it can displace an entry a live alias is holding.
+  The old parallel map survived that for free; the new one has to put the count back
+  where a non-resident key's count lives, or a re-decode would come back unpinned and
+  the alias's next upload could find no bytes. Every other eviction route — byte
+  budget, trim, clear, `clear_for_session` — already refuses pinned entries and now
+  reads the field instead of a second hash lookup.
+
+  Mutation-proved, five mutants:
+  the pre-fix code itself is the first, and it is the TDD red state rather than a
+  synthetic one — it fails the pin/unpin gate with the counts above and nothing else;
+  a narrow one that keeps the count on the entry and merely builds an owned key
+  beside it fails the same gate alone, so the gate is sensitive to *that call* and
+  not to the surrounding shape; dropping the hand-back fails the entry-cap test at
+  its "the alias is still live" assertion and nothing else; adopting a reservation
+  without consuming it fails both single-home assertions; and making `add_owner` push
+  unconditionally fails the lookup gate — with four `realloc` events, which is the
+  resize the probe counts precisely so a `with_capacity` becoming a `new` cannot
+  slip through — proving that gate is not a permanent pass.
+
+  **One mutant was not killed by the first version of the tests, and that gap was
+  real rather than cosmetic.** Handing pins back on a *same-key* replacement as well
+  leaves the count in both homes: `insert` has already adopted it onto the
+  replacement, so the entry and the table each claim it, no unpin can ever retire the
+  table's copy, and the key is pinned forever the next time it is re-inserted. The
+  single-home test now re-decodes a key that is resident **and** pinned — two Sessions
+  finishing a decode of one shared image, which this cache exists to allow — and the
+  mutant fails there.
+
+  **Found while measuring, not fixed here, and named rather than implied:**
+  `resolve_cached_image_rgba` builds an owned key **twice** before it reaches this
+  cache — once cloning out of the alias map, once in `to_io_cache_key` — on
+  `op_tex_image_2d_from_image`'s CPU-bytes path. It is in `runtime-v8`, above the
+  cache this task scopes, and it is the slow path: the ordinary draw takes the
+  GPU-side copy and never reaches it. Recorded as task 0.36 rather than absorbed
+  here, because how often that path is really taken is a question this task did not
+  answer.
+
   Found by applying task 0.26's gate to the text texture cache, which was built by
   copying this cache's shape — its own doc said "identical to the `io::image_cache`
   pattern". In the text cache that shape cost two `String` allocations and two frees
@@ -902,6 +962,22 @@ review. A commit alone is not completion evidence.
   lookup-plus-pin-plus-unpin at steady state. If it allocates, the fix is the one the
   text cache took — the count belongs on the entry — and it must land with its gate,
   not as a note.
+
+- [ ] 0.36 Decide whether `texImage2D(image)`'s CPU-bytes path needs its two owned
+  keys. Found while measuring task 0.34: `resolve_cached_image_rgba` clones the key
+  out of the alias map and then `to_io_cache_key` builds a second owned copy from it,
+  so the call allocates twice before the decoded-image cache — which now allocates
+  nothing — is reached. Both live in `crates/runtime-v8/src/rendering/webgl/webgl.rs`
+  and `crates/runtime-v8/src/rendering/image/cache.rs`.
+
+  **What has to be established first is how hot the path is**, and task 0.34
+  deliberately did not answer it. `op_tex_image_2d_from_image` takes a GPU-side copy
+  when the image already has a live shared texture and never reaches this code; the
+  CPU-bytes path is the fallback for an alias whose texture is not (yet) live. If
+  that fallback is ordinary for some content it is a per-draw allocation and Section
+  7.3 governs it; if it is genuinely exceptional, the honest outcome is to record it
+  as such rather than to gate it. Answering that is the task, and a gate written
+  before the answer would be a gate on a path nobody has shown to be steady.
 
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing

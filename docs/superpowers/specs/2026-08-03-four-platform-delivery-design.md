@@ -622,7 +622,8 @@ These are enforced by tests, not by inspection:
 
   **Covered so far:** the ordered host queue (`host_channel`, across coalescible
   motion, reliable and terminal transitions, and the drain), the input payload pool,
-  and the per-`fillText` text texture cache hit. What
+  the per-`fillText` text texture cache hit, and the decoded-image cache's lookup and
+  its pin/unpin pair. What
   `scripts/test-input-transport-contract.sh` does *not* do is still worth stating,
   because it is the reason this requirement was mis-recorded as satisfied for so
   long: it greps the sources for structural properties — `VecDeque::with_capacity(`,
@@ -635,9 +636,23 @@ These are enforced by tests, not by inspection:
   **Not covered, and named rather than implied.** The BLE notification path's Rust
   half is `cfg(target_os = "android")`, so a host test binary never compiles it and
   the gate cannot run there; its Java half needs a JVM mechanism entirely, because a
-  Rust allocator observes nothing the JVM allocates. The render command path, the
-  audio path and `io::image_cache` are unmeasured. No path may be recorded as
-  satisfying this requirement without a burst test named against it.
+  Rust allocator observes nothing the JVM allocates. The render command path and the
+  audio path are unmeasured, and so is the key construction *above* the decoded-image
+  cache: `resolve_cached_image_rgba` builds an owned key twice per call before the
+  cache is reached, on `texImage2D(image)`'s CPU-bytes path. No path may be recorded
+  as satisfying this requirement without a burst test named against it.
+
+  **What applying it to the decoded-image cache found**, since it is the second
+  instance of one shape and that is what makes it worth stating: a pin recorded in a
+  map keyed *beside* the cache needs an owned key to record it and drops that key
+  again when the count falls to zero, so an alias taken and released cost one
+  allocation and one free per event. The text texture cache paid it per `fillText`;
+  this cache paid it per alias, and the fix is the same one — the count belongs on
+  the entry. It is not the same *change*, though, and reading it as one would have
+  regressed the cache: this cache must accept a pin for a key that is not resident
+  yet, because an alias is established before its decode finishes. So the count on
+  the entry is paired with a reservation table for exactly the keys an entry cannot
+  hold, with one adoption point and one hand-back point, and a key is never in both.
 - **No cross-session lock on a per-event path.** Each covered path requires a
   contention regression test that fails when a per-event operation acquires a
   lock shared beyond its own session.

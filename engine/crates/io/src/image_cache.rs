@@ -68,6 +68,21 @@ pub fn resized_key(path: String, generation: u64, target_w: u32, target_h: u32) 
     (path, generation, target_w, target_h)
 }
 
+/// Report an unpin with no pin behind it.
+///
+/// Not a panic: the likeliest cause is refcount accounting drift in
+/// `runtime-v8::rendering::image::cache`, and taking the process down for it would
+/// trade a leaked pin for a crash. Warn once so the bug is visible and keep going.
+fn unpin_without_pin_is_a_bug(key: &ImageCacheKey) {
+    shared::warn_once!(
+        path = key.0.as_str(),
+        gen = key.1,
+        tw = key.2,
+        th = key.3,
+        "image_cache unpin without matching pin (accounting bug suspected)"
+    );
+}
+
 /// Cached image entry.
 ///
 /// `owners` records which Sessions have asked for these bytes, and it is the
@@ -84,6 +99,17 @@ struct CachedImage {
     image: NormalizedImage,
     size_bytes: usize,
     owners: Vec<i32>,
+    /// Live aliases holding these bytes. A non-zero count makes the entry immune
+    /// to LRU eviction, admission rejection, trim, and clear.
+    ///
+    /// On the entry rather than in a `HashMap<ImageCacheKey, u32>` beside the cache,
+    /// for the reason the text texture cache moved its own: a separately keyed map
+    /// needs an *owned* key to record a pin and drops it again when the count falls
+    /// to zero, so an alias taken and released — a sprite pool recycling images —
+    /// paid a `String` clone and a free per event. Keyed by the entry, a pin is a
+    /// field. [`ImageCache::reservations`] holds the counts this field cannot,
+    /// which are the ones for keys that are not resident yet.
+    pins: u32,
 }
 
 impl CachedImage {
@@ -95,6 +121,7 @@ impl CachedImage {
             image,
             size_bytes,
             owners,
+            pins: 0,
         }
     }
 
@@ -263,12 +290,23 @@ pub struct ImageCache {
     sketch: CountMinSketch,
     admissions_rejected: u64,
     trim_bytes_released: u64,
-    /// Non-evictable pin counter per key.  Entries with a count
-    /// >= 1 are immune to LRU eviction, admission rejection, trim,
-    /// and `clear`.  Missing or zero entries behave as plain LRU.
-    /// Sized small (one u32 per live key); memory cost is
-    /// negligible vs. the bitmap bytes the cache gates access to.
-    pins: HashMap<ImageCacheKey, u32>,
+    /// Pins taken for keys that are **not resident**, which is the one count
+    /// [`CachedImage::pins`] cannot hold.
+    ///
+    /// The pin path establishes an alias before the decode finishes, so a pin
+    /// routinely arrives before the bytes do (`begin_load` → decode → `insert`).
+    /// A reservation records that intent and [`ImageCache::insert`] adopts it, so
+    /// the newly resident entry arrives pre-pinned.
+    ///
+    /// Recording one costs an owned key, which is why the resident case does not
+    /// go through here: a reservation is taken once per decode, beside a decode
+    /// that allocates the bitmap itself, whereas pinning a resident entry is the
+    /// per-event path Section 7.3 governs.
+    ///
+    /// **A key is in exactly one home.** A reservation is removed the moment the
+    /// entry becomes resident, and handed back if that entry is later evicted with
+    /// pins still on it.
+    reservations: HashMap<ImageCacheKey, u32>,
     /// Per-Session lookup outcomes, beside the process aggregate rather than
     /// replacing it: the aggregate still describes the one cache that exists,
     /// while a game may only be told about its own traffic.
@@ -297,7 +335,7 @@ impl ImageCache {
             sketch: CountMinSketch::new_for_capacity(max_entries),
             admissions_rejected: 0,
             trim_bytes_released: 0,
-            pins: HashMap::new(),
+            reservations: HashMap::new(),
             sessions: HashMap::new(),
         }
     }
@@ -314,10 +352,19 @@ impl ImageCache {
     /// (and therefore the pin intent) is established before the
     /// bytes finish decoding.
     pub fn pin(&mut self, key: &ImageCacheKey) {
-        let count = {
-            let entry = self.pins.entry(key.clone()).or_insert(0);
-            *entry += 1;
-            *entry
+        // Resident first, and it is the case that must not reach the heap: this is
+        // the per-event half of the path, and the entry already owns a copy of the
+        // key. Only the not-yet-resident case pays for a reservation's owned key.
+        let count = match self.cache.peek_mut(key) {
+            Some(resident) => {
+                resident.pins = resident.pins.saturating_add(1);
+                resident.pins
+            }
+            None => {
+                let count = self.reservations.entry(key.clone()).or_insert(0);
+                *count += 1;
+                *count
+            }
         };
         // Diag trace: pin/unpin traffic is tightly coupled to
         // alias lifecycle, so a log stream of pin transitions is
@@ -344,27 +391,32 @@ impl ImageCache {
     /// No-op when the key has no pin recorded; this matches the
     /// "extra unpin" defensive case without panicking.
     pub fn unpin(&mut self, key: &ImageCacheKey) {
-        let new_count = if let Some(count) = self.pins.get_mut(key) {
-            *count = count.saturating_sub(1);
-            *count
-        } else {
-            // Defensive: unpin without a matching pin.  Don't
-            // panic — log once so the bug is visible but the
-            // runtime keeps going.  Common cause would be a
-            // refcount accounting drift in `runtime-v8::image::
-            // cache::ImageCache`.
-            shared::warn_once!(
-                path = key.0.as_str(),
-                gen = key.1,
-                tw = key.2,
-                th = key.3,
-                "image_cache unpin without matching pin (accounting bug suspected)"
-            );
-            return;
+        let new_count = match self.cache.peek_mut(key) {
+            Some(resident) if resident.pins > 0 => {
+                resident.pins -= 1;
+                resident.pins
+            }
+            Some(_) => {
+                // Resident but unpinned: the same accounting drift the branch
+                // below reports, seen through the other home.
+                unpin_without_pin_is_a_bug(key);
+                return;
+            }
+            None => match self.reservations.get_mut(key) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    let remaining = *count;
+                    if remaining == 0 {
+                        self.reservations.remove(key);
+                    }
+                    remaining
+                }
+                None => {
+                    unpin_without_pin_is_a_bug(key);
+                    return;
+                }
+            },
         };
-        if new_count == 0 {
-            self.pins.remove(key);
-        }
         tracing::trace!(
             path = key.0.as_str(),
             gen = key.1,
@@ -381,7 +433,10 @@ impl ImageCache {
     #[inline]
     #[allow(dead_code)]
     pub fn pin_count(&self, key: &ImageCacheKey) -> u32 {
-        self.pins.get(key).copied().unwrap_or(0)
+        match self.cache.peek(key) {
+            Some(resident) => resident.pins,
+            None => self.reservations.get(key).copied().unwrap_or(0),
+        }
     }
 
     /// Remove the LRU-tail entry that is NOT currently pinned, if
@@ -400,7 +455,7 @@ impl ImageCache {
             .cache
             .iter()
             .rev()
-            .find(|(k, _)| !self.pins.contains_key(*k))
+            .find(|(_, v)| v.pins == 0)
             .map(|(k, _)| k.clone())?;
         let victim = self.cache.pop(&victim_key)?;
         self.current_size = self.current_size.saturating_sub(victim.size_bytes);
@@ -479,7 +534,12 @@ impl ImageCache {
         // black-texture regression the pin mechanism exists to
         // prevent.  We also skip the admission check when the key
         // is already resident (replace-in-place path).
-        let newcomer_pinned = self.pins.contains_key(&key);
+        // Adopt whichever home holds this key's pins. Taken *before* the eviction
+        // loop below for the same reason the owners are: that loop can pop this very
+        // key, and reading afterwards would find nothing.
+        cached.pins = self.reservations.remove(&key).unwrap_or(0)
+            + self.cache.peek(&key).map_or(0, |resident| resident.pins);
+        let newcomer_pinned = cached.pins > 0;
         // Re-decoding a resident key must not forget who already depended on it,
         // and the owners are carried across **here**, before the eviction loop
         // below. That loop can pop this very key when it is the coldest unpinned
@@ -497,12 +557,12 @@ impl ImageCache {
             None => false,
         };
         if self.current_size + new_size > self.max_size && !newcomer_pinned && !already_resident {
-            if let Some((victim_key, _)) = self.cache.peek_lru() {
+            if let Some((victim_key, victim)) = self.cache.peek_lru() {
                 // Only count the true LRU tail as the victim when
                 // it's not pinned — a pinned tail item doesn't
                 // represent a real eviction candidate and its
                 // sketch count shouldn't gate newcomers.
-                let victim_pinned = self.pins.contains_key(victim_key);
+                let victim_pinned = victim.pins > 0;
                 let victim_freq = if victim_pinned {
                     0
                 } else {
@@ -545,7 +605,7 @@ impl ImageCache {
                     current_bytes = self.current_size,
                     max_bytes = self.max_size,
                     incoming_bytes = new_size,
-                    pinned_entries = self.pins.len(),
+                    pinned_entries = self.pinned_entry_count(),
                     total_entries = self.cache.len(),
                     "image_cache over budget: all remaining entries pinned"
                 );
@@ -554,11 +614,33 @@ impl ImageCache {
         }
         let _ = was_over_budget;
 
+        // `push` returns a displaced pair in two different situations, and they are
+        // not interchangeable: the previous value under *this* key, whose pins were
+        // adopted above, or — when the LRU is at its **entry** cap — the tail under
+        // some other key, whose pins would otherwise vanish. Asking the cache which
+        // one is about to happen is exact; `already_resident` is not, because the
+        // eviction loop above may have popped this key in between.
+        let displaces_this_key = self.cache.contains(&key);
+
         // Insert and update size (handle potential replacement).
-        if let Some(old) = self.cache.push(key, cached) {
-            self.current_size = self.current_size.saturating_sub(old.1.size_bytes);
+        if let Some((displaced_key, displaced)) = self.cache.push(key, cached) {
+            self.current_size = self.current_size.saturating_sub(displaced.size_bytes);
+            // The entry cap lives inside `LruCache` and cannot be taught about pins,
+            // so give a tail entry's pins back to the reservation table: the alias is
+            // still live and a re-insert must arrive pinned, which is the behaviour a
+            // pin map keyed beside the cache used to provide for free. Paying an
+            // owned key here is the trade that table exists for, on a path that runs
+            // only when a pinned entry is displaced by entry count.
+            if !displaces_this_key && displaced.pins > 0 {
+                *self.reservations.entry(displaced_key).or_insert(0) += displaced.pins;
+            }
         }
         self.current_size += new_size;
+    }
+
+    /// Resident entries a live alias is holding.
+    fn pinned_entry_count(&self) -> usize {
+        self.cache.iter().filter(|(_, v)| v.pins > 0).count()
     }
 
     /// Clear the entire cache except pinned entries.  Resets the
@@ -573,8 +655,9 @@ impl ImageCache {
     /// `ImageCache.clear()` routes through [`Self::clear_for_session`] instead.
     /// Retained at crate visibility for the cache's own tests.
     pub(crate) fn clear(&mut self) {
-        // Fast path: no pins → full clear as before.
-        if self.pins.is_empty() {
+        // Fast path: no pins → full clear as before. Reservations are counts for
+        // keys that are *not* resident, so they never keep an entry here.
+        if self.pinned_entry_count() == 0 {
             self.cache.clear();
             self.current_size = 0;
             self.sketch.reset();
@@ -587,7 +670,7 @@ impl ImageCache {
         let drop_keys: Vec<ImageCacheKey> = self
             .cache
             .iter()
-            .filter(|(k, _)| !self.pins.contains_key(*k))
+            .filter(|(_, v)| v.pins == 0)
             .map(|(k, _)| k.clone())
             .collect();
         for k in drop_keys {
@@ -613,9 +696,7 @@ impl ImageCache {
         let orphaned: Vec<ImageCacheKey> = self
             .cache
             .iter()
-            .filter(|(k, v)| {
-                v.owned_by(session) && v.owners.len() == 1 && !self.pins.contains_key(*k)
-            })
+            .filter(|(_, v)| v.owned_by(session) && v.owners.len() == 1 && v.pins == 0)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -1299,5 +1380,159 @@ mod tests {
              second game's clear evicted bytes the first is still using"
         );
         assert_eq!(cache.stats_for_session(a).entries, 1);
+    }
+
+    /// A pin lives on the entry while the entry is resident and in the reservation
+    /// table otherwise, and never in both. Nothing else in this cache is allowed to
+    /// depend on which one it is, so the transfer has to leave the other empty.
+    #[test]
+    fn a_key_never_holds_its_pins_in_both_homes() {
+        let mut cache = ImageCache::with_limits(8, 4 * 1024 * 1024);
+        let k = key("/two-homes.png");
+
+        // Pinned before the decode lands: the reservation table is the only home.
+        cache.pin(&k);
+        assert_eq!(cache.reservations.get(&k).copied(), Some(1));
+        assert_eq!(cache.pin_count(&k), 1);
+
+        // Resident: the entry takes the count over, and the reservation is gone.
+        cache.insert(k.clone(), rgba(16, 16), ONE_SESSION);
+        assert!(
+            !cache.reservations.contains_key(&k),
+            "an adopted reservation left a second count behind, so an unpin can \
+             retire one home while the other keeps the entry unevictable forever"
+        );
+        assert_eq!(cache.pin_count(&k), 1);
+
+        // Pinning again while resident must not reopen the other home.
+        cache.pin(&k);
+        assert!(!cache.reservations.contains_key(&k));
+        assert_eq!(cache.pin_count(&k), 2);
+
+        // A re-decode of a key that is resident *and* pinned — two Sessions both
+        // finishing a decode of one image, which this cache shares on purpose —
+        // replaces the entry under it. The pins move to the replacement; the copy
+        // that was displaced must not leave a count behind as well.
+        cache.insert(k.clone(), rgba(16, 16), ONE_SESSION);
+        assert_eq!(
+            cache.pin_count(&k),
+            2,
+            "a replacement dropped the pins of the aliases still holding the key"
+        );
+        assert!(
+            !cache.reservations.contains_key(&k),
+            "the displaced copy left its pins in the other home too, so the key \
+             carries a count no unpin can ever retire and the entry never becomes \
+             evictable again"
+        );
+
+        cache.unpin(&k);
+        cache.unpin(&k);
+        assert_eq!(cache.pin_count(&k), 0);
+        assert!(!cache.reservations.contains_key(&k));
+    }
+
+    /// The LRU's *entry* cap lives inside `LruCache` and cannot be taught about
+    /// pins, so it can displace an entry a live alias is holding. The pin has to
+    /// survive that, because the alias still exists and the re-decode that follows
+    /// must arrive pinned — which is what a pin map keyed beside the cache gave for
+    /// free, and what moving the count onto the entry would otherwise have lost.
+    #[test]
+    fn a_pin_survives_the_entry_cap_displacing_what_it_held() {
+        // Bytes are generous on purpose: this is the entry cap acting, not the
+        // byte budget, whose eviction already refuses pinned entries.
+        let mut cache = ImageCache::with_limits(2, 4 * 1024 * 1024);
+        let live = key("/held.png");
+
+        cache.insert(live.clone(), rgba(16, 16), ONE_SESSION);
+        cache.pin(&live);
+        cache.insert(key("/second.png"), rgba(16, 16), ONE_SESSION);
+        cache.insert(key("/third.png"), rgba(16, 16), ONE_SESSION);
+
+        assert!(
+            !cache.contains(&live),
+            "the entry cap is what this test needs to fire; it did not"
+        );
+        assert_eq!(
+            cache.pin_count(&live),
+            1,
+            "the alias is still live, so its pin must outlive the entry the cap took"
+        );
+
+        // The re-decode arrives pre-pinned, so a byte-budget flood cannot take it.
+        cache.insert(live.clone(), rgba(16, 16), ONE_SESSION);
+        assert_eq!(cache.pin_count(&live), 1);
+        assert!(!cache.reservations.contains_key(&live));
+        cache.clear();
+        assert!(
+            cache.contains(&live),
+            "a re-decode under a surviving pin came back unpinned"
+        );
+    }
+
+    // ── Section 7.3: zero steady-state allocation ───────────────────────────
+
+    /// Section 7.3, on the path `op_tex_image_2d_from_image` takes for every draw
+    /// whose bytes come from this cache: `resolve_cached_image_rgba` looks the key
+    /// up and hands back the decoded RGBA.
+    ///
+    /// Key construction is excluded on purpose, exactly as the text cache's gate
+    /// excludes it: the caller already holds the key. What this measures is whether
+    /// the *cache* adds a heap event to a hit -- the frequency increment, the
+    /// per-Session counters, and the per-owner attribution against the entry's
+    /// `owners` vector, which task 0.16 recorded as unmeasured.
+    ///
+    /// Two owners, not one, because `add_owner` scans that vector: a gate with a
+    /// single owner would pass a `Vec` that grew on every hit.
+    #[test]
+    fn steady_state_image_cache_hit_never_reaches_the_heap() {
+        let mut cache = ImageCache::with_limits(16, 4 * 1024 * 1024);
+        let hot = key("/steady.png");
+        cache.insert(hot.clone(), rgba(16, 16), 401);
+        assert!(cache.get(&hot, 402).is_some());
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "io::image_cache: per-draw lookup on a hit, with owner attribution",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                let hit = cache
+                    .get(&hot, 402)
+                    .expect("a resident entry stays resident");
+                hit.width
+            },
+        );
+    }
+
+    /// Section 7.3, on the path an alias takes across its own lifetime: `begin_load`
+    /// pins the decoded bytes when it hands out an alias, and the alias's release
+    /// unpins them. A game recycling image aliases -- a sprite pool, a scrolling
+    /// list -- runs this pair per event.
+    ///
+    /// The pair is measured as a pair because that is the shape of the defect: a pin
+    /// map keyed beside the entry needs an owned key to record the pin and drops it
+    /// again when the count reaches zero, so the allocation and the free are one
+    /// round trip rather than growth.
+    #[test]
+    fn steady_state_image_cache_pin_and_unpin_never_reach_the_heap() {
+        let mut cache = ImageCache::with_limits(16, 4 * 1024 * 1024);
+        let hot = key("/pinned.png");
+        cache.insert(hot.clone(), rgba(16, 16), 401);
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "io::image_cache: per-alias pin and unpin of a resident entry",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                cache.pin(&hot);
+                let pinned = cache.pin_count(&hot);
+                cache.unpin(&hot);
+                pinned
+            },
+        );
     }
 }

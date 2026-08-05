@@ -1734,6 +1734,7 @@ dependencies = [
  "lru",
  "md-5",
  "memmap2",
+ "migo-alloc-probe",
  "migo-shared",
  "parking_lot",
  "rusqlite",
