@@ -808,3 +808,54 @@ mod tests {
         assert!(ctx.nodes.contains_key(&21));
     }
 }
+
+// ── Section 7.3: zero steady-state allocation ───────────────────────────────
+
+#[cfg(test)]
+mod steady_state_allocation {
+    use super::*;
+    use crate::nodes::{GainNode, OscillatorNode};
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+
+    /// Section 7.3, on the audio graph's real-time path.
+    ///
+    /// `process` is the audio callback's work: it runs on the output thread —
+    /// SCHED_FIFO on Android, per `audio_thread.rs` — once per quantum, for the
+    /// life of every sound the game plays. A heap allocation here is not a
+    /// throughput cost like the ones on the frame path; it is a deadline miss,
+    /// heard as a dropout, because the allocator can block behind a thread that
+    /// is not real-time scheduled at all.
+    ///
+    /// The graph is a source into a gain into the destination — the shape every
+    /// `AudioBufferSourceNode`-plus-volume playback has — so the burst covers the
+    /// upstream mix, a node with input, and the additive write into the output.
+    #[test]
+    fn steady_state_audio_quantum_never_reaches_the_heap() {
+        const CHANNELS: u32 = 2;
+        const QUANTUM_FRAMES: usize = 128;
+
+        let mut ctx = AudioContext::new(1, 48_000, CHANNELS);
+        let mut oscillator = OscillatorNode::new(10);
+        oscillator.start(0.0);
+        ctx.add_node(Box::new(oscillator));
+        ctx.add_node(Box::new(GainNode::new(11)));
+        ctx.connect(10, 11);
+        ctx.connect(11, DESTINATION_NODE_ID);
+
+        let mut output = vec![0.0f32; QUANTUM_FRAMES * CHANNELS as usize];
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "audio: one graph quantum on the output thread",
+                // Covers the topological rebuild, the mix buffer's first resize
+                // and every node's output buffer being created on first use.
+                warmup: 8,
+                measured: 64,
+            },
+            |_| {
+                output.fill(0.0);
+                ctx.process(&mut output)
+            },
+        );
+    }
+}

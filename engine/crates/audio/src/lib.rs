@@ -74,6 +74,16 @@
 //! - [`streaming`]: HTTP streaming download and progressive decoding
 //! - [`power_manager`]: 3-level power state management
 
+// Section 7.3's steady-state allocation gate reads this. `#[cfg(test)]` scopes it
+// to this crate's own test binary: a `#[global_allocator]` is unique per binary, so
+// one declared unconditionally here would follow the library into every shipped
+// cdylib. Deleting it does not make the gates pass silently -- each burst proves the
+// allocator is installed before it trusts a zero count.
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: migo_alloc_probe::CountingAllocator =
+    migo_alloc_probe::CountingAllocator::system();
+
 mod audio_thread;
 pub mod cache;
 mod context;
