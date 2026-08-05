@@ -1838,7 +1838,6 @@ mod tests {
 mod steady_state_allocation {
     use super::*;
     use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
-    use shared::command_vec_pool::take_gl_command_vec;
 
     const WARMUP: usize = 4;
     const MEASURED: usize = 64;
@@ -1989,22 +1988,33 @@ mod steady_state_allocation {
     ///
     /// Its own gate rather than a shared one with the enqueue above: they are
     /// different calls, and a burst covering both could not say which reached the
-    /// heap. The batch is small enough to fit the pool's minimum capacity, so the
-    /// take/recycle round trip here is deterministic even when a concurrent test
-    /// empties the pool.
+    /// heap.
+    ///
+    /// **The batch vectors come from a reservoir built before the burst, not from
+    /// `take_gl_command_vec`, and that is the same rule `reserve_gl_segment_headroom`
+    /// explains.** The first version of this gate did call the pool inside the
+    /// measured window, on the reasoning that it recycles a vector every iteration
+    /// and would get one back. That reasoning is wrong under concurrency: a
+    /// concurrent test taking the pool's last vector leaves `take` with nothing to
+    /// hand back, so it allocates a fresh minimum-capacity one. It cost a green
+    /// standalone run and one failure under load — a single 1408-byte allocation,
+    /// which is `GL_COMMAND_VEC_INITIAL_CAPACITY * size_of::<GLCmd>()` exactly.
+    /// What is measured here is therefore the append and the recycle; whether the
+    /// pool hands capacity back is `command_vec_pool`'s own property, tested there
+    /// against a private instance where it can be deterministic.
     #[test]
     fn steady_state_gl_batch_append_never_reaches_the_heap() {
         const BATCH: usize = 8;
-        // Compile-time, because it is a property of the two constants rather than
-        // of this run: a batch larger than the pool's minimum capacity would grow
-        // the vector the pool just handed over, measuring the pool instead of the
-        // append.
-        const {
-            assert!(BATCH <= shared::command_vec_pool::GL_COMMAND_VEC_INITIAL_CAPACITY);
-        }
 
         let mut collector = UnifiedFrameCollector::new();
         reserve_gl_segment_headroom(&mut collector, (WARMUP + MEASURED) * BATCH);
+
+        // One vector per iteration, each already holding its batch's capacity, so
+        // the body neither allocates nor grows.
+        let mut reservoir: Vec<Vec<GLCmd>> = Vec::with_capacity(WARMUP + MEASURED);
+        for _ in 0..WARMUP + MEASURED {
+            reservoir.push(Vec::with_capacity(BATCH));
+        }
 
         assert_no_steady_state_allocation(
             Burst {
@@ -2013,7 +2023,9 @@ mod steady_state_allocation {
                 measured: MEASURED,
             },
             |_| {
-                let mut commands = take_gl_command_vec();
+                let mut commands = reservoir
+                    .pop()
+                    .expect("the reservoir holds one vector per iteration");
                 for _ in 0..BATCH {
                     commands.push(scalar_gl_command());
                 }
