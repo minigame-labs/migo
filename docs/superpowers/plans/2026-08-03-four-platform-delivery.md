@@ -825,7 +825,8 @@ review. A commit alone is not completion evidence.
   quality-gate's 20-minute budget; it runs in parallel with the 90-minute Android
   job, so the wall clock is unchanged. It refuses the Rust cache for the same reason
   the Android job does. The stale comment is rewritten to say what is and is not
-  covered, including that clippy for those four crates still runs nowhere — task 0.33.
+  covered, including that clippy for those four crates still ran nowhere — task 0.33,
+  since closed, which put their clippy in this same job.
   `scripts/test-local-verification-contract.sh` now also asserts that every crate the
   local loop tests appears in a `pr-ci.yml` test line, so the two lists cannot drift
   apart again, which is how the four crates went missing in the first place.
@@ -864,12 +865,46 @@ review. A commit alone is not completion evidence.
   the windows half. Until then the entry point will keep reporting both as
   `NOT PROVEN`, which is the correct reading and not noise to be silenced.
 
-- [ ] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
+- [x] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
   correcting `pr-ci.yml`'s stale comment for task 0.31. The new `host-engine-tests`
   job now has the system packages those crates need, so the missing coverage is one
   step, but it is a separate claim from the tests and pinning 1.95.0 surfaced a
   pre-existing lint backlog the workspace caps to `warn` — so this needs the same
   cap and its own verification rather than a line appended to a green job.
+
+  **Run locally before being added, which is what the task asked for.** `cargo
+  clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio
+  --all-targets -- --cap-lints warn` exits 0 against this tree and reports 610
+  warnings, all genuine clippy lints (`collapsible_if`, `too_many_arguments`,
+  `manual_is_multiple_of`, …), so the step reports rather than passing empty and
+  the cap is doing what it does in quality-gate rather than hiding a failure.
+
+  **audio is in the step even though the task named four crates.** Its clippy ran
+  nowhere for exactly the same reason theirs did — it needs ALSA, which only this
+  job installs — and it was added to this job's *tests* last round. Leaving it out
+  would have reopened the gap in the same commit that closed it.
+
+  **The toolchain step needed a change too, and it is the kind that fails
+  confusingly.** `dtolnay/rust-toolchain` installs a minimal profile, so this job
+  had no clippy driver at all; without `components: clippy` the step fails to find
+  the binary rather than reporting on the code.
+
+  **Closed as a class rather than as an instance.** The reason those four crates
+  had no clippy is the reason they had no tests: two lists in one file and nothing
+  comparing them. `test-local-verification-contract.sh` now asserts that every
+  crate CI *tests* is also a crate CI *lints* — across both jobs, since the split
+  is deliberate — so a crate added to a test line without a clippy line fails there
+  instead of going unlinted for months. Contract checks 40 → 52.
+
+  Mutation-proved, and the first attempt was wrong in a way worth recording:
+  dropping `-p migo-graphics` from the clippy line fails the guard at its own
+  `pr-ci.yml lints migo-graphics too` assertion; deleting every clippy invocation
+  fails at `cannot find the crates pr-ci.yml runs clippy on`. That second mutant
+  initially made the script **exit silently with no failure at all** — under
+  `set -euo pipefail` a `grep` matching nothing kills the script before the empty
+  check can report it, so the anti-vacuity branch was unreachable. It needed
+  `|| true`, which the neighbouring `selection=` line already had for the same
+  reason.
 
 - [x] 0.35 Build the shared-executor occupancy gate Section 7.3 now requires, then
   apply it. Found while doing 0.19 step 3's audio item, which the plan had deliberately

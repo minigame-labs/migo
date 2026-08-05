@@ -194,10 +194,11 @@ jobs:
       # Host clippy is SCOPED to the crates that build on a plain Linux host with
       # no extra system packages: shared, io, runtime-v8. graphics needs Skia's
       # EGL/GLES headers and audio needs libasound, which this fast gate does not
-      # install — the `host-engine-tests` job below installs them and runs those
-      # crates' test suites. It does NOT run clippy on them, so clippy coverage for
-      # graphics, core, capi and platform is still missing everywhere; that is a
-      # known gap, not something the Android build covers.
+      # install — the `host-engine-tests` job below installs them, and runs both
+      # those crates' test suites and their clippy. Between the two jobs every
+      # host-buildable crate is linted; `scripts/test-local-verification-contract.sh`
+      # asserts that, so the two lists cannot drift apart the way the test lists
+      # once did.
       #
       # Lints are capped to `warn` (incl. deny-by-default correctness lints like
       # clippy::erasing_op / await_holding_lock): pinning to 1.95.0 (frozen V8
@@ -496,6 +497,11 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          # Not the default: this action installs a minimal profile, so clippy has
+          # to be asked for. Without it the lint step below fails to find the
+          # driver rather than reporting on the code.
+          components: clippy
 
       # Each package answers a link or include request the build actually makes,
       # confirmed against the build script output rather than guessed:
@@ -517,6 +523,24 @@ jobs:
             libgl-dev libegl-dev libgles-dev \
             libfontconfig1-dev libfreetype-dev \
             libasound2-dev
+
+      # These five crates' clippy ran in no job at all until now, for the same
+      # reason their tests did not: quality-gate installs no system packages and
+      # they need Skia's EGL/GLES headers and ALSA, so the only job that can lint
+      # them is the one that already installs those. audio is here with the other
+      # four even though the gap was recorded against graphics/core/capi/platform:
+      # it is the same hole for the same reason, and leaving it out would reopen
+      # the gap the moment this lands.
+      #
+      # Capped to `warn` for the reason quality-gate's own clippy step is: pinning
+      # to 1.95.0 surfaced a pre-existing lint backlog across the workspace. The cap
+      # keeps clippy running and reporting while compile errors still fail the step.
+      # It was run against this set before being added, and it reports genuine
+      # clippy lints in the hundreds rather than passing empty. Remove the cap with
+      # the dedicated lint-cleanup work, in both jobs at once.
+      - name: Run clippy lints (crates needing host system packages)
+        working-directory: engine
+        run: cargo clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio --all-targets -- --cap-lints warn
 
       - name: Run Rust tests (graphics, core, capi, platform, audio)
         working-directory: engine
