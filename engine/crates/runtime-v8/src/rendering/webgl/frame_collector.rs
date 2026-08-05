@@ -1083,9 +1083,35 @@ mod tests {
         let old_256_slot_bytes =
             50 * 256 * (std::mem::size_of::<Canvas2DCmd>() + std::mem::size_of::<GLCmd>());
 
+        // The ceiling is derived from the pool's own rule rather than picked, and
+        // it has to be, because the capacities here are not this collector's
+        // decision: each segment takes a vector from a process-wide pool whose
+        // contents depend on what every other test in this binary recycled. An
+        // earlier fixed threshold read as a statement about the collector while
+        // actually measuring the pool, and it began failing when the pool started
+        // retaining by bytes instead of by length -- the aggregate bound never
+        // moved, only the distribution did.
+        //
+        // What the pool can hand out in total is its byte budget; anything beyond
+        // that is freshly allocated at the minimum capacity. That sum is a true
+        // upper bound whatever the pool happens to hold.
+        use shared::command_vec_pool::{
+            CANVAS_COMMAND_VEC_INITIAL_CAPACITY, COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT,
+            COMMAND_VEC_POOL_SLOTS, GL_COMMAND_VEC_INITIAL_CAPACITY,
+        };
+        let pool_budget = |command_bytes: usize| {
+            COMMAND_VEC_POOL_SLOTS * COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT * command_bytes
+        };
+        let ceiling = pool_budget(std::mem::size_of::<GLCmd>())
+            + pool_budget(std::mem::size_of::<Canvas2DCmd>())
+            + 50 * GL_COMMAND_VEC_INITIAL_CAPACITY * std::mem::size_of::<GLCmd>()
+            + 50 * CANVAS_COMMAND_VEC_INITIAL_CAPACITY * std::mem::size_of::<Canvas2DCmd>();
+
         assert!(
-            reserved_bytes <= old_256_slot_bytes / 8,
-            "100 single-command interleaved segments reserved {reserved_bytes} bytes; old policy reserved {old_256_slot_bytes} bytes"
+            reserved_bytes <= ceiling,
+            "100 single-command interleaved segments reserved {reserved_bytes} bytes, \
+             above the {ceiling} the pool's budget plus fresh minimums allows; the old \
+             256-slot policy would have reserved {old_256_slot_bytes}"
         );
     }
 

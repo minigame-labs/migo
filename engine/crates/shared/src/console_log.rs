@@ -127,6 +127,19 @@ pub fn get_console_log(id: i32) -> Option<Arc<Mutex<ConsoleLogBuffer>>> {
     log_map().read().get(&id).cloned()
 }
 
+/// Hand the registry's own lock to Section 7.3's contention gate.
+///
+/// The op that writes console output must hold the buffer it resolved at isolate
+/// bring-up, never look the session up again -- this map is shared with every
+/// other Session, and its writers are their bring-up and teardown. Behind a
+/// feature no shipped build enables, because the per-event path lives in another
+/// crate and cannot hold a private lock.
+#[cfg(any(test, feature = "contention-probe"))]
+pub fn console_registry_lock_for_contention_probe()
+-> &'static RwLock<HashMap<i32, Arc<Mutex<ConsoleLogBuffer>>>> {
+    log_map()
+}
+
 /// Push a console log entry for the given session.
 /// Returns false if the session is not registered (non-debug mode).
 pub fn push_console_log(id: i32, level: u8, message: String) -> bool {
