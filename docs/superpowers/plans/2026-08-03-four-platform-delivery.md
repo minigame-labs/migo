@@ -1290,6 +1290,40 @@ review. A commit alone is not completion evidence.
   probe into it needed no list change — the two-list contract stayed satisfied
   without editing it.
 
+- [x] 0.44 Gate the texture upload against the per-session registry lock. Section
+  7.3 has two requirements per covered path, not one, and task 0.36 changed the
+  second: `resolve_cached_image_rgba` now holds this Session's alias lock across
+  the shared decoded-bytes lock. Checking whether that path had a contention gate
+  at all is what found that it never did.
+
+  **The invariant was a comment.** `SESSION_IMAGE_CACHES` maps every live Session
+  to its alias table, and the design says per-event paths never consult it — they
+  hold the `Arc` resolved once at isolate bring-up. A comment cannot fail when
+  someone adds a lookup, and the lookup would *work*: it returns the right table,
+  just after queueing behind every other Session's bring-up and teardown, on a path
+  that runs per `texSubImage2D`. That is precisely the failure Section 7.3 asks for
+  a test — not an argument — to rule out.
+
+  Wired the way `shared::stats` already does it: a `#[cfg(test)]` accessor hands
+  the registry's own lock to the probe, so no shipped build can reach past the
+  handle it resolved at bring-up.
+
+  **Mutation-proved.** Replacing the held handle with `image_cache_for_host(id)`
+  inside the probed body — the exact regression the comment forbids — fails this
+  gate and nothing else, and it fails by *blocking*: the run takes 3.28 s against
+  the probe's 2 s patience, which distinguishes a real block from a failure for
+  some other reason.
+
+  **Also settled while here: the lock order 0.36 introduced is not a cross-session
+  hazard.** The alias mutex is per Session and reached only by that Session's own
+  isolates, so holding it across the shared io lock lengthens one Session's own
+  critical section, never another's. The shared lock on this path is the
+  decoded-bytes cache, which Section 6.5 puts in the deliberately-shared tier and
+  which the path already took before 0.36.
+
+  **Verified.** runtime-v8 515 from 514; every other crate unchanged;
+  `scripts/verify-change.sh --base HEAD` every host step PASS.
+
 - [ ] 0.41 Guard the batched submit's obligation to return its vector to the
   pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
   `recycle_gl_command_vec` instead of returning the emptied vector **failed no
