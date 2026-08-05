@@ -1253,6 +1253,22 @@ review. A commit alone is not completion evidence.
   against it. The helper now refuses an empty anchor or replacement, and reverts by
   restoring a verified copy rather than by inverse substitution.
 
+  **Amended: one existing test was reading the pool's contents and had to be
+  re-derived.** `interleaved_single_command_segments_do_not_reserve_256_slots_each`
+  summed the capacities of 100 interleaved segments against a fixed threshold. Those
+  capacities are not the collector's decision — each segment takes a vector from the
+  process-wide pool, so the sum depends on what every other test in the binary
+  recycled. The old per-vector length cap had been bounding that measurement by
+  accident; once retention went by bytes, a single-command segment could inherit a
+  larger recycled vector and the sum crossed the threshold. **The aggregate bound
+  did not move** — it is the pool's budget either way — only the distribution did.
+
+  The threshold is now derived from the pool's own rule (its byte budget, plus a
+  fresh minimum for every segment beyond what the pool can supply), which is a true
+  upper bound whatever the pool holds. It keeps its teeth: reinstating the 256-slot
+  policy the test is named for still fails it, at 1 843 200 bytes against a
+  1 272 448 ceiling.
+
 - [x] 0.43 Gate the audio graph's real-time path. Section 7.3 listed the audio
   path as unmeasured, and it is the last steady hot path a host test binary can
   reach — the BLE halves need an on-target binary and a JVM mechanism.
@@ -1324,34 +1340,45 @@ review. A commit alone is not completion evidence.
   **Verified.** runtime-v8 515 from 514; every other crate unchanged;
   `scripts/verify-change.sh --base HEAD` every host step PASS.
 
-- [ ] 0.45 Decide whether `console.log` may keep taking the process-wide console
-  registry lock. Found by sweeping every per-session registry behind a shared lock
-  after task 0.44, asking of each whether a per-event path consults it. Most came
-  back clean: `HOST_SENDERS` is already gated, `SESSION_CACHES` and `STATS` were
-  gated by tasks 0.16 and 0.27, and `VSYNC_SENDERS` resolves once into the host
-  handle — its "intentionally a cold attach-time operation" comment is true, and
-  the structure enforces it. This one did not.
+- [x] 0.45 Stop `console.log` taking the process-wide console registry lock.
+  Found by sweeping every per-session registry behind a shared lock after task
+  0.44, asking of each whether a per-event path consults it. Most came back clean:
+  `HOST_SENDERS` was already gated, `SESSION_CACHES` and `STATS` by tasks 0.16 and
+  0.27, and `VSYNC_SENDERS` resolves once into the host handle — its
+  "intentionally a cold attach-time operation" comment is true and the structure
+  enforces it. This one was not.
 
-  `push_console_log(id, ..)` calls `get_console_log(id)`, which takes a read guard
-  on the process-wide `CONSOLE_LOGS` map — **on every `console.log` the content
-  makes**, from `runtime-v8/src/console/mod.rs`. In production the map is empty and
-  the guard is uncontended, so the cost is nanoseconds; what the rule in Section
-  7.3 is about is the coupling, and this path does couple to every other Session's
-  bring-up and teardown, which take the same lock for writing.
+  `push_console_log(id, ..)` looked the session up in the process-wide
+  `CONSOLE_LOGS` map on **every `console.log` the content makes**. The lookup
+  *works* — it returns the right buffer — which is exactly why only a gate catches
+  it: what it costs is a queue behind an unrelated game's bring-up or teardown,
+  which take the same lock for writing, on a path a game can reach every frame.
 
-  **Not fixed here, because the obvious fix has a correctness trap and the win is
-  small.** The op already caches `HOST_ID` in a thread-local set once at bring-up,
-  so caching the `Arc<Mutex<ConsoleLogBuffer>>` beside it is the same shape as the
-  text texture cache and image cache fixes. But the buffer is registered only when
-  debug is enabled, and the restart path unregisters and re-registers, so a
-  bring-up-time resolve can miss it and a lazily cached `None` would miss it
-  permanently — trading a nanosecond for a silently empty devtools console.
+  **The ordering question that made this a decision rather than an edit was
+  checked in the source, not assumed.** The buffer is registered only when debug
+  is enabled, and the restart path builds a new isolate — so a bring-up-time
+  resolve is only safe if registration is already final both times. It is:
+  registration runs in the host's pre-JS services ahead of `HostJsRuntime::new` on
+  the first start, and a restart does not unregister, so the answer is settled
+  before `bind_thread_console` runs either time. Teardown unregisters, by which
+  point the isolate is gone. So the resolve-at-bring-up option is correct, and it
+  is the same shape the text texture cache and the image alias table already use.
 
-  So the decision this task owes is which of three: resolve at bring-up and prove
-  the ordering holds across restart; cache only a successful resolve and accept
-  that an unregistered session pays the lookup; or record the read as an accepted
-  exception, on the grounds that a debug-only buffer is not a hot path, and say so
-  in Section 7.3 rather than leaving the rule looking violated.
+  The op now holds the buffer it resolved at bring-up in a thread-local, where it
+  previously held only the session id. In production, where debug is off, that
+  turns a lock acquisition plus a hash lookup per log call into one branch on
+  `None`.
+
+  **Mutation-proved, and the mutant is the previous production code.** Restoring
+  the per-call `push_console_log` fails this gate and nothing else, by *blocking*:
+  3.16 s against the probe's 2 s patience.
+
+  **The fixture was wrong first, and the failure said so.** Its first version
+  bound the sink inside the probe body — but binding is what reads the registry,
+  so it deadlocked against the held write guard and reported at exactly 2.00 s.
+  Production resolves once at bring-up, outside any contention, and writes many
+  times after; the fixture now does the same, which is why the resolve and the
+  install are separate functions.
 
 - [ ] 0.41 Guard the batched submit's obligation to return its vector to the
   pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
