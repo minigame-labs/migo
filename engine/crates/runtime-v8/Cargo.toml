@@ -73,10 +73,10 @@ tokio = { workspace = true, features = ["test-util"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 # Section 7.3's steady-state allocation gate. A dev-dependency by construction:
 # the counting allocator must never be reachable from a shipped cdylib.
-migo-alloc-probe = { path = "../../testing/alloc-probe" }
+migo-alloc-probe = { path = "../../testing/alloc-probe", default-features = false }
 # Section 7.3's cross-session contention gate, same reasoning: dev-only by
 # construction so no shipped build can reach it.
-migo-contention-probe = { path = "../../testing/contention-probe" }
+migo-contention-probe = { path = "../../testing/contention-probe", default-features = false }
 # The gate holds the console registry's own lock, which only this feature exposes.
 shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["contention-probe"] }
 # Also a [build-dependencies] entry: the snapshot-fingerprint helper

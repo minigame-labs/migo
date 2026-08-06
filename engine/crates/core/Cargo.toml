@@ -37,7 +37,7 @@ tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-migo-contention-probe = { path = "../../testing/contention-probe" }
+migo-contention-probe = { path = "../../testing/contention-probe", default-features = false }
 # Section 7.3's contention gate holds the stats registry's lock, which is private to
 # `shared`. Requested here rather than in `[dependencies]` so resolver 2 leaves the
 # accessor out of the cdylib.

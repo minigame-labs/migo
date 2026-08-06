@@ -48,5 +48,5 @@ libc = "0.2"
 tokio = { workspace = true, features = ["rt"] }
 # Test-only by construction: a `[dependencies]` entry here would carry a
 # `#[global_allocator]` into every cdylib that links this crate.
-migo-alloc-probe = { path = "../../testing/alloc-probe" }
-migo-contention-probe = { path = "../../testing/contention-probe" }
+migo-alloc-probe = { path = "../../testing/alloc-probe", default-features = false }
+migo-contention-probe = { path = "../../testing/contention-probe", default-features = false }
