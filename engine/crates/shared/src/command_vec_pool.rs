@@ -10,6 +10,8 @@ use crate::protocol::render_cmd::{Canvas2DCmd, GLCmd};
 pub const GL_COMMAND_VEC_INITIAL_CAPACITY: usize = 16;
 pub const CANVAS_COMMAND_VEC_INITIAL_CAPACITY: usize = 8;
 pub const COMMAND_VEC_POOL_SLOTS: usize = 16;
+pub const FRAME_OP_VEC_INITIAL_CAPACITY: usize = 8;
+pub const FRAME_OP_VEC_POOL_BUDGET_OPS_PER_SLOT: usize = 128;
 
 /// Commands per slot the pool's memory budget is sized for.
 ///
@@ -34,7 +36,170 @@ pub const COMMAND_VEC_POOL_SLOTS: usize = 16;
 /// allowed, and no single frame size is special any more.
 pub const COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT: usize = 512;
 
-struct CommandVecPool<T> {
+/// Element types the recycler holds, each naming the one pool its vectors
+/// belong to.
+///
+/// The pool is chosen by the element type rather than carried inside every
+/// vector, so a [`PooledVec`] occupies exactly what a `Vec` occupies. That
+/// matters here: these vectors live inside `FrameOp`, which is itself held by
+/// the vector this trait also governs, so a per-vector back-pointer would be
+/// paid once per command batch and once per frame packet.
+pub trait Pooled: Sized + 'static {
+    fn pool() -> &'static CommandVecPool<Self>;
+}
+
+/// A command vector on loan from its pool, which returns itself when dropped.
+///
+/// **The return is drop glue, not an obligation, and that is the whole point.**
+/// The previous shape handed out a bare `Vec` and asked every consumer to call
+/// `recycle_*` when it was finished. Forgetting that call is invisible: every
+/// caller still gets a vector, just a freshly allocated one, so a pool that has
+/// silently stopped retaining anything looks exactly like a pool that is
+/// working. It is invisible to the allocation gates too — a leaked loan is a
+/// *de*allocation, which a burst that counts allocations cannot see by
+/// construction. Mutation testing confirmed it: deleting `append_gl_batch`'s
+/// recycle call failed no test in the binary.
+///
+/// So the call is gone rather than guarded. There is no `recycle` to forget,
+/// and a consumer that simply lets the vector fall out of scope does the right
+/// thing.
+///
+/// `Deref`/`DerefMut` reach the underlying `Vec` so call sites read as they did
+/// before. That does leave `mem::take` able to steal the allocation, which is
+/// deliberate: the failure this type exists to remove is *forgetting* to return
+/// a loan, not deciding to keep one.
+pub struct PooledVec<T: Pooled> {
+    inner: Vec<T>,
+}
+
+impl<T: Pooled> PooledVec<T> {
+    /// Takes a vector from `T`'s pool, reusing a retained allocation when one
+    /// is available.
+    #[inline]
+    pub fn take() -> Self {
+        Self {
+            inner: T::pool().take(),
+        }
+    }
+}
+
+impl<T: Pooled> Default for PooledVec<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::take()
+    }
+}
+
+impl<T: Pooled> Drop for PooledVec<T> {
+    #[inline]
+    fn drop(&mut self) {
+        // Emptied here rather than refused for being non-empty: a partially
+        // consumed loan still owns an allocation worth keeping, and dropping
+        // the remaining elements is what dropping the vector would do anyway.
+        T::pool().reclaim(std::mem::take(&mut self.inner));
+    }
+}
+
+impl<T: Pooled> std::ops::Deref for PooledVec<T> {
+    type Target = Vec<T>;
+
+    #[inline]
+    fn deref(&self) -> &Vec<T> {
+        &self.inner
+    }
+}
+
+impl<T: Pooled> std::ops::DerefMut for PooledVec<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        &mut self.inner
+    }
+}
+
+/// Adopts an existing vector into the pool's population.
+///
+/// Mostly a test convenience, and sound in production too: the pool's retention
+/// budget bounds what it keeps regardless of where a vector came from.
+impl<T: Pooled> From<Vec<T>> for PooledVec<T> {
+    #[inline]
+    fn from(inner: Vec<T>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: Pooled + std::fmt::Debug> std::fmt::Debug for PooledVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+impl<T: Pooled + PartialEq> PartialEq for PooledVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+/// Consuming iteration that still returns the allocation.
+///
+/// `std::vec::IntoIter` owns the buffer and frees it, which would defeat the
+/// pool on every `for op in packet.into_ops()`. Reversing once and popping from
+/// the back yields the same order in O(n) with no unsafe and no second
+/// allocation, and leaves the emptied vector for [`PooledVec`]'s own `Drop` —
+/// including when the loop breaks early.
+pub struct PooledIntoIter<T: Pooled> {
+    vec: PooledVec<T>,
+}
+
+impl<T: Pooled> Iterator for PooledIntoIter<T> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.vec.inner.pop()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vec.inner.len();
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T: Pooled> ExactSizeIterator for PooledIntoIter<T> {}
+
+impl<T: Pooled> IntoIterator for PooledVec<T> {
+    type Item = T;
+    type IntoIter = PooledIntoIter<T>;
+
+    #[inline]
+    fn into_iter(mut self) -> PooledIntoIter<T> {
+        self.inner.reverse();
+        PooledIntoIter { vec: self }
+    }
+}
+
+impl<'a, T: Pooled> IntoIterator for &'a PooledVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> std::slice::Iter<'a, T> {
+        self.inner.iter()
+    }
+}
+
+impl<T: Pooled> Extend<T> for PooledVec<T> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.inner.extend(iter);
+    }
+}
+
+/// A bounded recycler for one element type's command vectors.
+///
+/// Public only because [`Pooled`] names it; it cannot be constructed from
+/// outside this crate.
+pub struct CommandVecPool<T> {
     sender: Sender<Vec<T>>,
     receiver: Receiver<Vec<T>>,
     minimum_capacity: usize,
@@ -48,7 +213,11 @@ impl<T> CommandVecPool<T> {
     /// other is meant. A `usize` budget in bytes next to a `usize` count of
     /// commands is a mistake the compiler cannot catch, and the first draft of
     /// this change made it.
-    fn new(slots: usize, minimum_capacity: usize, budget_commands_per_slot: usize) -> Self {
+    pub(crate) fn new(
+        slots: usize,
+        minimum_capacity: usize,
+        budget_commands_per_slot: usize,
+    ) -> Self {
         assert!(slots > 0, "command vector pool must have at least one slot");
         assert!(
             minimum_capacity <= budget_commands_per_slot,
@@ -127,6 +296,16 @@ impl<T> CommandVecPool<T> {
         true
     }
 
+    /// Empties a returned loan and offers it back. Separate from [`Self::recycle`]
+    /// so that method keeps refusing a non-empty vector — the refusal is what
+    /// stops a caller from parking live commands in the pool, and a loan being
+    /// dropped is the one case where clearing is the caller's intent anyway.
+    #[inline]
+    fn reclaim(&self, mut commands: Vec<T>) {
+        commands.clear();
+        let _ = self.recycle(commands);
+    }
+
     #[cfg(test)]
     fn retained_bytes(&self) -> usize {
         self.retained_bytes.load(Ordering::Relaxed)
@@ -138,51 +317,262 @@ impl<T> CommandVecPool<T> {
     }
 }
 
-fn gl_pool() -> &'static CommandVecPool<GLCmd> {
-    static POOL: OnceLock<CommandVecPool<GLCmd>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        CommandVecPool::new(
-            COMMAND_VEC_POOL_SLOTS,
-            GL_COMMAND_VEC_INITIAL_CAPACITY,
-            COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT,
-        )
-    })
+impl Pooled for GLCmd {
+    fn pool() -> &'static CommandVecPool<GLCmd> {
+        static POOL: OnceLock<CommandVecPool<GLCmd>> = OnceLock::new();
+        POOL.get_or_init(|| {
+            CommandVecPool::new(
+                COMMAND_VEC_POOL_SLOTS,
+                GL_COMMAND_VEC_INITIAL_CAPACITY,
+                COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT,
+            )
+        })
+    }
 }
 
-fn canvas_pool() -> &'static CommandVecPool<Canvas2DCmd> {
-    static POOL: OnceLock<CommandVecPool<Canvas2DCmd>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        CommandVecPool::new(
-            COMMAND_VEC_POOL_SLOTS,
-            CANVAS_COMMAND_VEC_INITIAL_CAPACITY,
-            COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT,
-        )
-    })
+impl Pooled for Canvas2DCmd {
+    fn pool() -> &'static CommandVecPool<Canvas2DCmd> {
+        static POOL: OnceLock<CommandVecPool<Canvas2DCmd>> = OnceLock::new();
+        POOL.get_or_init(|| {
+            CommandVecPool::new(
+                COMMAND_VEC_POOL_SLOTS,
+                CANVAS_COMMAND_VEC_INITIAL_CAPACITY,
+                COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT,
+            )
+        })
+    }
+}
+
+impl Pooled for crate::protocol::FrameOp {
+    /// The frame packet's own op vector, which crosses the same thread boundary
+    /// its contents do — built on the thread running the game, consumed on the
+    /// render thread — and so needs the same cross-thread recycler rather than a
+    /// thread-local scratch buffer.
+    ///
+    /// Its own dimensions, because an op is not a command. A packet holds one
+    /// op per segment plus a `BeginFrame`, the `Materialize` ops at each
+    /// Canvas2D→WebGL boundary and a `Present`: single digits for a typical
+    /// frame, and the worst case measured on the shop scene was about
+    /// sixty-five. So the minimum capacity is small, and the per-slot budget is
+    /// a quarter of the command pools' — a `FrameOp` is several times the width
+    /// of a `GLCmd`, so matching their command count would reserve far more
+    /// memory for a vector that holds far fewer elements.
+    fn pool() -> &'static CommandVecPool<crate::protocol::FrameOp> {
+        static POOL: OnceLock<CommandVecPool<crate::protocol::FrameOp>> = OnceLock::new();
+        POOL.get_or_init(|| {
+            CommandVecPool::new(
+                COMMAND_VEC_POOL_SLOTS,
+                FRAME_OP_VEC_INITIAL_CAPACITY,
+                FRAME_OP_VEC_POOL_BUDGET_OPS_PER_SLOT,
+            )
+        })
+    }
 }
 
 #[inline]
-pub fn take_gl_command_vec() -> Vec<GLCmd> {
-    gl_pool().take()
+pub fn take_gl_command_vec() -> PooledVec<GLCmd> {
+    PooledVec::take()
 }
 
 #[inline]
-pub fn take_canvas_command_vec() -> Vec<Canvas2DCmd> {
-    canvas_pool().take()
-}
-
-#[inline]
-pub fn recycle_gl_command_vec(commands: Vec<GLCmd>) {
-    let _ = gl_pool().recycle(commands);
-}
-
-#[inline]
-pub fn recycle_canvas_command_vec(commands: Vec<Canvas2DCmd>) {
-    let _ = canvas_pool().recycle(commands);
+pub fn take_canvas_command_vec() -> PooledVec<Canvas2DCmd> {
+    PooledVec::take()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CommandVecPool;
+    use super::{CommandVecPool, Pooled, PooledVec};
+    use std::sync::OnceLock;
+
+    /// Gives a test its own element type, and so its own pool.
+    ///
+    /// `cargo test` runs these concurrently against one process, so two tests
+    /// sharing a pool would take each other's vectors and each would be
+    /// asserting about the other's allocations. A distinct type per test is the
+    /// isolation, and it costs nothing at runtime because the pool is selected
+    /// by type.
+    macro_rules! private_pool_type {
+        ($name:ident, $slots:expr, $minimum:expr, $budget:expr) => {
+            #[derive(Debug, PartialEq, Eq)]
+            struct $name(u32);
+
+            impl Pooled for $name {
+                fn pool() -> &'static CommandVecPool<$name> {
+                    static POOL: OnceLock<CommandVecPool<$name>> = OnceLock::new();
+                    POOL.get_or_init(|| CommandVecPool::new($slots, $minimum, $budget))
+                }
+            }
+        };
+    }
+
+    private_pool_type!(ScopeExit, 1, 4, 512);
+    private_pool_type!(PartiallyConsumed, 1, 4, 512);
+    private_pool_type!(FullyConsumed, 1, 4, 512);
+    private_pool_type!(Adopted, 1, 4, 512);
+
+    /// **The property the previous shape could not have.** A loan was returned
+    /// by calling `recycle_*`, and forgetting the call was invisible: every
+    /// caller still got a vector, just a freshly allocated one. Nothing observed
+    /// the difference — an allocation gate cannot, because a lost loan is a
+    /// *de*allocation. Mutation proved it: deleting `append_gl_batch`'s recycle
+    /// call failed no test in the binary.
+    ///
+    /// Here the vector simply goes out of scope, with no return call to write or
+    /// to forget, and the allocation comes back.
+    #[test]
+    fn a_loan_that_falls_out_of_scope_returns_its_allocation() {
+        let allocation = {
+            let mut commands = PooledVec::<ScopeExit>::take();
+            commands.reserve_exact(64);
+            commands.push(ScopeExit(1));
+            commands.as_ptr()
+        };
+
+        let reused = PooledVec::<ScopeExit>::take();
+        assert_eq!(
+            reused.as_ptr(),
+            allocation,
+            "a loan that went out of scope did not come back to its pool"
+        );
+        assert!(reused.is_empty(), "a returned loan must arrive empty");
+    }
+
+    /// A loan the consumer stopped reading part-way through still owns an
+    /// allocation worth keeping. The pool's own `recycle` refuses a non-empty
+    /// vector — that refusal stops a caller parking live commands in the pool —
+    /// so the drop path has to empty it rather than hand it over as-is.
+    #[test]
+    fn a_partially_consumed_loan_still_returns_its_allocation() {
+        let allocation = {
+            let mut commands = PooledVec::<PartiallyConsumed>::take();
+            commands.reserve_exact(64);
+            commands.extend([0, 1, 2, 3].map(PartiallyConsumed));
+            let ptr = commands.as_ptr();
+            for command in commands {
+                if command.0 == 1 {
+                    break;
+                }
+            }
+            ptr
+        };
+
+        assert_eq!(
+            PooledVec::<PartiallyConsumed>::take().as_ptr(),
+            allocation,
+            "a loan abandoned mid-iteration lost its allocation"
+        );
+    }
+
+    /// Consuming iteration has to yield submission order — the render thread
+    /// executes ops in the order it receives them — while still leaving the
+    /// buffer for the pool. `std::vec::IntoIter` gets the order right and frees
+    /// the buffer, which is why this iterator is not that one.
+    #[test]
+    fn consuming_iteration_yields_in_order_and_returns_the_allocation() {
+        let mut commands = PooledVec::<FullyConsumed>::take();
+        commands.reserve_exact(64);
+        commands.extend([10, 20, 30].map(FullyConsumed));
+        let allocation = commands.as_ptr();
+
+        let seen: Vec<u32> = commands.into_iter().map(|command| command.0).collect();
+        assert_eq!(
+            seen,
+            vec![10, 20, 30],
+            "consuming iteration reordered the ops"
+        );
+
+        assert_eq!(
+            PooledVec::<FullyConsumed>::take().as_ptr(),
+            allocation,
+            "a fully consumed loan did not return its allocation"
+        );
+    }
+
+    /// A plain `Vec` adopted into a loan joins the pool's population when it is
+    /// dropped. Test fixtures build batches this way, and it is sound in
+    /// production too: the retention budget bounds what the pool keeps whatever
+    /// the vector's origin.
+    #[test]
+    fn an_adopted_vector_joins_the_pool() {
+        let mut donated = Vec::with_capacity(64);
+        donated.push(Adopted(7));
+        let allocation = donated.as_ptr();
+
+        drop(PooledVec::from(donated));
+
+        assert_eq!(
+            PooledVec::<Adopted>::take().as_ptr(),
+            allocation,
+            "an adopted vector was dropped instead of being kept"
+        );
+    }
+
+    /// The pool's worst case in bytes, stated rather than assumed.
+    ///
+    /// A budget expressed in *commands per slot* means nothing on its own — the
+    /// same number reserves wildly different amounts for element types of
+    /// different widths, which is why the frame-op pool does not simply inherit
+    /// the command pools' figure. This pins what each pool may actually hold so
+    /// that changing a constant, or widening one of these enums, has to be a
+    /// decision someone takes rather than a number that drifts.
+    #[test]
+    fn each_pool_states_the_memory_it_may_retain() {
+        use crate::protocol::FrameOp;
+        use crate::protocol::render_cmd::{Canvas2DCmd, GLCmd};
+
+        let worst_case =
+            |per_slot: usize, width: usize| super::COMMAND_VEC_POOL_SLOTS * per_slot * width;
+
+        let gl = worst_case(
+            super::COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT,
+            size_of::<GLCmd>(),
+        );
+        let canvas = worst_case(
+            super::COMMAND_VEC_POOL_BUDGET_COMMANDS_PER_SLOT,
+            size_of::<Canvas2DCmd>(),
+        );
+        let frame_ops = worst_case(
+            super::FRAME_OP_VEC_POOL_BUDGET_OPS_PER_SLOT,
+            size_of::<FrameOp>(),
+        );
+
+        // A wrapper that costs nothing is the reason the pool is selected by
+        // element type instead of carried in each vector.
+        assert_eq!(
+            size_of::<super::PooledVec<GLCmd>>(),
+            size_of::<Vec<GLCmd>>(),
+            "a loan must occupy exactly what the vector it wraps occupies"
+        );
+
+        assert!(
+            frame_ops < gl / 2,
+            "the frame-op pool reserves {frame_ops} bytes against the GL pool's \
+             {gl}: an op is several times a command's width, so matching the \
+             command budget would reserve far more for far fewer elements"
+        );
+
+        // Currently 786 KiB GL, 448 KiB Canvas2D, 112 KiB frame ops — about
+        // 1.33 MiB in total, and reached only by a process that really did
+        // produce sixteen vectors that wide. The command pools' share of that is
+        // inherited: the byte budget was derived to permit exactly what the
+        // older per-vector element ceiling already permitted, so this test
+        // records that figure rather than proposing a different one.
+        //
+        // The ceiling below is a ceiling on the ceiling. It is not a target; it
+        // is what stops a widened `GLCmd` from quietly multiplying the reserve,
+        // since the budget counts elements and the bytes follow the enum. A
+        // command is 96 bytes today, and narrowing it — boxing the few variants
+        // that carry uploads — would cut the largest share of this directly.
+        // That is a measurement someone should take, not a change to make blind,
+        // and it is recorded as such rather than done here.
+        let total = gl + canvas + frame_ops;
+        assert!(
+            total <= 2 * 1024 * 1024,
+            "the three pools may retain {total} bytes between them ({gl} GL, \
+             {canvas} Canvas2D, {frame_ops} frame ops); the recycler is meant to \
+             avoid per-frame allocation, not to hold a cache this size"
+        );
+    }
 
     #[test]
     fn recycled_vector_reuses_its_allocation() {

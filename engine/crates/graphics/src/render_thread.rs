@@ -41,7 +41,7 @@ use crate::{
 };
 use crossbeam_channel::{Receiver, select, tick};
 use glow::HasContext;
-use shared::command_vec_pool::{recycle_canvas_command_vec, recycle_gl_command_vec};
+use shared::command_vec_pool::PooledVec;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
@@ -407,7 +407,7 @@ fn execute_canvas_batch(
         present,
         dirty_rect.is_some(),
     );
-    recycle_canvas_command_vec(commands);
+    // `commands` is a loan from the command pool; it returns itself here.
     should_mark_present
 }
 
@@ -466,7 +466,7 @@ fn execute_gl_batch(
         cm.mark_2d_context_stale(cid);
     }
 
-    recycle_gl_command_vec(commands);
+    // `commands` is a loan from the command pool; it returns itself here.
     batch_hit_onscreen
 }
 
@@ -534,26 +534,159 @@ where
 /// cross-dependency (e.g. `ctx.drawImage(webglCanvasElement, ...)` —
 /// the WebGL canvas's pixels must be flushed before the Canvas2D
 /// draw reads them), in which case we preserve issue order.
+/// The Canvas2D half's distinct targets, gathered without touching the heap.
+///
+/// This used to be a pair of `HashSet<u32>`, built and thrown away on every
+/// frame the engine renders. A packet's Canvas2D half addresses a handful of
+/// canvases — the heaviest scene profiled reached about thirty offscreen labels
+/// — so at these sizes a linear scan over an inline array beats hashing on
+/// every count that matters: no allocation, no hashing, and the whole set in one
+/// cache line's worth of contiguous `u32`s.
+///
+/// The inline capacity is what a pathological scene would need; beyond it the
+/// smallvec spills to the heap and stays correct, which is the right failure
+/// mode for a fast path.
+type CanvasTargets = smallvec::SmallVec<[CanvasId; 32]>;
+
 fn packet_safe_to_reorder(ops: &[FrameOp]) -> bool {
-    use std::collections::HashSet;
-    let mut canvas_targets: HashSet<u32> = HashSet::new();
-    let mut gl_targets: HashSet<u32> = HashSet::new();
+    let mut canvas_targets = CanvasTargets::new();
     for op in ops {
-        match op {
-            FrameOp::CanvasBatch(payload) => {
-                canvas_targets.insert(u32::from(payload.canvas_id));
-            }
-            FrameOp::GlBatch(payload) => {
-                for cmd in &payload.commands {
-                    if let Some(cid) = cmd.touches_canvas() {
-                        gl_targets.insert(u32::from(cid));
-                    }
-                }
-            }
-            _ => {}
+        if let FrameOp::CanvasBatch(payload) = op
+            && !canvas_targets.contains(&payload.canvas_id)
+        {
+            canvas_targets.push(payload.canvas_id);
         }
     }
-    canvas_targets.is_disjoint(&gl_targets)
+
+    // Nothing to collide with, so the question is settled before the GL half is
+    // walked at all — which is every WebGL-only frame, the common case.
+    if canvas_targets.is_empty() {
+        return true;
+    }
+
+    // Only the *first* shared canvas matters: one is enough to force issue
+    // order. The set version built both sides in full before comparing them.
+    for op in ops {
+        if let FrameOp::GlBatch(payload) = op {
+            for cmd in &payload.commands {
+                if let Some(cid) = cmd.touches_canvas()
+                    && canvas_targets.contains(&cid)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Runs a packet's ops, deferring the WebGL half when the packet admits the
+/// phase reorder.
+///
+/// Reorders to minimise EGL context switching. Profiling on hxddd's shop-open
+/// scene showed ~430 `eglMakeCurrent` calls per FramePacket — almost all from
+/// alternating between ~30 offscreen Canvas2D labels and the onscreen WebGL
+/// canvas, ping-pong style. When the packet's Canvas2D and WebGL halves do not
+/// share any canvas id, doing all Canvas2D work first then all WebGL work
+/// collapses the ping-pong into one switch per distinct canvas (measured:
+/// make_current 295 → 152 on the shop scene). Falls back to issue order when a
+/// cross-dependency is detected.
+///
+/// **It does not materialise a reordered vector.** It used to build two —
+/// `phase1` and `phase2`, each sized for the whole packet — concatenate them and
+/// drop the original: three allocations and a full extra move of every op, per
+/// frame, to express an ordering the loop can simply take. Running the first
+/// phase as the packet is consumed and holding only the second collapses that to
+/// one pooled vector, which is the deferred phase itself and is usually the
+/// smaller half.
+///
+/// **Separated from the executor so the ordering is testable at all.** The
+/// reorder is the one part of packet execution that can produce wrong pixels
+/// rather than slow ones — running a Canvas2D read of a WebGL canvas before the
+/// WebGL work that fills it — and until this split there was no way to observe
+/// its output without a live GL context, so nothing did.
+fn run_frame_phases(
+    ops: shared::command_vec_pool::PooledVec<FrameOp>,
+    mut execute: impl FnMut(FrameOp) -> bool,
+) -> bool {
+    let mut should_present = false;
+    if packet_safe_to_reorder(&ops) {
+        let mut deferred = PooledVec::<FrameOp>::take();
+        for op in ops {
+            match &op {
+                FrameOp::GlBatch(_) | FrameOp::Present => deferred.push(op),
+                FrameOp::BeginFrame | FrameOp::CanvasBatch(_) | FrameOp::Materialize { .. } => {
+                    should_present |= execute(op);
+                }
+            }
+        }
+        for op in deferred {
+            should_present |= execute(op);
+        }
+    } else {
+        for op in ops {
+            should_present |= execute(op);
+        }
+    }
+    should_present
+}
+
+/// Executes one op and reports whether it made the surface worth presenting.
+///
+/// Its own function because the phase reorder runs the packet's two halves from
+/// two different loops. Keeping the body here means the deferred half executes
+/// through exactly the same code as the immediate half — a second copy of this
+/// match is how the two phases would drift apart.
+fn execute_frame_op(
+    cm: &mut CanvasManager,
+    gl: &glow::Context,
+    renderer_2d: &mut Renderer2d,
+    renderer_gl: &mut RendererGL,
+    op: FrameOp,
+) -> bool {
+    match op {
+        FrameOp::BeginFrame => false,
+        // Presentation is coalesced by the physical-frame loop in the caller.
+        // Skia maintenance also lives there so multiple packets cannot trigger
+        // multiple all-context sweeps in one display frame.
+        FrameOp::Present => false,
+        FrameOp::Materialize { canvas_id } => {
+            // Canvas2D → WebGL boundary.  We MUST:
+            //   1. Flush Skia so subsequent GL ops see the pixels.
+            //   2. Snapshot/restore the 5 raw-GL bindings Skia
+            //      relies on (active-tex, PBO, alignment) via a
+            //      `Canvas2DGlScopeGuard`; on drop it also
+            //      invalidates the per-canvas dedup shadow so
+            //      any value Skia changed under our feet won't
+            //      be served from cache next WebGL draw.
+            //   3. *Not* eagerly call `reset_gl_state()` — the
+            //      per-context `skia_state_stale` flag picks
+            //      that up lazily the next time Skia draws.
+            //
+            // P1-7 invariant: calling `cm.clear_2d_dirty(canvas_id)`
+            // here guarantees that the end-of-frame
+            // `flush_dirty_2d_contexts` sweep in
+            // `present_frame_and_signal_raf` will NOT re-flush the
+            // same canvas (it drains `dirty_2d`).  A post-
+            // Materialize `Canvas2DBatch` that targets the same
+            // canvas will re-mark it dirty via
+            // `mark_2d_dirty`, which is the only code path that
+            // should trigger a second flush in one frame.
+            if cm.make_current_needed(canvas_id).is_ok() {
+                let _gl_scope = cm.begin_canvas2d_gl_scope_for(canvas_id);
+                if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
+                    ctx.flush_and_submit();
+                }
+                renderer_2d.clear_dirty_layer(canvas_id);
+                cm.clear_2d_dirty(canvas_id);
+                // `_gl_scope` drops here → raw-GL state restored,
+                // dedup shadow invalidated.
+            }
+            false
+        }
+        FrameOp::CanvasBatch(payload) => execute_canvas_batch(cm, gl, renderer_2d, payload),
+        FrameOp::GlBatch(payload) => execute_gl_batch(cm, gl, renderer_gl, payload),
+    }
 }
 
 fn execute_frame_packet(
@@ -580,81 +713,9 @@ fn execute_frame_packet(
         retained_image_ids.push(id);
     });
 
-    // Reorder ops to minimise EGL context switching.  Profiling on
-    // hxddd's shop-open scene showed ~430 `eglMakeCurrent` calls per
-    // FramePacket — almost all from alternating between ~30 offscreen
-    // Canvas2D labels and the onscreen WebGL canvas, ping-pong style.
-    // When the packet's Canvas2D and WebGL halves don't share any
-    // canvas id, doing all Canvas2D work first then all WebGL work
-    // collapses the ping-pong into one switch per distinct canvas
-    // (measured: make_current 295 → 152 on the shop scene).  Falls
-    // back to issue order when a cross-dependency is detected.
-    let ops_vec = packet.into_ops();
-    let ops: Vec<FrameOp> = if packet_safe_to_reorder(&ops_vec) {
-        let mut phase1: Vec<FrameOp> = Vec::with_capacity(ops_vec.len());
-        let mut phase2: Vec<FrameOp> = Vec::with_capacity(ops_vec.len());
-        for op in ops_vec {
-            match &op {
-                FrameOp::BeginFrame | FrameOp::CanvasBatch(_) | FrameOp::Materialize { .. } => {
-                    phase1.push(op)
-                }
-                FrameOp::GlBatch(_) | FrameOp::Present => phase2.push(op),
-            }
-        }
-        phase1.extend(phase2);
-        phase1
-    } else {
-        ops_vec
-    };
-
-    for op in ops {
-        match op {
-            FrameOp::BeginFrame => {}
-            // Presentation is coalesced by the physical-frame loop below. Skia
-            // maintenance also lives there so multiple packets cannot trigger
-            // multiple all-context sweeps in one display frame.
-            FrameOp::Present => {}
-            FrameOp::Materialize { canvas_id } => {
-                // Canvas2D → WebGL boundary.  We MUST:
-                //   1. Flush Skia so subsequent GL ops see the pixels.
-                //   2. Snapshot/restore the 5 raw-GL bindings Skia
-                //      relies on (active-tex, PBO, alignment) via a
-                //      `Canvas2DGlScopeGuard`; on drop it also
-                //      invalidates the per-canvas dedup shadow so
-                //      any value Skia changed under our feet won't
-                //      be served from cache next WebGL draw.
-                //   3. *Not* eagerly call `reset_gl_state()` — the
-                //      per-context `skia_state_stale` flag picks
-                //      that up lazily the next time Skia draws.
-                //
-                // P1-7 invariant: calling `cm.clear_2d_dirty(canvas_id)`
-                // here guarantees that the end-of-frame
-                // `flush_dirty_2d_contexts` sweep in
-                // `present_frame_and_signal_raf` will NOT re-flush the
-                // same canvas (it drains `dirty_2d`).  A post-
-                // Materialize `Canvas2DBatch` that targets the same
-                // canvas will re-mark it dirty via
-                // `mark_2d_dirty`, which is the only code path that
-                // should trigger a second flush in one frame.
-                if cm.make_current_needed(canvas_id).is_ok() {
-                    let _gl_scope = cm.begin_canvas2d_gl_scope_for(canvas_id);
-                    if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
-                        ctx.flush_and_submit();
-                    }
-                    renderer_2d.clear_dirty_layer(canvas_id);
-                    cm.clear_2d_dirty(canvas_id);
-                    // `_gl_scope` drops here → raw-GL state restored,
-                    // dedup shadow invalidated.
-                }
-            }
-            FrameOp::CanvasBatch(payload) => {
-                should_present |= execute_canvas_batch(cm, gl, renderer_2d, payload);
-            }
-            FrameOp::GlBatch(payload) => {
-                should_present |= execute_gl_batch(cm, gl, renderer_gl, payload);
-            }
-        }
-    }
+    should_present |= run_frame_phases(packet.into_ops(), |op| {
+        execute_frame_op(cm, gl, renderer_2d, renderer_gl, op)
+    });
 
     // F-1 release-then-drain sequence.  Release every id the
     // packet retained so any `DestroyImage` that arrived during
@@ -728,12 +789,329 @@ mod tests {
     use super::{
         canvas2d_batch_should_mark_present_dirty,
         execute_frame_packet_with_present_tracking_for_test, finalize_vsync_frame_decision,
-        mark_surface_destroyed, next_vsync_frame_decision, report_recovery_failure,
-        retire_unexpected_surface,
+        mark_surface_destroyed, next_vsync_frame_decision, packet_safe_to_reorder,
+        report_recovery_failure, retire_unexpected_surface,
     };
     use crate::{SurfaceSystem, frame_scheduler::FrameScheduler};
-    use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, DirtyRect};
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+    use shared::protocol::render_cmd::{
+        Canvas2DCmd, CanvasBatchPayload, CanvasId, DirtyRect, GLCmd, GlBatchPayload,
+    };
     use shared::{FrameOp, FramePacketBuilder};
+
+    // ── Phase reorder admission ──────────────────────────────────────────────
+    //
+    // The decision these cover was untested until the reorder was rewritten to
+    // stop allocating: a `false` that should be `true` costs only the EGL
+    // ping-pong the reorder exists to remove, but a `true` that should be
+    // `false` runs a Canvas2D read of a WebGL canvas *before* the WebGL work
+    // that fills it, and the wrong pixels are the visible result.
+
+    fn canvas_batch(canvas_id: u32) -> FrameOp {
+        FrameOp::CanvasBatch(CanvasBatchPayload {
+            canvas_id: CanvasId::from(canvas_id),
+            commands: vec![Canvas2DCmd::Save].into(),
+            present: false,
+            dirty_rect: None,
+        })
+    }
+
+    fn gl_batch_touching(canvas_ids: &[u32]) -> FrameOp {
+        FrameOp::GlBatch(GlBatchPayload {
+            commands: canvas_ids
+                .iter()
+                .map(|id| GLCmd::Clear {
+                    canvas_id: CanvasId::from(*id),
+                    bit_field: 0x4000,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        })
+    }
+
+    #[test]
+    fn disjoint_canvas_and_gl_targets_admit_the_phase_reorder() {
+        let ops = vec![
+            FrameOp::BeginFrame,
+            canvas_batch(2),
+            canvas_batch(3),
+            gl_batch_touching(&[1]),
+            FrameOp::Present,
+        ];
+
+        assert!(packet_safe_to_reorder(&ops));
+    }
+
+    #[test]
+    fn a_canvas_the_gl_half_also_touches_forces_issue_order() {
+        let ops = vec![
+            FrameOp::BeginFrame,
+            canvas_batch(2),
+            gl_batch_touching(&[1, 2]),
+        ];
+
+        assert!(
+            !packet_safe_to_reorder(&ops),
+            "reordering across a shared canvas runs the Canvas2D read before the \
+             WebGL write that feeds it"
+        );
+    }
+
+    /// A collision anywhere refuses, not just one the scan reaches early. The
+    /// rewrite returns on the first hit, so the last command of the last batch
+    /// is the case that pins the loop actually finishing.
+    #[test]
+    fn a_collision_in_the_last_command_of_the_last_batch_still_refuses() {
+        let ops = vec![
+            canvas_batch(9),
+            gl_batch_touching(&[1, 2, 3]),
+            gl_batch_touching(&[4, 5, 9]),
+        ];
+
+        assert!(!packet_safe_to_reorder(&ops));
+    }
+
+    /// The common case: a WebGL-only frame has no Canvas2D half to collide
+    /// with, so it reorders — and the classifier settles it without walking the
+    /// GL commands at all.
+    #[test]
+    fn a_packet_with_no_canvas_batches_admits_the_reorder() {
+        let ops = vec![
+            FrameOp::BeginFrame,
+            gl_batch_touching(&[1, 1, 1]),
+            FrameOp::Present,
+        ];
+
+        assert!(packet_safe_to_reorder(&ops));
+    }
+
+    /// Resource-context commands carry no canvas, so they cannot collide with
+    /// one. Treating "no canvas" as a match would refuse every packet that
+    /// compiles a shader.
+    #[test]
+    fn gl_commands_that_touch_no_canvas_never_collide() {
+        let ops = vec![
+            canvas_batch(1),
+            FrameOp::GlBatch(GlBatchPayload {
+                commands: vec![GLCmd::DeleteBuffer { buffer_id: 7 }].into(),
+            }),
+        ];
+
+        assert!(packet_safe_to_reorder(&ops));
+    }
+
+    // ── Phase reorder execution ──────────────────────────────────────────────
+
+    /// A label naming the op, so a test can assert the order execution saw.
+    fn label(op: &FrameOp) -> String {
+        match op {
+            FrameOp::BeginFrame => "begin".to_string(),
+            FrameOp::CanvasBatch(payload) => format!("canvas{}", u32::from(payload.canvas_id)),
+            FrameOp::Materialize { canvas_id } => format!("materialize{canvas_id}"),
+            FrameOp::GlBatch(payload) => format!("gl{}", payload.commands.len()),
+            FrameOp::Present => "present".to_string(),
+        }
+    }
+
+    fn phase_order(ops: Vec<FrameOp>) -> Vec<String> {
+        let mut seen = Vec::new();
+        let packet = ops
+            .into_iter()
+            .fold(FramePacketBuilder::new(1, 16.6), |builder, op| {
+                builder.push(op)
+            })
+            .finish();
+        super::run_frame_phases(packet.into_ops(), |op| {
+            seen.push(label(&op));
+            false
+        });
+        seen
+    }
+
+    #[test]
+    fn a_reorderable_packet_runs_its_canvas_half_before_its_webgl_half() {
+        let order = phase_order(vec![
+            FrameOp::BeginFrame,
+            canvas_batch(2),
+            gl_batch_touching(&[1]),
+            canvas_batch(3),
+            gl_batch_touching(&[1]),
+            FrameOp::Present,
+        ]);
+
+        assert_eq!(
+            order,
+            vec!["begin", "canvas2", "canvas3", "gl1", "gl1", "present"],
+            "the reorder must run every Canvas2D op first, and must keep each \
+             half in its own submission order"
+        );
+    }
+
+    /// The case the reorder must decline. Executing the Canvas2D read before the
+    /// WebGL write that fills the same canvas is the wrong-pixels failure, and it
+    /// is silent — every op still runs, and every one of them succeeds.
+    #[test]
+    fn a_packet_with_a_shared_canvas_runs_in_submission_order() {
+        let order = phase_order(vec![
+            FrameOp::BeginFrame,
+            gl_batch_touching(&[2]),
+            FrameOp::Materialize { canvas_id: 2 },
+            canvas_batch(2),
+            FrameOp::Present,
+        ]);
+
+        assert_eq!(
+            order,
+            vec!["begin", "gl1", "materialize2", "canvas2", "present"]
+        );
+    }
+
+    /// Every op must run exactly once whichever path the packet takes. A deferred
+    /// half that is built but never drained loses the frame's entire WebGL work,
+    /// and the frame still reports success.
+    #[test]
+    fn every_op_runs_exactly_once_on_both_paths() {
+        for (name, ops) in [
+            (
+                "reordered",
+                vec![
+                    FrameOp::BeginFrame,
+                    canvas_batch(2),
+                    gl_batch_touching(&[1]),
+                    FrameOp::Present,
+                ],
+            ),
+            (
+                "issue order",
+                vec![
+                    FrameOp::BeginFrame,
+                    canvas_batch(2),
+                    gl_batch_touching(&[2]),
+                    FrameOp::Present,
+                ],
+            ),
+        ] {
+            let expected = ops.len();
+            let order = phase_order(ops);
+            assert_eq!(
+                order.len(),
+                expected,
+                "{name} path dropped or repeated an op"
+            );
+        }
+    }
+
+    /// `should_present` must survive being reported from the deferred half. It is
+    /// accumulated across two loops now, so a WebGL-only frame — where the only
+    /// op that can request a present is deferred — is the case that catches a
+    /// reset between them.
+    #[test]
+    fn a_present_request_from_the_deferred_half_reaches_the_caller() {
+        let packet = FramePacketBuilder::new(1, 16.6)
+            .push(FrameOp::BeginFrame)
+            .push(canvas_batch(2))
+            .push(gl_batch_touching(&[1]))
+            .finish();
+
+        let requested =
+            super::run_frame_phases(packet.into_ops(), |op| matches!(op, FrameOp::GlBatch(_)));
+
+        assert!(
+            requested,
+            "the deferred half's present request was discarded"
+        );
+    }
+
+    const WARMUP: usize = 4;
+    const MEASURED: usize = 64;
+
+    /// **The whole-frame gate is not here, and where it is is not an accident.**
+    /// A frame cycle takes its vectors from the process-wide pools, so measuring
+    /// it at zero requires that the pool hand back what the previous iteration
+    /// returned. That holds in production — one game thread, one render thread,
+    /// a bounded number of packets in flight — and does not hold in a test
+    /// binary whose several dozen other tests build packets on their own
+    /// threads: a neighbour taking the pool's last vector leaves `take` with
+    /// nothing to hand back and it allocates a fresh one. Measured exactly that
+    /// way here: green standalone, red under the full suite.
+    ///
+    /// So the gate lives in `tests/frame_cycle_allocation.rs` over in
+    /// `migo-shared`, which is a binary of its own containing nothing else, and
+    /// it reaches the same builder and the same pools through public API. What
+    /// stays here is the half that needs no pool at all — the classifier above —
+    /// and the ordering the reorder produces.
+
+    /// Section 7.3, on a per-frame path: every packet the render thread executes
+    /// is classified first, so whatever this does, the engine does once a frame
+    /// for as long as it runs.
+    ///
+    /// It used to build two `HashSet<u32>`, fill them and throw them away — two
+    /// allocations and two frees per frame, to answer a question about a handful
+    /// of small integers.
+    #[test]
+    fn classifying_a_packet_for_reorder_never_reaches_the_heap() {
+        // The shape that motivated the reorder: a scene's worth of offscreen
+        // Canvas2D labels alongside one onscreen WebGL canvas.
+        let mut ops: Vec<FrameOp> = (2..32).map(canvas_batch).collect();
+        ops.push(gl_batch_touching(&[1]));
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "render_thread: phase-reorder admission check",
+                warmup: WARMUP,
+                measured: MEASURED,
+            },
+            |_| packet_safe_to_reorder(&ops),
+        );
+    }
+
+    /// Repeats must be gathered once. A packet whose Canvas2D half is one canvas
+    /// drawn many times is the ordinary shape — every label redrawn in a frame —
+    /// and the set version deduplicated for free where the inline scan has to do
+    /// it deliberately.
+    ///
+    /// **Gated by allocation rather than by the answer, because the answer does
+    /// not change.** Gathering the same canvas sixty-four times returns exactly
+    /// what gathering it once returns, so an assertion on the verdict cannot see
+    /// the difference; what it costs is the target list spilling past its inline
+    /// capacity onto the heap. A test named for deduplication that only checked
+    /// the verdict would be pinning nothing.
+    #[test]
+    fn repeated_canvas_targets_are_gathered_once() {
+        let mut ops: Vec<FrameOp> = (0..64).map(|_| canvas_batch(2)).collect();
+        ops.push(gl_batch_touching(&[1]));
+        assert!(packet_safe_to_reorder(&ops));
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "render_thread: reorder admission over one repeated canvas",
+                warmup: WARMUP,
+                measured: MEASURED,
+            },
+            |_| packet_safe_to_reorder(&ops),
+        );
+    }
+
+    /// Past the inline capacity the target list spills to the heap. That costs
+    /// an allocation on a scene nobody has yet produced, and the answer must
+    /// still be right — a spill that lost targets would admit a reorder across
+    /// a shared canvas.
+    #[test]
+    fn more_distinct_canvases_than_the_inline_capacity_stay_correct() {
+        let distinct: Vec<u32> = (100..180).collect();
+        let mut ops: Vec<FrameOp> = distinct.iter().map(|id| canvas_batch(*id)).collect();
+        ops.push(gl_batch_touching(&[1]));
+        assert!(
+            packet_safe_to_reorder(&ops),
+            "a spilled target list dropped canvases and found a collision that is not there"
+        );
+
+        ops.push(gl_batch_touching(&[179]));
+        assert!(
+            !packet_safe_to_reorder(&ops),
+            "a spilled target list lost the canvas the GL half collides with"
+        );
+    }
 
     #[test]
     fn unexpected_surface_loss_reports_once_but_expected_detach_never_reports() {
@@ -941,7 +1319,7 @@ mod tests {
             .push(FrameOp::BeginFrame)
             .push(FrameOp::CanvasBatch(CanvasBatchPayload {
                 canvas_id: 1,
-                commands: vec![Canvas2DCmd::Save],
+                commands: vec![Canvas2DCmd::Save].into(),
                 present: true,
                 dirty_rect: None,
             }))
@@ -975,7 +1353,7 @@ mod tests {
             .push(FrameOp::BeginFrame)
             .push(FrameOp::CanvasBatch(CanvasBatchPayload {
                 canvas_id: 1,
-                commands: vec![Canvas2DCmd::Save],
+                commands: vec![Canvas2DCmd::Save].into(),
                 present: true,
                 dirty_rect: Some(DirtyRect {
                     x: 0.0,
@@ -1022,7 +1400,7 @@ mod tests {
             .push(FrameOp::BeginFrame)
             .push(FrameOp::CanvasBatch(CanvasBatchPayload {
                 canvas_id: 1,
-                commands: vec![Canvas2DCmd::Save],
+                commands: vec![Canvas2DCmd::Save].into(),
                 present: true,
                 dirty_rect: None,
             }))
@@ -1050,7 +1428,7 @@ mod tests {
             .push(FrameOp::BeginFrame)
             .push(FrameOp::GlBatch(
                 shared::protocol::render_cmd::GlBatchPayload {
-                    commands: Vec::new(),
+                    commands: Vec::new().into(),
                 },
             ))
             .finish();
@@ -1174,14 +1552,14 @@ mod tests {
             .push(FrameOp::BeginFrame)
             .push(FrameOp::CanvasBatch(CanvasBatchPayload {
                 canvas_id: 1,
-                commands: vec![Canvas2DCmd::Save],
+                commands: vec![Canvas2DCmd::Save].into(),
                 present: true,
                 dirty_rect: None,
             }))
             .push(FrameOp::Materialize { canvas_id: 1 })
             .push(FrameOp::GlBatch(
                 shared::protocol::render_cmd::GlBatchPayload {
-                    commands: Vec::new(),
+                    commands: Vec::new().into(),
                 },
             ))
             .push(FrameOp::Present)
@@ -1203,19 +1581,19 @@ mod tests {
             .push(FrameOp::BeginFrame)
             .push(FrameOp::CanvasBatch(CanvasBatchPayload {
                 canvas_id: 1,
-                commands: vec![Canvas2DCmd::Save],
+                commands: vec![Canvas2DCmd::Save].into(),
                 present: false,
                 dirty_rect: None,
             }))
             .push(FrameOp::Materialize { canvas_id: 1 })
             .push(FrameOp::GlBatch(
                 shared::protocol::render_cmd::GlBatchPayload {
-                    commands: Vec::new(),
+                    commands: Vec::new().into(),
                 },
             ))
             .push(FrameOp::CanvasBatch(CanvasBatchPayload {
                 canvas_id: 1,
-                commands: vec![Canvas2DCmd::Restore],
+                commands: vec![Canvas2DCmd::Restore].into(),
                 present: true,
                 dirty_rect: None,
             }))

@@ -8,9 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use shared::command_vec_pool::{
-    recycle_gl_command_vec, take_canvas_command_vec, take_gl_command_vec,
-};
+use shared::command_vec_pool::{PooledVec, take_canvas_command_vec, take_gl_command_vec};
 use shared::protocol::frame_packet::FrameOp;
 use shared::protocol::render_cmd::{
     Canvas2DCmd, CanvasBatchPayload, DirtyRect, GLCmd, GlBatchPayload,
@@ -20,7 +18,7 @@ use shared::protocol::render_cmd::{
 
 pub(crate) struct Canvas2DSegment {
     pub canvas_id: u32,
-    pub commands: Vec<Canvas2DCmd>,
+    pub commands: PooledVec<Canvas2DCmd>,
     pub dirty_rect: Option<DirtyRect>,
     /// Once true, dirty_rect is permanently None for this segment.
     /// Set when a command with unknowable bounds is encountered (text,
@@ -122,7 +120,7 @@ impl Canvas2DSegment {
 }
 
 pub(crate) struct GlSegment {
-    pub commands: Vec<GLCmd>,
+    pub commands: PooledVec<GLCmd>,
 }
 
 pub(crate) enum FrameSegment {
@@ -343,32 +341,39 @@ impl UnifiedFrameCollector {
     /// Bulk-append a decoded GL command batch from the stream submit path.
     ///
     /// Design §7 contract:
-    /// - Empty `commands`: recycle the vec and return immediately (no segment, no stats).
-    /// - Non-empty + current segment is GL: `Vec::append` then recycle the now-empty
-    ///   input vec back to the pool.
+    /// - Empty `commands`: return immediately (no segment, no stats).
+    /// - Non-empty + current segment is GL: `Vec::append` into it, which empties
+    ///   the input.
     /// - Non-empty + current segment is not GL: move the input vec directly into a new
     ///   GL segment (same as `push_gl` creates a `GlSegment`).
+    ///
+    /// Two of those three paths finish holding an emptied loan, and returning it
+    /// to the pool used to be an explicit call on each — which is exactly the
+    /// obligation that turned out to be unguardable: deleting either call failed
+    /// no test in the binary, because a lost loan is a deallocation and the
+    /// allocation gates cannot see one. The parameter is a
+    /// [`PooledVec`], so the return is drop glue on every path, including the
+    /// early one, and there is nothing left to forget.
     /// - Update `pending_bytes` ONCE via `saturating_add(approx_bytes)`.
     /// - Update the logical-frame high-water mark exactly once.
     /// - Check the 4 MiB soft budget ONCE; returns `true` when the budget is exceeded
     ///   so the caller can invoke `maybe_auto_flush` (which re-borrows `OpState`).
     pub(crate) fn append_gl_batch(
         &mut self,
-        mut commands: Vec<GLCmd>,
+        mut commands: PooledVec<GLCmd>,
         approx_bytes: usize,
     ) -> bool {
         if commands.is_empty() {
-            // Nothing to do — recycle the empty vec and bail without touching stats.
-            recycle_gl_command_vec(commands);
+            // Nothing to do — bail without touching stats. The loan returns
+            // itself on the way out.
             return false;
         }
 
         if self.current == CurrentKind::GL {
-            // Extend the current GL segment in place.
+            // Extend the current GL segment in place, leaving `commands` empty
+            // to return its allocation when it goes out of scope.
             if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
                 seg.commands.append(&mut commands);
-                // commands is now empty; return to pool.
-                recycle_gl_command_vec(commands);
             }
         } else {
             // Start a new GL segment by moving the vec directly in.
@@ -790,7 +795,7 @@ mod tests {
         let stats = Arc::new(shared::stats::DebugStats::default());
         let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
 
-        collector.append_gl_batch(vec![clear_command()], 4_096);
+        collector.append_gl_batch(vec![clear_command()].into(), 4_096);
 
         assert_eq!(
             stats.collector_pending_bytes.load(Ordering::Relaxed),
@@ -803,12 +808,12 @@ mod tests {
     fn barrier_preserves_the_logical_frame_peak() {
         let stats = Arc::new(shared::stats::DebugStats::default());
         let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
-        collector.append_gl_batch(vec![clear_command()], 4_096);
+        collector.append_gl_batch(vec![clear_command()].into(), 4_096);
 
         assert!(collector.flush_as_barrier().is_some());
         assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 0);
 
-        collector.append_gl_batch(vec![clear_command()], 1_024);
+        collector.append_gl_batch(vec![clear_command()].into(), 1_024);
         assert!(collector.build_frame_packet(true).is_some());
         assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 4_096);
     }
@@ -818,11 +823,11 @@ mod tests {
         let stats = Arc::new(shared::stats::DebugStats::default());
         let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
 
-        collector.append_gl_batch(vec![clear_command()], 8_192);
+        collector.append_gl_batch(vec![clear_command()].into(), 8_192);
         assert!(collector.build_frame_packet(true).is_some());
         assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 8_192);
 
-        collector.append_gl_batch(vec![clear_command()], 512);
+        collector.append_gl_batch(vec![clear_command()].into(), 512);
         assert!(collector.build_frame_packet(true).is_some());
         assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 512);
 
@@ -835,7 +840,7 @@ mod tests {
         let stats = Arc::new(shared::stats::DebugStats::default());
         let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
 
-        collector.append_gl_batch(vec![clear_command()], usize::MAX);
+        collector.append_gl_batch(vec![clear_command()].into(), usize::MAX);
         assert!(collector.build_frame_packet(true).is_some());
         assert_eq!(
             stats.collector_pending_bytes.load(Ordering::Relaxed),
@@ -850,8 +855,8 @@ mod tests {
         let mut a = UnifiedFrameCollector::with_diagnostics(stats_a.clone());
         let mut b = UnifiedFrameCollector::with_diagnostics(stats_b.clone());
 
-        a.append_gl_batch(vec![clear_command()], 1_111);
-        b.append_gl_batch(vec![clear_command()], 2_222);
+        a.append_gl_batch(vec![clear_command()].into(), 1_111);
+        b.append_gl_batch(vec![clear_command()].into(), 2_222);
         assert!(a.build_frame_packet(true).is_some());
         assert!(b.build_frame_packet(true).is_some());
 
@@ -873,11 +878,11 @@ mod tests {
         shared::stats::unregister_stats(host_id);
         let mut collector = UnifiedFrameCollector::with_host_id(host_id);
 
-        collector.append_gl_batch(vec![clear_command()], 111);
+        collector.append_gl_batch(vec![clear_command()].into(), 111);
         assert!(collector.build_frame_packet(true).is_some());
 
         let stats = shared::stats::stats_for(host_id);
-        collector.append_gl_batch(vec![clear_command()], 333);
+        collector.append_gl_batch(vec![clear_command()].into(), 333);
         assert!(collector.build_frame_packet(true).is_some());
         assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 333);
         shared::stats::unregister_stats(host_id);
@@ -1248,7 +1253,7 @@ mod tests {
                 bit_field: 0x4100,
             },
         ];
-        c.append_gl_batch(cmds, 128);
+        c.append_gl_batch(cmds.into(), 128);
 
         let packet = c.build_frame_packet(false).unwrap();
         let ops = packet.ops();
@@ -1276,7 +1281,7 @@ mod tests {
                 bit_field: 0x4200,
             },
         ];
-        c.append_gl_batch(cmds, 64);
+        c.append_gl_batch(cmds.into(), 64);
 
         let packet = c.build_frame_packet(false).unwrap();
         let ops = packet.ops();
@@ -1319,7 +1324,8 @@ mod tests {
             vec![GLCmd::Clear {
                 canvas_id: 1,
                 bit_field: 0,
-            }],
+            }]
+            .into(),
             777,
         );
         assert_eq!(c.approx_pending_bytes(), 777);
@@ -1328,7 +1334,8 @@ mod tests {
             vec![GLCmd::Clear {
                 canvas_id: 1,
                 bit_field: 0,
-            }],
+            }]
+            .into(),
             333,
         );
         assert_eq!(c.approx_pending_bytes(), 1110);
@@ -1343,7 +1350,8 @@ mod tests {
             vec![GLCmd::Clear {
                 canvas_id: 1,
                 bit_field: 0,
-            }],
+            }]
+            .into(),
             AUTO_FLUSH_SOFT_BUDGET_BYTES + 1,
         );
         assert!(c.should_auto_flush());
@@ -1352,7 +1360,7 @@ mod tests {
     #[test]
     fn append_gl_batch_empty_creates_no_segment_and_does_not_publish_bytes() {
         let mut c = UnifiedFrameCollector::new();
-        c.append_gl_batch(vec![], 999);
+        c.append_gl_batch(Vec::new().into(), 999);
         // No segment created
         assert!(c.build_frame_packet(false).is_none());
         // pending_bytes stays at 0
@@ -1923,27 +1931,14 @@ mod steady_state_allocation {
 
     /// Hand the accumulated commands back the way the render thread does, so a
     /// gate does not leave the shared pool poorer than it found it.
+    ///
+    /// Dropping the packet is the whole of it now: every vector it carries is a
+    /// loan, and so is the op vector holding them. The earlier version of this
+    /// helper walked the ops, emptied each command vector and called the pool by
+    /// hand — which is precisely the shape that made a forgotten return
+    /// invisible in production code.
     fn end_frame(collector: &mut UnifiedFrameCollector) {
-        let Some(packet) = collector.build_frame_packet(true) else {
-            return;
-        };
-        for op in packet.into_ops() {
-            match op {
-                FrameOp::GlBatch(payload) => {
-                    // `recycle` refuses a non-empty vector, and the render thread
-                    // empties it by draining as it executes.
-                    let mut commands = payload.commands;
-                    commands.clear();
-                    recycle_gl_command_vec(commands);
-                }
-                FrameOp::CanvasBatch(payload) => {
-                    let mut commands = payload.commands;
-                    commands.clear();
-                    shared::command_vec_pool::recycle_canvas_command_vec(commands);
-                }
-                _ => {}
-            }
-        }
+        drop(collector.build_frame_packet(true));
     }
 
     /// Section 7.3, on the per-event unit of the render command path: one `gl.*`
@@ -2037,9 +2032,9 @@ mod steady_state_allocation {
 
         // One vector per iteration, each already holding its batch's capacity, so
         // the body neither allocates nor grows.
-        let mut reservoir: Vec<Vec<GLCmd>> = Vec::with_capacity(WARMUP + MEASURED);
+        let mut reservoir: Vec<PooledVec<GLCmd>> = Vec::with_capacity(WARMUP + MEASURED);
         for _ in 0..WARMUP + MEASURED {
-            reservoir.push(Vec::with_capacity(BATCH));
+            reservoir.push(PooledVec::from(Vec::with_capacity(BATCH)));
         }
 
         assert_no_steady_state_allocation(

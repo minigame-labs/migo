@@ -161,7 +161,9 @@ mod tests {
         })
     }
 
-    fn recv_gl_commands(render_rx: &crossbeam_channel::Receiver<RenderCommand>) -> Vec<GLCmd> {
+    fn recv_gl_commands(
+        render_rx: &crossbeam_channel::Receiver<RenderCommand>,
+    ) -> shared::command_vec_pool::PooledVec<GLCmd> {
         loop {
             match render_rx
                 .recv_timeout(Duration::from_secs(1))
@@ -2050,7 +2052,7 @@ mod tests {
     /// Returns the ops inside the packet.
     fn recv_one_frame_packet(
         render_rx: &crossbeam_channel::Receiver<RenderCommand>,
-    ) -> Vec<FrameOp> {
+    ) -> shared::command_vec_pool::PooledVec<FrameOp> {
         let timeout = std::time::Duration::from_secs(2);
         loop {
             match render_rx
@@ -2067,7 +2069,7 @@ mod tests {
         render_rx: crossbeam_channel::Receiver<RenderCommand>,
     ) -> (
         std::thread::JoinHandle<()>,
-        std::sync::mpsc::Receiver<Vec<FrameOp>>,
+        std::sync::mpsc::Receiver<shared::command_vec_pool::PooledVec<FrameOp>>,
     ) {
         use shared::protocol::render_cmd::CanvasCmd;
 
@@ -2419,7 +2421,8 @@ mod tests {
         // Spawn a helper thread that responds to Canvas GetInfo requests
         // (required by the Canvas constructor called inside createCanvas())
         // and forwards the first FramePacket back through a standard channel.
-        let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<Vec<FrameOp>>(1);
+        let (packet_tx, packet_rx) =
+            std::sync::mpsc::sync_channel::<shared::command_vec_pool::PooledVec<FrameOp>>(1);
         let handle = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {

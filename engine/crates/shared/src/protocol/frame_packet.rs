@@ -1,3 +1,4 @@
+use crate::command_vec_pool::PooledVec;
 use crate::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, DirtyRect, GlBatchPayload};
 
 #[derive(Debug)]
@@ -17,21 +18,29 @@ pub enum FrameOp {
 pub struct FramePacket {
     frame_id: u64,
     raf_time_ms: f64,
-    ops: Vec<FrameOp>,
+    ops: PooledVec<FrameOp>,
 }
 
 pub struct FramePacketBuilder {
     frame_id: u64,
     raf_time_ms: f64,
-    ops: Vec<FrameOp>,
+    ops: PooledVec<FrameOp>,
 }
 
 impl FramePacketBuilder {
+    /// The op vector comes from the pool rather than from `Vec::new`.
+    ///
+    /// It used to start empty and grow: one allocation plus its doublings on
+    /// every frame the engine renders, for the life of the process, on the
+    /// thread running the game. It is the same cross-thread hand-off the command
+    /// vectors inside it already make — built here, consumed on the render
+    /// thread — so it uses the same recycler, and the loan returns itself when
+    /// the render thread finishes with the packet.
     pub fn new(frame_id: u64, raf_time_ms: f64) -> Self {
         Self {
             frame_id,
             raf_time_ms,
-            ops: Vec::new(),
+            ops: PooledVec::take(),
         }
     }
 
@@ -54,7 +63,7 @@ impl FramePacket {
         frame_id: u64,
         raf_time_ms: f64,
         canvas_id: u32,
-        commands: Vec<Canvas2DCmd>,
+        commands: PooledVec<Canvas2DCmd>,
         present: bool,
         dirty_rect: Option<DirtyRect>,
     ) -> Self {
@@ -85,7 +94,9 @@ impl FramePacket {
         &self.ops
     }
 
-    pub fn into_ops(self) -> Vec<FrameOp> {
+    /// Hands over the ops *and the loan that holds them*, so a consumer that
+    /// simply lets the result go out of scope returns the allocation.
+    pub fn into_ops(self) -> PooledVec<FrameOp> {
         self.ops
     }
 
@@ -97,7 +108,7 @@ impl FramePacket {
     pub fn for_gl_batch(
         frame_id: u64,
         raf_time_ms: f64,
-        commands: Vec<super::render_cmd::GLCmd>,
+        commands: PooledVec<super::render_cmd::GLCmd>,
     ) -> Self {
         FramePacketBuilder::new(frame_id, raf_time_ms)
             .push(FrameOp::BeginFrame)
@@ -146,7 +157,7 @@ mod tests {
     #[test]
     fn canvas_batch_helper_builds_non_presenting_packet() {
         let packet =
-            FramePacket::for_canvas_batch(7, 12.5, 1, vec![Canvas2DCmd::Save], false, None);
+            FramePacket::for_canvas_batch(7, 12.5, 1, vec![Canvas2DCmd::Save].into(), false, None);
 
         assert_eq!(packet.frame_id(), 7);
         assert!(matches!(packet.ops()[0], FrameOp::BeginFrame));
@@ -163,7 +174,7 @@ mod tests {
             3,
             16.6,
             1,
-            vec![Canvas2DCmd::Save],
+            vec![Canvas2DCmd::Save].into(),
             true,
             Some(DirtyRect {
                 x: 0.0,
@@ -184,7 +195,7 @@ mod tests {
                 canvas_id: 3,
                 present: false,
                 dirty_rect: None,
-                commands: vec![Canvas2DCmd::Save],
+                commands: vec![Canvas2DCmd::Save].into(),
             }))
             .push(FrameOp::Present)
             .finish();
@@ -219,7 +230,7 @@ mod tests {
                     width: 32.0,
                     height: 32.0,
                 }),
-                commands: vec![Canvas2DCmd::Save],
+                commands: vec![Canvas2DCmd::Save].into(),
             }))
             .push(FrameOp::Present)
             .finish();
@@ -240,7 +251,7 @@ mod tests {
         let packet = FramePacketBuilder::new(9, 20.0)
             .push(FrameOp::BeginFrame)
             .push(FrameOp::GlBatch(GlBatchPayload {
-                commands: Vec::new(),
+                commands: Vec::new().into(),
             }))
             .push(FrameOp::Present)
             .finish();
@@ -263,7 +274,8 @@ mod tests {
             vec![GLCmd::Clear {
                 canvas_id: 1,
                 bit_field: 0x4000,
-            }],
+            }]
+            .into(),
         );
 
         assert_eq!(packet.ops().len(), 2);
@@ -278,14 +290,14 @@ mod tests {
 
     #[test]
     fn for_gl_batch_uses_sentinel_metadata() {
-        let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new());
+        let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new().into());
         assert_eq!(packet.frame_id(), 0);
         assert_eq!(packet.raf_time_ms(), 0.0);
     }
 
     #[test]
     fn gl_packet_gets_stamped_by_set_frame_metadata() {
-        let mut packet = FramePacket::for_gl_batch(0, 0.0, Vec::new());
+        let mut packet = FramePacket::for_gl_batch(0, 0.0, Vec::new().into());
         packet.set_frame_metadata(42, 16.666);
         assert_eq!(packet.frame_id(), 42);
         assert!((packet.raf_time_ms() - 16.666).abs() < f64::EPSILON);
