@@ -59,9 +59,29 @@ jobs:
         # sat wrong on ILP32 for two appended fields before anyone compiled it.
         # `MIGO_ABI_REQUIRE_ILP32=1` turns a skip into a failure, so an install
         # that regresses is loud instead of invisible.
+        # A stalled Ubuntu mirror once spent 988s on the install alone and the
+        # job hit its 20-minute ceiling several steps later, which reads as
+        # "the contract hung" rather than "apt hung". So probe for what the
+        # lane actually needs -- a compiler that can target -m32 -- and only
+        # reach for the network when it is missing, with every attempt bounded
+        # so a slow mirror fails quickly instead of eating the whole budget.
+        # A probe that guesses wrong cannot hide anything: the required-ILP32
+        # invocations below turn a skipped lane into a failure either way.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-multilib
+          can_target_m32() {
+            printf 'int main(void){return 0;}' \
+              | "$1" -m32 -ffreestanding -std=c11 -c -x c - -o /dev/null 2>/dev/null
+          }
+          install_multilib() {
+            timeout 90 sudo apt-get update -qq || return 1
+            timeout 150 sudo apt-get install -y -qq gcc-multilib || return 1
+          }
+          if ! can_target_m32 gcc || ! can_target_m32 clang; then
+            install_multilib || {
+              echo "multilib install stalled or failed; retrying once" >&2
+              install_multilib
+            }
+          fi
           MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
           CC=clang CXX=clang++ MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
 
