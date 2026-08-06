@@ -15,7 +15,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::debug;
 
 use crate::decoder::mp3::{
-    Mp3FrameDecoder, Mp3Step, STREAM_LOOKAHEAD_BYTES, append_as_f32, first_frame_length,
+    Mp3FrameDecoder, Mp3Step, STREAM_LOOKAHEAD_BYTES, append_as_f32, first_frame_at_front,
 };
 use crate::off_worker::OffWorker;
 
@@ -572,9 +572,16 @@ impl Mp3StreamDecoder {
 
         while !self.buffer.is_empty() {
             let probe = probe.get_or_insert_with(Mp3FrameDecoder::new);
-            let Some(length) = first_frame_length(probe, &self.buffer, previous_length) else {
+            let Some((skip, length)) = first_frame_at_front(probe, &self.buffer, previous_length)
+            else {
                 break;
             };
+            // Whatever sits in front of the frame goes first: the rule that lets a
+            // lone frame through wants it at offset zero.
+            if skip > 0 {
+                self.buffer.drain(..skip);
+                continue;
+            }
             previous_length = Some(length);
 
             match self.decode_step(0, length, out) {

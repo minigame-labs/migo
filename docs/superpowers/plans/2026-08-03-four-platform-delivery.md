@@ -1807,6 +1807,8 @@ review. A commit alone is not completion evidence.
     non-audio-bytes test alone. This is the ordering argument as a mutant.
   - Making the probe measure by decoding rather than through minimp3's
     null-output path: the non-audio-bytes test alone.
+  - Offering the whole-file decode the whole remainder again: its own
+    tags-around-the-frames test alone.
 
   Re-run in full after the `Skipped` fix, since that changed what `decode` means
   by a byte it did not use. One result moved and moved for the better: removing
@@ -1870,18 +1872,48 @@ review. A commit alone is not completion evidence.
   cannot do, getting past leading non-audio larger than a frame, and runs only
   when isolation could not move at all.
 
-  Measured across 28 combinations of stream length (1 to 96 frames, spanning both
-  sides of the lookahead) and tag placement (none, trailing, leading, both), 27
-  are now exact. The one that is not is a **single-frame** stream behind a leading
-  tag larger than a frame: isolation cannot reach past the tag and the fallback
-  cannot chain a lone frame to anything. That is 26 ms of audio behind a 4 KiB
-  tag, and it is recorded rather than fixed.
+  A fourth piece closed the last gap: **the probe searches from the next sync
+  candidate when nothing is isolable at the front.** A leading tag larger than a
+  frame — an ID3v2 tag routinely is — hides the audio from a front-anchored probe
+  as well as from the in-place path, and ID3v2 at the front paired with ID3v1 at
+  the end is the classic layout. Eleven set bits is the sync word, so candidates
+  are cheap to find; minimp3 still decides, and the search is capped at 32 false
+  starts so a pathological file cannot cost a rescan per byte.
 
-  Two earlier attempts are worth recording because they were both plausible and
-  both wrong. Decoding eagerly until the first frame lands recovered the short
-  case only partly (1 frame of 6) while costing a frame on streams that had been
-  exact (23 of 24) — reverted. Isolating *after* the in-place pass fixed one- and
-  two-frame streams and nothing else, for the ordering reason above.
+  Measured across 24 combinations of stream length (1 to 96 frames, spanning both
+  sides of the lookahead) and tag placement (none, trailing, leading, both):
+  **all 24 exact.**
+
+  **The same defect was in the whole-file decode, it was worse there, and it was
+  not mine.** `decoder::mp3::decode` is the path every locally loaded or fully
+  downloaded MP3 takes — far more travelled than streaming — and it offered
+  minimp3 the whole remainder, so the same chain-check failure applied. Measured
+  against the previous implementation, cell for cell **identical**: the last frame
+  of a long tagged file lost, and *every* frame of a short one, which made
+  `decode` report that it had produced no samples. A tagged two-second sound
+  effect did not play slightly short — it failed to load.
+
+  It is fixed by handing that decoder one frame at a time as well, uniformly
+  rather than only near the end, which is both simpler and strictly better: a lone
+  frame is what minimp3 accepts without a successor, and it is also its
+  state-preserving fast path, so the reservoir survives every step instead of only
+  the ones a lookahead happened to cover. **All 20 combinations exact**, against 15
+  of 20 before.
+
+  The extra call per frame measures the frame and returns before any decoding
+  work, and it costs nothing measurable: 2000 frames — about 52 seconds of audio —
+  decode in **18.77 ms isolated against 18.80 ms whole-remainder**, release build,
+  twenty runs each.
+
+  Three earlier attempts are worth recording because each was plausible and each
+  was wrong. Decoding eagerly until the first frame lands recovered the short case
+  only partly (1 frame of 6) while costing a frame on streams that had been exact
+  (23 of 24) — reverted. Isolating *after* the in-place pass fixed one- and
+  two-frame streams and nothing else, for the ordering reason above. Keeping the
+  whole-file decode's bulk phase and isolating only its tail left a short file
+  with tags at both ends at zero, because the bulk phase's "skip everything but
+  the last frame's worth" rule — which is right for a stream that may still grow —
+  discards real audio in a file that is already complete.
 
   The committed test asserts every combination **exact**, deliberately not "at
   most one frame lost": a rule that tolerates one lost frame tolerates the

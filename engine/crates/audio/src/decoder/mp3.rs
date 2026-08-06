@@ -204,6 +204,48 @@ impl Mp3FrameDecoder {
     }
 }
 
+/// How many false starts to tolerate while looking for where the audio begins.
+///
+/// A tag holds no sync words at all in the ordinary case, so a handful is
+/// generous. The bound is what keeps a pathological file from costing a rescan
+/// of the remainder per byte.
+const MAX_SYNC_CANDIDATES: usize = 32;
+
+/// Offset of the next byte pair that could begin a frame header.
+///
+/// Eleven set bits is the sync word; anything else cannot start a frame. This is
+/// a candidate and not a verdict — [`first_frame_at_front`] decides by asking
+/// minimp3.
+fn next_sync_candidate(buffer: &[u8], from: usize) -> Option<usize> {
+    (from..buffer.len().saturating_sub(1))
+        .find(|&index| buffer[index] == 0xFF && (buffer[index + 1] & 0xE0) == 0xE0)
+}
+
+/// Where the next whole frame starts in `buffer`, and how long it is.
+///
+/// Returns `(bytes before the frame, frame length)`. The caller must get past the
+/// first before handing the second to its real decoder: minimp3's
+/// accept-a-lone-frame rule requires the frame to start at offset zero.
+///
+/// Searching from a later offset is what gets past a leading tag bigger than a
+/// frame — an ID3v2 tag at the front and an ID3v1 tag at the end is the classic
+/// pairing, and together they hid the audio from both the in-place path and a
+/// front-anchored probe.
+pub(crate) fn first_frame_at_front(
+    probe: &mut Mp3FrameDecoder,
+    buffer: &[u8],
+    hint: Option<usize>,
+) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for _ in 0..=MAX_SYNC_CANDIDATES {
+        if let Some(length) = first_frame_length(probe, &buffer[offset..], hint) {
+            return Some((offset, length));
+        }
+        offset = next_sync_candidate(buffer, offset + 1)?;
+    }
+    None
+}
+
 /// Length of the frame at the front of `buffer`, if one is there in full.
 ///
 /// **Why this exists.** minimp3 will not accept a frame it cannot chain to a
@@ -247,8 +289,28 @@ pub(crate) fn append_as_f32(pcm: &[i16], out: &mut Vec<f32>) {
     out.extend(pcm.iter().map(|&sample| f32::from(sample) / 32768.0));
 }
 
+/// Decode a whole MP3 file.
+///
+/// **The decoder is handed exactly one frame at a time, and that is what makes a
+/// file's frames survive its tags.** minimp3 will not accept a frame it cannot
+/// chain to a successor, and what follows a file's final frame is not audio — an
+/// ID3v1 tag is 128 bytes at the end of a large fraction of real files, usually
+/// paired with an ID3v2 tag at the front. Offering the whole remainder lost the
+/// last frame of a tagged file and lost *every* frame of a short one: a
+/// two-second sound effect with an ID3v1 tag decoded to nothing at all, and
+/// `decode` reported that it had produced no samples. Measured against the
+/// previous implementation, which behaved identically in every case — this is a
+/// defect being fixed, not one being introduced.
+///
+/// A lone frame is the one thing minimp3 accepts without a successor to confirm
+/// it, and handing it one also keeps it on its state-preserving fast path, so the
+/// bit reservoir a frame's main data may live in survives every step. The cost is
+/// one extra call per frame to measure the frame's length, which returns before
+/// any decoding work; see [`first_frame_at_front`].
 pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let mut frames = Mp3FrameDecoder::new();
+    let mut probe: Option<Mp3FrameDecoder> = None;
+    let mut previous_length: Option<usize> = None;
 
     let mut samples: Vec<f32> = Vec::new();
     let mut sample_rate = 0u32;
@@ -256,7 +318,25 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let mut pos = 0usize;
 
     while pos < data.len() {
-        match frames.decode(&data[pos..]) {
+        let remaining = &data[pos..];
+        let probe = probe.get_or_insert_with(Mp3FrameDecoder::new);
+        let take = match first_frame_at_front(probe, remaining, previous_length) {
+            // Get past whatever sits in front of the frame first: the rule that
+            // lets a lone frame through wants it at offset zero.
+            Some((skip, _)) if skip > 0 => {
+                pos += skip;
+                continue;
+            }
+            Some((_, length)) => {
+                previous_length = Some(length);
+                length
+            }
+            // No whole frame ahead. Offering everything is the last thing to try
+            // before giving up on the remainder.
+            None => remaining.len(),
+        };
+
+        match frames.decode(&remaining[..take]) {
             Mp3Step::NeedMoreData => break,
             Mp3Step::Skipped(skipped) => pos += skipped,
             Mp3Step::Frame {
@@ -304,6 +384,51 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
 mod tests {
     use super::*;
     use crate::mp3_fixture;
+
+    /// A whole file's frames must survive the tags wrapped around them.
+    ///
+    /// ID3v2 at the front and ID3v1 at the end is the classic pairing, and both
+    /// defeat minimp3's requirement that a frame be chainable to a successor.
+    /// Before the decoder was handed one frame at a time this lost the last frame
+    /// of a long file and *every* frame of a short one — `decode` then reported
+    /// that it had produced no samples, so a tagged sound effect failed to load
+    /// rather than playing slightly short.
+    ///
+    /// One frame is included on purpose: a file with exactly one frame has no
+    /// successor to offer under any circumstances, so it is the case the
+    /// accept-a-lone-frame rule exists for.
+    #[test]
+    fn a_files_frames_survive_the_tags_around_them() {
+        let id3v1 = {
+            let mut tag = b"TAG".to_vec();
+            tag.resize(128, 0);
+            tag
+        };
+        // Larger than any frame, so it cannot be got past by probing from the
+        // front and the sync search is what has to carry it.
+        let id3v2 = vec![0u8; 4096];
+
+        for frames in [1usize, 2, 6, 40] {
+            for (label, leading, trailing) in [
+                ("no tags", [].as_slice(), [].as_slice()),
+                ("a trailing tag", [].as_slice(), id3v1.as_slice()),
+                ("a leading tag", id3v2.as_slice(), [].as_slice()),
+                ("tags at both ends", id3v2.as_slice(), id3v1.as_slice()),
+            ] {
+                let mut data = leading.to_vec();
+                data.extend_from_slice(&mp3_fixture::stream(frames));
+                data.extend_from_slice(trailing);
+
+                let decoded = decode(&data)
+                    .unwrap_or_else(|error| panic!("{frames} frames with {label}: {error}"));
+                assert_eq!(
+                    decoded.samples.len() / mp3_fixture::SAMPLES_PER_FRAME,
+                    frames,
+                    "a {frames}-frame file with {label} must decode every frame"
+                );
+            }
+        }
+    }
 
     /// The fixture has to be a real MP3 before anything built on it means
     /// something, so this is the control: a stream of frames decodes to exactly
