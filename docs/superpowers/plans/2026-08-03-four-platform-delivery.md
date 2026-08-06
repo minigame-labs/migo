@@ -1499,8 +1499,43 @@ review. A commit alone is not completion evidence.
   target would have left it existing but never executed in the session's own
   verification.
 
+  **★It broke `scripts/test-local-verification-contract.sh`, and I did not find
+  that — CI did.** The contract recovers the crate list this script tests by
+  grepping it for `cargo test -p migo-...`, and the routing above moved the word
+  `cargo` out of the step strings, so the grep matched nothing. The claim
+  recorded here first — "verified, 15 of 15 PASS" — was made without running the
+  one contract that guards the file being changed, which is the same shape as
+  every other gap in this ledger: the evidence covered what was easy to reach.
+  Every quality-gate contract now runs before that sentence is written; 23 of 24
+  pass locally and the Qt kit needs Qt.
+
+  **Two defects, not one, and the second is why the first was hard to read.**
+  That grep had no `|| true`, so under `set -euo pipefail` the empty match killed
+  the contract *at the assignment* — before reaching the `fail "cannot find the
+  crates scripts/verify-change.sh tests"` written directly underneath it for
+  exactly this case. CI reported a bare exit 1 after the last passing assertion
+  and said nothing else. The block immediately below it carries a comment
+  explaining this precise hazard and applies `|| true` to itself; the fix had not
+  been applied one block earlier. **The N-th instance of a guard covering only
+  the face it was written for.**
+
+  Fixed on both sides. `verify-change.sh --list-host-crates` reports the list
+  from the one array that defines it, and the contract asks the script instead of
+  guessing at its source — the §9 rule that a gate referencing an external
+  identifier must resolve it from the authority or assert it still exists. Both
+  extractions in that block are now non-fatal, so an empty one is reported rather
+  than fatal-and-silent.
+
+  **Mutation evidence.** Making the listing report nothing now fails with
+  `[FAIL] scripts/verify-change.sh --list-host-crates reported nothing` — where
+  before the same condition produced a silent exit 1. Adding a crate to the host
+  steps that CI does not test fails at `pr-ci.yml runs migo-nonexistent's tests
+  too`. Removing a crate from pr-ci's clippy list fails at
+  `pr-ci.yml lints migo-graphics too`.
+
   **Verified** by the run this enabled: 15 of 15 PASS, ending
-  `verified for every target this change touches`.
+  `verified for every target this change touches`, plus all 23 runnable
+  quality-gate contracts.
 
 - [x] 0.42 Stop the derived-cache prune test depending on the host's wall clock.
   Found by `scripts/verify-change.sh` failing on a crate this branch had not

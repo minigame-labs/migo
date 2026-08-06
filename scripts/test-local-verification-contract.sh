@@ -317,12 +317,24 @@ fi
 # The gap this closes is the one that made the entry point necessary: two lists of
 # crates in two files, one of them missing four crates, and nothing comparing them.
 # ------------------------------------------------------------
-local_crates="$(grep -oE 'cargo test -p migo-[a-z0-9-]+' "$ROOT/scripts/verify-change.sh" \
-    | grep -oE 'migo-[a-z0-9-]+' | sort -u)"
+#
+# The local half asks the script rather than grepping it. It used to grep for
+# `cargo test -p migo-...`, which coupled this check to a spelling: the day the
+# host steps stopped carrying the word `cargo` themselves, the grep matched
+# nothing -- and with no `|| true` under `set -euo pipefail`, this file died at
+# that assignment, *before* reaching the `fail` below that exists to report
+# exactly that case. It failed with no message at all, which is the vacuous
+# failure the block underneath already warned about in its own comment and did
+# not apply here. Both extractions are now non-fatal so the empty case is
+# reportable, and the local one has one authority instead of a regular
+# expression guessing at one.
+local_crates="$(bash "$ROOT/scripts/verify-change.sh" --list-host-crates 2>/dev/null || true)"
 ci_crates="$(grep -E 'cargo test' "$ROOT/.github/workflows/pr-ci.yml" \
-    | grep -oE '\-p migo-[a-z0-9-]+' | grep -oE 'migo-[a-z0-9-]+' | sort -u)"
-if [[ -z "$local_crates" ]]; then
-    fail "cannot find the crates scripts/verify-change.sh tests"
+    | grep -oE '\-p migo-[a-z0-9-]+' | grep -oE 'migo-[a-z0-9-]+' | sort -u || true)"
+if [[ -z "$ci_crates" ]]; then
+    fail "cannot find the crates pr-ci.yml tests"
+elif [[ -z "$local_crates" ]]; then
+    fail "scripts/verify-change.sh --list-host-crates reported nothing"
 else
     while read -r crate; do
         assert_contains "$ci_crates" "$crate" "pr-ci.yml runs $crate's tests too"

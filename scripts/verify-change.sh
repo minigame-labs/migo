@@ -51,6 +51,44 @@ print_info()    { printf '\033[0;36m[verify] %s\033[0m\n' "$*"; }
 print_success() { printf '\033[0;32m[verify] %s\033[0m\n' "$*"; }
 print_error()   { printf '\033[0;31m[verify] %s\033[0m\n' "$*" >&2; }
 
+# ------------------------------------------------------------
+# The host suites, declared before anything runs so the script can report them.
+#
+# `--list-host-crates` exists because the contract needs this list and used to
+# recover it by grepping this file for `cargo test -p migo-...`. That coupled a
+# check to a spelling: the day the steps stopped carrying the word `cargo`
+# themselves, the grep matched nothing and -- under `set -e`, with no `|| true`
+# -- the contract died before it could say so. Asking the script is one
+# authority instead of a regular expression guessing at one.
+# ------------------------------------------------------------
+HOST_CARGO_STEPS=(
+    "build --workspace --all-targets"
+    # Before the suites that depend on it: a broken counting allocator would
+    # otherwise surface as an unexplained allocation gate failure downstream.
+    "test -p migo-alloc-probe"
+    "test -p migo-contention-probe"
+    "test -p migo-executor-probe"
+    "test -p migo-shared"
+    "test -p migo-io --lib"
+    "test -p migo-runtime-v8 --lib"
+    # Carries the occupancy gate on the shared audio streaming worker, so a suite
+    # that ran nowhere would leave that gate as decoration.
+    "test -p migo-audio --lib"
+    "test -p migo-graphics --lib"
+    "test -p migo-core --lib"
+    "test -p migo-capi --lib"
+    "test -p migo-platform --lib"
+    "fmt --all --check"
+)
+
+if [[ "${1:-}" == "--list-host-crates" ]]; then
+    for step in "${HOST_CARGO_STEPS[@]}"; do
+        [[ "$step" =~ -p\ (migo-[a-z0-9-]+) ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+    done | sort -u
+    exit 0
+fi
+
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --base)      shift; [[ $# -gt 0 ]] || { print_error "--base requires a ref"; exit 2; }; BASE="$1" ;;
@@ -58,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --plan-only) PLAN_ONLY=true ;;
         --abi)       shift; [[ $# -gt 0 ]] || { print_error "--abi requires a value"; exit 2; }; ABI="$1" ;;
         --abi=*)     ABI="${1#*=}" ;;
+        --list-host-crates) ;;  # handled above, before any work
         --help|-h)   sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)           print_error "unknown argument: $1"; exit 2 ;;
     esac
@@ -150,25 +189,6 @@ run_step() {
 # Host suites. Always: they are the only evidence for the portable tree, and a
 # target build does not run a single test.
 # ------------------------------------------------------------
-HOST_CARGO_STEPS=(
-    "build --workspace --all-targets"
-    # Before the suites that depend on it: a broken counting allocator would
-    # otherwise surface as an unexplained allocation gate failure downstream.
-    "test -p migo-alloc-probe"
-    "test -p migo-contention-probe"
-    "test -p migo-executor-probe"
-    "test -p migo-shared"
-    "test -p migo-io --lib"
-    "test -p migo-runtime-v8 --lib"
-    # Carries the occupancy gate on the shared audio streaming worker, so a suite
-    # that ran nowhere would leave that gate as decoration.
-    "test -p migo-audio --lib"
-    "test -p migo-graphics --lib"
-    "test -p migo-core --lib"
-    "test -p migo-capi --lib"
-    "test -p migo-platform --lib"
-    "fmt --all --check"
-)
 
 # `migo-graphics`, `migo-core`, `migo-capi` and `migo-platform` link Skia, and a
 # minimal Linux host cannot build it with a bare `cargo`: it needs the system
