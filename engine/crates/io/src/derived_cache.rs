@@ -708,14 +708,27 @@ mod tests {
         let dir = tmp("prune_budget");
         let cache_dir = derived_cache_dir(&dir);
         std::fs::create_dir_all(&cache_dir).unwrap();
-        // Write files with a short sleep between them so each entry
-        // has a strictly greater mtime than the previous. Sleep is
-        // 20 ms which is well above every filesystem's mtime
-        // resolution the runtime will ship on (ext4, f2fs, tmpfs).
+        // Stamp the modification times instead of spacing the writes apart in
+        // real time.
+        //
+        // This test asserts an LRU order, and `prune_derived_cache` derives that
+        // order from mtimes with no tie-break, so spacing the writes made the
+        // assertion depend on the host's wall clock advancing monotonically across
+        // them. It does not always: this failed once under heavy load — `f_00`,
+        // written first, survived a prune that removed three newer files — while
+        // passing twenty times in isolation. Stamping the times removes the
+        // dependency outright, so the fix does not rest on diagnosing which clock
+        // moved, and it drops 120 ms of sleeps.
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         for i in 0..6u32 {
             let path = cache_dir.join(format!("f_{i:02}.bin"));
             std::fs::write(&path, vec![0u8; 1024]).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(base + std::time::Duration::from_secs(u64::from(i))),
+            )
+            .unwrap();
         }
         let report = prune_derived_cache(&dir, 3 * 1024);
         assert!(report.bytes_kept <= 3 * 1024);

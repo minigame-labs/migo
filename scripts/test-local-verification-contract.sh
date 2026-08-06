@@ -329,6 +329,33 @@ else
     done <<< "$local_crates"
 fi
 
+# ------------------------------------------------------------
+# CI lints every crate it tests.
+#
+# The same two-lists-in-one-file drift, one step later. Clippy for graphics, core,
+# capi, platform and audio ran in no job at all while their tests ran in one --
+# nothing compared the lint list to the test list, so the omission was invisible.
+# Comparing them means a crate added to a test line without a clippy line fails
+# here rather than being linted nowhere for months.
+#
+# Split across two jobs on purpose (one installs system packages, one does not),
+# so the check is against the file, not against any single job.
+# ------------------------------------------------------------
+#
+# `|| true` because the whole point of the empty case is to report it: under
+# `set -euo pipefail` a grep that matches nothing kills the script, and a contract
+# that dies silently when its subject disappears is exactly the vacuous pass this
+# file exists to prevent.
+clippy_crates="$(grep -E 'cargo clippy' "$ROOT/.github/workflows/pr-ci.yml" \
+    | grep -oE '\-p migo-[a-z0-9-]+' | grep -oE 'migo-[a-z0-9-]+' | sort -u || true)"
+if [[ -z "$clippy_crates" ]]; then
+    fail "cannot find the crates pr-ci.yml runs clippy on"
+else
+    while read -r crate; do
+        assert_contains "$clippy_crates" "$crate" "pr-ci.yml lints $crate too"
+    done <<< "$ci_crates"
+fi
+
 if [[ "$failures" -ne 0 ]]; then
     printf '\033[0;31m%s contract check(s) failed\033[0m\n' "$failures" >&2
     exit 1

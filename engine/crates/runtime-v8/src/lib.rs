@@ -92,6 +92,16 @@
 //! runtime.run_event_loop(PollEventLoopOptions::default()).await?;
 //! ```
 
+// Section 7.3's steady-state allocation gate reads this. `#[cfg(test)]` scopes it
+// to this crate's own test binary: a `#[global_allocator]` is unique per binary, so
+// one declared unconditionally here would follow the library into every shipped
+// cdylib. Deleting it does not make the gates pass silently -- each burst proves the
+// allocator is installed before it trusts a zero count.
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: migo_alloc_probe::CountingAllocator =
+    migo_alloc_probe::CountingAllocator::system();
+
 use shared::op_state::HostOpState;
 
 // CORE modules (always compiled)

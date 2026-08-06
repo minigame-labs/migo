@@ -370,10 +370,14 @@ review. A commit alone is not completion evidence.
   or the allocating core lifted into portable code. Its Java half needs a JVM
   mechanism (`ThreadMXBean.getThreadAllocatedBytes`), because a Rust allocator
   observes nothing the JVM allocates; `platforms/android` has no such usage today.
-  Also unmeasured: the render command path, the audio path, and
-  `io::image_cache`, which uses the same parallel-pin-map shape the text cache just
-  shed and is therefore likely to carry the same per-event key clone on the image
-  path.
+
+  Still unmeasured: the render command path and the audio path. **`io::image_cache`
+  no longer belongs on that list** — the prediction recorded here was right and was
+  acted on: task 0.34 measured it (the pin/unpin pair allocated, the lookup did
+  not) and task 0.36 removed the two owned keys on the layer above it. This
+  sentence named work already done for one session, which is the failure mode a
+  hand-maintained "remaining" list has in this repository; it is corrected rather
+  than left for the next reader to redo.
 - [ ] 0.27 Build the cross-session contention gate Section 7.3 requires.
   **Mechanism built and applied to the Rust per-event paths; the permission gate's
   JVM half stays with task 5.1, so this item stays open.**
@@ -825,7 +829,8 @@ review. A commit alone is not completion evidence.
   quality-gate's 20-minute budget; it runs in parallel with the 90-minute Android
   job, so the wall clock is unchanged. It refuses the Rust cache for the same reason
   the Android job does. The stale comment is rewritten to say what is and is not
-  covered, including that clippy for those four crates still runs nowhere — task 0.33.
+  covered, including that clippy for those four crates still ran nowhere — task 0.33,
+  since closed, which put their clippy in this same job.
   `scripts/test-local-verification-contract.sh` now also asserts that every crate the
   local loop tests appears in a `pr-ci.yml` test line, so the two lists cannot drift
   apart again, which is how the four crates went missing in the first place.
@@ -864,12 +869,46 @@ review. A commit alone is not completion evidence.
   the windows half. Until then the entry point will keep reporting both as
   `NOT PROVEN`, which is the correct reading and not noise to be silenced.
 
-- [ ] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
+- [x] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
   correcting `pr-ci.yml`'s stale comment for task 0.31. The new `host-engine-tests`
   job now has the system packages those crates need, so the missing coverage is one
   step, but it is a separate claim from the tests and pinning 1.95.0 surfaced a
   pre-existing lint backlog the workspace caps to `warn` — so this needs the same
   cap and its own verification rather than a line appended to a green job.
+
+  **Run locally before being added, which is what the task asked for.** `cargo
+  clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio
+  --all-targets -- --cap-lints warn` exits 0 against this tree and reports 610
+  warnings, all genuine clippy lints (`collapsible_if`, `too_many_arguments`,
+  `manual_is_multiple_of`, …), so the step reports rather than passing empty and
+  the cap is doing what it does in quality-gate rather than hiding a failure.
+
+  **audio is in the step even though the task named four crates.** Its clippy ran
+  nowhere for exactly the same reason theirs did — it needs ALSA, which only this
+  job installs — and it was added to this job's *tests* last round. Leaving it out
+  would have reopened the gap in the same commit that closed it.
+
+  **The toolchain step needed a change too, and it is the kind that fails
+  confusingly.** `dtolnay/rust-toolchain` installs a minimal profile, so this job
+  had no clippy driver at all; without `components: clippy` the step fails to find
+  the binary rather than reporting on the code.
+
+  **Closed as a class rather than as an instance.** The reason those four crates
+  had no clippy is the reason they had no tests: two lists in one file and nothing
+  comparing them. `test-local-verification-contract.sh` now asserts that every
+  crate CI *tests* is also a crate CI *lints* — across both jobs, since the split
+  is deliberate — so a crate added to a test line without a clippy line fails there
+  instead of going unlinted for months. Contract checks 40 → 52.
+
+  Mutation-proved, and the first attempt was wrong in a way worth recording:
+  dropping `-p migo-graphics` from the clippy line fails the guard at its own
+  `pr-ci.yml lints migo-graphics too` assertion; deleting every clippy invocation
+  fails at `cannot find the crates pr-ci.yml runs clippy on`. That second mutant
+  initially made the script **exit silently with no failure at all** — under
+  `set -euo pipefail` a `grep` matching nothing kills the script before the empty
+  check can report it, so the anti-vacuity branch was unreachable. It needed
+  `|| true`, which the neighbouring `selection=` line already had for the same
+  reason.
 
 - [x] 0.35 Build the shared-executor occupancy gate Section 7.3 now requires, then
   apply it. Found while doing 0.19 step 3's audio item, which the plan had deliberately
@@ -883,7 +922,73 @@ review. A commit alone is not completion evidence.
   Still uncovered by it, and named rather than implied: the shared IO executor's
   per-host fairness, which Section 6.4 records as enforced by reading.
 
-- [ ] 0.34 Measure `io::image_cache`'s per-frame paths with the allocation gate.
+  **Closed under task 0.37, and not by this probe.** Reading the executor first is
+  what settled it: it is a fixed set of OS worker threads behind a condvar, not a
+  tokio runtime, and the property is fairness under contention rather than
+  occupancy by CPU work — so the probe's shape does not fit and forcing it would
+  have produced a gate on the wrong question.
+
+- [x] 0.34 Measure `io::image_cache`'s per-frame paths with the allocation gate.
+  **Measured, and the prediction was half right**, which is the half worth recording:
+  the pin/unpin pair allocated exactly as expected and the lookup did not.
+
+  Two gates, named separately because they are different events and a combined burst
+  could not say which of the three calls reached the heap. The lookup gate —
+  `get` on a hit, including the frequency increment, the per-Session counters and the
+  per-owner attribution task 0.16 left unmeasured — **passed without any fix**, so
+  the `Vec` scan that note was uneasy about costs nothing. The pin/unpin gate failed
+  against the unfixed cache at its own assertion with the counts the defect predicts:
+  64 fresh allocations and 64 frees over 64 iterations, 704 bytes, which is one
+  `String` clone of the key per pin and one free per unpin.
+
+  **The fix is the text cache's, but it is not the text cache's change**, and reading
+  it as one would have regressed this cache. `pin` here must accept a key that is not
+  resident: an alias is established before its decode finishes, so a pin routinely
+  arrives before the bytes (`begin_load` → decode → `insert`), which is what
+  `pin_absent_key_is_honoured_on_later_insert` has always pinned down. Moving the
+  count wholesale onto the entry would have dropped those. So the count lives on
+  `CachedImage` where the entry exists, and a `reservations` table holds exactly the
+  counts an entry cannot — one adoption point in `insert`, one hand-back point, and a
+  key never in both homes.
+
+  The hand-back exists because `LruCache`'s **entry** cap is inside the crate and
+  cannot be taught about pins, so it can displace an entry a live alias is holding.
+  The old parallel map survived that for free; the new one has to put the count back
+  where a non-resident key's count lives, or a re-decode would come back unpinned and
+  the alias's next upload could find no bytes. Every other eviction route — byte
+  budget, trim, clear, `clear_for_session` — already refuses pinned entries and now
+  reads the field instead of a second hash lookup.
+
+  Mutation-proved, five mutants:
+  the pre-fix code itself is the first, and it is the TDD red state rather than a
+  synthetic one — it fails the pin/unpin gate with the counts above and nothing else;
+  a narrow one that keeps the count on the entry and merely builds an owned key
+  beside it fails the same gate alone, so the gate is sensitive to *that call* and
+  not to the surrounding shape; dropping the hand-back fails the entry-cap test at
+  its "the alias is still live" assertion and nothing else; adopting a reservation
+  without consuming it fails both single-home assertions; and making `add_owner` push
+  unconditionally fails the lookup gate — with four `realloc` events, which is the
+  resize the probe counts precisely so a `with_capacity` becoming a `new` cannot
+  slip through — proving that gate is not a permanent pass.
+
+  **One mutant was not killed by the first version of the tests, and that gap was
+  real rather than cosmetic.** Handing pins back on a *same-key* replacement as well
+  leaves the count in both homes: `insert` has already adopted it onto the
+  replacement, so the entry and the table each claim it, no unpin can ever retire the
+  table's copy, and the key is pinned forever the next time it is re-inserted. The
+  single-home test now re-decodes a key that is resident **and** pinned — two Sessions
+  finishing a decode of one shared image, which this cache exists to allow — and the
+  mutant fails there.
+
+  **Found while measuring, not fixed here, and named rather than implied:**
+  `resolve_cached_image_rgba` builds an owned key **twice** before it reaches this
+  cache — once cloning out of the alias map, once in `to_io_cache_key` — on
+  `op_tex_image_2d_from_image`'s CPU-bytes path. It is in `runtime-v8`, above the
+  cache this task scopes, and it is the slow path: the ordinary draw takes the
+  GPU-side copy and never reaches it. Recorded as task 0.36 rather than absorbed
+  here, because how often that path is really taken is a question this task did not
+  answer.
+
   Found by applying task 0.26's gate to the text texture cache, which was built by
   copying this cache's shape — its own doc said "identical to the `io::image_cache`
   pattern". In the text cache that shape cost two `String` allocations and two frees
@@ -902,6 +1007,458 @@ review. A commit alone is not completion evidence.
   lookup-plus-pin-plus-unpin at steady state. If it allocates, the fix is the one the
   text cache took — the count belongs on the entry — and it must land with its gate,
   not as a note.
+
+- [x] 0.37 Gate the shared IO executor's per-host fairness. Section 6.4 lists it
+  among the properties "already enforced" and Section 7.3 recorded it as the only
+  one of those with no gate named against it — the last item task 0.35's probe
+  left open.
+
+  **The probe does not fit, and reading the executor is what established that
+  rather than an attempt to force it.** `engine/testing/executor-probe` spawns onto
+  a tokio runtime and asks whether a step occupies a shared worker with CPU-bound
+  work. The IO executor is neither: it is a fixed set of OS worker threads behind a
+  condvar (`crates/io/src/pools.rs`), with a round-robin lane per host and
+  `host_cap_when_contended` bounding how many workers one host may hold while
+  another has work queued. The property is *fairness under contention*, not
+  occupancy. Applying the probe here would have gated the wrong question.
+
+  What was built instead shares no code with the two probes and every principle:
+  manufacture the adversarial condition rather than wait for it. One host fills all
+  four workers and keeps two more queued, the neighbour submits one job, and
+  exactly one worker is freed — which must go to the neighbour, because the flooder
+  then holds three against a contended cap of two. Three load-bearing details, two
+  of them the probes' lessons restated: the flooding jobs are released by the test
+  alone and share no deadline with the neighbour's wait, or a timeout would free
+  the very worker the neighbour was waiting for and an unfair executor would pass;
+  saturation is asserted rather than assumed, since a neighbour handed an idle
+  worker observes nothing; and one permit is released rather than a broadcast,
+  because freeing every worker asks the dispatcher nothing.
+
+  **The duplication question was asked before the test was kept, not after.**
+  `QueueState`'s own tests already drive this policy directly, so a second gate had
+  to pin something they cannot. It does: giving every submitted job one host token
+  — the plumbing between a registration and the queue — fails only the new test,
+  because a test that pushes tokens by hand never traverses `submit` → worker →
+  dispatch. Removing the cap fails both, which is one policy seen at two levels
+  rather than two guards on one case.
+
+  **A third mutant is recorded rather than counted.** Making a completion stop
+  releasing its host and class slots deadlocks the executor's own shutdown —
+  workers park holding pending work that can never dispatch, and `close` cannot
+  drain them — so the suite hangs instead of reporting. No test can report on that
+  mutant, this one included.
+
+- [x] 0.36 Remove `texSubImage2D(image)`'s two owned keys per call. Found while
+  measuring task 0.34: `resolve_cached_image_rgba` cloned the key out of the alias
+  map and then `to_io_cache_key` built a second owned copy from it, so the call
+  allocated twice before the decoded-image cache — which now allocates nothing —
+  was reached.
+
+  **The hotness question was answered by structure rather than by measurement:
+  there is a second caller with no fast path at all.** Task 0.34 recorded this as
+  open on the assumption that `op_tex_image_2d_from_image` was the only way in, and
+  for that op the reading was right — it takes a GPU-side copy whenever the alias
+  has a live shared texture, and `shared_for_image_id` misses only in narrow states
+  (a load still in flight, or an alias whose entry is gone), so the CPU-bytes branch
+  really is a fallback. But `op_tex_sub_image_2d_from_image` calls
+  `resolve_cached_image_rgba` **unconditionally**: there is no
+  `TexSubImage2DFromShared` command and no branch above it. Every
+  `texSubImage2D(…, image)` paid both owned keys, every call, with no cheaper route
+  available to the content, and it does not depend on which game is running.
+
+  **The gate came first and failed with the counts the defect predicts**: 128 heap
+  allocation events over 64 measured iterations — 128 fresh, 128 releases, 4352
+  bytes — which is exactly two owned keys per call and nothing else. `migo-io`
+  already had the counting allocator; `migo-runtime-v8` did not, so it gained the
+  `[dev-dependencies]` entry and the `#[cfg(test)]` `#[global_allocator]`. No CI
+  list needed editing: `migo-runtime-v8` was already on both the test and the
+  clippy line, which is what the two-list contract exists to keep true.
+
+  **The fix deletes the conversion rather than making it cheaper.** The two owned
+  keys were one defect wearing two faces: the alias table keyed on
+  `(path\0WxH, generation)` and the cache below it on `(path, generation, w, h)`,
+  so the boundary had to be crossed by rebuilding. `cache::ImageCacheKey` is now
+  *the same type* as `migo_io::image_cache::ImageCacheKey` — the mangling, the
+  parse and `to_io_cache_key` are gone from eleven call sites, not just from this
+  one — and `cache_key_for_image_id` hands back a borrow, so the lookup copies
+  nothing. Making the two sides share one type also puts an encoding drift between
+  them beyond writing, which the mangled form could not.
+
+  **Lock order argued, not assumed, and the argument is that it cannot be
+  inverted.** The borrow lives only while the alias lock is held, so the lookup now
+  nests this Session's alias mutex outside the process-wide decoded-bytes mutex.
+  That is the order this code already took everywhere — every `pin`/`unpin` in
+  `ImageCache` runs under the alias lock, and `ImageCache::drain` holds an io guard
+  inside one — and the reverse is unwritable rather than merely absent: `migo-io`
+  does not depend on `migo-runtime-v8`, so no code holding the io lock can reach an
+  alias table. Searched rather than recalled: every `global_cache()` acquisition
+  outside `migo-io` itself is either a statement temporary or the one inside
+  `drain`. No new cross-session lock either — this path already took the shared
+  decoded-bytes lock, which Section 6.5 puts in the deliberately-shared tier.
+
+  **Two mutants, each changing exactly one property, each killing exactly one
+  test.** A single `key.clone()` at the lookup fails the burst gate alone with 64
+  events over 64 iterations — one added allocation per call, so the gate is
+  sensitive to *that* call and not to the shape around it. Making `make_cache_key`
+  ignore the requested size fails
+  `each_requested_size_gets_a_cache_slot_of_its_own` alone, at its own assertion.
+  That second guard earns its place: the size used to ride in the path and now
+  rides in the key's own fields, so a key built without them is still well formed,
+  and every other test in that file uses full-resolution keys — the mutant proves
+  nothing else was covering it, including
+  `resized_rgba_cache_key_uses_decoded_source_generation`, which stayed green.
+
+  **Not done, and named rather than implied.** `remove_previous_alias` and
+  `try_release_and_get_destroy_rid` still clone the key out of `shared_to_key`,
+  because they remove from that same map afterwards and the borrow cannot outlive
+  it. Those run per `img.src =` and per destroy, not per frame; unifying the key
+  type halved them for free, and no gate claims them. The six V8 snapshots were
+  already stale on this branch before this change and remain so — the fingerprint
+  covers every `runtime-v8` `.rs` file, so they are regenerated once for the
+  branch rather than once per task.
+
+- [x] 0.38 Gate the render command path's steady-state allocation. Section 7.3
+  listed it as unmeasured and it is the highest-rate event the engine handles —
+  one `gl.*` call from content becomes one command in the collector, and Cocos and
+  three.js emit hundreds per frame.
+
+  **Two gates, not one, because they are different calls.** `push_gl_fast` is the
+  per-command enqueue; `append_gl_batch` is what `op_gl_submit_stream` reaches
+  after decoding a stream, which is the path a Pixi frame actually takes. A burst
+  covering both could not say which reached the heap — the lesson task 0.34 paid
+  for. **Both passed against unmodified code**, so the collector and the command
+  vector pool were already doing their job on the per-event path; that is a result
+  rather than a non-event, and the mutants below are what make it one.
+
+  **The reservation is established locally rather than by cycling frames through
+  the pool, and the reason is recorded in the fixture.** The pool is
+  process-global and `cargo test` runs this binary concurrently, so a gate that
+  depended on getting *its own* recycled vector back would fail whenever another
+  test took it first. A flaky gate is worse than none. The pool's reuse property
+  is already covered where it can be deterministic — against a private instance,
+  in `command_vec_pool::tests::recycled_vector_reuses_its_allocation`.
+
+  **One measured defect, fixed here.** `build_frame_packet_inner` took the segment
+  list with `std::mem::take`, which hands away both the segments *and* the vector
+  holding them and leaves it at zero capacity — so the first push of every frame
+  allocated it again, forever, on the thread running the game. `drain(..)` moves
+  the segments out and keeps the allocation. Measured over ten frames after
+  warm-up: **two allocations and two frees per frame became one and one**, at any
+  frame size up to the pool's retention ceiling.
+
+  **Mutation-proved, three mutants.** Dropping `append_gl_batch`'s recycle instead
+  of returning the vector fails the append gate alone with exactly one allocation
+  per event (64 over 64, 90112 bytes) — and **no other test in the binary noticed
+  a leaked pool vector**. Reverting `drain` to `mem::take` fails the segment-list
+  test alone. Making every command open a segment of its own fails both burst
+  gates, at the fixture's own precondition rather than at the burst — and nothing
+  else in the binary, so a segment per command is otherwise invisible.
+
+  **That third mutant is also why the fixture has a bound.** Its first version
+  looped until the segment held enough reserved slots, which under that mutant can
+  never happen: the run allocated until the kernel killed it (exit 137), so the
+  mutant was reported as a hung suite rather than as a failure. A fixture that
+  cannot establish its precondition has to say so. It now stops and names the
+  invariant that broke, which is what turned an unkillable mutant into a killed
+  one.
+
+  **Verified.** runtime-v8 514 from a 511 baseline; shared 392, io 264/5, graphics
+  523, core 51, capi 142, platform 50/1, audio 48 unchanged; python CI 117; both
+  contract scripts; clippy clean on the touched crate — the one warning this
+  change introduced was a constant assertion, and clippy's suggestion was taken
+  rather than silenced, so the fixture's precondition is now a compile-time check.
+  `scripts/verify-change.sh --base HEAD` reports every host step PASS and requires
+  no target build: the changed file carries no conditional, which the selector
+  confirms rather than assumes.
+
+  **Amended: the append gate was pool-contention-flaky, and fixing it cost a
+  mutant.** Its first version called `take_gl_command_vec` inside the measured
+  window, reasoning that it recycled a vector every iteration and would get one
+  back. That reasoning fails under concurrency: a concurrent test taking the
+  pool's last vector leaves `take` with nothing to hand back, so it allocates a
+  fresh minimum-capacity one. It passed standalone and failed under
+  `verify-change`'s load with a single 1408-byte allocation — exactly
+  `GL_COMMAND_VEC_INITIAL_CAPACITY * size_of::<GLCmd>()`. The batch vectors now
+  come from a reservoir built before the burst, which is the same rule
+  `reserve_gl_segment_headroom` already carried and which this gate should have
+  had from the start.
+
+  The cost is recorded rather than glossed: with the pool out of the measured
+  window, **the "stops recycling" mutant no longer fails anything** — a dropped
+  vector is a deallocation, and the burst counts allocations. Re-checked against
+  the final code: 514 passed, nothing failed. What still kills this gate is the
+  segment-per-command mutant, via the fixture's precondition. The recycle
+  obligation itself is now unguarded, which is task 0.41.
+
+- [x] 0.39 Bound the command-vector pool by the bytes it retains. Task 0.38
+  measured the old rule as a cliff rather than a gradient: `MAX_RECYCLABLE_COMMAND_CAPACITY`
+  capped a *single* vector at 512 elements, so a frame one command past it had its
+  vector dropped and regrew from the 16-element minimum on every subsequent frame.
+
+  | commands per frame | allocations | reallocations | bytes |
+  | --- | --- | --- | --- |
+  | 512 | 1 | 0 | 224 |
+  | 513 | 2 | 6 | 179 040 |
+
+  799x the bytes for one more command, about 10.5 MB/s of copying at 60 Hz, on the
+  thread CLAUDE.md Section 7 identifies as the bottleneck.
+
+  **Three defects in one constant, which is why raising it was not the fix.** It
+  was in the wrong unit — elements, so the same number meant 44 KiB of `GLCmd` and
+  a different amount of `Canvas2DCmd`. It bounded the wrong quantity — one vector,
+  not the pool, so it never actually bounded memory: 16 slots times 512 elements
+  was already permitted. And it was a cliff, which a retention rule should not be.
+  Raising the number moves the cliff; shrinking an oversized vector before
+  recycling trades six reallocations for one and loses the capacity anyway.
+
+  So the pool now bounds exactly what the ceiling was protecting: its own retained
+  bytes, tracked across `take` and `recycle`. **The permitted worst case is
+  unchanged by construction** — the budget is `slots * commands_per_slot *
+  size_of::<T>()`, the same arithmetic the old rule already allowed — but the
+  allowance is now spent on whatever shape the workload has, one large vector or
+  sixteen small ones, and no frame size is special.
+
+  **The unit hazard is designed out rather than documented.** The budget parameter
+  stays in *commands* and the pool converts to bytes itself, because a `usize`
+  byte budget beside a `usize` command count is a mistake the compiler cannot
+  catch — and the first draft of this change made exactly that mistake, handing a
+  byte value to the element parameter and getting a green test that proved
+  nothing.
+
+  **Mutation-proved, four mutants, and the fourth changed the design.** Removing
+  the budget check fails both budget tests. Dropping the reservation rollback on a
+  full channel fails the accounting test. Dropping it in `take` fails the same
+  test. Removing the separate `bytes > budget` early refusal **killed nothing** —
+  so it was a branch that read like a guard while changing no outcome, and it is
+  gone; the one budget check turns away the pathological vector too, since it is
+  over budget from an empty pool.
+
+  **One mutant survived the first version of the accounting test, and the test was
+  wrong rather than the code.** Its "refused by a full pool" case was really being
+  refused by the budget, so the `try_send` rollback it claimed to cover was never
+  reached. The fixture now separates the two limits — one slot, budget to spare —
+  and asserts which limit does the refusing.
+
+  **Verified.** shared 395 from 392; io 264/5, runtime-v8 514, graphics 523, core
+  51, capi 142, platform 50/1, audio 48 unchanged; `scripts/verify-change.sh
+  --base HEAD` every host step PASS.
+
+  **A tooling failure worth recording, because it nearly cost the work.** The
+  mutant-revert helper applied `str.replace(new, old)` with `new` empty when the
+  mutant was a deletion, and in Python `"abc".replace("", X)` inserts `X` between
+  every character — it wrote 12 505 copies of the block into the file, 2.7 MB. The
+  corruption was deterministic and exactly reversible (remove every occurrence of
+  the inserted block, which also removed the one real copy, which was the intent),
+  and the recovered file was confirmed by compiling and by re-running every mutant
+  against it. The helper now refuses an empty anchor or replacement, and reverts by
+  restoring a verified copy rather than by inverse substitution.
+
+  **Amended: one existing test was reading the pool's contents and had to be
+  re-derived.** `interleaved_single_command_segments_do_not_reserve_256_slots_each`
+  summed the capacities of 100 interleaved segments against a fixed threshold. Those
+  capacities are not the collector's decision — each segment takes a vector from the
+  process-wide pool, so the sum depends on what every other test in the binary
+  recycled. The old per-vector length cap had been bounding that measurement by
+  accident; once retention went by bytes, a single-command segment could inherit a
+  larger recycled vector and the sum crossed the threshold. **The aggregate bound
+  did not move** — it is the pool's budget either way — only the distribution did.
+
+  The threshold is now derived from the pool's own rule (its byte budget, plus a
+  fresh minimum for every segment beyond what the pool can supply), which is a true
+  upper bound whatever the pool holds. It keeps its teeth: reinstating the 256-slot
+  policy the test is named for still fails it, at 1 843 200 bytes against a
+  1 272 448 ceiling.
+
+- [x] 0.43 Gate the audio graph's real-time path. Section 7.3 listed the audio
+  path as unmeasured, and it is the last steady hot path a host test binary can
+  reach — the BLE halves need an on-target binary and a JVM mechanism.
+
+  **Different stakes from the frame path, which is why it was worth doing even
+  though it passed.** `AudioContext::process` is the output callback's work: once
+  per quantum, on a thread `audio_thread.rs` runs under SCHED_FIFO on Android. An
+  allocation there is not a throughput cost, it is a deadline miss — the allocator
+  can block behind a thread that is not real-time scheduled at all, and the result
+  is an audible dropout rather than a slower frame.
+
+  **It passed against unmodified code**: the mix buffer is a reused field, node
+  output buffers are created on first use, and the finished-node list is a
+  `Vec::new()` that only allocates when a source actually ends. Recorded as a
+  result rather than a non-event, because two mutants show the gate can fail.
+
+  **Mutation-proved, two mutants, both killing this gate alone.** Replacing the
+  reused mix buffer with a per-quantum `vec!` fails with 192 events and 196 608
+  bytes over 64 quanta. The one that matters more is smaller and looks like an
+  improvement: giving the finished-node list `Vec::with_capacity(self.nodes.len())`
+  instead of `Vec::new()` costs exactly one allocation per quantum — 64 over 64,
+  768 bytes — on the real-time thread, for a list that is almost always empty.
+  That is the shape of regression this gate exists to catch, and nothing else in
+  the crate would have.
+
+  **Scope stated rather than implied.** What is measured is the graph render for a
+  source-into-gain-into-destination chain, which is what every buffer-playback
+  plus volume does. The rest of the audio subsystem — `audio_thread`'s scheduling,
+  `output`'s device handoff, `streaming`'s refill — is still unmeasured, so the
+  audio path is not recorded as satisfied, only this part of it.
+
+  **Verified.** migo-audio 49 from a 48 baseline; every other crate unchanged;
+  clippy clean; `scripts/verify-change.sh --base HEAD` every host step PASS.
+  `migo-audio` was already on both the CI test and clippy lists, so wiring the
+  probe into it needed no list change — the two-list contract stayed satisfied
+  without editing it.
+
+- [x] 0.44 Gate the texture upload against the per-session registry lock. Section
+  7.3 has two requirements per covered path, not one, and task 0.36 changed the
+  second: `resolve_cached_image_rgba` now holds this Session's alias lock across
+  the shared decoded-bytes lock. Checking whether that path had a contention gate
+  at all is what found that it never did.
+
+  **The invariant was a comment.** `SESSION_IMAGE_CACHES` maps every live Session
+  to its alias table, and the design says per-event paths never consult it — they
+  hold the `Arc` resolved once at isolate bring-up. A comment cannot fail when
+  someone adds a lookup, and the lookup would *work*: it returns the right table,
+  just after queueing behind every other Session's bring-up and teardown, on a path
+  that runs per `texSubImage2D`. That is precisely the failure Section 7.3 asks for
+  a test — not an argument — to rule out.
+
+  Wired the way `shared::stats` already does it: a `#[cfg(test)]` accessor hands
+  the registry's own lock to the probe, so no shipped build can reach past the
+  handle it resolved at bring-up.
+
+  **Mutation-proved.** Replacing the held handle with `image_cache_for_host(id)`
+  inside the probed body — the exact regression the comment forbids — fails this
+  gate and nothing else, and it fails by *blocking*: the run takes 3.28 s against
+  the probe's 2 s patience, which distinguishes a real block from a failure for
+  some other reason.
+
+  **Also settled while here: the lock order 0.36 introduced is not a cross-session
+  hazard.** The alias mutex is per Session and reached only by that Session's own
+  isolates, so holding it across the shared io lock lengthens one Session's own
+  critical section, never another's. The shared lock on this path is the
+  decoded-bytes cache, which Section 6.5 puts in the deliberately-shared tier and
+  which the path already took before 0.36.
+
+  **Verified.** runtime-v8 515 from 514; every other crate unchanged;
+  `scripts/verify-change.sh --base HEAD` every host step PASS.
+
+- [x] 0.45 Stop `console.log` taking the process-wide console registry lock.
+  Found by sweeping every per-session registry behind a shared lock after task
+  0.44, asking of each whether a per-event path consults it. Most came back clean:
+  `HOST_SENDERS` was already gated, `SESSION_CACHES` and `STATS` by tasks 0.16 and
+  0.27, and `VSYNC_SENDERS` resolves once into the host handle — its
+  "intentionally a cold attach-time operation" comment is true and the structure
+  enforces it. This one was not.
+
+  `push_console_log(id, ..)` looked the session up in the process-wide
+  `CONSOLE_LOGS` map on **every `console.log` the content makes**. The lookup
+  *works* — it returns the right buffer — which is exactly why only a gate catches
+  it: what it costs is a queue behind an unrelated game's bring-up or teardown,
+  which take the same lock for writing, on a path a game can reach every frame.
+
+  **The ordering question that made this a decision rather than an edit was
+  checked in the source, not assumed.** The buffer is registered only when debug
+  is enabled, and the restart path builds a new isolate — so a bring-up-time
+  resolve is only safe if registration is already final both times. It is:
+  registration runs in the host's pre-JS services ahead of `HostJsRuntime::new` on
+  the first start, and a restart does not unregister, so the answer is settled
+  before `bind_thread_console` runs either time. Teardown unregisters, by which
+  point the isolate is gone. So the resolve-at-bring-up option is correct, and it
+  is the same shape the text texture cache and the image alias table already use.
+
+  The op now holds the buffer it resolved at bring-up in a thread-local, where it
+  previously held only the session id. In production, where debug is off, that
+  turns a lock acquisition plus a hash lookup per log call into one branch on
+  `None`.
+
+  **Mutation-proved, and the mutant is the previous production code.** Restoring
+  the per-call `push_console_log` fails this gate and nothing else, by *blocking*:
+  3.16 s against the probe's 2 s patience.
+
+  **The fixture was wrong first, and the failure said so.** Its first version
+  bound the sink inside the probe body — but binding is what reads the registry,
+  so it deadlocked against the held write guard and reported at exactly 2.00 s.
+  Production resolves once at bring-up, outside any contention, and writes many
+  times after; the fixture now does the same, which is why the resolve and the
+  install are separate functions.
+
+  **Containment of the test-only seam checked rather than asserted, and a guard
+  deliberately not added.** Both this task and 0.44 add a `pub fn` handing out a
+  process-global lock behind `feature = "contention-probe"`, under a comment
+  claiming no shipped build enables it. Cargo feature unification can make that
+  claim false, so it was tested: a `compile_error!` tripwire on
+  `all(feature = "contention-probe", not(test))` **compiles clean** through normal
+  builds of `migo-core` and `migo-runtime-v8`, and fires when the feature is forced
+  on, so it is not vacuous. Resolver 2 keeps dev-dependency features out of normal
+  builds and the claim holds.
+
+  The tripwire was removed rather than kept, because it cannot be made permanent:
+  it fires during `cargo test -p migo-runtime-v8` too, since `shared` is built
+  there as an ordinary dependency of the test binary rather than under `cfg(test)`,
+  so a compile-time check cannot tell a dev-dependency enabling it from a shipping
+  build enabling it. The only mechanism left is a manifest-parsing contract script,
+  and the harm it would guard against is a `pub fn` returning a lock reference in a
+  crate that is not a third-party API surface — real hygiene, no correctness or
+  security consequence. Recorded as verified-not-gated so the next reader knows the
+  claim was measured and why no gate backs it, rather than finding a comment and
+  having to repeat the work.
+
+- [ ] 0.41 Guard the batched submit's obligation to return its vector to the
+  pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
+  `recycle_gl_command_vec` instead of returning the emptied vector **failed no
+  test in the binary** — the burst gate caught it only while it took from the
+  pool, and that dependency had to go because it made the gate flaky under load.
+
+  A leaked pool vector is a deallocation, not an allocation, so the burst
+  mechanism cannot see it by construction. The two obvious replacements are both
+  unusable as written: asserting on the shared pool's contents is the flakiness
+  that was just removed, and counting deallocations across the burst is defeated
+  by the pool legitimately refusing a recycle once it is full. What would work is
+  an observation point that does not depend on the global pool's state — the
+  question this task has to answer before it writes a guard.
+
+  Worth doing rather than shrugging at: the failure mode is silent. Every caller
+  still gets a vector, just a freshly allocated one, so a forgotten recycle looks
+  exactly like a working pool and shows up only as steady-state allocation nobody
+  is measuring.
+
+- [x] 0.42 Stop the derived-cache prune test depending on the host's wall clock.
+  Found by `scripts/verify-change.sh` failing on a crate this branch had not
+  touched: `prune_respects_budget_and_preserves_newer_files` asserted that the
+  first-written file was evicted, and it survived a prune that removed three newer
+  ones.
+
+  **Diagnosed as far as the evidence allowed, then fixed in a way that does not
+  depend on the diagnosis.** The test spaced six writes 20 ms apart and let the
+  ambient clock supply the ordering; `prune_derived_cache` sorts on mtime with no
+  tie-break, so a clock that does not advance monotonically across those writes
+  inverts the expected order. It reproduced only under load — it passed 12 times
+  in isolation and 8 more across the full suite, and the failing run took 2.10 s
+  against 0.25 s idle. Rather than assert a root cause that could not be pinned
+  down on this host, the fixture now stamps the six modification times explicitly
+  with `File::set_times`, which removes the clock from the test entirely and drops
+  120 ms of sleeps.
+
+  The assertion is not weakened by the change: reversing the eviction order in
+  `prune_derived_cache` still fails this test and nothing else.
+
+  Recorded rather than folded silently into another commit, because an
+  intermittent failure in shared verification is not a nuisance — it is the thing
+  that makes every later "verified" line arguable.
+
+- [ ] 0.40 Pool the frame packet's op vector, or record why it stays unpooled.
+  The one allocation per frame that survives task 0.38's fix:
+  `FramePacketBuilder::new` starts from `Vec::new()` and the packet carries it to
+  the render thread. The command vectors either side of it are pooled; this one is
+  not, so a frame costs one allocation and one free (224 bytes) no matter how
+  little it draws.
+
+  It is not the same change as the command vector pool, which is why it is its own
+  item. The packet has two consumption sites, and the main one
+  (`render_thread.rs`) already allocates **two more** vectors to reorder the ops
+  into Canvas2D-then-GL phases, then drops the original. So the recycle point is
+  not simply "after execution", and the reorder's own two allocations per frame
+  belong in the same measurement. Until that is settled, a burst across a whole
+  frame cycle cannot assert zero, which is why task 0.38 asserted the segment
+  list's capacity directly instead.
 
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
@@ -1614,10 +2171,62 @@ review. A commit alone is not completion evidence.
   parsed per render thread, so N games parsing one font parse it N times. Whether
   sharing them pays is a measurement; the GPU glyph atlas built from them stays
   per-session regardless.
-- [ ] 0.20 Resolve Engine-scoped storage roots. `MigoEngineConfig` takes the
+- [x] 0.20 Resolve Engine-scoped storage roots. `MigoEngineConfig` takes the
   file, cache, and code-cache roots per Engine, so a single-Engine host cannot
   give two games different roots. Either document the shared root as intended or
   move the roots to Session scope.
+
+  **Documented as intended — and the three roots reach that answer by three
+  different arguments, which is why the task insisted they be argued separately.**
+
+  `code_cache_dir` decides itself: Section 6.5 *requires* the on-disk V8 code
+  cache to be shared, its key is `hash(source_bytes, v8_version)` so an entry means
+  the same thing whichever Session compiled it, and task 0.19 moved its budget onto
+  the directory precisely because the directory is one. Session scope would not
+  relocate that cache, it would retract it — each Session paying for its own copy
+  of every compile, and the ceiling that now bounds the directory bounding nothing.
+
+  `files_dir` and `cache_dir` decide themselves too, from what they are: the host
+  application's own directories, granted to it once by the platform. Android gives
+  one `Context.getFilesDir()` per app, iOS one `NSDocumentDirectory`; there is no
+  second one to hand a second game. Session scope would add a *way to get it
+  wrong* rather than a capability — a host can already give two Sessions one root,
+  and would then also have to be trusted not to give them one content id. The host
+  that genuinely needs two volumes creates a second Engine, which the ABI has
+  always allowed and `two_engines_account_for_their_own_sessions` already executes.
+
+  **The obligation this leaves on the host was unstated, and that was the real
+  gap.** Isolation below the root is `<root>/migo/games/<content_id>/…`, the
+  content id comes from `MigoContentDescriptor`, and nothing checks it for
+  uniqueness — so two concurrently live Sessions given one id share one game
+  directory: storage, cache and temp alike. The header now says so where the roots
+  are declared. Refusing a duplicate is deliberately not done: two Sessions of one
+  title is a legitimate thing for a host to want and the engine cannot tell that
+  from a mistake, so the honest move is to name the contract, not to guess.
+
+  **Executed rather than only written**, because Section 6.4 says a property never
+  executed may not be claimed. The single construction site in
+  `capi/src/surface.rs` became `EngineInner::session_init_options`, and
+  `concurrent_sessions.rs` now runs two Sessions of one Engine and asserts all
+  three roots come back exactly as the host named them. One place by construction:
+  there is no second site for a per-Session override to be added to and missed at.
+  Two mutants, each killed at its own assertion — deriving a subdirectory
+  (`files_dir.join("migo")`), which is the "never invents a location" clause, and
+  the copy-paste the extraction invites, `code_cache_dir` reading `cache_dir`.
+
+  **A third test was written and then deleted, and the reason is worth keeping.**
+  It asserted that two Engines' Sessions never carry each other's roots. Every
+  mutant that killed it killed the roots-are-verbatim test first, because "each
+  Engine's Sessions get that Engine's configured roots" already forces two
+  differently configured Engines apart — no mutation makes one pass while the other
+  fails. Two guards on one case pin it no better than one.
+
+  **Still not executed, and not claimed:** the identity half of the split. A
+  Session from `migo_session_create` has no surface, no Host and no bound game
+  identity, so what these tests reach is the roots, and `GamePaths`' own
+  storage-isolation tests in `runtime-v8` reach the `<content_id>` partition below
+  them. Nothing yet drives two live Sessions through content to two directories on
+  disk; that stays task 0.21's open half.
 - [ ] 0.21 Add the first behavioural two-session tests. **First increment landed;
   two of the four property groups still uncovered.** The opening premise is now
   false in the good way: `engine/crates/capi/src/concurrent_sessions.rs` creates two

@@ -374,8 +374,9 @@ single Session remain serialised by the host.
 **Properties already enforced, which become gated requirements:** one V8 isolate
 per Session, with a fresh isolate on restart and no `SharedArrayBuffer` store
 crossing sessions; per-game filesystem, key-value, and quota isolation derived
-from the game identity; per-host fairness on the shared IO executor; an Engine
-that refuses destruction while any Session is live; per-session platform manager
+from the game identity; per-host fairness on the shared IO executor — **now gated
+against the real executor rather than read, see Section 7.3**; an Engine that
+refuses destruction while any Session is live; per-session platform manager
 registries; and per-session permission monitors.
 
 **Defects that must be fixed before multi-game support is claimed:**
@@ -417,6 +418,25 @@ registries; and per-session permission monitors.
    Engine rather than per Session, so a single-Engine host cannot give two games
    different roots. Isolation below the root is by game identity; the shared root
    must be documented, or the roots must move to Session scope.
+
+   **Resolved under task 0.20 by taking the first option, and the three roots do
+   not share one reason.** `files_dir` and `cache_dir` are the *host
+   application's* directories, granted to it once by the platform — one
+   `getFilesDir()` per Android app — so there is no second one for a second game
+   to be given, and Session scope would add a way to configure isolation wrongly
+   rather than a way to obtain it: a host can already hand two Sessions one root,
+   and would then also have to be trusted not to hand them one content id.
+   `code_cache_dir` is the root that moving would actively damage, because
+   Section 6.5 *requires* it to be shared and defect 4's fix put its budget on the
+   directory precisely because the directory is one; per-Session code caches would
+   give each Session its own copy of every compile.
+
+   The obligation this leaves on the host is now stated where the roots are
+   declared rather than implied: **content ids must be distinct between
+   concurrently live Sessions**, since every per-game path is derived from that id
+   and nothing in the engine enforces uniqueness. Refusing a duplicate is
+   deliberately *not* done — two Sessions of one title is a legitimate thing for a
+   host to want, and the engine cannot tell that apart from a mistake.
 
 **Test requirement.** No test anywhere currently creates two concurrent Sessions.
 Every isolation property above is correct by reading rather than by execution.
@@ -535,6 +555,14 @@ is exactly what two games loading the same module should get, attribution would 
 live on disk to survive a restart, and the cost of losing an entry is one recompile.
 The gate covers the budget, not the fairness.
 
+**Its Engine scope is load-bearing, which task 0.20 settled rather than assumed.**
+"One budget per directory" is only a budget while the directory is one, so the
+question defect 5 raised — whether the roots belong on the Session instead — is
+answered here for this root and answered *differently* from the other two: moving
+`code_cache_dir` to Session scope would silently retract the sharing this section
+requires, not merely relocate a path. Both the header and Section 6.4 defect 5 now
+say so where a host and a maintainer respectively will read it.
+
 ### 6.6 What A Game May Name
 
 A game may name a path only inside its own sandbox, and every op that takes one
@@ -622,7 +650,11 @@ These are enforced by tests, not by inspection:
 
   **Covered so far:** the ordered host queue (`host_channel`, across coalescible
   motion, reliable and terminal transitions, and the drain), the input payload pool,
-  and the per-`fillText` text texture cache hit. What
+  the per-`fillText` text texture cache hit, the decoded-image cache's lookup and
+  its pin/unpin pair, the per-call image texture resolve above it that
+  `texSubImage2D(image)` takes, the render command path's two enqueues — the
+  per-command one and the batched submit — and the audio graph's per-quantum
+  render on the output thread. What
   `scripts/test-input-transport-contract.sh` does *not* do is still worth stating,
   because it is the reason this requirement was mis-recorded as satisfied for so
   long: it greps the sources for structural properties — `VecDeque::with_capacity(`,
@@ -635,9 +667,42 @@ These are enforced by tests, not by inspection:
   **Not covered, and named rather than implied.** The BLE notification path's Rust
   half is `cfg(target_os = "android")`, so a host test binary never compiles it and
   the gate cannot run there; its Java half needs a JVM mechanism entirely, because a
-  Rust allocator observes nothing the JVM allocates. The render command path, the
-  audio path and `io::image_cache` are unmeasured. No path may be recorded as
-  satisfying this requirement without a burst test named against it.
+  Rust allocator observes nothing the JVM allocates. The audio path is measured at
+  its graph render only; `audio_thread`'s scheduling, `output`'s device handoff and
+  `streaming`'s refill are not. The render command path's *per-event* enqueues are now gated, but its **frame
+  boundary** is not zero and cannot yet be asserted as such: the frame packet's op
+  vector is pooled nowhere, so a frame costs one allocation however little it
+  draws, and the pool's element-based retention ceiling turns a frame above it into
+  six reallocations and 175 KiB of copying — a cliff at one command's width, not a
+  gradient. Both are recorded as their own items with their measurements. No path
+  may be recorded as satisfying this requirement without a burst test named against
+  it.
+
+  **What applying it to the decoded-image cache found**, since it is the second
+  instance of one shape and that is what makes it worth stating: a pin recorded in a
+  map keyed *beside* the cache needs an owned key to record it and drops that key
+  again when the count falls to zero, so an alias taken and released cost one
+  allocation and one free per event. The text texture cache paid it per `fillText`;
+  this cache paid it per alias, and the fix is the same one — the count belongs on
+  the entry. It is not the same *change*, though, and reading it as one would have
+  regressed the cache: this cache must accept a pin for a key that is not resident
+  yet, because an alias is established before its decode finishes. So the count on
+  the entry is paired with a reservation table for exactly the keys an entry cannot
+  hold, with one adoption point and one hand-back point, and a key is never in both.
+
+  **And what the layer above it found, which is the same lesson at a boundary
+  rather than inside one.** The alias table and the decoded-bytes cache spoke two
+  key shapes for the same thing — `(path\0WxH, generation)` above,
+  `(path, generation, w, h)` below — so every crossing rebuilt the key. Two owned
+  keys per call, on a path `texSubImage2D(image)` takes unconditionally: one
+  cloning the alias key out of the table, one parsing the mangled suffix back
+  apart for the cache below. Making the two sides share the *type* deletes the
+  conversion instead of making it cheaper, and leaves the alias key borrowable —
+  so the lookup runs under the alias lock and copies nothing. The lock nesting
+  that makes the borrow live long enough is the order this code already took
+  everywhere else, and it cannot be inverted: `migo-io` does not depend on
+  `runtime-v8`, so nothing holding the decoded-bytes lock can reach an alias
+  table.
 - **No cross-session lock on a per-event path.** Each covered path requires a
   contention regression test that fails when a per-event operation acquires a
   lock shared beyond its own session.
@@ -714,9 +779,41 @@ These are enforced by tests, not by inspection:
   which owns the decoder behind a private field with no accessor: reaching it outside a
   blocking step is a compile error rather than a rule.
 
-  **Not covered:** the shared IO executor's per-host fairness, which Section 6.4
-  records as enforced by reading. No path may be recorded as satisfying this
-  requirement without a gate named against it.
+  **The shared IO executor's per-host fairness needed a different mechanism, and
+  saying which took reading it rather than assuming.** That executor is not a
+  tokio runtime — it is a fixed set of OS worker threads behind a condvar, with a
+  round-robin lane per host and a cap on how many workers one host may hold while
+  another has work queued. So the probe above does not apply: it spawns onto a
+  runtime, and its property is *occupancy by CPU work*, which is not the property
+  here. The property here is that a worker freed under contention goes to the host
+  that is not already over its cap.
+
+  It is now gated by a test against the real executor —
+  `a_worker_freed_under_contention_goes_to_the_host_that_is_not_hogging_it` — built
+  on the same principle as the two probes even though it shares no code with them:
+  manufacture the adversarial condition rather than wait for it. One host fills
+  every worker and keeps a backlog, the other submits one job, and exactly one
+  worker is freed. Three details are load-bearing, and two are the probes' lessons
+  restated: the flooding jobs are released by the test alone and share no deadline
+  with the neighbour's wait, because a timeout that freed a worker would hand an
+  unfair executor the very thing the neighbour was waiting for; saturation is
+  *asserted* before the neighbour submits, since a neighbour handed an idle worker
+  proves nothing; and exactly one permit is released rather than a broadcast,
+  because freeing every worker asks the dispatcher nothing.
+
+  The queue's own tests already drove this policy directly against `QueueState`,
+  so the question was whether a second gate pins anything. It does, and one mutant
+  separates them: giving every submitted job the same host token — the plumbing
+  between a registration and the queue — fails only the new test, because a test
+  that pushes tokens by hand cannot see the path from `submit` to dispatch.
+  Removing the cap fails both, which is the same policy seen at two levels rather
+  than two guards on one case.
+
+  **One mutant is not usable here, and that is a fact about the harness.** Making
+  a completion stop releasing its host and class slots deadlocks the executor's own
+  shutdown — workers park with pending work that can never dispatch, and `close`
+  cannot drain them — so the suite hangs instead of reporting. It is recorded
+  rather than counted.
 - **Idle quiescence.** No polling loop and no fixed-interval wakeup when idle.
   Frame delivery is demand-driven. Measured as wakeups per second at idle,
   against a per-platform ceiling recorded in the versioned threshold file

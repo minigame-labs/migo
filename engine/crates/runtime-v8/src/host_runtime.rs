@@ -269,7 +269,7 @@ impl HostJsRuntime {
 
         // Set thread-local host ID so op_console can route logs to the
         // per-session ring buffer without accessing OpState.
-        crate::console::set_thread_host_id(host_id);
+        crate::console::bind_thread_console(host_id);
 
         let bindings = JsBindings::new(&mut rt, host_id);
         tracing::info!(

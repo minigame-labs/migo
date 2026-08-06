@@ -1,3 +1,13 @@
+// Section 7.3's steady-state allocation gate reads this. `#[cfg(test)]` scopes it
+// to this crate's own test binary: a `#[global_allocator]` is unique per binary, so
+// one declared unconditionally here would follow the library into every shipped
+// cdylib. Deleting it does not make the gates pass silently -- each burst proves the
+// allocator is installed before it trusts a zero count.
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: migo_alloc_probe::CountingAllocator =
+    migo_alloc_probe::CountingAllocator::system();
+
 pub mod atomic_write;
 pub mod cost;
 pub mod count_min_sketch;

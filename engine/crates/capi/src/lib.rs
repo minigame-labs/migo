@@ -70,13 +70,34 @@ use migo_capi_abi::{
 };
 use migo_core::{HostThread, send_command_to_host};
 use panic_barrier::guard;
-use shared::{protocol::host_cmd::HostCommand, surface::SurfaceLossReason};
+use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceLossReason};
 
 // ---- Handles ----------------------------------------------------------------
 
 /// Process-level state: the storage roots the host granted, plus a live-session
 /// count so `migo_engine_destroy` can enforce the header's rule that children
 /// go first instead of leaving sessions pointing at freed configuration.
+///
+/// # Why the three roots are the Engine's and not each Session's
+///
+/// Two games in one Engine are separated *below* these roots, at the game
+/// identity: every path a Session touches is `<root>/migo/games/<content_id>/…`.
+/// Moving the roots to Session scope would not add that separation — a host could
+/// still hand two Sessions one root and one content id — while each root has its
+/// own reason to stay where it is.
+///
+/// `files_dir` and `cache_dir` are the *host application's* directories, granted
+/// to it once by the platform: one `Context.getFilesDir()` per Android app, one
+/// `NSDocumentDirectory` per iOS app. There is no second one for the engine to
+/// take. A host that genuinely needs two games on two different volumes creates a
+/// second Engine, which the ABI allows and `concurrent_sessions` covers.
+///
+/// `code_cache_dir` is shared **on purpose**, and this is the root that would be
+/// actively damaged by moving: Section 6.5 requires the on-disk V8 code cache to
+/// be shared between Sessions, its key is `hash(source_bytes, v8_version)` so the
+/// bytes mean the same thing to whoever asked, and the budget task 0.19 moved onto
+/// the directory is a budget *because* the directory is one. Per-Session roots
+/// would silently give each Session its own copy of every compile.
 struct EngineInner {
     files_dir: PathBuf,
     cache_dir: PathBuf,
@@ -88,6 +109,27 @@ struct EngineInner {
 }
 
 impl EngineInner {
+    /// The options every Session of this Engine starts a Host from.
+    ///
+    /// One place, deliberately. The storage roots are the whole of what
+    /// `MigoEngineConfig` grants, and a per-Session override added at one
+    /// construction site and missed at another is how "every Session of an Engine
+    /// shares these roots" stops being true without anything failing. There is
+    /// nothing to keep in step because there is nothing to keep in step *with*.
+    ///
+    /// The roots pass through verbatim: the header states that Migo never invents
+    /// a location of its own, so deriving a subdirectory here would put game data
+    /// somewhere the host cannot find, clear, or back up.
+    fn session_init_options(&self, pixel_ratio: f32) -> InitOptions {
+        InitOptions::new()
+            .with_files_dir(self.files_dir.clone())
+            .with_cache_dir(self.cache_dir.clone())
+            .with_code_cache_dir(self.code_cache_dir.clone())
+            .with_pixel_ratio(pixel_ratio)
+            .with_target_fps(60)
+            .with_code_signing_enabled(!self.allow_unsigned_content)
+    }
+
     fn retire_host(&self, host: HostThread) {
         if let Err(error) = host.request_shutdown() {
             tracing::error!("failed to request shutdown for Host {}: {error}", host.id());
