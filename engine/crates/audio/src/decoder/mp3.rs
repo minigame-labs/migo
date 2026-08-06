@@ -119,14 +119,25 @@ impl Mp3FrameDecoder {
         let consumed = info.frame_bytes.max(0) as usize;
 
         if samples_per_channel <= 0 {
-            // minimp3 reports "no frame in here" by claiming everything it
-            // looked at. Hold back a header's worth minus one: a sync word can
-            // straddle a chunk boundary, and consuming it would desynchronise
-            // the stream against the next chunk. When that leaves nothing to
-            // skip there is no progress to be made without more input, which is
-            // also what stops this from looping.
+            // Two different answers arrive here and they must not be conflated.
+            //
+            // When minimp3 consumed *less* than it was given, it got past a real
+            // frame it could not decode. Those bytes are behind us.
+            //
+            // When it claims everything it looked at, it means "nothing usable in
+            // here" — and that is not the same as "these bytes are yours to
+            // discard". A frame that simply has not arrived in full looks
+            // identical from here. Any frame beginning within the last
+            // `MAX_FRAME_BYTES` may still be incomplete, so that much is kept,
+            // plus a header's worth minus one for a sync word straddling the
+            // boundary. Everything older than that cannot be an incomplete
+            // frame's start, because its frame would have fit.
+            //
+            // The bound is what keeps a stream of pure garbage from growing the
+            // buffer without limit, and leaving nothing to skip is what stops
+            // this from looping: the caller must wait for more input.
             let hold_back = if consumed >= input.len() {
-                HEADER_BYTES - 1
+                MAX_FRAME_BYTES + HEADER_BYTES - 1
             } else {
                 0
             };
@@ -297,21 +308,38 @@ mod tests {
         );
     }
 
-    /// A sync word split across a chunk boundary must survive to be re-offered
-    /// with the next chunk; consuming it would desynchronise the stream.
+    /// Bytes that might still turn into a frame must survive to be re-offered
+    /// with the next chunk; consuming them would desynchronise the stream.
+    ///
+    /// The three cases are the three ways "no frame yet" arises, and the middle
+    /// one is the one that was got wrong: a frame's first bytes are
+    /// indistinguishable, from minimp3's answer alone, from bytes worth nothing.
     #[test]
-    fn a_split_header_is_held_back_rather_than_consumed() {
+    fn bytes_that_may_still_become_a_frame_are_held_back() {
+        // A sync word split across a chunk boundary.
         assert!(matches!(
             Mp3FrameDecoder::new().decode(&[0xFF, 0xFB, 0x90]),
             Mp3Step::NeedMoreData
         ));
 
-        // And a buffer of pure noise must still make progress, or a stream that
-        // opened with a large tag would never advance.
-        let noise = vec![0x5Au8; 512];
+        // The front of a real frame that has not fully arrived. Discarding this
+        // is silent data loss, and minimp3 reports it exactly as it reports
+        // garbage: by claiming every byte it looked at.
+        let frame = mp3_fixture::stream(1);
+        let partial = &frame[..mp3_fixture::FRAME_BYTES / 3];
+        assert!(matches!(
+            Mp3FrameDecoder::new().decode(partial),
+            Mp3Step::NeedMoreData
+        ));
+
+        // Pure noise must still make progress, or a stream opening with a large
+        // tag would grow the buffer without limit. What is retained is bounded by
+        // the largest frame that could still be incomplete.
+        let noise = vec![0x5Au8; 4096];
+        let retained = MAX_FRAME_BYTES + HEADER_BYTES - 1;
         assert!(matches!(
             Mp3FrameDecoder::new().decode(&noise),
-            Mp3Step::Skipped(skipped) if skipped == noise.len() - (HEADER_BYTES - 1)
+            Mp3Step::Skipped(skipped) if skipped == noise.len() - retained
         ));
     }
 }

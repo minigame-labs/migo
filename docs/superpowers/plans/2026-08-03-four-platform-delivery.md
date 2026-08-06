@@ -1795,14 +1795,22 @@ review. A commit alone is not completion evidence.
   **Mutation evidence.** Each mutant killed the named tests and nothing else:
 
   - Rebuilding the decoder per decode: the chunk gate (**512 events, 2,886,656
-    bytes**) *and* the chunked-versus-one-pass reftest.
+    bytes**) *and* both correctness tests — the chunked-versus-one-pass reftest
+    and the trailing-tag one.
   - The resampler's `to_vec` history: the chunk gate alone, at **256 events, 2048
     bytes** — exactly one per frame, eight bytes each.
   - A loan that never returns: the chunk gate alone, at **128 events, 16,777,216
     bytes** — exactly one 128 KiB buffer per chunk.
-  - Removing the lookahead: the reftest and
-    `the_decode_step_leaves_the_shared_streaming_worker_free`, whose fidelity
-    assertion about the retained buffer is sensitive to it.
+  - Removing the lookahead: both correctness tests, and neither allocation gate,
+    which is right — losing the reservoir costs audio, not memory.
+
+  Re-run in full after the `Skipped` fix, since that changed what `decode` means
+  by a byte it did not use. One result moved and moved for the better: removing
+  the lookahead no longer kills
+  `the_decode_step_leaves_the_shared_streaming_worker_free`. That test asserts the
+  decoder retained a chunk it could not decode, and it used to be sensitive to the
+  lookahead constant; now the hold-back retains it for its own reasons, so the
+  assertion says what it means rather than what the constant happened to imply.
 
   The loan's identity is asserted by address as well, because a pool that quietly
   allocated a fresh buffer each time satisfies every other observable property and
@@ -1812,6 +1820,52 @@ review. A commit alone is not completion evidence.
   same frame decoder, which removes the per-frame `Vec<i16>` from every audio load
   — roughly seven thousand allocations for a three-minute track — and one full
   copy with it.
+
+  **How much audio the reservoir fix is actually worth, measured against the
+  code it replaced.** The per-chunk decoder was not losing an occasional frame;
+  it was losing most of them. Running the old algorithm inline against the same
+  bytes, with no trailing tag at all:
+
+  | stream | per-chunk decoder (before) | persistent decoder (after) |
+  | --- | --- | --- |
+  | 40 frames | **14 of 40** | **40 of 40** |
+  | 6 frames | 2 of 6 | 6 of 6 |
+  | 40 frames + ID3v1 tag | 13 of 40 | 39 of 40 |
+
+  That is the defect stated as audio rather than as allocations: about two thirds
+  of a streamed track was being dropped, silently, with no error on any path.
+
+  **One cell where this is worse than what it replaced, stated because the whole
+  point of this section is that omissions get named.** A stream whose entire body
+  is shorter than the lookahead decodes nothing until the flush and meets a
+  decoder there that has never run; minimp3's cold path will not accept a frame it
+  cannot chain to a successor, so if that stream *also* ends in bytes that are not
+  audio, the chain check fails at the tag and every frame is rejected — 0 of 6,
+  against 2 of 6 before. That is under ~0.2 s of 128 kb/s audio, so only very
+  short remote clips reach it.
+
+  Decoding eagerly until the first frame lands was tried and **made things
+  worse**, which is why the lookahead is unconditional: it recovered that case
+  only partly (1 frame of 6) while costing a frame on streams that had been exact
+  (23 of 24). Closing it properly means parsing frame lengths here instead of
+  asking minimp3 for them, which is a bigger change than the case justifies. The
+  committed test asserts the invariant for streams longer than the lookahead and
+  says in its own doc comment why the shorter one is absent, rather than quietly
+  choosing a fixture that passes.
+
+  **That experiment did find a real latent defect, though, and it is fixed.**
+  `Mp3Step::Skipped` was conflating two different answers. When minimp3 consumes
+  *less* than it was given it has got past a real frame it could not decode; when
+  it claims everything it looked at it means "nothing usable here" — and a frame
+  that has merely not arrived in full is indistinguishable from garbage at that
+  point. The old rule held back three bytes, enough for a split sync word and not
+  enough for a partial frame, so a `decode` called on a buffer without a complete
+  frame would discard the front of one. Nothing reached it, because the lookahead
+  guarantees a complete frame is present — safe by accident of a constant rather
+  than by construction. It now holds back `MAX_FRAME_BYTES + 3`: any frame that
+  began later than that could still be incomplete, and anything older cannot be,
+  because its frame would have fit. The bound is what keeps pure garbage from
+  growing the buffer without limit.
 
   **What is still not gated, named rather than implied:** the network side. The
   reqwest body stream, the response handling and the `OffWorker` hop each allocate

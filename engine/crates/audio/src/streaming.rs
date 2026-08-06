@@ -520,6 +520,22 @@ impl Mp3StreamDecoder {
     ///
     /// Leaves a lookahead behind the cursor so minimp3 can confirm the next
     /// frame's header and keep its state; see [`STREAM_LOOKAHEAD_BYTES`].
+    ///
+    /// **Known limitation, measured rather than assumed.** A stream whose whole
+    /// body is shorter than the lookahead decodes nothing until the flush, and
+    /// the flush then meets a decoder that has never run. minimp3's cold path
+    /// will not accept a frame it cannot chain to a successor, so if such a
+    /// stream also ends in bytes that are not audio — an ID3v1 tag is 128 bytes
+    /// at the end of a large fraction of real files — the chain check fails at
+    /// the tag and every frame is rejected. Under ~0.2 s of 128 kb/s audio, so
+    /// only very short remote clips are exposed.
+    ///
+    /// Decoding eagerly until the first frame lands was tried and made things
+    /// worse, which is why the constant is unconditional: it recovered that case
+    /// only partly (1 frame of 6) while costing a frame on streams that were
+    /// previously exact (23 of 24 instead of 24 of 24). Closing it properly means
+    /// parsing frame lengths here rather than asking minimp3 for them, which is
+    /// a bigger change than the case justifies.
     fn decode_into(&mut self, out: &mut Vec<f32>) -> (u32, u32) {
         self.decode_with_lookahead(STREAM_LOOKAHEAD_BYTES, out)
     }
@@ -722,6 +738,51 @@ mod tests {
             "a chunked stream lost or invented samples"
         );
         assert_eq!(chunked, one_pass.samples);
+    }
+
+    /// A stream that ends in bytes that are not audio must still decode.
+    ///
+    /// An ID3v1 tag is 128 bytes at the very end of a large fraction of real MP3
+    /// files, and minimp3 will not accept a frame it cannot chain to a successor,
+    /// so the frame immediately before such a tag is lost. That single frame —
+    /// 26 ms at the end of a track — is the accepted cost; what is asserted here
+    /// is that it is *one* frame and not the stream.
+    ///
+    /// **Only streams longer than the lookahead are asserted here, and that is a
+    /// stated limitation rather than a convenient choice of input.** A stream
+    /// whose whole body fits inside the lookahead decodes nothing until the
+    /// flush and meets a cold decoder there, which rejects the whole chain; see
+    /// `Mp3StreamDecoder::decode_into`. Measured at 0 frames of 6, against 2 of 6
+    /// for the per-chunk decoder this replaced — worse in that one cell, and
+    /// better everywhere else, which is why it is written down here instead of
+    /// being covered by picking a longer fixture and saying nothing.
+    #[test]
+    fn a_stream_ending_in_a_tag_loses_at_most_its_final_frame() {
+        let id3v1 = {
+            let mut tag = b"TAG".to_vec();
+            tag.resize(128, 0);
+            tag
+        };
+
+        for frames in [40usize, 96] {
+            let mut source = mp3_fixture::stream(frames);
+            source.extend_from_slice(&id3v1);
+
+            let mut decoder = Mp3StreamDecoder::new(mp3_fixture::SAMPLE_RATE);
+            let mut out = Vec::new();
+            for chunk in source.chunks(137) {
+                decoder.push_data(chunk);
+                decoder.decode_into(&mut out);
+            }
+            decoder.flush_into(&mut out);
+
+            let decoded = out.len() / mp3_fixture::SAMPLES_PER_FRAME;
+            assert!(
+                decoded >= frames - 1,
+                "a {frames}-frame stream ending in an ID3v1 tag decoded {decoded} frames; \
+                 at most the final frame may be lost to the tag"
+            );
+        }
     }
 
     /// The loan has to come back, and come back empty.
