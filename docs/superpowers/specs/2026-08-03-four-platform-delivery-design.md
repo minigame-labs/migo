@@ -653,8 +653,11 @@ These are enforced by tests, not by inspection:
   the per-`fillText` text texture cache hit, the decoded-image cache's lookup and
   its pin/unpin pair, the per-call image texture resolve above it that
   `texSubImage2D(image)` takes, the render command path's two enqueues — the
-  per-command one and the batched submit — the audio graph's per-quantum
-  render on the output thread, and **the frame boundary itself**: building a frame
+  per-command one and the batched submit — **the whole of the audio path**: the
+  graph's per-quantum render, the audio thread's own five-millisecond tick
+  (draining the stream, mixing a block and emitting the events that block raised),
+  the hardware output callback, and the streaming refill from a network chunk to
+  decoded PCM — and **the frame boundary itself**: building a frame
   packet and running both phases of its execution, which reaches the heap zero
   times in steady state now that the packet's op vector is pooled, the phase
   reorder no longer materialises a reordered packet, and the reorder's admission
@@ -668,12 +671,30 @@ These are enforced by tests, not by inspection:
   fail when one appears. It now additionally requires that the real gates exist,
   since deleting a test is the one failure a test cannot report about itself.
 
+  **One path needed the burst pointed at first calls rather than steady ones, and
+  it did not need a new mechanism.** The output callback runs on a real-time
+  scheduled thread, where the first call is as deadline-bound as the
+  ten-thousandth and stream recovery rebuilds the callback with a device buffer
+  size nobody chose; a steady-state window cannot see a buffer that only ever
+  grows, because the one resize happens during the warm-up. Running each iteration
+  against a subject that has never run — a fleet of one-shot callbacks built
+  before the measured window — measures first calls exactly, using the burst
+  exactly as it is. Demonstrated both ways: the pre-fix buffer fails the
+  first-call gate and passes the steady one, and an allocation on the path only
+  the steady gate exercises does the reverse.
+
   **Not covered, and named rather than implied.** The BLE notification path's Rust
   half is `cfg(target_os = "android")`, so a host test binary never compiles it and
   the gate cannot run there; its Java half needs a JVM mechanism entirely, because a
-  Rust allocator observes nothing the JVM allocates. The audio path is measured at
-  its graph render only; `audio_thread`'s scheduling, `output`'s device handoff and
-  `streaming`'s refill are not. Within the frame boundary, the render path's three
+  Rust allocator observes nothing the JVM allocates. Of the audio path, what is
+  measured stops where a device or a socket begins: the rest of `run_audio_thread`
+  — the command drain, the decode-result drain and the refill loop's write into
+  the ring — needs an `AudioOutput`, so what is lifted out and gated is the
+  per-player work one tick performs; that cpal calls the output callback at all,
+  and that the thread it calls it on is the real-time one, needs a device, and on
+  Android a device running Android; and the streaming gate starts where the bytes
+  are already in hand, so the reqwest body stream and the hop onto the blocking
+  worker are uncovered. Within the frame boundary, the render path's three
   per-frame canvas-id sets are one gated type, but its two remaining call sites —
   the WebGL batch executor and the packet builder — carry no gate of their own,
   because one needs a live GL context and the other a pool no neighbouring test is

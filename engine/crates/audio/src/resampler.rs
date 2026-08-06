@@ -12,9 +12,13 @@ pub struct StreamResampler {
     /// Rate ratio as 16.16 fixed point (input_rate / output_rate).
     ratio: u64,
     /// Last input frame of the previous chunk (`channels` samples), used as the virtual
-    /// prefix so interpolation stays continuous across chunk boundaries. `None` before
+    /// prefix so interpolation stays continuous across chunk boundaries. Empty before
     /// the first chunk.
-    history: Option<Vec<f32>>,
+    ///
+    /// One buffer, refilled in place. It used to be rebuilt with `to_vec` on every
+    /// call, which on the streaming path meant one allocation per MP3 frame for
+    /// as few as two samples.
+    history: Vec<f32>,
 }
 
 impl StreamResampler {
@@ -26,27 +30,21 @@ impl StreamResampler {
             channels,
             position: 0,
             ratio,
-            history: None,
+            history: Vec::with_capacity(channels as usize),
         }
     }
 
-    /// Process interleaved samples, returns resampled interleaved output.
+    /// Resample `input`, **appending** the result to `output`.
     ///
     /// Streaming-safe: an output frame whose right-hand interpolation neighbour would
     /// fall in the *next* chunk is deferred (the read position carries over) rather than
     /// approximated, so concatenating the per-chunk outputs equals a single-pass resample
     /// of the whole stream — no sample is skipped or duplicated at a chunk boundary.
-    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
-        let mut output = Vec::new();
-        self.process_into(input, &mut output);
-        output
-    }
-
-    /// Resample `input`, **appending** the result to `output`.
     ///
-    /// Appending (rather than allocating a fresh `Vec` per call) lets a caller
-    /// resample a large buffer chunk-by-chunk into one destination without a
-    /// temporary allocation + copy per chunk.
+    /// Appending into a caller-owned buffer is the only shape offered on purpose.
+    /// The convenience wrapper that returned a fresh `Vec` was the streaming
+    /// decoder's per-frame allocation, and an allocating call left available is
+    /// one a future caller will reach for.
     pub fn process_into(&mut self, input: &[f32], output: &mut Vec<f32>) {
         let channels = self.channels as usize;
         if channels == 0 || input.is_empty() {
@@ -59,15 +57,18 @@ impl StreamResampler {
             return;
         }
 
-        // Virtual input = [previous chunk's last frame] ++ this chunk.
-        let prefix = self.history.take();
-        let work_len = n_chunk + usize::from(prefix.is_some());
+        // Virtual input = [previous chunk's last frame] ++ this chunk. Taken out
+        // rather than borrowed so the same allocation can be refilled below,
+        // after the closure that reads it has gone.
+        let mut prefix = std::mem::take(&mut self.history);
+        let has_prefix = !prefix.is_empty();
+        let work_len = n_chunk + usize::from(has_prefix);
 
         let virtual_at = |frame: usize, ch: usize| -> f32 {
-            match &prefix {
-                Some(p) if frame == 0 => p[ch],
-                Some(_) => input[(frame - 1) * channels + ch],
-                None => input[frame * channels + ch],
+            match (has_prefix, frame) {
+                (true, 0) => prefix[ch],
+                (true, _) => input[(frame - 1) * channels + ch],
+                (false, _) => input[frame * channels + ch],
             }
         };
 
@@ -94,7 +95,9 @@ impl StreamResampler {
         self.position -= consumed << 16;
 
         let last_frame_start = (n_chunk - 1) * channels;
-        self.history = Some(input[last_frame_start..last_frame_start + channels].to_vec());
+        prefix.clear();
+        prefix.extend_from_slice(&input[last_frame_start..last_frame_start + channels]);
+        self.history = prefix;
     }
 }
 
@@ -236,7 +239,8 @@ mod tests {
             samples.push(-(i as f32) * 2.0); // channel 1
         }
 
-        let single = StreamResampler::new(input_rate, output_rate, channels).process(&samples);
+        let mut single = Vec::new();
+        StreamResampler::new(input_rate, output_rate, channels).process_into(&samples, &mut single);
 
         let audio = DecodedAudio {
             samples,

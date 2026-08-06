@@ -9,7 +9,7 @@ use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::op_state::HostTx;
 use shared::protocol::audio_cmd::{
     AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId, AudioResp,
-    InnerAudioId, InnerAudioInfo, InnerAudioState,
+    InnerAudioEvent, InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
 use shared::protocol::host_cmd::HostCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -520,6 +520,42 @@ fn calculate_process_frames(sample_rate: u32) -> usize {
     let frames = (sample_rate as f32 * target_ms / 1000.0) as usize;
     // Round up to nearest power of 2 for better cache alignment
     frames.next_power_of_two().max(512).min(4096)
+}
+
+/// Step 3 of one audio-thread tick: service every player once — drain what the
+/// network delivered, adopt a finished stream into the cache, and hand out the
+/// events the player raised.
+///
+/// A free function over an event sink rather than a method on the loop's locals,
+/// because this is the tick's steady per-player work and Section 7.3 requires it
+/// to be measured. `HostTx` and `AudioOutput` are the two things a host test
+/// binary cannot build; the sink removes the first and this step never touches
+/// the second. The production call site passes a closure over `host_tx`, which
+/// captures by reference and allocates nothing.
+fn service_players(
+    inner_players: &mut HashMap<InnerAudioId, InnerAudioPlayer>,
+    audio_cache: &GlobalAudioCache,
+    mut emit: impl FnMut(InnerAudioEvent),
+) {
+    for player in inner_players.values_mut() {
+        player.poll_stream();
+
+        // Cache completed streaming audio
+        if player.is_stream_complete() {
+            if let Some(url) = player.loading_url().map(|s| s.to_string()) {
+                if let Some(audio) = player.take_streamed_audio() {
+                    let cached = audio_cache.insert(url, audio);
+                    // Update player to use cached reference
+                    player.load_cached(cached);
+                }
+            }
+        }
+
+        // Hand the player's events to the caller
+        for event in player.drain_events() {
+            emit(event);
+        }
+    }
 }
 
 fn wait_for_audio_work(wakeup: &ThreadWakeup, mode: AudioWaitMode) {
@@ -1840,44 +1876,28 @@ fn run_audio_thread(
         //    twice (steps 3+4 merged). Step 7 (audio processing) remains
         //    separate because it runs conditionally inside a nested loop.
         // -----------------------------------------------------------------
-        for player in inner_players.values_mut() {
-            player.poll_stream();
-
-            // Cache completed streaming audio
-            if player.is_stream_complete() {
-                if let Some(url) = player.loading_url().map(|s| s.to_string()) {
-                    if let Some(audio) = player.take_streamed_audio() {
-                        let cached = audio_cache.insert(url, audio);
-                        // Update player to use cached reference
-                        player.load_cached(cached);
-                    }
-                }
-            }
-
-            // Push player events to the host thread
-            for event in player.take_events() {
-                tracing::trace!(
-                    "Pushing InnerAudio event: id={}, type={:?}, time={:.2}s",
-                    event.id,
-                    event.event_type,
-                    event.current_time
+        service_players(&mut inner_players, &audio_cache, |event| {
+            tracing::trace!(
+                "Pushing InnerAudio event: id={}, type={:?}, time={:.2}s",
+                event.id,
+                event.event_type,
+                event.current_time
+            );
+            let ev_id = event.id;
+            let ev_type = event.event_type;
+            if let Err(e) = host_tx.try_send(HostCommand::InnerAudioEvent {
+                id: event.id,
+                event_type: event.event_type,
+                current_time: event.current_time,
+            }) {
+                tracing::warn!(
+                    "Failed to send audio event (id={}, type={:?}): {}",
+                    ev_id,
+                    ev_type,
+                    e
                 );
-                let ev_id = event.id;
-                let ev_type = event.event_type;
-                if let Err(e) = host_tx.try_send(HostCommand::InnerAudioEvent {
-                    id: event.id,
-                    event_type: event.event_type,
-                    current_time: event.current_time,
-                }) {
-                    tracing::warn!(
-                        "Failed to send audio event (id={}, type={:?}): {}",
-                        ev_id,
-                        ev_type,
-                        e
-                    );
-                }
             }
-        }
+        });
 
         // -----------------------------------------------------------------
         // 5. Determine management and audible-output activity independently.
@@ -2012,6 +2032,7 @@ fn run_audio_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
 
     #[test]
     fn decode_pool_starts_only_when_first_job_is_submitted() {
@@ -2029,6 +2050,84 @@ mod tests {
 
         assert!(pool.is_started());
         assert!(result_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    /// Section 7.3's steady-state allocation gate, applied to the audio thread's
+    /// own tick.
+    ///
+    /// The tick is what runs 200 times a second while anything is audible, so a
+    /// per-tick allocation is a per-5ms allocation on the thread that must never
+    /// be late. Three pieces of steady work are covered here and nowhere else:
+    /// draining what the network delivered (`poll_stream`), mixing one block
+    /// (`process`), and handing out the events the block raised.
+    ///
+    /// **The events are the point.** A block that crosses the `TimeUpdate`
+    /// throttle raises one, and every player raises one roughly four times a
+    /// second forever. The graph gate in `context.rs` cannot see this: it renders
+    /// a quantum, and `InnerAudioPlayer` is the other half of the mixer.
+    ///
+    /// The warm-up covers the source vector's first fill and the stream
+    /// receiver's first poll. Every iteration then delivers exactly one chunk and
+    /// consumes exactly one block, so the buffered depth is stationary and the
+    /// measured window is genuine steady state rather than a drain.
+    #[test]
+    fn a_steady_state_audio_thread_tick_never_reaches_the_heap() {
+        const OUTPUT_CHANNELS: u32 = 2;
+        const SAMPLE_RATE: u32 = 48_000;
+        // One block per tick, and one chunk in per block out, so nothing drifts.
+        const BLOCK_FRAMES: usize = 1024;
+        const CHUNK_SAMPLES: usize = BLOCK_FRAMES * OUTPUT_CHANNELS as usize;
+
+        let cache = GlobalAudioCache::new();
+        let mut players: HashMap<InnerAudioId, InnerAudioPlayer> = HashMap::with_capacity(1);
+
+        // The stream feed. Capacity for every iteration's chunk, filled before the
+        // burst: a send that blocked or a channel that grew would be measuring the
+        // harness rather than the tick.
+        let total_iterations = 8 + 64;
+        let (tx, rx) = tokio::sync::mpsc::channel::<streaming::StreamMsg>(total_iterations + 1);
+        let state = StreamingState::new();
+
+        let mut player = InnerAudioPlayer::new(1, OUTPUT_CHANNELS);
+        player.start_streaming("http://example/track.mp3".into(), rx, state);
+        player.shared.set_sample_rate(SAMPLE_RATE);
+        player.shared.set_channels(OUTPUT_CHANNELS);
+        player.shared.set_loaded(true);
+        player.shared.set_state(PlaybackState::Playing);
+        players.insert(1, player);
+
+        // Real loaned buffers, not bare vectors: returning one is what the player
+        // does with every chunk, and it happens inside the measured window.
+        let mut pool = streaming::PcmPool::new();
+        for _ in 0..total_iterations {
+            let mut pcm = pool.take();
+            pcm.buffer_mut().resize(CHUNK_SAMPLES, 0.0);
+            tx.try_send(streaming::StreamMsg::Samples(pcm))
+                .expect("the feed must be sized for the whole burst");
+        }
+
+        let mut block = vec![0.0f32; BLOCK_FRAMES * OUTPUT_CHANNELS as usize];
+        let mut events = 0usize;
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "audio: one audio-thread tick (poll the stream, mix a block, emit events)",
+                warmup: 8,
+                measured: 64,
+            },
+            |_| {
+                service_players(&mut players, &cache, |_| events += 1);
+                block.fill(0.0);
+                for player in players.values_mut() {
+                    player.process(&mut block);
+                }
+            },
+        );
+
+        assert!(
+            events > 0,
+            "the burst must have raised player events, or it proves nothing about emitting them"
+        );
     }
 
     #[test]

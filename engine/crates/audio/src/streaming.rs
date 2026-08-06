@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use tokio::sync::{Notify, mpsc};
-use tracing::{debug, warn};
+use tracing::debug;
 
+use crate::decoder::mp3::{Mp3FrameDecoder, Mp3Step, STREAM_LOOKAHEAD_BYTES, append_as_f32};
 use crate::off_worker::OffWorker;
 
 /// Keep only a small number of decoded chunks ahead of the audio thread.
@@ -65,11 +66,86 @@ pub enum StreamMsg {
     /// Audio format detected, can start playback
     Ready { sample_rate: u32, channels: u32 },
     /// New decoded samples available
-    Samples(Vec<f32>),
+    Samples(PcmChunk),
     /// Download/decode complete
     Done,
     /// Error occurred
     Error(String),
+}
+
+/// Samples a recycled PCM buffer starts out able to hold.
+///
+/// Roughly a third of a second of 48 kHz stereo, which covers the network chunk
+/// sizes reqwest actually delivers. A larger chunk grows the buffer once and the
+/// recycled buffer keeps the larger capacity, so growth is paid at most once per
+/// stream rather than once per chunk.
+const PCM_CHUNK_SAMPLES: usize = 32 * 1024;
+
+/// Decoded PCM on loan from the stream that produced it.
+///
+/// A decoded chunk has to change threads, so it has to be owned; without a way
+/// back, every chunk is one allocation on the streaming worker and one free on
+/// the audio thread, forever, for as long as anything is playing. Handing the
+/// buffer back is a `Drop` rather than a call the consumer has to remember,
+/// which is the same instrument the render path's command vectors use: there is
+/// no recycle step to forget.
+pub struct PcmChunk {
+    buffer: Vec<f32>,
+    home: mpsc::Sender<Vec<f32>>,
+}
+
+impl PcmChunk {
+    /// The buffer to decode into. Only the producer has one of these before it
+    /// is sent, so this cannot be used to mutate a chunk in flight.
+    pub(crate) fn buffer_mut(&mut self) -> &mut Vec<f32> {
+        &mut self.buffer
+    }
+}
+
+impl std::ops::Deref for PcmChunk {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl Drop for PcmChunk {
+    fn drop(&mut self) {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.clear();
+        // Never blocks and never grows. A full return channel means the producer
+        // already holds more buffers than it can be using, and a closed one means
+        // the stream is gone; either way this buffer is simply released. That
+        // matters because the common caller is the audio thread.
+        let _ = self.home.try_send(buffer);
+    }
+}
+
+/// The producer's half of the loan: hands out chunks, takes back what returns.
+pub(crate) struct PcmPool {
+    home: mpsc::Sender<Vec<f32>>,
+    returns: mpsc::Receiver<Vec<f32>>,
+}
+
+impl PcmPool {
+    pub(crate) fn new() -> Self {
+        // One slot more than can be in flight, so a healthy stream never fails a
+        // return for want of room.
+        let (home, returns) = mpsc::channel(STREAM_CHANNEL_CAPACITY + 1);
+        Self { home, returns }
+    }
+
+    pub(crate) fn take(&mut self) -> PcmChunk {
+        let buffer = self
+            .returns
+            .try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(PCM_CHUNK_SAMPLES));
+        PcmChunk {
+            buffer,
+            home: self.home.clone(),
+        }
+    }
 }
 
 /// Shared state for streaming progress
@@ -250,6 +326,7 @@ async fn streaming_download_task(
     // Stream the response body
     let mut stream = response.bytes_stream();
     let mut decoder = OffWorker::new(Mp3StreamDecoder::new(target_sample_rate));
+    let mut pcm_pool = PcmPool::new();
     let mut ready_sent = false;
 
     use futures_util::StreamExt;
@@ -314,10 +391,15 @@ async fn streaming_download_task(
         // Feed the chunk to the decoder and take whatever frames it completed. Both
         // are CPU-bound and this task's worker is shared with every other session's
         // download, so the step runs where the worker is not waiting for it.
-        let (rest, (new_samples, sample_rate, channels)) = decoder
+        //
+        // The buffer it decodes into is on loan from the pool: whatever the player
+        // finished with is what this chunk is written into.
+        let mut pcm = pcm_pool.take();
+        let (rest, (pcm, sample_rate, channels)) = decoder
             .with(move |decoder| {
                 decoder.push_data(&chunk);
-                decoder.decode_available()
+                let (sample_rate, channels) = decoder.decode_into(pcm.buffer_mut());
+                (pcm, sample_rate, channels)
             })
             .await?;
         decoder = rest;
@@ -342,26 +424,34 @@ async fn streaming_download_task(
             ready_sent = true;
         }
 
-        // Send decoded samples
-        if !new_samples.is_empty() {
-            total_decoded_samples += new_samples.len();
+        // Send decoded samples. A chunk that decoded to nothing is not sent; it
+        // falls out of scope here, which is what returns its buffer to the pool.
+        if !pcm.is_empty() {
+            total_decoded_samples += pcm.len();
             tracing::trace!(
                 "Decoded {} samples (total: {})",
-                new_samples.len(),
+                pcm.len(),
                 total_decoded_samples
             );
-            if tx.send(StreamMsg::Samples(new_samples)).await.is_err() {
+            if tx.send(StreamMsg::Samples(pcm)).await.is_err() {
                 return Ok(());
             }
         }
     }
 
     // Flush remaining data
-    let (_decoder, (final_samples, _, _)) = decoder.with(Mp3StreamDecoder::flush).await?;
-    if !final_samples.is_empty() {
-        total_decoded_samples += final_samples.len();
-        tracing::trace!("Flushed {} final samples", final_samples.len());
-        if tx.send(StreamMsg::Samples(final_samples)).await.is_err() {
+    let mut final_pcm = pcm_pool.take();
+    let (_decoder, (final_pcm, _, _)) = decoder
+        .with(move |decoder| {
+            let (sample_rate, channels) = decoder.flush_into(final_pcm.buffer_mut());
+            (final_pcm, sample_rate, channels)
+        })
+        .await?;
+
+    if !final_pcm.is_empty() {
+        total_decoded_samples += final_pcm.len();
+        tracing::trace!("Flushed {} final samples", final_pcm.len());
+        if tx.send(StreamMsg::Samples(final_pcm)).await.is_err() {
             return Ok(());
         }
     }
@@ -379,12 +469,23 @@ async fn streaming_download_task(
     Ok(())
 }
 
-/// MP3 streaming decoder
+/// Bytes of undecoded MP3 the receive buffer starts out able to hold.
+///
+/// Enough for a typical network chunk plus the lookahead the decoder keeps
+/// behind its cursor, so the buffer settles at one allocation for the stream.
+const RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// MP3 streaming decoder.
+///
+/// Everything here is owned once and reused: the minimp3 decoder (whose state a
+/// frame's main data is entitled to reach back into), the receive buffer, and
+/// the scratch a frame is converted through on the way to the resampler. What a
+/// chunk costs is a memcpy of its bytes and the samples it produces, and nothing
+/// else.
 struct Mp3StreamDecoder {
-    /// Accumulated raw data
+    frames: Mp3FrameDecoder,
+    /// Bytes received and not yet decoded.
     buffer: Vec<u8>,
-    /// Position of last successful decode
-    decode_pos: usize,
     /// Detected sample rate
     sample_rate: u32,
     /// Detected channels
@@ -393,17 +494,21 @@ struct Mp3StreamDecoder {
     target_sample_rate: u32,
     /// Resampler state (if needed)
     resampler: Option<crate::resampler::StreamResampler>,
+    /// One frame as `f32`, reused. Only the resampling path needs it; without a
+    /// resampler a frame goes straight into the caller's buffer.
+    scratch: Vec<f32>,
 }
 
 impl Mp3StreamDecoder {
     fn new(target_sample_rate: u32) -> Self {
         Self {
-            buffer: Vec::with_capacity(128 * 1024),
-            decode_pos: 0,
+            frames: Mp3FrameDecoder::new(),
+            buffer: Vec::with_capacity(RECEIVE_BUFFER_BYTES),
             sample_rate: 0,
             channels: 0,
             target_sample_rate,
             resampler: None,
+            scratch: Vec::with_capacity(minimp3::MAX_SAMPLES_PER_FRAME),
         }
     }
 
@@ -411,87 +516,72 @@ impl Mp3StreamDecoder {
         self.buffer.extend_from_slice(data);
     }
 
-    /// Decode available frames, returns (samples, sample_rate, channels)
-    fn decode_available(&mut self) -> (Vec<f32>, u32, u32) {
-        let mut samples = Vec::new();
+    /// Decode what the buffer can spare, appending to `out`.
+    ///
+    /// Leaves a lookahead behind the cursor so minimp3 can confirm the next
+    /// frame's header and keep its state; see [`STREAM_LOOKAHEAD_BYTES`].
+    fn decode_into(&mut self, out: &mut Vec<f32>) -> (u32, u32) {
+        self.decode_with_lookahead(STREAM_LOOKAHEAD_BYTES, out)
+    }
 
-        // Create decoder from current buffer position
-        let data_to_decode = &self.buffer[self.decode_pos..];
-        if data_to_decode.is_empty() {
-            return (samples, self.sample_rate, self.channels);
-        }
+    /// Decode everything that is left, for a stream that has ended.
+    fn flush_into(&mut self, out: &mut Vec<f32>) -> (u32, u32) {
+        self.decode_with_lookahead(0, out)
+    }
 
-        let mut decoder = minimp3::Decoder::new(std::io::Cursor::new(data_to_decode));
-        let mut bytes_consumed = 0;
+    fn decode_with_lookahead(&mut self, lookahead: usize, out: &mut Vec<f32>) -> (u32, u32) {
+        let mut pos = 0usize;
 
-        loop {
-            match decoder.next_frame() {
-                Ok(frame) => {
-                    // First frame - detect format
+        while self.buffer.len().saturating_sub(pos) > lookahead {
+            match self.frames.decode(&self.buffer[pos..]) {
+                Mp3Step::NeedMoreData => break,
+                Mp3Step::Skipped(skipped) => pos += skipped,
+                Mp3Step::Frame {
+                    pcm,
+                    sample_rate,
+                    channels,
+                    consumed,
+                } => {
+                    pos += consumed;
+
                     if self.sample_rate == 0 {
-                        self.sample_rate = frame.sample_rate as u32;
-                        self.channels = frame.channels as u32;
+                        self.sample_rate = sample_rate;
+                        self.channels = channels;
 
-                        // Create resampler if needed
-                        if self.sample_rate != self.target_sample_rate {
+                        if sample_rate != self.target_sample_rate {
                             self.resampler = Some(crate::resampler::StreamResampler::new(
-                                self.sample_rate,
+                                sample_rate,
                                 self.target_sample_rate,
-                                self.channels,
+                                channels,
                             ));
                         }
                     }
 
-                    // Convert i16 to f32
-                    let frame_samples: Vec<f32> =
-                        frame.data.iter().map(|&s| s as f32 / 32768.0).collect();
-
-                    // Resample if needed
-                    let output_samples = if let Some(ref mut resampler) = self.resampler {
-                        resampler.process(&frame_samples)
-                    } else {
-                        frame_samples
-                    };
-
-                    samples.extend(output_samples);
-
-                    // Get exact bytes consumed from cursor position
-                    bytes_consumed = decoder.reader().position() as usize;
-                }
-                Err(minimp3::Error::Eof) => break,
-                Err(minimp3::Error::InsufficientData) => break,
-                Err(e) => {
-                    warn!("MP3 decode error: {:?}, skipping", e);
-                    // Try to skip bad data
-                    bytes_consumed += 1;
-                    break;
+                    match self.resampler.as_mut() {
+                        Some(resampler) => {
+                            self.scratch.clear();
+                            append_as_f32(pcm, &mut self.scratch);
+                            resampler.process_into(&self.scratch, out);
+                        }
+                        None => append_as_f32(pcm, out),
+                    }
                 }
             }
         }
 
-        // Update decode position
-        self.decode_pos += bytes_consumed;
-
-        // Trim buffer if it gets too large (keep last 4KB for potential incomplete frame)
-        if self.decode_pos > 64 * 1024 {
-            let keep_from = self.decode_pos.saturating_sub(4096);
-            self.buffer.drain(..keep_from);
-            self.decode_pos -= keep_from;
+        if pos > 0 {
+            self.buffer.drain(..pos);
         }
 
-        (samples, self.sample_rate, self.channels)
-    }
-
-    /// Flush remaining data
-    fn flush(&mut self) -> (Vec<f32>, u32, u32) {
-        // Try one more decode pass
-        self.decode_available()
+        (self.sample_rate, self.channels)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mp3_fixture;
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
     use migo_executor_probe::{PATIENCE, SharedExecutor, assert_leaves_the_executor_free};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::mpsc::error::TrySendError;
@@ -517,7 +607,7 @@ mod tests {
                     .with(move |decoder| {
                         cpu.occupy();
                         decoder.push_data(A_CHUNK);
-                        decoder.decode_available();
+                        decoder.decode_into(&mut Vec::new());
                         decoder.buffer.len()
                     })
                     .await
@@ -530,6 +620,131 @@ mod tests {
             buffered,
             A_CHUNK.len(),
             "the step must have run against the real decoder, not a stand-in"
+        );
+    }
+
+    /// Section 7.3's steady-state allocation gate, applied to the streaming
+    /// refill: one network chunk in, its decoded PCM out.
+    ///
+    /// The unit is a chunk because that is what repeats -- a track is thousands
+    /// of them -- and everything inside it is per-frame, so an allocation here is
+    /// multiplied by however many frames the chunk carried. Resampling is on
+    /// (the fixture is 44.1 kHz, the device 48 kHz), which is the configuration
+    /// most Android devices actually run.
+    ///
+    /// The warm-up covers the decoder's first frame, the resampler's
+    /// construction, every buffer's first growth to a chunk's worth, and the
+    /// return channel's block list reaching its working set -- tokio hands out
+    /// message slots 32 to a block and recycles them, so the list grows once and
+    /// then never again. Forty iterations crosses that boundary; the property was
+    /// checked over 256 measured iterations before this window was chosen, so the
+    /// number is a warm-up and not a hiding place.
+    #[test]
+    fn a_steady_state_streaming_chunk_never_reaches_the_heap() {
+        const WARMUP: usize = 40;
+        const MEASURED: usize = 128;
+        const FRAMES_PER_CHUNK: usize = 2;
+
+        let chunk_bytes = FRAMES_PER_CHUNK * mp3_fixture::FRAME_BYTES;
+        // Built before the measured window, and long enough that no iteration
+        // runs out of input and quietly measures a decoder with nothing to do.
+        let source = mp3_fixture::stream(FRAMES_PER_CHUNK * (WARMUP + MEASURED) + 4);
+        let chunks: Vec<&[u8]> = source.chunks_exact(chunk_bytes).collect();
+        assert!(chunks.len() >= WARMUP + MEASURED);
+
+        let mut decoder = Mp3StreamDecoder::new(48_000);
+        let mut pool = PcmPool::new();
+        let mut decoded_total = 0usize;
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "audio: one streaming chunk decoded and resampled",
+                warmup: WARMUP,
+                measured: MEASURED,
+            },
+            |iteration| {
+                decoder.push_data(chunks[iteration]);
+                // Taken from the pool and dropped again at the end of the
+                // iteration, which is the whole loan: a burst that kept its
+                // buffers would measure the pool draining, not the steady state.
+                let mut pcm = pool.take();
+                decoder.decode_into(pcm.buffer_mut());
+                decoded_total += pcm.len();
+            },
+        );
+
+        assert!(
+            decoded_total > 0,
+            "the burst must have decoded audio, or it proves nothing"
+        );
+    }
+
+    /// A stream cut into chunks must decode to exactly what one pass over the
+    /// same bytes produces.
+    ///
+    /// This is the correctness half of the same change, and it is a reftest
+    /// rather than a golden file because both sides are computed in the same run:
+    /// no baseline to go stale, and no claim about any particular recording. The
+    /// chunk size is deliberately not a multiple of the frame size, so frames are
+    /// split at every offset within them.
+    ///
+    /// What it pins is decoder *state*. Rebuilding the decoder per chunk -- which
+    /// is what constructing one inside the decode step amounted to -- discards
+    /// the bit reservoir, and a frame whose main data lives there then decodes to
+    /// nothing at all: silently short audio, no error anywhere.
+    #[test]
+    fn a_chunked_stream_decodes_to_what_one_pass_over_the_same_bytes_does() {
+        const FRAMES: usize = 24;
+        // Coprime with the frame size, so no chunk boundary lands on a frame one.
+        const CHUNK_BYTES: usize = 137;
+
+        let source = mp3_fixture::stream(FRAMES);
+        let one_pass = crate::decoder::mp3::decode(&source).expect("the fixture must decode");
+
+        // Same rate in and out, so the two sides are comparable sample for sample.
+        let mut decoder = Mp3StreamDecoder::new(mp3_fixture::SAMPLE_RATE);
+        let mut chunked = Vec::new();
+        for chunk in source.chunks(CHUNK_BYTES) {
+            decoder.push_data(chunk);
+            decoder.decode_into(&mut chunked);
+        }
+        decoder.flush_into(&mut chunked);
+
+        assert_eq!(
+            one_pass.samples.len(),
+            FRAMES * mp3_fixture::SAMPLES_PER_FRAME,
+            "the one-pass side must itself be complete, or this compares two \
+             equally broken decodes"
+        );
+        assert_eq!(
+            chunked.len(),
+            one_pass.samples.len(),
+            "a chunked stream lost or invented samples"
+        );
+        assert_eq!(chunked, one_pass.samples);
+    }
+
+    /// The loan has to come back, and come back empty.
+    ///
+    /// Identity is asserted by address: a pool that quietly allocated a fresh
+    /// buffer each time would satisfy every other observable property here, and
+    /// the allocation gate above is the only other thing that would notice.
+    #[test]
+    fn a_returned_chunk_is_the_buffer_the_next_one_is_written_into() {
+        let mut pool = PcmPool::new();
+
+        let mut first = pool.take();
+        first.buffer_mut().extend_from_slice(&[0.5f32; 128]);
+        let lent = first.buffer.as_ptr();
+        assert_eq!(first.len(), 128);
+        drop(first);
+
+        let second = pool.take();
+        assert!(second.is_empty(), "a returned buffer must come back empty");
+        assert_eq!(
+            second.buffer.as_ptr(),
+            lent,
+            "the next chunk must be written into the buffer the last one returned"
         );
     }
 

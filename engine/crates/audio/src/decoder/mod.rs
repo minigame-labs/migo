@@ -1,4 +1,4 @@
-mod mp3;
+pub(crate) mod mp3;
 mod ogg;
 mod wav;
 

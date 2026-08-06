@@ -1,31 +1,187 @@
-use minimp3::{Decoder, Frame};
+use std::ffi::c_int;
+
+use minimp3::ffi;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 
 use super::DecodedAudio;
 
+/// Largest MPEG-1 Layer III frame in bytes (320 kb/s at 32 kHz, padded).
+const MAX_FRAME_BYTES: usize = 1441;
+
+/// Bytes an MP3 frame header occupies.
+const HEADER_BYTES: usize = 4;
+
+/// Bytes that must stay unread behind the decode cursor while a stream's buffer
+/// is still growing.
+///
+/// minimp3 keeps `mp3dec_t` -- the bit reservoir included -- only when it can
+/// confirm the *next* frame's header in the same buffer; when it cannot, it
+/// wipes the decoder and searches from scratch. Decoding right up to the end of
+/// a partially received buffer therefore throws the reservoir away at every
+/// chunk boundary, and an MP3 frame whose main data lives in that reservoir then
+/// decodes to nothing at all. Two maximum frames of slack keeps the confirmation
+/// available; at 128 kb/s that is under a quarter of a second of hold-back, well
+/// inside the half second of buffering the player already waits for.
+pub(crate) const STREAM_LOOKAHEAD_BYTES: usize = 2 * MAX_FRAME_BYTES;
+
+/// What one call to [`Mp3FrameDecoder::decode`] did with the bytes it was given.
+pub(crate) enum Mp3Step<'a> {
+    /// A frame decoded. `pcm` is interleaved and borrowed from the decoder's own
+    /// buffer, so it is valid until the next `decode`.
+    Frame {
+        pcm: &'a [i16],
+        sample_rate: u32,
+        channels: u32,
+        consumed: usize,
+    },
+    /// Bytes carried no audio -- an ID3 tag, padding, or garbage -- and belong to
+    /// nobody. Skipping them is progress.
+    Skipped(usize),
+    /// Not enough input to decide anything. The caller must keep what it has.
+    NeedMoreData,
+}
+
+/// One minimp3 decoder that lives as long as the stream does, plus the fixed
+/// buffer a frame decodes into.
+///
+/// **Both halves of that sentence are load-bearing.** Constructing a decoder per
+/// chunk allocated three times over -- the 6.6 KiB `mp3dec_t`, a
+/// virtual-memory-backed ring, and an 11 KiB refill buffer -- and, worse, reset
+/// the bit reservoir and the MDCT overlap that MP3 frames are entitled to
+/// inherit from their predecessors. Decoding into a buffer the decoder owns is
+/// what removes the per-frame `Vec<i16>` the safe wrapper allocates and hands
+/// back; at 1152 samples a frame that is one allocation every 26 ms of audio.
+pub(crate) struct Mp3FrameDecoder {
+    state: Box<ffi::mp3dec_t>,
+    /// Sized by minimp3's documented maximum for a single frame, which is the
+    /// contract the `pcm` pointer below is passed under.
+    pcm: Box<[i16; minimp3::MAX_SAMPLES_PER_FRAME]>,
+}
+
+impl Mp3FrameDecoder {
+    pub(crate) fn new() -> Self {
+        // `mp3dec_init` only invalidates the cached header; the rest of the
+        // struct is the decoder's state and must start zeroed.
+        let mut state = Box::new(ffi::mp3dec_t {
+            mdct_overlap: [[0.0; 288]; 2],
+            qmf_state: [0.0; 960],
+            reserv: 0,
+            free_format_bytes: 0,
+            header: [0; 4],
+            reserv_buf: [0; 511],
+        });
+        // SAFETY: `state` is a live, correctly aligned, fully initialised
+        // `mp3dec_t` owned by this struct.
+        unsafe { ffi::mp3dec_init(&mut *state) };
+
+        Self {
+            state,
+            pcm: Box::new([0; minimp3::MAX_SAMPLES_PER_FRAME]),
+        }
+    }
+
+    /// Decode at most one frame from the front of `input`.
+    ///
+    /// The whole remaining buffer should be passed, not one frame's worth:
+    /// minimp3's state-preserving fast path is conditional on the next header
+    /// being visible.
+    pub(crate) fn decode<'a>(&'a mut self, input: &[u8]) -> Mp3Step<'a> {
+        if input.is_empty() {
+            return Mp3Step::NeedMoreData;
+        }
+
+        let mut info = ffi::mp3dec_frame_info_t {
+            frame_bytes: 0,
+            frame_offset: 0,
+            channels: 0,
+            hz: 0,
+            layer: 0,
+            bitrate_kbps: 0,
+        };
+
+        // SAFETY: `input` is a readable slice of `len` bytes and `len` is its own
+        // length clamped to what the C signature can carry; `pcm` points at
+        // `MINIMP3_MAX_SAMPLES_PER_FRAME` writable samples, which is the maximum
+        // one frame can produce and the size minimp3 documents for this pointer;
+        // `state` is an initialised `mp3dec_t` owned here and borrowed uniquely
+        // for this call. Nothing borrowed escapes the call.
+        let len = input.len().min(c_int::MAX as usize) as c_int;
+        let samples_per_channel = unsafe {
+            ffi::mp3dec_decode_frame(
+                &mut *self.state,
+                input.as_ptr(),
+                len,
+                self.pcm.as_mut_ptr(),
+                &mut info,
+            )
+        };
+
+        let consumed = info.frame_bytes.max(0) as usize;
+
+        if samples_per_channel <= 0 {
+            // minimp3 reports "no frame in here" by claiming everything it
+            // looked at. Hold back a header's worth minus one: a sync word can
+            // straddle a chunk boundary, and consuming it would desynchronise
+            // the stream against the next chunk. When that leaves nothing to
+            // skip there is no progress to be made without more input, which is
+            // also what stops this from looping.
+            let hold_back = if consumed >= input.len() {
+                HEADER_BYTES - 1
+            } else {
+                0
+            };
+            return match consumed.saturating_sub(hold_back) {
+                0 => Mp3Step::NeedMoreData,
+                skip => Mp3Step::Skipped(skip),
+            };
+        }
+
+        let channels = info.channels.max(1) as usize;
+        let total = (samples_per_channel as usize).saturating_mul(channels);
+        debug_assert!(total <= minimp3::MAX_SAMPLES_PER_FRAME);
+
+        Mp3Step::Frame {
+            pcm: &self.pcm[..total.min(minimp3::MAX_SAMPLES_PER_FRAME)],
+            sample_rate: info.hz.max(0) as u32,
+            channels: channels as u32,
+            consumed,
+        }
+    }
+}
+
+/// Convert one interleaved `i16` frame to normalized `f32`, appending.
+#[inline]
+pub(crate) fn append_as_f32(pcm: &[i16], out: &mut Vec<f32>) {
+    out.extend(pcm.iter().map(|&sample| f32::from(sample) / 32768.0));
+}
+
 pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
-    let mut decoder = Decoder::new(data);
+    let mut frames = Mp3FrameDecoder::new();
 
     let mut samples: Vec<f32> = Vec::new();
     let mut sample_rate = 0u32;
     let mut channels = 0u32;
+    let mut pos = 0usize;
 
-    loop {
-        match decoder.next_frame() {
-            Ok(Frame {
-                data: frame_data,
+    while pos < data.len() {
+        match frames.decode(&data[pos..]) {
+            Mp3Step::NeedMoreData => break,
+            Mp3Step::Skipped(skipped) => pos += skipped,
+            Mp3Step::Frame {
+                pcm,
                 sample_rate: sr,
                 channels: ch,
-                ..
-            }) => {
+                consumed,
+            } => {
+                pos += consumed;
                 if sample_rate == 0 {
-                    sample_rate = sr as u32;
-                    channels = ch as u32;
+                    sample_rate = sr;
+                    channels = ch;
                 }
 
                 // Reject a decode bomb before growing the buffer.
                 if !crate::limits::pcm_samples_within_budget(
-                    samples.len().saturating_add(frame_data.len()),
+                    samples.len().saturating_add(pcm.len()),
                 ) {
                     return Err(EngineError::from_detail(
                         ErrorCode::InvalidArgument,
@@ -33,17 +189,7 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
                     ));
                 }
 
-                // Convert i16 to f32
-                for s in frame_data {
-                    samples.push(s as f32 / 32768.0);
-                }
-            }
-            Err(minimp3::Error::Eof) => break,
-            Err(e) => {
-                return Err(EngineError::from_detail(
-                    ErrorCode::InvalidArgument,
-                    format!("MP3 decode error: {:?}", e),
-                ));
+                append_as_f32(pcm, &mut samples);
             }
         }
     }
@@ -60,4 +206,112 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
         sample_rate,
         channels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mp3_fixture;
+
+    /// The fixture has to be a real MP3 before anything built on it means
+    /// something, so this is the control: a stream of frames decodes to exactly
+    /// the sample count its headers promise.
+    #[test]
+    fn the_synthetic_stream_decodes_to_the_frames_its_headers_declare() {
+        const FRAMES: usize = 4;
+        let decoded = decode(&mp3_fixture::stream(FRAMES)).expect("fixture must decode");
+
+        assert_eq!(decoded.sample_rate, mp3_fixture::SAMPLE_RATE);
+        assert_eq!(decoded.channels, mp3_fixture::CHANNELS as u32);
+        assert_eq!(
+            decoded.samples.len(),
+            FRAMES * mp3_fixture::SAMPLES_PER_FRAME,
+            "every frame must have produced a full frame of samples"
+        );
+    }
+
+    /// The decoder's state is what a frame's main data may live in, and a frame
+    /// that points into a reservoir a reset decoder does not have decodes to
+    /// nothing. Feeding the same bytes one frame at a time to one decoder must
+    /// therefore give the same answer as feeding them all at once.
+    #[test]
+    fn a_persistent_decoder_carries_the_bit_reservoir_across_calls() {
+        const FRAMES: usize = 4;
+        let stream = mp3_fixture::stream(FRAMES);
+
+        let mut persistent = Mp3FrameDecoder::new();
+        let mut carried = 0usize;
+        let mut pos = 0usize;
+        while pos < stream.len() {
+            match persistent.decode(&stream[pos..]) {
+                Mp3Step::NeedMoreData => break,
+                Mp3Step::Skipped(skipped) => pos += skipped,
+                Mp3Step::Frame { pcm, consumed, .. } => {
+                    pos += consumed;
+                    carried += pcm.len();
+                }
+            }
+        }
+        assert_eq!(carried, FRAMES * mp3_fixture::SAMPLES_PER_FRAME);
+
+        // The same bytes, but with the decoder rebuilt for each frame -- which is
+        // what constructing a decoder per network chunk amounted to. Every frame
+        // after the first is silently lost.
+        let mut rebuilt = 0usize;
+        for index in 0..FRAMES {
+            let frame = &stream[index * mp3_fixture::FRAME_BYTES..][..mp3_fixture::FRAME_BYTES];
+            if let Mp3Step::Frame { pcm, .. } = Mp3FrameDecoder::new().decode(frame) {
+                rebuilt += pcm.len();
+            }
+        }
+        assert_eq!(
+            rebuilt,
+            mp3_fixture::SAMPLES_PER_FRAME,
+            "a decoder rebuilt per frame must lose every frame that needs the \
+             reservoir -- if this ever stops being true the test above proves \
+             nothing and the fixture needs a stronger frame"
+        );
+    }
+
+    /// Leading bytes that are not a frame -- an ID3 tag is the usual one -- must
+    /// be got past without being mistaken for audio.
+    ///
+    /// minimp3 folds them into the frame it eventually finds rather than
+    /// reporting them separately, so `consumed` covers both and the caller must
+    /// advance by it rather than by the frame length it might have assumed.
+    #[test]
+    fn leading_non_audio_bytes_are_consumed_with_the_frame_that_follows_them() {
+        const PADDING: usize = 64;
+        let mut input = vec![0u8; PADDING];
+        input.extend_from_slice(&mp3_fixture::stream(3));
+
+        let mut decoder = Mp3FrameDecoder::new();
+        let Mp3Step::Frame { pcm, consumed, .. } = decoder.decode(&input) else {
+            panic!("the frame after the padding must be found");
+        };
+        assert_eq!(pcm.len(), mp3_fixture::SAMPLES_PER_FRAME);
+        assert_eq!(
+            consumed,
+            PADDING + mp3_fixture::FRAME_BYTES,
+            "the padding must be consumed along with the frame it precedes"
+        );
+    }
+
+    /// A sync word split across a chunk boundary must survive to be re-offered
+    /// with the next chunk; consuming it would desynchronise the stream.
+    #[test]
+    fn a_split_header_is_held_back_rather_than_consumed() {
+        assert!(matches!(
+            Mp3FrameDecoder::new().decode(&[0xFF, 0xFB, 0x90]),
+            Mp3Step::NeedMoreData
+        ));
+
+        // And a buffer of pure noise must still make progress, or a stream that
+        // opened with a large tag would never advance.
+        let noise = vec![0x5Au8; 512];
+        assert!(matches!(
+            Mp3FrameDecoder::new().decode(&noise),
+            Mp3Step::Skipped(skipped) if skipped == noise.len() - (HEADER_BYTES - 1)
+        ));
+    }
 }
