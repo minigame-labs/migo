@@ -1401,24 +1401,106 @@ review. A commit alone is not completion evidence.
   claim was measured and why no gate backs it, rather than finding a comment and
   having to repeat the work.
 
-- [ ] 0.41 Guard the batched submit's obligation to return its vector to the
+- [x] 0.41 Guard the batched submit's obligation to return its vector to the
   pool. Task 0.38 proved the gap twice over: dropping `append_gl_batch`'s
   `recycle_gl_command_vec` instead of returning the emptied vector **failed no
   test in the binary** — the burst gate caught it only while it took from the
   pool, and that dependency had to go because it made the gate flaky under load.
 
   A leaked pool vector is a deallocation, not an allocation, so the burst
-  mechanism cannot see it by construction. The two obvious replacements are both
+  mechanism cannot see it by construction. The two obvious replacements were both
   unusable as written: asserting on the shared pool's contents is the flakiness
   that was just removed, and counting deallocations across the burst is defeated
-  by the pool legitimately refusing a recycle once it is full. What would work is
-  an observation point that does not depend on the global pool's state — the
-  question this task has to answer before it writes a guard.
+  by the pool legitimately refusing a recycle once it is full. This task's stated
+  job was to find an observation point that does not depend on the global pool's
+  state, before writing a guard.
 
-  Worth doing rather than shrugging at: the failure mode is silent. Every caller
-  still gets a vector, just a freshly allocated one, so a forgotten recycle looks
-  exactly like a working pool and shows up only as steady-state allocation nobody
-  is measuring.
+  **There is no such observation point, and the answer is that there does not
+  need to be one.** The obligation was removed instead of guarded.
+  `shared::command_vec_pool::PooledVec<T>` is a command vector on loan from its
+  pool, and its `Drop` returns it. `take_gl_command_vec` and
+  `take_canvas_command_vec` hand one out, `GlBatchPayload::commands` and
+  `CanvasBatchPayload::commands` hold one, and the free `recycle_*` functions are
+  deleted. `append_gl_batch` takes a loan and finishes two of its three paths
+  holding an emptied one; both used to call the pool by hand, and neither does
+  now.
+
+  Design points, each load-bearing:
+
+  - **The pool is chosen by the element type, not carried in the vector.** A
+    `Pooled` trait names the one pool per element type, so a `PooledVec<T>`
+    occupies exactly what a `Vec<T>` occupies — asserted, because these vectors
+    live inside `FrameOp`, which is itself held by a vector of the same kind, and
+    a back-pointer would be paid once per batch and once per packet.
+  - **`Drop` empties before offering.** The pool's `recycle` refuses a non-empty
+    vector, which is what stops a caller parking live commands in it; a loan a
+    consumer stopped reading part-way through still owns an allocation worth
+    keeping, and dropping the remainder is what dropping the vector would do
+    anyway. The old path threw that allocation away.
+  - **Consuming iteration returns the buffer.** `std::vec::IntoIter` owns and
+    frees it, which would defeat the pool on every `for op in packet.into_ops()`.
+    Reversing once and popping from the back is the same order in O(n), with no
+    unsafe and no second allocation, and leaves the emptied vector for `Drop` —
+    including when the loop breaks early.
+  - **`Deref`/`DerefMut` reach the `Vec`**, so the thirty-odd call sites read as
+    they did. That leaves `mem::take` able to steal a loan, deliberately: the
+    failure being removed is *forgetting* to return one.
+
+  **Mutation evidence.** The mutant this task was written for — delete the
+  recycle call — no longer exists to write. Its nearest expressible form,
+  `std::mem::forget(commands)` inside `append_gl_batch`, **survives**, and that is
+  recorded rather than papered over: nothing catches a deliberate leak, and the
+  type's claim is only about omission. What is killed:
+
+  - A `Drop` that hands the vector over without emptying it: three
+    `command_vec_pool` tests, at their own assertions.
+  - Consuming iteration without the reversal: the ordering test alone.
+  - `FramePacketBuilder` back to `Vec::new()`: the frame-cycle gate from task
+    0.40, at 128 allocation events over 64 frames.
+  - A `Drop` that frees instead of returning: the same gate, at 192 events over
+    64 frames — the three loans a frame holds.
+
+  **Verified.** migo-shared 400 lib from 395 plus a new 1-test integration
+  binary, migo-graphics 535 lib from 523, migo-runtime-v8 516, migo-core 51,
+  migo-io 264, migo-capi 142, migo-platform 50, migo-audio 49, the input
+  transport contract PASS, `cargo fmt --all --check` and `git diff --check`
+  clean, and clippy at the two CI invocations exits 0 with no new lint in a
+  touched file. `scripts/verify-change.sh --base HEAD` reports **verified for
+  every target this change touches**, including
+  `PASS android compile bash scripts/build-android-so.sh --compile-only arm64-v8a`
+  — required, because the change reaches `crates/graphics` and `crates/core`.
+
+- [x] 0.46 Make `scripts/verify-change.sh` able to pass. Found while verifying
+  task 0.40: four of its fourteen host steps failed — `cargo build --workspace`
+  and the `migo-graphics`, `migo-core`, `migo-capi` and `migo-platform` suites —
+  and re-running it against a stashed, **untouched** tree produced the same four
+  failures. They link Skia, which a minimal Linux host cannot build with a bare
+  `cargo`: it needs the system clang rather than the NDK's, the Khronos headers,
+  and the linux-gnu V8 archive.
+
+  This is the worst state a verifier can be in. It is not a false negative about
+  one change; it reports the same red whatever the change did, so the only thing
+  it can teach a reader is to stop reading it — and Section 7.4 makes this script
+  the thing that produces the sentence "any change touching conditional code
+  names the target build that compiled it". A sentence nobody trusts does not get
+  written.
+
+  The three prerequisites are already established by `scripts/dev-test-host.sh`,
+  so the host steps run through it rather than restating any of them. Whether it
+  is usable is asked of that script itself — a new `--probe` that has *run* the
+  preparation and reports the outcome, rather than a second copy of its
+  conditions in the caller, because two definitions of "usable" drift. Where the
+  native toolchain is absent the previous behaviour is unchanged and the verifier
+  says so out loud before running, so a reader knows the Skia-linked failures
+  below are about the environment.
+
+  Also widened `-p migo-shared --lib` to `-p migo-shared`: the frame-cycle gate
+  from task 0.40 is an integration test, and a verifier that ran only the lib
+  target would have left it existing but never executed in the session's own
+  verification.
+
+  **Verified** by the run this enabled: 15 of 15 PASS, ending
+  `verified for every target this change touches`.
 
 - [x] 0.42 Stop the derived-cache prune test depending on the host's wall clock.
   Found by `scripts/verify-change.sh` failing on a crate this branch had not
@@ -1444,21 +1526,82 @@ review. A commit alone is not completion evidence.
   intermittent failure in shared verification is not a nuisance — it is the thing
   that makes every later "verified" line arguable.
 
-- [ ] 0.40 Pool the frame packet's op vector, or record why it stays unpooled.
-  The one allocation per frame that survives task 0.38's fix:
-  `FramePacketBuilder::new` starts from `Vec::new()` and the packet carries it to
-  the render thread. The command vectors either side of it are pooled; this one is
-  not, so a frame costs one allocation and one free (224 bytes) no matter how
-  little it draws.
+- [x] 0.40 Pool the frame packet's op vector, or record why it stays unpooled.
+  Pooled. It was the one allocation per frame that survived task 0.38's fix:
+  `FramePacketBuilder::new` started from `Vec::new()` and the packet carried it to
+  the render thread, so a frame cost an allocation and its doublings no matter how
+  little it drew.
 
-  It is not the same change as the command vector pool, which is why it is its own
-  item. The packet has two consumption sites, and the main one
-  (`render_thread.rs`) already allocates **two more** vectors to reorder the ops
-  into Canvas2D-then-GL phases, then drops the original. So the recycle point is
-  not simply "after execution", and the reorder's own two allocations per frame
-  belong in the same measurement. Until that is settled, a burst across a whole
-  frame cycle cannot assert zero, which is why task 0.38 asserted the segment
-  list's capacity directly instead.
+  It was its own item because the recycle point is not simply "after execution":
+  the packet has several consumption sites, and the main one allocated **two
+  more** vectors to reorder the ops into Canvas2D-then-GL phases. All of it is
+  gone, in three parts.
+
+  **The op vector is a loan** from a `FrameOp` pool, on the mechanism task 0.41
+  built. It needed its own dimensions rather than the command pools': a packet
+  holds one op per segment plus `BeginFrame`, the `Materialize` ops at each
+  Canvas2D→WebGL boundary and a `Present` — single digits typically, about
+  sixty-five in the heaviest scene profiled — while a `FrameOp` is several times
+  a `GLCmd`'s width, so matching the command budget would reserve far more memory
+  for far fewer elements.
+
+  **The reorder no longer materialises a reordered packet.** It built `phase1`
+  and `phase2`, each sized for the whole packet, concatenated them and dropped
+  the original: three allocations and a full extra move of every op, to express
+  an ordering the loop can simply take. Running the first phase as the packet is
+  consumed and holding only the second — in one pooled vector, usually the
+  smaller half — leaves zero.
+
+  **The admission check no longer allocates either, and this one was not in the
+  original count.** `packet_safe_to_reorder` built two `HashSet<u32>` per packet
+  to ask whether a handful of small integers intersect. It gathers into an inline
+  32-element list and returns on the first collision instead — no allocation, no
+  hashing, and no walk of the GL half at all when the packet has no Canvas2D
+  half, which is every WebGL-only frame.
+
+  **Splitting the phase runner out is what made the reorder testable at all.**
+  It is the one part of packet execution that can produce wrong pixels rather
+  than slow ones — running a Canvas2D read of a WebGL canvas before the WebGL
+  work that fills it — and it had **no tests**: the existing ordering test drives
+  a separate test-only executor that does not reorder. `run_frame_phases` now
+  takes the execution as a closure, so its output is observable without a GL
+  context. Seven tests cover the classifier and four the ordering, including
+  every op running exactly once on both paths and a present request surviving
+  the deferred half.
+
+  **The gate Section 7.3 asked for exists and is deterministic.** A whole frame —
+  build the packet, run both phases, hand every loan back — reaches the heap zero
+  times in steady state. It lives in `engine/crates/shared/tests/frame_cycle_allocation.rs`
+  and **that is not a filing decision**: a frame takes from process-wide pools, so
+  measuring it at zero needs the pool to hand back what the previous iteration
+  returned. That holds in production and does not hold inside a lib-test binary
+  whose dozens of other tests build packets concurrently — a neighbour taking the
+  last vector leaves `take` with nothing to give and it allocates. Measured
+  exactly that way: green standalone, red under the full suite. An integration
+  test is the smallest unit that can hold the pools to itself, and it is also the
+  unit that has to install the counting allocator.
+
+  **Mutation evidence.** Each mutant killed the named tests and nothing else:
+
+  - The original two-`HashSet` implementation: both reorder allocation gates,
+    529 other tests still passing.
+  - Dropping the deduplication: `repeated_canvas_targets_are_gathered_once`
+    alone. That test is gated on allocation rather than on the verdict
+    deliberately — gathering one canvas sixty-four times returns what gathering
+    it once returns, so an assertion on the answer would pin nothing, and what it
+    actually costs is the target list spilling to the heap.
+  - A collision that no longer refuses: the three ordering-correctness tests.
+  - Deleting graphics' counting `#[global_allocator]`: both gates, at the
+    installation self-check.
+  - `FramePacketBuilder` back to `Vec::new()`: the frame-cycle gate, **128
+    allocation events over 64 frames (64 fresh, 64 resize, 43008 bytes)** — the
+    measurement of what this item removed.
+
+  **Still not zero, and named rather than implied:** the packet's *segment* list
+  and the collector's `pending_2d` set are outside this measurement, and
+  `smallvec` spills if a scene ever exceeds 32 distinct Canvas2D targets in one
+  packet — correct, but an allocation, and the right failure mode for a fast
+  path.
 
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
