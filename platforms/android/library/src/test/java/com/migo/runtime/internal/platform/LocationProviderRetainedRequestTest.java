@@ -180,6 +180,7 @@ public final class LocationProviderRetainedRequestTest {
         close.setDaemon(true);
         close.start();
         assertTrue(cancelStarted.await(1, TimeUnit.SECONDS));
+        awaitParkedOnInFlightCleanup(close);
 
         releaseListenerRemoval.countDown();
         callback.join(1000);
@@ -236,6 +237,7 @@ public final class LocationProviderRetainedRequestTest {
         Thread close = new Thread(() -> firstClose[0] = gate.close(78));
         close.start();
         assertTrue(cancelStarted.await(1, TimeUnit.SECONDS));
+        awaitParkedOnInFlightCleanup(close);
 
         releaseListenerRemoval.countDown();
         callback.join(1000);
@@ -322,5 +324,38 @@ public final class LocationProviderRetainedRequestTest {
             Thread.currentThread().interrupt();
             throw new AssertionError(interrupted);
         }
+    }
+
+    /**
+     * Blocks until {@code closing} has actually parked inside the retained request's in-flight
+     * cleanup wait.
+     *
+     * <p>The cancellation signals before it calls {@code cancel}, so the "cancel started" latch
+     * only says the close thread reached the cancellation body — not that it reached the wait
+     * whose ordering these interleaving tests describe. Releasing the blocked removal on that
+     * latch alone lets the close thread be descheduled in between, the callback thread finish its
+     * cleanup first, and cancel then take the ordinary path. That is correct behaviour, but it is
+     * the other interleaving, so the assertions written for this one fail. Waiting for the park
+     * pins the one under test.
+     */
+    private static void awaitParkedOnInFlightCleanup(Thread closing) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (closing.getState() == Thread.State.WAITING && isInRetainedRequest(closing)) {
+                return;
+            }
+            Thread.yield();
+        }
+        throw new AssertionError(
+                "close thread never parked on the in-flight cleanup: " + closing.getState());
+    }
+
+    private static boolean isInRetainedRequest(Thread thread) {
+        for (StackTraceElement frame : thread.getStackTrace()) {
+            if (frame.getClassName().endsWith("RetainedRequest")) {
+                return true;
+            }
+        }
+        return false;
     }
 }
