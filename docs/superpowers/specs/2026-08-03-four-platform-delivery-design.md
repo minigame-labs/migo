@@ -673,11 +673,13 @@ These are enforced by tests, not by inspection:
   the gate cannot run there; its Java half needs a JVM mechanism entirely, because a
   Rust allocator observes nothing the JVM allocates. The audio path is measured at
   its graph render only; `audio_thread`'s scheduling, `output`'s device handoff and
-  `streaming`'s refill are not. Within the frame boundary, the packet's *segment*
-  list and the collector's pending-canvas set are outside the burst, and the
-  reorder's target list spills to the heap on a scene with more than 32 distinct
-  Canvas2D targets in one packet. No path may be recorded as satisfying this
-  requirement without a burst test named against it.
+  `streaming`'s refill are not. Within the frame boundary, the render path's three
+  per-frame canvas-id sets are one gated type, but its two remaining call sites —
+  the WebGL batch executor and the packet builder — carry no gate of their own,
+  because one needs a live GL context and the other a pool no neighbouring test is
+  taking from; and that type spills to the heap on a scene with more than 32
+  distinct Canvas2D targets in one packet. No path may be recorded as satisfying
+  this requirement without a burst test named against it.
 
   **What the gates cannot see, stated because it bounds the claim.** A burst counts
   allocations, so a *lost* pooled vector — a deallocation — is invisible to it by

@@ -1597,11 +1597,35 @@ review. A commit alone is not completion evidence.
     allocation events over 64 frames (64 fresh, 64 resize, 43008 bytes)** — the
     measurement of what this item removed.
 
-  **Still not zero, and named rather than implied:** the packet's *segment* list
-  and the collector's `pending_2d` set are outside this measurement, and
-  `smallvec` spills if a scene ever exceeds 32 distinct Canvas2D targets in one
-  packet — correct, but an allocation, and the right failure mode for a fast
-  path.
+  **The two sets this item first recorded as "still not zero" are now zero too.**
+  Writing the gate exposed that the render path held *three* independently
+  written per-frame `HashSet`s of canvas ids, not one: the reorder classifier
+  above, `execute_gl_batch`'s `touched_canvases` (allocated per GL batch, which
+  Pixi reaches twice a frame and a Cocos scene far more often), and the
+  collector's `pending_2d` (per frame, on the thread running the game). Each was
+  built and thrown away to answer a question about a handful of small integers.
+
+  They are one type now — `shared::protocol::CanvasIdSet`, an inline 32-entry
+  set that deduplicates on insert, keeps its capacity across a `clear`, and
+  spills to the heap rather than losing entries on a scene nobody has produced
+  yet. One implementation means the deduplication a set implies is written once
+  and gated once; an inline `SmallVec` that a caller forgets to check before
+  pushing is a set only by intention. Iteration is insertion-ordered
+  deliberately: these ids feed straight into emitted render ops, and a
+  `HashSet`'s arbitrary order would make a packet's contents vary run to run for
+  no benefit.
+
+  Its own gates are deterministic — no pool, no GL — and four mutants were run:
+  dropping the deduplication kills three tests including the burst; a `clear`
+  that surrenders the allocation kills the capacity test; and reducing the inline
+  array to zero entries kills the burst alone.
+
+  **What is still not gated, named rather than implied:** the two new call sites
+  inherit the type's gate but have none of their own, because both need what a
+  host test binary cannot give them — `execute_gl_batch` a live GL context, and
+  `build_frame_packet` a pool that no neighbouring test is taking from. The type
+  is the thing that can regress; the call sites can only regress by swapping it
+  back out.
 
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
