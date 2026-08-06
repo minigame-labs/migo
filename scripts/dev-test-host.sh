@@ -75,6 +75,16 @@ c_info "V8: $V8_ARCHIVE"
 c_info "CC=$CC CXX=$CXX"
 
 ARGS=("$@")
+
+# `--probe` answers one question — is this host set up to build the engine
+# natively? — and answers it by having run the whole preparation above rather
+# than by re-checking a copy of its conditions. A caller that asked separately
+# would be a second definition of "usable", and the two would drift.
+if [[ ${#ARGS[@]} -eq 1 && "${ARGS[0]}" == "--probe" ]]; then
+    c_info "host toolchain is usable"
+    exit 0
+fi
+
 [[ ${#ARGS[@]} -gt 0 ]] || ARGS=(test -p migo-runtime-v8 --lib --offline)
 
 cd "$ENGINE_DIR"

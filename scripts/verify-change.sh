@@ -150,30 +150,54 @@ run_step() {
 # Host suites. Always: they are the only evidence for the portable tree, and a
 # target build does not run a single test.
 # ------------------------------------------------------------
-HOST_STEPS=(
-    "cd engine && cargo build --workspace --all-targets"
+HOST_CARGO_STEPS=(
+    "build --workspace --all-targets"
     # Before the suites that depend on it: a broken counting allocator would
     # otherwise surface as an unexplained allocation gate failure downstream.
-    "cd engine && cargo test -p migo-alloc-probe"
-    "cd engine && cargo test -p migo-contention-probe"
-    "cd engine && cargo test -p migo-executor-probe"
-    "cd engine && cargo test -p migo-shared --lib"
-    "cd engine && cargo test -p migo-io --lib"
-    "cd engine && cargo test -p migo-runtime-v8 --lib"
+    "test -p migo-alloc-probe"
+    "test -p migo-contention-probe"
+    "test -p migo-executor-probe"
+    "test -p migo-shared"
+    "test -p migo-io --lib"
+    "test -p migo-runtime-v8 --lib"
     # Carries the occupancy gate on the shared audio streaming worker, so a suite
     # that ran nowhere would leave that gate as decoration.
-    "cd engine && cargo test -p migo-audio --lib"
-    "cd engine && cargo test -p migo-graphics --lib"
-    "cd engine && cargo test -p migo-core --lib"
-    "cd engine && cargo test -p migo-capi --lib"
-    "cd engine && cargo test -p migo-platform --lib"
-    "cd engine && cargo fmt --all --check"
-    "git diff --check"
+    "test -p migo-audio --lib"
+    "test -p migo-graphics --lib"
+    "test -p migo-core --lib"
+    "test -p migo-capi --lib"
+    "test -p migo-platform --lib"
+    "fmt --all --check"
 )
 
-for step in "${HOST_STEPS[@]}"; do
-    run_step "host" "$step" || true
+# `migo-graphics`, `migo-core`, `migo-capi` and `migo-platform` link Skia, and a
+# minimal Linux host cannot build it with a bare `cargo`: it needs the system
+# clang rather than the NDK's, the Khronos headers, and the linux-gnu V8
+# archive. `dev-test-host.sh` is where this repository already establishes all
+# three, so these steps run through it instead of restating any of it here.
+#
+# **Without this, four of the fourteen host steps failed on an untouched tree**,
+# which is the worst state for a verifier to be in: it reports the same red
+# whatever the change did, and the only thing it can teach a reader is to stop
+# reading it. Measured that way — `--base HEAD` with nothing modified, four
+# FAILs — before the routing was added.
+HOST_CARGO="cd engine && cargo"
+if bash "$ROOT/scripts/dev-test-host.sh" --probe >/dev/null 2>&1; then
+    HOST_CARGO="bash scripts/dev-test-host.sh"
+else
+    # Said out loud rather than absorbed. On a host without the native
+    # toolchain the Skia-linked steps below will fail for a reason that has
+    # nothing to do with the change under verification, and a reader has to
+    # know that is what they are looking at.
+    print_info "host: native toolchain unavailable; Skia-linked suites will \
+report their environment, not this change"
+fi
+
+for step in "${HOST_CARGO_STEPS[@]}"; do
+    run_step "host" "$HOST_CARGO $step" || true
 done
+
+run_step "host" "git diff --check" || true
 
 # ------------------------------------------------------------
 # Target builds. A platform with no entry here is reported NOT PROVEN, never
