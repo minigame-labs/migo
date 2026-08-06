@@ -160,6 +160,87 @@ impl Mp3FrameDecoder {
     }
 }
 
+impl Mp3FrameDecoder {
+    /// Byte length of the frame at the front of `input`, without decoding it.
+    ///
+    /// minimp3 answers this directly when handed a null output pointer: it
+    /// locates the frame, records its length, and returns before any of the work
+    /// that depends on decoder state.
+    ///
+    /// **That last part is the whole reason this exists.** A frame whose main
+    /// data lives in a bit reservoir the decoder does not have decodes to zero
+    /// samples, which from outside is indistinguishable from garbage — so a probe
+    /// that measured by decoding would report "no frame here" for exactly the
+    /// frames worth rescuing.
+    fn frame_bytes_at_front(&mut self, input: &[u8]) -> Option<usize> {
+        if input.is_empty() {
+            return None;
+        }
+
+        let mut info = ffi::mp3dec_frame_info_t {
+            frame_bytes: 0,
+            frame_offset: 0,
+            channels: 0,
+            hz: 0,
+            layer: 0,
+            bitrate_kbps: 0,
+        };
+
+        // SAFETY: as in `decode`, except for the output pointer. minimp3 checks
+        // `pcm` for null and returns the frame's sample count before writing
+        // anything through it, so passing null selects its measure-only path.
+        let len = input.len().min(c_int::MAX as usize) as c_int;
+        let samples = unsafe {
+            ffi::mp3dec_decode_frame(
+                &mut *self.state,
+                input.as_ptr(),
+                len,
+                std::ptr::null_mut(),
+                &mut info,
+            )
+        };
+
+        (samples > 0 && info.frame_bytes > 0).then_some(info.frame_bytes as usize)
+    }
+}
+
+/// Length of the frame at the front of `buffer`, if one is there in full.
+///
+/// **Why this exists.** minimp3 will not accept a frame it cannot chain to a
+/// successor — except when the buffer it is handed is *exactly* one frame, which
+/// it accepts outright. That exception is the only way past a stream whose next
+/// bytes are a tag rather than a frame, and an ID3v1 tag is 128 bytes at the end
+/// of a large fraction of real MP3 files.
+///
+/// Growing prefixes rather than a header table: asking minimp3 what a frame's
+/// length is means duplicating its bitrate and sample-rate tables here, and a
+/// second opinion about frame lengths is a second thing to be wrong. `hint` is
+/// the previous frame's length, which a constant-bitrate stream repeats, so the
+/// usual cost is one probe rather than a scan.
+///
+/// **The decoder passed in must be a throwaway.** Every rejected probe resets
+/// minimp3's state, and the bit reservoir is precisely what the real decoder has
+/// to keep.
+pub(crate) fn first_frame_length(
+    probe: &mut Mp3FrameDecoder,
+    buffer: &[u8],
+    hint: Option<usize>,
+) -> Option<usize> {
+    let mut ends_a_frame =
+        |len: usize| len <= buffer.len() && probe.frame_bytes_at_front(&buffer[..len]) == Some(len);
+
+    if let Some(len) = hint
+        && ends_a_frame(len)
+    {
+        return Some(len);
+    }
+
+    // No frame can be longer than this, so failing to find one by here means
+    // there is not a whole frame at the front.
+    let limit = buffer.len().min(MAX_FRAME_BYTES);
+    (HEADER_BYTES..=limit).find(|&len| ends_a_frame(len))
+}
+
 /// Convert one interleaved `i16` frame to normalized `f32`, appending.
 #[inline]
 pub(crate) fn append_as_f32(pcm: &[i16], out: &mut Vec<f32>) {

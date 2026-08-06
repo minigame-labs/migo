@@ -1803,6 +1803,10 @@ review. A commit alone is not completion evidence.
     bytes** — exactly one 128 KiB buffer per chunk.
   - Removing the lookahead: both correctness tests, and neither allocation gate,
     which is right — losing the reservoir costs audio, not memory.
+  - Running the flush's in-place pass before isolation instead of after: the
+    non-audio-bytes test alone. This is the ordering argument as a mutant.
+  - Making the probe measure by decoding rather than through minimp3's
+    null-output path: the non-audio-bytes test alone.
 
   Re-run in full after the `Skipped` fix, since that changed what `decode` means
   by a byte it did not use. One result moved and moved for the better: removing
@@ -1835,23 +1839,53 @@ review. A commit alone is not completion evidence.
   That is the defect stated as audio rather than as allocations: about two thirds
   of a streamed track was being dropped, silently, with no error on any path.
 
-  **One cell where this is worse than what it replaced, stated because the whole
-  point of this section is that omissions get named.** A stream whose entire body
-  is shorter than the lookahead decodes nothing until the flush and meets a
-  decoder there that has never run; minimp3's cold path will not accept a frame it
-  cannot chain to a successor, so if that stream *also* ends in bytes that are not
-  audio, the chain check fails at the tag and every frame is rejected — 0 of 6,
-  against 2 of 6 before. That is under ~0.2 s of 128 kb/s audio, so only very
-  short remote clips reach it.
+  **Bytes that are not audio used to cost frames, and now cost none.** minimp3
+  will not accept a frame it cannot chain to a successor, so a tag at either end
+  of a stream defeated it: an ID3v1 tag (128 bytes, at the end of a large
+  fraction of real files) stranded the final frame, and a stream shorter than the
+  lookahead — which decodes nothing until the flush and therefore arrives with a
+  decoder that has never run — lost *every* frame it had, decoding to silence
+  outright. That last one is the case short remote sound effects fall in.
 
-  Decoding eagerly until the first frame lands was tried and **made things
-  worse**, which is why the lookahead is unconditional: it recovered that case
-  only partly (1 frame of 6) while costing a frame on streams that had been exact
-  (23 of 24). Closing it properly means parsing frame lengths here instead of
-  asking minimp3 for them, which is a bigger change than the case justifies. The
-  committed test asserts the invariant for streams longer than the lookahead and
-  says in its own doc comment why the shorter one is absent, rather than quietly
-  choosing a fixture that passes.
+  Three things were needed, and the order of two of them is the fix rather than a
+  preference:
+
+  - **minimp3 accepts a buffer that is exactly one frame** without asking for a
+    successor to confirm it. So the flush isolates frames, handing the decoder one
+    at a time, and the real decoder then takes its state-preserving fast path.
+  - **The length comes from a throwaway decoder**, because every rejected probe
+    resets minimp3 and the bit reservoir is exactly what must survive.
+  - **The probe measures without decoding**, via minimp3's null-output-pointer
+    path. Measuring by decoding does not work and the reason is the same one
+    underneath everything here: a frame whose main data lives in a reservoir the
+    *probe* does not have decodes to zero samples and is indistinguishable from
+    garbage — so the probe reported "no frame" for precisely the frames worth
+    rescuing. This was found by instrumenting the flush phases after the first two
+    parts landed and still lost the last frame of every long stream.
+
+  Isolation runs **before** the in-place pass, not after. An in-place decode that
+  fails resets minimp3, and what it resets is the reservoir belonging to the very
+  frame it just failed on — trying in place first destroys the state needed to
+  recover it. The in-place pass is kept as a fallback for the one thing isolation
+  cannot do, getting past leading non-audio larger than a frame, and runs only
+  when isolation could not move at all.
+
+  Measured across 28 combinations of stream length (1 to 96 frames, spanning both
+  sides of the lookahead) and tag placement (none, trailing, leading, both), 27
+  are now exact. The one that is not is a **single-frame** stream behind a leading
+  tag larger than a frame: isolation cannot reach past the tag and the fallback
+  cannot chain a lone frame to anything. That is 26 ms of audio behind a 4 KiB
+  tag, and it is recorded rather than fixed.
+
+  Two earlier attempts are worth recording because they were both plausible and
+  both wrong. Decoding eagerly until the first frame lands recovered the short
+  case only partly (1 frame of 6) while costing a frame on streams that had been
+  exact (23 of 24) — reverted. Isolating *after* the in-place pass fixed one- and
+  two-frame streams and nothing else, for the ordering reason above.
+
+  The committed test asserts every combination **exact**, deliberately not "at
+  most one frame lost": a rule that tolerates one lost frame tolerates the
+  mechanism ceasing to work and losing it every time.
 
   **That experiment did find a real latent defect, though, and it is fixed.**
   `Mp3Step::Skipped` was conflating two different answers. When minimp3 consumes

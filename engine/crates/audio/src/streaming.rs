@@ -14,7 +14,9 @@ use shared::error::{EngineError, EngineResult, ErrorCode};
 use tokio::sync::{Notify, mpsc};
 use tracing::debug;
 
-use crate::decoder::mp3::{Mp3FrameDecoder, Mp3Step, STREAM_LOOKAHEAD_BYTES, append_as_f32};
+use crate::decoder::mp3::{
+    Mp3FrameDecoder, Mp3Step, STREAM_LOOKAHEAD_BYTES, append_as_f32, first_frame_length,
+};
 use crate::off_worker::OffWorker;
 
 /// Keep only a small number of decoded chunks ahead of the audio thread.
@@ -519,69 +521,79 @@ impl Mp3StreamDecoder {
     /// Decode what the buffer can spare, appending to `out`.
     ///
     /// Leaves a lookahead behind the cursor so minimp3 can confirm the next
-    /// frame's header and keep its state; see [`STREAM_LOOKAHEAD_BYTES`].
-    ///
-    /// **Known limitation, measured rather than assumed.** A stream whose whole
-    /// body is shorter than the lookahead decodes nothing until the flush, and
-    /// the flush then meets a decoder that has never run. minimp3's cold path
-    /// will not accept a frame it cannot chain to a successor, so if such a
-    /// stream also ends in bytes that are not audio — an ID3v1 tag is 128 bytes
-    /// at the end of a large fraction of real files — the chain check fails at
-    /// the tag and every frame is rejected. Under ~0.2 s of 128 kb/s audio, so
-    /// only very short remote clips are exposed.
-    ///
-    /// Decoding eagerly until the first frame lands was tried and made things
-    /// worse, which is why the constant is unconditional: it recovered that case
-    /// only partly (1 frame of 6) while costing a frame on streams that were
-    /// previously exact (23 of 24 instead of 24 of 24). Closing it properly means
-    /// parsing frame lengths here rather than asking minimp3 for them, which is
-    /// a bigger change than the case justifies.
+    /// frame's header and keep its state; see [`STREAM_LOOKAHEAD_BYTES`]. What
+    /// the lookahead strands at the end of the stream is [`Self::flush_into`]'s
+    /// problem, and it has a way past it.
     fn decode_into(&mut self, out: &mut Vec<f32>) -> (u32, u32) {
         self.decode_with_lookahead(STREAM_LOOKAHEAD_BYTES, out)
     }
 
     /// Decode everything that is left, for a stream that has ended.
+    ///
+    /// Isolation first, and **the order is the fix, not a preference.** An
+    /// in-place decode that fails resets minimp3 — and what it resets is the bit
+    /// reservoir the frame it just failed on is entitled to. Trying in place
+    /// first therefore destroys the state needed to recover the very frame it was
+    /// reaching for; measured, that cost the last frame of every tagged stream
+    /// and all six frames of a short one.
+    ///
+    /// The in-place pass is kept as a fallback for the one thing isolation cannot
+    /// do: get past leading bytes that are not audio and are larger than a frame,
+    /// which an ID3v2 tag routinely is. It runs only when isolation could not
+    /// move at all, so a failed attempt cannot cost a frame that was recoverable.
     fn flush_into(&mut self, out: &mut Vec<f32>) -> (u32, u32) {
-        self.decode_with_lookahead(0, out)
+        let before = self.buffer.len();
+        self.isolate_remaining_frames(out);
+
+        if !self.buffer.is_empty() && self.buffer.len() == before {
+            self.decode_with_lookahead(0, out);
+            self.isolate_remaining_frames(out);
+        }
+
+        (self.sample_rate, self.channels)
+    }
+
+    /// Decode what is left one isolated frame at a time.
+    ///
+    /// minimp3 rejects a frame it cannot chain to a successor, so a stream ending
+    /// in an ID3v1 tag strands its final frame — and a stream shorter than the
+    /// lookahead, which decodes nothing until the flush and therefore arrives
+    /// here with a decoder that has never run, strands *every* frame it has. Both
+    /// were measured: the second was a short remote clip decoding to silence
+    /// outright.
+    ///
+    /// Handing the decoder exactly one frame is what gets past it, and the length
+    /// comes from a throwaway decoder rather than from the real one, whose bit
+    /// reservoir a rejected probe would reset. The real decoder then sees a buffer
+    /// that is exactly one frame, which is its state-preserving fast path.
+    fn isolate_remaining_frames(&mut self, out: &mut Vec<f32>) {
+        let mut probe: Option<Mp3FrameDecoder> = None;
+        let mut previous_length: Option<usize> = None;
+
+        while !self.buffer.is_empty() {
+            let probe = probe.get_or_insert_with(Mp3FrameDecoder::new);
+            let Some(length) = first_frame_length(probe, &self.buffer, previous_length) else {
+                break;
+            };
+            previous_length = Some(length);
+
+            match self.decode_step(0, length, out) {
+                Some(consumed) if consumed > 0 => {
+                    self.buffer.drain(..consumed);
+                }
+                _ => break,
+            }
+        }
     }
 
     fn decode_with_lookahead(&mut self, lookahead: usize, out: &mut Vec<f32>) -> (u32, u32) {
         let mut pos = 0usize;
 
         while self.buffer.len().saturating_sub(pos) > lookahead {
-            match self.frames.decode(&self.buffer[pos..]) {
-                Mp3Step::NeedMoreData => break,
-                Mp3Step::Skipped(skipped) => pos += skipped,
-                Mp3Step::Frame {
-                    pcm,
-                    sample_rate,
-                    channels,
-                    consumed,
-                } => {
-                    pos += consumed;
-
-                    if self.sample_rate == 0 {
-                        self.sample_rate = sample_rate;
-                        self.channels = channels;
-
-                        if sample_rate != self.target_sample_rate {
-                            self.resampler = Some(crate::resampler::StreamResampler::new(
-                                sample_rate,
-                                self.target_sample_rate,
-                                channels,
-                            ));
-                        }
-                    }
-
-                    match self.resampler.as_mut() {
-                        Some(resampler) => {
-                            self.scratch.clear();
-                            append_as_f32(pcm, &mut self.scratch);
-                            resampler.process_into(&self.scratch, out);
-                        }
-                        None => append_as_f32(pcm, out),
-                    }
-                }
+            let take = self.buffer.len() - pos;
+            match self.decode_step(pos, take, out) {
+                Some(consumed) if consumed > 0 => pos += consumed,
+                _ => break,
             }
         }
 
@@ -590,6 +602,50 @@ impl Mp3StreamDecoder {
         }
 
         (self.sample_rate, self.channels)
+    }
+
+    /// One decode against `buffer[pos..pos + take]`, appending any frame it
+    /// produced. Returns the bytes it got past, or `None` for no progress.
+    ///
+    /// The two callers differ only in how much of the buffer they offer, which is
+    /// the whole of the difference between decoding in place and isolating a
+    /// frame — so they share this and cannot drift apart in how a frame is
+    /// adopted.
+    fn decode_step(&mut self, pos: usize, take: usize, out: &mut Vec<f32>) -> Option<usize> {
+        match self.frames.decode(&self.buffer[pos..pos + take]) {
+            Mp3Step::NeedMoreData => None,
+            Mp3Step::Skipped(skipped) => Some(skipped),
+            Mp3Step::Frame {
+                pcm,
+                sample_rate,
+                channels,
+                consumed,
+            } => {
+                if self.sample_rate == 0 {
+                    self.sample_rate = sample_rate;
+                    self.channels = channels;
+
+                    if sample_rate != self.target_sample_rate {
+                        self.resampler = Some(crate::resampler::StreamResampler::new(
+                            sample_rate,
+                            self.target_sample_rate,
+                            channels,
+                        ));
+                    }
+                }
+
+                match self.resampler.as_mut() {
+                    Some(resampler) => {
+                        self.scratch.clear();
+                        append_as_f32(pcm, &mut self.scratch);
+                        resampler.process_into(&self.scratch, out);
+                    }
+                    None => append_as_f32(pcm, out),
+                }
+
+                Some(consumed)
+            }
+        }
     }
 }
 
@@ -748,40 +804,54 @@ mod tests {
     /// 26 ms at the end of a track — is the accepted cost; what is asserted here
     /// is that it is *one* frame and not the stream.
     ///
-    /// **Only streams longer than the lookahead are asserted here, and that is a
-    /// stated limitation rather than a convenient choice of input.** A stream
-    /// whose whole body fits inside the lookahead decodes nothing until the
-    /// flush and meets a cold decoder there, which rejects the whole chain; see
-    /// `Mp3StreamDecoder::decode_into`. Measured at 0 frames of 6, against 2 of 6
-    /// for the per-chunk decoder this replaced — worse in that one cell, and
-    /// better everywhere else, which is why it is written down here instead of
-    /// being covered by picking a longer fixture and saying nothing.
+    /// Bytes that are not audio, before or after the audio, must cost no frames.
+    ///
+    /// An ID3v1 tag is 128 bytes at the end of a large fraction of real MP3
+    /// files, and an ID3v2 tag at the front runs to kilobytes. Both defeat
+    /// minimp3's requirement that a frame be chainable to a successor, and the
+    /// lengths matter independently: a stream shorter than the lookahead decodes
+    /// nothing until the flush and so meets a decoder that has never run, while a
+    /// longer one arrives there warm.
+    ///
+    /// Every combination is asserted **exact**. Losing "just the last frame" was
+    /// the behaviour before the flush learned to isolate frames, and it is not a
+    /// tolerance worth keeping: a rule that permits one lost frame permits the
+    /// mechanism to stop working and lose it every time.
     #[test]
-    fn a_stream_ending_in_a_tag_loses_at_most_its_final_frame() {
+    fn bytes_that_are_not_audio_cost_no_frames() {
         let id3v1 = {
             let mut tag = b"TAG".to_vec();
             tag.resize(128, 0);
             tag
         };
+        // Larger than any frame, so the flush cannot isolate its way past it and
+        // the in-place fallback is what has to carry this case.
+        let id3v2 = vec![0u8; 4096];
 
-        for frames in [40usize, 96] {
-            let mut source = mp3_fixture::stream(frames);
-            source.extend_from_slice(&id3v1);
+        for frames in [2usize, 6, 40] {
+            for (label, leading, trailing) in [
+                ("a trailing tag", [].as_slice(), id3v1.as_slice()),
+                ("a leading tag", id3v2.as_slice(), [].as_slice()),
+                ("tags at both ends", id3v2.as_slice(), id3v1.as_slice()),
+            ] {
+                let mut source = leading.to_vec();
+                source.extend_from_slice(&mp3_fixture::stream(frames));
+                source.extend_from_slice(trailing);
 
-            let mut decoder = Mp3StreamDecoder::new(mp3_fixture::SAMPLE_RATE);
-            let mut out = Vec::new();
-            for chunk in source.chunks(137) {
-                decoder.push_data(chunk);
-                decoder.decode_into(&mut out);
+                let mut decoder = Mp3StreamDecoder::new(mp3_fixture::SAMPLE_RATE);
+                let mut out = Vec::new();
+                for chunk in source.chunks(137) {
+                    decoder.push_data(chunk);
+                    decoder.decode_into(&mut out);
+                }
+                decoder.flush_into(&mut out);
+
+                assert_eq!(
+                    out.len() / mp3_fixture::SAMPLES_PER_FRAME,
+                    frames,
+                    "a {frames}-frame stream with {label} must decode every frame"
+                );
             }
-            decoder.flush_into(&mut out);
-
-            let decoded = out.len() / mp3_fixture::SAMPLES_PER_FRAME;
-            assert!(
-                decoded >= frames - 1,
-                "a {frames}-frame stream ending in an ID3v1 tag decoded {decoded} frames; \
-                 at most the final frame may be lost to the tag"
-            );
         }
     }
 
