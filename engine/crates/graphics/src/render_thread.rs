@@ -43,7 +43,8 @@ use crossbeam_channel::{Receiver, select, tick};
 use glow::HasContext;
 use shared::command_vec_pool::PooledVec;
 use shared::error::{EngineError, EngineResult, ErrorCode};
-use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
+use shared::protocol::CanvasIdSet;
+use shared::protocol::render_cmd::{CanvasBatchPayload, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
 use shared::render_event::{RenderEvent, RenderEventReceiver, RenderEventSender};
 use shared::surface::{
@@ -425,8 +426,7 @@ fn execute_gl_batch(
     // *before* dispatch (cheap borrow via `&cmd`) so we can scope
     // stale-marking to just the affected contexts and avoid the
     // old "broadcast to every live Canvas2DContext" overkill.
-    let mut touched_canvases: std::collections::HashSet<CanvasId> =
-        std::collections::HashSet::new();
+    let mut touched_canvases = CanvasIdSet::new();
 
     for gl_cmd in commands.drain(..) {
         if let Some(cid) = gl_cmd.touches_canvas() {
@@ -462,7 +462,7 @@ fn execute_gl_batch(
     // means every command was a resource-context op (CreateShader,
     // LinkProgram, etc.) that doesn't bind any per-canvas state —
     // no Canvas2DContext needs invalidation.
-    for cid in touched_canvases {
+    for cid in &touched_canvases {
         cm.mark_2d_context_stale(cid);
     }
 
@@ -534,27 +534,11 @@ where
 /// cross-dependency (e.g. `ctx.drawImage(webglCanvasElement, ...)` —
 /// the WebGL canvas's pixels must be flushed before the Canvas2D
 /// draw reads them), in which case we preserve issue order.
-/// The Canvas2D half's distinct targets, gathered without touching the heap.
-///
-/// This used to be a pair of `HashSet<u32>`, built and thrown away on every
-/// frame the engine renders. A packet's Canvas2D half addresses a handful of
-/// canvases — the heaviest scene profiled reached about thirty offscreen labels
-/// — so at these sizes a linear scan over an inline array beats hashing on
-/// every count that matters: no allocation, no hashing, and the whole set in one
-/// cache line's worth of contiguous `u32`s.
-///
-/// The inline capacity is what a pathological scene would need; beyond it the
-/// smallvec spills to the heap and stays correct, which is the right failure
-/// mode for a fast path.
-type CanvasTargets = smallvec::SmallVec<[CanvasId; 32]>;
-
 fn packet_safe_to_reorder(ops: &[FrameOp]) -> bool {
-    let mut canvas_targets = CanvasTargets::new();
+    let mut canvas_targets = CanvasIdSet::new();
     for op in ops {
-        if let FrameOp::CanvasBatch(payload) = op
-            && !canvas_targets.contains(&payload.canvas_id)
-        {
-            canvas_targets.push(payload.canvas_id);
+        if let FrameOp::CanvasBatch(payload) = op {
+            canvas_targets.insert(payload.canvas_id);
         }
     }
 
@@ -570,7 +554,7 @@ fn packet_safe_to_reorder(ops: &[FrameOp]) -> bool {
         if let FrameOp::GlBatch(payload) = op {
             for cmd in &payload.commands {
                 if let Some(cid) = cmd.touches_canvas()
-                    && canvas_targets.contains(&cid)
+                    && canvas_targets.contains(cid)
                 {
                     return false;
                 }

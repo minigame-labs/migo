@@ -4,7 +4,6 @@
 //! single ordered timeline of segments. At frame end, one `FramePacket` is
 //! built with `Materialize` barriers inserted at Canvas2D→GL transitions.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -422,7 +421,7 @@ impl UnifiedFrameCollector {
 
         // Track which canvases have unmaterialized 2D work as we scan.
         // Canvas2D segments add to the set; GL segments consume it.
-        let mut pending_2d: HashSet<u32> = HashSet::new();
+        let mut pending_2d = shared::protocol::CanvasIdSet::new();
 
         // `drain` rather than `mem::take`: the segments belong to the packet, the
         // list holding them belongs to the next frame.  Taking hands both away and
@@ -442,7 +441,7 @@ impl UnifiedFrameCollector {
                 }
                 FrameSegment::GL(s) => {
                     // Insert Materialize for all canvases with pending 2D work.
-                    for &cid in &pending_2d {
+                    for cid in &pending_2d {
                         builder = builder.push(FrameOp::Materialize { canvas_id: cid });
                     }
                     pending_2d.clear();
@@ -456,7 +455,7 @@ impl UnifiedFrameCollector {
         // Barrier mode: materialize any trailing pending 2D canvases so
         // a subsequent sync readback (readPixels, getImageData) sees results.
         if materialize_trailing && !pending_2d.is_empty() {
-            for &cid in &pending_2d {
+            for cid in &pending_2d {
                 builder = builder.push(FrameOp::Materialize { canvas_id: cid });
             }
         }

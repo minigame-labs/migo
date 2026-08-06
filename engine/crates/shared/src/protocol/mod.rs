@@ -15,6 +15,7 @@ use crate::{
 pub mod ahb;
 pub mod audio_cmd;
 pub mod camera_frame;
+pub mod canvas_id_set;
 pub mod color;
 pub mod error;
 pub mod frame_packet;
@@ -23,6 +24,7 @@ pub mod io_cmd;
 pub mod render_cmd;
 
 pub use self::{
+    canvas_id_set::CanvasIdSet,
     frame_packet::{FrameOp, FramePacket, FramePacketBuilder},
     render_cmd::{CanvasBatchPayload, DirtyRect, GlBatchPayload},
 };
