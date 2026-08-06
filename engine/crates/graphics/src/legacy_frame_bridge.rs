@@ -1,3 +1,4 @@
+use shared::command_vec_pool::PooledVec;
 use shared::protocol::GlBatchPayload;
 use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, DirtyRect, GLCmd};
 use shared::{FrameOp, FramePacket, FramePacketBuilder};
@@ -11,14 +12,14 @@ impl LegacyFrameBridge {
         Self { ops: Vec::new() }
     }
 
-    pub(crate) fn push_gl_batch(&mut self, commands: Vec<GLCmd>) {
+    pub(crate) fn push_gl_batch(&mut self, commands: PooledVec<GLCmd>) {
         self.ops.push(FrameOp::GlBatch(GlBatchPayload { commands }));
     }
 
     pub(crate) fn push_canvas_batch(
         &mut self,
         canvas_id: u32,
-        commands: Vec<Canvas2DCmd>,
+        commands: PooledVec<Canvas2DCmd>,
         present: bool,
         dirty_rect: Option<DirtyRect>,
     ) {
@@ -64,7 +65,7 @@ fn frame_op_requests_present(op: &FrameOp) -> bool {
 #[cfg(test)]
 pub(crate) fn assert_bridge_flushes_pending_ops_without_packet_level_present_boundary() {
     let mut bridge = LegacyFrameBridge::new();
-    bridge.push_gl_batch(Vec::new());
+    bridge.push_gl_batch(Vec::new().into());
     let packet = bridge.finish_frame(12, 33.0).unwrap();
 
     assert_eq!(packet.frame_id(), 12);
@@ -88,7 +89,7 @@ mod tests {
     #[test]
     fn gl_only_frame_omits_packet_level_present_boundary() {
         let mut bridge = LegacyFrameBridge::new();
-        bridge.push_gl_batch(Vec::new());
+        bridge.push_gl_batch(Vec::new().into());
 
         let packet = bridge.finish_frame(5, 20.0).unwrap();
 

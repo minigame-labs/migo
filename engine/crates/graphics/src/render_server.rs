@@ -1,4 +1,5 @@
 use shared::FramePacket;
+use shared::command_vec_pool::PooledVec;
 use shared::protocol::render_cmd::{Canvas2DCmd, DirtyRect, GLCmd};
 
 use crate::LegacyFrameBridge;
@@ -32,14 +33,14 @@ impl RenderServer {
         packet.set_frame_metadata(self.frame_id, self.current_raf_time_ms);
     }
 
-    pub fn enqueue_gl_batch(&mut self, commands: Vec<GLCmd>) {
+    pub fn enqueue_gl_batch(&mut self, commands: PooledVec<GLCmd>) {
         self.bridge.push_gl_batch(commands);
     }
 
     pub fn enqueue_canvas_batch(
         &mut self,
         canvas_id: u32,
-        commands: Vec<Canvas2DCmd>,
+        commands: PooledVec<Canvas2DCmd>,
         present: bool,
         dirty_rect: Option<DirtyRect>,
     ) {
@@ -51,7 +52,7 @@ impl RenderServer {
         frame_id: u64,
         raf_time_ms: f64,
         canvas_id: u32,
-        commands: Vec<Canvas2DCmd>,
+        commands: PooledVec<Canvas2DCmd>,
         present: bool,
         dirty_rect: Option<DirtyRect>,
     ) -> FramePacket {
@@ -90,7 +91,7 @@ mod tests {
         assert!(server.finish_frame(16.0).is_none());
         assert_eq!(server.frame_id(), 0);
 
-        server.enqueue_gl_batch(Vec::new());
+        server.enqueue_gl_batch(Vec::new().into());
         let packet = server.finish_frame(32.0).unwrap();
 
         assert_eq!(packet.frame_id(), 1);
@@ -103,7 +104,7 @@ mod tests {
         let mut server = RenderServer::new();
         server.enqueue_canvas_batch(
             1,
-            vec![Canvas2DCmd::Save],
+            vec![Canvas2DCmd::Save].into(),
             true,
             Some(DirtyRect {
                 x: 0.0,
@@ -125,8 +126,14 @@ mod tests {
 
     #[test]
     fn packet_for_non_presenting_canvas_batch_omits_present() {
-        let packet =
-            RenderServer::packet_for_canvas_batch(7, 12.5, 1, vec![Canvas2DCmd::Save], false, None);
+        let packet = RenderServer::packet_for_canvas_batch(
+            7,
+            12.5,
+            1,
+            vec![Canvas2DCmd::Save].into(),
+            false,
+            None,
+        );
 
         assert_eq!(packet.frame_id(), 7);
         assert!(matches!(
@@ -139,7 +146,7 @@ mod tests {
     #[test]
     fn finish_non_presenting_canvas2d_frame_omits_present_packet() {
         let mut server = RenderServer::new();
-        server.enqueue_canvas_batch(1, vec![Canvas2DCmd::Save], false, None);
+        server.enqueue_canvas_batch(1, vec![Canvas2DCmd::Save].into(), false, None);
 
         let packet = server.finish_frame(33.0).unwrap();
 
@@ -157,7 +164,7 @@ mod tests {
         assert_eq!(server.frame_id(), 0);
 
         for expected in 1..=5u64 {
-            server.enqueue_canvas_batch(1, vec![Canvas2DCmd::Save], true, None);
+            server.enqueue_canvas_batch(1, vec![Canvas2DCmd::Save].into(), true, None);
             let packet = server.finish_frame(expected as f64 * 16.666).unwrap();
             assert_eq!(packet.frame_id(), expected);
             assert_eq!(server.frame_id(), expected);
@@ -167,7 +174,7 @@ mod tests {
     #[test]
     fn raf_time_ms_preserved_in_packet() {
         let mut server = RenderServer::new();
-        server.enqueue_canvas_batch(1, vec![Canvas2DCmd::Save], true, None);
+        server.enqueue_canvas_batch(1, vec![Canvas2DCmd::Save].into(), true, None);
 
         let packet = server.finish_frame(16.666).unwrap();
         assert!((packet.raf_time_ms() - 16.666).abs() < f64::EPSILON);
@@ -183,7 +190,7 @@ mod tests {
 
         // JS constructs packet with sentinel values.
         let mut packet =
-            FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save], true, None);
+            FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save].into(), true, None);
         assert_eq!(packet.frame_id(), 0);
         assert_eq!(packet.raf_time_ms(), 0.0);
 
@@ -202,8 +209,14 @@ mod tests {
         server.set_raf_time_ms(33.333);
 
         for expected in 1..=3u64 {
-            let mut packet =
-                FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save], true, None);
+            let mut packet = FramePacket::for_canvas_batch(
+                0,
+                0.0,
+                1,
+                vec![Canvas2DCmd::Save].into(),
+                true,
+                None,
+            );
             server.stamp_packet(&mut packet);
             assert_eq!(packet.frame_id(), expected);
         }
@@ -216,12 +229,14 @@ mod tests {
         let mut server = RenderServer::new();
 
         server.set_raf_time_ms(16.666);
-        let mut p1 = FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save], true, None);
+        let mut p1 =
+            FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save].into(), true, None);
         server.stamp_packet(&mut p1);
         assert!((p1.raf_time_ms() - 16.666).abs() < f64::EPSILON);
 
         server.set_raf_time_ms(33.333);
-        let mut p2 = FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save], true, None);
+        let mut p2 =
+            FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save].into(), true, None);
         server.stamp_packet(&mut p2);
         assert!((p2.raf_time_ms() - 33.333).abs() < f64::EPSILON);
     }
@@ -236,7 +251,8 @@ mod tests {
         server.set_raf_time_ms(16.666);
 
         // Canvas2D frame
-        let mut p1 = FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save], true, None);
+        let mut p1 =
+            FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save].into(), true, None);
         server.stamp_packet(&mut p1);
         assert_eq!(p1.frame_id(), 1);
 
@@ -247,7 +263,8 @@ mod tests {
             vec![GLCmd::Clear {
                 canvas_id: 1,
                 bit_field: 0x4000,
-            }],
+            }]
+            .into(),
         );
         server.stamp_packet(&mut p2);
         assert_eq!(p2.frame_id(), 2);
@@ -265,7 +282,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..3 {
             let mut packet = if i % 2 == 0 {
-                FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save], true, None)
+                FramePacket::for_canvas_batch(0, 0.0, 1, vec![Canvas2DCmd::Save].into(), true, None)
             } else {
                 FramePacket::for_gl_batch(
                     0,
@@ -273,7 +290,8 @@ mod tests {
                     vec![GLCmd::Clear {
                         canvas_id: 1,
                         bit_field: 0x4000,
-                    }],
+                    }]
+                    .into(),
                 )
             };
             server.stamp_packet(&mut packet);

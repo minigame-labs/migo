@@ -52,6 +52,16 @@ compile_error!("embed_icudtl and external_icudtl are mutually exclusive");
 /// which would inspect their own unrelated feature namespace.
 pub const EMBEDS_ICU_DATA: bool = cfg!(feature = "embed_icudtl");
 
+// Section 7.3's steady-state allocation gate reads this. `#[cfg(test)]` scopes it
+// to this crate's own test binary: a `#[global_allocator]` is unique per binary, so
+// one declared unconditionally here would follow the library into every shipped
+// cdylib. Deleting it does not make the gates pass silently -- each burst proves the
+// allocator is installed before it trusts a zero count.
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: migo_alloc_probe::CountingAllocator =
+    migo_alloc_probe::CountingAllocator::system();
+
 pub mod atlas;
 pub mod atrace;
 #[doc(hidden)]
@@ -136,7 +146,7 @@ fn does_not_present_when_surface_is_not_ready() {
 fn gl_only_packet_triggers_present_when_batch_hits_onscreen() {
     use shared::FramePacket;
 
-    let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new());
+    let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new().into());
 
     let mut hit_count = 0u32;
     let should_present = render_thread::execute_frame_packet_with_present_tracking(
@@ -160,7 +170,7 @@ fn gl_only_packet_triggers_present_when_batch_hits_onscreen() {
 fn gl_only_packet_no_present_when_batch_is_offscreen() {
     use shared::FramePacket;
 
-    let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new());
+    let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new().into());
 
     let should_present = render_thread::execute_frame_packet_with_present_tracking(
         packet,
@@ -182,13 +192,13 @@ fn mixed_canvas2d_and_gl_packet_unions_present_signals() {
         .push(FrameOp::BeginFrame)
         .push(FrameOp::CanvasBatch(CanvasBatchPayload {
             canvas_id: 1,
-            commands: vec![Canvas2DCmd::Save],
+            commands: vec![Canvas2DCmd::Save].into(),
             present: true,
             dirty_rect: None,
         }))
         .push(FrameOp::GlBatch(
             shared::protocol::render_cmd::GlBatchPayload {
-                commands: Vec::new(),
+                commands: Vec::new().into(),
             },
         ))
         .finish();

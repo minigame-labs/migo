@@ -45,14 +45,14 @@ pub struct DirtyRect {
 #[derive(Debug)]
 pub struct CanvasBatchPayload {
     pub canvas_id: CanvasId,
-    pub commands: Vec<Canvas2DCmd>,
+    pub commands: crate::command_vec_pool::PooledVec<Canvas2DCmd>,
     pub present: bool,
     pub dirty_rect: Option<DirtyRect>,
 }
 
 #[derive(Debug)]
 pub struct GlBatchPayload {
-    pub commands: Vec<GLCmd>,
+    pub commands: crate::command_vec_pool::PooledVec<GLCmd>,
 }
 
 pub type SyncResp<T> = Sender<RenderResult<T>>;

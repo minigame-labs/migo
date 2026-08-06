@@ -293,17 +293,38 @@ mod tests {
         );
     }
 
+    /// Presentation is coalesced by the physical-frame loop, so executing a
+    /// packet's ops must never sweep every live context — that sweep is what
+    /// made multiple packets in one display frame cost multiple all-context
+    /// walks.
+    ///
+    /// **Scoped to the whole op executor rather than to the `Present` arm.** The
+    /// earlier version split the source on `"FrameOp::Present => {"` and
+    /// inspected the text up to the next arm. That pinned one arm out of five,
+    /// so a sweep introduced in `Materialize` or `GlBatch` passed it; and it was
+    /// coupled to the arm's brace style closely enough that turning the arm into
+    /// an expression broke the extraction rather than the property. Both are the
+    /// same mistake — a guard covering only the face it was written for — so the
+    /// assertion now covers every arm and does not depend on how any of them is
+    /// written.
     #[test]
-    fn frame_packet_present_no_longer_sweeps_every_context() {
+    fn executing_a_frame_op_never_sweeps_every_context() {
         let source = include_str!("render_thread.rs");
-        let present = source
-            .split("FrameOp::Present => {")
-            .nth(1)
-            .and_then(|tail| tail.split("FrameOp::Materialize").next())
-            .expect("FrameOp::Present arm");
+        let executor = source
+            .split_once("fn execute_frame_op(")
+            .and_then(|(_, tail)| tail.split_once("\nfn "))
+            .map(|(body, _)| body)
+            .expect("execute_frame_op is where a packet's ops are executed");
 
-        assert!(!present.contains("perform_deferred_cleanup"));
-        assert!(!present.contains("contexts_2d_iter_mut"));
+        assert!(
+            !executor.contains("perform_deferred_cleanup"),
+            "executing one op performs the deferred-cleanup sweep, which belongs \
+             to the physical-frame tail"
+        );
+        assert!(
+            !executor.contains("contexts_2d_iter_mut"),
+            "executing one op walks every live 2D context"
+        );
     }
 
     #[test]

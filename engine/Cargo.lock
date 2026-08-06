@@ -1714,6 +1714,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "lru",
+ "migo-alloc-probe",
  "migo-shared",
  "parking_lot",
  "png 0.17.16",
