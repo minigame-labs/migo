@@ -62,9 +62,23 @@ jobs:
         # sat wrong on ILP32 for two appended fields before anyone compiled it.
         # `MIGO_ABI_REQUIRE_ILP32=1` turns a skip into a failure, so an install
         # that regresses is loud instead of invisible.
+        # Same bounded install as the PR gate -- see pr-ci.yml for the 988s
+        # mirror stall that made an unbounded one a job-killer.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-multilib
+          can_target_m32() {
+            printf 'int main(void){return 0;}' \
+              | "$1" -m32 -ffreestanding -std=c11 -c -x c - -o /dev/null 2>/dev/null
+          }
+          install_multilib() {
+            timeout 90 sudo apt-get update -qq || return 1
+            timeout 150 sudo apt-get install -y -qq gcc-multilib || return 1
+          }
+          if ! can_target_m32 gcc || ! can_target_m32 clang; then
+            install_multilib || {
+              echo "multilib install stalled or failed; retrying once" >&2
+              install_multilib
+            }
+          fi
           MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
           CC=clang CXX=clang++ MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
 
