@@ -466,7 +466,28 @@ review. A commit alone is not completion evidence.
   mechanism (`ThreadMXBean.getThreadAllocatedBytes`), because a Rust allocator
   observes nothing the JVM allocates; `platforms/android` has no such usage today.
 
-  Still unmeasured: the render command path and the audio path. **`io::image_cache`
+  **And it is not merely ungated: it is unmet, five times per notification.** Read on
+  2026-08-08 while auditing this item. `onBLECharacteristicValueChange` in
+  `platform/src/android/jni/inbound.rs` allocates three `String`s (device, service and
+  characteristic UUIDs, via `env.get_string(..).into()`), one `Vec<u8>` for the value
+  (`convert_byte_array`), and one `Box<BleCharacteristicData>` — on every notification,
+  for a stream a peripheral can drive at a hundred hertz or more. The three UUIDs are
+  *the same three strings* on every notification from one characteristic, which is what
+  makes them interning candidates rather than an unavoidable JNI copy; the value and the
+  box are what the input path already solves with a payload pool. So the shape of the
+  fix is known and it is the pool this requirement already built once. What is not
+  known is whether the JNI string extraction can avoid an allocation at all, which is a
+  question about the `jni` crate's API and needs a target to answer honestly. Recorded
+  with its count rather than left as "uncovered", because "no gate exists" and "the
+  requirement is violated" are different states and this item had them conflated.
+
+  ~~Still unmeasured: the render command path and the audio path.~~ **Both are since
+  covered** — the render command path's two enqueues under tasks 0.38 and 0.41, and the
+  audio path under 0.43 (the graph's per-quantum render), 0.47 (the thread's own tick),
+  0.48 (the hardware output callback) and 0.49 (the streaming refill), all listed in
+  Section 7.3's "Covered so far". This is the second time this item's hand-maintained
+  remaining list named work already done, and the same correction as the
+  `io::image_cache` line below. **`io::image_cache`
   no longer belongs on that list** — the prediction recorded here was right and was
   acted on: task 0.34 measured it (the pin/unpin pair allocated, the lookup did
   not) and task 0.36 removed the two owned keys on the layer above it. This
@@ -476,6 +497,15 @@ review. A commit alone is not completion evidence.
 - [ ] 0.27 Build the cross-session contention gate Section 7.3 requires.
   **Mechanism built and applied to the Rust per-event paths; the permission gate's
   JVM half stays with task 5.1, so this item stays open.**
+
+  **The Rust permission gate is now among them, and it was a live violation rather
+  than a covered path.** This entry said the gate had no such test and pointed at task
+  5.1 for the replacement — which is the *JVM* gate. The Rust gate is a different
+  object, and pointing this mechanism at it under task 0.66 found every gated Android
+  device call taking a process-wide `Mutex` on the live-host map. The mechanism grew a
+  `Mutex` form for it, sharing a body with the `RwLock` one; factoring that body out
+  inverted a lock order and the mechanism's own overlap self-test caught it, which is
+  the second time one of these probes' controls has earned its place.
 
   No such test covered the permission gate. The first attempt was withdrawn because it
   was provably unable to fail: the path it exercised took the shared lock inside the
