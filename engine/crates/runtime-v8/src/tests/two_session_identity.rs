@@ -118,6 +118,39 @@ mod tests {
         }
     }
 
+    /// The text texture cache *this Session's own* canvas op state is bound to.
+    ///
+    /// Read out of the live op state rather than resolved from a host id the test
+    /// picks, because the claim under test is that a Session binds its own — a test
+    /// that called `text_cache_for_host(1)` itself would be asserting that a registry
+    /// separates two keys, which is what the registry's own tests already do.
+    fn text_cache_of(rt: &HostJsRuntime) -> shared::text_texture_cache::SharedTextCache {
+        let op_state = rt.op_state();
+        let borrowed = op_state.borrow();
+        borrowed
+            .borrow::<shared::op_state::CanvasOpState>()
+            .text_cache
+            .clone()
+    }
+
+    /// A cache key that differs only in its text, so the label is the only thing that
+    /// can separate two entries and a collision cannot come from anything else.
+    fn text_key(label: &str) -> shared::text_texture_cache::TextCacheKey {
+        shared::text_texture_cache::TextCacheKey {
+            text: label.to_string(),
+            font_request: "16px sans-serif".to_string(),
+            font_size_bits: 16.0f32.to_bits(),
+            font_weight: 400,
+            italic: false,
+            fill_color: 0xFFFF_FFFF,
+            text_align: shared::protocol::render_cmd::TextAlign::Left,
+            text_baseline: shared::protocol::render_cmd::TextBaseline::Alphabetic,
+            canvas_w: 64,
+            canvas_h: 32,
+            font_generation: 0,
+        }
+    }
+
     fn storage_of(rt: &HostJsRuntime) -> PathBuf {
         let op_state = rt.op_state();
         let borrowed = op_state.borrow();
@@ -135,6 +168,12 @@ mod tests {
         Write { key: String, bytes: usize },
         /// This game's own byte total, as its own store accounts for it.
         ReportBytes,
+        /// Put a text texture under `label` in whatever cache *this* Session's own
+        /// canvas op state is bound to.
+        CacheText { label: String, texture_id: u32 },
+        /// Whether this Session's own cache holds `label`, and under which texture
+        /// name. `None` means its own cache has never seen it.
+        LookUpText { label: String },
     }
 
     /// What a step answered. One channel carries all three because the steps are
@@ -146,6 +185,8 @@ mod tests {
         /// for the wrong reason is visible in the failure.
         Written(Result<(), String>),
         Bytes(u64),
+        /// The texture name this Session's own cache holds for a label, if any.
+        Texture(Option<u32>),
     }
 
     /// A host thread with one live `HostJsRuntime`, driven step by step so the
@@ -205,6 +246,33 @@ mod tests {
                                         .map_err(|e| e.to_string()),
                                     )
                                 }
+                                Step::CacheText { label, texture_id } => {
+                                    // Deliberately asserts nothing. A setup assertion
+                                    // here would make a cross-session hit die inside
+                                    // this helper -- detecting the defect while never
+                                    // evaluating the claim the test is named for. Under
+                                    // a merged cache the second insert evicts the
+                                    // first, and the eviction list is exactly the kind
+                                    // of tempting setup assertion that hides where the
+                                    // failure belongs.
+                                    let cache = text_cache_of(&js);
+                                    let _evicted = cache.lock().insert(
+                                        text_key(&label),
+                                        shared::text_texture_cache::CachedTextEntry {
+                                            texture_id,
+                                            width: 16,
+                                            height: 16,
+                                            size_bytes: 4 * 16 * 16,
+                                        },
+                                    );
+                                    Answer::Texture(None)
+                                }
+                                Step::LookUpText { label } => Answer::Texture(
+                                    text_cache_of(&js)
+                                        .lock()
+                                        .get(&text_key(&label))
+                                        .map(|entry| entry.texture_id),
+                                ),
                                 Step::ReportBytes => {
                                     let dir = storage_of(&js);
                                     Answer::Bytes(
@@ -261,6 +329,22 @@ mod tests {
             }) {
                 Answer::Written(outcome) => outcome,
                 _ => panic!("a write step must answer with its outcome"),
+            }
+        }
+
+        fn cache_text(&self, label: &str, texture_id: u32) {
+            let _ = self.step(Step::CacheText {
+                label: label.to_string(),
+                texture_id,
+            });
+        }
+
+        fn look_up_text(&self, label: &str) -> Option<u32> {
+            match self.step(Step::LookUpText {
+                label: label.to_string(),
+            }) {
+                Answer::Texture(found) => found,
+                _ => panic!("a lookup step must answer with a texture name or nothing"),
             }
         }
 
@@ -332,6 +416,76 @@ mod tests {
             sb.starts_with(&nb) && !sb.starts_with(&na),
             "game-b resolved to {sb:?}, which is not its own namespace {nb:?}"
         );
+
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two live Sessions hold two text texture caches, which is Section 6.4 defect 1
+    /// at the layer the defect was about.
+    ///
+    /// The cache's own isolation tests take two host ids from
+    /// `text_cache_for_host` and show the registry separates them. That is a claim
+    /// about a registry given distinct keys — the same shape task 0.62 replaced for
+    /// storage. What was never executed is the step before it: that a Session *binds*
+    /// its own cache, through `CanvasOpState::for_host` in the `web` extension's state
+    /// init, so two live Sessions end up on two caches without anyone choosing a key.
+    /// This reads the cache out of each live op state instead of resolving one.
+    ///
+    /// **Both entries are cached before either lookup.** A cache keyed without session
+    /// identity, or a process-wide slot written at bind time, or one op state behind
+    /// two runtimes all show up as a cross-session hit only once both Sessions have
+    /// written. Looking `a` up before `b` writes would let every one of them through.
+    ///
+    /// **Each Session's own hit is asserted too**, and it is not decoration: every
+    /// negative assertion here is satisfied by a cache that stores nothing at all.
+    #[test]
+    fn two_live_sessions_hold_their_own_text_texture_cache() {
+        let root = scratch("two-sessions-text-cache");
+        let files = root.join("files");
+        let cache = root.join("cache");
+        install_entry(&files, &cache, "game-a");
+        install_entry(&files, &cache, "game-b");
+
+        // Host ids no other test in this process uses, because the cache registry is
+        // process-wide and keyed by host id: a shared id would make two tests agree
+        // by accident.
+        let a = Session::spawn(&files, &cache, 8101);
+        let b = Session::spawn(&files, &cache, 8102);
+        a.load("game-a");
+        b.load("game-b");
+
+        // The *same* label from both Sessions, deliberately. Two different labels
+        // would separate the entries by key and the test would pass over a cache with
+        // no session identity at all. Different texture names, because equal ones pass
+        // under a merge.
+        a.cache_text("shared-label", 0xA11);
+        b.cache_text("shared-label", 0xB22);
+
+        assert_eq!(
+            a.look_up_text("shared-label"),
+            Some(0xA11),
+            "game-a's own cache did not return game-a's texture: it either lost the \
+             entry, or game-b's insert under the same label replaced it"
+        );
+        assert_eq!(
+            b.look_up_text("shared-label"),
+            Some(0xB22),
+            "game-b was served game-a's texture name, which is meaningless in its own \
+             GL context"
+        );
+
+        // And each must miss what only the other cached, which is the half a
+        // same-label test can state and a different-label one cannot.
+        assert_eq!(
+            a.look_up_text("only-b-has-this"),
+            None,
+            "game-a found a label only game-b could have cached"
+        );
+        b.cache_text("only-b-has-this", 0xB33);
+        assert_eq!(a.look_up_text("only-b-has-this"), None);
+        assert_eq!(b.look_up_text("only-b-has-this"), Some(0xB33));
 
         drop(a);
         drop(b);
