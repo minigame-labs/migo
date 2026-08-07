@@ -1516,22 +1516,69 @@ mod tests {
     /// again when the count reaches zero, so the allocation and the free are one
     /// round trip rather than growth.
     #[test]
-    fn steady_state_image_cache_pin_and_unpin_never_reach_the_heap() {
+    /// Section 7.3's steady-state *growth* requirement, on the reservation table.
+    ///
+    /// This is the pin path's other half. The resident case above must not reach the
+    /// heap at all; the *non*-resident case must, because a reservation records the
+    /// pin beside the cache and needs an owned key to do it. So no burst can be
+    /// written over it, and the only available question is whether the round trip
+    /// gives the key back.
+    ///
+    /// The reservation table is the one structure in this cache that
+    /// `current_size` does not account for, which makes it the one place growth can
+    /// hide from every budget test *and* from the public API: a reservation left
+    /// behind at a count of zero is indistinguishable from an absent one through
+    /// `pin_count`, and invisible to `size_bytes`. Only the bytes show it.
+    #[test]
+    fn a_reservation_round_trip_gives_back_the_key_it_took() {
         let mut cache = ImageCache::with_limits(16, 4 * 1024 * 1024);
-        let hot = key("/pinned.png");
-        cache.insert(hot.clone(), rgba(16, 16), 401);
 
-        migo_alloc_probe::assert_no_steady_state_allocation(
-            migo_alloc_probe::Burst {
-                path: "io::image_cache: per-alias pin and unpin of a resident entry",
+        migo_alloc_probe::assert_no_steady_state_growth(
+            migo_alloc_probe::Cycle {
+                path: "io::image_cache: pin and unpin a key that is not resident",
                 warmup: 4,
                 measured: 64,
             },
-            |_| {
-                cache.pin(&hot);
-                let pinned = cache.pin_count(&hot);
-                cache.unpin(&hot);
+            |iteration| {
+                // A distinct key per iteration, all the same length, so the bytes a
+                // balanced round trip takes and returns are equal and the measured
+                // net is exactly zero rather than approximately so. Repeating one
+                // key would let a table that never released it still look balanced,
+                // because the second pin of a live reservation allocates nothing.
+                let absent = key(&format!("/absent{iteration:06}.png"));
+                cache.pin(&absent);
+                let pinned = cache.pin_count(&absent);
+                cache.unpin(&absent);
                 pinned
+            },
+        );
+    }
+
+    /// The same requirement one level up: a cache at its byte budget must give back
+    /// what each admission takes.
+    ///
+    /// Measured against the allocator rather than against `current_size`, which is
+    /// the point — the cache's own accounting counts an entry's pixels and nothing
+    /// else, so a guard that reads it cannot see growth in what it does not count.
+    #[test]
+    fn a_cache_at_its_budget_does_not_grow_as_entries_turn_over() {
+        const ENTRY_BYTES: usize = 16 * 16 * 4;
+        let mut cache = ImageCache::with_limits(1024, ENTRY_BYTES * 8);
+
+        migo_alloc_probe::assert_no_steady_state_growth(
+            migo_alloc_probe::Cycle {
+                path: "io::image_cache: admit one entry at the byte budget",
+                // Long enough for the byte budget to bind, so the measured window
+                // sees turnover rather than the cache legitimately filling.
+                warmup: 32,
+                measured: 64,
+            },
+            |iteration| {
+                cache.insert(
+                    key(&format!("/turnover{iteration:06}.png")),
+                    rgba(16, 16),
+                    501,
+                );
             },
         );
     }

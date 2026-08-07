@@ -37,6 +37,7 @@ struct Counters {
     reallocations: Cell<u64>,
     deallocations: Cell<u64>,
     bytes_allocated: Cell<u64>,
+    bytes_freed: Cell<u64>,
 }
 
 thread_local! {
@@ -49,6 +50,7 @@ thread_local! {
             reallocations: Cell::new(0),
             deallocations: Cell::new(0),
             bytes_allocated: Cell::new(0),
+            bytes_freed: Cell::new(0),
         }
     };
 }
@@ -60,6 +62,7 @@ pub struct AllocationCounts {
     pub reallocations: u64,
     pub deallocations: u64,
     pub bytes_allocated: u64,
+    pub bytes_freed: u64,
 }
 
 impl AllocationCounts {
@@ -73,6 +76,16 @@ impl AllocationCounts {
         self.allocations + self.reallocations
     }
 
+    /// Bytes taken and not yet given back, as a signed value.
+    ///
+    /// Signed because it is meaningful for a thread to release more than it took:
+    /// a block allocated on one thread and freed on another leaves the freeing
+    /// thread negative, and a drain-only cycle is not growth.
+    #[must_use]
+    pub const fn live_bytes(&self) -> i64 {
+        self.bytes_allocated as i64 - self.bytes_freed as i64
+    }
+
     #[must_use]
     fn since(self, earlier: Self) -> Self {
         Self {
@@ -80,6 +93,7 @@ impl AllocationCounts {
             reallocations: self.reallocations - earlier.reallocations,
             deallocations: self.deallocations - earlier.deallocations,
             bytes_allocated: self.bytes_allocated - earlier.bytes_allocated,
+            bytes_freed: self.bytes_freed - earlier.bytes_freed,
         }
     }
 }
@@ -97,6 +111,7 @@ pub fn thread_counts() -> AllocationCounts {
             reallocations: counters.reallocations.get(),
             deallocations: counters.deallocations.get(),
             bytes_allocated: counters.bytes_allocated.get(),
+            bytes_freed: counters.bytes_freed.get(),
         })
         .unwrap_or_default()
 }
@@ -116,7 +131,10 @@ fn record_allocation(bytes: usize) {
     });
 }
 
-fn record_reallocation(new_bytes: usize) {
+// A resize is both ends at once: the new block is taken and the old one given
+// back. Recording only the new size would make every growing container look like
+// it leaked the difference between its old and new capacity.
+fn record_reallocation(new_bytes: usize, old_bytes: usize) {
     let _ = COUNTERS.try_with(|counters| {
         counters
             .reallocations
@@ -127,14 +145,20 @@ fn record_reallocation(new_bytes: usize) {
                 .get()
                 .wrapping_add(new_bytes as u64),
         );
+        counters
+            .bytes_freed
+            .set(counters.bytes_freed.get().wrapping_add(old_bytes as u64));
     });
 }
 
-fn record_deallocation() {
+fn record_deallocation(bytes: usize) {
     let _ = COUNTERS.try_with(|counters| {
         counters
             .deallocations
             .set(counters.deallocations.get().wrapping_add(1));
+        counters
+            .bytes_freed
+            .set(counters.bytes_freed.get().wrapping_add(bytes as u64));
     });
 }
 
@@ -168,14 +192,155 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        record_reallocation(new_size);
+        record_reallocation(new_size, layout.size());
         unsafe { self.inner.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        record_deallocation();
+        record_deallocation(layout.size());
         unsafe { self.inner.dealloc(ptr, layout) }
     }
+}
+
+/// One measured run of a cycle, for Section 7.3's steady-state *growth*
+/// requirement — "resident memory does not grow across a defined long-running
+/// workload".
+///
+/// The sibling of [`Burst`], and the difference is which paths each can be
+/// pointed at. A burst asks whether a path touches the heap at all, so it applies
+/// only where the answer must be never. A cycle asks whether a path that
+/// legitimately allocates gives everything back — which is the only question
+/// available for the paths a game repeats for hours and which cannot be
+/// allocation-free by construction: load and evict an image, insert and evict a
+/// cache entry, open and close a connection. An unbounded cache is the shape this
+/// exists for: it allocates for a living, so no burst can be written over it, and
+/// it retains, so a cycle fails on it.
+///
+/// **What a delta measurement cannot see, because it bounds the claim.** Both
+/// counters move only inside the measured window, so a block allocated *before*
+/// the window and leaked *inside* it is invisible: nothing was taken and nothing
+/// was given back. That is the pooled-vector case — a lost loan becomes
+/// observable only once the drained pool forces a fresh allocation, which is the
+/// same second-order signal a burst relies on, not a new one. A cycle is a gate
+/// on bytes the window itself took.
+pub struct Cycle<'a> {
+    /// The cycle under measurement, quoted verbatim in the failure.
+    pub path: &'a str,
+    /// Iterations run before measurement begins. Stricter than a burst's warm-up:
+    /// every bounded cache the cycle touches must reach its bound here, or the
+    /// measured window counts a cache legitimately filling as growth.
+    pub warmup: usize,
+    /// Iterations measured, as `warmup..warmup + measured`.
+    pub measured: usize,
+}
+
+/// Run a cycle repeatedly and fail if it retained bytes.
+///
+/// Passing means the measured iterations released at least as much as they took.
+/// It does not mean nothing leaked: a cycle that leaks a hundred bytes while
+/// releasing two hundred elsewhere nets negative and passes. Net is what "does
+/// not grow" means, and a stricter reading would fail every legitimately
+/// shrinking path.
+#[track_caller]
+pub fn assert_no_steady_state_growth<T>(cycle: Cycle<'_>, mut body: impl FnMut(usize) -> T) {
+    assert!(
+        cycle.warmup > 0,
+        "{}: warmup iterations must be non-zero, or the measurement counts a cache \
+         filling as growth",
+        cycle.path
+    );
+    assert!(
+        cycle.measured > 0,
+        "{}: measured iterations must be non-zero, or the assertion proves nothing",
+        cycle.path
+    );
+
+    assert_allocator_observes_both_ends(cycle.path);
+
+    for iteration in 0..cycle.warmup {
+        black_box(body(iteration));
+    }
+
+    let before = thread_counts();
+    for iteration in cycle.warmup..cycle.warmup + cycle.measured {
+        black_box(body(iteration));
+    }
+    let delta = thread_counts().since(before);
+
+    assert!(
+        delta.live_bytes() <= 0,
+        "{path}: retained {retained} byte(s) over {measured} measured iteration(s) \
+         ({taken} taken, {given} given back; {allocations} fresh, {reallocations} resize, \
+         {deallocations} release(s)). Section 7.3 requires that a steady-state cycle not grow.",
+        path = cycle.path,
+        retained = delta.live_bytes(),
+        measured = cycle.measured,
+        taken = delta.bytes_allocated,
+        given = delta.bytes_freed,
+        allocations = delta.allocations,
+        reallocations = delta.reallocations,
+        deallocations = delta.deallocations,
+    );
+}
+
+/// Refuse to certify a growth measurement unless *both* counters are live.
+///
+/// A growth gate has one more way to be silently green than an allocation gate.
+/// If frees stopped being counted, every cycle would look like it grew — loud and
+/// harmless. If allocations stopped being counted, every cycle would look like it
+/// shrank, and the gate would pass forever. So the check is not "did we see an
+/// allocation" but "did an allocate-and-release pair net to exactly zero", which
+/// no single broken counter can satisfy.
+#[track_caller]
+fn assert_allocator_observes_both_ends(path: &str) {
+    let before = thread_counts();
+    let probe: Vec<u8> = Vec::with_capacity(PROBE_BYTES);
+    black_box(&probe);
+    drop(black_box(probe));
+    let observed = thread_counts().since(before);
+
+    if let Some(reason) = untrustworthy_growth_observation(observed) {
+        panic!(
+            "{path}: {reason}, so this cycle's byte accounting would prove nothing. \
+             Declare the counting allocator in this binary:\n  \
+             #[global_allocator]\n  static ALLOCATOR: migo_alloc_probe::CountingAllocator = \
+             migo_alloc_probe::CountingAllocator::system();"
+        );
+    }
+}
+
+/// Bytes the installation probe asks for. Large enough that no allocator would
+/// satisfy it from an existing block without a call.
+const PROBE_BYTES: usize = 4096;
+
+/// Why an allocate-and-release probe's counts cannot be trusted for growth, if
+/// they cannot. `None` means both ends are observed.
+///
+/// Separated from the probe itself so the judgement is testable against
+/// fabricated counts: a broken allocator cannot be installed alongside the real
+/// one to test it end to end, since `#[global_allocator]` is unique per binary.
+fn untrustworthy_growth_observation(observed: AllocationCounts) -> Option<&'static str> {
+    if observed.allocation_events() == 0 && observed.bytes_freed == 0 {
+        return Some(
+            "the counting allocator observed neither end of a known allocate-and-release pair",
+        );
+    }
+    if observed.allocation_events() == 0 {
+        return Some(
+            "the counting allocator did not observe a known allocation, so every cycle would appear to shrink",
+        );
+    }
+    if observed.bytes_freed == 0 {
+        return Some(
+            "the counting allocator did not observe a known release, so every cycle would appear to grow",
+        );
+    }
+    if observed.live_bytes() != 0 {
+        return Some(
+            "a known allocate-and-release pair did not net to zero, so the two counters disagree",
+        );
+    }
+    None
 }
 
 /// One measured burst.
@@ -264,7 +429,10 @@ fn assert_counting_allocator_is_installed(path: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Burst, assert_no_steady_state_allocation};
+    use super::{
+        AllocationCounts, Burst, Cycle, assert_no_steady_state_allocation,
+        assert_no_steady_state_growth, untrustworthy_growth_observation,
+    };
 
     // This binary deliberately installs no counting allocator, which makes it the
     // negative control for installation. `tests/harness.rs` is the positive one.
@@ -274,6 +442,19 @@ mod tests {
     fn a_burst_refuses_to_certify_a_binary_without_the_allocator() {
         assert_no_steady_state_allocation(
             Burst {
+                path: "uninstrumented binary",
+                warmup: 1,
+                measured: 1,
+            },
+            |_| (),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "observed neither end")]
+    fn a_cycle_refuses_to_certify_a_binary_without_the_allocator() {
+        assert_no_steady_state_growth(
+            Cycle {
                 path: "uninstrumented binary",
                 warmup: 1,
                 measured: 1,
@@ -306,5 +487,100 @@ mod tests {
             },
             |_| (),
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "measured iterations must be non-zero")]
+    fn a_cycle_measuring_nothing_is_rejected() {
+        assert_no_steady_state_growth(
+            Cycle {
+                path: "vacuous",
+                warmup: 1,
+                measured: 0,
+            },
+            |_| (),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "counts a cache filling as growth")]
+    fn a_cycle_without_warmup_is_rejected() {
+        assert_no_steady_state_growth(
+            Cycle {
+                path: "cold",
+                warmup: 0,
+                measured: 1,
+            },
+            |_| (),
+        );
+    }
+
+    /// The four ways a probe's counts disqualify a growth measurement, judged
+    /// against fabricated counts because a broken allocator cannot be installed
+    /// beside the real one to produce them.
+    #[test]
+    fn a_silent_allocator_disqualifies_a_growth_measurement() {
+        assert_eq!(
+            untrustworthy_growth_observation(AllocationCounts::default())
+                .expect("no allocator at all is refused"),
+            "the counting allocator observed neither end of a known allocate-and-release pair"
+        );
+    }
+
+    #[test]
+    fn an_allocator_that_ignores_allocations_disqualifies_a_growth_measurement() {
+        let counts = AllocationCounts {
+            bytes_freed: 4096,
+            deallocations: 1,
+            ..AllocationCounts::default()
+        };
+        assert!(
+            untrustworthy_growth_observation(counts)
+                .expect("half-blind counters are refused")
+                .contains("every cycle would appear to shrink"),
+            "an unseen allocation is the dangerous direction and must say so"
+        );
+    }
+
+    #[test]
+    fn an_allocator_that_ignores_releases_disqualifies_a_growth_measurement() {
+        let counts = AllocationCounts {
+            allocations: 1,
+            bytes_allocated: 4096,
+            ..AllocationCounts::default()
+        };
+        assert!(
+            untrustworthy_growth_observation(counts)
+                .expect("half-blind counters are refused")
+                .contains("every cycle would appear to grow")
+        );
+    }
+
+    #[test]
+    fn counters_that_disagree_disqualify_a_growth_measurement() {
+        let counts = AllocationCounts {
+            allocations: 1,
+            bytes_allocated: 4096,
+            deallocations: 1,
+            bytes_freed: 2048,
+            ..AllocationCounts::default()
+        };
+        assert!(
+            untrustworthy_growth_observation(counts)
+                .expect("a pair that does not net to zero is refused")
+                .contains("did not net to zero")
+        );
+    }
+
+    #[test]
+    fn a_balanced_probe_qualifies_a_growth_measurement() {
+        let counts = AllocationCounts {
+            allocations: 1,
+            bytes_allocated: 4096,
+            deallocations: 1,
+            bytes_freed: 4096,
+            ..AllocationCounts::default()
+        };
+        assert_eq!(untrustworthy_growth_observation(counts), None);
     }
 }

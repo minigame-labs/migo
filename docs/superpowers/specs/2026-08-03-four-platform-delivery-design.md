@@ -923,6 +923,74 @@ These are enforced by tests, not by inspection:
 - **No steady-state growth.** Resident memory does not grow across a defined
   long-running workload.
 
+  **Two instruments, because one requirement has two failure modes.**
+  `migo_alloc_probe::assert_no_steady_state_growth` holds an individual cycle to
+  net zero heap bytes, and `scripts/measure-steady-state-growth.sh` holds the whole
+  process to a flat resident trend — the only instrument that can see growth
+  outside the Rust heap: GPU allocations, the V8 heap, mmap, allocator
+  fragmentation.
+
+  **The cycle gate is the sibling of the allocation burst, and the difference is
+  which paths each can be pointed at.** A burst asks whether a path touches the
+  heap at all, so it applies only where the answer must be never. A cycle asks
+  whether a path that legitimately allocates gives everything back — the only
+  question available for what a game repeats for hours and which cannot be
+  allocation-free by construction: admit and evict a cache entry, take and release
+  an alias, open and close a connection. An unbounded cache is the shape it exists
+  for: it allocates for a living, so no burst can be written over it, and it
+  retains, so a cycle fails on it.
+
+  Three properties make it a gate rather than a decoration:
+
+  - **A resize is both ends at once.** `realloc` takes the new block and returns
+    the old, so recording only the new size would make every growing container
+    look like it leaked the difference.
+  - **The installation self-check is stricter than the burst's, because a growth
+    gate has one more way to be silently green.** If frees stopped being counted
+    every cycle would look like it grew — loud and harmless. If *allocations*
+    stopped being counted every cycle would look like it shrank, and the gate would
+    pass forever. So the check is not "did we see an allocation" but "did a known
+    allocate-and-release pair net to exactly zero", which no single broken counter
+    can satisfy. The judgement is a pure function of the observed counts, tested
+    against fabricated ones, because a broken allocator cannot be installed beside
+    the real one.
+  - **Passing means net, and net is what the requirement says.** A cycle that
+    leaks a hundred bytes while releasing two hundred elsewhere passes. A stricter
+    reading would fail every legitimately shrinking path.
+
+  **What a delta measurement cannot see, stated because it bounds the claim and
+  because the first version of this section claimed the opposite.** Both counters
+  move only inside the measured window, so a block allocated *before* the window
+  and leaked *inside* it is invisible: nothing was taken and nothing was given
+  back. That is exactly the pooled-vector case this section names above, so the
+  cycle gate does **not** close it — a lost loan still surfaces only once the
+  drained pool forces a fresh allocation, which is the same second-order signal a
+  burst relies on. The claim that a cycle "sees the retained bytes directly" was
+  written before it was tested, and the test that was supposed to demonstrate it
+  failed instead. It is kept as a control that pins the boundary.
+
+  **Covered:** the image cache's reservation round trip and its admission at the
+  byte budget. The reservation table is the one structure in that cache
+  `current_size` does not account for, which makes it the one place growth can hide
+  from every budget test *and* from the public API — a reservation left behind at a
+  count of zero is indistinguishable from an absent one through `pin_count` and
+  invisible to `size_bytes`. Mutation confirms the gate is load-bearing rather than
+  redundant: leaving a spent reservation behind fails that gate **and nothing else
+  in the crate**. This is the general reason to measure the allocator rather than a
+  structure's own accounting — a guard that reads `current_size` cannot see growth
+  in what `current_size` does not count.
+
+  **Measured:** 180 s of continuous rendering at 60 fps, resident memory
+  270.4 MB → 257.7 MB, peak 270.4 MB, net **−12.7 MB** with 176 telemetry lines
+  proving the workload never stalled. That liveness half is required for the same
+  reason the idle-wakeup measurement needs it: a workload that stopped rendering
+  also has flat memory.
+
+  **Not covered.** The threshold that turns the process measurement into a gate
+  belongs in the versioned baseline file, which is Phase 5's, and the run exists on
+  the Linux host only. Session create/destroy cycles, the V8 heap across a soft
+  restart, and GPU-side growth have no gate of their own.
+
 ### 7.4 Gate Semantics
 
 Baseline thresholds are versioned and reviewed. A missing metric, a zero-sample

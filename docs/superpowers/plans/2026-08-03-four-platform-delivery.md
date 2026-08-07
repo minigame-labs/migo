@@ -1946,6 +1946,99 @@ review. A commit alone is not completion evidence.
   binary against the restored tree. That is CLAUDE.md §9's WSL2 mtime trap arriving
   through a new door. Restores touch the file now.
 
+- [x] 0.51 Build the steady-state growth gate Section 7.3 requires, then apply it.
+  The fifth of Section 7.3's structural requirements to get a mechanism. Unlike
+  task 0.50, auditing this one found **no defect**: 180 s of continuous rendering
+  at 60 fps moves resident memory 270.4 MB → 257.7 MB, net **−12.7 MB**. So this
+  task is a missing gate rather than a missing fix, and it is worth saying that
+  plainly rather than manufacturing a finding.
+
+  **Why the allocation burst could not be reused.** A burst asks whether a path
+  touches the heap at all, which is only answerable where the answer must be
+  never. Every path this requirement is really about — admit and evict a cache
+  entry, take and release an alias, open and close a connection — allocates for a
+  living, so no burst can be pointed at it. `Cycle` /
+  `assert_no_steady_state_growth` asks the other question: did the window give
+  back what it took. Net live bytes, from the same counting allocator, which
+  gained `bytes_freed` and a signed `live_bytes()` for the purpose.
+
+  Design points, each pinned by a control or a mutant:
+
+  - **A resize is both ends at once.** `realloc` takes the new block and returns
+    the old, so `record_reallocation` records both. Recording only the new size
+    makes every growing container look like it leaked the difference — the mutant
+    that drops the old-size half fails `growing_a_block_nets_only_the_difference`
+    at 4096 against 4032.
+  - **The installation check is stricter than the burst's, and it has to be.** A
+    growth gate has one extra way to be silently green: if *frees* stopped being
+    counted every cycle would look like it grew, which is loud and harmless, but if
+    *allocations* stopped being counted every cycle would look like it shrank and
+    the gate would pass forever. So the check is not "did we see an allocation" but
+    "did a known allocate-and-release pair net to exactly zero", which no single
+    broken counter satisfies. The mutant that stops counting frees is killed by the
+    check itself, naming the direction.
+  - **The judgement is a pure function of the observed counts.** A broken allocator
+    cannot be installed beside the real one — `#[global_allocator]` is unique per
+    binary — so `untrustworthy_growth_observation` takes counts and returns the
+    reason, and the four disqualifying shapes are unit-tested against fabricated
+    ones. This is the same "separate the observation from the judgement" move that
+    makes the other probes' policies testable.
+  - **Passing means net.** A cycle that leaks a hundred bytes while releasing two
+    hundred elsewhere passes, because net is what "does not grow" means and a
+    stricter reading fails every legitimately shrinking path. Stated in the doc
+    comment rather than left for a reader to discover.
+
+  **A claim written before it was tested turned out to be false, and the test is
+  what caught it.** The mechanism was designed to close the pooled-vector hole
+  task 0.41 recorded as open — "nothing catches a deliberate leak". The reasoning
+  was that a lost loan is a missing deallocation, so a net-bytes measure would see
+  it where an allocation burst cannot. **It does not.** A delta measure only moves
+  when the *window* allocates or frees, and a loan was allocated before the window;
+  taking it from the pool and forgetting it moves neither counter. The test written
+  to demonstrate the closure failed, and it is kept — inverted, as
+  `a_block_taken_from_an_earlier_population_and_leaked_is_not_visible` — so the
+  boundary is pinned rather than re-assumed. Section 7.3's pooled-vector paragraph
+  is corrected in place. The lost loan still surfaces only when the drained pool
+  forces an allocation, which is the burst's second-order signal, not a new one.
+
+  **Applied to the image cache, and the mutant proves it is not redundant.** Two
+  gates: the reservation round trip (`pin` then `unpin` of a *non*-resident key,
+  which must allocate an owned key and give it back) and admission at the byte
+  budget. The reservation table is the one structure in that cache `current_size`
+  does not account for, which makes it the one place growth can hide from every
+  budget test **and** from the public API: a reservation left behind at a count of
+  zero is indistinguishable from an absent one through `pin_count`
+  (`unwrap_or(0)`), and invisible to `size_bytes`. Deleting the
+  `reservations.remove(key)` that runs when a count reaches zero fails
+  `a_reservation_round_trip_gives_back_the_key_it_took` at 6968 retained bytes over
+  64 iterations — **and nothing else in the crate**, across 266 tests. That is the
+  general lesson: measure the allocator, not the structure's own accounting, because
+  a guard that reads `current_size` cannot see growth in what `current_size` does
+  not count.
+
+  The gate needs distinct keys per iteration, which is not cosmetic: repeating one
+  key would let a table that never released it still look balanced, because the
+  second pin of a live reservation allocates nothing. They are the same length so
+  the balanced net is exactly zero rather than approximately so.
+
+  **The process-level instrument is committed too**, because the requirement is
+  about resident memory and the heap gates cannot see GPU allocations, the V8 heap,
+  mmap or fragmentation. `scripts/measure-steady-state-growth.sh` samples `VmRSS`
+  across a long workload and **fails when the content stopped producing frames**,
+  for the same reason the idle-wakeup script asserts painted frames: a stalled
+  engine does not grow either. Two instruments, one two-sided rule.
+
+  **Verified.** migo-alloc-probe 11 unit from 3 and 17 harness from 8, migo-io 266
+  from 264, migo-shared 405, migo-graphics 554, `cargo fmt --all --check` clean, and
+  `scripts/verify-change.sh --base HEAD` PASS on every host step and on
+  `android compile`.
+
+  **What this does not close.** The threshold that turns the process measurement
+  into a gate belongs in the versioned baseline file (Phase 5), and the run exists
+  on the Linux host only. Session create/destroy cycles, the V8 heap across a soft
+  restart, and GPU-side growth have no gate of their own — named rather than
+  implied, since "no steady-state growth" would otherwise read as covering them.
+
 - [x] 0.50 Make frame delivery demand-driven on the engine-paced platforms.
   Section 7.3's idle-quiescence requirement was the last of its structural
   requirements with no mechanism at all, and auditing it found a live defect
@@ -3737,6 +3830,11 @@ review. A commit alone is not completion evidence.
   before. What stays here is the *ceiling*: a per-platform value in the versioned
   threshold file, and the same measurement run on Windows and HarmonyOS hosts
   rather than the Linux host alone.
+  **No steady-state growth got its mechanism under task 0.51** — a net-live-bytes
+  cycle gate plus a resident-memory measurement over a long workload, both
+  two-sided. What stays here is likewise the threshold, and gates for the cycles
+  that measurement cannot reach: session create/destroy, the V8 heap across a soft
+  restart, and GPU-side growth.
   The cross-session lock requirement is **not** satisfied by the declaration
   guard added under task 0.1. That guard reflects on the session map's declared
   type, and an independent review constructed a counterexample it cannot detect:
