@@ -45,7 +45,7 @@ use glow::HasContext;
 use shared::command_vec_pool::PooledVec;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::CanvasIdSet;
-use shared::protocol::render_cmd::{CanvasBatchPayload, GlBatchPayload, RenderCommand};
+use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
 use shared::render_event::{RenderEvent, RenderEventReceiver, RenderEventSender};
 use shared::surface::{
@@ -535,30 +535,55 @@ where
 /// cross-dependency (e.g. `ctx.drawImage(webglCanvasElement, ...)` —
 /// the WebGL canvas's pixels must be flushed before the Canvas2D
 /// draw reads them), in which case we preserve issue order.
+///
+/// **It gathers nothing.** The question is whether one set intersects another,
+/// which is a boolean, and the ops that answer it are already in hand — so
+/// materialising either side buys nothing and costs a container. The version
+/// that did cost one: an inline thirty-two-entry set, sized against the
+/// thirty-label scene that motivated the reorder, which spilled to the heap on
+/// any busier scene and so allocated and freed on the render thread **every
+/// frame, for as long as the scene was on screen** (measured at eighty
+/// canvases: two heap events per frame, 768 bytes). A capacity cannot fix that,
+/// because nothing bounds how many canvases a game draws to in one frame; not
+/// needing one can.
+///
+/// It is also strictly less work than gathering was. Gathering deduplicated on
+/// insert — a scan per Canvas2D op — and then scanned the gathered list once per
+/// WebGL command. This scans the ops once per *distinct* canvas a WebGL command
+/// binds, which is normally one.
 fn packet_safe_to_reorder(ops: &[FrameOp]) -> bool {
-    let mut canvas_targets = CanvasIdSet::new();
-    for op in ops {
-        if let FrameOp::CanvasBatch(payload) = op {
-            canvas_targets.insert(payload.canvas_id);
-        }
-    }
-
     // Nothing to collide with, so the question is settled before the GL half is
     // walked at all — which is every WebGL-only frame, the common case.
-    if canvas_targets.is_empty() {
+    if !ops.iter().any(|op| matches!(op, FrameOp::CanvasBatch(_))) {
         return true;
     }
 
+    // The canvas most recently *proven not to be* a Canvas2D target. Only a
+    // proven-absent id is ever remembered, because a hit returns immediately —
+    // so a stale or mismatched entry here can cost a repeated scan and can
+    // never change the verdict. That is what makes the memo safe on the one
+    // path in packet execution where a wrong answer is wrong pixels rather than
+    // a slow frame.
+    let mut proven_absent: Option<CanvasId> = None;
+
     // Only the *first* shared canvas matters: one is enough to force issue
-    // order. The set version built both sides in full before comparing them.
+    // order.
     for op in ops {
         if let FrameOp::GlBatch(payload) = op {
             for cmd in &payload.commands {
-                if let Some(cid) = cmd.touches_canvas()
-                    && canvas_targets.contains(cid)
+                let Some(cid) = cmd.touches_canvas() else {
+                    continue;
+                };
+                if proven_absent == Some(cid) {
+                    continue;
+                }
+                if ops
+                    .iter()
+                    .any(|other| matches!(other, FrameOp::CanvasBatch(p) if p.canvas_id == cid))
                 {
                     return false;
                 }
+                proven_absent = Some(cid);
             }
         }
     }
@@ -1030,15 +1055,25 @@ mod tests {
     /// is classified first, so whatever this does, the engine does once a frame
     /// for as long as it runs.
     ///
-    /// It used to build two `HashSet<u32>`, fill them and throw them away — two
-    /// allocations and two frees per frame, to answer a question about a handful
-    /// of small integers.
+    /// **Eighty canvases, deliberately, because thirty proved the wrong thing.**
+    /// This gate first ran against a thirty-canvas fixture — the profiled
+    /// shop-open scene — which fitted inside the classifier's inline
+    /// thirty-two-entry target set and so passed over an implementation that
+    /// allocated on every frame of any busier scene (measured at eighty: 128
+    /// heap events over 64 frames, 49152 bytes). A burst has to hold for the
+    /// workload, not for the workload that happens to fit the constant, and
+    /// nothing bounds how many canvases a game draws to in one frame.
     #[test]
     fn classifying_a_packet_for_reorder_never_reaches_the_heap() {
-        // The shape that motivated the reorder: a scene's worth of offscreen
-        // Canvas2D labels alongside one onscreen WebGL canvas.
-        let mut ops: Vec<FrameOp> = (2..32).map(canvas_batch).collect();
+        // The shape that motivated the reorder, on a UI larger than the one
+        // profiled: a scene's worth of offscreen Canvas2D labels alongside one
+        // onscreen WebGL canvas.
+        let mut ops: Vec<FrameOp> = (2..82).map(canvas_batch).collect();
         ops.push(gl_batch_touching(&[1]));
+        assert!(
+            packet_safe_to_reorder(&ops),
+            "fixture must be reorderable, or the burst measures the refusal path"
+        );
 
         assert_no_steady_state_allocation(
             Burst {
@@ -1050,51 +1085,33 @@ mod tests {
         );
     }
 
-    /// Repeats must be gathered once. A packet whose Canvas2D half is one canvas
-    /// drawn many times is the ordinary shape — every label redrawn in a frame —
-    /// and the set version deduplicated for free where the inline scan has to do
-    /// it deliberately.
+    /// Eighty distinct Canvas2D targets, and the canvas the WebGL half collides
+    /// with is the last of them — so a scan that stopped short would report the
+    /// reorder as safe, and a Canvas2D read of a WebGL canvas would run before
+    /// the WebGL work that fills it. That is the one defect in packet execution
+    /// that produces wrong pixels rather than a slow frame, and it is the shape
+    /// an implementation carrying a fixed-size target list gets wrong.
     ///
-    /// **Gated by allocation rather than by the answer, because the answer does
-    /// not change.** Gathering the same canvas sixty-four times returns exactly
-    /// what gathering it once returns, so an assertion on the verdict cannot see
-    /// the difference; what it costs is the target list spilling past its inline
-    /// capacity onto the heap. A test named for deduplication that only checked
-    /// the verdict would be pinning nothing.
+    /// **What this adds over the small collision fixtures is the scale, and only
+    /// that.** The memo — the last canvas proven absent from the Canvas2D half —
+    /// is already pinned by `a_canvas_the_gl_half_also_touches_forces_issue_order`
+    /// and by the last-command test, both of which put a colliding canvas after a
+    /// proven-absent one; a memo that answered without comparing the id fails all
+    /// three. Truncating the scan at forty ops fails this one alone.
     #[test]
-    fn repeated_canvas_targets_are_gathered_once() {
-        let mut ops: Vec<FrameOp> = (0..64).map(|_| canvas_batch(2)).collect();
-        ops.push(gl_batch_touching(&[1]));
-        assert!(packet_safe_to_reorder(&ops));
-
-        assert_no_steady_state_allocation(
-            Burst {
-                path: "render_thread: reorder admission over one repeated canvas",
-                warmup: WARMUP,
-                measured: MEASURED,
-            },
-            |_| packet_safe_to_reorder(&ops),
-        );
-    }
-
-    /// Past the inline capacity the target list spills to the heap. That costs
-    /// an allocation on a scene nobody has yet produced, and the answer must
-    /// still be right — a spill that lost targets would admit a reorder across
-    /// a shared canvas.
-    #[test]
-    fn more_distinct_canvases_than_the_inline_capacity_stay_correct() {
+    fn a_scene_with_eighty_canvases_still_finds_the_one_the_gl_half_collides_with() {
         let distinct: Vec<u32> = (100..180).collect();
         let mut ops: Vec<FrameOp> = distinct.iter().map(|id| canvas_batch(*id)).collect();
         ops.push(gl_batch_touching(&[1]));
         assert!(
             packet_safe_to_reorder(&ops),
-            "a spilled target list dropped canvases and found a collision that is not there"
+            "a canvas no batch targets was reported as a collision"
         );
 
         ops.push(gl_batch_touching(&[179]));
         assert!(
             !packet_safe_to_reorder(&ops),
-            "a spilled target list lost the canvas the GL half collides with"
+            "the collision on the eightieth canvas went unfound"
         );
     }
 

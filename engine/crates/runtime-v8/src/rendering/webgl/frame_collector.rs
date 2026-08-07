@@ -150,6 +150,17 @@ pub(crate) struct UnifiedFrameCollector {
     /// frame. A sync/auto-flush barrier resets `pending_bytes` but not this
     /// value; only `build_frame_packet` publishes and resets it.
     frame_peak_bytes: usize,
+    /// Which canvases hold unmaterialised 2D work at the point the segment scan
+    /// has reached. Reset at the start of every packet and at every
+    /// Canvas2D→GL boundary.
+    ///
+    /// **A field rather than a local because a scene decides its size and
+    /// nothing caps a scene.** One entry per distinct Canvas2D target in the
+    /// run, which for the UI this collector was profiled against is one per
+    /// text label; above the set's inline capacity a local would allocate and
+    /// free on the thread running the game *every frame*, for as long as the
+    /// scene is on screen. Held here, that spill is paid once.
+    pending_2d: shared::protocol::CanvasIdSet,
     diagnostics_host_id: Option<i32>,
     diagnostics_stats: Option<Arc<shared::stats::DebugStats>>,
 }
@@ -198,6 +209,7 @@ impl UnifiedFrameCollector {
             current: CurrentKind::None,
             pending_bytes: 0,
             frame_peak_bytes: 0,
+            pending_2d: shared::protocol::CanvasIdSet::new(),
             diagnostics_host_id,
             diagnostics_stats,
         }
@@ -421,7 +433,10 @@ impl UnifiedFrameCollector {
 
         // Track which canvases have unmaterialized 2D work as we scan.
         // Canvas2D segments add to the set; GL segments consume it.
-        let mut pending_2d = shared::protocol::CanvasIdSet::new();
+        // `begin` hands the set over empty and keeps the capacity earlier
+        // frames reached, so a scene wider than its inline array allocates on
+        // its first frame rather than on all of them.
+        let pending_2d = self.pending_2d.begin();
 
         // `drain` rather than `mem::take`: the segments belong to the packet, the
         // list holding them belongs to the next frame.  Taking hands both away and
@@ -441,7 +456,7 @@ impl UnifiedFrameCollector {
                 }
                 FrameSegment::GL(s) => {
                     // Insert Materialize for all canvases with pending 2D work.
-                    for cid in &pending_2d {
+                    for cid in pending_2d.iter() {
                         builder = builder.push(FrameOp::Materialize { canvas_id: cid });
                     }
                     pending_2d.clear();
@@ -455,7 +470,7 @@ impl UnifiedFrameCollector {
         // Barrier mode: materialize any trailing pending 2D canvases so
         // a subsequent sync readback (readPixels, getImageData) sees results.
         if materialize_trailing && !pending_2d.is_empty() {
-            for cid in &pending_2d {
+            for cid in pending_2d.iter() {
                 builder = builder.push(FrameOp::Materialize { canvas_id: cid });
             }
         }
@@ -969,6 +984,56 @@ mod tests {
         assert!(matches!(ops[2], FrameOp::Materialize { canvas_id: 1 }));
         assert!(matches!(&ops[3], FrameOp::GlBatch(_)));
         assert!(matches!(ops[4], FrameOp::Present));
+    }
+
+    /// The pending-canvas set spans frames so its allocation does; its
+    /// *contents* must not. A frame handed a set still holding the previous
+    /// frame's canvases would emit a `Materialize` for each of them — an
+    /// `eglMakeCurrent` and a Skia flush per stale canvas, on canvases with no
+    /// work to flush and possibly none left to flush it to.
+    ///
+    /// **The first frame must end on Canvas2D work, and that is the whole
+    /// fixture.** A GL segment consumes the pending run at the boundary, so a
+    /// frame that ends with one leaves the set empty and inherits nothing — this
+    /// test's first version ended both frames that way and a set that was never
+    /// emptied passed it. What survives a frame boundary is a *trailing* 2D run:
+    /// nothing follows it to consume it, and a non-barrier packet does not
+    /// materialise it.
+    #[test]
+    fn a_frames_materialize_ops_name_only_that_frames_canvases() {
+        fn materialized(packet: &shared::FramePacket) -> Vec<u32> {
+            packet
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    FrameOp::Materialize { canvas_id } => Some(*canvas_id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut c = UnifiedFrameCollector::new();
+
+        c.push_canvas2d(1, Canvas2DCmd::Save);
+        c.push_canvas2d(2, Canvas2DCmd::Save);
+        let trailing = c.build_frame_packet(true).unwrap();
+        assert_eq!(
+            materialized(&trailing),
+            Vec::<u32>::new(),
+            "a trailing 2D run is materialized lazily, so this frame leaves 1 and 2 pending"
+        );
+
+        c.push_canvas2d(4, Canvas2DCmd::Save);
+        c.push_gl(GLCmd::Clear {
+            canvas_id: 99,
+            bit_field: 0x4000,
+        });
+        let next = c.build_frame_packet(true).unwrap();
+        assert_eq!(
+            materialized(&next),
+            vec![4],
+            "the previous frame's canvases were materialized again"
+        );
     }
 
     #[test]
@@ -1963,6 +2028,56 @@ mod steady_state_allocation {
         );
 
         end_frame(&mut collector);
+    }
+
+    /// Section 7.3, on the set the packet builder gathers its `Materialize`
+    /// targets into. One entry per distinct Canvas2D target in the run — one per
+    /// text label on the UI this collector was profiled against — and nothing
+    /// caps how many a scene has. Above the set's inline capacity a per-frame
+    /// set allocates and frees on the thread running the game on every frame of
+    /// that scene; one that spans frames pays it once.
+    ///
+    /// **Asserted on the retained capacity rather than measured by a burst, and
+    /// that is not a weaker gate here.** A burst over `build_frame_packet` would
+    /// measure the packet's own pooled op vector too, and this binary's several
+    /// hundred other tests take from that pool concurrently — the interference
+    /// `reserve_gl_segment_headroom` above exists to avoid, which is why the
+    /// whole-frame burst lives in an integration test of its own over in
+    /// `migo-shared`. That pool is unreachable from here, but the property this
+    /// item is about is exactly "the second frame does not allocate again",
+    /// which the retained capacity states directly and deterministically.
+    #[test]
+    fn a_frame_wider_than_the_pending_set_pays_its_spill_once() {
+        const DISTINCT: u32 =
+            shared::protocol::canvas_id_set::CANVAS_ID_SET_INLINE_CAPACITY as u32 * 2;
+
+        let mut collector = UnifiedFrameCollector::new();
+        let wide_frame = |c: &mut UnifiedFrameCollector| {
+            // Distinct canvases, so each opens its own Canvas2D segment and all
+            // of them are pending at once when the GL segment closes the run.
+            for canvas in 0..DISTINCT {
+                c.push_canvas2d(canvas, Canvas2DCmd::Save);
+            }
+            c.push_gl_fast(scalar_gl_command());
+            end_frame(c);
+        };
+
+        wide_frame(&mut collector);
+        assert!(
+            collector.pending_2d.spilled(),
+            "the frame gathered its pending canvases somewhere else, so the set that \
+             spans frames never saw them and every frame pays the spill"
+        );
+        let reached = collector.pending_2d.capacity();
+        assert!(reached >= DISTINCT as usize);
+
+        wide_frame(&mut collector);
+
+        assert_eq!(
+            collector.pending_2d.capacity(),
+            reached,
+            "the second frame grew the set again, so the spill is paid per frame"
+        );
     }
 
     /// Building a packet hands the *segments* to the builder. It must not hand
