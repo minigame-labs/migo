@@ -3373,32 +3373,476 @@ review. A commit alone is not completion evidence.
   `.swap_buffers(` and `blit_succeeded`. They catch a reordering and they cannot
   fail on a behavioural change that leaves the text intact — the same
   inspection-wearing-a-test's-clothing shape Section 7.3 names, sitting on the
-  presentation path. Replacing them needs a GL context and is not attempted here.
-  ANGLE and `OHNativeWindow` are untouched for the reason 0.32 gives; the Android
-  Surface path compiles but is unmeasured.
+  presentation path. ~~Replacing them needs a GL context and is not attempted
+  here.~~ **That last sentence was wrong, and task 0.61 replaced them.** The blit
+  needs a GL context; the *bookkeeping either side of it* does not, and taking the
+  swap outcome as an argument instead of an early `?` return makes both branches
+  reachable with no surface at all. Reading it as "the effect needs GL, so the
+  ordering cannot be tested" is the same conflation that let 0.57's dead bypass path
+  stay dead. ANGLE and `OHNativeWindow` are untouched for the reason 0.32 gives; the
+  Android Surface path compiles but is unmeasured.
 
-- [ ] 0.57 Sharpen the DrawingBuffer bypass condition, or record why it cannot be.
-  Found by task 0.56, which measured what `canvas_count == 1` costs: every game with
-  a single offscreen canvas — the ordinary case — presents through a full-frame copy
-  it may not need.
+- [x] 0.57 Make the DrawingBuffer bypass path present at all. Planned as "sharpen
+  the `canvas_count == 1` condition, or record why it cannot be"; the enumeration
+  the plan asked for found the path the condition gates was **dead**, so the
+  sharpening is deferred and this task is the repair.
 
-  **The premise to verify first.** The condition protects against real FBO 0 naming
-  a pbuffer instead of the window. But the render path calls
-  `make_current_needed(canvas_id)` before every batch and already `debug_assert`s
-  the current canvas at other blit sites, so at the moment onscreen drawing runs the
-  onscreen surface *is* current and FBO 0 *is* the window. If that holds over every
-  path that can touch FBO 0 — the Canvas2D materialise, `drawImage` of an offscreen
-  canvas, the frame capture, surface recreate — then the condition can become "no
-  other surface may be current while onscreen drawing runs", which is an invariant
-  the code already maintains rather than a count.
+  **The recorded plan named the wrong thing to check, for the fifth time in a
+  row.** It proposed hoisting `make_current_needed(cmd.touches_canvas())` to the
+  top of `handle_command` so the invariant held by construction. `touches_canvas()`
+  cannot carry that: its own doc says "exhaustive over every variant that carries a
+  `canvas_id` field", and 29 of 118 such variants are missing — `TexImage2D`,
+  `TexSubImage2D`, `TexStorage2D`, the whole `Uniform*` family,
+  `FramebufferTexture2D`, the compressed uploads, and every
+  `TexImage2DFrom{Canvas2D,Shared,Snapshot,TextCache}`. The hoist would have
+  *deleted* make-current from 29 command families, which is exactly the
+  draw-lands-in-the-wrong-surface fault the bypass condition exists to prevent.
+  Split out as task 0.59; it is a live defect on two other consumers.
 
-  **Why it is its own task and not a line in 0.56.** The premise is a statement
-  about every FBO-0 toucher, not about one function; getting it wrong presents a
-  pbuffer's contents or a black window, and neither a host test nor the Linux player
-  can settle it — the player would show it, but only for the paths that bundle
-  exercises. This needs the invariant enumerated in code, a bypass-mode assertion
-  that fails loudly when a foreign surface is current at present time, and a device
-  run per platform before the condition changes.
+  **What the enumeration actually found.** Ask "which framebuffer is this canvas's
+  WebGL default?" and three sites answer independently. The post-swap restore
+  applied bypass in a bespoke `if !bypass` and was the only one that did;
+  `make_current_needed` and the surface-recreate DrawingBuffer reuse both derived
+  `drawing_buffer.map(|db| db.fbo)` with no bypass term. And a fourth site was
+  missing entirely: a bypass mode change moves *what the default framebuffer means*
+  with no `bindFramebuffer` from the content, and nothing re-pointed the binding.
+  So the onscreen canvas kept the DrawingBuffer bound from its own creation — which
+  deliberately leaves it bound — drew into it, and skipped the only blit that would
+  have carried it to the window.
+
+  **Measured, because the property is a driver binding and no host test can see
+  one.** `scripts/fixtures/bypass-probe` holds all four bypass conditions for a
+  whole run; every shipping bundle breaks `canvas_count == 1` within a second of
+  startup, which is why bypass had only ever run for warmup frames nobody looked
+  at. It painted 240 frames of `rgba(51,204,102,255)` and the captured frame was
+  `rgba(0,0,0,0)` on every sampled pixel. `blit-probe` — the same fixture plus one
+  more `createCanvas()`, so `canvas_count == 2` and bypass never latches —
+  presented the colour. After the fix, both do.
+
+  `scripts/verify-bypass-present.sh` is the gate, and its shape is the point. The
+  frame count is asserted beside the pixel because **240 frames in the wrong buffer
+  is the same count as 240 frames on the window**: the pixel alone is satisfied by
+  a run that never painted, the count alone by a run that painted into a buffer
+  nobody reads. Which path ran is read from the engine's transition log, not from
+  the fixture's intent, so a fixture that failed to create its second canvas is not
+  scored against the path it meant to take — that happened on the first run, when
+  `migo.createOffscreenCanvas` turned out not to exist. `blit-probe` doubles as the
+  control on the instrument: if the player, the capture or the PNG decode were at
+  fault both probes would fail, and the fault would not be bypass. The gate builds
+  the player unconditionally rather than if-missing, because a mutation run leaves a
+  binary compiled from the mutant beside a restored tree and WSL2 preserves mtime.
+
+  **Mutation evidence. Six mutants, each attributed, file byte-identical
+  (sha256, not `git diff`) after every restore.**
+
+  | Mutant | Kills |
+  | --- | --- |
+  | `default_framebuffer_of` ignores bypass | `bypass_resolves_the_default_framebuffer_to_the_window` |
+  | `plan_bypass_rebind` ignores `mode_changed` | `an_unchanged_mode_issues_no_bind` |
+  | ... ignores `onscreen_context_is_current` | `a_mode_change_off_the_onscreen_context_defers_to_the_next_make_current` |
+  | ... ignores `draws_to_default_fbo` | `a_mode_change_leaves_a_framebuffer_the_content_bound_alone` |
+  | ... never re-binds | `entering_bypass_repoints_...at_the_window` **and** `leaving_bypass_repoints_...at_the_drawing_buffer` |
+  | ... always re-binds the window | `leaving_bypass_repoints_...at_the_drawing_buffer` |
+
+  The last two exist because the first four are all *negative* assertions, and a
+  planner that never re-binds satisfies every one of them — the always-red gate this
+  plan keeps catching. `never re-binds` proves the gate can fire; `always re-binds
+  the window` proves something pins the target and not merely the decision. Killing
+  two is correct for the first of those: their job is the positive control, and they
+  differ in the value carried.
+
+  **And a seventh mutant that no host test can reach.** Deleting the rebind from
+  `evaluate_bypass` while keeping everything else: 240 frames painted — *the same
+  count* — and `rgba(0,0,0,0)` captured. That is the site attribution the unit tests
+  cannot give, since they pin the planner and not the call.
+
+  **Design notes worth keeping.** `onscreen_context_is_current` is a precondition,
+  not an optimisation: a bind lands in whichever context is current, so off the
+  onscreen context it would corrupt an offscreen canvas instead. Skipping loses
+  nothing because the `make_current_needed` that brings the context back resolves
+  the binding from the same function — between them the two sites cover every path,
+  which is why the planner returns `Nothing` rather than deferring work.
+  `draws_to_default_fbo` is consulted because content mid-render-to-texture has its
+  own FBO bound and the driver must keep it; re-pointing regardless would aim an RTT
+  pass at the screen. The post-swap site's bespoke `if !bypass` is gone: it now asks
+  the resolver, and "under bypass there was no blit, so nothing was clobbered" falls
+  out of the answer instead of being asserted separately.
+
+  **Not covered, named rather than implied.** The *cost* half of Section 7.3's "no
+  redundant presentation copy" is still unmet for ordinary content — this repairs
+  the fast path, it does not widen the condition that keeps ordinary content off it,
+  and that widening still needs the FBO-0 invariant enumerated over every toucher
+  plus a device run per platform. Of the four re-pointing sites only the mode change
+  is covered end to end; a single-canvas fixture never switches contexts, so
+  `make_current_needed` and the surface-recreate reuse are covered only at the shared
+  resolver. ANGLE and `OHNativeWindow` are untouched for the reason 0.32 gives.
+
+- [x] 0.59 Make `GLCmd::touches_canvas()` exhaustive by construction. Found by
+  0.57, which needed it as a hoist target and could not use it.
+
+  The function's own doc claimed exhaustiveness over every variant carrying a
+  `canvas_id` and instructed future variants to be added; a `_ => None` catch-all
+  meant the compiler never checked, and 29 of 118 had drifted off — `TexImage2D`,
+  `TexSubImage2D`, `TexStorage2D`, the compressed uploads, all four
+  `TexImage2DFrom*`, `FramebufferTexture2D`, `DebugLoseContext`, and the whole
+  `Uniform*` family. Two live consumers read it, and neither degrades safely:
+
+  - **Scoped stale marking** (`execute_gl_batch`) flips `skia_state_stale` only for
+    canvases the batch touched. A canvas whose only commands in a batch are
+    unlisted ones is not marked, and the next Canvas2D draw on it trusts Skia state
+    a WebGL batch has since disturbed.
+  - **Phase-reorder admission** (`can_reorder_phases`) defers the WebGL half of a
+    packet past the Canvas2D half when the two share no canvas. A missed id makes
+    two halves look disjoint when they are not, and the reorder inverts issue order
+    on one canvas.
+
+  **Two design choices, and the second is the one that matters.** Dropping the
+  catch-all makes *exhaustiveness* the compiler's job. It does not make
+  *classification* the compiler's job — a variant carrying a `canvas_id` can still
+  be written into the `None` bucket behind a `{ .. }`. So the `None` arms name every
+  field explicitly and use no `..`: giving any of them a `canvas_id` then fails to
+  compile too. Together those two make the syntactic rule hold by construction
+  rather than by the comment that had been asserting it.
+
+  **The rule stays purely syntactic — carries `canvas_id` ⇒ `Some`.** That moved
+  `DebugLoseContext` onto the list even though its handler arm ignores the field:
+  any semantic exception is where the next drift starts, and both consumers are
+  safe in the conservative direction (an extra stale mark, a reorder refused).
+
+  **Mutation evidence. Two of the three mutants must fail to *compile*, because a
+  claim about the compiler is only demonstrated by making the compiler refuse.**
+  File byte-identical (sha256) after each restore.
+
+  | Mutant | Result |
+  | --- | --- |
+  | Add a new `canvas_id`-carrying variant | `E0004 non-exhaustive patterns: MutantProbe { .. } not covered` |
+  | Give `LinkProgram` a `canvas_id` | `E0027 pattern does not mention field canvas_id` |
+  | Misclassify `Uniform3f` into the `None` bucket | `touches_canvas_covers_the_families_that_drifted_off_the_list` alone, at its own assertion |
+
+  Removal is no longer an available mutant — with no catch-all, deleting a variant
+  from the list does not compile — so the third is the realistic drift that remains,
+  and it is what the new test exists for. The test pins one representative of each
+  family that had drifted (a uniform write, an immutable texture allocation, a
+  framebuffer attachment, and an upload sourced from another canvas) rather than
+  enumerating 118 variants, because enumeration is now the compiler's job.
+
+  Verified at 414 `migo-shared` and 561 `migo-graphics` lib tests, no failures; the
+  four phase-reorder tests still pass, which is where a newly-refused reorder would
+  have shown.
+
+  **Not covered, named rather than implied.** `TexImage2DFromCanvas2D` and
+  `TexSubImage2DFrom*` carry a *second* canvas — the 2D source they read. This
+  returns the destination, which is right for both consumers as they are written,
+  but reorder admission arguably wants the source too: deferring a WebGL half past a
+  Canvas2D batch that draws into the very canvas the upload reads would sample the
+  wrong frame. Nothing here establishes whether that packet shape can occur.
+
+- [x] 0.60 Stop the engine's own framebuffer re-points from lying to the dedup
+  shadow. Found by 0.57's enumeration; kept separate because it is not a bypass
+  property, and it turned out to be a live defect rather than a coverage gap.
+
+  `gl_state`'s framebuffer shadow is keyed on the **user-facing** framebuffer name,
+  where `None` means "the default framebuffer". Two engine-internal paths re-pointed
+  the driver at the DrawingBuffer without telling that shadow — the EGL switch in
+  `make_current_needed` and the post-swap restore after the blit. Content holding its
+  own FBO therefore had its next `bindFramebuffer(sameName)` deduped against a claim
+  the engine had already invalidated, the call never reached the driver, and the
+  render-to-texture pass drew wherever the engine last pointed: **the screen**.
+
+  **Measured before it was fixed.** `scripts/fixtures/rtt-probe` binds a complete
+  render target, lets a canvas switch happen, re-binds the same target and clears
+  red. It presented `rgba(217,26,38,255)` full-screen on every one of 180 frames with
+  `fbo_status = GL_FRAMEBUFFER_COMPLETE`. Any multi-canvas WebGL game doing
+  render-to-texture was drawing its offscreen passes onto the window.
+
+  **The `make_current_needed` fix is a deletion, and the argument for it is not
+  performance.** The framebuffer binding is per-GL-context state and each canvas owns
+  its context, so EGL hands a canvas back exactly the binding it had — which is also
+  what the shadow already claims. Re-pointing it gave one function *two* behaviours:
+  the `bound == Canvas(id)` short-circuit left the content's binding alone while a
+  real switch clobbered it, and the shadow described only the first. Removing the
+  re-point makes the two paths agree, removes a driver call per canvas switch, and
+  needs no shadow write because nothing changed. A fresh context needs no help
+  either: `DrawingBuffer::new` leaves its FBO bound and `evaluate_bypass` re-points
+  it when bypass latches.
+
+  **The sites that genuinely destroyed the binding get a paired operation.** The blit
+  binds `READ=DrawingBuffer, DRAW=0`, so the post-swap restore must re-point — and
+  `record_default_framebuffer_bind` is half of that operation, not bookkeeping after
+  it. It records `None` on all three framebuffer targets and sets
+  `draws_to_default_fbo`. Recording `None` rather than `clear()`ing the map is the
+  difference between free and one redundant driver call per frame: `None` *is* the
+  name of the default framebuffer, so the Cocos-style `bindFramebuffer(FRAMEBUFFER,
+  0)` every frame — the exact redundancy this dedup exists for — stays deduped.
+
+  **Mutation evidence, host half.** Files byte-identical (sha256) after each restore.
+
+  | Mutant | Kills |
+  | --- | --- |
+  | The record does nothing (the defect as it shipped) | all three property tests, each at its own assertion |
+  | The record `clear()`s the map instead of naming the default | `a_content_bind_of_the_default_is_still_deduped_after_the_engine_repoints` |
+  | The record covers only `FRAMEBUFFER` | `the_engine_repoint_covers_the_separate_draw_and_read_targets_too` |
+  | The record forgets `draws_to_default_fbo` | `the_engine_repoint_makes_the_canvas_draw_to_the_default_framebuffer_again` |
+
+  **Mutation evidence, site half — and this is where the work was.** No host test can
+  reach either site, so each needed a running engine, and each needed its *own*
+  fixture:
+
+  | Site mutant | Killed by | Presents |
+  | --- | --- | --- |
+  | Restore the `make_current_needed` re-point | `rtt-probe` alone | `rgba(217,26,38,255)` — the render target on the screen |
+  | Delete the post-swap shadow record | `rtt-boundary-probe` alone | `rgba(26,76,230,255)` — a frozen first frame |
+
+  `rtt-boundary-probe` exists **because the post-swap mutant walked past
+  `rtt-probe`**, and the reason generalises: `rtt-probe`'s first framebuffer call each
+  frame binds `null`, which differs from any stale shadow and is issued however wrong
+  that shadow is. Reaching the post-swap site requires the frame's *first* call to be
+  the content's own FBO, which means drawing the baseline with no bind at all —
+  legitimate, because a frame beginning with the default framebuffer bound is exactly
+  what the post-swap restore guarantees.
+
+  **The gate had to be strengthened twice, and both holes were the same defect
+  wearing different clothes.** First, `dominant_pixel.py` reported only the most
+  common sampled colour, so a frame presented through a partial damage region could
+  carry wrong pixels in part of the surface while the stale majority still read as
+  expected; it now reports the distinct sampled colour count and the gate requires
+  exactly one, which is the honest claim for fixtures that clear flat. Second — and
+  this one is worth remembering — the post-swap mutant's real consequence is not red
+  pixels but **no presentation at all**: with `draws_to_default_fbo` left false every
+  clear looks invisible to damage tracking, the engine presented exactly one frame per
+  run (confirmed by instrumenting the post-swap site: one event in three seconds), and
+  the frozen frame's colour *was* the pass condition. Every probe now paints its first
+  frame a different colour, so a stale capture reads blue. **"The screen is the
+  expected colour" is an absence claim and needs its liveness paired in the same
+  instrument — the frame count is not enough, because the JS loop kept running at
+  60 fps throughout.**
+
+  Verified at 569 `migo-graphics` lib tests and all four probes green.
+
+  **Not covered, named rather than implied.** `frame_capture::capture_default_fbo`
+  binds `READ_FRAMEBUFFER = None` and does not restore it; that is now subsumed,
+  because the post-swap record names all three targets and runs after the capture —
+  but nothing *pins* it, since a probe would have to request a capture mid-run and the
+  player only captures once at the end. The equivalent shadow question for buffers,
+  textures and programs is untouched: only the framebuffer binding was audited, and
+  `make_current_needed` was the only engine-internal re-point of it. ANGLE and
+  `OHNativeWindow` are untouched for the reason 0.32 gives.
+
+- [x] 0.61 Replace the presentation path's source-text inspection tests. Named as a
+  known hole by 0.56, which then said replacing them "needs a GL context and is not
+  attempted here". That was wrong, and correcting it in place is half the point of
+  this task.
+
+  `swap_failure_preserves_accumulated_damage_for_retry` and
+  `blit_failure_poison_is_propagated_to_present_history` read the *source text* of
+  `swap_buffers_no_restore` and asserted that the byte offsets of `.swap_buffers(`,
+  `self.damage.reset()` and `blit_succeeded` came in the right order. Two real
+  properties, both orderings, neither able to fail on a behavioural change that
+  leaves the text intact — on the path where being wrong means a frame of stale
+  pixels.
+
+  **What made them look untestable was a conflation.** The blit needs a live GL
+  context; the *bookkeeping either side of it* does not. What actually blocked a real
+  test was that swap failure was expressed as an early `?` return, so the failure
+  branch could not be entered without a window surface. Passing the swap outcome in
+  as data — the move `run_frame_phases` already used for the frame phases — makes all
+  three branches reachable, and `commit_present_outcome` now owns them over a real
+  `FrameDamageAccumulator` and `PresentDamageHistory`, both of which construct on the
+  host.
+
+  **Two design choices came out of writing the tests rather than out of planning
+  them.** The commit takes the whole `PresentDamagePlan`, not just `current`, so
+  "history records the frame's own damage and never the age-expanded repair" is a
+  decision *inside* the tested function instead of a choice at the call site that
+  only a text search could see — which retired a third inspection guard,
+  `manager_blit_consumes_repair_and_history_records_current`'s history half. And the
+  fixture plan gives `current` and `repair` deliberately *different* values, because
+  they were interchangeable in the old guard and a test cannot tell apart two regions
+  that are equal.
+
+  **Mutation evidence. Six mutants, each a realistic tidying-up defect, each killing
+  exactly one test at its own assertion; file byte-identical (sha256) after every
+  restore.**
+
+  | Mutant | Kills |
+  | --- | --- |
+  | Reset the accumulator even when the swap failed | `a_failed_swap_keeps_the_frames_damage_for_the_retry`, at its damage assertion |
+  | Record a frame the swap never presented | *the same test*, at its history assertion |
+  | Never reset the accumulator | `a_successful_swap_resets_the_frames_damage` |
+  | Record `repair` instead of `current` | `history_records_the_frames_own_damage_and_never_the_age_expanded_repair` |
+  | Leave a partial frame in history as a repair source | `a_failed_blit_makes_the_history_unusable_as_a_repair_source` |
+  | Forget the whole-surface debt after a partial blit | `a_failed_blit_leaves_the_next_present_owing_the_whole_surface` |
+
+  The first two matter as a pair: they kill one test at two different assertion
+  lines, which is what shows both of its claims are load-bearing rather than one
+  riding along. The last two are why the failed-blit case is **two** tests: poisoning
+  history fixes what a *later* present repairs from, the accumulator debt fixes what
+  the *next* one does, a commit could do either alone, and one bundled assertion
+  would have left whichever half broke unnamed — the shape this plan has now caught
+  three times.
+
+  `a_successful_swap_resets_the_frames_damage` is the control: without it, "damage
+  survives a failed swap" is satisfied by an accumulator that never resets, which
+  would make every frame repair the whole surface and the buffer-age machinery
+  decoration.
+
+  Verified at 564 `migo-graphics` lib tests, no failures.
+
+  **Not covered, named rather than implied.** One text guard is kept and narrowed:
+  `blit_to_surface` must return `bool`, because a blit that cannot report failure
+  makes the poison branch unreachable and no host test can see that. Whether that
+  return value is *truthful* still needs a GL context. Two writing rules found along
+  the way and worth reusing: a reset `FrameDamageAccumulator` resolves to
+  `FullSurface`, not to an empty rect list, so `resolve_rects` is the wrong
+  observable for "owes nothing" and `has_damage()` is the right one; and
+  `PresentDamageHistory` exposes no accessor, so what an entry *is* must be read
+  through `resolve_with_age(current, 2)` rather than by counting with `len()`, which
+  cannot tell a poisoned entry from a recorded one.
+
+- [x] 0.63 Audit the rest of the dedup shadow against the engine's own GL writes.
+  The open question 0.60 left: it fixed the framebuffer binding, and buffers,
+  textures, programs and vertex arrays are shadowed the same way.
+
+  **The enumeration.** Seven sites in the manager declare `TEXTURE_BINDING` stale to
+  *Skia's* tracker (`mark_all_2d_contexts_stale_bits`), which is the honest signal
+  that they disturbed the texture binding — and none told the WebGL dedup shadow, the
+  other consumer of the same driver state. The discriminator is not whether they
+  declare but whether they **restore**: five save `prev_tex` / `prev_active_texture`
+  and put it back, so the shadow stays true and the Skia declaration is needed only
+  because Skia's tracker cannot see the restore. Two bind *zero* instead —
+  `pbo_upload.rs` (behind `load_shared_image`) and `texture_import.rs` (behind
+  `load_ahb_image`) — and those two are the defect. `compressed_upload.rs` already
+  restores, under the comment "Restore the app-visible bindings on both success and
+  failure paths", which makes the other two an inconsistency rather than a decision.
+
+  **So the fix is a restore, not an invalidation.** An `invalidate_after_texture_upload`
+  helper was written first and then deleted: telling the shadow to forget is correct
+  but costs the next draw a rebind for state that never needed to move, and it leaves
+  three upload paths following two patterns. Saving `TEXTURE_BINDING_2D` and
+  `UNPACK_ALIGNMENT` and putting them back keeps the shadow true by construction,
+  costs two `glGet` per *image* rather than per frame, and makes all three identical.
+
+  **Two hypotheses were wrong, and recording them is the point.** First: this was
+  predicted to be a live defect on every image load. It is not — ordinary loads go to
+  the upload thread, which owns a GL context of its own and so cannot disturb a
+  canvas's bindings. Measured: `scripts/fixtures/upload-shadow-probe` binds a texture,
+  loads images continuously, re-binds, and asks `getParameter(TEXTURE_BINDING_2D)` —
+  which the handler answers from a real driver query, not from the shadow — and
+  reports the binding intact for a whole run. Second: the sync render-thread path was
+  assumed reachable from JS by making an image too large for the async byte budget. It
+  is not; a 1200×1200 image (5.49 MB decoded, 8 KB on disk) still went async, and
+  instrumenting `load_shared_image` counted **zero** calls in a run. What actually
+  reaches a canvas context is the AHB path (unconditional, and the Android default),
+  compressed textures, `ImagePriority::Critical` — which nothing produces today, every
+  JS load asks for `Normal` — and the async-degradation fallbacks.
+
+  So the defect is **latent on the platform that ships** and unreachable here. The
+  probe is kept, inverted, as a boundary control on the architectural property that
+  makes it latent: uploads must not run on a canvas context. An "optimisation" that
+  moved them onto the render thread to save a context switch would silently
+  reintroduce exactly what 0.60 fixed on the framebuffer binding, and this probe is
+  what would say so.
+
+  **A fixture defect the gate caught, worth keeping in mind.** The probe first
+  reported `path=bypass` when it wanted the blit path: its second canvas was held in
+  an unused `const` and was collected — the engine logged `canvas_count` going
+  1 → 2 → 1 as the finaliser ran, driven by the per-frame image allocations. A canvas
+  has to be *used* to stay alive. This surfaced only because the gate reads which path
+  ran from the engine's own transition log instead of trusting the fixture's intent.
+
+  **Not covered, named rather than implied.** The two restores are unpinned: no host
+  test can see a driver binding, and neither reachable caller can be driven on Linux.
+  They are argued from the code and from the third path that already does it, not
+  measured. Programs, vertex arrays and buffers were checked only through the seven
+  `mark_all_2d_contexts_stale_bits` sites; a path that disturbs one of those *without*
+  declaring anything to Skia would not appear in that enumeration, and nothing here
+  rules one out.
+
+- [x] 0.62 Drive two real Sessions to a bound game identity. The layer seam that
+  task 0.21's storage/quota group and 0.58's permission group both stop at: each is
+  proven "given distinct inputs" and nothing showed two Sessions *producing* distinct
+  inputs.
+
+  **The recorded obstacle was false, which makes six in a row.** It was written down
+  as "a Session with no surface never reaches `evaluate_module` or the permission
+  gate". `HostJsRuntime::new(host_id, host_state, cache_dir, ..)`
+  (`runtime-v8/src/host_runtime.rs:101`) takes **no surface**, and
+  `HostJsRuntime::evaluate_module(game_id, entry)` (`:831`) is precisely where the
+  identity binds: it builds `GamePaths::new(files_dir, cache_dir, game_id)` and
+  installs it with `set_game_paths` (`:942`), which is the value
+  `crate::storage::storage_dir` resolves against. A surface is required by
+  `spawn_host_thread` → `Host::new` (`core/src/runtime/host.rs:312`), i.e. by the
+  *orchestration* layer — one level above where the property lives. Asking "which
+  layer can see this property?" arrives at `HostJsRuntime`; asking "how do I start a
+  Session?" arrives at the surface and stops. Nor was a surface an obstacle even
+  there: `tools/player` runs headless on an `OffscreenSurface` pbuffer with no window
+  server.
+
+  **What V8 actually constrains, which is not what the plan guessed.** Two
+  `HostJsRuntime`s on one thread abort the process:
+  `Fatal error in v8::HandleScope::CreateHandle(): Cannot create a handle without a
+  HandleScope`. The current isolate is thread-local and each runtime expects to own
+  it. So the fixture is a thread per Session, driven step by step over a channel with
+  every wait bounded — which is *closer* to the thing under test, because a real
+  concurrent Session is a host thread. The real constraint was the isolate, not the
+  surface.
+
+  **Two fixture decisions carry the test.** Both Sessions get the **same**
+  `app_files_dir` and `app_cache_dir`; giving each its own would make the two paths
+  differ for a reason unrelated to per-game namespacing, and the test would pass over
+  an engine that ignored the game id entirely. And both loads complete before either
+  path is read: every way an identity can be shared — a process-wide slot written at
+  bind time, a resolver memoising its first answer, one op state behind two runtimes —
+  produces two *equal* paths only once both Sessions have bound, so reading `a` before
+  `b` loads would let all of them through.
+
+  The assertion is not merely `assert_ne!`. Two paths can differ while both are wrong
+  — a counter, a host id, a temp name — so each is also required to be under its own
+  namespace *and under no other*. That negative half is what caught the first mutant.
+
+  **Mutation evidence, and the point is what *survived*.** Files byte-identical
+  (sha256) after each restore.
+
+  | Mutant | Kills the new test at | Pre-existing suite |
+  | --- | --- | --- |
+  | The stored identity is the Session, not the game (`host-N` for the game id) | its namespace assertion | **all 519 survive** |
+  | The bound identity escapes to a process-wide slot the resolver prefers | its `assert_ne!` | **all 519 survive** |
+
+  Two different assertion lines, so both halves of the one test are load-bearing. That
+  the whole pre-existing suite survives both is the proof the fixture closes a real gap
+  rather than restating one:
+  `the_resolver_gives_two_games_different_storage_files` builds two `OpState`s by hand
+  and never calls `set_game_paths`, so it cannot see an identity that escapes at *bind*
+  time — the escape is invisible to a test that never binds.
+
+  **The first mutant had to be narrowed, and the reason generalises.** Changing the
+  `game_id` fed to `GamePaths::new` moved the *code* directory too, so the entry module
+  went missing and the test died inside a helper on a module-load error rather than at
+  the assertion it is named for. The usable mutant changes only the identity that gets
+  *stored*, leaving the local `code_dir` the loader uses intact. When one value feeds
+  two things, mutate at the point only the property under test can see.
+
+  **One production line was added:** `pub(crate) fn op_state()` on `HostJsRuntime`, so
+  the question goes to the *production* resolver over the state a real
+  `evaluate_module` left behind, rather than to a hand-built `OpState` that agrees with
+  it by construction.
+
+  **A test was written, passed, and was then deleted — worth recording.**
+  `loading_a_second_game_does_not_move_the_first_ones_storage` was killed by the second
+  mutant, but by the *same* mutant as the other test and by nothing alone. Every
+  shared-identity defect is already caught by reading both paths after both loads, so
+  it was redundancy, and redundancy hides which guard is load-bearing. Its content
+  moved into the surviving test's doc comment, where the read ordering it was
+  protecting is now stated as the load-bearing thing it is.
+
+  **Not covered, named rather than implied.** This covers the storage half only. The
+  permission half is a *different arbiter*: `platform/src/android_permission_gate.rs:33`
+  keys `live: HashMap<i32, HostState>` by **host id**, not by game id, so the game
+  identity never enters it — and 0.58 pinned the *Java* `PermissionOperationGate`,
+  which is keyed by session id. Two separate objects, and the spec should stop implying
+  one property spans both. Quota is untouched: distinct storage roots are necessary for
+  a per-game quota but not sufficient, and nothing yet shows one game exhausting its
+  10 MB leaving another's intact.
 
 - [x] 0.58 Assert that a permission grant does not cross Sessions. The last of task
   0.21's uncovered property groups. `PermissionOperationGate` is a process-wide

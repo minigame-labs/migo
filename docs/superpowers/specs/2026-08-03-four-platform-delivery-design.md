@@ -379,6 +379,25 @@ against the real executor rather than read, see Section 7.3**; an Engine that
 refuses destruction while any Session is live; per-session platform manager
 registries; and per-session permission monitors.
 
+**Where the key-value half is now gated, and what a passing test used to be able
+to miss.** The claim is that isolation is "derived from the game identity", and
+until task 0.62 nothing tested the derivation: the resolver was gated by handing
+it two `GamePaths` built by the test itself, which is a claim about one function
+given distinct inputs, not about two Sessions producing them. Two live Sessions —
+a thread each, a real V8 isolate each, a real `evaluate_module` each, and
+deliberately the *same* app directories so the game id is the only input that
+differs — now resolve storage under their own identity and under no other. Both
+mutants that break that (namespacing by Session instead of by game; letting the
+bound identity escape to a process-wide slot) leave every other test in the crate
+passing, which is what says the seam was real.
+
+**Two separate permission arbiters, and this section used to read as one.** The
+Rust gate (`platform/src/android_permission_gate.rs`) keys its live map by **host
+id**; the JVM gate (`PermissionOperationGate`) keys by **session id**. The game
+identity enters neither. So "per-session permission monitors" is a statement about
+two different objects with two different keys, and a test of one says nothing about
+the other — task 0.58 covers the JVM gate's arbitration only.
+
 **Defects that must be fixed before multi-game support is claimed:**
 
 1. The process-global text texture cache is keyed without session identity while
@@ -1045,16 +1064,98 @@ These are enforced by tests, not by inspection:
   now: three of the four conditions carried a paragraph each and this one carried
   the assertion "bypass is safe when there is exactly one canvas" with no argument.
 
+  **The bypass path presented nothing, and the condition is why nobody knew.**
+  Sharpening `canvas_count == 1` needed the invariant "the onscreen surface is
+  current whenever onscreen drawing runs" enumerated over every path that touches
+  FBO 0. Enumerating it found something else first: *what the default framebuffer
+  binding is* had three deriving sites and they disagreed. A bypass mode change
+  moves the meaning of "the default framebuffer" with no `bindFramebuffer` from the
+  content, and nothing re-pointed the binding — so the onscreen canvas kept the
+  DrawingBuffer bound from its own creation, drew every frame into it, and skipped
+  the blit that was the only thing carrying it to the window. Two of the three
+  sites also derived the target as `drawing_buffer.fbo` with no bypass term, so
+  each EGL switch back into the onscreen canvas re-broke it.
+
+  `scripts/verify-bypass-present.sh` is the gate. Four fixtures clear to one flat
+  colour and are captured by the same instrument, differing only in which path they
+  put the frame on: `blit-probe` and `bypass-probe` separate the two presentation
+  paths (one line apart — whether a second canvas exists), and `rtt-probe` and
+  `rtt-boundary-probe` ask the opposite question, whether a frame that was never meant
+  for the window stays off it. Before the fixes `bypass-probe` painted 240 frames and
+  presented `rgba(0,0,0,0)`; `rtt-probe` presented its render-target red on all 180.
+
+  **Three assertions, because each alone is satisfiable by something other than the
+  property.** The frame count, because 240 frames landing in the wrong buffer is the
+  same count as 240 frames reaching the window. The *distinct* sampled colour count,
+  because a frame presented through a partial damage region carries wrong pixels in
+  part of the surface while the stale majority still reads as expected. And a
+  first-frame colour that differs from the steady state, because "the screen is the
+  expected colour" is an absence claim that an engine which presented once and then
+  stopped satisfies forever — that is not hypothetical, it is what one of the mutants
+  here actually does, with the JS loop still running at 60 fps.
+
   **What is asserted, and what only a device can settle.** The four conditions are
   a pure function with one test each — previously two of them shared a test, so
   deleting either passed the blame to a test that covered both and neither was
-  individually pinned. The blit itself cannot be observed by a host test, because
-  it needs a live GL context; what observes it is the engine's own transition log,
-  now carrying the four inputs alongside the verdict, which is the instrument that
-  produced the measurement above. Windows and HarmonyOS presentation paths
+  individually pinned. So is the resolution of "which framebuffer is this canvas's
+  default" and the decision to re-point it, each pinned by a mutant that only the
+  named property can see; the two positive cases are pinned separately, because a
+  planner that never re-binds satisfies every negative one. The engine's own
+  transition log carries the four inputs alongside the verdict, which is the
+  instrument that produced the bandwidth measurement.
+
+  **A previous version of this section said the blit "cannot be observed by a host
+  test, because it needs a live GL context". That was wrong and it is what let the
+  dead path stay dead.** The blit is unobservable; the *presentation outcome* is
+  not — the headless Linux player captures the presented frame, so "did these
+  pixels reach the window" is answerable here without a device, and one flat colour
+  is enough to answer it. Windows and HarmonyOS presentation paths
   (`platform/src/{windows,ohos}/presenter.rs`) have never compiled on this machine
   at all — see Section 12 and ledger 0.32 — so nothing here covers ANGLE or
   `OHNativeWindow`, and the Android Surface path compiles but is unmeasured.
+
+  **Still not covered, named rather than implied.** The blit's *cost* remains
+  unmet for ordinary content: this fixes the bypass path, it does not widen the
+  condition that keeps ordinary content off it, and that widening still needs a
+  device run per platform (ledger 0.57). Of the sites that re-point the binding,
+  only the mode-change one is covered end to end, because a single-canvas fixture
+  never switches contexts; the other two are covered at the shared resolver.
+  Neither `frame_capture`'s unrestored `READ_FRAMEBUFFER` nor the dedup shadow's
+  disagreement with a driver binding clobbered behind the content's back is
+  addressed here — see ledger 0.60.
+
+- **The engine may not change GL state behind the content's back without telling
+  the dedup shadow.** Every per-canvas GL binding is shadowed so a redundant call
+  from content can be dropped, which makes the shadow a claim about the driver — and
+  an engine-internal write that leaves the claim standing turns the next matching
+  call from the content into a silent no-op.
+
+  **This was violated on the framebuffer binding and it put pixels on the screen.**
+  Two paths re-pointed the driver at the DrawingBuffer without a shadow write: the
+  EGL switch in `make_current_needed` and the post-swap restore after the blit.
+  Content holding its own FBO across either then had its next
+  `bindFramebuffer(sameName)` deduped away, and its render-to-texture pass drew onto
+  the window. Measured on `scripts/fixtures/rtt-probe`: 180 of 180 frames presented
+  the render target's colour full-screen, with the framebuffer complete.
+
+  The `make_current_needed` half was deleted rather than repaired. The binding is
+  per-GL-context state and each canvas owns its context, so EGL restores exactly
+  what the shadow already claims; re-pointing it had given one function two
+  behaviours, since the already-current short-circuit left the content's binding
+  alone while a real switch clobbered it. The post-swap half genuinely destroys the
+  binding, so it re-points *and* records — one operation, not a write plus
+  bookkeeping.
+
+  **What this requirement does not yet cover.** The texture binding was audited
+  through the seven sites that declare `TEXTURE_BINDING` stale to Skia's tracker: five
+  restore what the content had and are therefore already correct, and the two upload
+  paths that bound zero now restore too (ledger 0.63). Those two restores are argued,
+  not measured — ordinary image loads run on the upload thread's own GL context and so
+  cannot reach a canvas's bindings at all, which is what makes the defect latent rather
+  than live, and which the boundary-control probe pins. What reaches a canvas context
+  is the AHB path, compressed textures, and async-degradation fallbacks, none drivable
+  on Linux. A path that disturbs a shadowed binding *without* declaring anything to
+  Skia would not have appeared in that enumeration; nothing rules one out.
 - **No steady-state growth.** Resident memory does not grow across a defined
   long-running workload.
 
