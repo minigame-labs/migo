@@ -94,8 +94,9 @@ review. A commit alone is not completion evidence.
   and Slim test counts.
 - [ ] 0.15 A6: run lifecycle, reattachment, input saturation, ABI, and header
   contract suites with both product profiles.
-- [ ] 0.16 Fix the process-global text texture cache. **Implementation landed,
-  reviews outstanding** (`b73ac60`). The cache is now per session: a registry
+- [x] 0.16 Fix the process-global text texture cache. **Closed: implementation,
+  both reviews, Section 7.3's gate, the recorded residual, and — last — the
+  two-live-Session behavioural test Section 6.4 requires** (`b73ac60`). The cache is now per session: a registry
   hands out a reference-counted per-session cache with its own lock, byte budget,
   trim accounting and font generation, and both the JavaScript and render sides
   resolve their handle once at bring-up so the registry lock never appears on a
@@ -116,7 +117,14 @@ review. A commit alone is not completion evidence.
   every live session, and `render_diagnostics::set_text_cache_gauges` remains a
   process-global accumulator so two sessions' gauges interleave. **Both cache halves
   are since fixed** — the io `clear()` removed, the alias table partitioned per
-  Session — leaving only the gauges.
+  Session — ~~leaving only the gauges.~~ **and the gauges are fixed too, which this
+  line went on claiming after the fact.** The accumulator and its sink are both
+  thread-local (`HOT` and `SINK` in `render_diagnostics`), and
+  `a_gauge_set_before_another_session_sets_its_own_still_reports_its_own` pins it in
+  four ordered phases — set A, set B, flush A, flush B — precisely because two threads
+  setting gauges at once would catch a merge only on a lucky interleaving, and because
+  a counter test cannot stand in: counters publish with `fetch_add`, gauges with
+  `store`, so a merge means the session that flushed last silently speaks for both.
 
   **Independent code-quality review done; spec review still outstanding.** Reviewed
   as a five-commit batch isolated in its own worktree, so the diff was the
@@ -155,6 +163,36 @@ review. A commit alone is not completion evidence.
   `a_per_frame_text_cache_hit_does_not_reach_the_session_registry`, which holds
   `SESSION_CACHES` in write mode against a frame (task 0.27). This line previously
   misnamed that obligation as task 0.26's allocation gate.
+
+  **What closed this item was the last thing on Section 6.4's own list: two live
+  Sessions.** Every isolation test the cache had takes two host ids from
+  `text_cache_for_host` and shows the registry separates them — a claim about a
+  registry given distinct keys, which is the exact shape task 0.62 replaced for
+  storage. The step before it was never executed: that a Session *binds* its own
+  cache, through `CanvasOpState::for_host` in the `web` extension's state init, so two
+  live Sessions land on two caches without anyone choosing a key.
+  `two_live_sessions_hold_their_own_text_texture_cache` reads the cache out of each
+  live op state rather than resolving one, and caches the **same label** from both —
+  two different labels would separate the entries by key and pass over a cache with no
+  session identity at all.
+
+  Two details are the discipline restated. Both entries are written before either
+  lookup, because a process-wide slot written at bind time shows up only once both
+  Sessions have written. And the step that caches is deliberately assertion-free: its
+  first version asserted the insert evicted nothing, and the mutant then killed the
+  test **inside that helper**, detecting the defect while never evaluating the claim
+  the test is named for.
+
+  Mutation: binding the cache from a constant host id instead of the Session's own —
+  the plumbing a test that resolves a cache itself cannot see — fails only this test,
+  at its own assertion, with all 414 `migo-shared` tests and both its siblings in the
+  file passing.
+
+  **Not covered, named rather than implied.** The GL half stays unobservable here: the
+  entries hold texture names, and whether a name minted in one Session's EGL context is
+  refused in another's needs two live GL contexts, which no host test has. What is
+  gated is that the two Sessions never reach the same entry, which is what makes the
+  question moot rather than answered.
 - [x] 0.17 Arbitrate device-exclusive resources across Sessions.
   **Implementation complete, reviews outstanding.** Camera, microphone and the
   Bluetooth adapter were acquired independently by each Session's own manager, so the

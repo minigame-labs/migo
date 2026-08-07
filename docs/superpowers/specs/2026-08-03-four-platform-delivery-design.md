@@ -415,7 +415,17 @@ the other — task 0.58 covers the JVM gate's arbitration only.
 
 **Defects that must be fixed before multi-game support is claimed:**
 
-1. The process-global text texture cache is keyed without session identity while
+1. **Fixed and gated under task 0.16.** The cache is per session, the font
+   generation counter with it, and — last, because it is what Section 6.4's own test
+   requirement asks for — two *live* Sessions now hold two caches:
+   `two_live_sessions_hold_their_own_text_texture_cache` reads the handle out of each
+   Session's own op state and caches the same label from both. Every earlier isolation
+   test took two host ids from the registry, which is a claim about a registry given
+   distinct keys rather than about two Sessions producing them. The mutant that binds
+   the cache from a constant host id — the plumbing between a Session and the registry
+   — fails only that test. The original defect read:
+
+   The process-global text texture cache is keyed without session identity while
    its entries hold raw GL texture names owned by one Session's context. Two
    games rendering identical text at identical size, weight, colour, and canvas
    dimensions collide on one key, so one session can receive a texture name that
