@@ -269,10 +269,14 @@ impl AudioSource {
         self.len() == 0
     }
 
-    /// Extend owned samples (only works for Owned variant)
-    fn extend(&mut self, samples: Vec<f32>) {
+    /// Append to owned samples (only works for Owned variant).
+    ///
+    /// A slice rather than a `Vec`: the streaming path's samples arrive in a
+    /// buffer on loan from the decoder, and taking ownership of it here would be
+    /// taking it out of circulation.
+    fn extend_from_slice(&mut self, samples: &[f32]) {
         if let AudioSource::Owned(v) = self {
-            v.extend(samples);
+            v.extend_from_slice(samples);
         }
     }
 }
@@ -322,7 +326,10 @@ impl InnerAudioPlayer {
             source: AudioSource::Owned(Vec::new()),
             position: 0,
             output_channels,
-            pending_events: Vec::new(),
+            // Bought once at construction rather than on the first event, so the
+            // audio thread's first tick is no different from its ten-thousandth.
+            // A tick raises at most a seek pair plus a throttled TimeUpdate.
+            pending_events: Vec::with_capacity(4),
             stream_rx: None,
             stream_state: None,
             stream_complete: false,
@@ -529,7 +536,10 @@ impl InnerAudioPlayer {
                     );
                 }
                 StreamMsg::Samples(new_samples) => {
-                    self.source.extend(new_samples);
+                    self.source.extend_from_slice(&new_samples);
+                    // Dropped at the end of this arm, which returns the buffer to
+                    // the decoder that lent it.
+                    drop(new_samples);
                     // Fresh data arrived: re-arm the stall notification so a
                     // subsequent underrun emits `Waiting` again.
                     self.waiting_notified = false;
@@ -693,9 +703,17 @@ impl InnerAudioPlayer {
         self.push_event(InnerAudioEventType::Stop);
     }
 
-    /// Take pending events (call from audio thread loop)
-    pub fn take_events(&mut self) -> Vec<InnerAudioEvent> {
-        std::mem::take(&mut self.pending_events)
+    /// Drain pending events (call from audio thread loop).
+    ///
+    /// Draining rather than handing the vector away is what keeps the audio
+    /// thread off the heap. `mem::take` left the player holding a zero-capacity
+    /// vector, so the next `push_event` allocated a fresh one — and a playing
+    /// player raises a throttled `TimeUpdate` about four times a second forever,
+    /// which made this a permanent steady-state allocation on the one thread that
+    /// must never be late. Measured at six allocation events over 64 ticks before
+    /// the change. `Vec::drain` keeps the capacity, so the buffer is bought once.
+    pub fn drain_events(&mut self) -> std::vec::Drain<'_, InnerAudioEvent> {
+        self.pending_events.drain(..)
     }
 
     /// Check if player is active (playing)
@@ -926,7 +944,7 @@ mod tests {
         player.shared.set_sample_rate(44_100);
         player.shared.set_channels(2);
         player.shared.set_loaded(true);
-        player.source.extend(vec![0.0f32; 44_100]); // 22050 stereo frames
+        player.source.extend_from_slice(&vec![0.0f32; 44_100]); // 22050 stereo frames
         player.shared.set_state(PlaybackState::Playing);
         player.position = 44_100; // at the end of available data
 
@@ -936,8 +954,7 @@ mod tests {
         }
 
         let waiting = player
-            .take_events()
-            .into_iter()
+            .drain_events()
             .filter(|e| matches!(e.event_type, InnerAudioEventType::Waiting))
             .count();
         assert_eq!(
@@ -955,7 +972,7 @@ mod tests {
         player.shared.set_sample_rate(44_100);
         player.shared.set_channels(2);
         player.shared.set_loaded(true);
-        player.source.extend(vec![0.0f32; 44_100]); // 22050 stereo frames
+        player.source.extend_from_slice(&vec![0.0f32; 44_100]); // 22050 stereo frames
         player.shared.set_state(PlaybackState::Playing);
 
         let mut out = [0.0f32; 8];
@@ -972,8 +989,7 @@ mod tests {
         player.process(&mut out);
 
         let waiting = player
-            .take_events()
-            .into_iter()
+            .drain_events()
             .filter(|e| matches!(e.event_type, InnerAudioEventType::Waiting))
             .count();
         assert_eq!(
@@ -994,8 +1010,7 @@ mod tests {
         // One block covering >2 intervals.
         player.accumulate_time_update((interval * 2 + 500) as usize);
         let first = player
-            .take_events()
-            .into_iter()
+            .drain_events()
             .filter(|e| matches!(e.event_type, InnerAudioEventType::TimeUpdate))
             .count();
         assert_eq!(
@@ -1010,8 +1025,7 @@ mod tests {
         // A tiny follow-up block must not fire again from a drained backlog.
         player.accumulate_time_update(1);
         let second = player
-            .take_events()
-            .into_iter()
+            .drain_events()
             .filter(|e| matches!(e.event_type, InnerAudioEventType::TimeUpdate))
             .count();
         assert_eq!(

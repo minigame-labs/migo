@@ -90,6 +90,8 @@ mod context;
 mod decoder;
 mod inner_audio;
 mod limits;
+#[cfg(test)]
+mod mp3_fixture;
 mod nodes;
 mod off_worker;
 mod output;

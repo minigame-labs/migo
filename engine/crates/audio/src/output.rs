@@ -165,7 +165,7 @@ impl AudioOutput {
                 low_watermark_samples,
                 stream_error.clone(),
             )?,
-            SampleFormat::I16 => build_stream_i16(
+            SampleFormat::I16 => build_stream_converted::<i16>(
                 &device,
                 &config.into(),
                 consumer,
@@ -173,7 +173,7 @@ impl AudioOutput {
                 low_watermark_samples,
                 stream_error.clone(),
             )?,
-            SampleFormat::U16 => build_stream_u16(
+            SampleFormat::U16 => build_stream_converted::<u16>(
                 &device,
                 &config.into(),
                 consumer,
@@ -296,150 +296,162 @@ impl AudioOutput {
     }
 }
 
-// Separate functions for each sample format to avoid generic trait object overhead
-// and to pre-allocate the conversion buffer
+/// Samples converted per pass through the stack scratch buffer.
+///
+/// 512 f32 is 2 KiB of stack, which every real-time audio callback thread has
+/// (AAudio, ALSA and CoreAudio all give their callback threads a stack measured
+/// in tens of kilobytes). Chunking is what removes the heap from the callback:
+/// the scratch is sized by this constant rather than by whatever the device asks
+/// for, so no device buffer size can make the callback allocate.
+const CONVERT_CHUNK_SAMPLES: usize = 512;
+
+/// A device sample format the ring's `f32` can be written as.
+///
+/// A trait rather than three copies of the callback: the conversion is the only
+/// difference between the integer formats, and it monomorphises away.
+trait FromNormalizedF32: Copy {
+    fn from_normalized(sample: f32) -> Self;
+}
+
+impl FromNormalizedF32 for i16 {
+    #[inline]
+    fn from_normalized(sample: f32) -> Self {
+        (sample.clamp(-1.0, 1.0) * 32767.0) as Self
+    }
+}
+
+impl FromNormalizedF32 for u16 {
+    #[inline]
+    fn from_normalized(sample: f32) -> Self {
+        // Centred at 32768, matching the unsigned PCM convention.
+        ((sample.clamp(-1.0, 1.0) * 32767.0) + 32768.0) as Self
+    }
+}
+
+/// Everything the hardware callback does, as a named type rather than a closure.
+///
+/// **This exists so the real-time region can be measured.** The callback runs on
+/// a thread the platform schedules as real-time -- `SCHED_FIFO` on Android -- and
+/// an allocation there is not slow, it is a missed deadline heard as a dropout,
+/// because the allocator can block behind a thread that is not real-time
+/// scheduled at all. Section 7.3 requires that to be enforced by a test, and a
+/// closure handed to `build_output_stream` cannot be reached without a device.
+///
+/// The type is also what removes the duplication: three near-identical callbacks
+/// differing only in the sample conversion collapse into two methods.
+struct OutputCallback {
+    consumer: HeapCons<f32>,
+    sync: AudioSync,
+    low_watermark: usize,
+}
+
+impl OutputCallback {
+    /// The device speaks the ring's own format: pop straight into its buffer.
+    fn render_native(&mut self, data: &mut [f32]) {
+        self.sync.observe_callback(data.len());
+
+        let read = self.consumer.pop_slice(data);
+        if read < data.len() {
+            data[read..].fill(0.0);
+        }
+
+        self.report_depth();
+    }
+
+    /// The device speaks an integer format: convert through a fixed stack
+    /// scratch, a chunk at a time.
+    ///
+    /// The scratch used to be a `Vec<f32>` pre-sized to 4096 samples and grown
+    /// with `resize` whenever the device asked for more. A device is under no
+    /// obligation to request the same number of samples every callback, or a
+    /// number this code guessed -- AAudio's `numFrames` varies across route
+    /// changes and stream recovery, and cpal's ALSA backend sizes each callback
+    /// from the period space actually available -- so that `resize` was a
+    /// `realloc` inside a real-time callback. A fixed scratch cannot be grown,
+    /// so the failure mode is gone rather than made unlikely.
+    fn render_converted<T: FromNormalizedF32>(&mut self, data: &mut [T]) {
+        self.sync.observe_callback(data.len());
+
+        let mut scratch = [0.0f32; CONVERT_CHUNK_SAMPLES];
+        for out in data.chunks_mut(CONVERT_CHUNK_SAMPLES) {
+            let scratch = &mut scratch[..out.len()];
+            let read = self.consumer.pop_slice(scratch);
+            if read < scratch.len() {
+                scratch[read..].fill(0.0);
+            }
+            for (dst, &sample) in out.iter_mut().zip(scratch.iter()) {
+                *dst = T::from_normalized(sample);
+            }
+        }
+
+        self.report_depth();
+    }
+
+    /// Publish the post-callback ring depth and ask for a refill if it is low.
+    #[inline]
+    fn report_depth(&self) {
+        let remaining = self.consumer.occupied_len();
+        self.sync.update_level(remaining);
+
+        if remaining < self.low_watermark {
+            self.sync.signal_need_data();
+        }
+    }
+}
 
 fn build_stream_f32(
     device: &Device,
     config: &StreamConfig,
-    mut consumer: HeapCons<f32>,
+    consumer: HeapCons<f32>,
     sync: AudioSync,
     low_watermark: usize,
     stream_error: Arc<AtomicBool>,
 ) -> EngineResult<Stream> {
-    let stream = device
-        .build_output_stream(
-            config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                sync.observe_callback(data.len());
-                // Direct read into output buffer - no allocation!
-                let read = consumer.pop_slice(data);
-
-                // Fill remaining with silence
-                if read < data.len() {
-                    data[read..].fill(0.0);
-                }
-
-                // Update level and signal if needed
-                let remaining = consumer.occupied_len();
-                sync.update_level(remaining);
-
-                if remaining < low_watermark {
-                    sync.signal_need_data();
-                }
-            },
-            move |err| {
-                error!("Audio output error: {}", err);
-                stream_error.store(true, Ordering::Release);
-            },
-            None,
-        )
-        .map_err(|e| {
-            EngineError::from_detail(
-                ErrorCode::Internal,
-                format!("Failed to build audio stream: {}", e),
-            )
-        })?;
-
-    Ok(stream)
+    let mut callback = OutputCallback {
+        consumer,
+        sync,
+        low_watermark,
+    };
+    build_stream(device, config, stream_error, move |data: &mut [f32]| {
+        callback.render_native(data)
+    })
 }
 
-fn build_stream_i16(
+fn build_stream_converted<T>(
     device: &Device,
     config: &StreamConfig,
-    mut consumer: HeapCons<f32>,
+    consumer: HeapCons<f32>,
     sync: AudioSync,
     low_watermark: usize,
     stream_error: Arc<AtomicBool>,
-) -> EngineResult<Stream> {
-    // Pre-allocate conversion buffer based on typical callback size
-    // Will be resized if needed (rare)
-    let mut temp_buffer: Vec<f32> = Vec::with_capacity(4096);
-
-    let stream = device
-        .build_output_stream(
-            config,
-            move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                sync.observe_callback(data.len());
-                // Resize temp buffer if needed (should be rare after warmup)
-                if temp_buffer.len() < data.len() {
-                    temp_buffer.resize(data.len(), 0.0);
-                }
-
-                let temp = &mut temp_buffer[..data.len()];
-                let read = consumer.pop_slice(temp);
-
-                // Fill remaining with silence
-                if read < temp.len() {
-                    temp[read..].fill(0.0);
-                }
-
-                // Convert f32 to i16
-                for (i, &sample) in temp.iter().enumerate() {
-                    data[i] = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-                }
-
-                let remaining = consumer.occupied_len();
-                sync.update_level(remaining);
-
-                if remaining < low_watermark {
-                    sync.signal_need_data();
-                }
-            },
-            move |err| {
-                error!("Audio output error: {}", err);
-                stream_error.store(true, Ordering::Release);
-            },
-            None,
-        )
-        .map_err(|e| {
-            EngineError::from_detail(
-                ErrorCode::Internal,
-                format!("Failed to build audio stream: {}", e),
-            )
-        })?;
-
-    Ok(stream)
+) -> EngineResult<Stream>
+where
+    T: cpal::SizedSample + FromNormalizedF32 + 'static,
+{
+    let mut callback = OutputCallback {
+        consumer,
+        sync,
+        low_watermark,
+    };
+    build_stream(device, config, stream_error, move |data: &mut [T]| {
+        callback.render_converted(data)
+    })
 }
 
-fn build_stream_u16(
+fn build_stream<T, F>(
     device: &Device,
     config: &StreamConfig,
-    mut consumer: HeapCons<f32>,
-    sync: AudioSync,
-    low_watermark: usize,
     stream_error: Arc<AtomicBool>,
-) -> EngineResult<Stream> {
-    let mut temp_buffer: Vec<f32> = Vec::with_capacity(4096);
-
-    let stream = device
+    mut render: F,
+) -> EngineResult<Stream>
+where
+    T: cpal::SizedSample + 'static,
+    F: FnMut(&mut [T]) + Send + 'static,
+{
+    device
         .build_output_stream(
             config,
-            move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                sync.observe_callback(data.len());
-                if temp_buffer.len() < data.len() {
-                    temp_buffer.resize(data.len(), 0.0);
-                }
-
-                let temp = &mut temp_buffer[..data.len()];
-                let read = consumer.pop_slice(temp);
-
-                if read < temp.len() {
-                    temp[read..].fill(0.0);
-                }
-
-                // Convert f32 to u16 (center at 32768)
-                for (i, &sample) in temp.iter().enumerate() {
-                    data[i] = ((sample.clamp(-1.0, 1.0) * 32767.0) + 32768.0) as u16;
-                }
-
-                let remaining = consumer.occupied_len();
-                sync.update_level(remaining);
-
-                if remaining < low_watermark {
-                    sync.signal_need_data();
-                }
-            },
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| render(data),
             move |err| {
                 error!("Audio output error: {}", err);
                 stream_error.store(true, Ordering::Release);
@@ -451,7 +463,171 @@ fn build_stream_u16(
                 ErrorCode::Internal,
                 format!("Failed to build audio stream: {}", e),
             )
-        })?;
+        })
+}
 
-    Ok(stream)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+
+    const WARMUP: usize = 8;
+    const MEASURED: usize = 64;
+
+    /// Deliberately larger than the 4096-sample conversion buffer this callback
+    /// used to pre-size, so a device that asks for more than the code guessed is
+    /// what the gates run against.
+    const CALLBACK_SAMPLES: usize = 8192;
+
+    /// A callback wired to its own ring, filled, with the producer kept alive.
+    ///
+    /// The producer is returned rather than dropped because a dropped producer
+    /// closes the ring, and a gate that measured a closed ring would be measuring
+    /// the wrong thing.
+    fn filled_callback(ring_samples: usize) -> (HeapProd<f32>, OutputCallback) {
+        let (mut producer, consumer) = HeapRb::<f32>::new(ring_samples).split();
+        let block = vec![0.25f32; ring_samples];
+        producer.push_slice(&block);
+        (
+            producer,
+            OutputCallback {
+                consumer,
+                sync: AudioSync::new(),
+                low_watermark: ring_samples / 4,
+            },
+        )
+    }
+
+    /// Section 7.3's steady-state allocation gate, on the hardware callback.
+    ///
+    /// One iteration is one device callback plus the refill that keeps the ring
+    /// from draining, which is the pair that actually repeats forever. Both
+    /// device shapes are covered in the same burst: the native `f32` path pops
+    /// straight into the device buffer, the integer path converts, and only the
+    /// second one ever owned a buffer.
+    #[test]
+    fn a_steady_state_output_callback_never_reaches_the_heap() {
+        let ring_samples = CALLBACK_SAMPLES * 2;
+        let (mut native_producer, mut native) = filled_callback(ring_samples);
+        let (mut converted_producer, mut converted) = filled_callback(ring_samples);
+
+        // The reservoir is built before the measured window, per Section 7.3's
+        // rule that a burst body must not take from a pool it does not control.
+        let refill = vec![0.25f32; CALLBACK_SAMPLES];
+        let mut native_out = vec![0.0f32; CALLBACK_SAMPLES];
+        let mut converted_out = vec![0i16; CALLBACK_SAMPLES];
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "audio: one hardware output callback, native and converted",
+                warmup: WARMUP,
+                measured: MEASURED,
+            },
+            |_| {
+                native.render_native(&mut native_out);
+                native_producer.push_slice(&refill);
+
+                converted.render_converted(&mut converted_out);
+                converted_producer.push_slice(&refill);
+            },
+        );
+    }
+
+    /// The same property, but from cold — which is the one that was broken.
+    ///
+    /// A steady-state burst cannot see this defect, and saying why is the point:
+    /// the conversion buffer only ever grew, so the one `realloc` a device buffer
+    /// larger than 4096 samples caused happened during the warm-up and the
+    /// measured window was clean. That is not an acceptable answer here. This
+    /// callback runs on a real-time-scheduled thread, where the first call is as
+    /// deadline-bound as the ten-thousandth, and stream recovery and route
+    /// changes rebuild it with a buffer size nobody chose.
+    ///
+    /// So every iteration gets a callback that has never run, all of them built
+    /// before the measured window. That needs no new mechanism: a burst over a
+    /// fleet of one-shot callbacks measures first calls exactly.
+    #[test]
+    fn an_output_callback_never_reaches_the_heap_on_its_very_first_call() {
+        let mut fleet: Vec<(HeapProd<f32>, OutputCallback)> = (0..WARMUP + MEASURED)
+            .map(|_| filled_callback(CALLBACK_SAMPLES))
+            .collect();
+        let mut out = vec![0i16; CALLBACK_SAMPLES];
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "audio: a hardware output callback's first call, at a device buffer size \
+                       larger than any the callback pre-sized for",
+                warmup: WARMUP,
+                measured: MEASURED,
+            },
+            |iteration| {
+                fleet[iteration].1.render_converted(&mut out);
+            },
+        );
+    }
+
+    /// The conversion must still be the conversion. A chunked scratch that
+    /// silenced or reordered samples would pass both gates above and be inaudible
+    /// to them, so the boundary between chunks is asserted directly.
+    #[test]
+    fn chunked_conversion_matches_the_ring_across_chunk_boundaries() {
+        // Not a multiple of the chunk size, so the final partial chunk is covered.
+        let samples = CONVERT_CHUNK_SAMPLES * 2 + 7;
+        let source: Vec<f32> = (0..samples)
+            .map(|i| (i as f32 / samples as f32) * 2.0 - 1.0)
+            .collect();
+
+        let (mut producer, consumer) = HeapRb::<f32>::new(samples).split();
+        producer.push_slice(&source);
+        let mut callback = OutputCallback {
+            consumer,
+            sync: AudioSync::new(),
+            low_watermark: 0,
+        };
+
+        let mut out = vec![0i16; samples];
+        callback.render_converted(&mut out);
+
+        for (index, (&want, &got)) in source.iter().zip(out.iter()).enumerate() {
+            assert_eq!(
+                got,
+                i16::from_normalized(want),
+                "sample {index} converted wrong across a chunk boundary"
+            );
+        }
+    }
+
+    /// A callback handed more than the ring holds must pad with silence rather
+    /// than leave the device buffer at whatever it contained.
+    #[test]
+    fn an_underrun_pads_the_rest_of_the_device_buffer_with_silence() {
+        let available = CONVERT_CHUNK_SAMPLES + 3;
+        let (mut producer, consumer) = HeapRb::<f32>::new(available).split();
+        producer.push_slice(&vec![1.0f32; available]);
+        let mut callback = OutputCallback {
+            consumer,
+            sync: AudioSync::new(),
+            low_watermark: usize::MAX,
+        };
+
+        let mut out = vec![0xAAu16.wrapping_mul(3); available * 2];
+        callback.render_converted(&mut out);
+
+        assert!(
+            out[..available]
+                .iter()
+                .all(|&s| s == u16::from_normalized(1.0)),
+            "the buffered samples must reach the device buffer"
+        );
+        assert!(
+            out[available..]
+                .iter()
+                .all(|&s| s == u16::from_normalized(0.0)),
+            "an underrun must pad with silence, not leave stale device samples"
+        );
+        assert!(
+            callback.sync.check_and_clear(),
+            "an underrun must ask the audio thread for a refill"
+        );
+    }
 }

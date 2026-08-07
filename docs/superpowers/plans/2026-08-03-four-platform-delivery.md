@@ -1662,6 +1662,290 @@ review. A commit alone is not completion evidence.
   is the thing that can regress; the call sites can only regress by swapping it
   back out.
 
+- [x] 0.47 Gate the audio thread's own tick. Section 7.3 recorded the audio path
+  as "measured at its graph render only", and the graph render is the half that
+  runs inside `AudioContext::process`. The other half is the tick that calls it:
+  `run_audio_thread`'s loop, which runs every five milliseconds for as long as
+  anything is audible.
+
+  **What the gate had to get past first.** The tick is unreachable from a host
+  test binary — it wants an `AudioOutput`, which wants a device — so the part of
+  it that is device-free was lifted out: `service_players` drains what the network
+  delivered, adopts a finished stream into the cache, and hands out the events the
+  players raised, over an event sink rather than `HostTx`. The production call
+  site passes a closure over `host_tx` and captures by reference. One iteration of
+  the burst is then a whole tick: poll the stream, mix a block, emit.
+
+  **What it found.** `take_events` handed the player's event vector to the caller
+  and left the player holding a zero-capacity one, so the next event bought a
+  fresh vector — and a playing player raises a throttled `TimeUpdate` about four
+  times a second, forever, per player. **Six allocation events over 64 measured
+  ticks, 384 bytes**, on the thread whose whole job is to be on time. It is
+  `drain_events` now, which keeps the capacity, and the vector is bought at
+  construction rather than on the first event.
+
+  **Mutation evidence.** Restoring `take_events` and the zero-capacity
+  construction verbatim kills
+  `a_steady_state_audio_thread_tick_never_reaches_the_heap` and nothing else, at
+  the same six events and 384 bytes. The gate also asserts it saw events at all,
+  because a burst over a silent player would pass while proving nothing.
+
+  **What is still not gated, named rather than implied:** the rest of the tick —
+  the command drain, the decode-result drain, the power-state transitions and the
+  refill loop's `output.write` — stays inside `run_audio_thread` and needs a
+  device. What was lifted out is what repeats per player per tick.
+
+- [x] 0.48 Gate the hardware output callback, and stop it owning a heap buffer.
+  This one is a correctness item wearing a performance item's clothes. The
+  callback runs on a thread the platform schedules as real-time — `SCHED_FIFO` on
+  Android — so an allocation in it is not slow, it is a missed deadline heard as
+  a dropout, because the allocator can block behind a thread that is not
+  real-time scheduled at all.
+
+  **The callback was three closures handed to cpal, which no test can reach.** It
+  is a named type now, `OutputCallback`, with the sample conversion behind a trait
+  so the three near-identical bodies are two methods. That is what makes it
+  measurable, and it deletes about ninety lines of duplication on the way.
+
+  **What it found.** The integer-format callbacks owned a `Vec<f32>` pre-sized to
+  4096 samples and grew it with `resize` whenever the device asked for more. A
+  device is under no obligation to ask for a number this code guessed — AAudio's
+  `numFrames` varies across route changes and stream recovery, and cpal's ALSA
+  backend sizes each callback from the period space actually available — so that
+  `resize` was a `realloc` inside a real-time callback. The conversion now runs
+  through a fixed 512-sample stack scratch, a chunk at a time: there is no
+  capacity to outgrow at any device buffer size.
+
+  **Two gates, and the second one is the point.** A steady-state burst cannot see
+  this defect and saying why matters: the buffer only ever grew, so the one
+  `realloc` a large device buffer caused happened during the warm-up and the
+  measured window was clean. That is not an acceptable answer for a path whose
+  first call is as deadline-bound as its ten-thousandth. So the second gate runs
+  every iteration against a callback that has never run, from a fleet built before
+  the measured window. **This needed no new mechanism** — a burst over one-shot
+  subjects measures first calls exactly — which is why the three probe crates are
+  untouched.
+
+  **Mutation evidence**, and it separates the two gates rather than restating one:
+
+  - The pre-fix heap scratch, restored verbatim: the cold gate alone, at **64
+    resize events and 2,097,152 bytes**. The steady gate stayed green, which is
+    the claim above demonstrated rather than argued.
+  - An allocation in `render_native`, which only the steady gate exercises: the
+    steady gate alone, at 64 events and 2048 bytes.
+
+  Two behavioural tests sit beside them, because a chunked scratch that silenced
+  or reordered samples would pass every allocation gate: the conversion is
+  compared to the ring across a deliberately non-aligned chunk boundary, and an
+  underrun is required to pad with silence and ask for a refill.
+
+  **What is still not gated, named rather than implied:** that cpal actually
+  calls this, and that the thread it calls it on is the real-time one. Both need
+  a device, and the second needs a device on Android.
+
+- [x] 0.49 Gate the streaming refill, and give the decoder its state back.
+  The unit is one network chunk, because that is what repeats — a track is
+  thousands of them — and everything inside it is per-frame, so an allocation
+  here is multiplied by however many frames the chunk carried.
+
+  **What it found: nine allocation events per chunk, 3,923,144 bytes over 64
+  chunks**, for two MP3 frames each. Four causes, and the first is not an
+  allocation problem at all:
+
+  - **A decoder was constructed per chunk.** That is three allocations — a 6.6 KiB
+    `mp3dec_t`, a virtual-memory-backed ring, an 11 KiB refill buffer — and, far
+    worse, it **reset the bit reservoir**. MP3 frames are entitled to reach back
+    into the previous frame's main data, and a frame that does so decodes to *no
+    samples at all* against a decoder that has just been reset. Silently short
+    audio, no error anywhere. `Mp3FrameDecoder` now lives as long as the stream.
+  - **minimp3 keeps that state only when it can confirm the next frame's header**
+    in the same buffer, and wipes the decoder when it cannot. Decoding right up to
+    the end of a still-growing buffer therefore threw the reservoir away at every
+    chunk boundary regardless. The decoder keeps `STREAM_LOOKAHEAD_BYTES` — two
+    maximum frames — behind its cursor.
+  - **Each frame was converted through a fresh `Vec<f32>`**, and the safe wrapper
+    allocated a `Vec<i16>` per frame to hand it over in the first place. Frames
+    decode into a buffer the decoder owns and convert through one reused scratch.
+  - **The resampler rebuilt its one-frame history with `to_vec` per call** — one
+    allocation per frame for two samples.
+
+  **The chunk that crosses threads is a loan.** It has to be owned, so without a
+  way back it is one allocation on the streaming worker and one free on the audio
+  thread for as long as anything plays. `PcmChunk` returns its buffer on `Drop`
+  rather than through a call someone has to remember — the same instrument the
+  render path's command vectors use — and the return is a `try_send` that never
+  blocks, which matters because the common caller is the audio thread.
+
+  **Result: zero, and the warm-up is not a hiding place.** The window is 40
+  warm-up iterations because tokio hands out message slots 32 to a block and
+  recycles them, so the return channel's block list grows once; the property was
+  checked over **256** measured iterations before the 128 in the committed gate
+  was chosen.
+
+  **Correctness is pinned separately, and as a reftest rather than a golden
+  file** — both sides are computed in the same run, so there is no baseline to go
+  stale: a stream cut into 137-byte chunks must decode to exactly what one pass
+  over the same bytes produces. The fixture is synthesised in
+  `mp3_fixture.rs` rather than checked in, which is what lets it *state* the
+  property under test: every frame after the first declares that its main data
+  begins in its predecessor's reservoir. A control test proves the fixture is a
+  real MP3, and a second proves the fixture is strong enough — a decoder rebuilt
+  per frame recovers exactly one frame of the four.
+
+  **Mutation evidence.** Each mutant killed the named tests and nothing else:
+
+  - Rebuilding the decoder per decode: the chunk gate (**512 events, 2,886,656
+    bytes**) *and* both correctness tests — the chunked-versus-one-pass reftest
+    and the trailing-tag one.
+  - The resampler's `to_vec` history: the chunk gate alone, at **256 events, 2048
+    bytes** — exactly one per frame, eight bytes each.
+  - A loan that never returns: the chunk gate alone, at **128 events, 16,777,216
+    bytes** — exactly one 128 KiB buffer per chunk.
+  - Removing the lookahead: both correctness tests, and neither allocation gate,
+    which is right — losing the reservoir costs audio, not memory.
+  - Running the flush's in-place pass before isolation instead of after: the
+    non-audio-bytes test alone. This is the ordering argument as a mutant.
+  - Making the probe measure by decoding rather than through minimp3's
+    null-output path: the non-audio-bytes test alone.
+  - Offering the whole-file decode the whole remainder again: its own
+    tags-around-the-frames test alone.
+
+  Re-run in full after the `Skipped` fix, since that changed what `decode` means
+  by a byte it did not use. One result moved and moved for the better: removing
+  the lookahead no longer kills
+  `the_decode_step_leaves_the_shared_streaming_worker_free`. That test asserts the
+  decoder retained a chunk it could not decode, and it used to be sensitive to the
+  lookahead constant; now the hold-back retains it for its own reasons, so the
+  assertion says what it means rather than what the constant happened to imply.
+
+  The loan's identity is asserted by address as well, because a pool that quietly
+  allocated a fresh buffer each time satisfies every other observable property and
+  only the allocation gate would notice.
+
+  **Carried into the full-file decode for free.** `decoder::mp3::decode` uses the
+  same frame decoder, which removes the per-frame `Vec<i16>` from every audio load
+  — roughly seven thousand allocations for a three-minute track — and one full
+  copy with it.
+
+  **How much audio the reservoir fix is actually worth, measured against the
+  code it replaced.** The per-chunk decoder was not losing an occasional frame;
+  it was losing most of them. Running the old algorithm inline against the same
+  bytes, with no trailing tag at all:
+
+  | stream | per-chunk decoder (before) | persistent decoder (after) |
+  | --- | --- | --- |
+  | 40 frames | **14 of 40** | **40 of 40** |
+  | 6 frames | 2 of 6 | 6 of 6 |
+  | 40 frames + ID3v1 tag | 13 of 40 | 39 of 40 |
+
+  That is the defect stated as audio rather than as allocations: about two thirds
+  of a streamed track was being dropped, silently, with no error on any path.
+
+  **Bytes that are not audio used to cost frames, and now cost none.** minimp3
+  will not accept a frame it cannot chain to a successor, so a tag at either end
+  of a stream defeated it: an ID3v1 tag (128 bytes, at the end of a large
+  fraction of real files) stranded the final frame, and a stream shorter than the
+  lookahead — which decodes nothing until the flush and therefore arrives with a
+  decoder that has never run — lost *every* frame it had, decoding to silence
+  outright. That last one is the case short remote sound effects fall in.
+
+  Three things were needed, and the order of two of them is the fix rather than a
+  preference:
+
+  - **minimp3 accepts a buffer that is exactly one frame** without asking for a
+    successor to confirm it. So the flush isolates frames, handing the decoder one
+    at a time, and the real decoder then takes its state-preserving fast path.
+  - **The length comes from a throwaway decoder**, because every rejected probe
+    resets minimp3 and the bit reservoir is exactly what must survive.
+  - **The probe measures without decoding**, via minimp3's null-output-pointer
+    path. Measuring by decoding does not work and the reason is the same one
+    underneath everything here: a frame whose main data lives in a reservoir the
+    *probe* does not have decodes to zero samples and is indistinguishable from
+    garbage — so the probe reported "no frame" for precisely the frames worth
+    rescuing. This was found by instrumenting the flush phases after the first two
+    parts landed and still lost the last frame of every long stream.
+
+  Isolation runs **before** the in-place pass, not after. An in-place decode that
+  fails resets minimp3, and what it resets is the reservoir belonging to the very
+  frame it just failed on — trying in place first destroys the state needed to
+  recover it. The in-place pass is kept as a fallback for the one thing isolation
+  cannot do, getting past leading non-audio larger than a frame, and runs only
+  when isolation could not move at all.
+
+  A fourth piece closed the last gap: **the probe searches from the next sync
+  candidate when nothing is isolable at the front.** A leading tag larger than a
+  frame — an ID3v2 tag routinely is — hides the audio from a front-anchored probe
+  as well as from the in-place path, and ID3v2 at the front paired with ID3v1 at
+  the end is the classic layout. Eleven set bits is the sync word, so candidates
+  are cheap to find; minimp3 still decides, and the search is capped at 32 false
+  starts so a pathological file cannot cost a rescan per byte.
+
+  Measured across 24 combinations of stream length (1 to 96 frames, spanning both
+  sides of the lookahead) and tag placement (none, trailing, leading, both):
+  **all 24 exact.**
+
+  **The same defect was in the whole-file decode, it was worse there, and it was
+  not mine.** `decoder::mp3::decode` is the path every locally loaded or fully
+  downloaded MP3 takes — far more travelled than streaming — and it offered
+  minimp3 the whole remainder, so the same chain-check failure applied. Measured
+  against the previous implementation, cell for cell **identical**: the last frame
+  of a long tagged file lost, and *every* frame of a short one, which made
+  `decode` report that it had produced no samples. A tagged two-second sound
+  effect did not play slightly short — it failed to load.
+
+  It is fixed by handing that decoder one frame at a time as well, uniformly
+  rather than only near the end, which is both simpler and strictly better: a lone
+  frame is what minimp3 accepts without a successor, and it is also its
+  state-preserving fast path, so the reservoir survives every step instead of only
+  the ones a lookahead happened to cover. **All 20 combinations exact**, against 15
+  of 20 before.
+
+  The extra call per frame measures the frame and returns before any decoding
+  work, and it costs nothing measurable: 2000 frames — about 52 seconds of audio —
+  decode in **18.77 ms isolated against 18.80 ms whole-remainder**, release build,
+  twenty runs each.
+
+  Three earlier attempts are worth recording because each was plausible and each
+  was wrong. Decoding eagerly until the first frame lands recovered the short case
+  only partly (1 frame of 6) while costing a frame on streams that had been exact
+  (23 of 24) — reverted. Isolating *after* the in-place pass fixed one- and
+  two-frame streams and nothing else, for the ordering reason above. Keeping the
+  whole-file decode's bulk phase and isolating only its tail left a short file
+  with tags at both ends at zero, because the bulk phase's "skip everything but
+  the last frame's worth" rule — which is right for a stream that may still grow —
+  discards real audio in a file that is already complete.
+
+  The committed test asserts every combination **exact**, deliberately not "at
+  most one frame lost": a rule that tolerates one lost frame tolerates the
+  mechanism ceasing to work and losing it every time.
+
+  **That experiment did find a real latent defect, though, and it is fixed.**
+  `Mp3Step::Skipped` was conflating two different answers. When minimp3 consumes
+  *less* than it was given it has got past a real frame it could not decode; when
+  it claims everything it looked at it means "nothing usable here" — and a frame
+  that has merely not arrived in full is indistinguishable from garbage at that
+  point. The old rule held back three bytes, enough for a split sync word and not
+  enough for a partial frame, so a `decode` called on a buffer without a complete
+  frame would discard the front of one. Nothing reached it, because the lookahead
+  guarantees a complete frame is present — safe by accident of a constant rather
+  than by construction. It now holds back `MAX_FRAME_BYTES + 3`: any frame that
+  began later than that could still be incomplete, and anything older cannot be,
+  because its frame would have fit. The bound is what keeps pure garbage from
+  growing the buffer without limit.
+
+  **What is still not gated, named rather than implied:** the network side. The
+  reqwest body stream, the response handling and the `OffWorker` hop each allocate
+  and none of them is covered; the gate starts where the bytes are in hand. And
+  `PCM_CHUNK_SAMPLES` is a starting capacity, not a bound — a chunk larger than a
+  third of a second of 48 kHz stereo grows its buffer once, and the recycled
+  buffer then keeps the larger capacity.
+
+  **A trap worth recording, because it cost a false result.** The mutation
+  harness restored files with `shutil.copy2`, which preserves mtime — so cargo saw
+  nothing newer than the artifact it had already built and reran the *mutated*
+  binary against the restored tree. That is CLAUDE.md §9's WSL2 mtime trap arriving
+  through a new door. Restores touch the file now.
+
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
   0.19's second half, and confirmed in the source rather than inferred. A `/code`
