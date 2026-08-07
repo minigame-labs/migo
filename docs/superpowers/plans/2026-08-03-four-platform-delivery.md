@@ -5111,9 +5111,28 @@ review. A commit alone is not completion evidence.
   rather than the Linux host alone.
   **No steady-state growth got its mechanism under task 0.51** — a net-live-bytes
   cycle gate plus a resident-memory measurement over a long workload, both
-  two-sided. What stays here is likewise the threshold, and gates for the cycles
+  two-sided. ~~What stays here is likewise the threshold, and gates for the cycles
   that measurement cannot reach: session create/destroy, the V8 heap across a soft
-  restart, and GPU-side growth.
+  restart, and GPU-side growth.~~ **Session create/destroy now has its gate**, in
+  `capi/src/concurrent_sessions.rs`: the C API creates and destroys a real Session 64
+  measured times against a counting allocator, and the cycle nets non-positive. The
+  process measurement cannot reach it because that workload renders and never creates a
+  Session.
+
+  Getting it attributed took the rule about redundancy. The obvious mutant —
+  `mem::forget` of the exported `Arc` — kills the gate **and** two pre-existing tests
+  that watch the handle's own strong count, so it is the same claim at two levels. The
+  case only the gate can see is a leak that count is blind to: a Session owns a heap
+  block that is not the handle's own, `pending_surface_releases`, and an extra clone of
+  that inner `Arc` escaping the Session fails the gate and nothing else in the crate's
+  143 tests. That is also the realistic shape for this field, since the asynchronous
+  surface-release path is exactly what wants a handle outliving a call.
+
+  The result is a finding rather than a fix: the cycle does not grow. What stays open on
+  this bullet is the threshold, the V8 heap across a soft restart, GPU-side growth, and
+  anything a Session registers process-wide once it has a surface — a surfaceless
+  Session has no Host and so no isolate, no text cache entry and no stats registration,
+  which is why the gate's reach stops where it does.
   **The cross-session lock requirement is now gated on both sides, and the design
   recorded here was not the one used.** It is not satisfied by the declaration guard
   added under task 0.1: that guard reflects on the session map's declared type, and an

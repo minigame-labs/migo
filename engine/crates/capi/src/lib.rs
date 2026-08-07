@@ -14,6 +14,16 @@
 //! are advertised by the public headers and artifact manifests, not inferred
 //! from which Rust modules happened to compile.
 
+// Section 7.3's steady-state growth gate reads this. `#[cfg(test)]` scopes it to this
+// crate's own test binary: a `#[global_allocator]` is unique per binary, so one declared
+// unconditionally here would follow this crate into the cdylib it exists to produce.
+// Deleting it does not make the gate pass silently -- every cycle proves the allocator
+// observes both ends before it trusts a delta.
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: migo_alloc_probe::CountingAllocator =
+    migo_alloc_probe::CountingAllocator::system();
+
 mod callback_gate;
 mod callbacks;
 mod capabilities;

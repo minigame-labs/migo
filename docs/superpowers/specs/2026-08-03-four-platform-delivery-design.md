@@ -1381,10 +1381,20 @@ These are enforced by tests, not by inspection:
   reason the idle-wakeup measurement needs it: a workload that stopped rendering
   also has flat memory.
 
+  **Session create/destroy is now gated too**, at the C ABI, because the process
+  measurement renders and never creates a Session. The cycle nets non-positive over 64
+  measured iterations. Attribution needed the redundancy rule: forgetting the exported
+  `Arc` fails the gate and two tests that watch the handle's own strong count, so what
+  the gate uniquely pins is a leak that count is blind to — an extra clone of
+  `pending_surface_releases`, a heap block the Session owns that is not the handle's,
+  escaping the Session. That fails the gate alone.
+
   **Not covered.** The threshold that turns the process measurement into a gate
   belongs in the versioned baseline file, which is Phase 5's, and the run exists on
-  the Linux host only. Session create/destroy cycles, the V8 heap across a soft
-  restart, and GPU-side growth have no gate of their own.
+  the Linux host only. The V8 heap across a soft restart and GPU-side growth have no
+  gate of their own, and neither does anything a Session registers process-wide once it
+  has a surface: the create/destroy cycle above uses a surfaceless Session, which has
+  no Host and therefore no isolate, no text cache entry and no stats registration.
 
 ### 7.4 Gate Semantics
 
