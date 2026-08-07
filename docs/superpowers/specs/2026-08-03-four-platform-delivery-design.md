@@ -379,6 +379,21 @@ against the real executor rather than read, see Section 7.3**; an Engine that
 refuses destruction while any Session is live; per-session platform manager
 registries; and per-session permission monitors.
 
+**Where the quota half is now gated, and what "derived from the game identity"
+left open.** Distinct roots are necessary and not sufficient: the accounting can be
+somewhere the files are not. `storage_ops` keeps its store handles in a process-wide
+`HashMap`, so a shared running total, or a cache key that lost the directory, would
+leave two games in two directories while spending one budget. Nothing filled a quota
+until now, so nothing distinguished "each game gets 10 MB" from "the games share
+10 MB" — task 0.21 recorded the reasoning ("per-root by the same fact that makes the
+roots separate") as though it were coverage, and it was not.
+`one_game_exhausting_its_quota_leaves_the_other_game_its_own` fills one live
+Session's storage through the production path under the *shipped* limit until it is
+refused, asserts the refusal is the quota's, and then requires the other Session's
+write to be admitted and its own byte total to account for its own writes alone. The
+mutant only that test can see is the shipped `LIMIT_SIZE_KB` itself: `migo-io`'s quota
+tests pass a 1 KiB limit of their own, so what each *game* gets is invisible to them.
+
 **Where the key-value half is now gated, and what a passing test used to be able
 to miss.** The claim is that isolation is "derived from the game identity", and
 until task 0.62 nothing tested the derivation: the resolver was gated by handing

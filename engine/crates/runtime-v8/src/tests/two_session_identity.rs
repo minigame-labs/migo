@@ -130,20 +130,36 @@ mod tests {
         /// Ask the production resolver, on this thread, over this isolate's own
         /// op state.
         ReportStorage,
+        /// Write one key through the production storage path, under the shipped
+        /// quota, and report whether it was admitted.
+        Write { key: String, bytes: usize },
+        /// This game's own byte total, as its own store accounts for it.
+        ReportBytes,
+    }
+
+    /// What a step answered. One channel carries all three because the steps are
+    /// ordered: a Session answers exactly one of these per step it is handed.
+    enum Answer {
+        Storage(PathBuf),
+        /// `Ok(())` when the write was admitted, `Err(message)` when the quota
+        /// refused it. The message is carried rather than the error so a refusal
+        /// for the wrong reason is visible in the failure.
+        Written(Result<(), String>),
+        Bytes(u64),
     }
 
     /// A host thread with one live `HostJsRuntime`, driven step by step so the
     /// two Sessions' loads can be ordered instead of raced.
     struct Session {
         steps: Option<mpsc::Sender<Step>>,
-        answers: mpsc::Receiver<PathBuf>,
+        answers: mpsc::Receiver<Answer>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Session {
         fn spawn(files: &Path, cache: &Path, id: i32) -> Self {
             let (step_tx, step_rx) = mpsc::channel::<Step>();
-            let (answer_tx, answer_rx) = mpsc::channel::<PathBuf>();
+            let (answer_tx, answer_rx) = mpsc::channel::<Answer>();
             let (files, cache) = (files.to_path_buf(), cache.to_path_buf());
 
             let thread = std::thread::Builder::new()
@@ -173,9 +189,33 @@ mod tests {
                                     js.evaluate_module(game_id.clone(), "game.js".to_string())
                                         .await
                                         .unwrap_or_else(|e| panic!("{game_id} must evaluate: {e}"));
-                                    PathBuf::new()
+                                    Answer::Storage(PathBuf::new())
                                 }
-                                Step::ReportStorage => storage_of(&js),
+                                Step::ReportStorage => Answer::Storage(storage_of(&js)),
+                                Step::Write { key, bytes } => {
+                                    let dir = storage_of(&js);
+                                    let value = "x".repeat(bytes);
+                                    Answer::Written(
+                                        migo_io::storage_ops::storage_set(
+                                            &dir,
+                                            &key,
+                                            &value,
+                                            crate::storage::MAX_TOTAL_BYTES,
+                                        )
+                                        .map_err(|e| e.to_string()),
+                                    )
+                                }
+                                Step::ReportBytes => {
+                                    let dir = storage_of(&js);
+                                    Answer::Bytes(
+                                        migo_io::storage_ops::storage_info(
+                                            &dir,
+                                            crate::storage::MAX_TOTAL_BYTES,
+                                        )
+                                        .expect("a loaded game's store reports its own size")
+                                        .current_bytes,
+                                    )
+                                }
                             };
                             if answer_tx.send(answer).is_err() {
                                 break;
@@ -192,7 +232,7 @@ mod tests {
             }
         }
 
-        fn step(&self, step: Step) -> PathBuf {
+        fn step(&self, step: Step) -> Answer {
             self.steps
                 .as_ref()
                 .expect("session still running")
@@ -208,7 +248,27 @@ mod tests {
         }
 
         fn storage(&self) -> PathBuf {
-            self.step(Step::ReportStorage)
+            match self.step(Step::ReportStorage) {
+                Answer::Storage(path) => path,
+                _ => panic!("a storage step must answer with a path"),
+            }
+        }
+
+        fn write(&self, key: &str, bytes: usize) -> Result<(), String> {
+            match self.step(Step::Write {
+                key: key.to_string(),
+                bytes,
+            }) {
+                Answer::Written(outcome) => outcome,
+                _ => panic!("a write step must answer with its outcome"),
+            }
+        }
+
+        fn bytes(&self) -> u64 {
+            match self.step(Step::ReportBytes) {
+                Answer::Bytes(total) => total,
+                _ => panic!("a size step must answer with a total"),
+            }
         }
     }
 
@@ -271,6 +331,90 @@ mod tests {
         assert!(
             sb.starts_with(&nb) && !sb.starts_with(&na),
             "game-b resolved to {sb:?}, which is not its own namespace {nb:?}"
+        );
+
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One game exhausting its storage quota leaves the other's untouched.
+    ///
+    /// Section 6.4 lists "per-game filesystem, key-value, and quota isolation
+    /// derived from the game identity" as an enforced property, and task 0.62 closed
+    /// the *namespace* half: two live Sessions resolve to two directories. Distinct
+    /// directories are necessary and not sufficient. Nothing showed that the 10 MB
+    /// limit is *each game's* 10 MB, which is a claim about where the accounting
+    /// lives, not about where the files do — and the two are separable. The store
+    /// handles are kept in a process-wide `HashMap` in `storage_ops`, and a shared
+    /// running total, a cache key that lost the directory, or a quota checked against
+    /// a global would all leave two distinct directories in place while making one
+    /// game's writes count against the other's budget.
+    ///
+    /// **The exhaustion is the setup and the neighbour's write is the property.**
+    /// `a` is filled through the production `storage_set` under the shipped
+    /// `MAX_TOTAL_BYTES` until it is refused, and that refusal is asserted: a fixture
+    /// that never reached the limit would prove nothing about sharing it. Then `b`
+    /// writes, and must be admitted.
+    ///
+    /// **The byte totals are asserted as well as the outcome**, because "b's write
+    /// succeeded" is satisfied by a shared store that simply had room left. `b`'s own
+    /// store must account for `b`'s bytes and nothing near `a`'s.
+    #[test]
+    fn one_game_exhausting_its_quota_leaves_the_other_game_its_own() {
+        let root = scratch("two-sessions-quota");
+        let files = root.join("files");
+        let cache = root.join("cache");
+        install_entry(&files, &cache, "game-a");
+        install_entry(&files, &cache, "game-b");
+
+        let a = Session::spawn(&files, &cache, 1);
+        let b = Session::spawn(&files, &cache, 2);
+        a.load("game-a");
+        b.load("game-b");
+
+        // One below `MAX_VALUE_SIZE`, so the per-value cap never decides anything
+        // here and the only limit in play is the total.
+        const CHUNK: usize = 1024 * 1024 - 1;
+        // The shipped total is 10 MB, so eleven chunks cannot fit however the store
+        // rounds; the loop stops at the first refusal rather than at this bound.
+        const ENOUGH_TO_OVERFILL: usize = 16;
+
+        let mut refusal = None;
+        for chunk in 0..ENOUGH_TO_OVERFILL {
+            if let Err(message) = a.write(&format!("fill-{chunk}"), CHUNK) {
+                refusal = Some((chunk, message));
+                break;
+            }
+        }
+        let (chunks_admitted, message) = refusal
+            .expect("game-a never reached its quota, so nothing here says whose quota it was");
+        assert!(
+            message.contains("storage limit exceeded"),
+            "game-a's write was refused for something other than its quota: {message}"
+        );
+        assert!(
+            chunks_admitted > 1,
+            "game-a was refused its {chunks_admitted}th chunk, which is too early for a \
+             10 MB limit -- the refusal is not the quota it is named for"
+        );
+
+        assert_eq!(
+            b.write("after-the-neighbour-filled-up", CHUNK),
+            Ok(()),
+            "game-b was refused because game-a had filled up"
+        );
+
+        let (bytes_a, bytes_b) = (a.bytes(), b.bytes());
+        assert!(
+            bytes_b < bytes_a,
+            "game-b's store accounts for {bytes_b} bytes against game-a's {bytes_a}, so \
+             the two are counting the same writes"
+        );
+        assert!(
+            bytes_b >= CHUNK as u64 && bytes_b < 2 * CHUNK as u64,
+            "game-b's store accounts for {bytes_b} bytes after writing one {CHUNK}-byte \
+             value, so it is not accounting for its own writes alone"
         );
 
         drop(a);

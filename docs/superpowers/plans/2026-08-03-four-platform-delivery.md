@@ -3338,16 +3338,50 @@ review. A commit alone is not completion evidence.
 
   Reading each group at that layer:
 
-  - **Storage and quota separation is covered**, in `tests/storage_isolation.rs`:
+  - **Storage separation is covered**, in `tests/storage_isolation.rs`:
     two game ids resolve to non-overlapping roots, neither contains the other,
     `storage_dir` asks `game_paths` rather than the host app's directory, and a
     missing game fails rather than falling back. The Session-level wiring above it
-    holds by construction rather than by convention — `HostRuntime::evaluate_module`
-    derives `GamePaths` from *that host's* base directories plus the game id it was
-    handed and calls `set_game_paths` on its own op state, with no process-global in
-    the path. Quota is not a shared pool either: `MAX_TOTAL_BYTES` is passed to each
+    is covered by task 0.62's two live Sessions rather than by construction as this
+    entry once said.
+
+    ~~Quota is not a shared pool either: `MAX_TOTAL_BYTES` is passed to each
     storage op *alongside the directory* and enforced inside that file's SQLite
-    transaction, so it is per-root by the same fact that makes the roots separate.
+    transaction, so it is per-root by the same fact that makes the roots separate.~~
+    **That sentence was reasoning, not coverage, and task 0.62 was right to name quota
+    as untouched.** The reasoning is correct and it was never executed: no test filled
+    a quota, so nothing distinguished "each game gets 10 MB" from "the games share
+    10 MB", and distinct directories do not settle it — the store handles live in a
+    process-wide `HashMap` in `storage_ops`, and a shared running total or a cache key
+    that lost the directory would leave two directories in place while making one
+    game's writes count against the other's budget.
+
+    **Now executed.** `one_game_exhausting_its_quota_leaves_the_other_game_its_own`
+    extends task 0.62's fixture: two live Sessions, a real isolate and a real
+    `evaluate_module` each, the *same* app directories so the game id is the only
+    thing that can separate them, and `game-a` filled through the production
+    `storage_set` under the shipped `MAX_TOTAL_BYTES` until it is refused. The
+    refusal is asserted, and asserted to be the quota's rather than any other error,
+    because a fixture that never reached the limit would say nothing about sharing
+    it. Then `game-b` writes and must be admitted — and both stores' byte totals are
+    asserted, because "b's write succeeded" is also satisfied by a shared store that
+    happened to have room.
+
+    | Mutant | Kills | Also kills |
+    | --- | --- | --- |
+    | The store-handle cache key loses the directory | this test, at the neighbour's write (`:403`) | 4 `migo-io` tests |
+    | The quota admits twice its limit | this test, at the exhaustion control (`:390`) | 1 `migo-io` test |
+    | The shipped `LIMIT_SIZE_KB` drops from 10240 to 1024 | this test, at the exhaustion control | **nothing** |
+
+    The first two are the same policy seen at two levels rather than two guards on
+    one case, and saying so matters: on this project's own rule, a test killed only
+    by mutants that also kill another is redundancy. The third is the case only this
+    test can see — `migo-io`'s quota tests pass their own 1 KiB limit in, so the
+    number each *game* actually gets is invisible to them, and the whole point of the
+    claim is that it is 10 MB per game rather than per process. Its sibling
+    `two_live_sessions_resolve_storage_under_their_own_game_id` survives all three,
+    which is what says the namespace half and the accounting half are different
+    claims.
   - **Isolate separation is a property of `deno_core`**: a `JsRuntime` owns its
     isolate and two of them cannot share one. What is worth testing is not that, but
     what two Sessions reach *around* their isolates — and there the audit found one
