@@ -24,6 +24,137 @@ public final class PermissionOperationGateTest {
      */
     private static final long BLOCKED_OBSERVATION_MILLIS = 200;
 
+    /**
+     * Budget for requiring a per-event path to finish while the admission guard is held.
+     * Six orders of magnitude above what an unblocked lookup needs, because the cost of
+     * being wrong the other way is a flaky gate. Shortening it can only make a correct
+     * path look blocked, which fails closed.
+     */
+    private static final long CONTENTION_PATIENCE_MILLIS = 2_000;
+
+    /**
+     * Section 7.3: no per-event path acquires a lock shared beyond its own session.
+     *
+     * This is the gate that requirement was first written for on this side of the JNI
+     * boundary, and the JVM half the Rust probe says nothing about. An earlier attempt was
+     * withdrawn for being unable to fail -- it took the shared lock inside the very helper
+     * it called -- and the design recorded to replace it was JVM thread contention
+     * monitoring plus an assertion that admission-attributable blocked time is zero. That
+     * measures the same structural fact less directly and has the shape of a metric that
+     * cannot fail: a run where nothing was admitted also blocks for zero milliseconds.
+     *
+     * So this takes the Rust probe's shape instead. Manufacture the contention rather than
+     * wait for load, by holding {@code openGuard} and requiring the per-event admission --
+     * {@code runIfGranted}, which is what a BLE characteristic notification takes -- to
+     * complete on another thread anyway. An uncontended acquisition, which a load test
+     * cannot see, fails this too.
+     *
+     * Three details are load-bearing. The admission runs on another thread, because on the
+     * holder's own thread Java's monitors are reentrant and it would pass with or without
+     * the property. Saturation is asserted before the admission starts, since an admission
+     * handed an unheld guard proves nothing. And the callback's own return value is
+     * asserted, because a refused admission returns instantly and would satisfy the timing
+     * assertion while never reaching the lookup at all.
+     */
+    @Test
+    public void perEventAdmissionDoesNotWaitForTheAdmissionGuard() throws Exception {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(31));
+        assertNull(gate.update(31, "scope.bluetooth", true, () -> true).failure());
+
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (gate.openGuard) {
+                held.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "admission-guard-holder");
+        holder.start();
+        assertTrue("the guard was never taken, so nothing was contended",
+                held.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS));
+
+        CountDownLatch admitted = new CountDownLatch(1);
+        List<Boolean> outcome = Collections.synchronizedList(new ArrayList<>());
+        Thread caller = new Thread(() -> {
+            outcome.add(gate.runIfGranted(31, "scope.bluetooth", () -> true));
+            admitted.countDown();
+        }, "per-event-admission");
+        caller.start();
+
+        boolean finished = admitted.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS);
+        release.countDown();
+        holder.join();
+        caller.join();
+
+        assertTrue(
+                "a per-event admission did not complete in " + CONTENTION_PATIENCE_MILLIS
+                        + "ms while the admission guard was held, so it acquires a lock"
+                        + " shared beyond its own session",
+                finished);
+        assertEquals(
+                "the admission was refused, so its speed says nothing about the lock",
+                Arrays.asList(true),
+                outcome);
+    }
+
+    /**
+     * The instrument's own control, and it is not optional.
+     *
+     * The test above asserts an absence: that a per-event path did *not* wait. That is
+     * satisfied by a guard nobody actually held, by a monitor this test failed to acquire,
+     * and by a deadline long enough to hide anything. Opening a session is the operation
+     * that genuinely takes {@code openGuard}, so requiring it to stay blocked for the same
+     * held guard is what says the instrument can observe a wait at all.
+     *
+     * The bound here is deliberately the short one: a correct {@code open} can never
+     * complete while the guard is held, so this observation cannot flake -- only a
+     * regression that stopped taking the guard could make it fail.
+     */
+    @Test
+    public void openingASessionDoesWaitForTheAdmissionGuard() throws Exception {
+        PermissionOperationGate gate = new PermissionOperationGate();
+
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (gate.openGuard) {
+                held.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "admission-guard-holder");
+        holder.start();
+        assertTrue(held.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS));
+
+        CountDownLatch opened = new CountDownLatch(1);
+        Thread opener = new Thread(() -> {
+            gate.open(41);
+            opened.countDown();
+        }, "session-open");
+        opener.start();
+
+        boolean finishedEarly = opened.await(BLOCKED_OBSERVATION_MILLIS, TimeUnit.MILLISECONDS);
+        release.countDown();
+        holder.join();
+        opener.join();
+
+        assertFalse(
+                "opening a session completed while the admission guard was held, so the"
+                        + " guard is not the mutual exclusion the per-event gate assumes"
+                        + " it holds",
+                finishedEarly);
+        assertTrue("the opener never finished even after the guard was released",
+                opened.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS));
+    }
+
     @Test
     public void missingSessionRejectsUpdatesAndRegistrationUntilExplicitlyOpened() {
         PermissionOperationGate gate = new PermissionOperationGate();

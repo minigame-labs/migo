@@ -70,7 +70,19 @@ public final class PermissionOperationGate {
      * exclusion, and {@link #openGuard} provides it.
      */
     private final ConcurrentMap<Integer, Session> sessions = new ConcurrentHashMap<>();
-    private final Object openGuard = new Object();
+
+    /**
+     * Mutual exclusion for admission and retirement only, and package-private so the
+     * contention gate in this package can hold it.
+     *
+     * Specification Section 7.3 requires a test that fails when a per-event operation
+     * acquires a lock shared beyond its own session, and says these are enforced by tests
+     * rather than by inspection. The only way to observe an acquisition rather than reason
+     * about one is to hold the lock and require the per-event path to finish anyway, which
+     * needs the monitor a test can synchronize on. Reflection would reach a private field
+     * too, and would go on compiling after a rename.
+     */
+    final Object openGuard = new Object();
 
     /**
      * Ids whose session has been closed. A tombstone must refuse exactly the ids that were

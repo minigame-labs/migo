@@ -5114,17 +5114,52 @@ review. A commit alone is not completion evidence.
   two-sided. What stays here is likewise the threshold, and gates for the cycles
   that measurement cannot reach: session create/destroy, the V8 heap across a soft
   restart, and GPU-side growth.
-  The cross-session lock requirement is **not** satisfied by the declaration
-  guard added under task 0.1. That guard reflects on the session map's declared
-  type, and an independent review constructed a counterexample it cannot detect:
-  taking the open guard inside the lookup leaves the declared type unchanged and
-  releases the lock before any observable barrier, so both delivered fixtures
-  still pass. The intended behavioural design is to enable JVM thread contention
-  monitoring, drive concurrent admissions across several sessions, and assert that
-  the blocked count attributable to admission is zero — which a shared monitor on
-  the lookup path cannot achieve under load and a concurrent map achieves exactly.
-  The same task owns removing per-event allocation from the BLE callback path via
-  a counted attempt admission with an interned connection wrapper.
+  **The cross-session lock requirement is now gated on both sides, and the design
+  recorded here was not the one used.** It is not satisfied by the declaration guard
+  added under task 0.1: that guard reflects on the session map's declared type, and an
+  independent review constructed a counterexample it cannot detect — taking the open
+  guard inside the lookup leaves the declared type unchanged and releases the lock
+  before any observable barrier, so both delivered fixtures still pass. ~~The intended
+  behavioural design is to enable JVM thread contention monitoring, drive concurrent
+  admissions across several sessions, and assert that the blocked count attributable to
+  admission is zero.~~ **That was rejected on this project's own rule about absence
+  metrics**: a run in which nothing was admitted also blocks for zero milliseconds, and
+  making the number the pass condition is the shape of gate this plan keeps catching.
+
+  What landed instead is the Rust probe's shape, in Java: hold `openGuard` and require
+  `runIfGranted` — the admission a BLE characteristic notification takes — to complete
+  on another thread anyway. Contention is manufactured rather than waited for, so an
+  *uncontended* acquisition fails it too, which is what a load test cannot see. The
+  guard is package-private rather than reached by reflection, because reflection would
+  go on compiling after a rename. Three details are load-bearing: the admission runs on
+  another thread, since Java monitors are reentrant and the holder's own thread would
+  pass either way; saturation is asserted before the admission starts; and the
+  callback's return value is asserted, because a refused admission returns instantly and
+  would satisfy the timing assertion without reaching the lookup.
+
+  **The instrument has its own control, and it is the reason the pair is a gate.**
+  `perEventAdmissionDoesNotWaitForTheAdmissionGuard` asserts an *absence*, which is
+  satisfied by a guard nobody held and by a monitor the test failed to acquire. So
+  `openingASessionDoesWaitForTheAdmissionGuard` requires the operation that genuinely
+  takes the guard to stay blocked for the same held guard. Its bound is the short one,
+  because a correct `open` can never complete while the guard is held and so cannot
+  flake.
+
+  | Mutant | Kills |
+  | --- | --- |
+  | `runIfGranted`'s lookup takes `openGuard` — the review's own counterexample | `perEventAdmissionDoesNotWaitForTheAdmissionGuard` |
+  | `open` synchronizes on a fresh monitor instead of the shared one | `openingASessionDoesWaitForTheAdmissionGuard` |
+
+  Neither kills the other's test, so the property and the instrument are separately
+  pinned. 106 tests per flavour, Full and Slim, from a 104 baseline, no failures,
+  errors or skips; `scripts/test-permission-coverage-contract.sh` still 30 gated, 8
+  cleanup, 38 sensitive.
+
+  **Still open on this bullet:** removing per-event allocation from the BLE callback
+  path via a counted attempt admission with an interned connection wrapper. Its Rust
+  half is measured at five allocations per notification (task 0.26) and is
+  `cfg(target_os = "android")`; its Java half needs a JVM allocation mechanism, which
+  `platforms/android` still has none of.
 - [ ] 5.2 Make device and machine performance collection build, install, launch,
   sample, validate required fields, and fail closed on every platform.
 - [ ] 5.3 Run the representative workloads against each platform baseline and

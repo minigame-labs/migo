@@ -940,9 +940,17 @@ These are enforced by tests, not by inspection:
   of a grant even by a `clear` that never marked the session closing. Asserted with a
   scope, the mutant that removes the flag walked past all 52 tests.
 
-  **Not covered.** The JVM `PermissionOperationGate` is a different object with a
-  different key and remains ungated; its replacement is designed around `ThreadMXBean`
-  blocked-time and is tracked as task 5.1, and the Rust probe says nothing about it.
+  **The JVM gate is now covered too, and not by the design recorded for it.** The
+  `ThreadMXBean` blocked-time plan was rejected on this document's own rule about
+  absence metrics: a run in which nothing was admitted blocks for zero milliseconds, so
+  the number cannot be the pass condition. `PermissionOperationGate` gets the same
+  manufactured-contention shape instead — hold `openGuard`, require `runIfGranted` to
+  complete on another thread — with the guard package-private rather than reflected, and
+  with its own instrument control: `openingASessionDoesWaitForTheAdmissionGuard`
+  requires the operation that genuinely takes the guard to stay blocked, because the
+  first test asserts an absence a guard nobody held would satisfy. The review's own
+  counterexample, taking the guard inside the per-event lookup, fails the first and not
+  the second.
   The BLE notification path's Rust half is `cfg(target_os = "android")`, so a host test
   binary never compiles the *notification* traffic itself, and the android-only half of
   this fix — the nine service types that now hold the handle — compiled for
