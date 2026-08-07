@@ -487,6 +487,18 @@ section states is therefore now met by construction for both mount kinds, and th
 lesson stands: check what the key actually carries before sharing anything, and check
 it for every backend the key can come from, not just the one in front of you.
 
+**And the directory-backed half is now gated, which it was not.** It was reasoned
+correct here and left at that, while the pack-backed half got both a fix and tests
+— so the branch this section calls safe was the one nothing could fail on.
+`two_games_do_not_share_a_cache_entry_for_an_identical_asset` gives two games their
+own code directories, the same virtual path, and files with **identical bytes and
+identical mtimes**: that last detail is the test, because two files left to the
+filesystem differ in mtime and the keys would then differ for a reason that has
+nothing to do with isolation. Mutation says the real path's contribution to the
+token is a single load-bearing guard rather than one of two — removing it, or
+substituting `source_mounted_at` as this section warns against, each fails that
+test and nothing else.
+
 **A game's package is untrusted with respect to every other game's, and the
 property a shared key must therefore carry is that producing it requires holding
 the content.** This was previously left open. It has to be stated this way because
@@ -621,6 +633,68 @@ These are enforced by tests, not by inspection:
 - **Bounded hot paths.** No unbounded queue growth under saturation. Terminal
   transitions retain reserved capacity and supersede replaceable work rather
   than being dropped.
+
+  **This one is observed behaviourally where it has been pointed, and the
+  coverage list belongs here for the same reason the other requirements have
+  one.** Without it the bullet reads as a claim about every queue in the engine
+  while only some are gated. `scripts/test-input-transport-contract.sh` greps for
+  the absence of `unbounded_channel` and for a `VecDeque::with_capacity`, which is
+  inspection and cannot fail when a bound disappears — but it is not the only
+  thing covering this requirement, and reading it as such understates the tree.
+  `host_channel.rs` holds eleven tests that drive the real queue:
+  `critical_bypasses_full_normal_budget_and_keeps_fifo` fills the normal lane and
+  requires the refusal to hand the command back rather than drop it;
+  `reliable_reserve_is_bounded_and_returns_original_command` does the same for the
+  reserve; and `terminal_supersedes_older_motion_for_its_stream` is the saturation
+  case this requirement's second sentence is about — the lane is full, and the
+  terminal transition is required to come back `Enqueued` rather than `Reserved`,
+  which is only true if it superseded the replaceable motion instead of spending
+  the reserve or being dropped.
+
+  **Covered:** the ordered host input queue, in both lanes and the reserve.
+  Elsewhere the bound is structural and holds by construction: the render command
+  channel is a `crossbeam_channel::bounded`, and the render thread's deferred
+  upload queue refuses above `MAX_DEFERRED_UPLOADS` by returning the image and its
+  responder to the caller — the same "hand it back rather than drop it" policy the
+  input queue uses.
+
+  **The audio command transport was the one defect this requirement found, and it
+  is closed.** It was a `tokio` *unbounded* channel whose consumer drains at most
+  `AUDIO_COMMANDS_PER_DRAIN` commands per tick and defers the rest — an unbounded
+  queue behind a capped drain, which is the growth shape exactly, and the drain's
+  own comment named the producer that reaches it ("JS fires rapid bursts
+  (automation, game SFX)"). It could not take the input queue's shape: `AudioCmd`
+  carries JS-allocated ids with fire-and-forget creates, so ordering *is* the
+  protocol and nothing in it is replaceable or droppable. It takes the render
+  path's shape instead — `shared::audio_channel`, a bounded crossbeam channel
+  whose send waits — which is backpressure without loss, and whose wait is bounded
+  because the audio thread never blocks (its device write is a push onto a
+  lock-free ring) and every send notifies its latched wakeup.
+
+  Three things about that are load-bearing rather than incidental. The
+  notification for a full queue happens **before** the wait, because the audio
+  thread sleeps indefinitely after silence and a send's own wakeup is what returns
+  it — parking first and notifying after the send returns is a deadlock, and it
+  has a test whose failure is a deadline rather than a hang. The capacity is
+  *derived* from the drain cap, with the relationship asserted at compile time, so
+  a full queue always empties in a bounded number of iterations. And the profile
+  without `api-media` now holds a sender with no receiver at all rather than a
+  receiver it never reads: that shape was a queue nobody drained, harmless only
+  because the audio ops are compiled out of that profile, and behind a bounded
+  channel it would have parked the first producer to fill it. The same applied to
+  the Worker's placeholder sender.
+
+  Bounding it also removed a per-event allocation the zero-allocation requirement
+  had not covered: `tokio`'s unbounded channel buys a block from the heap every
+  thirty-two messages, and the burst gate over the send catches that
+  independently — reverting the transport to unbounded fails it.
+
+  **Not covered.** Worker `postMessage` queues are unbounded, and there the web
+  platform specifies no bound, so what is missing is a stated position rather than
+  a fix. The pre-start command buffer `AudioService` fills before the audio thread
+  exists is a `Vec` with no cap; it grows only while nothing but lifecycle
+  commands have arrived, which is host-driven rather than content-driven, and it is
+  recorded rather than bounded.
 - **Zero steady-state allocation.** No per-event heap allocation on any steady
   hot path, including the BLE notification path named in Section 6.1. Each covered
   path requires an allocation-count regression test: a test that counts actual
@@ -671,6 +745,25 @@ These are enforced by tests, not by inspection:
   fail when one appears. It now additionally requires that the real gates exist,
   since deleting a test is the one failure a test cannot report about itself.
 
+  **A burst is only a gate for the workload it is pointed at, and one of these was
+  pointed at the wrong one.** The frame boundary's reorder-admission gate ran
+  against the thirty-canvas scene that motivated the reorder, which fitted inside
+  the classifier's inline thirty-two-entry canvas-id set — so it passed over an
+  implementation that allocated and freed on the render thread on **every frame of
+  any busier scene** (measured at eighty canvases: 128 heap events over 64 frames,
+  49152 bytes). Nothing caps how many canvases a game draws to in one frame, so no
+  inline capacity closes this. The classifier gathers nothing at all now: the
+  question it asks is whether one set intersects another, which is a boolean, and
+  both sides are already in the op slice, so it scans them once per *distinct*
+  canvas a WebGL command binds instead of building a container to scan against.
+  The packet builder does need the ids — it emits a `Materialize` op per pending
+  canvas — and holds its set across frames instead, so the spill is paid once
+  however wide the scene. That one is gated on the retained capacity rather than by
+  a burst, because a burst over the builder would also measure the packet's pooled
+  op vector, which this crate's several hundred other tests take from concurrently;
+  the reuse is of the allocation and never of the contents, which is a second
+  property and has a test of its own.
+
   **One path needed the burst pointed at first calls rather than steady ones, and
   it did not need a new mechanism.** The output callback runs on a real-time
   scheduled thread, where the first call is as deadline-bound as the
@@ -694,13 +787,22 @@ These are enforced by tests, not by inspection:
   and that the thread it calls it on is the real-time one, needs a device, and on
   Android a device running Android; and the streaming gate starts where the bytes
   are already in hand, so the reqwest body stream and the hop onto the blocking
-  worker are uncovered. Within the frame boundary, the render path's three
-  per-frame canvas-id sets are one gated type, but its two remaining call sites —
-  the WebGL batch executor and the packet builder — carry no gate of their own,
-  because one needs a live GL context and the other a pool no neighbouring test is
-  taking from; and that type spills to the heap on a scene with more than 32
-  distinct Canvas2D targets in one packet. No path may be recorded as satisfying
-  this requirement without a burst test named against it.
+  worker are uncovered. Within the frame boundary, one of the render path's three
+  canvas-id sets stays ungated and stays a per-batch local: the WebGL batch
+  executor's, which needs a live GL context. Its count is the number of distinct
+  canvases one batch's commands bind, and each of those carries a live WebGL
+  context — an EGL context and its framebuffers — so it is not the Canvas2D label
+  count that made the other two reachable, and a scene of text labels does not
+  produce thirty-three of them. Both ways to remove its spill were rejected: moving
+  the stale-marking inside the dispatch loop puts the flag's set before commands
+  that might clear it, and holding the gathered ids in a `RendererGL`-owned scratch
+  requires them to survive a `&mut RendererGL` call that could clobber them. Each is
+  an invariant by convention on the one path where a wrong answer is wrong pixels
+  rather than a slow frame, and no host test can observe either. The classifier's
+  early-out — settling a WebGL-only packet without walking its GL half — is likewise
+  unpinned, because removing it changes no verdict and allocates nothing; it is a
+  performance guard only. No path may be recorded as satisfying this requirement
+  without a burst test named against it.
 
   **What the gates cannot see, stated because it bounds the claim.** A burst counts
   allocations, so a *lost* pooled vector — a deallocation — is invisible to it by
@@ -920,6 +1022,39 @@ These are enforced by tests, not by inspection:
   platform surface performs no additional full-frame copy. The path is documented
   per platform — Android Surface, X11 and Wayland EGL, ANGLE, and
   `OHNativeWindow` — and asserted where the platform allows observation.
+
+  **This requirement is not met for ordinary content, and it took a measurement to
+  say so.** The onscreen canvas renders into a Chromium-style intermediate FBO —
+  the `DrawingBuffer` — which is blitted to the window on every present. A bypass
+  exists that redirects the onscreen default framebuffer to real FBO 0 and skips
+  the blit, gated on four conditions, and the one that decides the ordinary case is
+  `canvas_count == 1`. Measured on the Linux host with the bunnymark bundle: its
+  onscreen canvas is pure WebGL, is never read back, and matches the surface
+  exactly, and it **still presents its whole 60 fps steady state through the blit**,
+  because one offscreen canvas exists (`canvas_count=2`). At 720×1280 that is about
+  3.7 MB read and 3.7 MB written per frame — roughly 440 MB/s — for a copy that
+  buys nothing but disambiguation.
+
+  **The condition is sound, which is why it cannot simply be deleted.** Bypass
+  makes the onscreen default framebuffer *real* FBO 0, and real FBO 0 is whichever
+  EGL draw surface is current; offscreen canvases are pbuffers with surfaces of
+  their own, and the render path switches between them batch by batch. With a
+  second canvas in existence, "FBO 0" stops naming the window. The `DrawingBuffer`
+  removes the ambiguity because its FBO is a name in the shared context and does
+  not move when the surface does. That reasoning was absent from the code until
+  now: three of the four conditions carried a paragraph each and this one carried
+  the assertion "bypass is safe when there is exactly one canvas" with no argument.
+
+  **What is asserted, and what only a device can settle.** The four conditions are
+  a pure function with one test each — previously two of them shared a test, so
+  deleting either passed the blame to a test that covered both and neither was
+  individually pinned. The blit itself cannot be observed by a host test, because
+  it needs a live GL context; what observes it is the engine's own transition log,
+  now carrying the four inputs alongside the verdict, which is the instrument that
+  produced the measurement above. Windows and HarmonyOS presentation paths
+  (`platform/src/{windows,ohos}/presenter.rs`) have never compiled on this machine
+  at all — see Section 12 and ledger 0.32 — so nothing here covers ANGLE or
+  `OHNativeWindow`, and the Android Surface path compiles but is unmeasured.
 - **No steady-state growth.** Resident memory does not grow across a defined
   long-running workload.
 
