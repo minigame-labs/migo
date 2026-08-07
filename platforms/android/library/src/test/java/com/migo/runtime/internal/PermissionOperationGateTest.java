@@ -292,6 +292,41 @@ public final class PermissionOperationGateTest {
         assertNull(gate.register(3011, "scope.camera"));
     }
 
+    /**
+     * A grant belongs to the Session that was granted it, and to no other. This gate is a
+     * process-wide static keyed by session id, so two concurrent Sessions meet inside one
+     * object -- and a grant that leaked between them would let one game use a capability
+     * the user approved for another. That is the permission half of Section 6.4's
+     * concurrent-session isolation, and it was the group task 0.21 recorded as untested.
+     *
+     * <p>The existing cross-session test grants a scope and then checks the granted
+     * session still works. This checks the other direction, which nothing did: that the
+     * session which was <em>not</em> granted is refused. Both directions are needed
+     * because the first alone passes over a gate that grants everyone.
+     *
+     * <p>The positive assertion in the middle is that control: a gate that granted nobody
+     * would satisfy both denials while breaking every permission in the product.
+     */
+    @Test
+    public void aGrantOnOneSessionLeavesTheSameScopeDeniedOnAnother() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertTrue(gate.open(4001));
+        assertTrue(gate.open(4002));
+
+        assertNull(gate.update(4001, "scope.camera", true, () -> true).failure());
+
+        assertTrue(
+                "the session the grant was made for could not use it",
+                gate.runIfGranted(4001, "scope.camera", () -> true));
+
+        assertFalse(
+                "one session's grant admitted another session's callback",
+                gate.runIfGranted(4002, "scope.camera", () -> true));
+        assertNull(
+                "one session's grant let another session register a cancellation",
+                gate.register(4002, "scope.camera"));
+    }
+
     @Test
     public void closingOneSessionLeavesAnotherLiveSessionUntouched() {
         PermissionOperationGate gate = new PermissionOperationGate();
