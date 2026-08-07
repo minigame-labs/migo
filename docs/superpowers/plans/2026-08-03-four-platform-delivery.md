@@ -251,15 +251,110 @@ review. A commit alone is not completion evidence.
   Section 7.3.** Section 6.4 names two halves — `open` rejecting any id at or below a
   process-wide high-water mark, and its return value being discarded at the call
   site. Both are fixed: the mark is gone, and `open` is `#[must_use]` with
-  `open_or_report` as the reporting call site. Section 7.3's allocation and
+  `open_or_report` as the reporting call site. ~~Section 7.3's allocation and
   contention gates remain absent for this path: both mechanisms now exist (tasks 0.26
   and 0.27) but neither has been pointed here, and what needs gating is the
   *notification* traffic rather than arbitration itself — an acquire and a release
-  happen once per session, not per event.
+  happen once per session, not per event.~~
+
+  **The contention half is now gated, and the sentence above named the wrong thing.**
+  Pointing the probe at this path found a live violation, not a covered one: it is not
+  only the acquire and release that are per session. Every *gated device call* went
+  through `permission_jni_call` to `PermissionGate::run(host_id, ..)`, whose first act
+  was `host_state(host_id)` — a `Mutex<Hosts>` on a process singleton — and that
+  includes the Bluetooth characteristic writes Section 6.1 names as a steady hot path.
+  Fixed under task 0.66, whose entry carries the evidence.
 
   Resolved while fixing this: `HostCommand::Restart` is a payload-free unit
   variant, so restart cannot swap to different content, which is why preserving
   standing grants across restart is safe as well as specified.
+- [x] 0.66 Take the process-wide permission map off the per-event device-call path.
+  Found by pointing task 0.27's contention probe at the one path Section 7.3 says the
+  requirement was first written for, which task 0.18 had recorded as needing nothing.
+
+  **The recorded obstacle named the wrong thing, and this is the seventh time.**
+  Section 7.3 said "the BLE notification path's Rust half is
+  `cfg(target_os = "android")`, so a host test binary never compiles it", and task 0.18
+  said "what needs gating is the *notification* traffic rather than arbitration itself
+  — an acquire and a release happen once per session, not per event". Both are about
+  the wrong object. The lock is in `crates/platform/src/android_permission_gate.rs`,
+  which is `cfg(any(target_os = "android", test))` and therefore compiles and runs its
+  tests on a host binary; and what is per event is neither the acquire nor the
+  notification but the *gated call*. `permission_jni_call` reaches
+  `PermissionGate::run(host_id, ..)`, which begins `host_state(host_id)` —
+  `self.hosts.lock()` on a `OnceLock` singleton. Two sessions writing BLE
+  characteristics serialised there on every call.
+
+  Useful reflex again: ask which layer can *see* the property. The effect is on an
+  android-only path; the lock is not.
+
+  **Red first.** `a_gated_device_call_does_not_reach_the_process_wide_live_host_map`
+  holds `PermissionGate::hosts` and requires a granted Bluetooth call on another thread
+  to finish anyway. Against the pre-fix implementation it timed out for the full two
+  seconds and reported at the probe's own message, naming the live-host map. The gate
+  needed one mechanism change to reach it: the probe took `&RwLock<L>` and this lock is
+  a `Mutex`, so `assert_completes_while_mutex_locked` now shares a body with the
+  `RwLock` form. Factoring that body out inverted a lock order — the guard became an
+  argument, so it was taken *before* `ONE_GATE_AT_A_TIME` — and the mechanism's own
+  `two_gates_never_overlap_and_so_cannot_blame_each_other_s_lock` failed immediately.
+  The guard is a closure now, and the reason is recorded where it is taken.
+
+  **The fix is the move two other paths already made**: a `SessionGate` resolved once
+  when a session's device services are built, holding the `Arc<HostControl>` directly,
+  exactly as task 0.16 did for the text texture cache and the input path did for the
+  debug-stats registry. `PermissionGate::run` and `PermissionGate::scope_state` — the
+  id-taking forms — are **deleted** rather than left beside the handle, so the
+  defective call cannot be written; the nine service types that make gated calls hold
+  the handle, and `permission_jni_call` takes it. `open_or_report` became
+  `open_session`, which returns the handle, and a non-reporting `session` exists
+  because the report is a `debug_assert!` and a test asserting that a *retired* id
+  stays refused must not trip it.
+
+  **What the fix moved, which is the interesting part.** `clear` removing the
+  live-host entry used to be enough to refuse on its own, because every call looked the
+  id up and got nothing; a handle keeps the control block alive, so the `Closing`
+  lifecycle flag — previously belt and braces behind the map — is now the whole of the
+  refusal. Nothing tested that:
+  `clear_waits_for_inflight_update_then_leaves_a_tombstone` and
+  `a_cleared_id_stays_retired_when_a_higher_id_opens_afterwards` both ask the gate for a
+  handle *after* the clear, so they hold an empty one and are satisfied by the map alone.
+
+  **A mutant walked, and the fixture was the reason.** The first version of
+  `a_handle_taken_before_teardown_is_refused_after_it` asserted a *scoped* call, and
+  removing `state.lifecycle = Lifecycle::Closing` from `clear` left all 52 tests
+  passing — because `clear` empties the scope map too, so the call was refused for want
+  of a grant either way. An **unscoped** protected call is the only one whose
+  post-teardown refusal can come from nothing but the flag, and `close_adapter` and
+  `stop_devices_discovery` are real unscoped gated calls. Rewritten that way, the same
+  mutant kills that one test and 51 others pass.
+
+  **Mutation evidence, files byte-identical by sha256 after each restore.**
+
+  | Mutant | Kills | Survivors |
+  | --- | --- | --- |
+  | `clear` stops marking `Closing` (scoped fixture) | nothing | 52 |
+  | `clear` stops marking `Closing` (unscoped fixture) | `a_handle_taken_before_teardown_is_refused_after_it` | 51 |
+  | `run` inverts the required-scope check | 7 tests, including the contention gate's own `Ok(0xB1E)` | 45 |
+
+  The third is not a pin — it kills too much to attribute — but it is the control that
+  says the contention gate's burst really was an *admitted* call: a refusal completes
+  instantly and would satisfy the timing assertion while proving nothing.
+
+  **Not covered, named rather than implied.** What the contention test cannot see is a
+  regression inside `SessionGate::run`: the handle holds no path back to the gate, so
+  reintroducing the map lookup is a design change rather than a mutant, and the test's
+  red half is the pre-fix implementation rather than a repeatable mutant. It stands as
+  the guard against a future acquisition of anything process-wide on that path — which
+  is exactly how the input send's stats-registry defect was found. The nine service
+  types are `cfg(target_os = "android")`: they compiled for `aarch64-linux-android` and
+  were not run. The JVM `PermissionOperationGate` is a different object with a different
+  key and stays ungated (task 5.1). The allocation half of Section 7.3 is still not
+  pointed at this path. `scripts/test-permission-coverage-contract.sh` matched the
+  wrapper by its first argument, so it failed on the new call shape and its pattern and
+  self-check fixture moved with it — 30 gated, 8 cleanup, 38 sensitive, unchanged.
+  Verified by `scripts/verify-change.sh --base HEAD`: every host target plus the
+  arm64-v8a Android compile, migo-platform 52 tests from a 51 baseline.
+
 - [ ] 0.26 Build the allocation-count gate Section 7.3 requires, then apply it.
   **Mechanism built and applied to three paths; the two paths Section 6.1 names
   remain uncovered, so this item stays open.**

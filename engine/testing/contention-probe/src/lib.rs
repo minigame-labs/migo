@@ -80,8 +80,47 @@ pub fn assert_completes_while_locked<L, T>(
 where
     T: Send + 'static,
 {
+    complete_while_held(path, || shared.write(), operation)
+}
+
+/// [`assert_completes_while_locked`] for a shared state held behind a plain `Mutex`.
+///
+/// A `Mutex` has one side, so the read/write care the `RwLock` form documents does not
+/// arise: holding it is exclusive by construction and any acquisition on the path
+/// blocks. Everything else — the other thread, the re-raised panic, the one gate at a
+/// time — is the same mechanism, which is why they share a body.
+#[track_caller]
+pub fn assert_completes_while_mutex_locked<L, T>(
+    path: PerEventPath<'_>,
+    shared: &Mutex<L>,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> T
+where
+    T: Send + 'static,
+{
+    complete_while_held(path, || shared.lock(), operation)
+}
+
+/// The mechanism both public forms share.
+///
+/// `hold` is a closure rather than an already-taken guard, and that is not stylistic:
+/// an argument would be evaluated *before* the call, taking the caller's lock ahead of
+/// `ONE_GATE_AT_A_TIME` and inverting the order against a concurrent gate. The
+/// mechanism's own `two_gates_never_overlap_and_so_cannot_blame_each_other_s_lock`
+/// caught exactly that when this body was first factored out. `G` is unbounded because
+/// all this needs of the guard is to hold it and drop it at the three points that
+/// matter.
+#[track_caller]
+fn complete_while_held<G, T>(
+    path: PerEventPath<'_>,
+    hold: impl FnOnce() -> G,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> T
+where
+    T: Send + 'static,
+{
     let _sole_gate = ONE_GATE_AT_A_TIME.lock();
-    let guard = shared.write();
+    let guard = hold();
 
     let (finished, wait) = mpsc::channel();
     let worker = thread::Builder::new()
@@ -114,7 +153,7 @@ where
             // than outliving the test still parked on the lock.
             drop(guard);
             panic!(
-                "{path}: did not complete in {patience:?} while {lock} was write-locked, \
+                "{path}: did not complete in {patience:?} while {lock} was held, \
                  so it acquires a lock shared beyond its own session. Section 7.3 requires \
                  per-event paths to resolve their handles once, at bring-up.",
                 path = path.path,

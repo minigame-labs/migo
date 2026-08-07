@@ -881,20 +881,52 @@ These are enforced by tests, not by inspection:
   correct path look blocked, which fails closed.
 
   **Covered:** the per-event input send, gated separately against the host registry
-  and the debug-stats registry, and the per-frame text cache hit against the session
-  registry. Applying it showed the input send acquiring the process-wide stats
-  registry on every event — the very path this section recorded as satisfied — and
-  the stats handle is now captured at bring-up alongside the queue and the payload
-  pools.
+  and the debug-stats registry, the per-frame text cache hit against the session
+  registry, and — the path this requirement was first written for — a gated Android
+  device call against the permission gate's live-host map. Applying it showed the
+  input send acquiring the process-wide stats registry on every event, the very path
+  this section recorded as satisfied, and the stats handle is now captured at bring-up
+  alongside the queue and the payload pools.
 
-  **No such test exists yet for the permission gate**, which is the one this
-  requirement was first written for. The first attempt was withdrawn because it was
-  provably unable to fail — the code path it exercised took the shared lock inside
-  the very helper the test called, so the test passed with and without the property.
-  Its replacement is designed around `ThreadMXBean` blocked-time and is tracked as
-  task 5.1; that half is JVM-side and the Rust probe says nothing about it. The BLE
-  notification path's Rust half is `cfg(target_os = "android")`, so a host test
-  binary never compiles it either.
+  **The permission gate was the same defect again, and "it needs a device" was the
+  wrong reason for the gap.** ~~No such test exists yet for the permission gate.~~
+  Every gated Android device call went through `permission_jni_call` to
+  `PermissionGate::run(host_id, ..)`, whose first act was `host_state(host_id)` — a
+  `Mutex<Hosts>` on a process singleton. Two sessions doing Bluetooth characteristic
+  traffic serialised on it per call. The requirement was recorded as blocked on the
+  BLE notification path being `cfg(target_os = "android")`, and that is true of the
+  *notification* path and irrelevant to the *lock*: `android_permission_gate.rs` is
+  `cfg(any(target_os = "android", test))`, so it compiles and its tests run on a host
+  binary. `a_gated_device_call_does_not_reach_the_process_wide_live_host_map` failed
+  against the pre-fix implementation at the gate's own message, timing out for the
+  full two seconds while the map was held.
+
+  The fix is the move the text cache and the input path already made: a `SessionGate`
+  resolved once when a session's device services are built, holding the
+  `Arc<HostControl>` so nothing per-event consults the map. The id-taking `run` and
+  `scope_state` are **gone** rather than left beside the handle, so the defective call
+  cannot be written. What that moved, and it needed its own test: `clear` removing the
+  live-host entry used to be enough to refuse on its own, because every call looked the
+  id up; a handle keeps the control block alive, so the `Closing` lifecycle flag is now
+  the whole of the refusal.
+  `a_handle_taken_before_teardown_is_refused_after_it` pins it, and does so with an
+  **unscoped** protected call — `close_adapter` and `stop_devices_discovery` are real
+  ones — because `clear` empties the scope map too, so a scoped call is refused for want
+  of a grant even by a `clear` that never marked the session closing. Asserted with a
+  scope, the mutant that removes the flag walked past all 52 tests.
+
+  **Not covered.** The JVM `PermissionOperationGate` is a different object with a
+  different key and remains ungated; its replacement is designed around `ThreadMXBean`
+  blocked-time and is tracked as task 5.1, and the Rust probe says nothing about it.
+  The BLE notification path's Rust half is `cfg(target_os = "android")`, so a host test
+  binary never compiles the *notification* traffic itself, and the android-only half of
+  this fix — the nine service types that now hold the handle — compiled for
+  `aarch64-linux-android` and was not run. What the contention test cannot see is a
+  regression *inside* `SessionGate::run`: the handle holds no path back to the gate, so
+  reintroducing the map lookup is a design change rather than a mutant, and the test's
+  red half is the pre-fix implementation rather than a repeatable mutant. It stands as
+  the guard against a future acquisition of anything process-wide on that path, which
+  is exactly how the input send's stats-registry defect was found.
 - **No CPU-bound work on an executor sessions share.** Each covered path requires a
   regression test that fails when a step occupies an executor another session's work
   is waiting on.

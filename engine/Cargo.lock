@@ -1763,6 +1763,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "libloading",
+ "migo-contention-probe",
  "migo-core",
  "migo-graphics",
  "migo-io",

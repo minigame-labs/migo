@@ -2165,7 +2165,6 @@ impl RendererGL {
                 client_id,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                let owner = Self::current_owner_canvas(cm);
                 unsafe {
                     match gl.create_framebuffer() {
                         Ok(fb) => {
