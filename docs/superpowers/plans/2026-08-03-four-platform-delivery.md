@@ -1946,6 +1946,142 @@ review. A commit alone is not completion evidence.
   binary against the restored tree. That is CLAUDE.md §9's WSL2 mtime trap arriving
   through a new door. Restores touch the file now.
 
+- [x] 0.50 Make frame delivery demand-driven on the engine-paced platforms.
+  Section 7.3's idle-quiescence requirement was the last of its structural
+  requirements with no mechanism at all, and auditing it found a live defect
+  rather than a missing test: **Linux, Windows and HarmonyOS woke the render
+  thread sixty times a second with nothing to draw.**
+
+  **What was wrong, and why it survived.** `RenderThread::spawn` created
+  `crossbeam_channel::tick(1/fps)` whenever the platform reported no external
+  vsync source, and the `recv(ticker)` arm drained commands, presented and touched
+  stats on every tick regardless of demand. Android escapes this because
+  `FrameClock::uses_external_vsync` is true for it, so it arms one Choreographer
+  callback at a time through `should_arm_one_shot`. The revealing detail is that
+  `should_arm_one_shot`'s own passing test asserted
+  `should_arm_one_shot(has_vsync=false, ..) == false` — "no vsync source (desktop
+  ticker) → never arm". The demand-driven policy was written, tested, and then
+  deliberately excluded from the path whose unconditional ticker *was* the clock.
+  So this was never a partially-implemented requirement; it was a requirement met
+  on the one platform that had an arm route. `LinuxPlatform` and `WindowsPlatform`
+  answer false, and HarmonyOS reaches the engine through `CapiHostKit`, which
+  answers false unless the C host installed `on_request_frame` — which the ArkTS
+  bridge does not. Three of the four delivered platforms, one battery-powered.
+
+  **The fix is one policy over two arms, not a second policy.**
+  `SoftwareFrameClock` answers when the render thread should next wake, `None`
+  meaning never, and `RenderWait` is the loop's single wait point taking that
+  answer. Design decisions and why each is load-bearing:
+
+  - **The deadline is an argument to the wait, not a timer channel.**
+    `crossbeam_channel::at(deadline)` was the obvious mechanism and is the wrong
+    one: it allocates a channel per armed frame, sixty allocations a second on the
+    very render thread tasks 0.38 through 0.41 spent four commits de-allocating.
+    `Select::ready_deadline` re-arms for free. The `Select` itself is built once
+    outside the loop for the same reason.
+  - **The pacing grid outlives the idle period.** Two `Option<Instant>`s, not one:
+    `armed_at` is the scheduled frame and `earliest_next` is the grid. Demand
+    republished two milliseconds after a frame therefore waits for that frame's
+    slot, so a rAF loop cannot spin the clock — with a single field, re-arming
+    would set the deadline to *now* and free-run. The grid advance is computed, not
+    iterated: dropping the partial interval `ran_at` sits in and adding a whole one
+    lands on the next slot, so a frame that overran by ten slots owes one frame
+    rather than ten, an on-time frame keeps its phase, and there is no
+    multiplication to overflow.
+  - **An overdue frame is served before the channels are polled.** `Select` returns
+    any ready operation without consulting the deadline, so a continuously-ready
+    command queue would starve the frame indefinitely. The converse cannot happen:
+    the frame branch drains the command queue itself and running a frame advances
+    the grid past now.
+  - **Stopping the clock is only safe because demand can reach a sleeping thread.**
+    On engine-paced platforms `request_vsync` becomes a single-slot nudge the wait
+    selects on, so `op_await_next_frame` wakes the render thread and the thread
+    then arms its own clock. The nudge carries no payload — demand is read from the
+    latch — which is what makes a full slot the right thing to drop rather than a
+    lost wakeup. The render thread is deliberately *not* handed the nudge closure:
+    a thread nudging itself is a wakeup that arms nothing, and `host.rs` passes
+    `None` there so that is a compile-time fact rather than a rule.
+
+  **One asymmetry is deliberate and recorded where it is written.**
+  `should_arm_engine_paced` omits `can_present`, which its vsync sibling requires.
+  Asking a compositor for a frame callback with no live surface is meaningless,
+  whereas an engine-paced frame with no surface still opens the per-frame upload
+  budget and drains completed uploads — the exact stall the vsync branch's own
+  comment describes, and a real risk for a C host that loads content before
+  handing over its window. Uniformity here would have been a regression dressed
+  as symmetry.
+
+  **Also cleaned up, because the ticker was scattered state.** `ticker` was a
+  `Receiver<Instant>` reassigned from four places (init, `FrameRate`, `Pause`,
+  `Resume`). Those become `set_fps`, `stop` and demand, and the four `select!`
+  arms become a `match` on a named `Wake`. `Select` readiness is advisory, so each
+  arm now distinguishes an empty receiver (spurious wakeup, wait again) from a
+  disconnected one — which the `select!` version could not express.
+
+  **Measured, and the measurement needed two sides.**
+  `scripts/measure-idle-wakeups.sh` reads the render thread's and the whole
+  process's `voluntary_ctxt_switches` while committed probe content
+  (`scripts/fixtures/idle-probe`) paints twice and then stops asking for frames:
+
+  | | render thread | whole process | frames painted |
+  | --- | --- | --- | --- |
+  | before | 59 wakeups/s | — | 2 |
+  | after | **0** | **0** (53 threads) | 2 |
+  | engine-paced arm deleted | 0 | 0 | **0** |
+
+  That third row is why the script asserts painted frames before believing the
+  silence: **an engine that never renders is also perfectly quiet.** It is the
+  always-red-gate failure mode this ledger has hit twice in tests, arriving
+  through a measurement instead — and it is also the mutation evidence for the
+  clock-to-loop wiring, which no unit test covers.
+
+  **Mutation evidence.** Seven mutants, each killed by exactly one named test at
+  that test's own assertion: the clock starting armed
+  (`an_idle_clock_schedules_no_wakeup`), a frame leaving it armed
+  (`a_frame_that_ran_leaves_the_clock_idle_until_demand_re_arms_it`), arming
+  ignoring the pacing slot
+  (`re_arming_inside_the_current_slot_cannot_raise_the_frame_rate`), a frame
+  re-phasing instead of advancing the grid
+  (`pacing_does_not_drift_when_every_frame_runs_late`), `stop()` not retiring the
+  wakeup (`stopping_cancels_the_armed_wakeup`), the arm ignoring pause
+  (`engine_paced_arm_needs_demand_and_a_running_clock`), and the wait polling
+  channels before an overdue frame
+  (`an_overdue_frame_is_served_before_a_ready_command_queue`).
+
+  **One mutant survived first, and fixing it changed the design rather than the
+  test** — which is the reading rule this ledger already records, applied to its
+  own case. With state `slot: Option<Instant>` plus `armed: bool`, mutating
+  `new()` to start armed killed nothing: `deadline()` returned `self.slot`, which
+  is `None` on a fresh clock, so the idle test passed for the wrong reason.
+  `armed && slot.is_none()` was an unreachable state that was nevertheless
+  *representable*, and a representable invalid state is what let the mutant hide.
+  Replacing the pair with `armed_at: Option<Instant>` makes "armed for no
+  particular time" unspellable, and the same mutant then dies at the assertion it
+  was aimed at. The lesson generalises: when a mutant walks, ask whether the state
+  space is too large before assuming the test is too weak.
+
+  **Verified.** `scripts/verify-change.sh --base HEAD` PASS on every host step and
+  on `android compile` for `arm64-v8a`, which it required because the change
+  touches `render_thread.rs`. Whole workspace green (migo-graphics 554 from a
+  measured 535 baseline — eleven clock tests, one arm-policy test, seven wait
+  tests; migo-shared 405, migo-core 51, migo-capi 142, migo-io 264,
+  migo-platform 50), `cargo fmt --all
+  --check` and `git diff --check` clean, and no new clippy finding in any changed
+  file (the two `warm_frames -= 1` saturating-subtraction warnings are present at
+  baseline; `frame_scheduler.rs` and `render_wait.rs` are clean).
+
+  **End-to-end, not only in units.** The headless Linux player runs the bunnymark
+  bundle at a steady **fps=60** and captures a 720x1280 presented frame, so the
+  demand-driven clock paces at the target rate rather than merely stopping.
+
+  **What this does not close.** Section 7.3's ceiling belongs in the versioned
+  threshold file, which is Phase 5's; the measurement exists on the Linux host
+  only, so Windows and HarmonyOS need the same instrument run against their own
+  hosts before their rows are real, and HarmonyOS's target build stays blocked
+  behind item 0.32. A disconnected external vsync channel would leave the wait
+  spinning — pre-existing on the Android path, unchanged here, and named because a
+  quiescence claim should not be read as covering it.
+
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
   0.19's second half, and confirmed in the source rather than inferred. A `/code`
@@ -3596,6 +3732,11 @@ review. A commit alone is not completion evidence.
   steady-state allocation, no cross-session lock on a per-event path, idle
   quiescence with a per-platform wakeup ceiling, no redundant presentation copy,
   and no steady-state growth.
+  **Idle quiescence's behavioural half closed under task 0.50** — the engine-paced
+  clock is demand-driven and measured at 0 wakeups per second at idle against 59
+  before. What stays here is the *ceiling*: a per-platform value in the versioned
+  threshold file, and the same measurement run on Windows and HarmonyOS hosts
+  rather than the Linux host alone.
   The cross-session lock requirement is **not** satisfied by the declaration
   guard added under task 0.1. That guard reflects on the session map's declared
   type, and an independent review constructed a counterexample it cannot detect:

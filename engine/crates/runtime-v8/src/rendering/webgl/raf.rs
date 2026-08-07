@@ -101,7 +101,7 @@ pub(crate) fn raf_publish_demand_and_arm(
 /// Sync op to set the preferred frame rate (1-120 fps).
 ///
 /// On Choreographer: adjusts the frame divisor (skip VSync signals).
-/// On software ticker: recreates the ticker at the new interval.
+/// Engine-paced: widens or narrows the frame clock's pacing grid.
 #[op2(fast)]
 pub(crate) fn op_set_preferred_fps(state: &mut OpState, #[smi] fps: u32) {
     let tx = state.borrow::<HostOpState>().render_tx.clone();

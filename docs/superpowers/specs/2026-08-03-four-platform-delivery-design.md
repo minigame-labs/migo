@@ -851,6 +851,71 @@ These are enforced by tests, not by inspection:
   Frame delivery is demand-driven. Measured as wakeups per second at idle,
   against a per-platform ceiling recorded in the versioned threshold file
   alongside the other baselines.
+
+  **This held on Android only, and the way it failed elsewhere is instructive.**
+  Android arms one Choreographer callback at a time through `should_arm_one_shot`,
+  whose own passing test asserted that the software path never arms — so the
+  demand-driven policy was written, tested, and then deliberately excluded from
+  the path where an unconditional `crossbeam_channel::tick(1/fps)` *was* the
+  clock. Linux, Windows and HarmonyOS all take that path, as does any C host that
+  did not install `on_request_frame`, so three of the four delivered platforms
+  woke sixty times a second with nothing to draw, one of them battery-powered.
+  The requirement was not partially met; it was met on the one platform whose
+  arm route existed.
+
+  **Fixed under task 0.50** by giving the engine-paced platforms the same policy
+  over a different arm. `SoftwareFrameClock` answers one question — when, if
+  ever, should the render thread wake for a frame — and `None` means never, so
+  idle quiescence is a property of that type rather than of the loop reading it.
+  Four decisions are load-bearing:
+
+  - **The deadline lives on the wait, not in a timer channel.**
+    `crossbeam_channel::at` would allocate a channel per armed frame — sixty
+    allocations a second on the render thread this section has just finished
+    de-allocating — while `Select::ready_deadline` takes it as an argument and
+    costs nothing to re-arm.
+  - **The pacing grid survives the idle period.** Demand republished inside a
+    frame's own slot waits for that slot, so a rAF loop cannot arm faster than
+    the frame rate; a clock that re-phased on every arm would free-run. A frame
+    that overran its slot resumes on the next grid slot rather than owing one
+    frame per slot it missed, and lateness never accumulates into drift.
+  - **An overdue frame is served before the channels are polled.** `Select`
+    returns any ready operation without consulting the deadline, so a
+    continuously-ready command queue would otherwise starve the frame
+    indefinitely. The converse cannot happen, because the frame branch drains the
+    command queue itself.
+  - **Stopping the clock is only safe because demand can still reach a sleeping
+    render thread.** On engine-paced platforms the one-shot arm becomes a
+    single-slot nudge the wait selects on, so `op_await_next_frame` publishing
+    demand wakes the thread; the nudge carries no payload because demand is read
+    from the latch, and a nudge already pending is not worth queueing twice.
+
+  One asymmetry between the two arms is deliberate: the engine-paced arm omits
+  `can_present`. Asking a compositor for a frame callback with no live surface is
+  meaningless, whereas an engine-paced frame with no surface still opens the
+  per-frame upload budget and drains completed uploads — which a host that loads
+  content before handing over its window depends on. Both arms are bounded by
+  demand either way.
+
+  **Measured rather than asserted.** `scripts/measure-idle-wakeups.sh` reads the
+  render thread's and the whole process's `voluntary_ctxt_switches` while probe
+  content that paints twice and then stops sits idle: **59 wakeups per second
+  before, 0 after**, and 0 across all 53 threads of the process. **Both halves of
+  that run are required, because an engine that never renders is also quiet** —
+  deleting the engine-paced arm scores zero wakeups *and* zero painted frames, so
+  the script fails when nothing painted rather than reporting silence as success.
+  This is the same shape as the always-red gate this document warns about
+  elsewhere, arriving through a measurement instead of a test.
+
+  **Not covered, named rather than implied.** The per-platform ceiling in the
+  versioned threshold file is Phase 5's, and this measurement exists on the Linux
+  host only — Windows and HarmonyOS need the same instrument run against their own
+  hosts before their rows are real. Android's route is unchanged and unmeasured
+  here. The audio thread's fifty-millisecond low-power window remains a deliberate
+  warm standby that ends in an indefinite wait three seconds after silence, so it
+  is bounded rather than a polling loop. And a *disconnected* external vsync
+  channel would leave the wait spinning, which is pre-existing on the Android path
+  and unchanged by this work.
 - **No redundant presentation copy.** The path from the rendered surface to the
   platform surface performs no additional full-frame copy. The path is documented
   per platform — Android Surface, X11 and Wayland EGL, ANGLE, and

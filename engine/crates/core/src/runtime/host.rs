@@ -336,7 +336,7 @@ impl Host {
         // ---- VSync channel (Choreographer JNI → render thread) ----
         // Only platforms that actually publish external timestamps get this
         // receiver. Passing a never-fed `Some(receiver)` on desktop would make
-        // RenderThread disable its software ticker and freeze the frame loop.
+        // RenderThread wait for frame timestamps nobody sends, freezing the loop.
         let uses_external_vsync = platform.uses_external_vsync();
         let mut startup_guard = HostStartupGuard::new(id);
         let vsync_rx = if uses_external_vsync {
@@ -395,15 +395,32 @@ impl Host {
             }))
         };
 
-        // R1: one-shot vsync arm. Routes to `platform.request_vsync(id)` (a
-        // no-op by default; Android posts a single Choreographer frame callback
-        // via JNI). The closure keeps `graphics` decoupled from `platform` — the
+        // R1: one-shot frame arm, one route per platform.
+        //
+        // With an external vsync source this routes to `platform.request_vsync(id)`
+        // (Android posts a single Choreographer frame callback via JNI). Without
+        // one the engine paces frames itself and its clock stops whenever nothing
+        // is animating, so the arm has to wake the render thread instead: a
+        // demand nudge it selects on. The payload is the wakeup — demand itself is
+        // read from the latch — so a nudge already pending is not worth queueing
+        // twice, which is what the single slot and `try_send` express.
+        //
+        // Either way the closure keeps `graphics` decoupled from `platform`: the
         // render thread and `op_await_next_frame` only invoke `Arc<dyn Fn()>`.
-        let request_vsync: Option<Arc<dyn Fn() + Send + Sync>> = if uses_external_vsync {
+        let (frame_demand_rx, request_vsync): (
+            Option<crossbeam_channel::Receiver<()>>,
+            Option<Arc<dyn Fn() + Send + Sync>>,
+        ) = if uses_external_vsync {
             let platform = platform.clone();
-            Some(Arc::new(move || platform.request_vsync(id)))
+            (None, Some(Arc::new(move || platform.request_vsync(id))))
         } else {
-            None
+            let (nudge_tx, nudge_rx) = crossbeam_channel::bounded::<()>(1);
+            (
+                Some(nudge_rx),
+                Some(Arc::new(move || {
+                    let _ = nudge_tx.try_send(());
+                })),
+            )
         };
         let report_surface_loss: Arc<
             dyn Fn(shared::surface::PublicSurfaceGeneration, shared::surface::SurfaceLossReason)
@@ -419,6 +436,7 @@ impl Host {
         let mut render = RenderService::new(
             raf_tx,
             vsync_rx,
+            frame_demand_rx,
             id,
             surface,
             graphics_platform,
@@ -429,7 +447,10 @@ impl Host {
             context_lost.clone(),
             render_wake,
             raf_demand.clone(),
-            request_vsync.clone(),
+            // The render thread's own arm route is its clock when the engine paces
+            // frames, so it is deliberately not handed the nudge: a thread nudging
+            // itself is a wakeup that arms nothing.
+            uses_external_vsync.then(|| request_vsync.clone()).flatten(),
             surface_control,
             report_surface_loss,
         )?;

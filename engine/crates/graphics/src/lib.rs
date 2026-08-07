@@ -83,6 +83,7 @@ mod render_frame_state;
 pub(crate) mod render_loop;
 mod render_server;
 mod render_thread;
+mod render_wait;
 mod renderergl;
 pub(crate) mod shader_cache;
 mod surface_binding;
