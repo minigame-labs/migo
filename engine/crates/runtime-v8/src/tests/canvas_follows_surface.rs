@@ -29,7 +29,6 @@ mod canvas_follows_surface_tests {
         protocol::render_cmd::{CanvasCmd, RenderCommand},
         render_command_sender::CommandSender,
     };
-    use tokio::sync::mpsc;
 
     /// The size the stand-in render thread reports for the onscreen canvas.
     ///
@@ -89,7 +88,6 @@ mod canvas_follows_surface_tests {
     }
 
     fn test_host_state(render_tx: CommandSender) -> HostOpState {
-        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         HostOpState {
@@ -102,7 +100,7 @@ mod canvas_follows_surface_tests {
             mount_table: None,
             render_tx,
             text_measurer: None,
-            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
             host_tx,
             // No window-info service, exactly like a C-ABI host that supplies
             // none: the canvas must still follow the surface.

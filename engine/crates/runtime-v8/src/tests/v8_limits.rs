@@ -205,14 +205,12 @@ mod host_watchdog_tests {
         op_state::{AudioSender, HostOpState, NetworkPolicy},
         render_command_sender::CommandSender,
     };
-    use tokio::sync::mpsc;
 
     use crate::watchdog::DeadlineWatchdogConfig;
     use crate::{HostJsRuntime, V8LimitsConfig};
 
     fn test_host_state(files_dir: PathBuf, cache_dir: PathBuf) -> HostOpState {
         let (render_tx, _render_rx) = CommandSender::new();
-        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         HostOpState {
@@ -225,7 +223,7 @@ mod host_watchdog_tests {
             mount_table: None,
             render_tx,
             text_measurer: None,
-            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
             host_tx,
             device_services: None,
             raf_rx: None,

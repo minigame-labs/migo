@@ -352,11 +352,12 @@ async fn op_worker_create(
 
         // Create dummy channels for services the worker does not use
         let (render_tx, _render_rx) = shared::render_command_sender::CommandSender::new();
-        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         // Workers don't send audio commands in practice, but the type
         // system requires an AudioSender.  Use a no-op ThreadWakeup.
-        let audio_tx =
-            shared::op_state::AudioSender::new(audio_raw_tx, shared::channel::ThreadWakeup::new());
+        let audio_tx = shared::op_state::AudioSender::new(
+            shared::audio_channel::disconnected(),
+            shared::channel::ThreadWakeup::new(),
+        );
 
         let worker_state = HostOpState {
             id: host.id,
@@ -1252,7 +1253,6 @@ mod timer_lifecycle_tests {
     };
     fn test_host_state(timer_backgrounded: Arc<AtomicBool>) -> HostOpState {
         let (render_tx, _render_rx) = CommandSender::new();
-        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         HostOpState {
@@ -1265,7 +1265,7 @@ mod timer_lifecycle_tests {
             mount_table: None,
             render_tx,
             text_measurer: None,
-            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
             host_tx,
             device_services: None,
             raf_rx: None,
@@ -1616,7 +1616,6 @@ mod watchdog_worker_tests {
 
     fn wt_host_state() -> HostOpState {
         let (render_tx, _render_rx) = CommandSender::new();
-        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
         HostOpState {
             id: 1,
@@ -1628,7 +1627,7 @@ mod watchdog_worker_tests {
             mount_table: None,
             render_tx,
             text_measurer: None,
-            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
             host_tx,
             device_services: None,
             raf_rx: None,
