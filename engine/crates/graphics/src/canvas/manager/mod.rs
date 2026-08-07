@@ -2742,17 +2742,29 @@ impl CanvasManager {
                 db.width == e.physical_width && db.height == e.physical_height
             })
         });
+        let canvas_count = self.canvases.len();
+        let onscreen_has_2d_context = self.contexts_2d.contains_key(&onscreen_id);
+        let needs_default_fbo_readback = self.needs_default_fbo_readback;
         let can_bypass = can_bypass_drawing_buffer(
-            self.canvases.len(),
-            self.needs_default_fbo_readback,
-            self.contexts_2d.contains_key(&onscreen_id),
+            canvas_count,
+            needs_default_fbo_readback,
+            onscreen_has_2d_context,
             onscreen_db_matches_surface,
         );
 
         let mut mode_changed = false;
         if let Some(entry) = self.canvases.get_mut(&onscreen_id) {
             if entry.bypass_drawing_buffer != can_bypass {
+                // The four inputs travel with the verdict: a presented frame
+                // either copies or it does not, and "why not" is otherwise only
+                // recoverable by re-deriving them from a log that does not carry
+                // them. This is the instrument Section 7.3's "asserted where the
+                // platform allows observation" needs on a host with no device.
                 tracing::info!(
+                    canvas_count,
+                    needs_default_fbo_readback,
+                    onscreen_has_2d_context,
+                    onscreen_db_matches_surface,
                     "DrawingBuffer bypass: {} → {}",
                     entry.bypass_drawing_buffer,
                     can_bypass,
@@ -5395,6 +5407,35 @@ impl Drop for CanvasManager {
 ///
 /// Extracted as a pure fn so the conditions are unit-testable without a live GL
 /// context.
+/// Whether the onscreen canvas may render straight to the window and skip the
+/// per-frame DrawingBuffer→surface blit.
+///
+/// **Why a single canvas is required, which was the one condition here with no
+/// reason recorded.** Bypass makes `get_drawing_buffer_fbo` return `None`, so the
+/// onscreen canvas's default framebuffer is *real* FBO 0 — and real FBO 0 is
+/// whichever EGL draw surface is current. Offscreen canvases are
+/// [`SurfaceKind::Pbuffer`], each with a surface of its own, and
+/// `make_current_needed` switches between them batch by batch: with more than one
+/// canvas "FBO 0" therefore stops naming the window, and an onscreen draw issued
+/// while a pbuffer is current would land in the pbuffer. The DrawingBuffer removes
+/// the ambiguity because its FBO is a name in the shared context and does not move
+/// when the surface does.
+///
+/// **The consequence is measured, not hypothetical.** A single offscreen canvas
+/// anywhere in the scene disables bypass for the whole run, and that is the
+/// ordinary case rather than the exotic one: the bunnymark bundle is pure WebGL on
+/// its onscreen canvas, never reads it back, and matches the surface exactly — and
+/// it still presents its entire 60 fps steady state through the blit, because
+/// `canvas_count` is 2. At its 720×1280 that is about 3.7 MB read and 3.7 MB
+/// written per frame, some 440 MB/s of bandwidth, for a copy whose only purpose is
+/// to keep FBO 0 unambiguous.
+///
+/// So Section 7.3's "no redundant presentation copy" is **not** met for ordinary
+/// content, and the reason is this ambiguity rather than a missing optimisation.
+/// Whether the condition can be sharpened — the render path already makes a
+/// canvas current before every batch, so FBO 0 is the window whenever onscreen
+/// drawing runs — is its own task, because the premise is an invariant over every
+/// path that touches FBO 0 and the verdict needs a device.
 fn can_bypass_drawing_buffer(
     canvas_count: usize,
     needs_default_fbo_readback: bool,
@@ -5881,11 +5922,26 @@ mod tests {
         assert!(!can_bypass_drawing_buffer(1, false, false, false));
     }
 
+    /// Bypass binds *real* FBO 0, which is whichever EGL draw surface is current.
+    /// An offscreen canvas is a pbuffer with a surface of its own, and the render
+    /// path switches surfaces batch by batch — so with a second canvas in
+    /// existence "FBO 0" no longer names the window and an onscreen draw could
+    /// land in a pbuffer.
+    ///
+    /// **Split from the readback case deliberately.** The two were one test, so
+    /// deleting either condition failed it and neither was individually pinned —
+    /// the aggregate-assertion shape this plan warns about. One test per condition
+    /// means a mutant names the guard it broke.
     #[test]
-    fn bypass_off_for_multi_canvas_or_readback() {
-        // More than one canvas (offscreen canvases exist) → never bypass.
+    fn an_offscreen_canvas_disables_bypass_because_fbo_zero_stops_naming_the_window() {
         assert!(!can_bypass_drawing_buffer(2, false, false, true));
-        // Default-FBO readback latched (content must be preserved) → never bypass.
+    }
+
+    /// A latched default-FBO readback means content has to survive
+    /// `eglSwapBuffers`, and under bypass the window's back buffer is undefined
+    /// afterwards per the EGL spec. Only the DrawingBuffer preserves it.
+    #[test]
+    fn a_latched_default_fbo_readback_disables_bypass() {
         assert!(!can_bypass_drawing_buffer(1, true, false, true));
     }
 
