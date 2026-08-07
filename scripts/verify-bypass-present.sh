@@ -137,6 +137,28 @@ run_probe rtt-boundary-probe false
 # "optimisation" that moved uploads onto the render thread to avoid a context switch
 # would silently reintroduce the defect 0.60 fixed on the framebuffer binding.
 run_probe upload-shadow-probe false
+# Two canvases, both drawn to, so the frame really does switch EGL contexts — twice
+# per frame, and it *ends* on the offscreen pbuffer so presentation has to bring the
+# window back unaided. bypass-probe and blit-probe differ by whether a second canvas
+# exists and neither ever draws to one, so until now nothing here switched contexts
+# inside a frame at all. Its offscreen clear is red: an empty capture means the
+# onscreen clear went somewhere that is not the window, and a red one means an
+# offscreen draw arrived there.
+run_probe bypass-multi-probe false
+# The end-to-end guard over the rewritten GL-object deletion path. An offscreen canvas
+# frees a pool of framebuffers while the onscreen canvas keeps a render target of its
+# own, which is the shape that used to issue those frees against the onscreen
+# context's namespace.
+#
+# What it cannot see, stated because it bounds the claim: on this host the wrong-context
+# delete is invisible. Mesa numbers container objects from one counter for the whole
+# share group, so an offscreen framebuffer never holds a name the onscreen context has
+# live, and the only consequence here is the leak — the object is not freed and its
+# bookkeeping is already gone. A driver that numbers per context, which is what mobile
+# GPUs do, collides an offscreen canvas's first framebuffer with the onscreen
+# DrawingBuffer. The classification itself is gated by the unit tests in
+# `canvas/manager/gl_object.rs`; this probe gates the eleven rewritten call sites.
+run_probe fbo-owner-probe false
 echo
 
 if [[ "$failures" -gt 0 ]]; then

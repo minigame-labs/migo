@@ -74,6 +74,7 @@ use std::{
 mod context_2d_impl;
 pub(crate) mod drawing_buffer;
 mod egl_ops;
+pub(crate) mod gl_object;
 mod image;
 mod pbo_upload;
 mod types;
@@ -2812,6 +2813,35 @@ impl CanvasManager {
         }
     }
 
+    /// Delete one GL object, from the context that owns it when its kind has one.
+    ///
+    /// The pairing is the point. `glDelete*` for a container object — a framebuffer,
+    /// vertex array, query or transform feedback — issued from another context of the
+    /// share group either frees that context's object of the same name or silently
+    /// frees nothing, and this decision used to be taken independently at each of the
+    /// eleven delete sites. See [`gl_object`] for the sharing rule and for what the
+    /// two sites that took it wrongly actually did.
+    ///
+    /// A missing owner canvas is not a reason to delete from somewhere else: a
+    /// container object cannot outlive the context that holds it, so if the canvas is
+    /// gone the object already is. That replaces a fallback which deleted from
+    /// whatever context happened to be current.
+    pub(crate) fn delete_gl_object(&mut self, object: gl_object::GlObject) -> EngineResult<()> {
+        match object.owning_context() {
+            Some(owner) => {
+                if !self.canvases.contains_key(&owner) {
+                    return Ok(());
+                }
+                self.make_current_needed(owner)?;
+            }
+            None => {
+                self.ensure_any_canvas_current()?;
+            }
+        }
+        object.delete(&self.gl);
+        Ok(())
+    }
+
     pub(crate) fn make_current_needed(&mut self, id: CanvasId) -> EngineResult<()> {
         if self.bound == BoundContext::Canvas(id) {
             return Ok(());
@@ -5450,16 +5480,35 @@ impl Drop for CanvasManager {
 /// Whether the onscreen canvas may render straight to the window and skip the
 /// per-frame DrawingBuffer→surface blit.
 ///
-/// **Why a single canvas is required, which was the one condition here with no
-/// reason recorded.** Bypass makes `get_drawing_buffer_fbo` return `None`, so the
-/// onscreen canvas's default framebuffer is *real* FBO 0 — and real FBO 0 is
-/// whichever EGL draw surface is current. Offscreen canvases are
-/// [`SurfaceKind::Pbuffer`], each with a surface of its own, and
-/// `make_current_needed` switches between them batch by batch: with more than one
-/// canvas "FBO 0" therefore stops naming the window, and an onscreen draw issued
-/// while a pbuffer is current would land in the pbuffer. The DrawingBuffer removes
-/// the ambiguity because its FBO is a name in the shared context and does not move
-/// when the surface does.
+/// **Why a single canvas is required — and the reason recorded here was wrong.**
+/// The argument used to be that bypass makes `get_drawing_buffer_fbo` return `None`,
+/// so the onscreen canvas's default framebuffer is *real* FBO 0; that real FBO 0 is
+/// whichever EGL draw surface is current; and that since offscreen canvases are
+/// [`SurfaceKind::Pbuffer`] with surfaces of their own, "FBO 0" stops naming the
+/// window as soon as a second canvas exists.
+///
+/// The middle step does not hold, because FBO 0 follows the current *surface of the
+/// current context* and every canvas here owns a context of its own. `create_onscreen`
+/// calls `eglCreateContext` and `register_offscreen` calls `create_pbuffer_context`,
+/// each sharing only the resource context's *objects*, and
+/// [`Self::make_current_needed`] takes the context and the surface from one
+/// [`EglContextHandle`]. So a pbuffer is only ever current *with its own canvas's
+/// context*, in which the onscreen canvas cannot be drawn at all — and inside the
+/// onscreen context real FBO 0 is the window however many canvases exist.
+///
+/// What both modes really require is the same: a command that draws to a canvas runs
+/// with that canvas current. `handle_command` establishes that per command. Bypass
+/// does not weaken it; it changes what going wrong looks like, from a framebuffer name
+/// that means nothing in the current context to a silently wrong surface.
+///
+/// So this condition is not a correctness condition. It makes a *shared* precondition
+/// vacuous by leaving no other context to be current, and the cost of that is paid by
+/// every real bundle. Measured on the Linux host: two live canvases, drawn to in both
+/// orders, with the frame deliberately ending on the pbuffer, present the onscreen
+/// clear and nothing else — `scripts/fixtures/bypass-multi-probe`, 240 frames, one
+/// distinct colour. It is still not widened here, because bypass has never run in
+/// steady state on any device (this condition is why), and Android, Windows and
+/// HarmonyOS presentation is unmeasured — see ledger 0.57 and 0.65.
 ///
 /// **The consequence is measured, not hypothetical.** A single offscreen canvas
 /// anywhere in the scene disables bypass for the whole run, and that is the
@@ -5471,11 +5520,7 @@ impl Drop for CanvasManager {
 /// to keep FBO 0 unambiguous.
 ///
 /// So Section 7.3's "no redundant presentation copy" is **not** met for ordinary
-/// content, and the reason is this ambiguity rather than a missing optimisation.
-/// Whether the condition can be sharpened — the render path already makes a
-/// canvas current before every batch, so FBO 0 is the window whenever onscreen
-/// drawing runs — is its own task, because the premise is an invariant over every
-/// path that touches FBO 0 and the verdict needs a device.
+/// content, and the reason is this condition rather than a missing optimisation.
 fn can_bypass_drawing_buffer(
     canvas_count: usize,
     needs_default_fbo_readback: bool,
@@ -6079,18 +6124,25 @@ mod tests {
         assert!(!can_bypass_drawing_buffer(1, false, false, false));
     }
 
-    /// Bypass binds *real* FBO 0, which is whichever EGL draw surface is current.
-    /// An offscreen canvas is a pbuffer with a surface of its own, and the render
-    /// path switches surfaces batch by batch — so with a second canvas in
-    /// existence "FBO 0" no longer names the window and an onscreen draw could
-    /// land in a pbuffer.
+    /// A second canvas keeps the onscreen canvas on the DrawingBuffer blit.
+    ///
+    /// **The name this test used to carry asserted a reason that is false**, and it is
+    /// worth recording rather than quietly correcting: it said FBO 0 stops naming the
+    /// window once a pbuffer exists. FBO 0 follows the current surface *of the current
+    /// context*, and every canvas here owns its own context paired with its own
+    /// surface, so a pbuffer is only ever current with the canvas that owns it. See
+    /// [`can_bypass_drawing_buffer`] for the whole argument and for what the condition
+    /// is actually doing.
+    ///
+    /// So what this pins is that the condition is still in force — which is deliberate
+    /// while bypass has never run in steady state on any device — and not why.
     ///
     /// **Split from the readback case deliberately.** The two were one test, so
     /// deleting either condition failed it and neither was individually pinned —
     /// the aggregate-assertion shape this plan warns about. One test per condition
     /// means a mutant names the guard it broke.
     #[test]
-    fn an_offscreen_canvas_disables_bypass_because_fbo_zero_stops_naming_the_window() {
+    fn a_second_canvas_keeps_the_onscreen_canvas_on_the_drawing_buffer() {
         assert!(!can_bypass_drawing_buffer(2, false, false, true));
     }
 

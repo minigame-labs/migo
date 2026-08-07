@@ -11,6 +11,7 @@ use crate::CanvasGLState;
 use crate::CanvasManager;
 use crate::ScissorState;
 use crate::backend::gl::state_tracker as st;
+use crate::canvas::gl_object::GlObject;
 use crate::damage_effect::DamageEffect;
 
 #[inline]
@@ -739,7 +740,6 @@ impl RendererGL {
             }
 
             GLCmd::DeleteProgram { program_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
                 if let Some(mut meta) = cm.programs.remove(&program_id) {
                     // Invalidate dedup state: if this program was current, clear it
                     // so the next UseProgram with the same ID isn't skipped.
@@ -752,7 +752,7 @@ impl RendererGL {
                     }
                     meta.deleted = true;
                     if let Some(ph) = meta.gl_handle {
-                        unsafe { gl.delete_program(ph) };
+                        cm.delete_gl_object(GlObject::Program(ph))?;
                     }
                 }
                 Ok(DamageEffect::NoDamage)
@@ -991,11 +991,10 @@ impl RendererGL {
             }
 
             GLCmd::DeleteShader { shader_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
                 if let Some(mut meta) = cm.shaders.remove(&shader_id) {
                     meta.deleted = true;
                     if let Some(sh) = meta.gl_handle {
-                        unsafe { gl.delete_shader(sh) };
+                        cm.delete_gl_object(GlObject::Shader(sh))?;
                     }
                 }
                 Ok(DamageEffect::NoDamage)
@@ -1194,7 +1193,6 @@ impl RendererGL {
             }
 
             GLCmd::DeleteTexture { texture_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
                 if let Some(meta) = cm.textures.remove(&texture_id) {
                     // Invalidate dedup state: per GL spec, deleting a texture
                     // implicitly unbinds it from all units.  Clear matching
@@ -1206,7 +1204,7 @@ impl RendererGL {
                             .retain(|_, tid| *tid != Some(texture_id));
                     }
                     if let Some(h) = meta.gl_handle {
-                        unsafe { gl.delete_texture(h) };
+                        cm.delete_gl_object(GlObject::Texture(h))?;
                     }
                 }
                 Ok(DamageEffect::NoDamage)
@@ -2175,7 +2173,7 @@ impl RendererGL {
                                 client_id,
                                 crate::canvas::FramebufferMeta {
                                     gl_handle: Some(fb),
-                                    owner_canvas: owner,
+                                    owner: canvas_id,
                                     deleted: false,
                                 },
                             );
@@ -2189,11 +2187,13 @@ impl RendererGL {
             }
 
             GLCmd::DeleteFramebuffer { framebuffer_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
-                if let Some(meta) = cm.framebuffers.remove(&framebuffer_id) {
-                    if let Some(h) = meta.gl_handle {
-                        unsafe { gl.delete_framebuffer(h) };
-                    }
+                let object = cm
+                    .framebuffers
+                    .get_mut(&framebuffer_id)
+                    .and_then(|meta| meta.take_for_delete());
+                cm.framebuffers.remove(&framebuffer_id);
+                if let Some(object) = object {
+                    cm.delete_gl_object(object)?;
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -2362,20 +2362,18 @@ impl RendererGL {
             }
 
             GLCmd::DeleteRenderbuffer { renderbuffer_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
                 if let Some(meta) = cm.renderbuffers.remove(&renderbuffer_id) {
                     if let Some(h) = meta.gl_handle {
-                        unsafe { gl.delete_renderbuffer(h) };
+                        cm.delete_gl_object(GlObject::Renderbuffer(h))?;
                     }
                 }
                 Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DeleteBuffer { buffer_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
                 if let Some(meta) = cm.buffers.remove(&buffer_id) {
                     if let Some(h) = meta.gl_handle {
-                        unsafe { gl.delete_buffer(h) };
+                        cm.delete_gl_object(GlObject::Buffer(h))?;
                     }
                 }
                 Ok(DamageEffect::NoDamage)
@@ -2513,18 +2511,19 @@ impl RendererGL {
                     client_id,
                     crate::canvas::VaoMeta {
                         gl_handle: handle,
-                        owner_canvas: Some(canvas_id),
+                        owner: canvas_id,
                         deleted: false,
                     },
                 );
                 Ok(DamageEffect::NoDamage)
             }
             GLCmd::DeleteVertexArray { vao } => {
-                if let Some(meta) = cm.vaos.get_mut(&vao) {
-                    if let Some(h) = meta.gl_handle.take() {
-                        unsafe { gl.delete_vertex_array(h) };
-                    }
-                    meta.deleted = true;
+                let object = cm
+                    .vaos
+                    .get_mut(&vao)
+                    .and_then(|meta| meta.take_for_delete());
+                if let Some(object) = object {
+                    cm.delete_gl_object(object)?;
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -2732,11 +2731,12 @@ impl RendererGL {
                 Ok(DamageEffect::NoDamage)
             }
             GLCmd::DeleteSampler { sampler } => {
-                if let Some(meta) = cm.samplers.get_mut(&sampler) {
-                    if let Some(h) = meta.gl_handle.take() {
-                        unsafe { gl.delete_sampler(h) };
-                    }
+                let handle = cm.samplers.get_mut(&sampler).and_then(|meta| {
                     meta.deleted = true;
+                    meta.gl_handle.take()
+                });
+                if let Some(h) = handle {
+                    cm.delete_gl_object(GlObject::Sampler(h))?;
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -2792,11 +2792,12 @@ impl RendererGL {
                 Ok(DamageEffect::NoDamage)
             }
             GLCmd::DeleteSync { sync } => {
-                if let Some(meta) = cm.syncs.get_mut(&sync) {
-                    if let Some(h) = meta.gl_handle.take() {
-                        unsafe { gl.delete_sync(h) };
-                    }
+                let handle = cm.syncs.get_mut(&sync).and_then(|meta| {
                     meta.deleted = true;
+                    meta.gl_handle.take()
+                });
+                if let Some(h) = handle {
+                    cm.delete_gl_object(GlObject::Sync(h))?;
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -2857,7 +2858,7 @@ impl RendererGL {
                     client_id,
                     crate::canvas::QueryMeta {
                         gl_handle: handle,
-                        owner_canvas: Some(canvas_id),
+                        owner: canvas_id,
                         deleted: false,
                     },
                 );
@@ -2869,16 +2870,12 @@ impl RendererGL {
                 // delete with a fresh mutable borrow.  We can't hold
                 // a `get_mut` reference across the `make_current_needed`
                 // call because that also takes `&mut cm`.
-                let owner = cm.queries.get(&query).and_then(|m| m.owner_canvas);
-                let handle = cm.queries.get_mut(&query).and_then(|m| m.gl_handle.take());
-                if let (Some(owner), Some(h)) = (owner, handle) {
-                    cm.make_current_needed(owner)?;
-                    unsafe { gl.delete_query(h) };
-                } else if let Some(h) = handle {
-                    unsafe { gl.delete_query(h) };
-                }
-                if let Some(meta) = cm.queries.get_mut(&query) {
-                    meta.deleted = true;
+                let object = cm
+                    .queries
+                    .get_mut(&query)
+                    .and_then(|meta| meta.take_for_delete());
+                if let Some(object) = object {
+                    cm.delete_gl_object(object)?;
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -2902,9 +2899,7 @@ impl RendererGL {
             GLCmd::GetQueryParameter { query, pname, resp } => {
                 let meta = cm.queries.get(&query).cloned();
                 let result: u32 = if let Some(meta) = meta {
-                    if let Some(owner) = meta.owner_canvas {
-                        cm.make_current_needed(owner)?;
-                    }
+                    cm.make_current_needed(meta.owner)?;
                     match meta.gl_handle {
                         Some(h) => unsafe { gl.get_query_parameter_u32(h, pname) },
                         None => 0,
@@ -2927,26 +2922,19 @@ impl RendererGL {
                     client_id,
                     crate::canvas::TransformFeedbackMeta {
                         gl_handle: handle,
-                        owner_canvas: Some(canvas_id),
+                        owner: canvas_id,
                         deleted: false,
                     },
                 );
                 Ok(DamageEffect::NoDamage)
             }
             GLCmd::DeleteTransformFeedback { tf } => {
-                let owner = cm.transform_feedbacks.get(&tf).and_then(|m| m.owner_canvas);
-                let handle = cm
+                let object = cm
                     .transform_feedbacks
                     .get_mut(&tf)
-                    .and_then(|m| m.gl_handle.take());
-                if let (Some(owner), Some(h)) = (owner, handle) {
-                    cm.make_current_needed(owner)?;
-                    unsafe { gl.delete_transform_feedback(h) };
-                } else if let Some(h) = handle {
-                    unsafe { gl.delete_transform_feedback(h) };
-                }
-                if let Some(meta) = cm.transform_feedbacks.get_mut(&tf) {
-                    meta.deleted = true;
+                    .and_then(|meta| meta.take_for_delete());
+                if let Some(object) = object {
+                    cm.delete_gl_object(object)?;
                 }
                 Ok(DamageEffect::NoDamage)
             }

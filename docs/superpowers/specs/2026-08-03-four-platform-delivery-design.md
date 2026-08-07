@@ -1056,13 +1056,43 @@ These are enforced by tests, not by inspection:
 
   **The condition is sound, which is why it cannot simply be deleted.** Bypass
   makes the onscreen default framebuffer *real* FBO 0, and real FBO 0 is whichever
-  EGL draw surface is current; offscreen canvases are pbuffers with surfaces of
-  their own, and the render path switches between them batch by batch. With a
-  second canvas in existence, "FBO 0" stops naming the window. The `DrawingBuffer`
-  removes the ambiguity because its FBO is a name in the shared context and does
-  not move when the surface does. That reasoning was absent from the code until
-  now: three of the four conditions carried a paragraph each and this one carried
-  the assertion "bypass is safe when there is exactly one canvas" with no argument.
+  EGL draw surface is current. ~~offscreen canvases are pbuffers with surfaces of
+  their own, and the render path switches between them batch by batch, so with a
+  second canvas in existence "FBO 0" stops naming the window.~~ **That second step
+  is false, and the enumeration this requirement asked for is what found it.** FBO 0
+  follows the current surface *of the current context*, and every canvas owns a
+  context of its own: `create_onscreen` calls `eglCreateContext` and
+  `register_offscreen` calls `create_pbuffer_context`, each sharing only the resource
+  context's objects, and `make_current_needed` takes the context and the surface from
+  one `EglContextHandle`. A pbuffer is therefore only ever current *with its own
+  canvas's context*, in which the onscreen canvas cannot be drawn at all, and inside
+  the onscreen context real FBO 0 is the window however many canvases exist. Nor is
+  the DrawingBuffer's FBO "a name in the shared context": framebuffers are container
+  objects and share groups do not share them, so that name is local to the onscreen
+  context too.
+
+  **What the condition actually does**, stated because "sound" was doing a lot of
+  work here: both modes require the same thing — a command that draws to a canvas
+  runs with that canvas current, which `handle_command` establishes per command — and
+  `canvas_count == 1` makes that precondition *vacuous* by leaving no other context
+  to be current. It is not a correctness condition; it is a way of not needing one,
+  and every real bundle pays 440 MB/s for it.
+
+  **Measured with two live canvases, which nothing here had done.** `bypass-probe`
+  and `blit-probe` differ by whether a second canvas *exists* and neither ever draws
+  to one, so no probe had ever switched EGL contexts inside a frame — the very thing
+  the recorded reason was about. `scripts/fixtures/bypass-multi-probe` draws to both,
+  twice per frame, and ends the frame on the offscreen pbuffer so presentation has to
+  bring the window back unaided. On the blit path it presents the onscreen colour;
+  with the condition temporarily widened it presents the onscreen colour on the
+  bypass path too — 240 frames, one distinct colour, first frame in a different
+  colour, and the offscreen canvas's red nowhere on the surface.
+
+  **It is still not widened, and the reason is not this argument.** Bypass has never
+  run in steady state on any device, because this condition is what kept content off
+  it; widening it would enable, for every bundle on four platforms, a path whose only
+  end-to-end evidence is a Linux software rasteriser. Android, Windows and HarmonyOS
+  presentation remain unmeasured — see ledger 0.57 and 0.65.
 
   **The bypass path presented nothing, and the condition is why nobody knew.**
   Sharpening `canvas_count == 1` needed the invariant "the onscreen surface is
@@ -1117,12 +1147,76 @@ These are enforced by tests, not by inspection:
   **Still not covered, named rather than implied.** The blit's *cost* remains
   unmet for ordinary content: this fixes the bypass path, it does not widen the
   condition that keeps ordinary content off it, and that widening still needs a
-  device run per platform (ledger 0.57). Of the sites that re-point the binding,
-  only the mode-change one is covered end to end, because a single-canvas fixture
-  never switches contexts; the other two are covered at the shared resolver.
+  device run per platform (ledger 0.57, 0.65). Of the sites that re-point the
+  binding, only the mode-change one is covered end to end at a single canvas; with
+  two live canvases `bypass-multi-probe` now switches contexts inside the frame, but
+  it does so on the blit path, so the bypass half of `make_current_needed` and of the
+  surface-recreate reuse is still covered only at the shared resolver.
   Neither `frame_capture`'s unrestored `READ_FRAMEBUFFER` nor the dedup shadow's
   disagreement with a driver binding clobbered behind the content's back is
   addressed here — see ledger 0.60.
+
+- **A GL object is deleted from a context in which its name means that object.**
+  ES 3.0 Appendix C.1 shares buffer, program, shader, renderbuffer, sampler, sync
+  and texture objects across an EGL share group, and does not share the container
+  objects: framebuffers, vertex arrays, queries and transform feedbacks. Each
+  context of the group has its own namespace for those, so the same small integer
+  names a different object in each.
+
+  **This was violated for framebuffers and vertex arrays, and the knowledge to get
+  it right was already written down beside the code that ignored it.** The decision
+  was taken independently at each of eleven delete sites, in four different ways:
+  six bound *any* canvas through `ensure_any_canvas_current`, three bound nothing at
+  all and used whatever was current, and only queries and transform feedbacks
+  consulted the owner — behind a fallback that deleted from the current context when
+  they could not. `VaoMeta`'s own doc comment said "VAOs are not shared in the EGL
+  share-group model WebGL uses" while `DeleteVertexArray` deleted from whatever
+  context the previous command had left current, and `FramebufferMeta.owner_canvas`
+  and `VaoMeta.owner_canvas` were both recorded and both `#[allow(dead_code)]`.
+  `SyncMeta`'s comment had the opposite error, claiming sync objects are *not*
+  shared when Appendix C.1 says they are.
+
+  **What that costs, and which half of it a driver decides.** The leak is certain on
+  every driver: the name does not exist in the context the call was issued in,
+  `glDelete*` ignores unknown names, and the bookkeeping has already been discarded,
+  so nothing can ever free the object. The other half is a driver's choice of
+  numbering. Measured on the Linux host with an instrumented build: the onscreen
+  DrawingBuffer is framebuffer 1, the onscreen canvas's own render target is 2, and
+  an offscreen canvas's pool comes back 3..10 — Mesa numbers container objects from
+  one counter for the whole share group, so a collision cannot happen there. A
+  driver that numbers per context, which is what mobile GPUs do, gives an offscreen
+  canvas's first framebuffer the name 1, and an offscreen `deleteFramebuffer`
+  dispatched while the onscreen canvas is current then destroys the **DrawingBuffer**
+  — after which the onscreen canvas renders into a deleted object and presents
+  nothing, which is the same outcome ledger 0.57 spent a task on.
+
+  **Fixed by making the decision unspellable rather than repeated.** A `GlObject`
+  carries a kind and a name that cannot disagree, and a container variant cannot be
+  constructed without its owner; `CanvasManager::delete_gl_object` is the only place
+  that issues a `glDelete*`, and it makes the owning context current first. Both
+  matches over the enum are catch-all-free, so a new object kind cannot be added
+  without its sharing being decided — the mutant that demonstrates it is a new
+  variant, which produces `E0004` in both. A missing owner canvas is no longer a
+  reason to delete from somewhere else: a container object cannot outlive the context
+  that holds it, so if the canvas is gone the object already is.
+
+  **Covered:** the classification, by two tests that a reclassifying mutant kills
+  individually — moving `Framebuffer` or `VertexArray` to the shared bucket fails
+  `a_container_object_must_be_deleted_from_the_context_that_minted_it` at its own
+  assertion line, 144 and 153 respectively, with the other 570 tests in the crate
+  passing; moving `Texture` the other way fails only
+  `a_shared_object_may_be_deleted_from_any_context_in_the_group`, which is the
+  positive control an all-`Some(owner)` classification would otherwise satisfy.
+
+  **Not covered, named rather than implied.** The wrong-context deletion cannot be
+  observed on this host at all, for the numbering reason above: neither the
+  cross-canvas destruction nor the leak changes a pixel or a counter here.
+  `scripts/fixtures/fbo-owner-probe` therefore gates the eleven rewritten call sites
+  end to end — an offscreen canvas freeing a framebuffer pool while the onscreen
+  canvas keeps a render target of its own — and not the defect that motivated them.
+  Nothing stops a future call site issuing `gl.delete_*` directly instead of going
+  through `delete_gl_object`; that remains a convention, because the handles the
+  container metadata holds are still readable for binding.
 
 - **The engine may not change GL state behind the content's back without telling
   the dedup shadow.** Every per-canvas GL binding is shadowed so a redundant call
