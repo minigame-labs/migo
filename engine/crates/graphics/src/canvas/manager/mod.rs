@@ -1385,8 +1385,23 @@ impl CanvasManager {
                 "Reusing preserved DrawingBuffer for onscreen canvas"
             );
             unsafe {
-                self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
+                self.gl.bind_framebuffer(
+                    glow::FRAMEBUFFER,
+                    default_framebuffer_of(
+                        self.canvases
+                            .get(&id)
+                            .map_or(false, |e| e.bypass_drawing_buffer),
+                        Some(db.fbo),
+                    ),
+                );
             }
+            // The install re-points the driver, so the shadow has to say so. A
+            // resume carries the previous surface's `gl_state` forward, and it can
+            // still name a framebuffer the content bound before the surface went
+            // away.
+            crate::backend::gl::state_tracker::record_default_framebuffer_bind(
+                self.gl_state.entry(id).or_default(),
+            );
             Some(db)
         } else {
             None
@@ -2541,11 +2556,10 @@ impl CanvasManager {
         canvas_id: CanvasId,
     ) -> Option<glow::NativeFramebuffer> {
         self.canvases.get(&canvas_id).and_then(|entry| {
-            if entry.bypass_drawing_buffer {
-                None // Bypass: bind real FBO 0, skip DrawingBuffer.
-            } else {
-                entry.drawing_buffer.as_ref().map(|db| db.fbo)
-            }
+            default_framebuffer_of(
+                entry.bypass_drawing_buffer,
+                entry.drawing_buffer.as_ref().map(|db| db.fbo),
+            )
         })
     }
 
@@ -2782,6 +2796,20 @@ impl CanvasManager {
             self.damage
                 .add(crate::damage_effect::DamageEffect::FullSurface);
         }
+
+        let rebind = plan_bypass_rebind(
+            mode_changed,
+            self.bound == BoundContext::Canvas(onscreen_id),
+            self.gl_state
+                .get(&onscreen_id)
+                .map_or(true, |s| s.draws_to_default_fbo),
+            self.get_drawing_buffer_fbo(onscreen_id),
+        );
+        if let BypassRebind::DefaultFramebuffer(fbo) = rebind {
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, fbo);
+            }
+        }
     }
 
     pub(crate) fn make_current_needed(&mut self, id: CanvasId) -> EngineResult<()> {
@@ -2808,17 +2836,41 @@ impl CanvasManager {
             })?;
         self.bound = BoundContext::Canvas(id);
 
-        // After EGL context switch to the onscreen canvas, bind the
-        // DrawingBuffer FBO so GL commands target it instead of the
-        // window surface (FBO 0).  This is the Chromium DrawingBuffer
-        // pattern: WebGL's "default framebuffer" is actually our FBO.
-        if let Some(db) = entry.drawing_buffer.as_ref() {
-            unsafe {
-                self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
-            }
-        }
+        // The framebuffer binding is deliberately NOT re-established here.
+        //
+        // It is per-GL-context state and each canvas owns its context, so EGL
+        // hands this canvas back exactly the binding it had — which is also what
+        // the dedup shadow already claims. Re-pointing it at the default
+        // framebuffer instead gave this one function *two* behaviours: the
+        // short-circuit above left the content's binding alone while a real switch
+        // clobbered it, and the shadow described only the first. Content that kept
+        // its own FBO across a canvas switch then had its next
+        // `bindFramebuffer(sameName)` deduped away and rendered to texture
+        // straight onto the screen — see `scripts/fixtures/rtt-probe`. A freshly
+        // created context needs no help either: `DrawingBuffer::new` leaves its FBO
+        // bound and `evaluate_bypass` re-points it when bypass latches.
 
         Ok(())
+    }
+
+    /// Re-point `id` at its WebGL default framebuffer and tell the dedup shadow.
+    ///
+    /// For the sites that genuinely destroyed the binding rather than merely left
+    /// it: the swap-time blit binds `READ=DrawingBuffer, DRAW=0`, and a surface
+    /// install starts from whatever the fresh context had. The shadow record is
+    /// half of the operation, not bookkeeping after it — a driver re-point the
+    /// shadow does not know about is exactly what put a render-to-texture pass on
+    /// the screen.
+    fn bind_default_framebuffer(&mut self, id: CanvasId) {
+        let Some(target) = self.get_drawing_buffer_fbo(id) else {
+            return;
+        };
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target));
+        }
+        crate::backend::gl::state_tracker::record_default_framebuffer_bind(
+            self.gl_state.entry(id).or_default(),
+        );
     }
 
     pub(crate) fn ensure_any_canvas_current(&mut self) -> EngineResult<CanvasId> {
@@ -3368,7 +3420,8 @@ impl CanvasManager {
         let Some(entry_surf) = entry.ctx.surf else {
             return Ok(ResolvedDamage::FullSurface);
         };
-        self.egl
+        let swap = self
+            .egl
             .swap_buffers(self.display, entry_surf)
             .map_err(|e| {
                 match classify_egl_swap_failure(e) {
@@ -3386,48 +3439,35 @@ impl CanvasManager {
                     ErrorCode::RenderBackendError,
                     format!("eglSwapBuffers failed: {e:?}"),
                 )
-            })?;
+            });
 
-        // Reset only after a successful frame boundary. The `?` above returns
-        // before this line on swap failure, preserving damage for a retry.
-        self.damage.reset();
+        let commit = commit_present_outcome(
+            &mut self.damage,
+            &mut self.damage_history,
+            swap.is_ok(),
+            blit_succeeded,
+            &plan,
+        );
+        // The failed-swap path returns here, and the commit above is what leaves
+        // this frame's damage in the accumulator for the retry to repair.
+        swap?;
 
-        // Re-bind the DrawingBuffer FBO after swap so the next frame's GL
-        // commands target it instead of the window surface.
-        // When bypass is active, leave FBO 0 bound — next frame renders there.
-        let bypass = self
-            .canvases
-            .get(&id)
-            .map_or(false, |e| e.bypass_drawing_buffer);
-        if !bypass {
-            if let Some(ref db) = self
-                .canvases
-                .get(&id)
-                .and_then(|e| e.drawing_buffer.as_ref())
-            {
-                unsafe {
-                    self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
-                }
-            }
-        }
+        // The blit bound READ=DrawingBuffer / DRAW=0 and so destroyed whatever
+        // the content had on `FRAMEBUFFER`; re-point it at this canvas's default
+        // framebuffer and record that in the shadow, or the content's next bind of
+        // its own FBO is deduped against a claim the blit already invalidated.
+        // Under bypass there was no blit, nothing was destroyed, and the
+        // resolver's answer (real FBO 0) is what is already bound.
+        self.bind_default_framebuffer(id);
 
-        if blit_succeeded {
-            // Record this frame's *current* surface damage AFTER both a complete
-            // blit and a successful swap — never the age-expanded `repair`.
-            self.damage_history.push(plan.current.clone());
-            Ok(Self::region_to_resolved(&plan.current))
-        } else {
-            // The swap advanced EGL's buffer sequence, but the back buffer is
-            // only partially defined because at least one repair write failed.
-            // Poison history and force the next present to repair everything;
-            // a same-frame full retry is illegal after a partial declaration.
-            self.damage_history.clear();
-            self.damage_history
-                .push(crate::present_damage::DamageRegion::FullSurface);
-            self.damage
-                .add(crate::damage_effect::DamageEffect::FullSurface);
-            Ok(ResolvedDamage::FullSurface)
-        }
+        Ok(match commit {
+            PresentCommit::Presented(resolved) => resolved,
+            PresentCommit::PresentedPartial => ResolvedDamage::FullSurface,
+            // `swap?` above returns on exactly this arm. Answered rather than
+            // `unreachable!()`d so that reordering the two degrades to the
+            // conservative region instead of panicking on the present path.
+            PresentCommit::Retry => ResolvedDamage::FullSurface,
+        })
     }
 
     /// Collapse a [`crate::present_damage::DamageRegion`] to a single-AABB
@@ -5448,6 +5488,123 @@ fn can_bypass_drawing_buffer(
         && onscreen_db_matches_surface
 }
 
+/// The framebuffer name that *is* a canvas's WebGL default framebuffer: the
+/// DrawingBuffer's FBO normally, and real FBO 0 (`None`) under bypass — because
+/// bypass is *defined* as "the WebGL default framebuffer is the window's".
+///
+/// **Single-sourced because two sites derived it independently and dropped the
+/// bypass term.** `make_current_needed` and the surface-recreate DrawingBuffer
+/// reuse each bound `drawing_buffer.map(|db| db.fbo)` directly, so under bypass
+/// they re-pointed the default framebuffer at a buffer that bypass has just
+/// stopped blitting. Nothing then presents the frame. The post-swap restore
+/// carried the bypass term in a bespoke `if !bypass` and was the only site that
+/// had it, which is why the disagreement read as a comment rather than a bug.
+fn default_framebuffer_of(
+    bypass_drawing_buffer: bool,
+    drawing_buffer_fbo: Option<glow::NativeFramebuffer>,
+) -> Option<glow::NativeFramebuffer> {
+    if bypass_drawing_buffer {
+        None
+    } else {
+        drawing_buffer_fbo
+    }
+}
+
+/// What one present attempt did to the frame's damage bookkeeping.
+#[derive(Debug, PartialEq, Eq)]
+enum PresentCommit {
+    /// The swap failed. This frame's damage stays in the accumulator so the
+    /// retry repairs everything the lost frame still owed, and history is
+    /// untouched because nothing reached the surface.
+    Retry,
+    /// Swap and blit both complete: history records the frame's own damage, and
+    /// a later present with buffer age 2 can repair from it.
+    Presented(ResolvedDamage),
+    /// The swap advanced EGL's buffer sequence, but at least one repair write
+    /// failed, so the back buffer is only partly defined. History is poisoned so
+    /// the next present repairs everything — a same-frame full retry is illegal
+    /// once the sequence has advanced.
+    PresentedPartial,
+}
+
+/// Commit one present attempt's damage bookkeeping.
+///
+/// **Split out of `swap_buffers_no_restore` because the ordering is the property
+/// and the EGL calls around it are not.** Taking the swap outcome as data
+/// instead of leaving it as an early `?` return is what makes both branches
+/// reachable without a window surface — the same move `run_frame_phases` used for
+/// the frame phases. Until now the two properties were asserted by searching
+/// this function's *source text* for `.swap_buffers(`, `blit_succeeded` and
+/// `self.damage.reset()` and checking the offsets were in order, which cannot
+/// fail on any behavioural change that leaves the text intact, on the one path
+/// where being wrong means a frame of stale pixels.
+fn commit_present_outcome(
+    damage: &mut crate::damage_effect::FrameDamageAccumulator,
+    history: &mut crate::present_damage::PresentDamageHistory,
+    swap_succeeded: bool,
+    blit_succeeded: bool,
+    plan: &crate::present_damage::PresentDamagePlan,
+) -> PresentCommit {
+    if !swap_succeeded {
+        return PresentCommit::Retry;
+    }
+    // Reset only at a frame boundary that actually happened.
+    damage.reset();
+    if blit_succeeded {
+        // `current`, never `repair`. `repair` is age-expanded — it covers what
+        // this frame had to rewrite to make an N-frames-old back buffer whole,
+        // which is a superset of what this frame's content changed. Recording it
+        // would make every later repair grow off the previous one's expansion.
+        history.push(plan.current.clone());
+        PresentCommit::Presented(CanvasManager::region_to_resolved(&plan.current))
+    } else {
+        history.clear();
+        history.push(crate::present_damage::DamageRegion::FullSurface);
+        damage.add(crate::damage_effect::DamageEffect::FullSurface);
+        PresentCommit::PresentedPartial
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BypassRebind {
+    /// Issue no bind.
+    Nothing,
+    /// Re-point the onscreen `FRAMEBUFFER` binding here; `None` is real FBO 0.
+    DefaultFramebuffer(Option<glow::NativeFramebuffer>),
+}
+
+/// A bypass mode change moves *what the default framebuffer means* without any
+/// `bindFramebuffer` from the content, so the binding the driver holds stops
+/// matching it and has to be re-established. This was the missing site, and it
+/// is why a run that never left bypass presented nothing at all: the onscreen
+/// canvas is created, its DrawingBuffer is deliberately left bound, and only
+/// *then* does `evaluate_bypass` latch bypass on — after which the blit that
+/// would have carried those pixels to the window no longer runs.
+///
+/// `onscreen_context_is_current` is a precondition, not an optimisation: a bind
+/// issued while another canvas is current lands in that canvas's context. When
+/// it is false there is nothing to do, because the `make_current_needed` that
+/// brings the onscreen context back resolves the binding from the same
+/// [`default_framebuffer_of`] — between them the two sites cover every path.
+///
+/// `draws_to_default_fbo` is the shadow's answer to "is the content drawing to
+/// the default framebuffer?". When the content has its own FBO bound the driver
+/// already holds it and must keep it: the content's next `bindFramebuffer(null)`
+/// resolves the new meaning through the same function. Re-binding regardless
+/// would silently redirect a render-to-texture pass at the screen.
+fn plan_bypass_rebind(
+    mode_changed: bool,
+    onscreen_context_is_current: bool,
+    draws_to_default_fbo: bool,
+    default_framebuffer: Option<glow::NativeFramebuffer>,
+) -> BypassRebind {
+    if mode_changed && onscreen_context_is_current && draws_to_default_fbo {
+        BypassRebind::DefaultFramebuffer(default_framebuffer)
+    } else {
+        BypassRebind::Nothing
+    }
+}
+
 /// One offscreen canvas that must be re-created after the EGL share group is
 /// rebuilt, captured before the dead group is torn down.
 #[derive(Debug, Clone, PartialEq)]
@@ -5943,6 +6100,255 @@ mod tests {
     #[test]
     fn a_latched_default_fbo_readback_disables_bypass() {
         assert!(!can_bypass_drawing_buffer(1, true, false, true));
+    }
+
+    // ---- What the default framebuffer resolves to, and who re-points it ----
+    //
+    // Bypass was measured presenting *nothing*: `scripts/fixtures/bypass-probe`
+    // holds all four bypass conditions for a whole run, painted 180 frames of
+    // rgba(51,204,102,255), and the captured frame was (0,0,0,0) everywhere,
+    // while bunnymark — identical path except `canvas_count=2` — captured its
+    // real scene. The frames were landing in the DrawingBuffer, which bypass
+    // has by definition stopped blitting. Two causes, both here: the meaning of
+    // "the default framebuffer" changed with nothing re-pointing the binding,
+    // and two of the three sites that do re-point it derived the target without
+    // the bypass term.
+
+    fn fbo(n: u32) -> glow::NativeFramebuffer {
+        glow::NativeFramebuffer(std::num::NonZeroU32::new(n).expect("non-zero fbo name"))
+    }
+
+    /// Bypass *is* the statement "this canvas's WebGL default framebuffer is the
+    /// window's". A resolver that returned the DrawingBuffer here would send
+    /// every draw into a buffer nothing blits.
+    #[test]
+    fn bypass_resolves_the_default_framebuffer_to_the_window() {
+        assert_eq!(default_framebuffer_of(true, Some(fbo(7))), None);
+    }
+
+    /// The Chromium DrawingBuffer pattern off the bypass path: WebGL's "default
+    /// framebuffer" is our FBO, and the swap-time blit is what presents it.
+    #[test]
+    fn without_bypass_the_default_framebuffer_is_the_drawing_buffer() {
+        assert_eq!(default_framebuffer_of(false, Some(fbo(7))), Some(fbo(7)));
+    }
+
+    /// Entering bypass is the transition that was silently dropping frames: the
+    /// DrawingBuffer is still bound from its own creation, and the blit that
+    /// used to carry it to the window stops running on this very call.
+    #[test]
+    fn entering_bypass_repoints_the_default_framebuffer_at_the_window() {
+        assert_eq!(
+            plan_bypass_rebind(true, true, true, None),
+            BypassRebind::DefaultFramebuffer(None)
+        );
+    }
+
+    /// The reverse transition needs the bind just as much: the blit resumes and
+    /// reads the DrawingBuffer, so a frame drawn straight to the window would be
+    /// overwritten by whatever the DrawingBuffer last held.
+    #[test]
+    fn leaving_bypass_repoints_the_default_framebuffer_at_the_drawing_buffer() {
+        assert_eq!(
+            plan_bypass_rebind(true, true, true, Some(fbo(7))),
+            BypassRebind::DefaultFramebuffer(Some(fbo(7)))
+        );
+    }
+
+    /// `evaluate_bypass` runs on every canvas lifecycle event and almost never
+    /// changes the mode. A bind on each call would be a driver round trip per
+    /// event for a binding that already agrees.
+    #[test]
+    fn an_unchanged_mode_issues_no_bind() {
+        assert_eq!(
+            plan_bypass_rebind(false, true, true, None),
+            BypassRebind::Nothing
+        );
+    }
+
+    /// A bind lands in whichever context is current, so off the onscreen context
+    /// it would corrupt an offscreen canvas's state instead. Nothing is lost by
+    /// skipping: the `make_current_needed` that brings the onscreen context back
+    /// resolves the binding from `default_framebuffer_of` too.
+    #[test]
+    fn a_mode_change_off_the_onscreen_context_defers_to_the_next_make_current() {
+        assert_eq!(
+            plan_bypass_rebind(true, false, true, None),
+            BypassRebind::Nothing
+        );
+    }
+
+    /// Content that has bound its own FBO is mid-render-to-texture. The driver
+    /// holds that FBO and must keep it; the content's next
+    /// `bindFramebuffer(null)` picks up the new meaning. Re-pointing here would
+    /// aim a render-to-texture pass at the screen.
+    #[test]
+    fn a_mode_change_leaves_a_framebuffer_the_content_bound_alone() {
+        assert_eq!(
+            plan_bypass_rebind(true, true, false, None),
+            BypassRebind::Nothing
+        );
+    }
+
+    // ---- Present bookkeeping across swap and blit outcomes ----
+    //
+    // These replace two guards in `present_damage.rs` that read the *source
+    // text* of `swap_buffers_no_restore` and asserted the byte offsets of
+    // `.swap_buffers(`, `self.damage.reset()` and `blit_succeeded` were in
+    // order. That shape cannot fail on a behavioural change which leaves the
+    // text intact, and it sat on the presentation path. Passing the swap outcome
+    // in as data makes both branches reachable with no window surface.
+
+    use crate::present_damage::{DamageRegion, PresentDamageHistory, PresentDamagePlan};
+
+    /// A plan whose two regions are *distinguishable*, so a test can tell which
+    /// one the commit recorded. Both were the same value in the earlier
+    /// source-text guard, which is part of why "history records current, never
+    /// repair" could only be checked by reading the call.
+    fn plan_with_distinct_regions() -> PresentDamagePlan {
+        PresentDamagePlan {
+            current: DamageRegion::from_rect(
+                crate::present_damage::DamageRect::new(0, 0, 360, 640).expect("non-empty rect"),
+            ),
+            repair: DamageRegion::FullSurface,
+        }
+    }
+
+    /// The frame's damage is what the *next* present owes the compositor. A swap
+    /// that failed presented nothing, so resetting the accumulator would drop
+    /// the debt and the retry would declare a region smaller than what is
+    /// actually stale — leaving the previous image on screen inside the part
+    /// nobody declared.
+    #[test]
+    fn a_failed_swap_keeps_the_frames_damage_for_the_retry() {
+        let mut damage = FrameDamageAccumulator::new();
+        let mut history = PresentDamageHistory::new();
+        damage.add(DamageEffect::OnscreenRect {
+            x: 0,
+            y: 0,
+            width: 360,
+            height: 640,
+        });
+
+        let commit = commit_present_outcome(
+            &mut damage,
+            &mut history,
+            false,
+            true,
+            &plan_with_distinct_regions(),
+        );
+
+        assert_eq!(commit, PresentCommit::Retry);
+        assert!(
+            damage.has_damage(),
+            "a failed swap must leave the accumulated damage in place for the retry"
+        );
+        assert_eq!(
+            history.len(),
+            0,
+            "nothing reached the surface, so nothing may enter the buffer-age history"
+        );
+    }
+
+    /// The control for the test above. Without it, "damage survived a failed
+    /// swap" is satisfied by an accumulator that never resets at all — every
+    /// frame would then repair the whole surface forever and the buffer-age
+    /// machinery would be decoration.
+    #[test]
+    fn a_successful_swap_resets_the_frames_damage() {
+        let mut damage = FrameDamageAccumulator::new();
+        let mut history = PresentDamageHistory::new();
+        damage.add(DamageEffect::OnscreenRect {
+            x: 0,
+            y: 0,
+            width: 360,
+            height: 640,
+        });
+
+        let commit = commit_present_outcome(
+            &mut damage,
+            &mut history,
+            true,
+            true,
+            &plan_with_distinct_regions(),
+        );
+
+        assert!(matches!(commit, PresentCommit::Presented(_)));
+        assert!(
+            !damage.has_damage(),
+            "a presented frame starts the next one owing nothing"
+        );
+        assert_eq!(history.len(), 1, "a presented frame is repairable from");
+    }
+
+    /// `repair` is age-expanded: it covers what this frame had to rewrite to make
+    /// an N-frames-old back buffer whole, which is a superset of what the content
+    /// changed. Recording it would make each later repair grow off the previous
+    /// one's expansion until every frame was full.
+    #[test]
+    fn history_records_the_frames_own_damage_and_never_the_age_expanded_repair() {
+        let mut damage = FrameDamageAccumulator::new();
+        let mut history = PresentDamageHistory::new();
+        let plan = plan_with_distinct_regions();
+
+        commit_present_outcome(&mut damage, &mut history, true, true, &plan);
+
+        // Age 2 unions `current` with the newest history entry. The plan's
+        // `repair` is FullSurface here, so recording it would answer FullSurface
+        // and recording `current` answers the rect — which is what tells the two
+        // apart without an accessor into the ring buffer.
+        assert_eq!(
+            history.resolve_with_age(&plan.current, 2),
+            plan.current,
+            "the history entry must be the current-frame region, not the repair region"
+        );
+    }
+
+    /// A partial blit means the back buffer is only partly defined, but the swap
+    /// already advanced EGL's buffer sequence, so the frame cannot be retried in
+    /// place. The recovery is to poison history: the entry a later
+    /// buffer-age-2 present repairs from must be `FullSurface`, not the region
+    /// this frame *intended* to write.
+    #[test]
+    fn a_failed_blit_makes_the_history_unusable_as_a_repair_source() {
+        let mut damage = FrameDamageAccumulator::new();
+        let mut history = PresentDamageHistory::new();
+        let plan = plan_with_distinct_regions();
+        history.push(plan.current.clone());
+
+        let commit = commit_present_outcome(&mut damage, &mut history, true, false, &plan);
+
+        assert_eq!(commit, PresentCommit::PresentedPartial);
+        assert_eq!(
+            history.resolve_with_age(&plan.current, 2),
+            DamageRegion::FullSurface,
+            "a partially-written frame must be unusable as a repair source"
+        );
+    }
+
+    /// Separate from the history poison because they are separate obligations and
+    /// separate defects. Poisoning history only fixes what a *later* present
+    /// repairs *from*; the very next present also has to repair everything, and
+    /// that debt lives in the accumulator. A commit that did one and not the
+    /// other would leave a real hole, so bundling them into one assertion would
+    /// leave whichever half broke unnamed.
+    #[test]
+    fn a_failed_blit_leaves_the_next_present_owing_the_whole_surface() {
+        let mut damage = FrameDamageAccumulator::new();
+        let mut history = PresentDamageHistory::new();
+
+        commit_present_outcome(
+            &mut damage,
+            &mut history,
+            true,
+            false,
+            &plan_with_distinct_regions(),
+        );
+
+        assert!(
+            damage.is_full_surface(),
+            "the next present must repair everything, not the region this frame meant to write"
+        );
     }
 
     // ---- Unified DamageEffect accumulator integration tests ----

@@ -973,14 +973,11 @@ mod wiring_source_guards {
             !window.contains("plan.current"),
             "the blit must never be derived from the current region"
         );
-        assert!(
-            MGR.contains("push(plan.current"),
-            "successful-swap history must record current-frame surface damage"
-        );
-        assert!(
-            !MGR.contains("push(plan.repair"),
-            "history must never record the age-expanded repair region"
-        );
+        // Which region enters the history is no longer a text question: the
+        // choice moved inside `commit_present_outcome`, which receives the whole
+        // plan, and `history_records_the_frames_own_damage_and_never_the_age_
+        // expanded_repair` drives it against a real ring buffer with the two
+        // regions made distinguishable.
     }
 
     #[test]
@@ -1202,23 +1199,23 @@ mod wiring_source_guards {
         );
     }
 
+    // `swap_failure_preserves_accumulated_damage_for_retry` and
+    // `blit_failure_poison_is_propagated_to_present_history` stood here. Both
+    // read the source text of `swap_buffers_no_restore` and asserted the byte
+    // offsets of `.swap_buffers(`, `self.damage.reset()` and `blit_succeeded`
+    // were in order — inspection wearing a test's clothing, on the presentation
+    // path, which is what ledger 0.56 named them as. The properties are real and
+    // are orderings, so `swap_buffers_no_restore` now takes the swap outcome as
+    // data and hands the bookkeeping to `commit_present_outcome`, whose three
+    // branches are driven directly against a real `FrameDamageAccumulator` and
+    // `PresentDamageHistory` in `canvas::manager`'s tests. What is left here is
+    // only what genuinely has no host-observable behaviour: the wiring of one
+    // function's calls to another's, where the effect needs a GL context.
     #[test]
-    fn swap_failure_preserves_accumulated_damage_for_retry() {
-        let body = function_body(MGR, "pub(crate) fn swap_buffers_no_restore");
-        let swap = body
-            .find(".swap_buffers(")
-            .expect("swap path must call eglSwapBuffers");
-        let reset = body
-            .find("self.damage.reset()")
-            .expect("successful present must reset frame damage");
-        assert!(
-            swap < reset,
-            "frame damage must only reset after eglSwapBuffers succeeds"
-        );
-    }
-
-    #[test]
-    fn blit_failure_poison_is_propagated_to_present_history() {
+    fn drawing_buffer_blit_reports_whether_every_repair_write_succeeded() {
+        // Still text, because the alternative is a live GL context. Narrowed to
+        // the signature: a blit that cannot report failure makes the poison
+        // branch above unreachable, and no host test can see that.
         let declaration = DB
             .find("pub(crate) fn blit_to_surface")
             .expect("DrawingBuffer blit function must exist");
@@ -1228,17 +1225,6 @@ mod wiring_source_guards {
         assert!(
             DB[declaration..declaration + signature_end].contains("-> bool"),
             "DrawingBuffer blit must report whether every repair write succeeded"
-        );
-
-        let swap = function_body(MGR, "pub(crate) fn swap_buffers_no_restore");
-        assert!(
-            swap.contains("blit_succeeded"),
-            "swap must consume the DrawingBuffer blit outcome"
-        );
-        assert!(
-            swap.contains("self.damage_history.clear()")
-                && swap.contains("DamageRegion::FullSurface"),
-            "a failed blit followed by a successful swap must poison history"
         );
     }
 
