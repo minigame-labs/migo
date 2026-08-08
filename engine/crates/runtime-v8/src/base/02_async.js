@@ -7,7 +7,37 @@
 // - Always returns a Promise (supports both callback and await patterns).
 // - On success: calls success(res), complete(res), resolves with res.
 // - On failure: calls fail(res), complete(res), rejects with res.
+import { op_alloc_host_callback_id } from "ext:core/ops";
 import { _perf } from "ext:host_v8_base/05_perf.js";
+
+// Host callback ids cross JNI and the C ABI as signed 32-bit values, so the
+// space ends here and not at `Number.MAX_SAFE_INTEGER`.
+const MAX_HOST_CALLBACK_ID = 2147483647;
+
+// What the engine will accept as an id, applied to anything a platform sends
+// back. Deliberately strict: `Number()` turns `null` into 0 and `"1e3"` into
+// 1000, and an id that was silently coerced is an id that can match the wrong
+// pending request.
+function parseHostCallbackId(value) {
+    // The type check is not redundant with the range check below it: Number()
+    // maps `true` to 1, `[]` to 0 and `null` to 0, so a boolean `requestId`
+    // would otherwise parse as the id 1 and settle whichever request holds it.
+    // Strings stay acceptable because a platform that serialises the id it was
+    // given is still echoing it exactly.
+    if (typeof value !== 'number' && typeof value !== 'string') return null;
+    const id = Number(value);
+    return Number.isInteger(id) && id > 0 && id <= MAX_HOST_CALLBACK_ID ? id : null;
+}
+
+// One id space per Host, allocated natively, shared with every Worker and
+// carried across a runtime restart. A per-runtime counter would restart at 1,
+// and a result the retired runtime is still owed would then match a request the
+// replacement has just registered.
+function allocateHostCallbackId() {
+    const id = op_alloc_host_callback_id();
+    if (parseHostCallbackId(id) === null) throw new Error("invalid host callback id");
+    return id;
+}
 
 function wrapAsync(apiName, fn, options) {
     const { success, fail, complete } = options || {};
@@ -113,7 +143,6 @@ function promisify(apiName, executor) {
 // defaultTimeoutMs: auto-reject after this many ms if platform never settles.
 // Pass 0 to disable timeout.  Individual calls can override via opts._timeout.
 function createDeferredApi(apiName, defaultTimeoutMs) {
-    var _nextId = 1;
     var _pending = new Map();
     if (defaultTimeoutMs === undefined) defaultTimeoutMs = 30000;
 
@@ -149,9 +178,22 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
         var success = typeof opts.success === 'function' ? opts.success : null;
         var fail = typeof opts.fail === 'function' ? opts.fail : null;
         var complete = typeof opts.complete === 'function' ? opts.complete : null;
-        var requestId = _nextId++;
 
         return new Promise(function (resolve, reject) {
+            // Before the pending entry and before the platform call: an
+            // exhausted id space must leave nothing registered and dispatch
+            // nothing, rather than register under an id it could not obtain.
+            var requestId;
+            try {
+                requestId = allocateHostCallbackId();
+            } catch (e) {
+                var allocFailure = { errMsg: apiName + ':fail ' + e.message };
+                if (fail) fail(allocFailure);
+                if (complete) complete(allocFailure);
+                reject(allocFailure);
+                return;
+            }
+
             var pendingEntry = {
                 resolve: resolve,
                 reject: reject,
@@ -197,23 +239,31 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
         var parsed;
         try { parsed = JSON.parse(resultJson); } catch (e) { parsed = {}; }
 
-        // Try requestId-based lookup first.
-        var requestId = Number(parsed.requestId);
-        if (Number.isFinite(requestId)) {
+        // A result that carries the key at all is correlated by it, in any
+        // form. `null`, `1.5`, `-1`, `0`, `2147483648` and `"abc"` are all
+        // *present and not an id*, so they are discarded rather than allowed
+        // to reach the fallback below and settle somebody else's request.
+        if (parsed !== null && typeof parsed === 'object' && 'requestId' in parsed) {
+            var requestId = parseHostCallbackId(parsed.requestId);
+            if (requestId === null) return;
             var entry = _pending.get(requestId);
             if (entry) {
                 _pending.delete(requestId);
                 _settleEntry(entry, parsed);
             }
-            // requestId was present but entry not found -- the request was
-            // already settled (e.g. timed out).  Silently discard the stale
-            // callback to avoid mis-settling a different pending request.
+            // Present but unknown: already settled, or timed out. Discarding is
+            // the only safe answer -- there is no second candidate.
             return;
         }
 
-        // Fallback: settle the oldest pending request (FIFO).
-        // Only reached when the platform omits requestId entirely
-        // (legacy / backward-compat path).
+        // Fallback: settle the oldest pending request (FIFO), reached only when
+        // the platform omits `requestId` entirely.
+        //
+        // Do not delete this yet. Several Android result paths (location,
+        // scan, image, video, modal, action sheet, Bluetooth and application
+        // settings) still omit the id; task 6 of the runtime-restart plan is
+        // what makes them echo it. Removing the fallback first does not make
+        // them fail loudly -- their promises would simply never settle.
         var iter = _pending.keys();
         var first = iter.next();
         if (!first.done) {

@@ -792,6 +792,24 @@ fn op_is_subpackage_installed(state: &mut OpState, #[string] root: &str) -> bool
     !mt.list_dir(root).is_empty()
 }
 
+/// Take the next host-callback id from the Host's one allocator.
+///
+/// An op rather than a JavaScript counter because the space must outlive the
+/// isolate: a per-runtime counter restarts at 1, and then a result the retired
+/// runtime is still owed matches a request the replacement has just made. The
+/// allocator is shared with every Worker for the same reason.
+///
+/// Exhaustion surfaces as a thrown error, not as a wrapped or reused id: the
+/// caller must fail to register rather than register under someone else's id.
+#[op2(fast)]
+fn op_alloc_host_callback_id(state: &mut OpState) -> Result<i32, deno_error::JsErrorBox> {
+    state
+        .borrow::<HostOpState>()
+        .callback_ids
+        .allocate()
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
+}
+
 deno_core::extension!(
     host_v8_base,
     ops = [
@@ -806,6 +824,7 @@ deno_core::extension!(
         op_get_subpackage_identity,
         op_is_subpackage_persisted,
         op_is_subpackage_installed,
+        op_alloc_host_callback_id,
     ],
     esm = [
         dir "src/base",
