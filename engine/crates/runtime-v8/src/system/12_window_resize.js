@@ -1,5 +1,5 @@
 import { getWindowInfo } from "ext:host_v8_system/03_window_info.js";
-import { adoptMainCanvasSurfaceSize } from "ext:host_v8_web/03_canvas.js";
+import { setWindowResizeReporter } from "ext:host_v8_web/03_canvas.js";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 const _resize = createListenerGroup("onWindowResize");
@@ -29,19 +29,18 @@ function offWindowResize(listener) {
     _resize.off(listener);
 }
 
-function _internalTriggerWindowResize() {
-    // First, and unconditionally.
-    //
-    // The main canvas is what the content draws into, so a listener that reads
-    // `canvas.width` must not be handed the size the surface had a moment ago.
-    // Ahead of the read below because a host with no window-info service still
-    // has a surface -- gating this on `_readWindowSize()` succeeding would make
-    // the canvas track the surface only on platforms that happen to report
-    // their window geometry. Ahead of the de-duplication below for the same
-    // reason: it compares the numbers the *platform* reports, which is not what
-    // decides whether the surface moved.
-    adoptMainCanvasSurfaceSize();
-
+// Tell content the window geometry changed.
+//
+// The half of a surface change that needs a window-info service, and so the half
+// that this extension may own: `api-connectivity` gates it out of a Slim build,
+// which then reports no geometry to content and still resizes its canvas. The
+// canvas adoption is in `host_v8_web/03_canvas.js` for exactly that reason - it
+// must not be gated on whether this file was compiled.
+//
+// De-duplication belongs here rather than around the adoption, because it
+// compares the numbers the *platform* reports, which is not what decides whether
+// the surface moved.
+function _reportWindowResize() {
     let data;
     try {
         data = _readWindowSize();
@@ -59,8 +58,9 @@ function _internalTriggerWindowResize() {
     _resize.trigger(data);
 }
 
+setWindowResizeReporter(_reportWindowResize);
+
 export {
     onWindowResize,
     offWindowResize,
-    _internalTriggerWindowResize,
 };
