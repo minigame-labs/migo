@@ -314,12 +314,12 @@ run_step "host" "git diff --check" || true
 # them to changed files means maintaining a file list per gate -- a list to
 # forget an entry from, which is how a gate stops covering what it names.
 # ------------------------------------------------------------
-# Every Gradle build this run drives is offline, for the reason the `android-java`
-# lane below gives: this script verifies sources, not the dependency graph, and an
-# unconstrained resolve here stalls for tens of minutes. Exported rather than passed,
-# because the contract gates are invoked with the command line CI uses -- that parity
-# is the point of deriving them -- so the flag cannot live in the command string.
-export MIGO_GRADLE_OFFLINE=1
+# Every Gradle build this run drives uses the verifier's mode: the dependency cache
+# rather than the network, and no daemon left behind. See the `android-java` lane below
+# for both reasons. Exported rather than appended to a command, because the contract
+# gates are invoked with the exact command line CI uses -- that parity is what stops
+# the local lane drifting from CI -- so the flag cannot live in the command string.
+export MIGO_GRADLE_VERIFIER=1
 
 have_tool() {
     case "$1" in
@@ -416,8 +416,14 @@ target_command() {
             # can hang that long is a gate people learn to skip. The failure mode it
             # introduces is loud and names its own cause -- "No cached version
             # available for offline mode" -- unlike a silent stall.
+            #
+            # `--no-daemon` because a run drives more than one Gradle build and a daemon
+            # outlives its own build while holding the project lock. Measured: five
+            # daemons alive, the one owning this build parked on a lock for seventeen
+            # minutes having used twenty seconds of CPU, with `--quiet` printing nothing
+            # while it waited. A gate that stalls silently is one people learn to skip.
             [[ -x "$ROOT/platforms/android/gradlew" ]] && echo "cd platforms/android && \
-./gradlew --quiet --offline :library:testFullDebugUnitTest :library:testSlimDebugUnitTest"
+./gradlew --quiet --offline --no-daemon :library:testFullDebugUnitTest :library:testSlimDebugUnitTest"
             ;;
         *)                    echo "" ;;
     esac
