@@ -207,6 +207,23 @@ redo them. Ledger tasks T.4, T.5, T.6 and item 0.15.
 - **The ledger is split** per phase with a stable index, so several agents can work
   without colliding on one 5,900-line file.
 
+### 3.3 One Gradle invocation per run, because three of them deadlock
+
+**Open, diagnosed, not fixed.** A `--base master` run now makes three separate Gradle
+builds: `test-android-host-api-contract.sh`, `test-camera-frame-jni-contract.sh` and the
+`android-java` lane. Run one after another in the same invocation, the last one waits many
+minutes on a project lock the earlier builds' daemons still hold -- and because the lane
+passes `--quiet`, Gradle prints nothing at all while it waits. The same command standalone
+is seventeen seconds, and both halves are green run that way, so this is a serialisation
+problem in the verifier rather than a defect in the code under test.
+
+Measured while diagnosing it: a client killed mid-build leaves its daemon holding the lock,
+and `./gradlew --stop` is what clears it. `--quiet` hiding a lock wait is the part worth
+fixing first -- a gate that stalls with no output is indistinguishable from a hang.
+Candidates, in order: have the two contract gates reuse one build (they compile the same
+variants), drop `--quiet` for `--console=plain` so a wait is visible, or drive all three
+from one Gradle invocation.
+
 ### 3.3 Make the host suites selective (speed, ~1 session)
 
 `scripts/verify-change.sh` runs **all** host cargo suites on every invocation, and
