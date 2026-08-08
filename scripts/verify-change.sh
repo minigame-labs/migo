@@ -224,11 +224,33 @@ run_step "host" "git diff --check" || true
 # skipped: `ohos` and `windows` conditional code has no local build on this
 # machine, and that is a fact about the evidence, not a detail to swallow.
 # ------------------------------------------------------------
+#
+# `android-java` is the Android SDK's other half. It is here because this script
+# had no idea Java existed: `platforms/android/**` produced an empty plan, so a
+# change to the shipped AAR's own sources ran eleven Rust suites, cross-compiled
+# Rust for Android, and printed "verified for every target this change touches"
+# without compiling a line of Java. That is the same defect this script was
+# written to prevent -- a green run that is evidence about one language and
+# silent about another -- one layer out from the `cfg(target_os = "android")`
+# gap in its header.
+#
+# Both product variants, because the Java source set is variant-independent
+# while `BuildConfig` capability gating is not: Slim compiles the same files
+# with different flags, and a handler behind `MIGO_API_COMMERCE` that only Full
+# exercises is exactly the shape this repository has shipped broken before.
 target_command() {
     case "$1:$2" in
-        android:compile) echo "bash scripts/build-android-so.sh --compile-only $ABI" ;;
-        android:link)    echo "bash scripts/build-android-so.sh $ABI" ;;
-        *)               echo "" ;;
+        android:compile)      echo "bash scripts/build-android-so.sh --compile-only $ABI" ;;
+        android:link)         echo "bash scripts/build-android-so.sh $ABI" ;;
+        android-java:compile)
+            # Probed rather than assumed, so a machine without the Android
+            # build reports NOT PROVEN like every other absent target. Running
+            # a missing `gradlew` would record FAIL, which says "your change
+            # broke this" about a machine that never had the evidence.
+            [[ -x "$ROOT/platforms/android/gradlew" ]] && echo "cd platforms/android && \
+./gradlew --quiet :library:testFullDebugUnitTest :library:testSlimDebugUnitTest"
+            ;;
+        *)                    echo "" ;;
     esac
 }
 
