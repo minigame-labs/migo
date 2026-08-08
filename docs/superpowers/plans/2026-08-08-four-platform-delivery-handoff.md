@@ -268,7 +268,7 @@ reviews are user-triggered (§6).
 
    | Item | What it needs | Why |
    |---|---|---|
-   | 0.9/A9 | **execute, task 1 of 12 done** | plan `2026-08-02-runtime-restart-generation-boundary.md`; its §6.6 authority is *not* superseded, checked. Resume at Task 2, which is where the property lands and which wants a whole session |
+   | 0.9/A9 | **execute, tasks 1–2 of 12 done** | plan `2026-08-02-runtime-restart-generation-boundary.md`; its §6.6 authority is *not* superseded, checked. Resume at **Task 3**. Tasks 4–5 are the ones to give a whole session — they migrate the correlation registries, and half-migrated is worse than unmigrated |
    | 0.13 | **execute, partly device-blocked** | the entry states four concrete deliverables (ArkTS lifecycle hooks, `OHNativeWindow` release barrier, multi-touch, restart/shutdown barriers); spec §6.2 governs. Compile-level work is now verifiable locally via the T.8 lane; behaviour needs the emulator |
    | 0.8/A8 | **split, then audit** | five clauses in one line, one already closed as 0.12's third; the C ABI half overlaps the branch in 0.11 |
    | 0.11/A11 | **decide** | see item 0 above |

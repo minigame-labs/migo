@@ -415,12 +415,76 @@
   23 contract gates, `android compile` and `ohos compile` both PASS,
   `verified for every target this change touches`.
 
-  **Tasks 2–12 are not started**, and Task 2 is where the property actually lands:
-  the allocator changes no behaviour until it is carried through `HostOpState`,
-  the Host and Workers. Sized before stopping rather than guessed: Task 2 names
-  twelve files and the `HostOpState` literals reach **22 across 12 test files, 18
-  files in the workspace overall**. It wants a session with room to finish — a
-  half-migrated correlation registry is worse than an unstarted one.
+  **Task 2 of 12 done 2026-08-09.** One callback-id space and one runtime
+  generation now reach every `HostOpState`, including each Worker's, through
+  `core/src/runtime/restart_boundary.rs`, the registry, `HostIngress`, and
+  `Host`. 21 files.
+
+  **The writer/reader split is in the types, not in a convention.**
+  `RestartBoundary` can advance the generation; `RuntimeGenerationReader` is what
+  the registry, ingress and every clone hold, and it has no mutation API at all —
+  not a private one. A reader that could store would be a second authority, and
+  two authorities disagree. `commit(retired, candidate)` requires
+  `candidate == retired + 1` and compare-exchanges against the live value, so a
+  stale committer is refused outright rather than winning by being last; that is
+  what makes an abandoned candidate harmless. `candidate_generation()` mutates
+  nothing, because a candidate that fails to initialise must leave the live
+  generation exactly as it was.
+
+  **Checked rather than assumed: production constructs exactly one boundary.**
+  All four `RestartBoundary::new()` sites in `registry.rs` sit under its
+  `#[cfg(test)]`; the only production construction is in
+  `thread.rs::spawn_host_thread_inner`, before `register_sender`, so no sender is
+  ever reachable without a generation to stamp with. A second production boundary
+  would be precisely the defect the module documents against.
+
+  **`inherited_correlation` was extracted from `op_worker_create`.** The two lines
+  a Worker inherits were inline in an async op, which no unit test can reach.
+  Production calls the extracted function — it is the only implementation, not a
+  restatement beside one, which is the distinction §"a test-only restatement of a
+  production rule" turns on.
+
+  **The plan's "exact files" list was one short**, and its own instruction caught
+  it: `rg -n 'HostOpState \{'` finds `runtime-v8/src/tests/two_session_identity.rs`,
+  which post-dates the plan (it arrived with the session-isolation work in #29).
+  A hand-listed file set drifts; the completeness command is the part to trust.
+
+  **Three items have no production caller yet, and that is deliberate.**
+  `HostIngress::runtime_generation()` is the read-only accessor a later task
+  stamps direct ingress with; `candidate_generation` and `commit` are the restart
+  pair the plan requires now *"so later tasks cannot invent a second generation
+  authority"*. The two `RestartBoundary` methods carry a narrow
+  `#[allow(dead_code)]` with the reason above them, which is this repository's
+  existing shape for planned surface (73 sites). Measured rather than waved
+  through: `migo-core` emitted **zero** warnings before this task and exactly one
+  after, and that one was these methods — a new warning left for the next reader
+  to triage is decay, so it was closed at the two items rather than tolerated.
+
+  **Mutation evidence: `cargo-mutants --file crates/core/src/runtime/restart_boundary.rs`
+  — 24 mutants, 9 caught, 0 missed, 15 unviable.** The caught nine include
+  `commit`'s successor guard inverted (`!=` to `==`) and its `+` turned into `-`
+  and `*`, and every constant substitution on both `current` methods. The fifteen
+  unviable are the tool fabricating `EngineResult` and `RuntimeGenerationReader`
+  through constructors that do not exist — which is the read-only type refusing to
+  be forged, showing up as "cannot even be written".
+
+  Suites: `restart_boundary` 6, `worker_and_parent_share_host_callback_id_space` 1,
+  `migo-core` 68, `migo-runtime-v8` 523. Closing gate over the final state
+  (42 files in scope): 19 host steps, 23 contract gates, `android compile` and
+  `ohos compile` PASS, `verified for every target this change touches`, and zero
+  `migo-core` warnings in the log.
+
+  **Tasks 3–12 are not started, and the property is not enforced yet.** Ids and
+  generations are now carried everywhere they need to be, but nothing compares
+  them before invoking JavaScript: that is Task 7's rejection and Task 10's
+  unpublished candidate. Until then this is plumbing that changes no behaviour.
+
+  **The next task to be careful with is 4–5, not 3.** Those migrate the request,
+  progress and resource registries off their existing counters, and a
+  half-migrated correlation registry is worse than an unmigrated one — some
+  results correlate by the new id and some by the old counter, and the two
+  disagree exactly when a restart happens. Task 2 was safe to land alone because
+  it only adds fields; 4 and 5 are not.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.
