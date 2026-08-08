@@ -310,6 +310,135 @@ impl<T: Recyclable> Drop for Recycled<T> {
 }
 
 #[cfg(test)]
+mod recycle_pool_tests {
+    use super::{Recyclable, RecyclePool, Recycled};
+    use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+
+    /// A payload that owns a buffer, which is the only reason this pool exists.
+    ///
+    /// Its `recycle` keeps the allocation and drops the contents, and it counts
+    /// its own resets so a test can tell "the slot came back" from "a fresh slot
+    /// was made" without reading the pool's internals.
+    #[derive(Debug, Default)]
+    struct Payload {
+        bytes: Vec<u8>,
+        recycled: u32,
+    }
+
+    impl Recyclable for Payload {
+        fn recycle(&mut self) {
+            self.bytes.clear();
+            self.recycled += 1;
+        }
+    }
+
+    #[test]
+    fn a_returned_slot_is_the_next_acquisition() {
+        let pool: RecyclePool<Payload> = RecyclePool::new(4);
+
+        let mut first = pool.try_acquire().expect("an empty pool grows on demand");
+        first.bytes.extend_from_slice(b"hello");
+        let address = first.bytes.as_ptr();
+        drop(first);
+
+        let second = pool.try_acquire().expect("the returned slot is available");
+        assert_eq!(
+            second.recycled, 1,
+            "the slot was recycled rather than rebuilt"
+        );
+        assert!(second.bytes.is_empty(), "a reused slot carries no contents");
+        // Identity rather than capacity: the same address is proof the buffer
+        // was kept, while a capacity is only proof of `Vec`'s growth strategy --
+        // asserting the exact number here failed against a buffer that had been
+        // kept perfectly well, because five bytes reserve eight.
+        assert_eq!(
+            second.bytes.as_ptr(),
+            address,
+            "the buffer is kept, which is the whole purpose of this pool"
+        );
+        assert!(second.bytes.capacity() >= 5);
+    }
+
+    #[test]
+    fn the_population_grows_only_to_the_high_water_mark() {
+        let pool: RecyclePool<Payload> = RecyclePool::new(8);
+        assert_eq!(pool.population(), 0, "an unused pool costs nothing");
+
+        let held: Vec<Recycled<Payload>> = (0..3)
+            .map(|_| pool.try_acquire().expect("under capacity"))
+            .collect();
+        assert_eq!(pool.population(), 3);
+        drop(held);
+
+        for _ in 0..16 {
+            let slot = pool.try_acquire().expect("a returned slot is reusable");
+            drop(slot);
+        }
+        assert_eq!(
+            pool.population(),
+            3,
+            "traffic at a depth already reached must not make another slot"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_pool_refuses_rather_than_exceeding_its_capacity() {
+        const CAPACITY: usize = 3;
+        let pool: RecyclePool<Payload> = RecyclePool::new(CAPACITY);
+
+        let held: Vec<Recycled<Payload>> = (0..CAPACITY)
+            .map(|_| pool.try_acquire().expect("within capacity"))
+            .collect();
+
+        assert!(pool.try_acquire().is_none(), "the cap is a cap");
+        assert_eq!(pool.population(), CAPACITY);
+
+        drop(held);
+        assert!(
+            pool.try_acquire().is_some(),
+            "refusing while full must not poison the pool"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be non-zero")]
+    fn a_pool_that_can_never_hand_out_a_slot_is_a_construction_error() {
+        let _: RecyclePool<Payload> = RecyclePool::new(0);
+    }
+
+    /// Section 7.3, for the mechanism rather than for one of its consumers.
+    ///
+    /// The warm-up covers both one-time costs: the population growing to the
+    /// depth the burst uses, and each slot's buffer reaching the size it carries.
+    #[test]
+    fn steady_state_recycling_never_reaches_the_heap() {
+        const IN_FLIGHT: usize = 4;
+        let pool: RecyclePool<Payload> = RecyclePool::new(IN_FLIGHT);
+        // Reserved outside the burst: growth here would be attributed to the pool.
+        let mut held: Vec<Recycled<Payload>> = Vec::with_capacity(IN_FLIGHT);
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "recycle_pool: acquire, fill, and return at full occupancy",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                for _ in 0..IN_FLIGHT {
+                    let mut slot = pool.try_acquire().expect("a returned slot is reusable");
+                    slot.bytes.extend_from_slice(&[7_u8; 24]);
+                    held.push(slot);
+                }
+                assert!(pool.try_acquire().is_none(), "an exhausted pool refuses");
+                let carried: usize = held.iter().map(|slot| slot.bytes.len()).sum();
+                assert_eq!(carried, IN_FLIGHT * 24);
+                held.clear();
+            },
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{PayloadPool, Pooled};
     use crate::protocol::host_cmd::{TouchData, TouchPoint, TouchType};

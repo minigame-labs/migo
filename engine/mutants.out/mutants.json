@@ -1,0 +1,802 @@
+[
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl Clone for PayloadPool<T>>::clone -> Self with Default::default()\n@@ -31,19 +31,17 @@\n \n /// Cloneable handle to a fixed number of reusable payload allocations.\n pub struct PayloadPool<T> {\n     inner: Arc<PoolInner<T>>,\n }\n \n impl<T> Clone for PayloadPool<T> {\n     fn clone(&self) -> Self {\n-        Self {\n-            inner: Arc::clone(&self.inner),\n-        }\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl<T> PayloadPool<T> {\n     /// Allocate every slot up front.\n     ///\n     /// # Panics\n     /// Panics when `capacity` is zero; a zero-capacity ownership pool cannot\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl Clone for PayloadPool<T>>::clone",
+      "return_type": "-> Self",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 42
+        },
+        "start": {
+          "column": 5,
+          "line": 38
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:39:9: replace <impl Clone for PayloadPool<T>>::clone -> Self with Default::default()",
+    "package": "migo-shared",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 41
+      },
+      "start": {
+        "column": 9,
+        "line": 39
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::new())\n@@ -64,25 +64,17 @@\n     }\n \n     /// Move `value` into a free slot without blocking.\n     ///\n     /// Exhaustion returns the unchanged value to the caller. It never grows\n     /// the pool and never allocates a replacement slot.\n     #[inline]\n     pub fn try_insert(&self, value: T) -> Result<Pooled<T>, T> {\n-        let mut slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Err(value),\n-        };\n-        slot.value.write(value);\n-        Ok(Pooled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Ok(Pooled::new()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// One initialized payload slot.\n ///\n /// Dropping it destroys the current value and returns the allocation to its\n /// originating pool, including when a containing channel command is rejected\n /// or discarded during shutdown.\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "PayloadPool<T>::try_insert",
+      "return_type": "-> Result<Pooled<T>, T>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 81
+        },
+        "start": {
+          "column": 5,
+          "line": 66
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:72:9: replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::new())",
+    "package": "migo-shared",
+    "replacement": "Ok(Pooled::new())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 80
+      },
+      "start": {
+        "column": 9,
+        "line": 72
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::from_iter([Default::default()]))\n@@ -64,25 +64,17 @@\n     }\n \n     /// Move `value` into a free slot without blocking.\n     ///\n     /// Exhaustion returns the unchanged value to the caller. It never grows\n     /// the pool and never allocates a replacement slot.\n     #[inline]\n     pub fn try_insert(&self, value: T) -> Result<Pooled<T>, T> {\n-        let mut slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Err(value),\n-        };\n-        slot.value.write(value);\n-        Ok(Pooled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Ok(Pooled::from_iter([Default::default()])) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// One initialized payload slot.\n ///\n /// Dropping it destroys the current value and returns the allocation to its\n /// originating pool, including when a containing channel command is rejected\n /// or discarded during shutdown.\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "PayloadPool<T>::try_insert",
+      "return_type": "-> Result<Pooled<T>, T>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 81
+        },
+        "start": {
+          "column": 5,
+          "line": 66
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:72:9: replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::from_iter([Default::default()]))",
+    "package": "migo-shared",
+    "replacement": "Ok(Pooled::from_iter([Default::default()]))",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 80
+      },
+      "start": {
+        "column": 9,
+        "line": 72
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::new(Default::default()))\n@@ -64,25 +64,17 @@\n     }\n \n     /// Move `value` into a free slot without blocking.\n     ///\n     /// Exhaustion returns the unchanged value to the caller. It never grows\n     /// the pool and never allocates a replacement slot.\n     #[inline]\n     pub fn try_insert(&self, value: T) -> Result<Pooled<T>, T> {\n-        let mut slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Err(value),\n-        };\n-        slot.value.write(value);\n-        Ok(Pooled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Ok(Pooled::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// One initialized payload slot.\n ///\n /// Dropping it destroys the current value and returns the allocation to its\n /// originating pool, including when a containing channel command is rejected\n /// or discarded during shutdown.\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "PayloadPool<T>::try_insert",
+      "return_type": "-> Result<Pooled<T>, T>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 81
+        },
+        "start": {
+          "column": 5,
+          "line": 66
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:72:9: replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::new(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Ok(Pooled::new(Default::default()))",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 80
+      },
+      "start": {
+        "column": 9,
+        "line": 72
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::from(Default::default()))\n@@ -64,25 +64,17 @@\n     }\n \n     /// Move `value` into a free slot without blocking.\n     ///\n     /// Exhaustion returns the unchanged value to the caller. It never grows\n     /// the pool and never allocates a replacement slot.\n     #[inline]\n     pub fn try_insert(&self, value: T) -> Result<Pooled<T>, T> {\n-        let mut slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Err(value),\n-        };\n-        slot.value.write(value);\n-        Ok(Pooled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Ok(Pooled::from(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// One initialized payload slot.\n ///\n /// Dropping it destroys the current value and returns the allocation to its\n /// originating pool, including when a containing channel command is rejected\n /// or discarded during shutdown.\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "PayloadPool<T>::try_insert",
+      "return_type": "-> Result<Pooled<T>, T>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 81
+        },
+        "start": {
+          "column": 5,
+          "line": 66
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:72:9: replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::from(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Ok(Pooled::from(Default::default()))",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 80
+      },
+      "start": {
+        "column": 9,
+        "line": 72
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl Deref for Pooled<T>>::deref -> &Self::Target with Box::leak(Box::new(Default::default()))\n@@ -93,23 +93,17 @@\n \n impl<T> Deref for Pooled<T> {\n     type Target = T;\n \n     #[inline]\n     fn deref(&self) -> &Self::Target {\n         // SAFETY: `try_insert` initializes the slot before constructing this\n         // value, and only Drop takes it back out.\n-        unsafe {\n-            self.slot\n-                .as_ref()\n-                .expect(\"a live pooled payload owns its slot\")\n-                .value\n-                .assume_init_ref()\n-        }\n+        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl<T: fmt::Debug> fmt::Debug for Pooled<T> {\n     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n         self.deref().fmt(formatter)\n     }\n }\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl Deref for Pooled<T>>::deref",
+      "return_type": "-> &Self::Target",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 108
+        },
+        "start": {
+          "column": 5,
+          "line": 97
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:101:9: replace <impl Deref for Pooled<T>>::deref -> &Self::Target with Box::leak(Box::new(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Box::leak(Box::new(Default::default()))",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 107
+      },
+      "start": {
+        "column": 9,
+        "line": 101
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl fmt::Debug for Pooled<T>>::fmt -> fmt::Result with Ok(Default::default())\n@@ -105,17 +105,17 @@\n                 .value\n                 .assume_init_ref()\n         }\n     }\n }\n \n impl<T: fmt::Debug> fmt::Debug for Pooled<T> {\n     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n-        self.deref().fmt(formatter)\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl<T> Drop for Pooled<T> {\n     fn drop(&mut self) {\n         let mut slot = self\n             .slot\n             .take()\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl fmt::Debug for Pooled<T>>::fmt",
+      "return_type": "-> fmt::Result",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 114
+        },
+        "start": {
+          "column": 5,
+          "line": 112
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:113:9: replace <impl fmt::Debug for Pooled<T>>::fmt -> fmt::Result with Ok(Default::default())",
+    "package": "migo-shared",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 36,
+        "line": 113
+      },
+      "start": {
+        "column": 9,
+        "line": 113
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl Drop for Pooled<T>>::drop with ()\n@@ -111,30 +111,17 @@\n impl<T: fmt::Debug> fmt::Debug for Pooled<T> {\n     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n         self.deref().fmt(formatter)\n     }\n }\n \n impl<T> Drop for Pooled<T> {\n     fn drop(&mut self) {\n-        let mut slot = self\n-            .slot\n-            .take()\n-            .expect(\"a pooled payload returns its slot exactly once\");\n-        // SAFETY: the slot is initialized for the entire Pooled lifetime and\n-        // becomes uninitialized again before it is returned to the free list.\n-        unsafe { slot.value.assume_init_drop() };\n-        match self.pool.free_tx.try_send(slot) {\n-            Ok(()) => {}\n-            // Both cases indicate an invariant failure or final teardown. The\n-            // value has already been dropped, so releasing the empty allocation\n-            // is safe and preferable to panicking in Drop.\n-            Err(TrySendError::Full(slot) | TrySendError::Disconnected(slot)) => drop(slot),\n-        }\n+        () /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// A payload whose slot is reset in place rather than dropped.\n ///\n /// `recycle` runs on the consumer's thread when the loan falls out of scope. It\n /// decides what the slot keeps: the contents are gone either way, so what it is\n /// really choosing is which allocations survive to serve the next event.\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl Drop for Pooled<T>>::drop",
+      "return_type": "",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 133
+        },
+        "start": {
+          "column": 5,
+          "line": 118
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:119:9: replace <impl Drop for Pooled<T>>::drop with ()",
+    "package": "migo-shared",
+    "replacement": "()",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 132
+      },
+      "start": {
+        "column": 9,
+        "line": 119
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl Clone for RecyclePool<T>>::clone -> Self with Default::default()\n@@ -172,19 +172,17 @@\n /// first burst the high-water mark is already resident. Growth is bounded by\n /// `capacity`, so the pool can hold no more than the queue it feeds.\n pub struct RecyclePool<T: Recyclable> {\n     inner: Arc<RecycleInner<T>>,\n }\n \n impl<T: Recyclable> Clone for RecyclePool<T> {\n     fn clone(&self) -> Self {\n-        Self {\n-            inner: Arc::clone(&self.inner),\n-        }\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl<T: Recyclable> RecyclePool<T> {\n     /// # Panics\n     /// Panics when `capacity` is zero; a pool that can never hand out a slot\n     /// cannot make progress and is therefore a construction error.\n     #[must_use]\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl Clone for RecyclePool<T>>::clone",
+      "return_type": "-> Self",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 183
+        },
+        "start": {
+          "column": 5,
+          "line": 179
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:180:9: replace <impl Clone for RecyclePool<T>>::clone -> Self with Default::default()",
+    "package": "migo-shared",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 182
+      },
+      "start": {
+        "column": 9,
+        "line": 180
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with None\n@@ -203,24 +203,17 @@\n         }\n     }\n \n     /// Take a reset slot, or `None` when every slot is in flight.\n     ///\n     /// Never blocks and never exceeds the configured capacity.\n     #[inline]\n     pub fn try_acquire(&self) -> Option<Recycled<T>> {\n-        let slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.grow()?,\n-        };\n-        Some(Recycled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// The one path that allocates, taken at most `capacity` times per pool.\n     ///\n     /// Claiming the population slot before allocating is what bounds it: a\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::try_acquire",
+      "return_type": "-> Option<Recycled<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 219
+        },
+        "start": {
+          "column": 5,
+          "line": 206
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:211:9: replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with None",
+    "package": "migo-shared",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 218
+      },
+      "start": {
+        "column": 9,
+        "line": 211
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::new())\n@@ -203,24 +203,17 @@\n         }\n     }\n \n     /// Take a reset slot, or `None` when every slot is in flight.\n     ///\n     /// Never blocks and never exceeds the configured capacity.\n     #[inline]\n     pub fn try_acquire(&self) -> Option<Recycled<T>> {\n-        let slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.grow()?,\n-        };\n-        Some(Recycled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Some(Recycled::new()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// The one path that allocates, taken at most `capacity` times per pool.\n     ///\n     /// Claiming the population slot before allocating is what bounds it: a\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::try_acquire",
+      "return_type": "-> Option<Recycled<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 219
+        },
+        "start": {
+          "column": 5,
+          "line": 206
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:211:9: replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::new())",
+    "package": "migo-shared",
+    "replacement": "Some(Recycled::new())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 218
+      },
+      "start": {
+        "column": 9,
+        "line": 211
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::from_iter([Default::default()]))\n@@ -203,24 +203,17 @@\n         }\n     }\n \n     /// Take a reset slot, or `None` when every slot is in flight.\n     ///\n     /// Never blocks and never exceeds the configured capacity.\n     #[inline]\n     pub fn try_acquire(&self) -> Option<Recycled<T>> {\n-        let slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.grow()?,\n-        };\n-        Some(Recycled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Some(Recycled::from_iter([Default::default()])) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// The one path that allocates, taken at most `capacity` times per pool.\n     ///\n     /// Claiming the population slot before allocating is what bounds it: a\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::try_acquire",
+      "return_type": "-> Option<Recycled<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 219
+        },
+        "start": {
+          "column": 5,
+          "line": 206
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:211:9: replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::from_iter([Default::default()]))",
+    "package": "migo-shared",
+    "replacement": "Some(Recycled::from_iter([Default::default()]))",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 218
+      },
+      "start": {
+        "column": 9,
+        "line": 211
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::new(Default::default()))\n@@ -203,24 +203,17 @@\n         }\n     }\n \n     /// Take a reset slot, or `None` when every slot is in flight.\n     ///\n     /// Never blocks and never exceeds the configured capacity.\n     #[inline]\n     pub fn try_acquire(&self) -> Option<Recycled<T>> {\n-        let slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.grow()?,\n-        };\n-        Some(Recycled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Some(Recycled::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// The one path that allocates, taken at most `capacity` times per pool.\n     ///\n     /// Claiming the population slot before allocating is what bounds it: a\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::try_acquire",
+      "return_type": "-> Option<Recycled<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 219
+        },
+        "start": {
+          "column": 5,
+          "line": 206
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:211:9: replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::new(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Some(Recycled::new(Default::default()))",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 218
+      },
+      "start": {
+        "column": 9,
+        "line": 211
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::from(Default::default()))\n@@ -203,24 +203,17 @@\n         }\n     }\n \n     /// Take a reset slot, or `None` when every slot is in flight.\n     ///\n     /// Never blocks and never exceeds the configured capacity.\n     #[inline]\n     pub fn try_acquire(&self) -> Option<Recycled<T>> {\n-        let slot = match self.inner.free_rx.try_recv() {\n-            Ok(slot) => slot,\n-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.grow()?,\n-        };\n-        Some(Recycled {\n-            slot: Some(slot),\n-            pool: Arc::clone(&self.inner),\n-        })\n+        Some(Recycled::from(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// The one path that allocates, taken at most `capacity` times per pool.\n     ///\n     /// Claiming the population slot before allocating is what bounds it: a\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::try_acquire",
+      "return_type": "-> Option<Recycled<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 219
+        },
+        "start": {
+          "column": 5,
+          "line": 206
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:211:9: replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with Some(Recycled::from(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Some(Recycled::from(Default::default()))",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 218
+      },
+      "start": {
+        "column": 9,
+        "line": 211
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::grow -> Option<Box<T>> with None\n@@ -220,33 +220,17 @@\n \n     /// The one path that allocates, taken at most `capacity` times per pool.\n     ///\n     /// Claiming the population slot before allocating is what bounds it: a\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n     fn grow(&self) -> Option<Box<T>> {\n-        use std::sync::atomic::Ordering;\n-\n-        let mut population = self.inner.population.load(Ordering::Relaxed);\n-        loop {\n-            if population == self.inner.capacity {\n-                return None;\n-            }\n-            match self.inner.population.compare_exchange_weak(\n-                population,\n-                population + 1,\n-                Ordering::Relaxed,\n-                Ordering::Relaxed,\n-            ) {\n-                Ok(_) => return Some(Box::default()),\n-                Err(observed) => population = observed,\n-            }\n-        }\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Slots created so far, for tests that need to see growth stop.\n     #[must_use]\n     pub fn population(&self) -> usize {\n         self.inner\n             .population\n             .load(std::sync::atomic::Ordering::Relaxed)\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::grow",
+      "return_type": "-> Option<Box<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 245
+        },
+        "start": {
+          "column": 5,
+          "line": 221
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:228:9: replace RecyclePool<T>::grow -> Option<Box<T>> with None",
+    "package": "migo-shared",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 244
+      },
+      "start": {
+        "column": 9,
+        "line": 228
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::grow -> Option<Box<T>> with Some(Box::new(Default::default()))\n@@ -220,33 +220,17 @@\n \n     /// The one path that allocates, taken at most `capacity` times per pool.\n     ///\n     /// Claiming the population slot before allocating is what bounds it: a\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n     fn grow(&self) -> Option<Box<T>> {\n-        use std::sync::atomic::Ordering;\n-\n-        let mut population = self.inner.population.load(Ordering::Relaxed);\n-        loop {\n-            if population == self.inner.capacity {\n-                return None;\n-            }\n-            match self.inner.population.compare_exchange_weak(\n-                population,\n-                population + 1,\n-                Ordering::Relaxed,\n-                Ordering::Relaxed,\n-            ) {\n-                Ok(_) => return Some(Box::default()),\n-                Err(observed) => population = observed,\n-            }\n-        }\n+        Some(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Slots created so far, for tests that need to see growth stop.\n     #[must_use]\n     pub fn population(&self) -> usize {\n         self.inner\n             .population\n             .load(std::sync::atomic::Ordering::Relaxed)\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::grow",
+      "return_type": "-> Option<Box<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 245
+        },
+        "start": {
+          "column": 5,
+          "line": 221
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:228:9: replace RecyclePool<T>::grow -> Option<Box<T>> with Some(Box::new(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Some(Box::new(Default::default()))",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 244
+      },
+      "start": {
+        "column": 9,
+        "line": 228
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace == with != in RecyclePool<T>::grow\n@@ -224,17 +224,17 @@\n     /// concurrent grower that loses the exchange retries against the new value\n     /// and stops at the cap rather than racing past it.\n     #[cold]\n     fn grow(&self) -> Option<Box<T>> {\n         use std::sync::atomic::Ordering;\n \n         let mut population = self.inner.population.load(Ordering::Relaxed);\n         loop {\n-            if population == self.inner.capacity {\n+            if population != /* ~ changed by cargo-mutants ~ */ self.inner.capacity {\n                 return None;\n             }\n             match self.inner.population.compare_exchange_weak(\n                 population,\n                 population + 1,\n                 Ordering::Relaxed,\n                 Ordering::Relaxed,\n             ) {\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::grow",
+      "return_type": "-> Option<Box<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 245
+        },
+        "start": {
+          "column": 5,
+          "line": 221
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/shared/src/payload_pool.rs:232:27: replace == with != in RecyclePool<T>::grow",
+    "package": "migo-shared",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 29,
+        "line": 232
+      },
+      "start": {
+        "column": 27,
+        "line": 232
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace + with - in RecyclePool<T>::grow\n@@ -229,17 +229,17 @@\n \n         let mut population = self.inner.population.load(Ordering::Relaxed);\n         loop {\n             if population == self.inner.capacity {\n                 return None;\n             }\n             match self.inner.population.compare_exchange_weak(\n                 population,\n-                population + 1,\n+                population - /* ~ changed by cargo-mutants ~ */ 1,\n                 Ordering::Relaxed,\n                 Ordering::Relaxed,\n             ) {\n                 Ok(_) => return Some(Box::default()),\n                 Err(observed) => population = observed,\n             }\n         }\n     }\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::grow",
+      "return_type": "-> Option<Box<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 245
+        },
+        "start": {
+          "column": 5,
+          "line": 221
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/shared/src/payload_pool.rs:237:28: replace + with - in RecyclePool<T>::grow",
+    "package": "migo-shared",
+    "replacement": "-",
+    "span": {
+      "end": {
+        "column": 29,
+        "line": 237
+      },
+      "start": {
+        "column": 28,
+        "line": 237
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace + with * in RecyclePool<T>::grow\n@@ -229,17 +229,17 @@\n \n         let mut population = self.inner.population.load(Ordering::Relaxed);\n         loop {\n             if population == self.inner.capacity {\n                 return None;\n             }\n             match self.inner.population.compare_exchange_weak(\n                 population,\n-                population + 1,\n+                population * /* ~ changed by cargo-mutants ~ */ 1,\n                 Ordering::Relaxed,\n                 Ordering::Relaxed,\n             ) {\n                 Ok(_) => return Some(Box::default()),\n                 Err(observed) => population = observed,\n             }\n         }\n     }\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::grow",
+      "return_type": "-> Option<Box<T>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 245
+        },
+        "start": {
+          "column": 5,
+          "line": 221
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/shared/src/payload_pool.rs:237:28: replace + with * in RecyclePool<T>::grow",
+    "package": "migo-shared",
+    "replacement": "*",
+    "span": {
+      "end": {
+        "column": 29,
+        "line": 237
+      },
+      "start": {
+        "column": 28,
+        "line": 237
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::population -> usize with 0\n@@ -242,19 +242,17 @@\n                 Err(observed) => population = observed,\n             }\n         }\n     }\n \n     /// Slots created so far, for tests that need to see growth stop.\n     #[must_use]\n     pub fn population(&self) -> usize {\n-        self.inner\n-            .population\n-            .load(std::sync::atomic::Ordering::Relaxed)\n+        0 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// One payload on loan from its [`RecyclePool`], returned by drop glue.\n ///\n /// The return is drop glue rather than an obligation for the same reason the\n /// command vector pool made that choice: a forgotten `release` is invisible,\n /// because every caller still gets a payload and a pool that has silently\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::population",
+      "return_type": "-> usize",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 253
+        },
+        "start": {
+          "column": 5,
+          "line": 247
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:250:9: replace RecyclePool<T>::population -> usize with 0",
+    "package": "migo-shared",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 56,
+        "line": 252
+      },
+      "start": {
+        "column": 9,
+        "line": 250
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace RecyclePool<T>::population -> usize with 1\n@@ -242,19 +242,17 @@\n                 Err(observed) => population = observed,\n             }\n         }\n     }\n \n     /// Slots created so far, for tests that need to see growth stop.\n     #[must_use]\n     pub fn population(&self) -> usize {\n-        self.inner\n-            .population\n-            .load(std::sync::atomic::Ordering::Relaxed)\n+        1 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// One payload on loan from its [`RecyclePool`], returned by drop glue.\n ///\n /// The return is drop glue rather than an obligation for the same reason the\n /// command vector pool made that choice: a forgotten `release` is invisible,\n /// because every caller still gets a payload and a pool that has silently\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "RecyclePool<T>::population",
+      "return_type": "-> usize",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 253
+        },
+        "start": {
+          "column": 5,
+          "line": 247
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:250:9: replace RecyclePool<T>::population -> usize with 1",
+    "package": "migo-shared",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 56,
+        "line": 252
+      },
+      "start": {
+        "column": 9,
+        "line": 250
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl Deref for Recycled<T>>::deref -> &T with Box::leak(Box::new(Default::default()))\n@@ -264,19 +264,17 @@\n     pool: Arc<RecycleInner<T>>,\n }\n \n impl<T: Recyclable> Deref for Recycled<T> {\n     type Target = T;\n \n     #[inline]\n     fn deref(&self) -> &T {\n-        self.slot\n-            .as_ref()\n-            .expect(\"a live recycled payload owns its slot\")\n+        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl<T: Recyclable> DerefMut for Recycled<T> {\n     #[inline]\n     fn deref_mut(&mut self) -> &mut T {\n         self.slot\n             .as_mut()\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl Deref for Recycled<T>>::deref",
+      "return_type": "-> &T",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 275
+        },
+        "start": {
+          "column": 5,
+          "line": 270
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:272:9: replace <impl Deref for Recycled<T>>::deref -> &T with Box::leak(Box::new(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Box::leak(Box::new(Default::default()))",
+    "span": {
+      "end": {
+        "column": 61,
+        "line": 274
+      },
+      "start": {
+        "column": 9,
+        "line": 272
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl DerefMut for Recycled<T>>::deref_mut -> &mut T with Box::leak(Box::new(Default::default()))\n@@ -273,19 +273,17 @@\n             .as_ref()\n             .expect(\"a live recycled payload owns its slot\")\n     }\n }\n \n impl<T: Recyclable> DerefMut for Recycled<T> {\n     #[inline]\n     fn deref_mut(&mut self) -> &mut T {\n-        self.slot\n-            .as_mut()\n-            .expect(\"a live recycled payload owns its slot\")\n+        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl<T: Recyclable + fmt::Debug> fmt::Debug for Recycled<T> {\n     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n         self.deref().fmt(formatter)\n     }\n }\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl DerefMut for Recycled<T>>::deref_mut",
+      "return_type": "-> &mut T",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 284
+        },
+        "start": {
+          "column": 5,
+          "line": 279
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:281:9: replace <impl DerefMut for Recycled<T>>::deref_mut -> &mut T with Box::leak(Box::new(Default::default()))",
+    "package": "migo-shared",
+    "replacement": "Box::leak(Box::new(Default::default()))",
+    "span": {
+      "end": {
+        "column": 61,
+        "line": 283
+      },
+      "start": {
+        "column": 9,
+        "line": 281
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl fmt::Debug for Recycled<T>>::fmt -> fmt::Result with Ok(Default::default())\n@@ -281,17 +281,17 @@\n         self.slot\n             .as_mut()\n             .expect(\"a live recycled payload owns its slot\")\n     }\n }\n \n impl<T: Recyclable + fmt::Debug> fmt::Debug for Recycled<T> {\n     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n-        self.deref().fmt(formatter)\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl<T: Recyclable> Drop for Recycled<T> {\n     fn drop(&mut self) {\n         let mut slot = self\n             .slot\n             .take()\n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl fmt::Debug for Recycled<T>>::fmt",
+      "return_type": "-> fmt::Result",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 290
+        },
+        "start": {
+          "column": 5,
+          "line": 288
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:289:9: replace <impl fmt::Debug for Recycled<T>>::fmt -> fmt::Result with Ok(Default::default())",
+    "package": "migo-shared",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 36,
+        "line": 289
+      },
+      "start": {
+        "column": 9,
+        "line": 289
+      }
+    }
+  },
+  {
+    "diff": "--- crates/shared/src/payload_pool.rs\n+++ replace <impl Drop for Recycled<T>>::drop with ()\n@@ -287,30 +287,17 @@\n impl<T: Recyclable + fmt::Debug> fmt::Debug for Recycled<T> {\n     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n         self.deref().fmt(formatter)\n     }\n }\n \n impl<T: Recyclable> Drop for Recycled<T> {\n     fn drop(&mut self) {\n-        let mut slot = self\n-            .slot\n-            .take()\n-            .expect(\"a recycled payload returns its slot exactly once\");\n-        slot.recycle();\n-        match self.pool.free_tx.try_send(slot) {\n-            Ok(()) => {}\n-            // Unreachable while the invariant holds — the channel has room for\n-            // the whole population, and holding a loan keeps both endpoints\n-            // alive — so releasing the allocation is preferable to panicking in\n-            // Drop. The population counter deliberately keeps counting it: a\n-            // pool that lost a slot must not grow past its cap to replace it.\n-            Err(TrySendError::Full(slot) | TrySendError::Disconnected(slot)) => drop(slot),\n-        }\n+        () /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n #[cfg(test)]\n mod recycle_pool_tests {\n     use super::{RecyclePool, Recyclable, Recycled};\n     use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};\n \n",
+    "file": "crates/shared/src/payload_pool.rs",
+    "function": {
+      "function_name": "<impl Drop for Recycled<T>>::drop",
+      "return_type": "",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 309
+        },
+        "start": {
+          "column": 5,
+          "line": 294
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/shared/src/payload_pool.rs:295:9: replace <impl Drop for Recycled<T>>::drop with ()",
+    "package": "migo-shared",
+    "replacement": "()",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 308
+      },
+      "start": {
+        "column": 9,
+        "line": 295
+      }
+    }
+  }
+]

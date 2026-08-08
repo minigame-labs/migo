@@ -1,0 +1,34 @@
+--- crates/shared/src/payload_pool.rs
++++ replace <impl Drop for Recycled<T>>::drop with ()
+@@ -287,30 +287,17 @@
+ impl<T: Recyclable + fmt::Debug> fmt::Debug for Recycled<T> {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+         self.deref().fmt(formatter)
+     }
+ }
+ 
+ impl<T: Recyclable> Drop for Recycled<T> {
+     fn drop(&mut self) {
+-        let mut slot = self
+-            .slot
+-            .take()
+-            .expect("a recycled payload returns its slot exactly once");
+-        slot.recycle();
+-        match self.pool.free_tx.try_send(slot) {
+-            Ok(()) => {}
+-            // Unreachable while the invariant holds — the channel has room for
+-            // the whole population, and holding a loan keeps both endpoints
+-            // alive — so releasing the allocation is preferable to panicking in
+-            // Drop. The population counter deliberately keeps counting it: a
+-            // pool that lost a slot must not grow past its cap to replace it.
+-            Err(TrySendError::Full(slot) | TrySendError::Disconnected(slot)) => drop(slot),
+-        }
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::{PayloadPool, Pooled};
+     use crate::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
+     use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};

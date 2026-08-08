@@ -1,0 +1,27 @@
+--- crates/shared/src/payload_pool.rs
++++ replace <impl Deref for Pooled<T>>::deref -> &Self::Target with Box::leak(Box::new(Default::default()))
+@@ -93,23 +93,17 @@
+ 
+ impl<T> Deref for Pooled<T> {
+     type Target = T;
+ 
+     #[inline]
+     fn deref(&self) -> &Self::Target {
+         // SAFETY: `try_insert` initializes the slot before constructing this
+         // value, and only Drop takes it back out.
+-        unsafe {
+-            self.slot
+-                .as_ref()
+-                .expect("a live pooled payload owns its slot")
+-                .value
+-                .assume_init_ref()
+-        }
++        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl<T: fmt::Debug> fmt::Debug for Pooled<T> {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+         self.deref().fmt(formatter)
+     }
+ }

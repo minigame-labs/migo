@@ -1,0 +1,21 @@
+--- crates/shared/src/payload_pool.rs
++++ replace + with * in RecyclePool<T>::grow
+@@ -229,17 +229,17 @@
+ 
+         let mut population = self.inner.population.load(Ordering::Relaxed);
+         loop {
+             if population == self.inner.capacity {
+                 return None;
+             }
+             match self.inner.population.compare_exchange_weak(
+                 population,
+-                population + 1,
++                population * /* ~ changed by cargo-mutants ~ */ 1,
+                 Ordering::Relaxed,
+                 Ordering::Relaxed,
+             ) {
+                 Ok(_) => return Some(Box::default()),
+                 Err(observed) => population = observed,
+             }
+         }
+     }
