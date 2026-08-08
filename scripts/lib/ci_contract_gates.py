@@ -41,7 +41,11 @@ NEEDS = {
     "scripts/test-surface-attachment-contract.sh": "rg",
     "scripts/test-x11-owned-connection-contract.sh": "rg",
     "scripts/test-release-asset-ordering-contract.sh": "pyyaml",
-    # These compile the Java half themselves before reading it.
+    # These compile the Java half themselves before reading it -- checked, not
+    # assumed. The host-API gate did not, and inherited this line's reason from
+    # the entry below it: it read whatever bytecode an earlier build had left, so
+    # it failed on a cold tree and *passed* on a stale one. Only a gate that
+    # compiles what it reads may be listed here.
     "scripts/test-android-host-api-contract.sh": "gradlew",
     "scripts/test-camera-frame-jni-contract.sh": "gradlew",
 }
