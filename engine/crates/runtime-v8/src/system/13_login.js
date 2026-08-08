@@ -4,20 +4,17 @@ import {
     op_get_user_info,
     op_get_phone_number,
 } from "ext:core/ops";
+import {
+    allocateHostCallbackId,
+    parseHostCallbackId,
+} from "ext:host_v8_base/02_async.js";
 
 const noop = () => {};
 
-let _nextRequestId = 1;
 const _pendingLogin = new Map();
 const _pendingCheckSession = new Map();
 const _pendingUserInfo = new Map();
 const _pendingPhoneNumber = new Map();
-
-function _nextId() {
-    const id = _nextRequestId;
-    _nextRequestId += 1;
-    return id;
-}
 
 function _safeErrorMessage(error) {
     if (!error) return "unknown error";
@@ -64,18 +61,18 @@ function _normalizeLang(value) {
 
 function login(options = {}) {
     const opts = options && typeof options === "object" ? options : {};
-    const requestId = _nextId();
     const success = typeof opts.success === "function" ? opts.success : noop;
     const fail = typeof opts.fail === "function" ? opts.fail : noop;
     const complete = typeof opts.complete === "function" ? opts.complete : noop;
-
-    _pendingLogin.set(requestId, { success, fail, complete });
 
     const timeout = Number.isFinite(opts.timeout) && opts.timeout > 0
         ? Math.floor(opts.timeout)
         : undefined;
 
+    let requestId;
     try {
+        requestId = allocateHostCallbackId();
+        _pendingLogin.set(requestId, { success, fail, complete });
         op_login(JSON.stringify({ requestId, timeout }));
     } catch (error) {
         _pendingLogin.delete(requestId);
@@ -89,21 +86,21 @@ function login(options = {}) {
 
 function checkSession(options = {}) {
     const opts = options && typeof options === "object" ? options : {};
-    const requestId = _nextId();
     const success = typeof opts.success === "function" ? opts.success : noop;
     const fail = typeof opts.fail === "function" ? opts.fail : noop;
     const complete = typeof opts.complete === "function" ? opts.complete : noop;
 
     return new Promise(function (resolve, reject) {
-        _pendingCheckSession.set(requestId, {
-            success,
-            fail,
-            complete,
-            resolve,
-            reject,
-        });
-
+        let requestId;
         try {
+            requestId = allocateHostCallbackId();
+            _pendingCheckSession.set(requestId, {
+                success,
+                fail,
+                complete,
+                resolve,
+                reject,
+            });
             op_check_session(JSON.stringify({ requestId }));
         } catch (error) {
             _pendingCheckSession.delete(requestId);
@@ -119,17 +116,17 @@ function checkSession(options = {}) {
 
 function getUserInfo(options = {}) {
     const opts = options && typeof options === "object" ? options : {};
-    const requestId = _nextId();
     const success = typeof opts.success === "function" ? opts.success : noop;
     const fail = typeof opts.fail === "function" ? opts.fail : noop;
     const complete = typeof opts.complete === "function" ? opts.complete : noop;
 
-    _pendingUserInfo.set(requestId, { success, fail, complete });
-
     const withCredentials = opts.withCredentials === true;
     const lang = _normalizeLang(opts.lang);
 
+    let requestId;
     try {
+        requestId = allocateHostCallbackId();
+        _pendingUserInfo.set(requestId, { success, fail, complete });
         op_get_user_info(JSON.stringify({ requestId, withCredentials, lang }));
     } catch (error) {
         _pendingUserInfo.delete(requestId);
@@ -143,17 +140,17 @@ function getUserInfo(options = {}) {
 
 function getPhoneNumber(options = {}) {
     const opts = options && typeof options === "object" ? options : {};
-    const requestId = _nextId();
     const success = typeof opts.success === "function" ? opts.success : noop;
     const fail = typeof opts.fail === "function" ? opts.fail : noop;
     const complete = typeof opts.complete === "function" ? opts.complete : noop;
 
-    _pendingPhoneNumber.set(requestId, { success, fail, complete });
-
     const isRealtime = opts.isRealtime === true;
     const phoneNumberNoQuotaToast = opts.phoneNumberNoQuotaToast !== false;
 
+    let requestId;
     try {
+        requestId = allocateHostCallbackId();
+        _pendingPhoneNumber.set(requestId, { success, fail, complete });
         op_get_phone_number(JSON.stringify({
             requestId,
             isRealtime,
@@ -171,8 +168,8 @@ function getPhoneNumber(options = {}) {
 
 function _internalOnLoginResult(resultJson) {
     const result = _parseResultJson(resultJson);
-    const requestId = Number(result.requestId);
-    if (!Number.isFinite(requestId)) {
+    const requestId = parseHostCallbackId(result.requestId);
+    if (requestId === null) {
         return;
     }
 
@@ -209,8 +206,8 @@ function _internalOnLoginResult(resultJson) {
 
 function _internalOnCheckSessionResult(resultJson) {
     const result = _parseResultJson(resultJson);
-    const requestId = Number(result.requestId);
-    if (!Number.isFinite(requestId)) {
+    const requestId = parseHostCallbackId(result.requestId);
+    if (requestId === null) {
         return;
     }
 
@@ -239,8 +236,8 @@ function _internalOnCheckSessionResult(resultJson) {
 
 function _internalOnGetUserInfoResult(resultJson) {
     const result = _parseResultJson(resultJson);
-    const requestId = Number(result.requestId);
-    if (!Number.isFinite(requestId)) {
+    const requestId = parseHostCallbackId(result.requestId);
+    if (requestId === null) {
         return;
     }
 
@@ -291,8 +288,8 @@ function _internalOnGetUserInfoResult(resultJson) {
 
 function _internalOnGetPhoneNumberResult(resultJson) {
     const result = _parseResultJson(resultJson);
-    const requestId = Number(result.requestId);
-    if (!Number.isFinite(requestId)) {
+    const requestId = parseHostCallbackId(result.requestId);
+    if (requestId === null) {
         return;
     }
 
@@ -331,7 +328,6 @@ function _internalOnGetPhoneNumberResult(resultJson) {
 // Delegates to getUserInfo internally.
 function getUserProfile(options = {}) {
     const opts = options && typeof options === "object" ? options : {};
-    const requestId = _nextId();
     const success = typeof opts.success === "function" ? opts.success : noop;
     const fail = typeof opts.fail === "function" ? opts.fail : noop;
     const complete = typeof opts.complete === "function" ? opts.complete : noop;
@@ -340,13 +336,14 @@ function getUserProfile(options = {}) {
     const desc = typeof opts.desc === "string" ? opts.desc : "";
 
     return new Promise(function (resolve, reject) {
-        _pendingUserInfo.set(requestId, {
-            success: function (res) { success(res); resolve(res); },
-            fail: function (res) { fail(res); reject(res); },
-            complete,
-        });
-
+        let requestId;
         try {
+            requestId = allocateHostCallbackId();
+            _pendingUserInfo.set(requestId, {
+                success: function (res) { success(res); resolve(res); },
+                fail: function (res) { fail(res); reject(res); },
+                complete,
+            });
             op_get_user_info(JSON.stringify({
                 requestId,
                 withCredentials: false,

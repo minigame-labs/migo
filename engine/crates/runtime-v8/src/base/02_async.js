@@ -373,4 +373,17 @@ function errorToString(err) {
     return stack ? base + '\n' + stack : base;
 }
 
-export { wrapAsync, promisify, createDeferredApi, createListenerGroup, createCallbackEvent, errorToString };
+export {
+    wrapAsync,
+    promisify,
+    createDeferredApi,
+    createListenerGroup,
+    createCallbackEvent,
+    errorToString,
+    // Exported for the modules that own their own pending maps rather
+    // than going through createDeferredApi. They must draw from the same
+    // space and apply the same parser -- a second allocator or a looser
+    // parser here is a second answer to who an id belongs to.
+    allocateHostCallbackId,
+    parseHostCallbackId,
+};

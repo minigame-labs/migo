@@ -34,8 +34,10 @@ mod runtime_restart_boundary_tests {
         esm_entry_point = "ext:deferred_test_bridge/bridge.js",
         esm = ["ext:deferred_test_bridge/bridge.js" = {
             source = r#"
-                import { createDeferredApi } from "ext:host_v8_base/02_async.js";
+                import { allocateHostCallbackId, createDeferredApi }
+                    from "ext:host_v8_base/02_async.js";
                 globalThis.__createDeferredApi = createDeferredApi;
+                globalThis.__allocId = allocateHostCallbackId;
             "#
         },],
     );
@@ -62,7 +64,10 @@ mod runtime_restart_boundary_tests {
             raf_rx: None,
             raf_demand: Arc::new(shared::raf_signal::RafDemand::new()),
             request_vsync: None,
-            sub_packages: Vec::new(),
+            // One configured subpackage, so `loadSubpackage` resolves and reaches
+            // the allocation instead of failing validation first -- an unreached
+            // allocation site looks exactly like one that does not allocate.
+            sub_packages: vec![("sub".to_owned(), "sub/".to_owned())],
             workers_path: None,
             network_policy: NetworkPolicy::default(),
             backgrounded: Arc::new(AtomicBool::new(false)),
@@ -235,6 +240,54 @@ mod runtime_restart_boundary_tests {
             "__api.settle(JSON.stringify({ requestId: __ids[0] }));",
         );
         assert_js(&mut rt, "__settled.join(',') === 'second,first'");
+    }
+
+    #[test]
+    fn modules_with_their_own_pending_maps_draw_from_the_same_space() {
+        // login, payment and subpackage each kept a module-local counter that
+        // restarted at 1, so two of them handed the platform the same id for
+        // different requests and a restart reissued ids it had already used.
+        //
+        // Bracketed with two allocations instead of counted from Rust: the
+        // difference is exact regardless of how many APIs the profile ships, and
+        // Slim drops commerce, so a fixed total would assert the product
+        // configuration rather than the property. Absent APIs are skipped
+        // out loud rather than silently making the sum work out.
+        let mut rt = boot(Arc::new(CallbackIdAllocator::default()));
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__checked = [];
+            globalThis.__assertTakesOneId = function (name, fn) {
+                if (typeof fn !== 'function') return;
+                const before = globalThis.__allocId();
+                try {
+                    const out = fn();
+                    if (out && typeof out.catch === 'function') out.catch(function () {});
+                } catch (e) {
+                    // The platform boundary throws in this harness -- no host is
+                    // listening. Allocation happens first, which is the property.
+                }
+                const after = globalThis.__allocId();
+                if (after - before !== 2) {
+                    throw new Error(
+                        name + ' took ' + (after - before - 1) + ' ids from the Host space, want 1'
+                    );
+                }
+                globalThis.__checked.push(name);
+            };
+
+            __assertTakesOneId('wx.login', wx.login && function () { return wx.login({}); });
+            __assertTakesOneId(
+                'wx.requestMidasPayment',
+                wx.requestMidasPayment && function () { return wx.requestMidasPayment({ offerId: 'x' }); },
+            );
+            __assertTakesOneId('wx.loadSubpackage', function () { return wx.loadSubpackage({ name: 'sub' }); });
+            "#,
+        );
+
+        // At least one had to be present, or the test proved nothing at all.
+        assert_js(&mut rt, "__checked.length > 0");
     }
 
     #[test]
