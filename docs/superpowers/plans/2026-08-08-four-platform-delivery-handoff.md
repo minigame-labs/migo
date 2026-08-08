@@ -252,9 +252,18 @@ reviews are user-triggered (§6).
    only genuinely unmerged work in the repository; item 0.11 has the detail. A
    `git branch -D` loses it, because there is no remote copy.
 
-1. **The remaining phase-0 epics**: 0.7/A7 (Android capability enforcement, 30
-   protected and 8 cleanup operations), 0.8/A8, 0.9/A9, 0.10/A10, 0.11/A11, 0.13
-   HarmonyOS, 0.14/A13. Most have their own detailed plan named in the ledger entry.
+1. **The remaining phase-0 epics, sorted by what they actually need.** "Most have
+   their own detailed plan" was wrong — only A1–A4 have plan files, and A5–A14
+   mostly do not. Sorting them this way is what makes them startable:
+
+   | Item | What it needs | Why |
+   |---|---|---|
+   | 0.9/A9 | **execute** | has a 12-task plan, `2026-08-02-runtime-restart-generation-boundary.md` |
+   | 0.13 | **execute, partly device-blocked** | the entry states four concrete deliverables (ArkTS lifecycle hooks, `OHNativeWindow` release barrier, multi-touch, restart/shutdown barriers); spec §6.2 governs. Compile-level work is now verifiable locally via the T.8 lane; behaviour needs the emulator |
+   | 0.8/A8 | **split, then audit** | five clauses in one line, one already closed as 0.12's third; the C ABI half overlaps the branch in 0.11 |
+   | 0.11/A11 | **decide** | see item 0 above |
+   | 0.10/A10 | **write the requirement first** | "Canvas recovery as one transactional resource operation" has no plan file and no acceptance line in the spec — §6 runs 6.1–6.6 and none is canvas recovery. It cannot be audited against an object that does not exist, and inventing the criterion is a design decision, not verification |
+   | 0.7/A7, 0.14/A13 | **audited 2026-08-09** | read the entries; 0.7 is substantially in place, 0.14 has measured counts |
 2. **Phase 1 hermetic builds** — `part-phase-1.md`, 18 open items.
 
 **Before starting any of them, check the recorded obstacle against the object it
