@@ -367,6 +367,21 @@ std::uint32_t dom_button(Qt::MouseButton button) noexcept {
     }
 }
 
+// The button a move names, from the set still held after the event.
+//
+// `include/migo/input.h` says a move "names the button being held", so this has
+// to be asked of the event rather than remembered: a remembered ordinal survives
+// the release that ends the drag, and every later hover then reports a button
+// nobody is holding. Lowest ordinal first, because the ABI's field is one button
+// while Qt's mask is several, and primary is the one content acts on.
+std::uint32_t dom_button_held(Qt::MouseButtons buttons) noexcept {
+    for (const Qt::MouseButton candidate : {Qt::LeftButton, Qt::MiddleButton, Qt::RightButton,
+                                            Qt::BackButton, Qt::ForwardButton}) {
+        if (buttons & candidate) return dom_button(candidate);
+    }
+    return 0;
+}
+
 }  // namespace
 
 void MigoQtX11SurfaceView::deliverPointer(const QMouseEvent &event, std::uint32_t kind) {
@@ -374,7 +389,11 @@ void MigoQtX11SurfaceView::deliverPointer(const QMouseEvent &event, std::uint32_
     out.struct_size = static_cast<std::uint32_t>(sizeof(out));
     out.abi_version = MIGO_ABI_VERSION_1;
     out.event_type = kind;
-    out.button = held_button_;
+    // A press or a release names the button that changed state; a move names what
+    // is still down. Both come from the event, so there is no remembered ordinal
+    // to go stale between them.
+    out.button = kind == MIGO_POINTER_EVENT_MOVE ? dom_button_held(event.buttons())
+                                                 : dom_button(event.button());
     out.x = last_pointer_x_;
     out.y = last_pointer_y_;
     out.timestamp_ms = static_cast<double>(event.timestamp());
@@ -410,7 +429,6 @@ void MigoQtX11SurfaceView::mousePressEvent(QMouseEvent *event) {
     if (!inputIsDeliverable()) return;
     last_pointer_x_ = static_cast<float>(event->position().x());
     last_pointer_y_ = static_cast<float>(event->position().y());
-    held_button_ = dom_button(event->button());
     const bool first_press = !mouse_pressed_;
     mouse_pressed_ = true;
     if (pointer_delivery_ != PointerDelivery::TouchOnly) {
@@ -439,7 +457,6 @@ void MigoQtX11SurfaceView::mouseReleaseEvent(QMouseEvent *event) {
     if (!inputIsDeliverable()) return;
     last_pointer_x_ = static_cast<float>(event->position().x());
     last_pointer_y_ = static_cast<float>(event->position().y());
-    held_button_ = dom_button(event->button());
     const bool was_pressed = mouse_pressed_;
     mouse_pressed_ = false;
     if (pointer_delivery_ != PointerDelivery::TouchOnly) {

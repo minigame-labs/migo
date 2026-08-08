@@ -176,10 +176,11 @@ private:
     /// Fixed storage for one touch batch. The ABI's maximum is small and known,
     /// so the delivery path never allocates however many fingers arrive.
     std::array<MigoTouchPoint, MIGO_TOUCH_MAX_POINTS> touch_points_{};
-    /// The mouse button currently held, tracked so a focus loss can retract the
-    /// press the content is still waiting to see released.
+    /// True while a mouse button is down, so a focus loss can retract the press
+    /// the content is still waiting to see released. Which button is held is not
+    /// tracked: the ABI asks a move to name the button being held, and the event
+    /// already carries that, whereas a remembered ordinal outlives its release.
     bool mouse_pressed_ = false;
-    std::uint32_t held_button_ = 0;
     float last_pointer_x_ = 0.0F;
     float last_pointer_y_ = 0.0F;
     /// True between compositionstart and compositionend.
