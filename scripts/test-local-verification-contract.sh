@@ -104,6 +104,14 @@ add_stub_crate() {
 name = "migo-$name"
 version = "0.0.0"
 edition = "2021"
+
+# The real crates select their capability surface with these, and the host steps
+# run both, so a stub without them fails the Slim step on a missing feature
+# rather than on anything this contract is about.
+[features]
+default = ["profile-full"]
+profile-full = []
+profile-slim = []
 EOF
     cat > "$repo/engine/$group/$name/src/lib.rs" <<'EOF'
 pub fn present() -> bool {
@@ -126,6 +134,10 @@ new_fixture() {
     mkdir -p "$repo/scripts/lib" "$repo/docs" "$repo/engine"
     cp "$ROOT/scripts/verify-change.sh" "$repo/scripts/"
     cp "$ROOT/scripts/lib/verification_targets.py" "$repo/scripts/lib/"
+    # Every helper the script calls, not just the selector: a missing one makes the
+    # run fail for a reason unrelated to the property under test, which is the
+    # shape of an always-red gate.
+    cp "$ROOT/scripts/lib/ci_contract_gates.py" "$repo/scripts/lib/"
     {
         printf '[workspace]\nresolver = "2"\nmembers = [\n'
         for crate in "${STUB_CRATES[@]}"; do
@@ -147,6 +159,44 @@ new_fixture() {
     git_quiet "$repo" add -A
     git_quiet "$repo" commit -q -m "baseline"
     echo "$repo"
+}
+
+# A fixture whose workflow really has a quality-gate job, so the lane has gates to
+# run. Without one the only contract line a run produces is the "no workflow here"
+# verdict, which is recorded before the loop -- and a mutant that deleted the loop
+# entirely walked past an assertion on that line.
+#
+# Sixteen stubs because the derivation refuses a job with fewer than fifteen gates,
+# on the grounds that a lane that small is a parse which stopped matching. The
+# fixture has to clear the real floor rather than the floor being made tunable: a
+# knob that switches off an anti-vacuity check is a knob that switches it off in
+# production too.
+add_stub_gates() {
+    local repo="$1" failing="${2:-}"
+    mkdir -p "$repo/.github/workflows"
+    {
+        printf 'jobs:\n  quality-gate:\n    steps:\n'
+        for index in $(seq 1 16); do
+            printf '      - name: stub %s\n        run: bash scripts/test-stub-%s-contract.sh\n' \
+                "$index" "$index"
+            # Stub 1 drains stdin on purpose. A real gate does -- one of them runs
+            # `cargo` -- and when the lane iterated a here-string it swallowed
+            # every gate after it, which is how three gates and a verdict line
+            # went missing from a run that still reported success.
+            if [[ "$index" == "1" ]]; then
+                printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' \
+                    > "$repo/scripts/test-stub-$index-contract.sh"
+            else
+                printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/scripts/test-stub-$index-contract.sh"
+            fi
+            chmod +x "$repo/scripts/test-stub-$index-contract.sh"
+        done
+    } > "$repo/.github/workflows/pr-ci.yml"
+    if [[ -n "$failing" ]]; then
+        # The last gate, so a refusal is only observable if the lane got that far.
+        printf '#!/usr/bin/env bash\necho "stub gate refuses"\nexit 1\n' \
+            > "$repo/scripts/test-stub-16-contract.sh"
+    fi
 }
 
 run_verify() {
@@ -227,6 +277,11 @@ output="$(run_verify "$repo")" || status=$?
 assert_status "$status" 1 "the Java lane with no local Gradle fails the run"
 assert_contains "$output" "NOT PROVEN" "a machine without Gradle reports no evidence, not a break"
 assert_contains "$output" "android-java compile" "the Java lane is named in the verdict"
+# Executed, not merely planned. `--plan-only` prints the lane from the same helper,
+# so a mutant that deletes the loop which *runs* the gates would leave the plan
+# check green; only a verdict line proves the run reached them.
+assert_contains "$output" "no .github/workflows/pr-ci.yml in this tree" \
+    "the contract lane appears in the verdict of an actual run"
 assert_no_line_starting "$output" "FAIL" \
     "the Java lane's absence is the only thing that failed this run"
 
@@ -405,6 +460,63 @@ else
         assert_contains "$clippy_crates" "$crate" "pr-ci.yml lints $crate too"
     done <<< "$ci_crates"
 fi
+
+# ------------------------------------------------------------
+# The contract lane exists, and is derived rather than restated.
+#
+# `verify-change.sh` had no concept of the source-structure gates for months: they
+# lived only in pr-ci.yml, so a change that only one of them can catch -- a
+# resolver an entry point stopped calling, an import a crate must not have -- was
+# reported locally as "verified for every target this change touches". This asserts
+# the lane is present, is not vacuous, and names the ad reward gate specifically,
+# because that is the one whose absence was measured.
+# ------------------------------------------------------------
+lane="$(bash "$ROOT/scripts/verify-change.sh" --base HEAD --plan-only 2>&1 || true)"
+assert_contains "$lane" "CONTRACT" "the plan reports a contract lane"
+assert_contains "$lane" "scripts/test-ad-reward-integrity-contract.sh" \
+    "the contract lane includes the ad reward integrity gate"
+
+derived="$(python3 "$ROOT/scripts/lib/ci_contract_gates.py" "$ROOT" | grep -c . || true)"
+if [[ "$derived" -ge 15 ]]; then
+    pass "the contract lane derives $derived gate(s) from pr-ci.yml"
+else
+    fail "the contract lane derived only $derived gate(s); a lane this small is a parse that stopped matching"
+fi
+
+# Every gate the workflow's quality-gate job runs must be in the lane, answered by
+# the same parse that builds the lane rather than by a second grep -- a grep would
+# also match the build and Qt jobs, whose gates need release artifacts, and would
+# report them as missing forever.
+unaccounted="$(python3 "$ROOT/scripts/lib/ci_contract_gates.py" --audit "$ROOT" || true)"
+if [[ -z "$unaccounted" ]]; then
+    pass "no quality-gate contract script is missing from the local lane"
+else
+    fail "contract script(s) CI runs are absent from the local lane:"
+    printf '%s\n' "$unaccounted" >&2
+fi
+
+# ------------------------------------------------------------
+# The lane is run, and its verdict decides the run.
+#
+# Two properties, and a fixture with real gates is what separates them: that the
+# loop executes (a passing gate appears in the verdict) and that a gate's refusal
+# fails the run (an exit code, not a printed line). A mutant that planned the lane
+# and never ran it satisfied every earlier check.
+# ------------------------------------------------------------
+repo="$(new_fixture lane)"
+add_stub_gates "$repo"
+status=0
+output="$(run_verify "$repo")" || status=$?
+assert_contains "$output" "test-stub-16-contract.sh" \
+    "a gate after one that drains stdin still reaches the verdict"
+assert_contains "$output" "PASS" "a passing gate is recorded as PASS"
+
+repo="$(new_fixture lane_refusal)"
+add_stub_gates "$repo" failing
+status=0
+output="$(run_verify "$repo")" || status=$?
+assert_status "$status" 1 "a contract gate that refuses fails the whole run"
+assert_contains "$output" "FAIL" "the refusing gate is recorded as FAIL"
 
 if [[ "$failures" -ne 0 ]]; then
     printf '\033[0;31m%s contract check(s) failed\033[0m\n' "$failures" >&2

@@ -18,8 +18,10 @@
 #   2. asks scripts/lib/verification_targets.py which targets the changed files
 #      need, and why;
 #   3. runs the host suites, always;
-#   4. runs the target builds it knows how to run;
-#   5. prints one verdict line per target, and fails when a required target was
+#   4. runs the source-structure contract gates, derived from the workflow that
+#      already runs them so the local verdict cannot drift from CI's;
+#   5. runs the target builds it knows how to run;
+#   6. prints one verdict line per target, and fails when a required target was
 #      not proven -- including when the toolchain for it is simply absent. A skip
 #      there would reproduce the exact failure this script exists to prevent.
 #
@@ -78,6 +80,20 @@ HOST_CARGO_STEPS=(
     "test -p migo-core --lib"
     "test -p migo-capi --lib"
     "test -p migo-platform --lib"
+    # The Slim product profile, which nothing ran until 2026-08-08. Every crate
+    # above declares `default = ["profile-full"]`, so a plain `cargo test` compiles
+    # `api-media`, `api-commerce`, `api-connectivity`, `api-sensors` and
+    # `api-system` **on** and never builds a single `cfg(not(feature = ...))`
+    # branch. The first Slim host run reported 36 failures, and one group of them
+    # was a real defect rather than a test gap: the window-resize ingress lived in
+    # the `api-connectivity` extension, so no Slim build ever adopted its surface
+    # size and every canvas kept the size the window had before a rotation.
+    #
+    # `runtime-v8` and `core` are the two crates whose capability surface the
+    # profile selects. `graphics` takes its profile from `core`, and `capi` and
+    # `platform` do not build on the host at all.
+    "test -p migo-runtime-v8 --lib --no-default-features --features profile-slim"
+    "test -p migo-core --lib --no-default-features --features profile-slim"
     "fmt --all --check"
 )
 
@@ -158,6 +174,13 @@ if grep -q '^UNDETERMINED$' <<< "$plan"; then
 fi
 
 if [[ "$PLAN_ONLY" == true ]]; then
+    if gates="$(python3 "$SCRIPT_DIR/lib/ci_contract_gates.py" "$ROOT" 2>&1)"; then
+        printf 'CONTRACT %s gate(s) derived from .github/workflows/pr-ci.yml\n' \
+            "$(printf '%s\n' "$gates" | grep -c .)"
+        printf '%s\n' "$gates" | sed 's/^/  /'
+    else
+        printf 'CONTRACT undeterminable: %s\n' "$gates"
+    fi
     exit 0
 fi
 
@@ -220,6 +243,87 @@ done
 run_step "host" "git diff --check" || true
 
 # ------------------------------------------------------------
+# Source-structure contract gates.
+#
+# This script had no concept of them, and that is the same defect that put
+# `android-java` below, one layer further out. They are gates over structure a
+# test cannot reach -- what a crate may depend on, which resolver an entry point
+# calls, whether an event's payload keys match its reader -- and they lived only
+# in `.github/workflows/pr-ci.yml`. Found by A12's own mutation evidence:
+# reverting one ad entry point to a bare handler lookup, which is the exact
+# defect that item fixed, left every unit test green and was caught by a contract
+# script this script never ran. So the local verdict said "verified for every
+# target this change touches" about a change CI rejects.
+#
+# The list is derived from the workflow rather than restated here. A second copy
+# would drift, and it would drift silently in the direction that matters: a gate
+# added to CI and not here is a gate the local run does not have.
+#
+# They run unconditionally, like the host suites. Each is seconds, and keying
+# them to changed files means maintaining a file list per gate -- a list to
+# forget an entry from, which is how a gate stops covering what it names.
+# ------------------------------------------------------------
+have_tool() {
+    case "$1" in
+        rg)      command -v rg >/dev/null 2>&1 ;;
+        pyyaml)  python3 -c "import yaml" >/dev/null 2>&1 ;;
+        gradlew) [[ -x "$ROOT/platforms/android/gradlew" ]] ;;
+        *)       return 1 ;;
+    esac
+}
+
+contract_gates="$(python3 "$SCRIPT_DIR/lib/ci_contract_gates.py" "$ROOT" 2>&1)"
+case "$?" in
+    0) ;;
+    3)  # No workflow in this tree, so there are no CI gates to mirror. Said out
+        # loud rather than omitted, because a silent absence is how a lane stops
+        # covering anything.
+        record "contract" "no .github/workflows/pr-ci.yml in this tree" "CI ONLY"
+        contract_gates=""
+        ;;
+    *)  # The workflow is there and the lane could not be derived from it. That is
+        # a failure, not missing evidence: the alternative is a run that silently
+        # stops checking a whole class of gate.
+        record "contract" "derive gate list from .github/workflows/pr-ci.yml" "FAIL"
+        print_error "contract lane: $contract_gates"
+        contract_gates=""
+        ;;
+esac
+
+# Into an array first, and every gate runs with stdin closed. Both matter for the
+# same reason: read from a here-string, a gate that consumes stdin -- one of these
+# runs `cargo`, which does -- swallows the rest of the list, and the gates after it
+# vanish from the verdict without a word. That is the silent under-run this lane
+# exists to prevent, and it happened here first: three gates and the `CI ONLY` line
+# were missing from a run that reported success.
+contract_lane=()
+if [[ -n "$contract_gates" ]]; then
+    mapfile -t contract_lane <<< "$contract_gates"
+fi
+
+for entry in "${contract_lane[@]}"; do
+    disposition="${entry%% *}"
+    command="${entry#* }"
+    [[ -n "$disposition" && -n "$command" ]] || continue
+    case "$disposition" in
+        run)
+            run_step "contract" "$command" </dev/null || true
+            ;;
+        needs:*)
+            tool="${disposition#needs:}"
+            if have_tool "$tool"; then
+                run_step "contract" "$command" </dev/null || true
+            else
+                record "contract" "$command" "NOT PROVEN"
+            fi
+            ;;
+        skip:*)
+            record "contract" "$command" "CI ONLY"
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------
 # Target builds. A platform with no entry here is reported NOT PROVEN, never
 # skipped: `ohos` and `windows` conditional code has no local build on this
 # machine, and that is a fact about the evidence, not a detail to swallow.
@@ -272,7 +376,15 @@ echo "VERIFIED SCOPE  $scope"
 failed=0
 for index in "${!labels[@]}"; do
     printf '%-11s %-11s %s\n' "${verdicts[$index]}" "${labels[$index]}" "${commands[$index]}"
-    [[ "${verdicts[$index]}" == "PASS" ]] || failed=1
+    # `CI ONLY` is the one non-PASS verdict that does not fail the run, and
+    # the exception is closed: it marks a gate that runs *this script* over
+    # fixture repositories, so running it here would nest the gate inside
+    # itself. Everything else -- including a target whose toolchain is
+    # simply absent -- stays a failure, because unproven is not verified.
+    case "${verdicts[$index]}" in
+        PASS|"CI ONLY") ;;
+        *) failed=1 ;;
+    esac
 done
 
 if [[ "$failed" -ne 0 ]]; then
