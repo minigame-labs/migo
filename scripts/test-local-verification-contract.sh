@@ -99,11 +99,22 @@ STUB_TESTING_CRATES=(
 add_stub_crate() {
     local repo="$1" group="$2" name="$3"
     mkdir -p "$repo/engine/$group/$name/src"
+    # `io` depends on `shared`, mirroring the real graph, because the host-suite
+    # closure is only observable across an edge: without one, a change to a leaf
+    # selects that leaf and the under-running this contract is meant to catch would
+    # look identical to correct behaviour.
+    local dependency=""
+    if [[ "$name" == "io" ]]; then
+        dependency='shared = { path = "../shared", package = "migo-shared" }'
+    fi
     cat > "$repo/engine/$group/$name/Cargo.toml" <<EOF
 [package]
 name = "migo-$name"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+$dependency
 
 # The real crates select their capability surface with these, and the host steps
 # run both, so a stub without them fails the Slim step on a missing feature
@@ -517,6 +528,48 @@ status=0
 output="$(run_verify "$repo")" || status=$?
 assert_status "$status" 1 "a contract gate that refuses fails the whole run"
 assert_contains "$output" "FAIL" "the refusing gate is recorded as FAIL"
+
+# ------------------------------------------------------------
+# The host suites are selective, and selective in the safe direction.
+#
+# Running all sixteen on every invocation made a Java-only change pay for the whole
+# Rust tree. The risk of fixing that is the opposite failure, which is silent: a suite
+# that should have run and did not. So the closure is checked in both directions --
+# a leaf change reaches its dependents, and anything unreasonable-about widens to
+# everything.
+# ------------------------------------------------------------
+repo="$(new_fixture hostsuites)"
+printf 'pub fn changed() {}\n' >> "$repo/engine/crates/shared/src/lib.rs"
+
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_contains "$output" "HOSTSUITES" "the plan names the host suites it needs"
+assert_contains "$output" "migo-shared" "a changed crate is in its own closure"
+assert_contains "$output" "migo-io" "a leaf change reaches the crates that depend on it"
+
+status=0
+output="$(run_verify "$repo")" || status=$?
+assert_contains "$output" "test -p migo-io" \
+    "the dependent's suite is actually run, not merely planned"
+assert_absent "$output" "test -p migo-capi" \
+    "a crate that cannot see the change does not pay for it"
+
+# A path the selector cannot reason about must widen, not narrow.
+repo="$(new_fixture hostsuites_unknown)"
+printf 'echo changed\n' >> "$repo/scripts/verify-change.sh"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_contains "$output" "HOSTSUITES ALL" \
+    "a change outside engine/ that could affect anything runs every suite"
+
+repo="$(new_fixture hostsuites_java)"
+mkdir -p "$repo/platforms/android/library/src/main/java/com/migo/runtime"
+printf 'class Changed {}\n' \
+    > "$repo/platforms/android/library/src/main/java/com/migo/runtime/Changed.java"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_contains "$output" "HOSTSUITES NONE" \
+    "a Java-only change asks for no cargo suite"
 
 if [[ "$failures" -ne 0 ]]; then
     printf '\033[0;31m%s contract check(s) failed\033[0m\n' "$failures" >&2

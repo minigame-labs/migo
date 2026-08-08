@@ -236,7 +236,58 @@ else
 report their environment, not this change"
 fi
 
-for step in "${HOST_CARGO_STEPS[@]}"; do
+# Which of those steps this change actually needs. The selector answers with the
+# changed packages plus their reverse-dependency closure, so a change to a leaf crate
+# still runs the suites of everything that depends on it -- that is where its
+# behaviour is observed. A Java-only change now pays for none of them instead of
+# sixteen.
+#
+# Every branch here fails towards running more. `ALL` is what the selector returns for
+# a tree cargo cannot describe, for a file under `engine/` belonging to no member, and
+# for any path outside `engine/` that is not provably irrelevant; a missing
+# `HOSTSUITES` line lands in the same branch. `build --workspace --all-targets` and
+# `fmt --all --check` are kept whenever any package is implicated, because several
+# workspace members have no suite of their own and that build is the only thing that
+# compiles them.
+host_selection="ALL"
+if host_line="$(grep -m1 '^HOSTSUITES ' <<< "$plan")"; then
+    host_selection="${host_line#HOSTSUITES }"
+fi
+
+selected_host_steps=()
+case "$host_selection" in
+    ALL)
+        selected_host_steps=("${HOST_CARGO_STEPS[@]}")
+        ;;
+    NONE)
+        # Nothing Rust changed. `fmt` is kept because it is a second and costs
+        # nothing, and because a stray unformatted file is worth catching wherever it
+        # came from.
+        for step in "${HOST_CARGO_STEPS[@]}"; do
+            [[ "$step" == fmt* ]] && selected_host_steps+=("$step")
+        done
+        print_info "host: no workspace member changed; running formatting only"
+        ;;
+    *)
+        for step in "${HOST_CARGO_STEPS[@]}"; do
+            if [[ "$step" =~ -p\ (migo-[a-z0-9-]+) ]]; then
+                package="${BASH_REMATCH[1]}"
+                for candidate in $host_selection; do
+                    if [[ "$candidate" == "$package" ]]; then
+                        selected_host_steps+=("$step")
+                        break
+                    fi
+                done
+            else
+                selected_host_steps+=("$step")
+            fi
+        done
+        print_info "host: $((${#selected_host_steps[@]})) of ${#HOST_CARGO_STEPS[@]} \
+steps for $host_selection"
+        ;;
+esac
+
+for step in "${selected_host_steps[@]}"; do
     run_step "host" "$HOST_CARGO $step" || true
 done
 
