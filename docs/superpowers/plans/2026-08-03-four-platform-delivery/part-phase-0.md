@@ -363,6 +363,64 @@
   pass. The C ABI callback half overlaps the branch recorded under item 0.11.
 - [ ] 0.9 A9: runtime restart as a callback and resource ownership boundary.
   Plan: `2026-08-02-runtime-restart-generation-boundary.md` (12 tasks).
+
+  **Task 1 of 12 done 2026-08-09. Its premise was checked first and, unusually
+  for this ledger, held:** neither `shared/src/callback_id.rs` nor
+  `scripts/run-cargo-lib-test-filter.sh` existed and no callback-id allocator
+  existed anywhere, so the plan's "Expected: FAIL because `shared::callback_id`
+  does not exist" was true.
+
+  **The plan's own authority was the thing worth checking.** It names Section 6.6
+  of `docs/superpowers/specs/2026-07-29-three-platform-delivery-design.md`, which
+  reads as superseded — it is not. The four-platform spec replaces only Sections 3
+  and 15 of that document and states that every other section stays authoritative,
+  so §6.6 still governs this item.
+
+  **Two deviations from the plan, both stated rather than silent.** It says to work
+  in `.worktrees/three-platform-delivery`; a worktree has no `engine/target` and
+  would rebuild Skia, and `dev-test-host.sh`'s V8 path resolves from the repository
+  root — so the work is on `delivery/x11-and-mutation-evidence` with the index
+  scoped per task instead, which is what that rule is actually for. And the runner
+  drives cargo through `dev-test-host.sh` rather than invoking it bare: several
+  members link Skia and a bare `cargo test` fails for reasons unrelated to any
+  filter.
+
+  **`scripts/run-cargo-lib-test-filter.sh` earns its place independently of A9.**
+  A filtered `cargo test` exits 0 when the filter matches nothing, so a typo reads
+  as a passing suite — the "prefix filter as the criterion" mistake this repository
+  has made twice in one day. It lists first, fails on zero matches, and has a
+  `--self-test` over zero, one, several, and benchmark-only listings. That
+  self-test is falsifiable: loosening its parser to `grep -cE 'test'` fails four of
+  its five cases. Its first real use produced this item's red state —
+  `filter 'callback_id' matched no test in migo-shared` — rather than a green run
+  over nothing.
+
+  **`CallbackIdAllocator` has no reset, release or free, and the near-exhaustion
+  constructor is `#[cfg(test)]` and private.** A caller able to choose the starting
+  point is a caller able to reissue an identifier, which is the one thing the type
+  exists to prevent, so reuse is unexpressible rather than merely untested.
+  Exhaustion at `i32::MAX` is permanent and asked twice in the test, because an
+  "exhausted" that recovers on the next call is a wrap wearing an error's name.
+  `Relaxed` ordering is sufficient and the comment says why: a read-modify-write is
+  atomic whatever its ordering, and this call publishes no other memory.
+
+  **Mutation evidence: `cargo-mutants --file crates/shared/src/callback_id.rs` —
+  11 mutants, 11 caught, 0 missed, 0 unviable.** Among them both boundary
+  directions on `last < i32::MAX`, `+` to `-` and `*` in the increment and the
+  cast, and `Display::fmt`, which is caught only because a fifth test asserts the
+  message — T.2 recorded `Debug::fmt` survivors as noise for exactly the opposite
+  reason.
+
+  Verification, the same closing run recorded under item 0.14: 19 host steps,
+  23 contract gates, `android compile` and `ohos compile` both PASS,
+  `verified for every target this change touches`.
+
+  **Tasks 2–12 are not started**, and Task 2 is where the property actually lands:
+  the allocator changes no behaviour until it is carried through `HostOpState`,
+  the Host and Workers. Sized before stopping rather than guessed: Task 2 names
+  twelve files and the `HostOpState` literals reach **22 across 12 test files, 18
+  files in the workspace overall**. It wants a session with room to finish — a
+  half-migrated correlation registry is worse than an unstarted one.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.
@@ -590,17 +648,17 @@
   and Slim test counts. **Re-run 2026-08-09. Counts below are measured, not
   carried forward; neither independent review has run.**
 
-  Measured on `delivery/x11-and-mutation-evidence` (master + 7 commits) by
+  Measured on `delivery/x11-and-mutation-evidence` (master + 10 commits) by
   `bash scripts/verify-change.sh --base master`, plus both Gradle flavours read
   from their JUnit XML rather than from console output.
 
-  **Rust host suites — 2,987 passed, 31 ignored, 16 test steps** (the two
+  **Rust host suites — 2,992 passed, 31 ignored, 16 test steps** (the two
   non-test steps, `build --workspace --all-targets` and `fmt --all --check`,
   report no counts by design):
 
   | Profile-independent | | Full | | Slim | |
   |---|---|---|---|---|---|
-  | `migo-shared` | 432 | `migo-runtime-v8` | 524 | `migo-runtime-v8` | 472 |
+  | `migo-shared` | 437 | `migo-runtime-v8` | 524 | `migo-runtime-v8` | 472 |
   | `migo-graphics` | 604 | `migo-core` | 62 | `migo-core` | 59 |
   | `migo-io` | 266 | `migo-capi` | 147 | `migo-capi` | 147 |
   | `migo-capi-abi` | 60 | `migo-platform` | 53 | `migo-platform` | 53 |
@@ -608,12 +666,16 @@
   | `migo-alloc-probe` | 28 | | | | |
   | `migo-executor-probe` | 8 | | | | |
   | `migo-contention-probe` | 7 | | | | |
-  | **subtotal** | **1,470** | **subtotal** | **786** | **subtotal** | **731** |
+  | **subtotal** | **1,475** | **subtotal** | **786** | **subtotal** | **731** |
 
-  `migo-capi` is 147 in both profiles rather than the 143 recorded under T.7: this
-  branch adds three X11 cases (item 0.4) and two retirement cases, and removes one
-  test that could not fail (item 0.2). Net +4, and the arithmetic matching is the
-  point of recording exact numbers.
+  Two deltas against T.7's earlier record, and both reconcile — which is the point
+  of recording exact numbers rather than round ones. `migo-capi` is 147 in both
+  profiles rather than 143: three X11 cases (item 0.4) and two retirement cases,
+  less one test that could not fail (item 0.2), net +4. `migo-shared` is 437 rather
+  than 432 as first measured earlier the same day: the five `callback_id` cases
+  added by item 0.9's Task 1. The counts here are from the closing run, not the
+  first one — an audit that is stale before it is committed is the defect it exists
+  to catch.
 
   **Java — 143 Full, 143 Slim, 0 failures, 0 skipped**, identical counts across
   flavours because the source set is variant-independent while `BuildConfig`

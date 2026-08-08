@@ -131,6 +131,16 @@ clang, the Khronos headers and the linux-gnu V8 archive that four Skia-linked
 crates need. It passes any cargo subcommand through, so `cargo-mutants` runs
 inside it too (§2).
 
+**Never read a filtered `cargo test` exit status as evidence.** It exits 0 when
+the filter matches nothing, so a typo reads exactly like a passing suite — the
+mistake this repository has made twice in one day. Use the runner instead; it
+lists first and fails on zero matches:
+
+```bash
+bash scripts/run-cargo-lib-test-filter.sh migo-shared callback_id
+bash scripts/run-cargo-lib-test-filter.sh --self-test    # proves its own parser
+```
+
 **Two lanes `verify-change.sh` does not cover, and both matter:**
 
 ```bash
@@ -258,7 +268,7 @@ reviews are user-triggered (§6).
 
    | Item | What it needs | Why |
    |---|---|---|
-   | 0.9/A9 | **execute** | has a 12-task plan, `2026-08-02-runtime-restart-generation-boundary.md` |
+   | 0.9/A9 | **execute, task 1 of 12 done** | plan `2026-08-02-runtime-restart-generation-boundary.md`; its §6.6 authority is *not* superseded, checked. Resume at Task 2, which is where the property lands and which wants a whole session |
    | 0.13 | **execute, partly device-blocked** | the entry states four concrete deliverables (ArkTS lifecycle hooks, `OHNativeWindow` release barrier, multi-touch, restart/shutdown barriers); spec §6.2 governs. Compile-level work is now verifiable locally via the T.8 lane; behaviour needs the emulator |
    | 0.8/A8 | **split, then audit** | five clauses in one line, one already closed as 0.12's third; the C ABI half overlaps the branch in 0.11 |
    | 0.11/A11 | **decide** | see item 0 above |
