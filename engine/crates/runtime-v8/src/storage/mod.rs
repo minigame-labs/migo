@@ -50,7 +50,11 @@ const MAX_VALUE_SIZE: usize = 1024 * 1024;
 const LIMIT_SIZE_KB: u32 = 10240;
 
 /// Maximum total storage size in bytes.
-const MAX_TOTAL_BYTES: u64 = LIMIT_SIZE_KB as u64 * 1024;
+///
+/// Visible to the crate so the two-Session quota test spends the *shipped* limit
+/// rather than one of its own: a fixture with a small quota of its own would prove
+/// per-instance accounting without proving that this is the number each game gets.
+pub(crate) const MAX_TOTAL_BYTES: u64 = LIMIT_SIZE_KB as u64 * 1024;
 
 // ==================== Path Helpers ====================
 

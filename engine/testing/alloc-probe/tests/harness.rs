@@ -8,11 +8,158 @@
 //! allocator, so the self-check must refuse to certify anything there.
 
 use migo_alloc_probe::{
-    Burst, CountingAllocator, assert_no_steady_state_allocation, thread_counts,
+    Burst, CountingAllocator, Cycle, assert_no_steady_state_allocation,
+    assert_no_steady_state_growth, thread_counts,
 };
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator::system();
+
+#[test]
+fn releasing_a_block_returns_the_bytes_it_took() {
+    let before = thread_counts();
+    let block: Vec<u8> = Vec::with_capacity(64);
+    std::hint::black_box(&block);
+    drop(block);
+    let after = thread_counts();
+
+    assert_eq!(
+        after.live_bytes() - before.live_bytes(),
+        0,
+        "an allocate-and-release pair must net to zero, or growth cannot be measured"
+    );
+    assert!(
+        after.bytes_freed > before.bytes_freed,
+        "the release was seen"
+    );
+}
+
+#[test]
+fn a_retained_block_shows_as_live_bytes() {
+    let before = thread_counts();
+    let block: Vec<u8> = Vec::with_capacity(4096);
+    let after = thread_counts();
+    std::hint::black_box(&block);
+
+    assert!(
+        after.live_bytes() - before.live_bytes() >= 4096,
+        "a block still held must count as live"
+    );
+}
+
+#[test]
+fn growing_a_block_nets_only_the_difference() {
+    let mut block: Vec<u8> = Vec::with_capacity(64);
+    let before = thread_counts();
+    block.reserve_exact(4096);
+    let after = thread_counts();
+    std::hint::black_box(&block);
+
+    assert_eq!(
+        after.live_bytes() - before.live_bytes(),
+        4096 - 64,
+        "a resize must net the difference, not the whole new block"
+    );
+}
+
+#[test]
+fn a_cycle_that_gives_back_what_it_takes_reports_no_growth() {
+    assert_no_steady_state_growth(
+        Cycle {
+            path: "allocate and release",
+            warmup: 2,
+            measured: 16,
+        },
+        |_| {
+            let block: Vec<u8> = Vec::with_capacity(512);
+            std::hint::black_box(&block);
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "leaks a block: retained")]
+fn a_cycle_that_leaks_fails_and_names_the_path() {
+    assert_no_steady_state_growth(
+        Cycle {
+            path: "leaks a block",
+            warmup: 2,
+            measured: 16,
+        },
+        |_| std::mem::forget(Vec::<u8>::with_capacity(512)),
+    );
+}
+
+/// The boundary of a delta measurement, pinned so the gate is not over-claimed.
+///
+/// A block allocated *before* the window and leaked *inside* it moves neither
+/// counter, so the cycle reads as balanced. This is the pooled-vector case, and it
+/// is the reason a growth gate is not a leak detector: it gates the bytes the
+/// measured window itself took. A lost loan surfaces only once the drained pool
+/// forces a fresh allocation — the same second-order signal a burst relies on.
+#[test]
+fn a_block_taken_from_an_earlier_population_and_leaked_is_not_visible() {
+    let mut population: Vec<Vec<u8>> = (0..64).map(|_| Vec::with_capacity(512)).collect();
+    assert_no_steady_state_growth(
+        Cycle {
+            path: "leaks a block it was handed",
+            warmup: 2,
+            measured: 16,
+        },
+        |_| {
+            if let Some(loan) = population.pop() {
+                std::mem::forget(loan);
+            }
+        },
+    );
+}
+
+#[test]
+fn a_cycle_that_only_releases_is_not_growth() {
+    let mut blocks: Vec<Vec<u8>> = (0..32).map(|_| Vec::with_capacity(256)).collect();
+    assert_no_steady_state_growth(
+        Cycle {
+            path: "drains a backlog",
+            warmup: 2,
+            measured: 16,
+        },
+        |_| {
+            blocks.pop();
+        },
+    );
+}
+
+#[test]
+fn a_bounded_cache_filling_during_warmup_is_not_a_leak() {
+    let mut cache: Vec<Vec<u8>> = Vec::with_capacity(8);
+    assert_no_steady_state_growth(
+        Cycle {
+            path: "bounded cache reaching its bound",
+            warmup: 8,
+            measured: 16,
+        },
+        |_| {
+            if cache.len() == 8 {
+                cache.remove(0);
+            }
+            cache.push(Vec::with_capacity(256));
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "unbounded cache: retained")]
+fn a_cache_that_never_evicts_fails() {
+    let mut cache: Vec<Vec<u8>> = Vec::with_capacity(1024);
+    assert_no_steady_state_growth(
+        Cycle {
+            path: "unbounded cache",
+            warmup: 8,
+            measured: 16,
+        },
+        |_| cache.push(Vec::with_capacity(256)),
+    );
+}
 
 #[test]
 fn a_fresh_block_is_counted_as_an_allocation() {

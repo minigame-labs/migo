@@ -1998,30 +1998,29 @@ pub struct DrawImageEntry {
 // collector holds retains original capacities.
 
 impl GLCmd {
-    /// Return the canvas this command targets, if any.  Resource-context
-    /// commands (shader/program create/delete/link, contextless metadata
-    /// queries) return `None`; they don't dirty any per-canvas Skia
-    /// cache and therefore don't need to mark any `Canvas2DContext`
-    /// stale after the WebGL batch completes.
+    /// Return the canvas this command targets, if any.
     ///
-    /// Used by the render thread's `execute_gl_batch` to narrow down
-    /// which `Canvas2DContext::skia_state_stale` flags to flip, in
-    /// place of the previous over-conservative broadcast to every
-    /// live 2D context.
+    /// The rule is syntactic: a variant that carries a `canvas_id` is issued
+    /// into that canvas's GL context and answers with it; a variant that carries
+    /// none runs on the shared resource context and answers `None`. Two
+    /// consumers ask, and both want exactly that fact —
+    /// `execute_gl_batch`'s scoped stale marking, which flips
+    /// `Canvas2DContext::skia_state_stale` only for the canvases a WebGL batch
+    /// disturbed, and `can_reorder_phases`, which may defer a packet's WebGL
+    /// half past its Canvas2D half only when the two share no canvas.
+    ///
+    /// **Neither consumer degrades safely on a missing id, which is why this
+    /// match has no catch-all.** An unlisted command leaves its canvas out of
+    /// the stale marking and the next 2D draw there trusts Skia state a WebGL
+    /// batch has since changed; it also makes two halves of a packet look
+    /// disjoint when they are not, and the reorder then inverts issue order on
+    /// one canvas. A `_ => None` arm used to stand at the bottom with a comment
+    /// calling the list exhaustive and the fall-through conservative. It was
+    /// neither: 29 of the 118 canvas-carrying variants had drifted into it,
+    /// among them `TexImage2D`, every `Uniform*`, `FramebufferTexture2D` and all
+    /// four `TexImage2DFrom*` uploads. Exhaustiveness is the compiler's job now,
+    /// and so is the classification — see the `None` arms.
     pub fn touches_canvas(&self) -> Option<CanvasId> {
-        // Exhaustive over every variant that carries a `canvas_id`
-        // field — enumerated so the render thread's per-context
-        // stale marking picks up EVERY state-mutating command, not
-        // just the hot ones.  Variants without `canvas_id`
-        // (resource-context ops like `CreateShader`/`LinkProgram`
-        // that don't touch per-canvas GL binding state) return
-        // `None`; those can't dirty a Canvas2DContext's Skia
-        // tracking on their own.
-        //
-        // Any new GLCmd variant with a `canvas_id` field MUST be
-        // added here — otherwise `execute_gl_batch`'s scoped stale
-        // marking silently fails to flip the right flag, and the
-        // subsequent Canvas2D draw would trust stale Skia state.
         match self {
             GLCmd::Viewport { canvas_id, .. }
             | GLCmd::Clear { canvas_id, .. }
@@ -2111,20 +2110,133 @@ impl GLCmd {
             | GLCmd::TransformFeedbackVaryings { canvas_id, .. }
             | GLCmd::TexImage3D { canvas_id, .. }
             | GLCmd::TexSubImage3D { canvas_id, .. }
-            | GLCmd::TexStorage3D { canvas_id, .. } => Some(*canvas_id),
+            | GLCmd::TexStorage3D { canvas_id, .. }
+            | GLCmd::TexImage2D { canvas_id, .. }
+            | GLCmd::TexSubImage2D { canvas_id, .. }
+            | GLCmd::TexStorage2D { canvas_id, .. }
+            | GLCmd::CompressedTexImage2D { canvas_id, .. }
+            | GLCmd::CompressedTexSubImage2D { canvas_id, .. }
+            | GLCmd::TexImage2DFromShared { canvas_id, .. }
+            | GLCmd::TexImage2DFromSnapshot { canvas_id, .. }
+            | GLCmd::TexImage2DFromTextCache { canvas_id, .. }
+            | GLCmd::TexImage2DFromCanvas2D { canvas_id, .. }
+            | GLCmd::TexSubImage2DFromCanvas2D { canvas_id, .. }
+            | GLCmd::TexSubImage2DFromSnapshot { canvas_id, .. }
+            | GLCmd::FramebufferTexture2D { canvas_id, .. }
+            | GLCmd::DebugLoseContext { canvas_id }
+            | GLCmd::Uniform1f { canvas_id, .. }
+            | GLCmd::Uniform1fv { canvas_id, .. }
+            | GLCmd::Uniform1i { canvas_id, .. }
+            | GLCmd::Uniform1iv { canvas_id, .. }
+            | GLCmd::Uniform2f { canvas_id, .. }
+            | GLCmd::Uniform2fv { canvas_id, .. }
+            | GLCmd::Uniform2iv { canvas_id, .. }
+            | GLCmd::Uniform3f { canvas_id, .. }
+            | GLCmd::Uniform3fv { canvas_id, .. }
+            | GLCmd::Uniform3iv { canvas_id, .. }
+            | GLCmd::Uniform4f { canvas_id, .. }
+            | GLCmd::Uniform4fv { canvas_id, .. }
+            | GLCmd::Uniform4iv { canvas_id, .. }
+            | GLCmd::UniformMatrix2fv { canvas_id, .. }
+            | GLCmd::UniformMatrix3fv { canvas_id, .. }
+            | GLCmd::UniformMatrix4fv { canvas_id, .. } => Some(*canvas_id),
 
-            // Everything else — resource-context commands (shader
-            // create/source/compile/link, program create/attach/
-            // link/delete, buffer/texture/sampler/vao/fbo/rbo
-            // delete, uniform calls routed via `UseProgram`'s
-            // canvas_id above, etc.) doesn't bind any per-canvas
-            // GL state that a Canvas2DContext cares about.  The
-            // `#[non_exhaustive]` fall-through also catches any
-            // future variant that forgets to add its canvas_id
-            // here — conservative behaviour is "don't mark
-            // anything stale"; a real state leak will surface as
-            // a render-time bug and force us to add the variant.
-            _ => None,
+            // Resource-context commands: shader source/compile, program
+            // link/attach/delete, and the deletes of objects that live in the
+            // shared resource context. None of them is issued into a canvas's
+            // context, so none can disturb a `Canvas2DContext`'s Skia tracking
+            // or constrain the phase reorder.
+            //
+            // **Every field is named rather than elided, and there is no
+            // catch-all.** Those two together are what makes the syntactic rule
+            // above — carries a `canvas_id`, belongs to that canvas — hold by
+            // construction instead of by this comment: a new variant fails to
+            // compile until it is classified, and giving any variant below a
+            // `canvas_id` fails to compile until it moves up. A `_ => None`
+            // stood here and 29 canvas-carrying variants had drifted into it
+            // while the doc above claimed the list was exhaustive.
+            GLCmd::LinkProgram { program_id: _ }
+            | GLCmd::DeleteProgram { program_id: _ }
+            | GLCmd::CompileShader { shader_id: _ }
+            | GLCmd::DeleteShader { shader_id: _ }
+            | GLCmd::DeleteTexture { texture_id: _ }
+            | GLCmd::DeleteFramebuffer { framebuffer_id: _ }
+            | GLCmd::DeleteRenderbuffer { renderbuffer_id: _ }
+            | GLCmd::DeleteBuffer { buffer_id: _ }
+            | GLCmd::DeleteVertexArray { vao: _ }
+            | GLCmd::DeleteSampler { sampler: _ }
+            | GLCmd::DeleteSync { sync: _ }
+            | GLCmd::DeleteQuery { query: _ }
+            | GLCmd::DeleteTransformFeedback { tf: _ } => None,
+            GLCmd::GetProgramParameter {
+                program_id: _,
+                pname: _,
+                resp: _,
+            }
+            | GLCmd::GetShaderParameter {
+                shader_id: _,
+                pname: _,
+                resp: _,
+            }
+            | GLCmd::GetQueryParameter {
+                query: _,
+                pname: _,
+                resp: _,
+            } => None,
+            GLCmd::GetProgramInfoLog {
+                program_id: _,
+                resp: _,
+            }
+            | GLCmd::GetShaderInfoLog {
+                shader_id: _,
+                resp: _,
+            } => None,
+            GLCmd::ShaderSource {
+                shader_id: _,
+                source: _,
+                resp: _,
+            } => None,
+            GLCmd::AttachShader {
+                program_id: _,
+                shader_id: _,
+                resp: _,
+            } => None,
+            GLCmd::BindAttribLocation {
+                program_id: _,
+                index: _,
+                name: _,
+            } => None,
+            GLCmd::GetUniformBlockIndex {
+                program_id: _,
+                name: _,
+                resp: _,
+            } => None,
+            GLCmd::UniformBlockBinding {
+                program_id: _,
+                uniform_block_index: _,
+                uniform_block_binding: _,
+            } => None,
+            GLCmd::SamplerParameteri {
+                sampler: _,
+                pname: _,
+                param: _,
+            }
+            | GLCmd::SamplerParameterf {
+                sampler: _,
+                pname: _,
+                param: _,
+            } => None,
+            GLCmd::ClientWaitSync {
+                sync: _,
+                flags: _,
+                timeout_ns: _,
+                resp: _,
+            } => None,
+            GLCmd::GetTransformFeedbackVarying {
+                program: _,
+                index: _,
+                resp: _,
+            } => None,
         }
     }
 
@@ -2484,6 +2596,84 @@ mod approx_size_tests {
 
         let cmd = GLCmd::CompileShader { shader_id: 1u32 };
         assert_eq!(cmd.touches_canvas(), None);
+    }
+
+    /// The rule is syntactic — a variant that carries a `canvas_id` belongs to
+    /// that canvas's command stream — and a `_ => None` catch-all let 29 of the
+    /// 118 such variants drift off the list while the doc comment went on
+    /// claiming the list was exhaustive. Neither consumer degrades safely: an
+    /// unlisted command leaves the canvas out of the scoped stale marking, so
+    /// the next Canvas2D draw on it trusts Skia state a WebGL batch has since
+    /// disturbed; and it makes `can_reorder_phases` see two halves of a packet
+    /// as disjoint when they share a canvas, inverting issue order on it.
+    ///
+    /// The catch-all is gone, so exhaustiveness is now the compiler's job and
+    /// this test does not have to enumerate 118 variants. What it pins is the
+    /// *classification* the compiler cannot check, on one representative of each
+    /// family that had drifted: a uniform write, a texture allocation, a
+    /// framebuffer attachment, and an upload sourced from another canvas.
+    #[test]
+    fn touches_canvas_covers_the_families_that_drifted_off_the_list() {
+        let cid = CanvasId::from(42u32);
+        let other = CanvasId::from(43u32);
+
+        assert_eq!(
+            GLCmd::Uniform3f {
+                canvas_id: cid,
+                location: Some(0),
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }
+            .touches_canvas(),
+            Some(cid),
+            "a uniform write is issued into this canvas's program state"
+        );
+        assert_eq!(
+            GLCmd::TexStorage2D {
+                canvas_id: cid,
+                target: 0x0DE1,
+                levels: 1,
+                internal_format: 0x8058,
+                width: 4,
+                height: 4,
+            }
+            .touches_canvas(),
+            Some(cid),
+            "an immutable texture allocation binds this canvas's texture state"
+        );
+        assert_eq!(
+            GLCmd::FramebufferTexture2D {
+                canvas_id: cid,
+                target: 0x8D40,
+                attachment: 0x8CE0,
+                textarget: 0x0DE1,
+                texture: None,
+                level: 0,
+            }
+            .touches_canvas(),
+            Some(cid),
+            "an attachment change rewrites this canvas's framebuffer"
+        );
+        // The one that matters most to reorder admission: the destination is
+        // what runs, and it is the destination the WebGL half must not be
+        // deferred past a Canvas2D batch on.
+        assert_eq!(
+            GLCmd::TexImage2DFromCanvas2D {
+                canvas_id: cid,
+                target: 0x0DE1,
+                level: 0,
+                internalformat: 0x1908,
+                canvas_2d_id: other,
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }
+            .touches_canvas(),
+            Some(cid),
+            "an upload sourced from another canvas still executes on this one"
+        );
     }
 
     #[test]

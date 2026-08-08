@@ -112,6 +112,20 @@ pub fn upload_texture_with_pbo_ext(
 ) -> EngineResult<PboUploadResult> {
     let start = std::time::Instant::now();
 
+    // What the caller's context had bound, so it can have it back. On the upload
+    // thread nobody is watching; on the render thread the WebGL dedup shadow still
+    // names the content's texture and alignment, and binding *zero* here instead of
+    // restoring made the content's next identical `bindTexture` / `pixelStorei`
+    // look redundant — dropped, leaving the upload or sample after it pointed at no
+    // texture. `compressed_upload.rs` already restores for exactly this reason;
+    // these two upload paths were the ones that did not.
+    let saved = unsafe {
+        (
+            gl.get_parameter_i32(glow::TEXTURE_BINDING_2D),
+            gl.get_parameter_i32(glow::UNPACK_ALIGNMENT),
+        )
+    };
+
     // Create texture
     let tex = unsafe {
         gl.create_texture().map_err(|e| {
@@ -164,7 +178,12 @@ pub fn upload_texture_with_pbo_ext(
     }
 
     unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, None);
+        let (saved_texture, saved_alignment) = saved;
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            std::num::NonZeroU32::new(saved_texture as u32).map(glow::NativeTexture),
+        );
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, saved_alignment);
     }
 
     trace!(

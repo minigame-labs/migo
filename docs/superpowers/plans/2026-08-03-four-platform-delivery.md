@@ -94,8 +94,9 @@ review. A commit alone is not completion evidence.
   and Slim test counts.
 - [ ] 0.15 A6: run lifecycle, reattachment, input saturation, ABI, and header
   contract suites with both product profiles.
-- [ ] 0.16 Fix the process-global text texture cache. **Implementation landed,
-  reviews outstanding** (`b73ac60`). The cache is now per session: a registry
+- [x] 0.16 Fix the process-global text texture cache. **Closed: implementation,
+  both reviews, Section 7.3's gate, the recorded residual, and — last — the
+  two-live-Session behavioural test Section 6.4 requires** (`b73ac60`). The cache is now per session: a registry
   hands out a reference-counted per-session cache with its own lock, byte budget,
   trim accounting and font generation, and both the JavaScript and render sides
   resolve their handle once at bring-up so the registry lock never appears on a
@@ -116,7 +117,14 @@ review. A commit alone is not completion evidence.
   every live session, and `render_diagnostics::set_text_cache_gauges` remains a
   process-global accumulator so two sessions' gauges interleave. **Both cache halves
   are since fixed** — the io `clear()` removed, the alias table partitioned per
-  Session — leaving only the gauges.
+  Session — ~~leaving only the gauges.~~ **and the gauges are fixed too, which this
+  line went on claiming after the fact.** The accumulator and its sink are both
+  thread-local (`HOT` and `SINK` in `render_diagnostics`), and
+  `a_gauge_set_before_another_session_sets_its_own_still_reports_its_own` pins it in
+  four ordered phases — set A, set B, flush A, flush B — precisely because two threads
+  setting gauges at once would catch a merge only on a lucky interleaving, and because
+  a counter test cannot stand in: counters publish with `fetch_add`, gauges with
+  `store`, so a merge means the session that flushed last silently speaks for both.
 
   **Independent code-quality review done; spec review still outstanding.** Reviewed
   as a five-commit batch isolated in its own worktree, so the diff was the
@@ -155,6 +163,36 @@ review. A commit alone is not completion evidence.
   `a_per_frame_text_cache_hit_does_not_reach_the_session_registry`, which holds
   `SESSION_CACHES` in write mode against a frame (task 0.27). This line previously
   misnamed that obligation as task 0.26's allocation gate.
+
+  **What closed this item was the last thing on Section 6.4's own list: two live
+  Sessions.** Every isolation test the cache had takes two host ids from
+  `text_cache_for_host` and shows the registry separates them — a claim about a
+  registry given distinct keys, which is the exact shape task 0.62 replaced for
+  storage. The step before it was never executed: that a Session *binds* its own
+  cache, through `CanvasOpState::for_host` in the `web` extension's state init, so two
+  live Sessions land on two caches without anyone choosing a key.
+  `two_live_sessions_hold_their_own_text_texture_cache` reads the cache out of each
+  live op state rather than resolving one, and caches the **same label** from both —
+  two different labels would separate the entries by key and pass over a cache with no
+  session identity at all.
+
+  Two details are the discipline restated. Both entries are written before either
+  lookup, because a process-wide slot written at bind time shows up only once both
+  Sessions have written. And the step that caches is deliberately assertion-free: its
+  first version asserted the insert evicted nothing, and the mutant then killed the
+  test **inside that helper**, detecting the defect while never evaluating the claim
+  the test is named for.
+
+  Mutation: binding the cache from a constant host id instead of the Session's own —
+  the plumbing a test that resolves a cache itself cannot see — fails only this test,
+  at its own assertion, with all 414 `migo-shared` tests and both its siblings in the
+  file passing.
+
+  **Not covered, named rather than implied.** The GL half stays unobservable here: the
+  entries hold texture names, and whether a name minted in one Session's EGL context is
+  refused in another's needs two live GL contexts, which no host test has. What is
+  gated is that the two Sessions never reach the same entry, which is what makes the
+  question moot rather than answered.
 - [x] 0.17 Arbitrate device-exclusive resources across Sessions.
   **Implementation complete, reviews outstanding.** Camera, microphone and the
   Bluetooth adapter were acquired independently by each Session's own manager, so the
@@ -251,15 +289,110 @@ review. A commit alone is not completion evidence.
   Section 7.3.** Section 6.4 names two halves — `open` rejecting any id at or below a
   process-wide high-water mark, and its return value being discarded at the call
   site. Both are fixed: the mark is gone, and `open` is `#[must_use]` with
-  `open_or_report` as the reporting call site. Section 7.3's allocation and
+  `open_or_report` as the reporting call site. ~~Section 7.3's allocation and
   contention gates remain absent for this path: both mechanisms now exist (tasks 0.26
   and 0.27) but neither has been pointed here, and what needs gating is the
   *notification* traffic rather than arbitration itself — an acquire and a release
-  happen once per session, not per event.
+  happen once per session, not per event.~~
+
+  **The contention half is now gated, and the sentence above named the wrong thing.**
+  Pointing the probe at this path found a live violation, not a covered one: it is not
+  only the acquire and release that are per session. Every *gated device call* went
+  through `permission_jni_call` to `PermissionGate::run(host_id, ..)`, whose first act
+  was `host_state(host_id)` — a `Mutex<Hosts>` on a process singleton — and that
+  includes the Bluetooth characteristic writes Section 6.1 names as a steady hot path.
+  Fixed under task 0.66, whose entry carries the evidence.
 
   Resolved while fixing this: `HostCommand::Restart` is a payload-free unit
   variant, so restart cannot swap to different content, which is why preserving
   standing grants across restart is safe as well as specified.
+- [x] 0.66 Take the process-wide permission map off the per-event device-call path.
+  Found by pointing task 0.27's contention probe at the one path Section 7.3 says the
+  requirement was first written for, which task 0.18 had recorded as needing nothing.
+
+  **The recorded obstacle named the wrong thing, and this is the seventh time.**
+  Section 7.3 said "the BLE notification path's Rust half is
+  `cfg(target_os = "android")`, so a host test binary never compiles it", and task 0.18
+  said "what needs gating is the *notification* traffic rather than arbitration itself
+  — an acquire and a release happen once per session, not per event". Both are about
+  the wrong object. The lock is in `crates/platform/src/android_permission_gate.rs`,
+  which is `cfg(any(target_os = "android", test))` and therefore compiles and runs its
+  tests on a host binary; and what is per event is neither the acquire nor the
+  notification but the *gated call*. `permission_jni_call` reaches
+  `PermissionGate::run(host_id, ..)`, which begins `host_state(host_id)` —
+  `self.hosts.lock()` on a `OnceLock` singleton. Two sessions writing BLE
+  characteristics serialised there on every call.
+
+  Useful reflex again: ask which layer can *see* the property. The effect is on an
+  android-only path; the lock is not.
+
+  **Red first.** `a_gated_device_call_does_not_reach_the_process_wide_live_host_map`
+  holds `PermissionGate::hosts` and requires a granted Bluetooth call on another thread
+  to finish anyway. Against the pre-fix implementation it timed out for the full two
+  seconds and reported at the probe's own message, naming the live-host map. The gate
+  needed one mechanism change to reach it: the probe took `&RwLock<L>` and this lock is
+  a `Mutex`, so `assert_completes_while_mutex_locked` now shares a body with the
+  `RwLock` form. Factoring that body out inverted a lock order — the guard became an
+  argument, so it was taken *before* `ONE_GATE_AT_A_TIME` — and the mechanism's own
+  `two_gates_never_overlap_and_so_cannot_blame_each_other_s_lock` failed immediately.
+  The guard is a closure now, and the reason is recorded where it is taken.
+
+  **The fix is the move two other paths already made**: a `SessionGate` resolved once
+  when a session's device services are built, holding the `Arc<HostControl>` directly,
+  exactly as task 0.16 did for the text texture cache and the input path did for the
+  debug-stats registry. `PermissionGate::run` and `PermissionGate::scope_state` — the
+  id-taking forms — are **deleted** rather than left beside the handle, so the
+  defective call cannot be written; the nine service types that make gated calls hold
+  the handle, and `permission_jni_call` takes it. `open_or_report` became
+  `open_session`, which returns the handle, and a non-reporting `session` exists
+  because the report is a `debug_assert!` and a test asserting that a *retired* id
+  stays refused must not trip it.
+
+  **What the fix moved, which is the interesting part.** `clear` removing the
+  live-host entry used to be enough to refuse on its own, because every call looked the
+  id up and got nothing; a handle keeps the control block alive, so the `Closing`
+  lifecycle flag — previously belt and braces behind the map — is now the whole of the
+  refusal. Nothing tested that:
+  `clear_waits_for_inflight_update_then_leaves_a_tombstone` and
+  `a_cleared_id_stays_retired_when_a_higher_id_opens_afterwards` both ask the gate for a
+  handle *after* the clear, so they hold an empty one and are satisfied by the map alone.
+
+  **A mutant walked, and the fixture was the reason.** The first version of
+  `a_handle_taken_before_teardown_is_refused_after_it` asserted a *scoped* call, and
+  removing `state.lifecycle = Lifecycle::Closing` from `clear` left all 52 tests
+  passing — because `clear` empties the scope map too, so the call was refused for want
+  of a grant either way. An **unscoped** protected call is the only one whose
+  post-teardown refusal can come from nothing but the flag, and `close_adapter` and
+  `stop_devices_discovery` are real unscoped gated calls. Rewritten that way, the same
+  mutant kills that one test and 51 others pass.
+
+  **Mutation evidence, files byte-identical by sha256 after each restore.**
+
+  | Mutant | Kills | Survivors |
+  | --- | --- | --- |
+  | `clear` stops marking `Closing` (scoped fixture) | nothing | 52 |
+  | `clear` stops marking `Closing` (unscoped fixture) | `a_handle_taken_before_teardown_is_refused_after_it` | 51 |
+  | `run` inverts the required-scope check | 7 tests, including the contention gate's own `Ok(0xB1E)` | 45 |
+
+  The third is not a pin — it kills too much to attribute — but it is the control that
+  says the contention gate's burst really was an *admitted* call: a refusal completes
+  instantly and would satisfy the timing assertion while proving nothing.
+
+  **Not covered, named rather than implied.** What the contention test cannot see is a
+  regression inside `SessionGate::run`: the handle holds no path back to the gate, so
+  reintroducing the map lookup is a design change rather than a mutant, and the test's
+  red half is the pre-fix implementation rather than a repeatable mutant. It stands as
+  the guard against a future acquisition of anything process-wide on that path — which
+  is exactly how the input send's stats-registry defect was found. The nine service
+  types are `cfg(target_os = "android")`: they compiled for `aarch64-linux-android` and
+  were not run. The JVM `PermissionOperationGate` is a different object with a different
+  key and stays ungated (task 5.1). The allocation half of Section 7.3 is still not
+  pointed at this path. `scripts/test-permission-coverage-contract.sh` matched the
+  wrapper by its first argument, so it failed on the new call shape and its pattern and
+  self-check fixture moved with it — 30 gated, 8 cleanup, 38 sensitive, unchanged.
+  Verified by `scripts/verify-change.sh --base HEAD`: every host target plus the
+  arm64-v8a Android compile, migo-platform 52 tests from a 51 baseline.
+
 - [ ] 0.26 Build the allocation-count gate Section 7.3 requires, then apply it.
   **Mechanism built and applied to three paths; the two paths Section 6.1 names
   remain uncovered, so this item stays open.**
@@ -371,7 +504,28 @@ review. A commit alone is not completion evidence.
   mechanism (`ThreadMXBean.getThreadAllocatedBytes`), because a Rust allocator
   observes nothing the JVM allocates; `platforms/android` has no such usage today.
 
-  Still unmeasured: the render command path and the audio path. **`io::image_cache`
+  **And it is not merely ungated: it is unmet, five times per notification.** Read on
+  2026-08-08 while auditing this item. `onBLECharacteristicValueChange` in
+  `platform/src/android/jni/inbound.rs` allocates three `String`s (device, service and
+  characteristic UUIDs, via `env.get_string(..).into()`), one `Vec<u8>` for the value
+  (`convert_byte_array`), and one `Box<BleCharacteristicData>` — on every notification,
+  for a stream a peripheral can drive at a hundred hertz or more. The three UUIDs are
+  *the same three strings* on every notification from one characteristic, which is what
+  makes them interning candidates rather than an unavoidable JNI copy; the value and the
+  box are what the input path already solves with a payload pool. So the shape of the
+  fix is known and it is the pool this requirement already built once. What is not
+  known is whether the JNI string extraction can avoid an allocation at all, which is a
+  question about the `jni` crate's API and needs a target to answer honestly. Recorded
+  with its count rather than left as "uncovered", because "no gate exists" and "the
+  requirement is violated" are different states and this item had them conflated.
+
+  ~~Still unmeasured: the render command path and the audio path.~~ **Both are since
+  covered** — the render command path's two enqueues under tasks 0.38 and 0.41, and the
+  audio path under 0.43 (the graph's per-quantum render), 0.47 (the thread's own tick),
+  0.48 (the hardware output callback) and 0.49 (the streaming refill), all listed in
+  Section 7.3's "Covered so far". This is the second time this item's hand-maintained
+  remaining list named work already done, and the same correction as the
+  `io::image_cache` line below. **`io::image_cache`
   no longer belongs on that list** — the prediction recorded here was right and was
   acted on: task 0.34 measured it (the pin/unpin pair allocated, the lookup did
   not) and task 0.36 removed the two owned keys on the layer above it. This
@@ -381,6 +535,15 @@ review. A commit alone is not completion evidence.
 - [ ] 0.27 Build the cross-session contention gate Section 7.3 requires.
   **Mechanism built and applied to the Rust per-event paths; the permission gate's
   JVM half stays with task 5.1, so this item stays open.**
+
+  **The Rust permission gate is now among them, and it was a live violation rather
+  than a covered path.** This entry said the gate had no such test and pointed at task
+  5.1 for the replacement — which is the *JVM* gate. The Rust gate is a different
+  object, and pointing this mechanism at it under task 0.66 found every gated Android
+  device call taking a process-wide `Mutex` on the live-host map. The mechanism grew a
+  `Mutex` form for it, sharing a body with the `RwLock` one; factoring that body out
+  inverted a lock order and the mechanism's own overlap self-test caught it, which is
+  the second time one of these probes' controls has earned its place.
 
   No such test covered the permission gate. The first attempt was withdrawn because it
   was provably unable to fail: the path it exercised took the shared lock inside the
@@ -1642,8 +1805,12 @@ review. A commit alone is not completion evidence.
 
   They are one type now — `shared::protocol::CanvasIdSet`, an inline 32-entry
   set that deduplicates on insert, keeps its capacity across a `clear`, and
-  spills to the heap rather than losing entries on a scene nobody has produced
-  yet. One implementation means the deduplication a set implies is written once
+  spills to the heap rather than losing entries on a wider scene. **"A scene
+  nobody has produced yet" is how this read when it was written, and it was
+  wrong twice over** — the profiled scene was already at thirty of thirty-two,
+  and because no call site reused a set, a spill was an allocation *per frame*
+  rather than once. Corrected under task 0.52. One implementation means the
+  deduplication a set implies is written once
   and gated once; an inline `SmallVec` that a caller forgets to check before
   pushing is a set only by intention. Iteration is insertion-ordered
   deliberately: these ids feed straight into emitted render ops, and a
@@ -1658,9 +1825,268 @@ review. A commit alone is not completion evidence.
   **What is still not gated, named rather than implied:** the two new call sites
   inherit the type's gate but have none of their own, because both need what a
   host test binary cannot give them — `execute_gl_batch` a live GL context, and
-  `build_frame_packet` a pool that no neighbouring test is taking from. The type
+  `build_frame_packet` a pool that no neighbouring test is taking from. ~~The type
   is the thing that can regress; the call sites can only regress by swapping it
-  back out.
+  back out.~~ **That last sentence was false and is why task 0.52 exists.** A call
+  site regresses by *sizing* as well as by swapping: a set constructed per frame
+  turns one spill into one allocation and one free on every frame of the scene,
+  and the type's gate cannot see which of its callers keeps its buffer. Two of
+  the three did not.
+
+- [x] 0.52 Stop the render path's canvas-id sets allocating on every frame of a
+  wide scene. Section 7.3 recorded this as a blind spot in two parts: the shared
+  `CanvasIdSet` "spills to the heap on a scene with more than 32 distinct Canvas2D
+  targets in one packet", and two of its three call sites carry no gate of their
+  own. Checking the premise before building on it found the first part **true and
+  understated**, the second **true but not the reason it mattered**.
+
+  **The spill was per frame, not once.** The type's own `clear` promised that "a
+  set reused across frames stops allocating after the first spill" — and no call
+  site reused one. All three constructed a set, filled it and dropped it, so above
+  the inline capacity each frame bought a heap block and freed it again: on the
+  render thread for the reorder classifier, on the thread running the game for the
+  packet builder. Measured over eighty canvases: **128 heap allocation events over
+  64 frames (64 fresh, 64 resize, 49152 bytes)** on the classifier alone.
+
+  **And the gate that was supposed to cover it could not.**
+  `classifying_a_packet_for_reorder_never_reaches_the_heap` ran against the
+  thirty-canvas shop-open scene the reorder was profiled on — which *fits* inside a
+  thirty-two-entry inline array — so it read green over a path that allocated on
+  every frame of any busier scene. A burst has to be pointed at the workload, not
+  at the workload that happens to fit the constant. Its fixture is eighty now.
+
+  **What ruled out both cheap answers, recorded because it is a fact about the
+  engine rather than a preference.** Canvas ids come from
+  `CanvasManager::new_canvas_id`, a bare `fetch_add` with no free list, so they
+  climb for the life of a session and never repack — an id-indexed bitmap would be
+  sized by the highest id ever issued, not by the live count. And nothing caps live
+  canvases (`MAX_LIVE_CANVAS2D_SNAPSHOTS` caps snapshots, not canvases), so no
+  inline capacity is a bound either; widening 32 to 64 moves the cliff and calls it
+  fixed. A cocos UI gives each text label its own offscreen canvas, so the profiled
+  thirty is four table rows away from thirty-three.
+
+  **The classifier gathers nothing now.** `packet_safe_to_reorder` asks whether the
+  Canvas2D targets intersect the canvases the WebGL half binds — a boolean — and
+  both sides are already in the op slice it was handed, so materialising either one
+  buys nothing and costs a container. It scans the ops once per *distinct* canvas a
+  WebGL command binds, which is normally one, carrying a one-entry memo of the last
+  canvas **proven absent**. That asymmetry is the load-bearing part: a hit returns
+  immediately, so only a proven-absent id is ever remembered, and a stale or
+  mismatched entry can therefore cost a repeated scan and can never change the
+  verdict. It is also less work than gathering was — that deduplicated on insert,
+  a scan per Canvas2D op, and then scanned the gathered list once per WebGL
+  command, which on a forty-label frame with three hundred GL commands is twelve
+  thousand comparisons the memo collapses to forty-five.
+
+  **The packet builder does need the ids** — it emits one `Materialize` op per
+  pending canvas — so its set moved onto `UnifiedFrameCollector`, which spans
+  frames, and the spill is paid once however wide the scene gets. It is acquired
+  through `CanvasIdSet::begin`, which empties it and hands it out: the reuse is of
+  the allocation and never of the contents, and a method rather than field access
+  is what keeps that from being a rule someone has to remember.
+
+  **Gated on the retained capacity rather than by a burst, and that is not the
+  weaker choice here.** A burst over `build_frame_packet` would also measure the
+  packet's pooled op vector, and this crate's five hundred other tests take from
+  that pool concurrently — the interference that put the whole-frame burst in an
+  integration test of its own over in `migo-shared`, which cannot reach the
+  collector. The property at stake is exactly "the second frame does not allocate
+  again", which retained capacity states directly and deterministically.
+
+  **The third call site is unchanged, deliberately.** `execute_gl_batch`'s
+  `touched_canvases` holds one entry per distinct canvas the batch's commands bind,
+  and each of those carries a live WebGL context — an EGL context and its
+  framebuffers — so it is not the label count that made the other two reachable.
+  Removing its spill needs one of two things, and both were rejected: marking the
+  2D contexts stale inside the dispatch loop sets the flag ahead of commands that
+  might clear it, and holding the gathered ids in a `RendererGL`-owned scratch
+  needs them to survive a `&mut RendererGL` call that could clobber them. Each
+  trades a bounded spill for an invariant by convention, on the one path in packet
+  execution where a wrong answer is wrong pixels and which no host test can observe
+  because it needs a live GL context.
+
+  **Mutation evidence.** Every kill below is at the named test's own assertion.
+
+  | Mutant | Kills | Survives |
+  | --- | --- | --- |
+  | Classifier gathers a `CanvasIdSet` again | `classifying_a_packet_for_reorder_never_reaches_the_heap`, at 128 events / 49152 bytes | 552 |
+  | Memo answers from its entry without comparing the id | `a_canvas_the_gl_half_also_touches_forces_issue_order`, `a_collision_in_the_last_command_of_the_last_batch_still_refuses`, `a_scene_with_eighty_canvases_still_finds_the_one_the_gl_half_collides_with` | 550 |
+  | Scan truncated at forty ops | `a_scene_with_eighty_canvases_still_finds_the_one_the_gl_half_collides_with` alone | 552 |
+  | Classifier's early-out deleted | **nothing** | 553 |
+  | Packet builder gathers into a set of its own | `a_frame_wider_than_the_pending_set_pays_its_spill_once` | 517 |
+  | Builder reaches the span-frames set without emptying it | `a_frames_materialize_ops_name_only_that_frames_canvases`, at `[1, 2, 4]` against `[4]` | 517 |
+  | `begin` stops clearing | `begin_hands_out_an_empty_set_that_kept_its_capacity` and the same collector test | 6 + 517 |
+  | `clear` surrenders the allocation | `clearing_empties_the_set_without_giving_up_its_capacity`, `refilling_a_reused_set_far_above_the_inline_capacity_never_reaches_the_heap`, `begin_hands_out_an_empty_set_that_kept_its_capacity`, `a_frame_wider_than_the_pending_set_pays_its_spill_once` | 4 + 517 |
+
+  **Two of those rows are findings rather than confirmations.** The staleness
+  mutant *walked* on the first attempt, and the reason was a defect in the test,
+  not in the fix: both of its frames ended with a GL segment, and a GL segment
+  consumes the pending run at the boundary — so the set was empty at every frame
+  end and there was nothing to inherit. What survives a frame boundary is a
+  *trailing* 2D run, which nothing follows and which a non-barrier packet does not
+  materialise. Rewritten that way it dies naming the canvases it inherited. And
+  the early-out kills nothing at all: deleting it changes no verdict and allocates
+  nothing, because the scan then finds no Canvas2D op to match. It is a pure
+  performance guard and is recorded as unpinned rather than counted as covered —
+  the same status it had before this item, which is why it is worth saying.
+
+  **One test was deleted, which is the one thing a test cannot report about
+  itself.** `repeated_canvas_targets_are_gathered_once` was gated on allocation
+  because gathering one canvas sixty-four times spilled the target list; with
+  nothing gathered there is no deduplication on that path to pin, and the burst it
+  shared a fixture shape with now covers eighty distinct canvases. Its sibling
+  `more_distinct_canvases_than_the_inline_capacity_stay_correct` was renamed to
+  `a_scene_with_eighty_canvases_still_finds_the_one_the_gl_half_collides_with`,
+  because the classifier has no inline capacity to be above and the mutant table
+  shows what the fixture actually pins: scale, and not the memo, which two
+  pre-existing tests already caught.
+
+  **Verified** with `scripts/verify-change.sh --base HEAD`: the whole host
+  workspace, every crate's tests, `cargo fmt --all --check`, `git diff --check`,
+  and the `arm64-v8a` Android compile the change to `render_thread.rs` requires.
+  The classifier decides ordering rather than values, so a running engine is worth
+  more than a suite here: the headless Linux player reaches first frame and holds
+  60 fps for twelve seconds through the rewritten classifier. **That run exercises
+  the early-out and nothing else** — bunnymark is WebGL-only, so it never builds a
+  Canvas2D segment and never reaches the scan, the memo or the collision refusal.
+  Those are covered by tests alone; a bundle mixing offscreen Canvas2D labels with
+  an onscreen WebGL canvas is what would exercise them end to end, and the bench
+  repository has none.
+
+- [x] 0.53 Audit Section 7.3's "bounded hot paths" requirement and record what
+  observes it. Opened on the premise that nothing observes this behaviourally —
+  that `scripts/test-input-transport-contract.sh` greps for the absence of
+  `unbounded_channel` and a saturation test is missing. **The premise is false and
+  saying so is the finding**, because it is the second time this delivery has
+  mistaken that script's greps for the whole of a requirement's coverage: for the
+  *allocation* requirement (task 0.26) they really were all there was, and reading
+  the same script the same way here understates the tree.
+
+  `host_channel.rs` drives the real queue in eleven tests.
+  `critical_bypasses_full_normal_budget_and_keeps_fifo` fills the normal lane and
+  requires the refusal to return the command rather than drop it;
+  `reliable_reserve_is_bounded_and_returns_original_command` does the same for the
+  reserve; and `terminal_supersedes_older_motion_for_its_stream` **is** the
+  saturation test this requirement's second sentence asks for — the lane is at
+  capacity, and the terminal transition must come back `Enqueued` rather than
+  `Reserved`, which holds only if it superseded the replaceable motion instead of
+  spending the reserve or being dropped. Nothing needed building for the input
+  transport; what was missing was the coverage list every other Section 7.3
+  requirement carries, and its absence is what made the bullet read as a claim
+  about every queue in the engine. It is written now.
+
+  **What the audit found instead, and it is a defect rather than a gap.** The
+  audio command transport is `tokio::sync::mpsc::unbounded_channel::<AudioCmd>()`,
+  and its consumer drains at most `MAX_CMD_DRAIN = 256` commands per tick and
+  defers the rest — an unbounded queue behind a capped drain, which is the growth
+  shape the requirement names. The drain's own comment names the producer that
+  reaches it: "prevent mixing starvation when JS fires rapid bursts (automation,
+  game SFX)". So the design already anticipates a burst wider than the drain and
+  answers it with unbounded memory instead of backpressure. The ceiling is about
+  51,200 commands per second in Active mode and a tenth of that in the
+  fifty-millisecond low-power window.
+
+  Everything else on a hot path is bounded by construction: the render command
+  channel is a `crossbeam_channel::bounded`, and the render thread's deferred
+  upload queue refuses above `MAX_DEFERRED_UPLOADS` by handing the image and its
+  responder back — the input queue's policy at another layer. `cancelled_uploads`
+  only records ids that had a pending upload, with a comment saying why.
+
+- [x] 0.54 Bound the audio command transport. Found by task 0.53.
+
+  **It could not take the input queue's shape.** `AudioCmd` carries JS-allocated
+  ids with fire-and-forget creates — `CreateContext`'s own doc says "FIFO channel
+  ordering guarantees this command is processed before any node op that references
+  `ctx_id`" — so ordering is the protocol, nothing in it is replaceable, and a
+  dropped command leaves a later one addressing an id that was never created.
+  Coalescing and supersession are both unavailable, and returning a refusal to JS
+  is worse than useless: the Web Audio API has no error for it, so every op would
+  swallow it and the loss would surface as a node that does not exist.
+
+  **So it takes the render path's shape.** `shared::audio_channel` is a bounded
+  crossbeam channel whose send waits — backpressure without loss, the policy this
+  engine already uses for its other lossless-FIFO hot path. Deadlock-free for a
+  reason worth writing down rather than assuming: the audio thread never waits on
+  the producer, because every `AudioCmd` response is a `oneshot::Sender`, so there
+  is no cycle between a blocked producer and the consumer that frees it. It is
+  crossbeam's rather than a bounded `tokio` channel because `tokio`'s
+  `blocking_send` panics inside a runtime context and deno_core ops run in one.
+
+  **Three decisions are load-bearing.**
+
+  - **The notification for a full queue happens before the wait.** The audio
+    thread sleeps indefinitely once content has gone silent, and a send's own
+    wakeup is what brings it back — so a send that parked first and notified after
+    returning would wait for a drain that is waiting for it. Notifying before the
+    wait cannot race: the queue is full, so the woken drain must free a slot, and
+    `ThreadWakeup` latches its signal. This was found by design analysis, not by a
+    failure, and it has a test whose failure mode is a deadline rather than a hang.
+  - **The capacity is derived, not chosen.** A full queue must empty within a
+    small fixed number of consumer iterations, because that count *is* the bound
+    on how long a saturating producer waits;
+    `AUDIO_COMMAND_CAPACITY = 4 * AUDIO_COMMANDS_PER_DRAIN`, and the relationship
+    is a `const` assertion, so a capacity below one drain is a compile error rather
+    than a slow queue.
+  - **The pre-start backlog goes to the thread, not back into the channel.**
+    `AudioService` buffers commands that arrive before the audio thread exists and
+    used to re-inject them with `tx.send`. Against a bounded transport that is a
+    deadlock: at the moment of handover nothing is draining the queue, because the
+    receiver is still held by the service. The commands are handed over as a
+    backlog the thread consumes ahead of the channel, which also removes an
+    ordering argument that was never sound — the game thread can enqueue during the
+    handover, and a re-injected command would then land behind a newer one.
+
+  **The profile with no audio subsystem needed its own answer**, which is the
+  hazard task 0.53 recorded. `AudioService` in `not(feature = "api-media")` held a
+  receiver it never read, so a send queued for the life of the session — harmless
+  only because the audio ops are compiled out of that profile and nothing could
+  reach it. Behind a bounded channel that same shape parks the first producer to
+  fill it. It holds `audio_channel::disconnected()` now — a sender with no receiver
+  and no queue — so a send fails at once and hands the command back, and the reason
+  it is safe stops being a fact about which ops happen to be registered. The
+  Worker's placeholder sender had the identical shape and got the identical fix;
+  there it is also a small improvement, since a worker that did use audio was
+  accumulating commands in a queue nobody read.
+
+  **A second requirement was closed on the way.** `tokio`'s unbounded channel buys
+  a block from the heap every thirty-two messages, on the thread running the game,
+  on a per-event path Section 7.3's zero-allocation list did not cover. A bounded
+  crossbeam send allocates nothing, and the burst gate catches the difference
+  independently of the boundedness assertions.
+
+  **Mutation evidence.** Every kill is at the named test's own assertion.
+
+  | Mutant | Kills | Survives |
+  | --- | --- | --- |
+  | The transport is unbounded again | `the_transport_is_bounded`, `past_capacity_the_queue_hands_the_command_back`, `a_steady_state_audio_command_send_never_reaches_the_heap` | 410 |
+  | A full send parks before notifying | `a_send_into_a_full_queue_wakes_the_sleeping_consumer_that_frees_it`, at its deadline | 412 |
+  | `disconnected()` keeps a live receiver | `a_disconnected_sender_holds_no_queue_and_refuses_every_send`, on the first command | 412 |
+  | The drain consults the channel before the backlog | `the_startup_backlog_runs_before_anything_still_in_the_channel`, at `[30, 40, 10, 20]` against `[10, 20, 30, 40]` | 64 |
+  | The service drops what it buffered | all three backlog-assembly tests | 51 |
+  | Capacity below one drain | **compile error** at the `const` assertion | — |
+
+  **One mutant walked first, and closing it is why two functions were extracted.**
+  Dropping the pre-start backlog killed nothing: `crates/core/src/services/audio.rs`
+  had no tests at all, and the only thing naming `check_and_start` is a wiring test
+  that greps the host loop's source. The handover itself needs an audio device and a
+  host test cannot provide one, so the two parts of it that decide correctness were
+  lifted out where they can be observed — `take_startup_backlog`, which assembles
+  the buffer and appends `PauseAll` last so a backgrounded app does not start
+  playing what it buffered, and `next_command`, which is the drain's choice between
+  backlog and channel. The mutant dies at three assertions now.
+
+  **Verified** with `scripts/verify-change.sh --base HEAD` across 22 files: the
+  host workspace, every crate's tests, `cargo fmt --all --check`, `git diff
+  --check`, and the `arm64-v8a` Android compile. **Both profiles, because the gate
+  only covers one:** cargo's defaults are `profile-full`, so the gate never
+  compiled the `not(feature = "api-media")` branch this change touches —
+  `--no-default-features --features profile-slim` compiles and tests clean
+  separately. The headless player, which defaults to `profile-full`, reaches first
+  frame and holds 60 fps for ten seconds with the bounded transport wired in and
+  the host loop parking on its audio signal. **That run does not exercise a command
+  flowing**, because bunnymark plays no audio; what it shows is that construction,
+  lazy start and the idle path are intact. A bundle that uses Web Audio is what
+  would exercise the transport end to end, and the bench repository has none.
 
 - [x] 0.47 Gate the audio thread's own tick. Section 7.3 recorded the audio path
   as "measured at its graph render only", and the graph render is the half that
@@ -1945,6 +2371,235 @@ review. A commit alone is not completion evidence.
   nothing newer than the artifact it had already built and reran the *mutated*
   binary against the restored tree. That is CLAUDE.md §9's WSL2 mtime trap arriving
   through a new door. Restores touch the file now.
+
+- [x] 0.51 Build the steady-state growth gate Section 7.3 requires, then apply it.
+  The fifth of Section 7.3's structural requirements to get a mechanism. Unlike
+  task 0.50, auditing this one found **no defect**: 180 s of continuous rendering
+  at 60 fps moves resident memory 270.4 MB → 257.7 MB, net **−12.7 MB**. So this
+  task is a missing gate rather than a missing fix, and it is worth saying that
+  plainly rather than manufacturing a finding.
+
+  **Why the allocation burst could not be reused.** A burst asks whether a path
+  touches the heap at all, which is only answerable where the answer must be
+  never. Every path this requirement is really about — admit and evict a cache
+  entry, take and release an alias, open and close a connection — allocates for a
+  living, so no burst can be pointed at it. `Cycle` /
+  `assert_no_steady_state_growth` asks the other question: did the window give
+  back what it took. Net live bytes, from the same counting allocator, which
+  gained `bytes_freed` and a signed `live_bytes()` for the purpose.
+
+  Design points, each pinned by a control or a mutant:
+
+  - **A resize is both ends at once.** `realloc` takes the new block and returns
+    the old, so `record_reallocation` records both. Recording only the new size
+    makes every growing container look like it leaked the difference — the mutant
+    that drops the old-size half fails `growing_a_block_nets_only_the_difference`
+    at 4096 against 4032.
+  - **The installation check is stricter than the burst's, and it has to be.** A
+    growth gate has one extra way to be silently green: if *frees* stopped being
+    counted every cycle would look like it grew, which is loud and harmless, but if
+    *allocations* stopped being counted every cycle would look like it shrank and
+    the gate would pass forever. So the check is not "did we see an allocation" but
+    "did a known allocate-and-release pair net to exactly zero", which no single
+    broken counter satisfies. The mutant that stops counting frees is killed by the
+    check itself, naming the direction.
+  - **The judgement is a pure function of the observed counts.** A broken allocator
+    cannot be installed beside the real one — `#[global_allocator]` is unique per
+    binary — so `untrustworthy_growth_observation` takes counts and returns the
+    reason, and the four disqualifying shapes are unit-tested against fabricated
+    ones. This is the same "separate the observation from the judgement" move that
+    makes the other probes' policies testable.
+  - **Passing means net.** A cycle that leaks a hundred bytes while releasing two
+    hundred elsewhere passes, because net is what "does not grow" means and a
+    stricter reading fails every legitimately shrinking path. Stated in the doc
+    comment rather than left for a reader to discover.
+
+  **A claim written before it was tested turned out to be false, and the test is
+  what caught it.** The mechanism was designed to close the pooled-vector hole
+  task 0.41 recorded as open — "nothing catches a deliberate leak". The reasoning
+  was that a lost loan is a missing deallocation, so a net-bytes measure would see
+  it where an allocation burst cannot. **It does not.** A delta measure only moves
+  when the *window* allocates or frees, and a loan was allocated before the window;
+  taking it from the pool and forgetting it moves neither counter. The test written
+  to demonstrate the closure failed, and it is kept — inverted, as
+  `a_block_taken_from_an_earlier_population_and_leaked_is_not_visible` — so the
+  boundary is pinned rather than re-assumed. Section 7.3's pooled-vector paragraph
+  is corrected in place. The lost loan still surfaces only when the drained pool
+  forces an allocation, which is the burst's second-order signal, not a new one.
+
+  **Applied to the image cache, and the mutant proves it is not redundant.** Two
+  gates: the reservation round trip (`pin` then `unpin` of a *non*-resident key,
+  which must allocate an owned key and give it back) and admission at the byte
+  budget. The reservation table is the one structure in that cache `current_size`
+  does not account for, which makes it the one place growth can hide from every
+  budget test **and** from the public API: a reservation left behind at a count of
+  zero is indistinguishable from an absent one through `pin_count`
+  (`unwrap_or(0)`), and invisible to `size_bytes`. Deleting the
+  `reservations.remove(key)` that runs when a count reaches zero fails
+  `a_reservation_round_trip_gives_back_the_key_it_took` at 6968 retained bytes over
+  64 iterations — **and nothing else in the crate**, across 266 tests. That is the
+  general lesson: measure the allocator, not the structure's own accounting, because
+  a guard that reads `current_size` cannot see growth in what `current_size` does
+  not count.
+
+  The gate needs distinct keys per iteration, which is not cosmetic: repeating one
+  key would let a table that never released it still look balanced, because the
+  second pin of a live reservation allocates nothing. They are the same length so
+  the balanced net is exactly zero rather than approximately so.
+
+  **The process-level instrument is committed too**, because the requirement is
+  about resident memory and the heap gates cannot see GPU allocations, the V8 heap,
+  mmap or fragmentation. `scripts/measure-steady-state-growth.sh` samples `VmRSS`
+  across a long workload and **fails when the content stopped producing frames**,
+  for the same reason the idle-wakeup script asserts painted frames: a stalled
+  engine does not grow either. Two instruments, one two-sided rule.
+
+  **Verified.** migo-alloc-probe 11 unit from 3 and 17 harness from 8, migo-io 266
+  from 264, migo-shared 405, migo-graphics 554, `cargo fmt --all --check` clean, and
+  `scripts/verify-change.sh --base HEAD` PASS on every host step and on
+  `android compile`.
+
+  **What this does not close.** The threshold that turns the process measurement
+  into a gate belongs in the versioned baseline file (Phase 5), and the run exists
+  on the Linux host only. Session create/destroy cycles, the V8 heap across a soft
+  restart, and GPU-side growth have no gate of their own — named rather than
+  implied, since "no steady-state growth" would otherwise read as covering them.
+
+- [x] 0.50 Make frame delivery demand-driven on the engine-paced platforms.
+  Section 7.3's idle-quiescence requirement was the last of its structural
+  requirements with no mechanism at all, and auditing it found a live defect
+  rather than a missing test: **Linux, Windows and HarmonyOS woke the render
+  thread sixty times a second with nothing to draw.**
+
+  **What was wrong, and why it survived.** `RenderThread::spawn` created
+  `crossbeam_channel::tick(1/fps)` whenever the platform reported no external
+  vsync source, and the `recv(ticker)` arm drained commands, presented and touched
+  stats on every tick regardless of demand. Android escapes this because
+  `FrameClock::uses_external_vsync` is true for it, so it arms one Choreographer
+  callback at a time through `should_arm_one_shot`. The revealing detail is that
+  `should_arm_one_shot`'s own passing test asserted
+  `should_arm_one_shot(has_vsync=false, ..) == false` — "no vsync source (desktop
+  ticker) → never arm". The demand-driven policy was written, tested, and then
+  deliberately excluded from the path whose unconditional ticker *was* the clock.
+  So this was never a partially-implemented requirement; it was a requirement met
+  on the one platform that had an arm route. `LinuxPlatform` and `WindowsPlatform`
+  answer false, and HarmonyOS reaches the engine through `CapiHostKit`, which
+  answers false unless the C host installed `on_request_frame` — which the ArkTS
+  bridge does not. Three of the four delivered platforms, one battery-powered.
+
+  **The fix is one policy over two arms, not a second policy.**
+  `SoftwareFrameClock` answers when the render thread should next wake, `None`
+  meaning never, and `RenderWait` is the loop's single wait point taking that
+  answer. Design decisions and why each is load-bearing:
+
+  - **The deadline is an argument to the wait, not a timer channel.**
+    `crossbeam_channel::at(deadline)` was the obvious mechanism and is the wrong
+    one: it allocates a channel per armed frame, sixty allocations a second on the
+    very render thread tasks 0.38 through 0.41 spent four commits de-allocating.
+    `Select::ready_deadline` re-arms for free. The `Select` itself is built once
+    outside the loop for the same reason.
+  - **The pacing grid outlives the idle period.** Two `Option<Instant>`s, not one:
+    `armed_at` is the scheduled frame and `earliest_next` is the grid. Demand
+    republished two milliseconds after a frame therefore waits for that frame's
+    slot, so a rAF loop cannot spin the clock — with a single field, re-arming
+    would set the deadline to *now* and free-run. The grid advance is computed, not
+    iterated: dropping the partial interval `ran_at` sits in and adding a whole one
+    lands on the next slot, so a frame that overran by ten slots owes one frame
+    rather than ten, an on-time frame keeps its phase, and there is no
+    multiplication to overflow.
+  - **An overdue frame is served before the channels are polled.** `Select` returns
+    any ready operation without consulting the deadline, so a continuously-ready
+    command queue would starve the frame indefinitely. The converse cannot happen:
+    the frame branch drains the command queue itself and running a frame advances
+    the grid past now.
+  - **Stopping the clock is only safe because demand can reach a sleeping thread.**
+    On engine-paced platforms `request_vsync` becomes a single-slot nudge the wait
+    selects on, so `op_await_next_frame` wakes the render thread and the thread
+    then arms its own clock. The nudge carries no payload — demand is read from the
+    latch — which is what makes a full slot the right thing to drop rather than a
+    lost wakeup. The render thread is deliberately *not* handed the nudge closure:
+    a thread nudging itself is a wakeup that arms nothing, and `host.rs` passes
+    `None` there so that is a compile-time fact rather than a rule.
+
+  **One asymmetry is deliberate and recorded where it is written.**
+  `should_arm_engine_paced` omits `can_present`, which its vsync sibling requires.
+  Asking a compositor for a frame callback with no live surface is meaningless,
+  whereas an engine-paced frame with no surface still opens the per-frame upload
+  budget and drains completed uploads — the exact stall the vsync branch's own
+  comment describes, and a real risk for a C host that loads content before
+  handing over its window. Uniformity here would have been a regression dressed
+  as symmetry.
+
+  **Also cleaned up, because the ticker was scattered state.** `ticker` was a
+  `Receiver<Instant>` reassigned from four places (init, `FrameRate`, `Pause`,
+  `Resume`). Those become `set_fps`, `stop` and demand, and the four `select!`
+  arms become a `match` on a named `Wake`. `Select` readiness is advisory, so each
+  arm now distinguishes an empty receiver (spurious wakeup, wait again) from a
+  disconnected one — which the `select!` version could not express.
+
+  **Measured, and the measurement needed two sides.**
+  `scripts/measure-idle-wakeups.sh` reads the render thread's and the whole
+  process's `voluntary_ctxt_switches` while committed probe content
+  (`scripts/fixtures/idle-probe`) paints twice and then stops asking for frames:
+
+  | | render thread | whole process | frames painted |
+  | --- | --- | --- | --- |
+  | before | 59 wakeups/s | — | 2 |
+  | after | **0** | **0** (53 threads) | 2 |
+  | engine-paced arm deleted | 0 | 0 | **0** |
+
+  That third row is why the script asserts painted frames before believing the
+  silence: **an engine that never renders is also perfectly quiet.** It is the
+  always-red-gate failure mode this ledger has hit twice in tests, arriving
+  through a measurement instead — and it is also the mutation evidence for the
+  clock-to-loop wiring, which no unit test covers.
+
+  **Mutation evidence.** Seven mutants, each killed by exactly one named test at
+  that test's own assertion: the clock starting armed
+  (`an_idle_clock_schedules_no_wakeup`), a frame leaving it armed
+  (`a_frame_that_ran_leaves_the_clock_idle_until_demand_re_arms_it`), arming
+  ignoring the pacing slot
+  (`re_arming_inside_the_current_slot_cannot_raise_the_frame_rate`), a frame
+  re-phasing instead of advancing the grid
+  (`pacing_does_not_drift_when_every_frame_runs_late`), `stop()` not retiring the
+  wakeup (`stopping_cancels_the_armed_wakeup`), the arm ignoring pause
+  (`engine_paced_arm_needs_demand_and_a_running_clock`), and the wait polling
+  channels before an overdue frame
+  (`an_overdue_frame_is_served_before_a_ready_command_queue`).
+
+  **One mutant survived first, and fixing it changed the design rather than the
+  test** — which is the reading rule this ledger already records, applied to its
+  own case. With state `slot: Option<Instant>` plus `armed: bool`, mutating
+  `new()` to start armed killed nothing: `deadline()` returned `self.slot`, which
+  is `None` on a fresh clock, so the idle test passed for the wrong reason.
+  `armed && slot.is_none()` was an unreachable state that was nevertheless
+  *representable*, and a representable invalid state is what let the mutant hide.
+  Replacing the pair with `armed_at: Option<Instant>` makes "armed for no
+  particular time" unspellable, and the same mutant then dies at the assertion it
+  was aimed at. The lesson generalises: when a mutant walks, ask whether the state
+  space is too large before assuming the test is too weak.
+
+  **Verified.** `scripts/verify-change.sh --base HEAD` PASS on every host step and
+  on `android compile` for `arm64-v8a`, which it required because the change
+  touches `render_thread.rs`. Whole workspace green (migo-graphics 554 from a
+  measured 535 baseline — eleven clock tests, one arm-policy test, seven wait
+  tests; migo-shared 405, migo-core 51, migo-capi 142, migo-io 264,
+  migo-platform 50), `cargo fmt --all
+  --check` and `git diff --check` clean, and no new clippy finding in any changed
+  file (the two `warm_frames -= 1` saturating-subtraction warnings are present at
+  baseline; `frame_scheduler.rs` and `render_wait.rs` are clean).
+
+  **End-to-end, not only in units.** The headless Linux player runs the bunnymark
+  bundle at a steady **fps=60** and captures a 720x1280 presented frame, so the
+  demand-driven clock paces at the target rate rather than merely stopping.
+
+  **What this does not close.** Section 7.3's ceiling belongs in the versioned
+  threshold file, which is Phase 5's; the measurement exists on the Linux host
+  only, so Windows and HarmonyOS need the same instrument run against their own
+  hosts before their rows are real, and HarmonyOS's target build stays blocked
+  behind item 0.32. A disconnected external vsync channel would leave the wait
+  spinning — pre-existing on the Android path, unchanged here, and named because a
+  quiescence claim should not be read as covering it.
 
 - [x] 0.28 Give pack-backed image cache keys a globally meaningful identity.
   Found by spec-checking the sharing precondition in Section 6.5 while finishing
@@ -2738,19 +3393,872 @@ review. A commit alone is not completion evidence.
   root, and that two Sessions may be driven from two host threads while calls
   through a *single* Session stay the host's to serialise.
 
-  **Still uncovered, and deliberately not claimed:** isolate separation and storage
-  and quota separation. `migo_session_create` yields a Session with no attached
-  surface, so no Host and therefore no V8 isolate exists yet, and no game identity
-  has been bound. Reaching those needs a Session driven far enough to start content,
-  which needs a surface. Asserting them from this layer would be the
-  inspection-as-test mistake Section 7.3 warns about. Permission independence is
-  likewise untested here; the Java gate's own tests cover a single gate with several
-  session ids, which is not the same as two Sessions.
+  **Two property groups were recorded here as needing a surface. That was the wrong
+  reason, and re-reading it is what found the gap that was real.** The claim was
+  that isolate separation and storage/quota separation need "a Session driven far
+  enough to start content, which needs a surface". True of *this* layer —
+  `migo_session_create` yields a Session with no Host, and `migo_session_load_content`
+  refuses without a render target, so asserting either from the C API would be the
+  inspection-as-test mistake. But it does not follow that a surface is what a test
+  needs; what it needs is the layer that can see the property, and that layer
+  already exists. `tests/published_namespace_isolation.rs` boots a real `JsRuntime`
+  — a real V8 isolate — in a host test with no surface, no Host and no C API at all.
+
+  Reading each group at that layer:
+
+  - **Storage separation is covered**, in `tests/storage_isolation.rs`:
+    two game ids resolve to non-overlapping roots, neither contains the other,
+    `storage_dir` asks `game_paths` rather than the host app's directory, and a
+    missing game fails rather than falling back. The Session-level wiring above it
+    is covered by task 0.62's two live Sessions rather than by construction as this
+    entry once said.
+
+    ~~Quota is not a shared pool either: `MAX_TOTAL_BYTES` is passed to each
+    storage op *alongside the directory* and enforced inside that file's SQLite
+    transaction, so it is per-root by the same fact that makes the roots separate.~~
+    **That sentence was reasoning, not coverage, and task 0.62 was right to name quota
+    as untouched.** The reasoning is correct and it was never executed: no test filled
+    a quota, so nothing distinguished "each game gets 10 MB" from "the games share
+    10 MB", and distinct directories do not settle it — the store handles live in a
+    process-wide `HashMap` in `storage_ops`, and a shared running total or a cache key
+    that lost the directory would leave two directories in place while making one
+    game's writes count against the other's budget.
+
+    **Now executed.** `one_game_exhausting_its_quota_leaves_the_other_game_its_own`
+    extends task 0.62's fixture: two live Sessions, a real isolate and a real
+    `evaluate_module` each, the *same* app directories so the game id is the only
+    thing that can separate them, and `game-a` filled through the production
+    `storage_set` under the shipped `MAX_TOTAL_BYTES` until it is refused. The
+    refusal is asserted, and asserted to be the quota's rather than any other error,
+    because a fixture that never reached the limit would say nothing about sharing
+    it. Then `game-b` writes and must be admitted — and both stores' byte totals are
+    asserted, because "b's write succeeded" is also satisfied by a shared store that
+    happened to have room.
+
+    | Mutant | Kills | Also kills |
+    | --- | --- | --- |
+    | The store-handle cache key loses the directory | this test, at the neighbour's write (`:403`) | 4 `migo-io` tests |
+    | The quota admits twice its limit | this test, at the exhaustion control (`:390`) | 1 `migo-io` test |
+    | The shipped `LIMIT_SIZE_KB` drops from 10240 to 1024 | this test, at the exhaustion control | **nothing** |
+
+    The first two are the same policy seen at two levels rather than two guards on
+    one case, and saying so matters: on this project's own rule, a test killed only
+    by mutants that also kill another is redundancy. The third is the case only this
+    test can see — `migo-io`'s quota tests pass their own 1 KiB limit in, so the
+    number each *game* actually gets is invisible to them, and the whole point of the
+    claim is that it is 10 MB per game rather than per process. Its sibling
+    `two_live_sessions_resolve_storage_under_their_own_game_id` survives all three,
+    which is what says the namespace half and the accounting half are different
+    claims.
+  - **Isolate separation is a property of `deno_core`**: a `JsRuntime` owns its
+    isolate and two of them cannot share one. What is worth testing is not that, but
+    what two Sessions reach *around* their isolates — and there the audit found one
+    genuine hole, which is now closed (task 0.55).
+
+  **Permission independence was the third group, and its recorded reason was wrong
+  the same way.** "The Java gate's own tests cover a single gate with several session
+  ids, which is not the same as two Sessions" — but `PermissionOperationGate` is a
+  process-wide `static` in `NativeExports`, keyed internally by session id, so a
+  single gate holding several ids *is* the production topology and there is no other
+  gate for two Sessions to have. Its tests already drive two sessions in several
+  ways: `closingOneSessionLeavesAnotherLiveSessionUntouched`,
+  `twoSessionsAdmitCallbacksConcurrently`,
+  `perEventSessionLookupTakesNoLockSharedAcrossSessions`, and the id-ordering pair
+  from task 0.23.
+
+  What was genuinely missing was one direction: every one of those grants a scope and
+  then checks the *granted* session still works, and nothing checked that the session
+  which was **not** granted is refused. Closed under task 0.58.
 
   A footgun worth remembering: closure capture is per-field since edition 2021, so
   reading `wrapper.0` inside a `thread::spawn` closure captures the raw pointer and
   the `unsafe impl Send` on the wrapper never applies. The threads take the pointer
   through an accessor method, which captures the wrapper.
+- [x] 0.55 Pin the decoded-image cache's game scoping on the branch that had
+  none. Found by auditing task 0.21's remaining property groups. The decoded-image
+  cache is the one process-global structure two Sessions both reach that holds
+  their *content*, so what keeps one game's pixels out of another's is entirely the
+  cache key.
+
+  **And for a directory-mounted `/code` asset the key's path component is the
+  virtual string, not the real one.** `resolve_local_src` returns
+  `path: effective_src` there — `/code/logo.png`, byte-identical for both games —
+  so separation rests entirely on the source-version token, which happens to hash
+  the real path behind the mount. The other branches do not have this shape: the
+  VFS fallback and the `/user`, `/cache`, `/tmp` roots all carry the resolved real
+  path in the key itself.
+
+  **The codebase already knew the hazard and had fixed the other half of the same
+  branch.** `ResolvedCode::source_identity` carries it in its own doc: that
+  `source_mounted_at` is *not* usable across Sessions because "it counts mounts
+  within one `MountTable`, every Session owns its own, and a base mount is `1` in
+  all of them", and that "any cache shared between Sessions must key on this
+  instead". Task 0.28 applied that to the pack-backed case. The real-path case
+  satisfies the same rule by a different route — the file's own location, which is
+  strictly stronger for its case — and **nothing said so and nothing tested it.**
+
+  `two_games_do_not_share_a_cache_entry_for_an_identical_asset` does now: two
+  games' own code directories, the same virtual path, **identical bytes and
+  identical mtimes**. That fixture detail is the test. Left to the filesystem the
+  two files would differ in mtime, the keys would differ for a reason that has
+  nothing to do with isolation, and a token that had stopped hashing the real path
+  would walk straight through — the non-discriminating-fixture failure this plan
+  has recorded twice before. Two titles from one publisher shipping the same logo,
+  unpacked by the same reproducible extraction, is that fixture in production. The
+  paired second assertion is the control the first needs: a token that varied per
+  call would satisfy "the keys differ" while destroying the cache it exists to key.
+
+  **Mutation evidence.** Both kills are at the test's own assertion, and both leave
+  518 other tests passing — so this is a single load-bearing guard rather than one
+  of two, which also answers whether `source_mounted_at` helps: it does not.
+
+  | Mutant | Kills |
+  | --- | --- |
+  | The version token stops hashing the real path | `two_games_do_not_share_a_cache_entry_for_an_identical_asset` alone |
+  | The real-path branch keys on `source_mounted_at`, the substitution its own doc warns against | the same test alone |
+
+- [x] 0.56 Say what the presentation path actually does, and give each bypass
+  condition a test of its own. Section 7.3's "no redundant presentation copy" was
+  recorded as device-blocked. Half of that is true — `platform/src/{windows,ohos}/
+  presenter.rs` have never compiled on this machine (ledger 0.32) — but the Linux
+  path is reachable, and reading it found the requirement **unmet for ordinary
+  content**, which no amount of device access would have told us.
+
+  The onscreen canvas renders into a Chromium-style `DrawingBuffer` FBO, blitted to
+  the window before every `eglSwapBuffers`. A bypass exists that redirects the
+  default framebuffer to real FBO 0 and skips the blit, gated on four conditions.
+
+  **Measured, because the engine already logs the transition and the log was one
+  field short of being an instrument.** The transition now carries its four inputs
+  alongside the verdict, and with that the bunnymark bundle answers immediately: it
+  reaches `bypass = true` at startup, drops to `false` when a second canvas appears,
+  and **presents its whole 60 fps steady state through the blit** — `canvas_count=2`,
+  everything else favourable (`needs_default_fbo_readback=false`,
+  `onscreen_has_2d_context=false`, `onscreen_db_matches_surface=true`). At 720×1280
+  that is ~3.7 MB read and ~3.7 MB written per frame, about 440 MB/s, for a copy
+  whose only purpose is disambiguation. A Cocos UI, which gives each text label its
+  own offscreen canvas, is in the same state permanently.
+
+  **The condition is sound, which is why this task did not delete it.** Bypass makes
+  the onscreen default framebuffer *real* FBO 0, and real FBO 0 is whichever EGL
+  draw surface is current; offscreen canvases are `SurfaceKind::Pbuffer` with
+  surfaces of their own and the render path switches between them batch by batch, so
+  with a second canvas "FBO 0" stops naming the window. The `DrawingBuffer` removes
+  the ambiguity because its FBO is a name in the shared context that does not move
+  when the surface does. **None of that was written down**: the other three
+  conditions carried a paragraph each, and this one carried "bypass is safe when
+  there is exactly one canvas" with no argument — which is why it read as arbitrary
+  and why the cost went unnoticed.
+
+  **Each condition now has a test of its own.** Two of them shared one, so deleting
+  either failed a test that covered both and neither was individually pinned — the
+  aggregate-assertion shape this plan warns about. Mutation, each leaving 553 other
+  tests passing:
+
+  | Mutant | Kills |
+  | --- | --- |
+  | Drop `canvas_count == 1` | `an_offscreen_canvas_disables_bypass_because_fbo_zero_stops_naming_the_window` |
+  | Drop `!needs_default_fbo_readback` | `a_latched_default_fbo_readback_disables_bypass` |
+  | Drop `!onscreen_has_2d_context` | `onscreen_canvas2d_context_disables_bypass` |
+  | Drop `onscreen_db_matches_surface` | `onscreen_db_smaller_than_surface_disables_bypass` |
+
+  **Not covered, named rather than implied.** The blit itself cannot be observed by
+  a host test — it needs a live GL context — so what observes it is the engine's own
+  log, and what asserts anything is the pure condition function. The existing
+  guards over `swap_buffers_no_restore` in `present_damage.rs` are **source-text
+  inspection**: they read the function's body as a string and look for
+  `.swap_buffers(` and `blit_succeeded`. They catch a reordering and they cannot
+  fail on a behavioural change that leaves the text intact — the same
+  inspection-wearing-a-test's-clothing shape Section 7.3 names, sitting on the
+  presentation path. ~~Replacing them needs a GL context and is not attempted
+  here.~~ **That last sentence was wrong, and task 0.61 replaced them.** The blit
+  needs a GL context; the *bookkeeping either side of it* does not, and taking the
+  swap outcome as an argument instead of an early `?` return makes both branches
+  reachable with no surface at all. Reading it as "the effect needs GL, so the
+  ordering cannot be tested" is the same conflation that let 0.57's dead bypass path
+  stay dead. ANGLE and `OHNativeWindow` are untouched for the reason 0.32 gives; the
+  Android Surface path compiles but is unmeasured.
+
+- [x] 0.57 Make the DrawingBuffer bypass path present at all. Planned as "sharpen
+  the `canvas_count == 1` condition, or record why it cannot be"; the enumeration
+  the plan asked for found the path the condition gates was **dead**, so the
+  sharpening is deferred and this task is the repair.
+
+  **The recorded plan named the wrong thing to check, for the fifth time in a
+  row.** It proposed hoisting `make_current_needed(cmd.touches_canvas())` to the
+  top of `handle_command` so the invariant held by construction. `touches_canvas()`
+  cannot carry that: its own doc says "exhaustive over every variant that carries a
+  `canvas_id` field", and 29 of 118 such variants are missing — `TexImage2D`,
+  `TexSubImage2D`, `TexStorage2D`, the whole `Uniform*` family,
+  `FramebufferTexture2D`, the compressed uploads, and every
+  `TexImage2DFrom{Canvas2D,Shared,Snapshot,TextCache}`. The hoist would have
+  *deleted* make-current from 29 command families, which is exactly the
+  draw-lands-in-the-wrong-surface fault the bypass condition exists to prevent.
+  Split out as task 0.59; it is a live defect on two other consumers.
+
+  **What the enumeration actually found.** Ask "which framebuffer is this canvas's
+  WebGL default?" and three sites answer independently. The post-swap restore
+  applied bypass in a bespoke `if !bypass` and was the only one that did;
+  `make_current_needed` and the surface-recreate DrawingBuffer reuse both derived
+  `drawing_buffer.map(|db| db.fbo)` with no bypass term. And a fourth site was
+  missing entirely: a bypass mode change moves *what the default framebuffer means*
+  with no `bindFramebuffer` from the content, and nothing re-pointed the binding.
+  So the onscreen canvas kept the DrawingBuffer bound from its own creation — which
+  deliberately leaves it bound — drew into it, and skipped the only blit that would
+  have carried it to the window.
+
+  **Measured, because the property is a driver binding and no host test can see
+  one.** `scripts/fixtures/bypass-probe` holds all four bypass conditions for a
+  whole run; every shipping bundle breaks `canvas_count == 1` within a second of
+  startup, which is why bypass had only ever run for warmup frames nobody looked
+  at. It painted 240 frames of `rgba(51,204,102,255)` and the captured frame was
+  `rgba(0,0,0,0)` on every sampled pixel. `blit-probe` — the same fixture plus one
+  more `createCanvas()`, so `canvas_count == 2` and bypass never latches —
+  presented the colour. After the fix, both do.
+
+  `scripts/verify-bypass-present.sh` is the gate, and its shape is the point. The
+  frame count is asserted beside the pixel because **240 frames in the wrong buffer
+  is the same count as 240 frames on the window**: the pixel alone is satisfied by
+  a run that never painted, the count alone by a run that painted into a buffer
+  nobody reads. Which path ran is read from the engine's transition log, not from
+  the fixture's intent, so a fixture that failed to create its second canvas is not
+  scored against the path it meant to take — that happened on the first run, when
+  `migo.createOffscreenCanvas` turned out not to exist. `blit-probe` doubles as the
+  control on the instrument: if the player, the capture or the PNG decode were at
+  fault both probes would fail, and the fault would not be bypass. The gate builds
+  the player unconditionally rather than if-missing, because a mutation run leaves a
+  binary compiled from the mutant beside a restored tree and WSL2 preserves mtime.
+
+  **Mutation evidence. Six mutants, each attributed, file byte-identical
+  (sha256, not `git diff`) after every restore.**
+
+  | Mutant | Kills |
+  | --- | --- |
+  | `default_framebuffer_of` ignores bypass | `bypass_resolves_the_default_framebuffer_to_the_window` |
+  | `plan_bypass_rebind` ignores `mode_changed` | `an_unchanged_mode_issues_no_bind` |
+  | ... ignores `onscreen_context_is_current` | `a_mode_change_off_the_onscreen_context_defers_to_the_next_make_current` |
+  | ... ignores `draws_to_default_fbo` | `a_mode_change_leaves_a_framebuffer_the_content_bound_alone` |
+  | ... never re-binds | `entering_bypass_repoints_...at_the_window` **and** `leaving_bypass_repoints_...at_the_drawing_buffer` |
+  | ... always re-binds the window | `leaving_bypass_repoints_...at_the_drawing_buffer` |
+
+  The last two exist because the first four are all *negative* assertions, and a
+  planner that never re-binds satisfies every one of them — the always-red gate this
+  plan keeps catching. `never re-binds` proves the gate can fire; `always re-binds
+  the window` proves something pins the target and not merely the decision. Killing
+  two is correct for the first of those: their job is the positive control, and they
+  differ in the value carried.
+
+  **And a seventh mutant that no host test can reach.** Deleting the rebind from
+  `evaluate_bypass` while keeping everything else: 240 frames painted — *the same
+  count* — and `rgba(0,0,0,0)` captured. That is the site attribution the unit tests
+  cannot give, since they pin the planner and not the call.
+
+  **Design notes worth keeping.** `onscreen_context_is_current` is a precondition,
+  not an optimisation: a bind lands in whichever context is current, so off the
+  onscreen context it would corrupt an offscreen canvas instead. Skipping loses
+  nothing because the `make_current_needed` that brings the context back resolves
+  the binding from the same function — between them the two sites cover every path,
+  which is why the planner returns `Nothing` rather than deferring work.
+  `draws_to_default_fbo` is consulted because content mid-render-to-texture has its
+  own FBO bound and the driver must keep it; re-pointing regardless would aim an RTT
+  pass at the screen. The post-swap site's bespoke `if !bypass` is gone: it now asks
+  the resolver, and "under bypass there was no blit, so nothing was clobbered" falls
+  out of the answer instead of being asserted separately.
+
+  **Not covered, named rather than implied.** The *cost* half of Section 7.3's "no
+  redundant presentation copy" is still unmet for ordinary content — this repairs
+  the fast path, it does not widen the condition that keeps ordinary content off it.
+  ~~and that widening still needs the FBO-0 invariant enumerated over every toucher
+  plus a device run per platform.~~ **The first half of that is now known to have
+  been satisfied all along**: the enumeration, split out as task 0.65, found the
+  recorded reason for `canvas_count == 1` to be false, because every canvas owns an
+  EGL context that is only ever made current with its own surface. What the widening
+  still needs is the device run. Of the four re-pointing sites only the mode change
+  is covered end to end; a single-canvas fixture never switches contexts, so
+  `make_current_needed` and the surface-recreate reuse are covered only at the shared
+  resolver. ANGLE and `OHNativeWindow` are untouched for the reason 0.32 gives.
+
+- [x] 0.59 Make `GLCmd::touches_canvas()` exhaustive by construction. Found by
+  0.57, which needed it as a hoist target and could not use it.
+
+  The function's own doc claimed exhaustiveness over every variant carrying a
+  `canvas_id` and instructed future variants to be added; a `_ => None` catch-all
+  meant the compiler never checked, and 29 of 118 had drifted off — `TexImage2D`,
+  `TexSubImage2D`, `TexStorage2D`, the compressed uploads, all four
+  `TexImage2DFrom*`, `FramebufferTexture2D`, `DebugLoseContext`, and the whole
+  `Uniform*` family. Two live consumers read it, and neither degrades safely:
+
+  - **Scoped stale marking** (`execute_gl_batch`) flips `skia_state_stale` only for
+    canvases the batch touched. A canvas whose only commands in a batch are
+    unlisted ones is not marked, and the next Canvas2D draw on it trusts Skia state
+    a WebGL batch has since disturbed.
+  - **Phase-reorder admission** (`can_reorder_phases`) defers the WebGL half of a
+    packet past the Canvas2D half when the two share no canvas. A missed id makes
+    two halves look disjoint when they are not, and the reorder inverts issue order
+    on one canvas.
+
+  **Two design choices, and the second is the one that matters.** Dropping the
+  catch-all makes *exhaustiveness* the compiler's job. It does not make
+  *classification* the compiler's job — a variant carrying a `canvas_id` can still
+  be written into the `None` bucket behind a `{ .. }`. So the `None` arms name every
+  field explicitly and use no `..`: giving any of them a `canvas_id` then fails to
+  compile too. Together those two make the syntactic rule hold by construction
+  rather than by the comment that had been asserting it.
+
+  **The rule stays purely syntactic — carries `canvas_id` ⇒ `Some`.** That moved
+  `DebugLoseContext` onto the list even though its handler arm ignores the field:
+  any semantic exception is where the next drift starts, and both consumers are
+  safe in the conservative direction (an extra stale mark, a reorder refused).
+
+  **Mutation evidence. Two of the three mutants must fail to *compile*, because a
+  claim about the compiler is only demonstrated by making the compiler refuse.**
+  File byte-identical (sha256) after each restore.
+
+  | Mutant | Result |
+  | --- | --- |
+  | Add a new `canvas_id`-carrying variant | `E0004 non-exhaustive patterns: MutantProbe { .. } not covered` |
+  | Give `LinkProgram` a `canvas_id` | `E0027 pattern does not mention field canvas_id` |
+  | Misclassify `Uniform3f` into the `None` bucket | `touches_canvas_covers_the_families_that_drifted_off_the_list` alone, at its own assertion |
+
+  Removal is no longer an available mutant — with no catch-all, deleting a variant
+  from the list does not compile — so the third is the realistic drift that remains,
+  and it is what the new test exists for. The test pins one representative of each
+  family that had drifted (a uniform write, an immutable texture allocation, a
+  framebuffer attachment, and an upload sourced from another canvas) rather than
+  enumerating 118 variants, because enumeration is now the compiler's job.
+
+  Verified at 414 `migo-shared` and 561 `migo-graphics` lib tests, no failures; the
+  four phase-reorder tests still pass, which is where a newly-refused reorder would
+  have shown.
+
+  **Not covered, named rather than implied.** `TexImage2DFromCanvas2D` and
+  `TexSubImage2DFrom*` carry a *second* canvas — the 2D source they read. This
+  returns the destination, which is right for both consumers as they are written,
+  but reorder admission arguably wants the source too: deferring a WebGL half past a
+  Canvas2D batch that draws into the very canvas the upload reads would sample the
+  wrong frame. Nothing here establishes whether that packet shape can occur.
+
+- [x] 0.60 Stop the engine's own framebuffer re-points from lying to the dedup
+  shadow. Found by 0.57's enumeration; kept separate because it is not a bypass
+  property, and it turned out to be a live defect rather than a coverage gap.
+
+  `gl_state`'s framebuffer shadow is keyed on the **user-facing** framebuffer name,
+  where `None` means "the default framebuffer". Two engine-internal paths re-pointed
+  the driver at the DrawingBuffer without telling that shadow — the EGL switch in
+  `make_current_needed` and the post-swap restore after the blit. Content holding its
+  own FBO therefore had its next `bindFramebuffer(sameName)` deduped against a claim
+  the engine had already invalidated, the call never reached the driver, and the
+  render-to-texture pass drew wherever the engine last pointed: **the screen**.
+
+  **Measured before it was fixed.** `scripts/fixtures/rtt-probe` binds a complete
+  render target, lets a canvas switch happen, re-binds the same target and clears
+  red. It presented `rgba(217,26,38,255)` full-screen on every one of 180 frames with
+  `fbo_status = GL_FRAMEBUFFER_COMPLETE`. Any multi-canvas WebGL game doing
+  render-to-texture was drawing its offscreen passes onto the window.
+
+  **The `make_current_needed` fix is a deletion, and the argument for it is not
+  performance.** The framebuffer binding is per-GL-context state and each canvas owns
+  its context, so EGL hands a canvas back exactly the binding it had — which is also
+  what the shadow already claims. Re-pointing it gave one function *two* behaviours:
+  the `bound == Canvas(id)` short-circuit left the content's binding alone while a
+  real switch clobbered it, and the shadow described only the first. Removing the
+  re-point makes the two paths agree, removes a driver call per canvas switch, and
+  needs no shadow write because nothing changed. A fresh context needs no help
+  either: `DrawingBuffer::new` leaves its FBO bound and `evaluate_bypass` re-points
+  it when bypass latches.
+
+  **The sites that genuinely destroyed the binding get a paired operation.** The blit
+  binds `READ=DrawingBuffer, DRAW=0`, so the post-swap restore must re-point — and
+  `record_default_framebuffer_bind` is half of that operation, not bookkeeping after
+  it. It records `None` on all three framebuffer targets and sets
+  `draws_to_default_fbo`. Recording `None` rather than `clear()`ing the map is the
+  difference between free and one redundant driver call per frame: `None` *is* the
+  name of the default framebuffer, so the Cocos-style `bindFramebuffer(FRAMEBUFFER,
+  0)` every frame — the exact redundancy this dedup exists for — stays deduped.
+
+  **Mutation evidence, host half.** Files byte-identical (sha256) after each restore.
+
+  | Mutant | Kills |
+  | --- | --- |
+  | The record does nothing (the defect as it shipped) | all three property tests, each at its own assertion |
+  | The record `clear()`s the map instead of naming the default | `a_content_bind_of_the_default_is_still_deduped_after_the_engine_repoints` |
+  | The record covers only `FRAMEBUFFER` | `the_engine_repoint_covers_the_separate_draw_and_read_targets_too` |
+  | The record forgets `draws_to_default_fbo` | `the_engine_repoint_makes_the_canvas_draw_to_the_default_framebuffer_again` |
+
+  **Mutation evidence, site half — and this is where the work was.** No host test can
+  reach either site, so each needed a running engine, and each needed its *own*
+  fixture:
+
+  | Site mutant | Killed by | Presents |
+  | --- | --- | --- |
+  | Restore the `make_current_needed` re-point | `rtt-probe` alone | `rgba(217,26,38,255)` — the render target on the screen |
+  | Delete the post-swap shadow record | `rtt-boundary-probe` alone | `rgba(26,76,230,255)` — a frozen first frame |
+
+  `rtt-boundary-probe` exists **because the post-swap mutant walked past
+  `rtt-probe`**, and the reason generalises: `rtt-probe`'s first framebuffer call each
+  frame binds `null`, which differs from any stale shadow and is issued however wrong
+  that shadow is. Reaching the post-swap site requires the frame's *first* call to be
+  the content's own FBO, which means drawing the baseline with no bind at all —
+  legitimate, because a frame beginning with the default framebuffer bound is exactly
+  what the post-swap restore guarantees.
+
+  **The gate had to be strengthened twice, and both holes were the same defect
+  wearing different clothes.** First, `dominant_pixel.py` reported only the most
+  common sampled colour, so a frame presented through a partial damage region could
+  carry wrong pixels in part of the surface while the stale majority still read as
+  expected; it now reports the distinct sampled colour count and the gate requires
+  exactly one, which is the honest claim for fixtures that clear flat. Second — and
+  this one is worth remembering — the post-swap mutant's real consequence is not red
+  pixels but **no presentation at all**: with `draws_to_default_fbo` left false every
+  clear looks invisible to damage tracking, the engine presented exactly one frame per
+  run (confirmed by instrumenting the post-swap site: one event in three seconds), and
+  the frozen frame's colour *was* the pass condition. Every probe now paints its first
+  frame a different colour, so a stale capture reads blue. **"The screen is the
+  expected colour" is an absence claim and needs its liveness paired in the same
+  instrument — the frame count is not enough, because the JS loop kept running at
+  60 fps throughout.**
+
+  Verified at 569 `migo-graphics` lib tests and all four probes green.
+
+  **Not covered, named rather than implied.** `frame_capture::capture_default_fbo`
+  binds `READ_FRAMEBUFFER = None` and does not restore it; that is now subsumed,
+  because the post-swap record names all three targets and runs after the capture —
+  but nothing *pins* it, since a probe would have to request a capture mid-run and the
+  player only captures once at the end. The equivalent shadow question for buffers,
+  textures and programs is untouched: only the framebuffer binding was audited, and
+  `make_current_needed` was the only engine-internal re-point of it. ANGLE and
+  `OHNativeWindow` are untouched for the reason 0.32 gives.
+
+- [x] 0.61 Replace the presentation path's source-text inspection tests. Named as a
+  known hole by 0.56, which then said replacing them "needs a GL context and is not
+  attempted here". That was wrong, and correcting it in place is half the point of
+  this task.
+
+  `swap_failure_preserves_accumulated_damage_for_retry` and
+  `blit_failure_poison_is_propagated_to_present_history` read the *source text* of
+  `swap_buffers_no_restore` and asserted that the byte offsets of `.swap_buffers(`,
+  `self.damage.reset()` and `blit_succeeded` came in the right order. Two real
+  properties, both orderings, neither able to fail on a behavioural change that
+  leaves the text intact — on the path where being wrong means a frame of stale
+  pixels.
+
+  **What made them look untestable was a conflation.** The blit needs a live GL
+  context; the *bookkeeping either side of it* does not. What actually blocked a real
+  test was that swap failure was expressed as an early `?` return, so the failure
+  branch could not be entered without a window surface. Passing the swap outcome in
+  as data — the move `run_frame_phases` already used for the frame phases — makes all
+  three branches reachable, and `commit_present_outcome` now owns them over a real
+  `FrameDamageAccumulator` and `PresentDamageHistory`, both of which construct on the
+  host.
+
+  **Two design choices came out of writing the tests rather than out of planning
+  them.** The commit takes the whole `PresentDamagePlan`, not just `current`, so
+  "history records the frame's own damage and never the age-expanded repair" is a
+  decision *inside* the tested function instead of a choice at the call site that
+  only a text search could see — which retired a third inspection guard,
+  `manager_blit_consumes_repair_and_history_records_current`'s history half. And the
+  fixture plan gives `current` and `repair` deliberately *different* values, because
+  they were interchangeable in the old guard and a test cannot tell apart two regions
+  that are equal.
+
+  **Mutation evidence. Six mutants, each a realistic tidying-up defect, each killing
+  exactly one test at its own assertion; file byte-identical (sha256) after every
+  restore.**
+
+  | Mutant | Kills |
+  | --- | --- |
+  | Reset the accumulator even when the swap failed | `a_failed_swap_keeps_the_frames_damage_for_the_retry`, at its damage assertion |
+  | Record a frame the swap never presented | *the same test*, at its history assertion |
+  | Never reset the accumulator | `a_successful_swap_resets_the_frames_damage` |
+  | Record `repair` instead of `current` | `history_records_the_frames_own_damage_and_never_the_age_expanded_repair` |
+  | Leave a partial frame in history as a repair source | `a_failed_blit_makes_the_history_unusable_as_a_repair_source` |
+  | Forget the whole-surface debt after a partial blit | `a_failed_blit_leaves_the_next_present_owing_the_whole_surface` |
+
+  The first two matter as a pair: they kill one test at two different assertion
+  lines, which is what shows both of its claims are load-bearing rather than one
+  riding along. The last two are why the failed-blit case is **two** tests: poisoning
+  history fixes what a *later* present repairs from, the accumulator debt fixes what
+  the *next* one does, a commit could do either alone, and one bundled assertion
+  would have left whichever half broke unnamed — the shape this plan has now caught
+  three times.
+
+  `a_successful_swap_resets_the_frames_damage` is the control: without it, "damage
+  survives a failed swap" is satisfied by an accumulator that never resets, which
+  would make every frame repair the whole surface and the buffer-age machinery
+  decoration.
+
+  Verified at 564 `migo-graphics` lib tests, no failures.
+
+  **Not covered, named rather than implied.** One text guard is kept and narrowed:
+  `blit_to_surface` must return `bool`, because a blit that cannot report failure
+  makes the poison branch unreachable and no host test can see that. Whether that
+  return value is *truthful* still needs a GL context. Two writing rules found along
+  the way and worth reusing: a reset `FrameDamageAccumulator` resolves to
+  `FullSurface`, not to an empty rect list, so `resolve_rects` is the wrong
+  observable for "owes nothing" and `has_damage()` is the right one; and
+  `PresentDamageHistory` exposes no accessor, so what an entry *is* must be read
+  through `resolve_with_age(current, 2)` rather than by counting with `len()`, which
+  cannot tell a poisoned entry from a recorded one.
+
+- [x] 0.63 Audit the rest of the dedup shadow against the engine's own GL writes.
+  The open question 0.60 left: it fixed the framebuffer binding, and buffers,
+  textures, programs and vertex arrays are shadowed the same way.
+
+  **The enumeration.** Seven sites in the manager declare `TEXTURE_BINDING` stale to
+  *Skia's* tracker (`mark_all_2d_contexts_stale_bits`), which is the honest signal
+  that they disturbed the texture binding — and none told the WebGL dedup shadow, the
+  other consumer of the same driver state. The discriminator is not whether they
+  declare but whether they **restore**: five save `prev_tex` / `prev_active_texture`
+  and put it back, so the shadow stays true and the Skia declaration is needed only
+  because Skia's tracker cannot see the restore. Two bind *zero* instead —
+  `pbo_upload.rs` (behind `load_shared_image`) and `texture_import.rs` (behind
+  `load_ahb_image`) — and those two are the defect. `compressed_upload.rs` already
+  restores, under the comment "Restore the app-visible bindings on both success and
+  failure paths", which makes the other two an inconsistency rather than a decision.
+
+  **So the fix is a restore, not an invalidation.** An `invalidate_after_texture_upload`
+  helper was written first and then deleted: telling the shadow to forget is correct
+  but costs the next draw a rebind for state that never needed to move, and it leaves
+  three upload paths following two patterns. Saving `TEXTURE_BINDING_2D` and
+  `UNPACK_ALIGNMENT` and putting them back keeps the shadow true by construction,
+  costs two `glGet` per *image* rather than per frame, and makes all three identical.
+
+  **Two hypotheses were wrong, and recording them is the point.** First: this was
+  predicted to be a live defect on every image load. It is not — ordinary loads go to
+  the upload thread, which owns a GL context of its own and so cannot disturb a
+  canvas's bindings. Measured: `scripts/fixtures/upload-shadow-probe` binds a texture,
+  loads images continuously, re-binds, and asks `getParameter(TEXTURE_BINDING_2D)` —
+  which the handler answers from a real driver query, not from the shadow — and
+  reports the binding intact for a whole run. Second: the sync render-thread path was
+  assumed reachable from JS by making an image too large for the async byte budget. It
+  is not; a 1200×1200 image (5.49 MB decoded, 8 KB on disk) still went async, and
+  instrumenting `load_shared_image` counted **zero** calls in a run. What actually
+  reaches a canvas context is the AHB path (unconditional, and the Android default),
+  compressed textures, `ImagePriority::Critical` — which nothing produces today, every
+  JS load asks for `Normal` — and the async-degradation fallbacks.
+
+  So the defect is **latent on the platform that ships** and unreachable here. The
+  probe is kept, inverted, as a boundary control on the architectural property that
+  makes it latent: uploads must not run on a canvas context. An "optimisation" that
+  moved them onto the render thread to save a context switch would silently
+  reintroduce exactly what 0.60 fixed on the framebuffer binding, and this probe is
+  what would say so.
+
+  **A fixture defect the gate caught, worth keeping in mind.** The probe first
+  reported `path=bypass` when it wanted the blit path: its second canvas was held in
+  an unused `const` and was collected — the engine logged `canvas_count` going
+  1 → 2 → 1 as the finaliser ran, driven by the per-frame image allocations. A canvas
+  has to be *used* to stay alive. This surfaced only because the gate reads which path
+  ran from the engine's own transition log instead of trusting the fixture's intent.
+
+  **Not covered, named rather than implied.** The two restores are unpinned: no host
+  test can see a driver binding, and neither reachable caller can be driven on Linux.
+  They are argued from the code and from the third path that already does it, not
+  measured. Programs, vertex arrays and buffers were checked only through the seven
+  `mark_all_2d_contexts_stale_bits` sites; a path that disturbs one of those *without*
+  declaring anything to Skia would not appear in that enumeration, and nothing here
+  rules one out.
+
+- [x] 0.64 Delete a GL object from a context in which its name means that object.
+  Found by the FBO-0 enumeration ledger 0.57 deferred to 0.65, which is the third
+  time that enumeration has produced a defect adjacent to the one it went looking
+  for.
+
+  ES 3.0 Appendix C.1 shares buffer, program, shader, renderbuffer, sampler, sync and
+  texture objects across an EGL share group. It does **not** share the container
+  objects — framebuffers, vertex arrays, queries and transform feedbacks — so the
+  same small integer names a different object in every context of the group. Every
+  canvas here owns a context, so "which context is current" decides which object a
+  `glDelete*` frees.
+
+  **Eleven delete sites decided that four different ways.** Six bound *any* canvas
+  through `ensure_any_canvas_current` (`DeleteProgram`, `DeleteShader`,
+  `DeleteTexture`, `DeleteRenderbuffer`, `DeleteBuffer`, and — wrongly —
+  `DeleteFramebuffer`); three bound nothing and used whatever the previous command
+  left current (`DeleteSampler`, `DeleteSync`, and — wrongly — `DeleteVertexArray`);
+  two consulted the owner behind a fallback that deleted from the current context
+  when it was absent (`DeleteQuery`, `DeleteTransformFeedback`).
+
+  **The knowledge was already written down next to the code that ignored it**, which
+  is the part worth remembering. `VaoMeta`'s doc comment says "VAOs are not shared in
+  the EGL share-group model WebGL uses"; `DeleteVertexArray` deleted from whatever was
+  current. `FramebufferMeta.owner_canvas` and `VaoMeta.owner_canvas` were both
+  recorded and both carried `#[allow(dead_code)]` — the attribute *is* the defect,
+  written down. And `SyncMeta`'s comment had the opposite error, claiming sync objects
+  are not shared when Appendix C.1 says they are, so its rebind was unnecessary
+  rather than missing.
+
+  **How it was found, and it was not by reading the delete sites.** Cross-referencing
+  `GLCmd::touches_canvas()`'s 118 `Some(canvas)` variants against which
+  `handle_command` arms call `make_current_needed` produced two lists. Seven `Some`
+  variants have no call in the arm — `DebugLoseContext`, which touches no GL, and the
+  six `TexImage2DFrom*`/`TexSubImage2DFrom*`, which make current one level down in
+  their `CanvasManager` helper. Five arms *do* call it while `touches_canvas()`
+  answers `None`: `ClientWaitSync`, `DeleteQuery`, `GetQueryParameter`,
+  `DeleteTransformFeedback`, `GetTransformFeedbackVarying`. Those five resolve a
+  canvas from an object's owner rather than from their own fields, and asking *why
+  those five and not the other delete arms* is what surfaced the sharing rule.
+
+  **What the five mean for `touches_canvas`, reported because it survived.** Its two
+  consumers — scoped Skia stale marking and phase-reorder admission — want "which
+  canvas will this command bind", and the function answers "which canvas do this
+  command's fields name". For those five the answers differ. Neither consumer is
+  harmed today, because all five issue only `glDeleteQueries`,
+  `glDeleteTransformFeedbacks`, `glGetQueryObjectuiv`,
+  `glGetTransformFeedbackVarying` and `glClientWaitSync`, none of which touch any GL
+  state Skia caches. So this is a latent contract mismatch and not a live defect, and
+  it is recorded rather than fixed: the next command added in this shape inherits it.
+  Task 0.59 made the classification exhaustive over *fields*, which is a different
+  claim from exhaustive over *canvases touched*.
+
+  **What the defect costs, and which half a driver decides.** The leak is certain
+  everywhere: the name does not exist in the context the call went to, `glDelete*`
+  silently ignores unknown names, and the metadata has already been discarded, so
+  nothing can ever free the object. The other half is the driver's numbering, and an
+  instrumented build settled it on this host rather than leaving it to argument — the
+  onscreen DrawingBuffer is framebuffer 1, the onscreen canvas's own render target is
+  2, an offscreen pool comes back 3..10, and every one of the eight offscreen deletes
+  was dispatched with `bound=Some(1)`, the onscreen canvas. Mesa numbers container
+  objects from one share-group counter, so no collision is reachable here. A driver
+  that numbers per context — mobile GPUs — gives an offscreen canvas's first
+  framebuffer the name 1, and that delete then destroys the DrawingBuffer, after
+  which the onscreen canvas renders into a deleted object and presents nothing. That
+  is the same outcome 0.57 spent a whole task on, reachable from a game freeing a
+  render-target pool.
+
+  **The fix makes the decision unspellable rather than repeated.** `GlObject` carries
+  a kind and a name that cannot disagree, and a container variant cannot be
+  constructed without its owner. `CanvasManager::delete_gl_object` is the only place
+  that issues a `glDelete*` and it makes the owning context current first — one
+  operation, not a bind followed by a call that could be written without it. The four
+  container metadata types lost their `Option` around the owner, because
+  `Option<CanvasId>` where only `Some(canvas_id)` is reachable is the
+  representable-but-unreachable state that let two sites "handle" `None` by ignoring
+  the owner entirely; a `take_for_delete` hands the handle out only inside a
+  `GlObject`, so a caller cannot get a bare name. A missing owner is no longer a
+  reason to delete from somewhere else: a container object cannot outlive its
+  context, so if the canvas is gone the object already is.
+
+  **Mutation evidence. Four mutants, each attributed, every file byte-identical by
+  sha256 after restore.**
+
+  | Mutant | Kills | Survivors |
+  | --- | --- | --- |
+  | `Framebuffer` classified shared | `a_container_object_must_be_deleted_from_the_context_that_minted_it` at `gl_object.rs:144` | 570 |
+  | `VertexArray` classified shared | the same test at `gl_object.rs:153` | 570 |
+  | `Texture` classified per-context | `a_shared_object_may_be_deleted_from_any_context_in_the_group` | 570 |
+  | A new `GlObject` variant | `E0004 non-exhaustive patterns`, in **both** matches | — |
+
+  The two container mutants dying at *different* assertion lines is the point: both
+  claims in that test are load-bearing and neither rides along. The third is the
+  positive control — every assertion in the first test is satisfied by a
+  classification that answers `Some(owner)` for everything, which would also refuse
+  to delete a shared object whose nominal owner canvas has gone. The fourth is the
+  only kind of evidence available for a by-construction claim.
+
+  **Not covered, named rather than implied.** The wrong-context deletion is
+  unobservable on this host — neither the cross-canvas destruction nor the leak moves
+  a pixel or a counter under Mesa's numbering — so no probe here gates the defect
+  itself. `scripts/fixtures/fbo-owner-probe` gates the eleven rewritten call sites
+  instead: an offscreen canvas frees a pool of framebuffers, in a frame where nothing
+  has named it so the onscreen context is current, while the onscreen canvas keeps a
+  render target of its own and clears the window *before* its render-to-texture pass
+  so a destroyed target would send red to the screen rather than be painted over. It
+  is honest about what it is: an end-to-end regression guard on a rewrite of eleven
+  arms, not the gate for the defect. Nothing prevents a future site calling
+  `gl.delete_*` directly, because the container metadata's handles stay readable for
+  binding. Verified by `scripts/verify-change.sh --base HEAD`: every host target plus
+  the arm64-v8a Android compile, migo-graphics 571 tests, and all seven probes in
+  `scripts/verify-bypass-present.sh` green.
+
+- [ ] 0.65 Widen the DrawingBuffer bypass condition. Split out of 0.57, whose
+  deferred half this is. **The invariant work is done and the recorded reason for the
+  condition turned out to be false; the flip is deliberately not taken here.**
+
+  0.57 recorded that widening "needs the FBO-0 invariant enumerated over every
+  toucher plus a device run per platform". The enumeration says the first half is
+  already satisfied and always was, for a reason the spec had backwards.
+
+  **The recorded reason cannot arise.** It held that bypass makes the onscreen default
+  framebuffer real FBO 0, that real FBO 0 is whichever EGL draw surface is current,
+  and that offscreen pbuffers therefore stop "FBO 0" naming the window. FBO 0 follows
+  the current surface *of the current context*, and every canvas owns a context:
+  `create_onscreen` calls `eglCreateContext`, `register_offscreen` calls
+  `create_pbuffer_context`, each sharing only the resource context's objects, and
+  `make_current_needed` takes context and surface from one `EglContextHandle`. A
+  pbuffer is only ever current with the canvas that owns it, in which the onscreen
+  canvas cannot be drawn at all. The spec's supporting claim that the DrawingBuffer's
+  FBO is "a name in the shared context" is wrong for the same reason 0.64 is about:
+  framebuffers are container objects and share groups do not share them.
+
+  **What the condition is really doing.** Both modes require the same thing — a
+  command that draws to a canvas runs with that canvas current, established per
+  command in `handle_command` — and `canvas_count == 1` makes that precondition
+  vacuous by leaving no other context to be current. Bypass does not weaken the
+  precondition; it changes what violating it looks like, from a framebuffer name that
+  means nothing in the current context to a silently wrong surface.
+
+  **Enumeration of what bypass changes**, which is the smallest complete answer:
+  `get_drawing_buffer_fbo(onscreen)` returns `None` instead of the DrawingBuffer's
+  FBO, and the swap-time blit is skipped. Four consumers read the first
+  (`is_drawing_buffer_bound`, `bind_default_framebuffer`, `evaluate_bypass`'s rebind,
+  `BindFramebuffer`'s default-framebuffer redirect) and two read the second
+  (`swap_buffers_no_restore`, `prepare_present_plan`, which already forces a full
+  repair region under bypass). None has a canvas-count term. The paths that could
+  read the onscreen canvas's content as a texture do not exist: `DrawingBuffer`'s
+  `color_tex` never leaves `drawing_buffer.rs`, `TexImage2DFrom{Canvas2D,Snapshot}`
+  source a *2D* canvas — and an onscreen 2D context already disables bypass — and
+  `ReadPixels` on the onscreen default framebuffer latches
+  `needs_default_fbo_readback`, which also disables it. The cross-canvas upload path
+  uses a per-canvas `image_copy_fbo` as `READ_FRAMEBUFFER` and restores it, never
+  FBO 0.
+
+  **Measured with two live canvases, which no probe had done.** `bypass-probe` and
+  `blit-probe` differ by whether a second canvas *exists* and neither draws to one, so
+  nothing here had ever switched EGL contexts inside a frame — the exact condition the
+  recorded reason was about. `scripts/fixtures/bypass-multi-probe` draws to both twice
+  per frame and ends the frame on the offscreen pbuffer, so presentation must bring the
+  window back unaided; its offscreen clear is red, so an empty capture means the
+  onscreen clear went somewhere that is not the window and a red one means an offscreen
+  draw arrived there. On the blit path: 240 frames, `rgba(51,204,102,255)`, one
+  distinct colour. With `canvas_count == 1` temporarily removed: the same, on the
+  bypass path, and `bypass-probe` and `blit-probe` also both green.
+
+  **Why the flip is still not taken.** Because bypass has never run in steady state
+  on any device — this condition is *why* — so widening it enables, for every bundle
+  on four platforms at once, a path whose only end-to-end evidence is a Linux
+  software rasteriser. Android's Surface path compiles here and is unmeasured;
+  `platform/src/{windows,ohos}/presenter.rs` have never compiled here at all (0.32).
+  The remaining step is one line in `can_bypass_drawing_buffer` plus its test, and
+  what it needs is `scripts/verify-bypass-present.sh` run against each platform's own
+  host, `bypass-multi-probe` included. The condition's own test was renamed to
+  `a_second_canvas_keeps_the_onscreen_canvas_on_the_drawing_buffer`, because the old
+  name asserted the reason that turned out false.
+
+
+  task 0.21's storage/quota group and 0.58's permission group both stop at: each is
+  proven "given distinct inputs" and nothing showed two Sessions *producing* distinct
+  inputs.
+
+  **The recorded obstacle was false, which makes six in a row.** It was written down
+  as "a Session with no surface never reaches `evaluate_module` or the permission
+  gate". `HostJsRuntime::new(host_id, host_state, cache_dir, ..)`
+  (`runtime-v8/src/host_runtime.rs:101`) takes **no surface**, and
+  `HostJsRuntime::evaluate_module(game_id, entry)` (`:831`) is precisely where the
+  identity binds: it builds `GamePaths::new(files_dir, cache_dir, game_id)` and
+  installs it with `set_game_paths` (`:942`), which is the value
+  `crate::storage::storage_dir` resolves against. A surface is required by
+  `spawn_host_thread` → `Host::new` (`core/src/runtime/host.rs:312`), i.e. by the
+  *orchestration* layer — one level above where the property lives. Asking "which
+  layer can see this property?" arrives at `HostJsRuntime`; asking "how do I start a
+  Session?" arrives at the surface and stops. Nor was a surface an obstacle even
+  there: `tools/player` runs headless on an `OffscreenSurface` pbuffer with no window
+  server.
+
+  **What V8 actually constrains, which is not what the plan guessed.** Two
+  `HostJsRuntime`s on one thread abort the process:
+  `Fatal error in v8::HandleScope::CreateHandle(): Cannot create a handle without a
+  HandleScope`. The current isolate is thread-local and each runtime expects to own
+  it. So the fixture is a thread per Session, driven step by step over a channel with
+  every wait bounded — which is *closer* to the thing under test, because a real
+  concurrent Session is a host thread. The real constraint was the isolate, not the
+  surface.
+
+  **Two fixture decisions carry the test.** Both Sessions get the **same**
+  `app_files_dir` and `app_cache_dir`; giving each its own would make the two paths
+  differ for a reason unrelated to per-game namespacing, and the test would pass over
+  an engine that ignored the game id entirely. And both loads complete before either
+  path is read: every way an identity can be shared — a process-wide slot written at
+  bind time, a resolver memoising its first answer, one op state behind two runtimes —
+  produces two *equal* paths only once both Sessions have bound, so reading `a` before
+  `b` loads would let all of them through.
+
+  The assertion is not merely `assert_ne!`. Two paths can differ while both are wrong
+  — a counter, a host id, a temp name — so each is also required to be under its own
+  namespace *and under no other*. That negative half is what caught the first mutant.
+
+  **Mutation evidence, and the point is what *survived*.** Files byte-identical
+  (sha256) after each restore.
+
+  | Mutant | Kills the new test at | Pre-existing suite |
+  | --- | --- | --- |
+  | The stored identity is the Session, not the game (`host-N` for the game id) | its namespace assertion | **all 519 survive** |
+  | The bound identity escapes to a process-wide slot the resolver prefers | its `assert_ne!` | **all 519 survive** |
+
+  Two different assertion lines, so both halves of the one test are load-bearing. That
+  the whole pre-existing suite survives both is the proof the fixture closes a real gap
+  rather than restating one:
+  `the_resolver_gives_two_games_different_storage_files` builds two `OpState`s by hand
+  and never calls `set_game_paths`, so it cannot see an identity that escapes at *bind*
+  time — the escape is invisible to a test that never binds.
+
+  **The first mutant had to be narrowed, and the reason generalises.** Changing the
+  `game_id` fed to `GamePaths::new` moved the *code* directory too, so the entry module
+  went missing and the test died inside a helper on a module-load error rather than at
+  the assertion it is named for. The usable mutant changes only the identity that gets
+  *stored*, leaving the local `code_dir` the loader uses intact. When one value feeds
+  two things, mutate at the point only the property under test can see.
+
+  **One production line was added:** `pub(crate) fn op_state()` on `HostJsRuntime`, so
+  the question goes to the *production* resolver over the state a real
+  `evaluate_module` left behind, rather than to a hand-built `OpState` that agrees with
+  it by construction.
+
+  **A test was written, passed, and was then deleted — worth recording.**
+  `loading_a_second_game_does_not_move_the_first_ones_storage` was killed by the second
+  mutant, but by the *same* mutant as the other test and by nothing alone. Every
+  shared-identity defect is already caught by reading both paths after both loads, so
+  it was redundancy, and redundancy hides which guard is load-bearing. Its content
+  moved into the surviving test's doc comment, where the read ordering it was
+  protecting is now stated as the load-bearing thing it is.
+
+  **Not covered, named rather than implied.** This covers the storage half only. The
+  permission half is a *different arbiter*: `platform/src/android_permission_gate.rs:33`
+  keys `live: HashMap<i32, HostState>` by **host id**, not by game id, so the game
+  identity never enters it — and 0.58 pinned the *Java* `PermissionOperationGate`,
+  which is keyed by session id. Two separate objects, and the spec should stop implying
+  one property spans both. Quota is untouched: distinct storage roots are necessary for
+  a per-game quota but not sufficient, and nothing yet shows one game exhausting its
+  10 MB leaving another's intact.
+
+- [x] 0.58 Assert that a permission grant does not cross Sessions. The last of task
+  0.21's uncovered property groups. `PermissionOperationGate` is a process-wide
+  static keyed by session id, so two concurrent Sessions meet inside one object and a
+  grant that leaked between them would let one game use a capability the user
+  approved for another — the permission half of Section 6.4's isolation.
+
+  **The gate had two-session tests and none of them looked this way.** Every
+  cross-session test grants a scope and then asserts the *granted* session still
+  works; that direction passes over a gate that grants everyone.
+  `aGrantOnOneSessionLeavesTheSameScopeDeniedOnAnother` asserts the other direction —
+  an ungranted session is refused both the callback admission (`runIfGranted`) and
+  the cancellation registration (`register`) — with the positive case in the middle as
+  the control, since a gate that granted nobody would satisfy both denials while
+  breaking every permission in the product.
+
+  **Mutation evidence, and the mutant had to be chosen rather than reached for.**
+  Moving `Session.scopes` to the gate would have been the obvious "share the grants"
+  mutant, and it is not usable: `close` iterates its own session's scopes, so a
+  shared map makes closing one session cancel another's and the *existing*
+  cross-session close test fails — the mutant would have killed two tests and pinned
+  neither. The mutant used instead is the realistic defect: a fast path in
+  `runIfGranted` that, finding no entry for this session, reuses another session's
+  grant for the same scope — the shape an "optimisation" takes. It fails
+  `aGrantOnOneSessionLeavesTheSameScopeDeniedOnAnother` **alone**, with 103 other
+  Java tests passing, because no other test ever queries a scope on a session that
+  was not granted it.
+
+  Verified at **104 tests per flavour, Full and Slim, no failures, errors or
+  skips**; the permission coverage contract still reports 30 gated, 8 cleanup, 38
+  permission-sensitive operations.
+
+  **Not covered, named rather than implied.** This is the gate's own arbitration.
+  That two *real* Sessions reach it under distinct ids is a Rust-side property of id
+  allocation, which `capi/src/concurrent_sessions.rs` covers as distinct handles but
+  does not follow through to a registration at this gate — the same layer seam the
+  storage group has, and for the same reason: a Session with no surface never gets
+  that far.
+
 - [x] 0.22 Retain the concrete handle when cleanup of a rejected late GATT
   candidate fails. **Implementation complete, reviews outstanding.**
   `publishGattConnection` closed a candidate whose attempt had been superseded, and
@@ -2781,7 +4289,7 @@ review. A commit alone is not completion evidence.
   Verified at 96 tests per flavour, Full and Slim, up from 94, with no failures,
   errors, or skips; the permission coverage contract still reports 30 gated, 8
   cleanup, 38 sensitive operations.
-- [ ] 0.23 Apply the retired-id tombstone to the Java permission gate.
+- [x] 0.23 Apply the retired-id tombstone to the Java permission gate.
   **Implementation landed, reviews outstanding** (`6825fad`). The gate refused any
   session id at or below the highest ever opened rather than the ids actually
   retired, and because `registerSession` throws on refusal, two Sessions created
@@ -2794,11 +4302,38 @@ review. A commit alone is not completion evidence.
   profile with no failures, errors, or skips; permission coverage contract passes;
   `git diff --check` clean. Mutation-tested: reintroducing the high-water mark
   re-fails both ordering tests.
-  Still to check under this item: `NativeExports.registerSession` treats every
-  refusal as fatal, whereas the Rust gate distinguishes a tolerable live-id refusal
-  from a retired-id bug because restart rebuilds device services for the same live
-  id. Confirm no Java path re-registers a live session id, and if one exists, draw
-  the same distinction.
+  **Checked, and the answer is that no Java path re-registers a live session id.**
+  `registerSession` has exactly one caller — the `GameSession` constructor — and
+  `restart()` calls `NativeMethods.onRestart(sessionId)` without rebuilding the wrapper,
+  so the tolerance the Rust gate needs (because `HostCommand::Restart` *does* rebuild
+  `AndroidDeviceServices` for the same live id) has no counterpart here. Treating every
+  refusal as fatal is therefore correct, and no distinction of that kind was drawn.
+
+  **A different distinction was missing, and it was the diagnostic.** `open` returned a
+  `boolean` for two refusals that mean different things to a host — an id still live is
+  two sessions sharing an id, an id retired is one whose permissions can never be
+  granted again — and the single message `registerSession` threw named the *closing* case
+  for both, telling a host the opposite of what happened in the other half. `open` is now
+  `admit`, returning `ADMITTED | ALREADY_LIVE | RETIRED` answered in the **same**
+  acquisition of the admission guard, so no caller can observe a state between the two and
+  none can recompute the distinction differently. A `boolean` plus an `isRetired`
+  accessor was written first and rejected for exactly that: it is two acquisitions and two
+  chances to disagree about one id.
+
+  `admissionSaysWhetherARefusedIdIsLiveOrRetired` pins it, with the admitted case
+  asserted in the same test because a gate that refused everything satisfies both refusal
+  assertions. Mutation: collapsing a live id's answer into `RETIRED` — the shape that
+  produced the wrong message — fails that test and nothing else. Converting the boolean
+  call sites also made every existing refusal assertion name a cause instead of a
+  polarity. 107 tests per flavour, Full and Slim, from 106, no failures, errors or skips;
+  permission coverage contract unchanged at 30 gated, 8 cleanup, 38 sensitive.
+
+  **Not covered, named rather than implied.** `NativeExports.registerSession` itself has
+  no test. Reaching it needs a `GameSession`, whose constructor starts a
+  Choreographer-driven scheduler and touches framework state, and this module's test
+  classpath has no mocking framework; a production accessor added to reach it was written
+  and deleted rather than shipped. So what is gated is the gate's answer, and what renders
+  it into a message is read rather than executed.
 - [ ] 0.24 Order connection-state reports per device. `reportRetiredAttemptDisconnected`
   reads the current owner and then reports outside any lock, so a retired attempt
   that observes no owner can still deliver a stale `connected=false` after a fresh
@@ -2809,6 +4344,28 @@ review. A commit alone is not completion evidence.
   replacing the attempt map with a per-device state record whose monitor orders
   both — which is a substantive change to the GATT ownership model and needs its
   own plan and review rather than a patch.
+
+  **Re-read on 2026-08-08 and the description holds**, which is worth saying because
+  most recorded obstacles on this ledger have not. `gattConnections` is a
+  `ConcurrentHashMap<String, GattAttempt>`; `publishGattConnection` only checks
+  `get(deviceId) == attempt` before attaching, and `reportRetiredAttemptDisconnected`
+  reads the same map and then calls `connectionStateReporter.report` outside it. The
+  window is after `closeAndRemoveGatt` removed the entry and before a replacement is put
+  in: the retired attempt's `false` is *correct at the moment it is decided* and the
+  decision is not atomic with its delivery, so a replacement that publishes and reports
+  `true` in between is overwritten.
+
+  **One constraint the recorded "for example" runs into, found while confirming the
+  race.** Ordering both under a per-device monitor means holding that monitor across
+  `report`, which crosses into native — and this codebase's own rule elsewhere is that a
+  Migo lock is not held across a JNI call: the permission gate runs its external
+  operation under a counted lease precisely so revocation can wait without retaining the
+  host mutex. Reconciling those two is the substance of the plan this item asks for
+  rather than an afterthought. The alternatives are a monitor held across a report that
+  is a post rather than a wait, or a per-device delivery sequence that drops a report
+  older than the last delivered one — and the second only orders if the compare and the
+  call are themselves one step, which puts the monitor back. Recorded so the plan starts
+  from the real constraint instead of rediscovering it.
 - [x] 0.25 Snapshot the pending cancellation action safely. Landed with `6825fad`:
   `runCancellations` captures the action into a local while the snapshot is taken
   under the session monitor, so the executed action is exactly the one the snapshot
@@ -3596,17 +5153,81 @@ review. A commit alone is not completion evidence.
   steady-state allocation, no cross-session lock on a per-event path, idle
   quiescence with a per-platform wakeup ceiling, no redundant presentation copy,
   and no steady-state growth.
-  The cross-session lock requirement is **not** satisfied by the declaration
-  guard added under task 0.1. That guard reflects on the session map's declared
-  type, and an independent review constructed a counterexample it cannot detect:
-  taking the open guard inside the lookup leaves the declared type unchanged and
-  releases the lock before any observable barrier, so both delivered fixtures
-  still pass. The intended behavioural design is to enable JVM thread contention
-  monitoring, drive concurrent admissions across several sessions, and assert that
-  the blocked count attributable to admission is zero — which a shared monitor on
-  the lookup path cannot achieve under load and a concurrent map achieves exactly.
-  The same task owns removing per-event allocation from the BLE callback path via
-  a counted attempt admission with an interned connection wrapper.
+  **Idle quiescence's behavioural half closed under task 0.50** — the engine-paced
+  clock is demand-driven and measured at 0 wakeups per second at idle against 59
+  before. What stays here is the *ceiling*: a per-platform value in the versioned
+  threshold file, and the same measurement run on Windows and HarmonyOS hosts
+  rather than the Linux host alone.
+  **No steady-state growth got its mechanism under task 0.51** — a net-live-bytes
+  cycle gate plus a resident-memory measurement over a long workload, both
+  two-sided. ~~What stays here is likewise the threshold, and gates for the cycles
+  that measurement cannot reach: session create/destroy, the V8 heap across a soft
+  restart, and GPU-side growth.~~ **Session create/destroy now has its gate**, in
+  `capi/src/concurrent_sessions.rs`: the C API creates and destroys a real Session 64
+  measured times against a counting allocator, and the cycle nets non-positive. The
+  process measurement cannot reach it because that workload renders and never creates a
+  Session.
+
+  Getting it attributed took the rule about redundancy. The obvious mutant —
+  `mem::forget` of the exported `Arc` — kills the gate **and** two pre-existing tests
+  that watch the handle's own strong count, so it is the same claim at two levels. The
+  case only the gate can see is a leak that count is blind to: a Session owns a heap
+  block that is not the handle's own, `pending_surface_releases`, and an extra clone of
+  that inner `Arc` escaping the Session fails the gate and nothing else in the crate's
+  143 tests. That is also the realistic shape for this field, since the asynchronous
+  surface-release path is exactly what wants a handle outliving a call.
+
+  The result is a finding rather than a fix: the cycle does not grow. What stays open on
+  this bullet is the threshold, the V8 heap across a soft restart, GPU-side growth, and
+  anything a Session registers process-wide once it has a surface — a surfaceless
+  Session has no Host and so no isolate, no text cache entry and no stats registration,
+  which is why the gate's reach stops where it does.
+  **The cross-session lock requirement is now gated on both sides, and the design
+  recorded here was not the one used.** It is not satisfied by the declaration guard
+  added under task 0.1: that guard reflects on the session map's declared type, and an
+  independent review constructed a counterexample it cannot detect — taking the open
+  guard inside the lookup leaves the declared type unchanged and releases the lock
+  before any observable barrier, so both delivered fixtures still pass. ~~The intended
+  behavioural design is to enable JVM thread contention monitoring, drive concurrent
+  admissions across several sessions, and assert that the blocked count attributable to
+  admission is zero.~~ **That was rejected on this project's own rule about absence
+  metrics**: a run in which nothing was admitted also blocks for zero milliseconds, and
+  making the number the pass condition is the shape of gate this plan keeps catching.
+
+  What landed instead is the Rust probe's shape, in Java: hold `openGuard` and require
+  `runIfGranted` — the admission a BLE characteristic notification takes — to complete
+  on another thread anyway. Contention is manufactured rather than waited for, so an
+  *uncontended* acquisition fails it too, which is what a load test cannot see. The
+  guard is package-private rather than reached by reflection, because reflection would
+  go on compiling after a rename. Three details are load-bearing: the admission runs on
+  another thread, since Java monitors are reentrant and the holder's own thread would
+  pass either way; saturation is asserted before the admission starts; and the
+  callback's return value is asserted, because a refused admission returns instantly and
+  would satisfy the timing assertion without reaching the lookup.
+
+  **The instrument has its own control, and it is the reason the pair is a gate.**
+  `perEventAdmissionDoesNotWaitForTheAdmissionGuard` asserts an *absence*, which is
+  satisfied by a guard nobody held and by a monitor the test failed to acquire. So
+  `openingASessionDoesWaitForTheAdmissionGuard` requires the operation that genuinely
+  takes the guard to stay blocked for the same held guard. Its bound is the short one,
+  because a correct `open` can never complete while the guard is held and so cannot
+  flake.
+
+  | Mutant | Kills |
+  | --- | --- |
+  | `runIfGranted`'s lookup takes `openGuard` — the review's own counterexample | `perEventAdmissionDoesNotWaitForTheAdmissionGuard` |
+  | `open` synchronizes on a fresh monitor instead of the shared one | `openingASessionDoesWaitForTheAdmissionGuard` |
+
+  Neither kills the other's test, so the property and the instrument are separately
+  pinned. 106 tests per flavour, Full and Slim, from a 104 baseline, no failures,
+  errors or skips; `scripts/test-permission-coverage-contract.sh` still 30 gated, 8
+  cleanup, 38 sensitive.
+
+  **Still open on this bullet:** removing per-event allocation from the BLE callback
+  path via a counted attempt admission with an interned connection wrapper. Its Rust
+  half is measured at five allocations per notification (task 0.26) and is
+  `cfg(target_os = "android")`; its Java half needs a JVM allocation mechanism, which
+  `platforms/android` still has none of.
 - [ ] 5.2 Make device and machine performance collection build, install, launch,
   sample, validate required fields, and fail closed on every platform.
 - [ ] 5.3 Run the representative workloads against each platform baseline and

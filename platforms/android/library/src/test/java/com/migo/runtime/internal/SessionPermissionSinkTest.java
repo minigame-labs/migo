@@ -7,13 +7,14 @@ import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
 import java.util.List;
+import com.migo.runtime.internal.PermissionOperationGate.Admission;
 import org.junit.Test;
 
 public final class SessionPermissionSinkTest {
     @Test
     public void nativeGrantFailureReportsSchedulesCloseThrowsAndLeavesDenied() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertEquals(true, gate.open(101));
+        assertEquals(Admission.ADMITTED, gate.admit(101));
         List<RuntimeException> reported = new ArrayList<>();
         int[] scheduled = {0};
         NativeExports.SessionPermissionSink sink = new NativeExports.SessionPermissionSink(
@@ -43,7 +44,7 @@ public final class SessionPermissionSinkTest {
     @Test
     public void nativeRevokeFailureStillPublishesDeniedBeforeThrowing() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertEquals(true, gate.open(102));
+        assertEquals(Admission.ADMITTED, gate.admit(102));
         assertNull(gate.update(102, "scope.camera", true, () -> true).failure());
         assertNotNull(gate.register(102, "scope.camera"));
         int[] reports = {0};
@@ -73,7 +74,7 @@ public final class SessionPermissionSinkTest {
     @Test
     public void lateScopeUpdateAfterSessionTerminationIsIgnored() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertEquals(true, gate.open(103));
+        assertEquals(Admission.ADMITTED, gate.admit(103));
         int[] nativeUpdates = {0};
         int[] reports = {0};
         int[] scheduled = {0};

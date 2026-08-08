@@ -1654,6 +1654,7 @@ dependencies = [
 name = "migo-capi"
 version = "0.1.0"
 dependencies = [
+ "migo-alloc-probe",
  "migo-capi-abi",
  "migo-core",
  "migo-graphics",
@@ -1763,6 +1764,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "libloading",
+ "migo-contention-probe",
  "migo-core",
  "migo-graphics",
  "migo-io",

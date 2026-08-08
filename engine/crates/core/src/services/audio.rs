@@ -2,6 +2,8 @@
 use audio::AudioThread;
 
 #[cfg(feature = "api-media")]
+use shared::audio_channel::{AudioCommandReceiver, AudioCommandSender};
+#[cfg(feature = "api-media")]
 use shared::channel::ThreadWakeup;
 #[cfg(feature = "api-media")]
 use shared::error::{EngineError, EngineResult, ErrorCode};
@@ -11,8 +13,6 @@ use shared::op_state::{AudioHostStartSignal, AudioSender, HostTx};
 use shared::protocol::audio_cmd::AudioCmd;
 #[cfg(feature = "api-media")]
 use std::sync::Arc;
-#[cfg(feature = "api-media")]
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 #[cfg(feature = "api-media")]
 use tracing::info;
 
@@ -41,11 +41,11 @@ use tracing::info;
 #[cfg(feature = "api-media")]
 pub(crate) struct AudioService {
     /// Sender end of the channel.  Ops write here immediately.
-    tx: UnboundedSender<AudioCmd>,
+    tx: AudioCommandSender,
     /// Wakeup handle shared with [`AudioSender`] instances.
     wakeup: ThreadWakeup,
     /// Receiver end — held until the thread is started, then handed off.
-    rx: Option<UnboundedReceiver<AudioCmd>>,
+    rx: Option<AudioCommandReceiver>,
     /// Commands dequeued before the thread starts (replayed on start).
     pending: Vec<AudioCmd>,
     /// Handle to the spawned `AudioThread` (Some once started).
@@ -66,11 +66,34 @@ pub(crate) struct AudioService {
     http_client_factory: audio::streaming::StreamingHttpClientFactory,
 }
 
+/// What the audio thread starts with: everything buffered before it existed, in
+/// arrival order, with `PauseAll` last when the app is backgrounded.
+///
+/// **The buffered commands go to the thread rather than back into the channel.**
+/// Re-injecting them would deadlock now that the transport is bounded: at the
+/// moment of handover nothing is draining the queue — the receiver is still held
+/// by the service — so a full queue would park the caller forever. It also
+/// removes an ordering argument that was never sound, since the game thread can
+/// enqueue while the handover runs and a re-injected command would then land
+/// behind a newer one.
+///
+/// Extracted because the handover itself needs an audio device and a host test
+/// cannot provide one, while this can be observed exactly.
+#[cfg(feature = "api-media")]
+fn take_startup_backlog(pending: &mut Vec<AudioCmd>, is_paused: bool) -> Vec<AudioCmd> {
+    let mut backlog: Vec<AudioCmd> = pending.drain(..).collect();
+    if is_paused {
+        // Last, so it wins over anything that asked for playback.
+        backlog.push(AudioCmd::PauseAll);
+    }
+    backlog
+}
+
 #[cfg(feature = "api-media")]
 impl AudioService {
     /// Create a lazy audio service. **No thread or HTTP client is created.**
     pub(crate) fn new(host_tx: HostTx, network_policy: shared::op_state::NetworkPolicy) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = shared::audio_channel::channel();
         let wakeup = ThreadWakeup::new();
         let http_client_factory: audio::streaming::StreamingHttpClientFactory =
             Arc::new(move || {
@@ -156,18 +179,7 @@ impl AudioService {
             self.pending.len()
         );
 
-        // Re-inject buffered commands into the channel so the thread sees
-        // them when it starts consuming from `rx`.  This is safe because
-        // no other consumer exists for `rx` at this point.
-        for cmd in self.pending.drain(..) {
-            let _ = self.tx.send(cmd);
-        }
-
-        // If the app is currently paused (OnHide), inject PauseAll so the
-        // new thread doesn't play audio while backgrounded.
-        if self.is_paused {
-            let _ = self.tx.send(AudioCmd::PauseAll);
-        }
+        let startup_backlog = take_startup_backlog(&mut self.pending, self.is_paused);
 
         // Hand the receiver + wakeup directly to the thread — the thread
         // reads from the same channel that ops write to.  No forwarding
@@ -179,6 +191,7 @@ impl AudioService {
         let thread = AudioThread::spawn_with_channel(
             self.tx.clone(),
             rx,
+            startup_backlog,
             self.wakeup.clone(),
             self.host_tx.clone(),
             self.http_client_factory.clone(),
@@ -222,8 +235,14 @@ impl AudioService {
 
 #[cfg(not(feature = "api-media"))]
 pub(crate) struct AudioService {
-    tx: tokio::sync::mpsc::UnboundedSender<shared::protocol::audio_cmd::AudioCmd>,
-    _rx: tokio::sync::mpsc::UnboundedReceiver<shared::protocol::audio_cmd::AudioCmd>,
+    /// Permanently disconnected: this profile has no audio thread to send to.
+    ///
+    /// It used to hold a live receiver it never read, so a send queued for the
+    /// life of the session — harmless only because the audio ops are compiled out
+    /// of this profile and nothing could reach it. Behind a bounded transport that
+    /// same shape parks the first producer to fill it, so there is no receiver at
+    /// all now and a send fails at once. See `shared::audio_channel::disconnected`.
+    tx: shared::audio_channel::AudioCommandSender,
     wakeup: shared::channel::ThreadWakeup,
     start_signal: std::sync::Arc<shared::op_state::AudioHostStartSignal>,
 }
@@ -234,12 +253,11 @@ impl AudioService {
         _host_tx: shared::op_state::HostTx,
         _network_policy: shared::op_state::NetworkPolicy,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = shared::audio_channel::disconnected();
         let start_signal = shared::op_state::AudioHostStartSignal::new();
         start_signal.mark_started();
         Self {
             tx,
-            _rx: rx,
             wakeup: shared::channel::ThreadWakeup::new(),
             start_signal,
         }
@@ -268,4 +286,70 @@ impl AudioService {
 
     #[inline]
     pub(crate) fn shutdown(&mut self) {}
+}
+
+#[cfg(all(test, feature = "api-media"))]
+mod tests {
+    use super::*;
+
+    fn create_context(ctx_id: u32) -> AudioCmd {
+        AudioCmd::CreateContext {
+            ctx_id,
+            sample_rate: None,
+        }
+    }
+
+    fn label(cmd: &AudioCmd) -> String {
+        match cmd {
+            AudioCmd::CreateContext { ctx_id, .. } => format!("create({ctx_id})"),
+            AudioCmd::PauseAll => "pause".to_string(),
+            _ => "other".to_string(),
+        }
+    }
+
+    /// Commands accepted before the thread existed must reach it, in order. A
+    /// handover that dropped them would lose a `CreateContext` and every later
+    /// command addressing that id would fail — the failure this protocol has no
+    /// error path for.
+    #[test]
+    fn the_backlog_carries_every_buffered_command_in_arrival_order() {
+        let mut pending = vec![create_context(1), create_context(2)];
+
+        let backlog = take_startup_backlog(&mut pending, false);
+
+        assert_eq!(
+            backlog.iter().map(label).collect::<Vec<_>>(),
+            vec!["create(1)", "create(2)"]
+        );
+        assert!(
+            pending.is_empty(),
+            "the buffer kept a copy, so the thread will see it twice"
+        );
+    }
+
+    /// A backgrounded app must not start playing what it buffered, so the pause
+    /// goes last: ahead of the buffered commands it would be undone by them.
+    #[test]
+    fn a_backgrounded_app_hands_over_its_pause_last() {
+        let mut pending = vec![create_context(1)];
+
+        let backlog = take_startup_backlog(&mut pending, true);
+
+        assert_eq!(
+            backlog.iter().map(label).collect::<Vec<_>>(),
+            vec!["create(1)", "pause"]
+        );
+    }
+
+    #[test]
+    fn a_foreground_app_hands_over_no_pause() {
+        let mut pending = vec![create_context(1)];
+
+        let backlog = take_startup_backlog(&mut pending, false);
+
+        assert_eq!(
+            backlog.iter().map(label).collect::<Vec<_>>(),
+            vec!["create(1)"]
+        );
+    }
 }

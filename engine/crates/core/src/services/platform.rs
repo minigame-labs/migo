@@ -19,8 +19,8 @@ pub trait DeviceServiceProvider: Send + Sync {
 /// Display frame-clock capability supplied by a platform Host Kit.
 pub trait FrameClock: Send + Sync {
     /// Whether this platform supplies frame timestamps through the external
-    /// vsync channel. Platforms returning `false` keep the render thread's
-    /// software ticker enabled.
+    /// vsync channel. Platforms returning `false` are paced by the engine's own
+    /// demand-driven frame clock instead.
     fn uses_external_vsync(&self) -> bool {
         false
     }
@@ -33,8 +33,9 @@ pub trait FrameClock: Send + Sync {
     /// from any thread; the implementation is responsible for hopping to the UI
     /// thread and rechecking the live session before touching the Choreographer.
     ///
-    /// Default is a no-op: platforms without a demand-driven display clock rely
-    /// on the software ticker instead, so the render thread never arms.
+    /// Default is a no-op. Platforms without an external display clock are
+    /// routed to a nudge that wakes the render thread so it can arm its own
+    /// clock, which the host installs in place of this call.
     fn request_vsync(&self, _host_id: i32) {
         // Default: no-op.
     }

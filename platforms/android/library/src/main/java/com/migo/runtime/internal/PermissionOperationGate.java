@@ -70,7 +70,19 @@ public final class PermissionOperationGate {
      * exclusion, and {@link #openGuard} provides it.
      */
     private final ConcurrentMap<Integer, Session> sessions = new ConcurrentHashMap<>();
-    private final Object openGuard = new Object();
+
+    /**
+     * Mutual exclusion for admission and retirement only, and package-private so the
+     * contention gate in this package can hold it.
+     *
+     * Specification Section 7.3 requires a test that fails when a per-event operation
+     * acquires a lock shared beyond its own session, and says these are enforced by tests
+     * rather than by inspection. The only way to observe an acquisition rather than reason
+     * about one is to hold the lock and require the per-event path to finish anyway, which
+     * needs the monitor a test can synchronize on. Reflection would reach a private field
+     * too, and would go on compiling after a rename.
+     */
+    final Object openGuard = new Object();
 
     /**
      * Ids whose session has been closed. A tombstone must refuse exactly the ids that were
@@ -87,14 +99,29 @@ public final class PermissionOperationGate {
      */
     private final Set<Integer> retiredSessionIds = new HashSet<>();
 
-    /** Opens a previously unseen session. A closing tombstone is never reopened. */
-    public boolean open(int sessionId) {
+    /** What an admission attempt did, and when it refused, which refusal it was. */
+    public enum Admission {
+        ADMITTED,
+        /** The id is still live, so this is a duplicate registration. */
+        ALREADY_LIVE,
+        /** The id belonged to a closed session; every permission check for it is denied. */
+        RETIRED
+    }
+
+    /**
+     * Admit a previously unseen session, or say why not. A closing tombstone is never
+     * reopened.
+     *
+     * The two refusals mean different things to a caller and are answered in the *same*
+     * acquisition of {@link #openGuard} rather than by a second query, so no caller can
+     * observe a state between them and none can recompute the distinction differently.
+     */
+    public Admission admit(int sessionId) {
         synchronized (openGuard) {
-            if (retiredSessionIds.contains(sessionId) || sessions.containsKey(sessionId)) {
-                return false;
-            }
+            if (retiredSessionIds.contains(sessionId)) return Admission.RETIRED;
+            if (sessions.containsKey(sessionId)) return Admission.ALREADY_LIVE;
             sessions.put(sessionId, new Session());
-            return true;
+            return Admission.ADMITTED;
         }
     }
 

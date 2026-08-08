@@ -266,6 +266,14 @@ pub unsafe fn import_ahb_as_texture(
             .with_detail(format!("create_texture failed: {e}"))
     })?;
 
+    // What the caller's context had bound, so it can have it back. This path is
+    // unconditional on Android and runs on the render thread's canvas context;
+    // binding *zero* below instead of restoring left the WebGL dedup shadow naming a
+    // texture the driver no longer had, so the content's next identical
+    // `bindTexture` was dropped as redundant. `compressed_upload.rs` already
+    // restores for the same reason.
+    let saved_texture = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D);
+
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
 
     gl.tex_parameter_i32(
@@ -305,7 +313,10 @@ pub unsafe fn import_ahb_as_texture(
         );
     }
 
-    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.bind_texture(
+        glow::TEXTURE_2D,
+        std::num::NonZeroU32::new(saved_texture as u32).map(glow::NativeTexture),
+    );
 
     Ok(AhbTextureResult {
         texture: tex,

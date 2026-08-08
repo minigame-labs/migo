@@ -512,6 +512,37 @@ pub fn update_bind_framebuffer(state: &mut CanvasGLState, target: u32, fb: Optio
     }
 }
 
+/// Record that the *engine* re-pointed this canvas at its default framebuffer,
+/// outside any `bindFramebuffer` the content issued.
+///
+/// **This has to happen wherever the engine re-points the driver, and not doing
+/// it put a render-to-texture pass on the screen.** The shadow is keyed on the
+/// user-facing framebuffer name, so content holding its own FBO leaves
+/// `Some(name)` here; the engine then re-points the driver at the DrawingBuffer
+/// (an EGL switch, the post-swap restore after the blit) and the shadow still
+/// claims the content's FBO. The content's next `bindFramebuffer(sameName)` is
+/// deduped against that stale claim, never reaches the driver, and the pass draws
+/// wherever the engine last pointed. Measured on `scripts/fixtures/rtt-probe`,
+/// which presented its render-target colour full-screen on every frame.
+///
+/// Recording `None` rather than clearing the map is the difference between free
+/// and one redundant driver call per frame: `None` *is* the user-facing name for
+/// the default framebuffer, so the Cocos-style `bindFramebuffer(FRAMEBUFFER, 0)`
+/// every frame — the redundancy this dedup exists for — stays deduped.
+///
+/// All three targets, because binding `FRAMEBUFFER` sets the draw *and* read
+/// bindings, and the blit this most often follows clobbered the read target too.
+pub fn record_default_framebuffer_bind(state: &mut CanvasGLState) {
+    for target in [
+        glow::FRAMEBUFFER,
+        glow::DRAW_FRAMEBUFFER,
+        glow::READ_FRAMEBUFFER,
+    ] {
+        state.bound_framebuffer.insert(target, None);
+    }
+    state.draws_to_default_fbo = true;
+}
+
 /// `glBindRenderbuffer(RENDERBUFFER, rb)` dedup.  Only one target
 /// (`GL_RENDERBUFFER`) exists in GLES; tracked with a single slot.
 pub fn update_bind_renderbuffer(state: &mut CanvasGLState, rb: Option<u32>) -> bool {
@@ -971,6 +1002,95 @@ mod tests {
         // Rebinding default FBO (0 / None) is a real call after a
         // named FBO was bound.
         assert!(update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, None));
+    }
+
+    // ---- The engine's own re-points, and why the shadow has to hear about them.
+    //
+    // Measured before these existed: `scripts/fixtures/rtt-probe` binds its own
+    // framebuffer, lets a canvas switch happen, re-binds the same framebuffer, and
+    // clears red. It presented red full-screen on every frame — the re-bind was
+    // deduped against a shadow the engine had already invalidated by re-pointing
+    // the driver at the DrawingBuffer, so the render-to-texture clear landed on the
+    // screen.
+
+    /// The defect itself. `Some(7)` is still in the shadow when the engine
+    /// re-points, so without a record the content's identical re-bind looks
+    /// redundant and never reaches the driver.
+    #[test]
+    fn a_content_rebind_reaches_the_driver_after_the_engine_repoints_to_the_default() {
+        let mut s = fresh_state();
+        assert!(update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, Some(7)));
+
+        record_default_framebuffer_bind(&mut s);
+
+        assert!(
+            update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, Some(7)),
+            "the re-bind was deduped against a shadow the engine had made stale, \
+             so the content would render wherever the engine last pointed"
+        );
+    }
+
+    /// The control, and the reason the record is `None` rather than a `clear()`.
+    /// `None` is the user-facing name for the default framebuffer, so the
+    /// Cocos-style `bindFramebuffer(FRAMEBUFFER, 0)` every frame — the exact
+    /// redundancy this dedup was built for — stays deduped and the fix is free.
+    /// Clearing the map would satisfy the test above while costing a driver call
+    /// per frame for every game that does not render to texture at all.
+    #[test]
+    fn a_content_bind_of_the_default_is_still_deduped_after_the_engine_repoints() {
+        let mut s = fresh_state();
+        assert!(update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, None));
+
+        record_default_framebuffer_bind(&mut s);
+
+        assert!(!update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, None));
+    }
+
+    /// Binding `FRAMEBUFFER` moves the draw *and* read bindings, and the site this
+    /// most often follows is the swap-time blit, which bound
+    /// `READ=DrawingBuffer, DRAW=0`. A record that covered only `FRAMEBUFFER`
+    /// would leave a WebGL 2 content re-bind of either separate target deduped
+    /// against the blit's leftovers.
+    #[test]
+    fn the_engine_repoint_covers_the_separate_draw_and_read_targets_too() {
+        let mut s = fresh_state();
+        assert!(update_bind_framebuffer(
+            &mut s,
+            glow::DRAW_FRAMEBUFFER,
+            Some(7)
+        ));
+        assert!(update_bind_framebuffer(
+            &mut s,
+            glow::READ_FRAMEBUFFER,
+            Some(9)
+        ));
+
+        record_default_framebuffer_bind(&mut s);
+
+        assert!(update_bind_framebuffer(
+            &mut s,
+            glow::DRAW_FRAMEBUFFER,
+            Some(7)
+        ));
+        assert!(update_bind_framebuffer(
+            &mut s,
+            glow::READ_FRAMEBUFFER,
+            Some(9)
+        ));
+    }
+
+    /// Damage tracking asks `draws_to_default_fbo` whether a draw can dirty the
+    /// window. After the engine re-points, it can — leaving the flag false would
+    /// have the frame's clear counted as invisible and the region never declared
+    /// to the compositor, so the stale pixels stay on screen.
+    #[test]
+    fn the_engine_repoint_makes_the_canvas_draw_to_the_default_framebuffer_again() {
+        let mut s = fresh_state();
+        s.draws_to_default_fbo = false;
+
+        record_default_framebuffer_bind(&mut s);
+
+        assert!(s.draws_to_default_fbo);
     }
 
     #[test]

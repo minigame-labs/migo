@@ -45,6 +45,9 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 migo-core = { path = "../core", default-features = false, features = ["test-support"] }
+# Test-only by construction: resolver 2 keeps a `[dev-dependencies]` entry out of every
+# shipped build, which is what stops a probe crate reaching a cdylib.
+migo-contention-probe = { path = "../../testing/contention-probe", default-features = false }
 
 # On non-Android platforms, enable Rust-native implementations:
 # - zip-extract: Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)

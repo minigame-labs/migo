@@ -4,6 +4,9 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use shared::audio_channel::{
+    AUDIO_COMMANDS_PER_DRAIN, AudioCommandReceiver, AudioCommandSender, channel as audio_channel,
+};
 use shared::channel::ThreadWakeup;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::op_state::HostTx;
@@ -12,7 +15,6 @@ use shared::protocol::audio_cmd::{
     InnerAudioEvent, InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
 use shared::protocol::host_cmd::HostCommand;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{error, info, warn};
 
 /// Best-effort thread join with a timeout.  Falls back to detaching the
@@ -317,7 +319,7 @@ enum InitResult {
 }
 
 pub struct AudioThread {
-    tx: UnboundedSender<AudioCmd>,
+    tx: AudioCommandSender,
     wakeup: ThreadWakeup,
     handle: Option<thread::JoinHandle<()>>,
     thread_id: thread::ThreadId,
@@ -328,7 +330,7 @@ impl AudioThread {
         host_tx: HostTx,
         http_client_factory: StreamingHttpClientFactory,
     ) -> EngineResult<Self> {
-        let (tx, rx) = unbounded_channel::<AudioCmd>();
+        let (tx, rx) = audio_channel();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<InitResult>(1);
 
         // Create the shared wakeup handle. A clone lives in the AudioThread
@@ -362,7 +364,14 @@ impl AudioThread {
                     info!("AudioThread started");
 
                     // Run the audio thread loop with power management
-                    run_audio_thread(rx, output, host_tx, wakeup_for_thread, http_client_factory);
+                    run_audio_thread(
+                        rx,
+                        Vec::new(),
+                        output,
+                        host_tx,
+                        wakeup_for_thread,
+                        http_client_factory,
+                    );
 
                     info!("AudioThread stopped");
                 })); // end catch_unwind
@@ -422,8 +431,9 @@ impl AudioThread {
     /// asynchronously; commands queued before init finishes are buffered in the
     /// channel and processed once the output is ready.
     pub fn spawn_with_channel(
-        tx: UnboundedSender<AudioCmd>,
-        rx: UnboundedReceiver<AudioCmd>,
+        tx: AudioCommandSender,
+        rx: AudioCommandReceiver,
+        startup_backlog: Vec<AudioCmd>,
         wakeup: ThreadWakeup,
         host_tx: HostTx,
         http_client_factory: StreamingHttpClientFactory,
@@ -451,7 +461,14 @@ impl AudioThread {
                     };
 
                     info!("AudioThread (lazy) started");
-                    run_audio_thread(rx, output, host_tx, wakeup_for_thread, http_client_factory);
+                    run_audio_thread(
+                        rx,
+                        startup_backlog,
+                        output,
+                        host_tx,
+                        wakeup_for_thread,
+                        http_client_factory,
+                    );
                     info!("AudioThread (lazy) stopped");
                 })); // end catch_unwind
                 if let Err(panic_info) = result {
@@ -568,6 +585,24 @@ fn wait_for_audio_work(wakeup: &ThreadWakeup, mode: AudioWaitMode) {
     }
 }
 
+/// The next command to execute: the startup backlog before the channel.
+///
+/// **The order is the point, not a preference.** `AudioCmd` carries ids allocated
+/// on the JavaScript side and its creates are fire-and-forget, so a command that
+/// arrives out of order addresses a node that does not exist yet. The backlog
+/// holds commands the service accepted *before* this thread existed, which are by
+/// construction older than anything still sitting in the channel — so consulting
+/// the channel first would invert the only ordering this protocol has.
+///
+/// Its own function so that ordering is observable without an audio device, which
+/// `run_audio_thread` needs and a host test cannot provide.
+fn next_command(
+    startup_backlog: &mut std::vec::IntoIter<AudioCmd>,
+    rx: &AudioCommandReceiver,
+) -> Option<AudioCmd> {
+    startup_backlog.next().or_else(|| rx.try_recv().ok())
+}
+
 /// Audio thread main loop — 3-level power management.
 ///
 /// # Power States
@@ -582,12 +617,16 @@ fn wait_for_audio_work(wakeup: &ThreadWakeup, mode: AudioWaitMode) {
 /// incoming commands (via [`AudioSender`](shared::op_state::AudioSender))
 /// wake it without waiting for the next timed tick.
 fn run_audio_thread(
-    mut rx: UnboundedReceiver<AudioCmd>,
+    rx: AudioCommandReceiver,
+    startup_backlog: Vec<AudioCmd>,
     mut output: AudioOutput,
     host_tx: HostTx,
     wakeup: ThreadWakeup,
     http_client_factory: StreamingHttpClientFactory,
 ) {
+    // Consumed ahead of the channel in the drain below, so the commands the
+    // service buffered before this thread existed keep their place in the order.
+    let mut startup_backlog = startup_backlog.into_iter();
     let sample_rate = output.sample_rate();
     let channels = output.channels();
 
@@ -647,12 +686,11 @@ fn run_audio_thread(
         //    when JS fires rapid bursts (automation, game SFX).  Remaining
         //    commands are picked up on the next iteration (~5ms in Active).
         // -----------------------------------------------------------------
-        const MAX_CMD_DRAIN: usize = 256;
         let mut cmd_count = 0usize;
-        while cmd_count < MAX_CMD_DRAIN {
-            let cmd = match rx.try_recv() {
-                Ok(c) => c,
-                Err(_) => break,
+        while cmd_count < AUDIO_COMMANDS_PER_DRAIN {
+            let cmd = match next_command(&mut startup_backlog, &rx) {
+                Some(c) => c,
+                None => break,
             };
             cmd_count += 1;
             match cmd {
@@ -1837,7 +1875,7 @@ fn run_audio_thread(
         // Hitting the drain cap means the channel may still contain commands.
         // Notifications are intentionally coalesced into one latch, so the
         // loop must not block until it has observed the channel below the cap.
-        let commands_may_remain = cmd_count == MAX_CMD_DRAIN;
+        let commands_may_remain = cmd_count == AUDIO_COMMANDS_PER_DRAIN;
 
         // -----------------------------------------------------------------
         // 2. When backgrounded, pause the hardware stream and wait for an
@@ -2033,6 +2071,66 @@ fn run_audio_thread(
 mod tests {
     use super::*;
     use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+
+    fn create_context(ctx_id: u32) -> AudioCmd {
+        AudioCmd::CreateContext {
+            ctx_id,
+            sample_rate: None,
+        }
+    }
+
+    fn context_id(cmd: &AudioCmd) -> u32 {
+        match cmd {
+            AudioCmd::CreateContext { ctx_id, .. } => *ctx_id,
+            _ => panic!("fixture only builds CreateContext"),
+        }
+    }
+
+    /// A command the service accepted before this thread existed must run before
+    /// one that is still in the channel, and every command must run exactly once.
+    ///
+    /// **This is the property that replaced re-injecting the backlog into the
+    /// channel**, which the bounded transport made impossible: at the moment the
+    /// service hands the receiver over, nothing is draining the queue, so putting
+    /// commands back into a full one would park the caller forever. It also
+    /// removes an ordering argument that was never sound — the game thread can
+    /// enqueue while the handover runs, and a re-injected command would then land
+    /// behind a newer one.
+    #[test]
+    fn the_startup_backlog_runs_before_anything_still_in_the_channel() {
+        let (tx, rx) = shared::audio_channel::channel();
+        tx.try_send(create_context(30)).unwrap();
+        tx.try_send(create_context(40)).unwrap();
+        let mut backlog = vec![create_context(10), create_context(20)].into_iter();
+
+        let mut seen = Vec::new();
+        while let Some(cmd) = next_command(&mut backlog, &rx) {
+            seen.push(context_id(&cmd));
+        }
+
+        assert_eq!(
+            seen,
+            vec![10, 20, 30, 40],
+            "the backlog and the channel were interleaved or reordered"
+        );
+    }
+
+    /// With nothing buffered the drain is the channel alone, which is every
+    /// iteration after the first.
+    #[test]
+    fn an_empty_backlog_leaves_the_channel_order_untouched() {
+        let (tx, rx) = shared::audio_channel::channel();
+        tx.try_send(create_context(1)).unwrap();
+        tx.try_send(create_context(2)).unwrap();
+        let mut backlog = Vec::new().into_iter();
+
+        let mut seen = Vec::new();
+        while let Some(cmd) = next_command(&mut backlog, &rx) {
+            seen.push(context_id(&cmd));
+        }
+
+        assert_eq!(seen, vec![1, 2]);
+    }
 
     #[test]
     fn decode_pool_starts_only_when_first_job_is_submitted() {

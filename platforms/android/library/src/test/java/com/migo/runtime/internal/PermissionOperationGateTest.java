@@ -2,6 +2,7 @@ package com.migo.runtime.internal;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -15,6 +16,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
+import com.migo.runtime.internal.PermissionOperationGate.Admission;
 import org.junit.Test;
 
 public final class PermissionOperationGateTest {
@@ -24,6 +26,176 @@ public final class PermissionOperationGateTest {
      */
     private static final long BLOCKED_OBSERVATION_MILLIS = 200;
 
+    /**
+     * Budget for requiring a per-event path to finish while the admission guard is held.
+     * Six orders of magnitude above what an unblocked lookup needs, because the cost of
+     * being wrong the other way is a flaky gate. Shortening it can only make a correct
+     * path look blocked, which fails closed.
+     */
+    private static final long CONTENTION_PATIENCE_MILLIS = 2_000;
+
+    /**
+     * Section 7.3: no per-event path acquires a lock shared beyond its own session.
+     *
+     * This is the gate that requirement was first written for on this side of the JNI
+     * boundary, and the JVM half the Rust probe says nothing about. An earlier attempt was
+     * withdrawn for being unable to fail -- it took the shared lock inside the very helper
+     * it called -- and the design recorded to replace it was JVM thread contention
+     * monitoring plus an assertion that admission-attributable blocked time is zero. That
+     * measures the same structural fact less directly and has the shape of a metric that
+     * cannot fail: a run where nothing was admitted also blocks for zero milliseconds.
+     *
+     * So this takes the Rust probe's shape instead. Manufacture the contention rather than
+     * wait for load, by holding {@code openGuard} and requiring the per-event admission --
+     * {@code runIfGranted}, which is what a BLE characteristic notification takes -- to
+     * complete on another thread anyway. An uncontended acquisition, which a load test
+     * cannot see, fails this too.
+     *
+     * Three details are load-bearing. The admission runs on another thread, because on the
+     * holder's own thread Java's monitors are reentrant and it would pass with or without
+     * the property. Saturation is asserted before the admission starts, since an admission
+     * handed an unheld guard proves nothing. And the callback's own return value is
+     * asserted, because a refused admission returns instantly and would satisfy the timing
+     * assertion while never reaching the lookup at all.
+     */
+    /**
+     * The two refusals are different facts and the gate is what knows which.
+     *
+     * `admit` replaced a `boolean open`, and the boolean is why the one caller that acts on
+     * a refusal --- `NativeExports.registerSession`, which throws from the `GameSession`
+     * constructor --- threw a message naming the closing case for both. A duplicate
+     * registration and a reused id call for different things from a host: the first is two
+     * sessions sharing an id, the second is an id whose permissions can never be granted
+     * again.
+     *
+     * Answered in one acquisition of the admission guard rather than by a second query, so
+     * no caller can observe a state between the two and none can recompute the distinction
+     * differently. That is what makes the enum the right shape and a `boolean` plus an
+     * `isRetired` accessor the wrong one.
+     *
+     * The admitted case is asserted here too: without it, a gate that refused everything
+     * would satisfy both refusal assertions.
+     */
+    @Test
+    public void admissionSaysWhetherARefusedIdIsLiveOrRetired() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+
+        assertEquals(Admission.ADMITTED, gate.admit(3101));
+        assertEquals(
+                "a still-live id is a duplicate registration, not a closed session",
+                Admission.ALREADY_LIVE,
+                gate.admit(3101));
+
+        assertNull(gate.close(3101).failure());
+        assertEquals(
+                "a closed id is retired, not merely live elsewhere",
+                Admission.RETIRED,
+                gate.admit(3101));
+
+        // A neighbour is unaffected by either, which rules out an answer that depends on
+        // anything but the id asked about.
+        assertEquals(Admission.ADMITTED, gate.admit(3102));
+    }
+
+    @Test
+    public void perEventAdmissionDoesNotWaitForTheAdmissionGuard() throws Exception {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertEquals(Admission.ADMITTED, gate.admit(31));
+        assertNull(gate.update(31, "scope.bluetooth", true, () -> true).failure());
+
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (gate.openGuard) {
+                held.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "admission-guard-holder");
+        holder.start();
+        assertTrue("the guard was never taken, so nothing was contended",
+                held.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS));
+
+        CountDownLatch admitted = new CountDownLatch(1);
+        List<Boolean> outcome = Collections.synchronizedList(new ArrayList<>());
+        Thread caller = new Thread(() -> {
+            outcome.add(gate.runIfGranted(31, "scope.bluetooth", () -> true));
+            admitted.countDown();
+        }, "per-event-admission");
+        caller.start();
+
+        boolean finished = admitted.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS);
+        release.countDown();
+        holder.join();
+        caller.join();
+
+        assertTrue(
+                "a per-event admission did not complete in " + CONTENTION_PATIENCE_MILLIS
+                        + "ms while the admission guard was held, so it acquires a lock"
+                        + " shared beyond its own session",
+                finished);
+        assertEquals(
+                "the admission was refused, so its speed says nothing about the lock",
+                Arrays.asList(true),
+                outcome);
+    }
+
+    /**
+     * The instrument's own control, and it is not optional.
+     *
+     * The test above asserts an absence: that a per-event path did *not* wait. That is
+     * satisfied by a guard nobody actually held, by a monitor this test failed to acquire,
+     * and by a deadline long enough to hide anything. Opening a session is the operation
+     * that genuinely takes {@code openGuard}, so requiring it to stay blocked for the same
+     * held guard is what says the instrument can observe a wait at all.
+     *
+     * The bound here is deliberately the short one: a correct {@code open} can never
+     * complete while the guard is held, so this observation cannot flake -- only a
+     * regression that stopped taking the guard could make it fail.
+     */
+    @Test
+    public void openingASessionDoesWaitForTheAdmissionGuard() throws Exception {
+        PermissionOperationGate gate = new PermissionOperationGate();
+
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (gate.openGuard) {
+                held.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "admission-guard-holder");
+        holder.start();
+        assertTrue(held.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS));
+
+        CountDownLatch opened = new CountDownLatch(1);
+        Thread opener = new Thread(() -> {
+            gate.admit(41);
+            opened.countDown();
+        }, "session-open");
+        opener.start();
+
+        boolean finishedEarly = opened.await(BLOCKED_OBSERVATION_MILLIS, TimeUnit.MILLISECONDS);
+        release.countDown();
+        holder.join();
+        opener.join();
+
+        assertFalse(
+                "opening a session completed while the admission guard was held, so the"
+                        + " guard is not the mutual exclusion the per-event gate assumes"
+                        + " it holds",
+                finishedEarly);
+        assertTrue("the opener never finished even after the guard was released",
+                opened.await(CONTENTION_PATIENCE_MILLIS, TimeUnit.MILLISECONDS));
+    }
+
     @Test
     public void missingSessionRejectsUpdatesAndRegistrationUntilExplicitlyOpened() {
         PermissionOperationGate gate = new PermissionOperationGate();
@@ -31,7 +203,7 @@ public final class PermissionOperationGateTest {
         assertNotNull(gate.update(6, "scope.camera", true, () -> true).failure());
         assertNull(gate.register(6, "scope.camera"));
 
-        assertTrue(gate.open(6));
+        assertEquals(Admission.ADMITTED, gate.admit(6));
         assertNull(gate.update(6, "scope.camera", true, () -> true).failure());
         assertNotNull(gate.register(6, "scope.camera"));
     }
@@ -39,7 +211,7 @@ public final class PermissionOperationGateTest {
     @Test
     public void closeWaitsForDeferredFrameworkEntryBeforeCancelling() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(7));
+        assertEquals(Admission.ADMITTED, gate.admit(7));
         assertNull(gate.update(7, "scope.userLocation", true, () -> true).failure());
         List<String> events = Collections.synchronizedList(new ArrayList<>());
         PermissionOperationGate.Pending pending = gate.register(
@@ -78,7 +250,7 @@ public final class PermissionOperationGateTest {
     @Test
     public void updateWaitingBehindCloseCannotReopenTheSession() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(8));
+        assertEquals(Admission.ADMITTED, gate.admit(8));
         assertNull(gate.update(8, "scope.userLocation", true, () -> true).failure());
         CountDownLatch cancelling = new CountDownLatch(1);
         CountDownLatch releaseCancellation = new CountDownLatch(1);
@@ -112,14 +284,14 @@ public final class PermissionOperationGateTest {
         assertNull(closed[0].failure());
         assertNotNull(updated[0].failure());
         assertEquals(0, nativeUpdates[0]);
-        assertFalse(gate.open(8));
+        assertNotEquals(Admission.ADMITTED, gate.admit(8));
         assertNull(gate.register(8, "scope.camera"));
     }
 
     @Test
     public void failedCloseCancellationIsRetainedAndRetriedAcrossAllScopes() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(9));
+        assertEquals(Admission.ADMITTED, gate.admit(9));
         assertNull(gate.update(9, "scope.userLocation", true, () -> true).failure());
         assertNull(gate.update(9, "scope.camera", true, () -> true).failure());
         int[] locationAttempts = {0};
@@ -150,7 +322,7 @@ public final class PermissionOperationGateTest {
     @Test
     public void nativeGrantFailureLeavesScopeDenied() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(10));
+        assertEquals(Admission.ADMITTED, gate.admit(10));
 
         PermissionOperationGate.Result result =
                 gate.update(10, "scope.camera", true, () -> false);
@@ -162,12 +334,12 @@ public final class PermissionOperationGateTest {
     @Test
     public void closeLeavesTombstoneAndCannotRetainGrantOrBeReopened() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(11));
+        assertEquals(Admission.ADMITTED, gate.admit(11));
         assertNull(gate.update(11, "scope.camera", true, () -> true).failure());
 
         assertNull(gate.close(11).failure());
 
-        assertFalse(gate.open(11));
+        assertNotEquals(Admission.ADMITTED, gate.admit(11));
         assertNotNull(gate.update(11, "scope.camera", true, () -> true).failure());
         assertNull(gate.register(11, "scope.camera"));
     }
@@ -176,14 +348,14 @@ public final class PermissionOperationGateTest {
     public void duplicateOpenCannotRepublishAnExistingSession() {
         PermissionOperationGate gate = new PermissionOperationGate();
 
-        assertTrue(gate.open(12));
-        assertFalse(gate.open(12));
+        assertEquals(Admission.ADMITTED, gate.admit(12));
+        assertNotEquals(Admission.ADMITTED, gate.admit(12));
     }
 
     @Test
     public void nativeUpdateDoesNotHoldSessionMonitorWhileWaitingForHostLock() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(13));
+        assertEquals(Admission.ADMITTED, gate.admit(13));
         Object hostLock = new Object();
         CountDownLatch nativeUpdateStarted = new CountDownLatch(1);
         CountDownLatch javaEntryStarted = new CountDownLatch(1);
@@ -232,13 +404,13 @@ public final class PermissionOperationGateTest {
     public void successfulCloseReclaimsSessionsWithoutAllowingIdReuse() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
         for (int sessionId = 1000; sessionId < 2000; sessionId++) {
-            assertTrue(gate.open(sessionId));
+            assertEquals(Admission.ADMITTED, gate.admit(sessionId));
             assertNull(gate.close(sessionId).failure());
         }
         assertEquals(0, gate.retainedSessionCountForTests());
-        assertFalse(gate.open(1500));
+        assertNotEquals(Admission.ADMITTED, gate.admit(1500));
 
-        assertTrue(gate.open(2000));
+        assertEquals(Admission.ADMITTED, gate.admit(2000));
         assertNull(gate.update(2000, "scope.camera", true, () -> true).failure());
         CountDownLatch cancellationStarted = new CountDownLatch(1);
         CountDownLatch releaseCancellation = new CountDownLatch(1);
@@ -250,12 +422,12 @@ public final class PermissionOperationGateTest {
         close.start();
         assertTrue(cancellationStarted.await(1, TimeUnit.SECONDS));
 
-        assertFalse(gate.open(2000));
+        assertNotEquals(Admission.ADMITTED, gate.admit(2000));
         releaseCancellation.countDown();
         joinBounded(close);
 
         assertEquals(0, gate.retainedSessionCountForTests());
-        assertFalse(gate.open(2000));
+        assertNotEquals(Admission.ADMITTED, gate.admit(2000));
     }
 
     @Test
@@ -265,10 +437,10 @@ public final class PermissionOperationGateTest {
         // Neither id was retired, so both must be admitted and both must stay usable.
         PermissionOperationGate gate = new PermissionOperationGate();
 
-        assertTrue("the first session was refused", gate.open(3007));
-        assertTrue(
+        assertEquals("the first session was refused", Admission.ADMITTED, gate.admit(3007));
+        assertEquals(
                 "a live session was refused because a higher id opened first",
-                gate.open(3005));
+                Admission.ADMITTED, gate.admit(3005));
 
         assertNull(gate.update(3005, "scope.camera", true, () -> true).failure());
         assertNotNull(
@@ -281,23 +453,58 @@ public final class PermissionOperationGateTest {
     @Test
     public void aClosedIdStaysRetiredWhenAHigherIdOpensAfterwards() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(3011));
+        assertEquals(Admission.ADMITTED, gate.admit(3011));
         assertNull(gate.close(3011).failure());
 
         // A later, unrelated session must not resurrect the retired id.
-        assertTrue(gate.open(3012));
+        assertEquals(Admission.ADMITTED, gate.admit(3012));
 
-        assertFalse("a retired id was reopened", gate.open(3011));
+        assertNotEquals("a retired id was reopened", Admission.ADMITTED, gate.admit(3011));
         assertNotNull(gate.update(3011, "scope.camera", true, () -> true).failure());
         assertNull(gate.register(3011, "scope.camera"));
+    }
+
+    /**
+     * A grant belongs to the Session that was granted it, and to no other. This gate is a
+     * process-wide static keyed by session id, so two concurrent Sessions meet inside one
+     * object -- and a grant that leaked between them would let one game use a capability
+     * the user approved for another. That is the permission half of Section 6.4's
+     * concurrent-session isolation, and it was the group task 0.21 recorded as untested.
+     *
+     * <p>The existing cross-session test grants a scope and then checks the granted
+     * session still works. This checks the other direction, which nothing did: that the
+     * session which was <em>not</em> granted is refused. Both directions are needed
+     * because the first alone passes over a gate that grants everyone.
+     *
+     * <p>The positive assertion in the middle is that control: a gate that granted nobody
+     * would satisfy both denials while breaking every permission in the product.
+     */
+    @Test
+    public void aGrantOnOneSessionLeavesTheSameScopeDeniedOnAnother() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertEquals(Admission.ADMITTED, gate.admit(4001));
+        assertEquals(Admission.ADMITTED, gate.admit(4002));
+
+        assertNull(gate.update(4001, "scope.camera", true, () -> true).failure());
+
+        assertTrue(
+                "the session the grant was made for could not use it",
+                gate.runIfGranted(4001, "scope.camera", () -> true));
+
+        assertFalse(
+                "one session's grant admitted another session's callback",
+                gate.runIfGranted(4002, "scope.camera", () -> true));
+        assertNull(
+                "one session's grant let another session register a cancellation",
+                gate.register(4002, "scope.camera"));
     }
 
     @Test
     public void closingOneSessionLeavesAnotherLiveSessionUntouched() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(3022));
-        assertTrue("a live session was refused because a higher id opened first",
-                gate.open(3021));
+        assertEquals(Admission.ADMITTED, gate.admit(3022));
+        assertEquals("a live session was refused because a higher id opened first",
+                Admission.ADMITTED, gate.admit(3021));
         assertNull(gate.update(3021, "scope.camera", true, () -> true).failure());
 
         assertNull(gate.close(3022).failure());
@@ -307,7 +514,7 @@ public final class PermissionOperationGateTest {
                 gate.register(3021, "scope.camera"));
         assertTrue(gate.runIfGranted(3021, "scope.camera", () -> true));
         // A fresh id below the closed one is still admissible.
-        assertTrue(gate.open(3020));
+        assertEquals(Admission.ADMITTED, gate.admit(3020));
         assertNull(gate.update(3020, "scope.camera", true, () -> true).failure());
         assertEquals(2, gate.retainedSessionCountForTests());
     }
@@ -315,7 +522,7 @@ public final class PermissionOperationGateTest {
     @Test
     public void replacedCancellationRunsExactlyOnceAndAThrowingOneIsRetained() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(3030));
+        assertEquals(Admission.ADMITTED, gate.admit(3030));
         assertNull(gate.update(3030, "scope.userLocation", true, () -> true).failure());
         List<String> events = Collections.synchronizedList(new ArrayList<>());
         int[] replacementRuns = {0};
@@ -368,7 +575,7 @@ public final class PermissionOperationGateTest {
     public void aCancellationReplacedWhileAnotherRunsDoesNotSwapTheExecutedAction()
             throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(3031));
+        assertEquals(Admission.ADMITTED, gate.admit(3031));
         assertNull(gate.update(3031, "scope.userLocation", true, () -> true).failure());
         List<String> events = Collections.synchronizedList(new ArrayList<>());
         CountDownLatch firstEntered = new CountDownLatch(1);
@@ -412,7 +619,7 @@ public final class PermissionOperationGateTest {
     public void denialDrainsAdmittedScopeRunBeforeNativeUpdateAndRejectsLaterRun()
             throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(2001));
+        assertEquals(Admission.ADMITTED, gate.admit(2001));
         assertNull(gate.update(2001, "scope.bluetooth", true, () -> true).failure());
         assertNull(gate.update(2001, "scope.camera", true, () -> true).failure());
         List<String> events = Collections.synchronizedList(new ArrayList<>());
@@ -488,7 +695,7 @@ public final class PermissionOperationGateTest {
     public void closeDrainsAdmittedScopeRunBeforeCancellationAndRejectsLaterRun()
             throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(2002));
+        assertEquals(Admission.ADMITTED, gate.admit(2002));
         assertNull(gate.update(2002, "scope.bluetooth", true, () -> true).failure());
         List<String> events = Collections.synchronizedList(new ArrayList<>());
         CountDownLatch cancellationEntered = new CountDownLatch(1);
@@ -530,14 +737,14 @@ public final class PermissionOperationGateTest {
         assertEquals(Arrays.asList("callback", "cancel"), events);
         assertFalse(gate.runIfGranted(2002, "scope.bluetooth", () -> true));
         assertEquals(0, gate.retainedSessionCountForTests());
-        assertFalse(gate.open(2002));
+        assertNotEquals(Admission.ADMITTED, gate.admit(2002));
     }
 
     @Test
     public void callbackFailureReleasesScopeRunLeaseForSubsequentDenial()
             throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(2003));
+        assertEquals(Admission.ADMITTED, gate.admit(2003));
         assertNull(gate.update(2003, "scope.bluetooth", true, () -> true).failure());
         IllegalStateException callbackFailure =
                 new IllegalStateException("callback failed");
@@ -576,7 +783,7 @@ public final class PermissionOperationGateTest {
     @Test
     public void closeCancellationDoesNotRetainTheSessionMonitor() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(2004));
+        assertEquals(Admission.ADMITTED, gate.admit(2004));
         assertNull(gate.update(2004, "scope.bluetooth", true, () -> true).failure());
         assertNull(gate.update(2004, "scope.camera", true, () -> true).failure());
         CountDownLatch cancellationEntered = new CountDownLatch(1);
@@ -628,9 +835,9 @@ public final class PermissionOperationGateTest {
     @Test
     public void twoSessionsAdmitCallbacksConcurrently() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(2005));
+        assertEquals(Admission.ADMITTED, gate.admit(2005));
         assertNull(gate.update(2005, "scope.bluetooth", true, () -> true).failure());
-        assertTrue(gate.open(2006));
+        assertEquals(Admission.ADMITTED, gate.admit(2006));
         assertNull(gate.update(2006, "scope.bluetooth", true, () -> true).failure());
         CyclicBarrier bothInside = new CyclicBarrier(2);
         boolean[] admitted = {false, false};

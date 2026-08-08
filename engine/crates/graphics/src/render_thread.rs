@@ -29,9 +29,10 @@ use crate::{
     canvas2d_dispatcher::Renderer2d,
     damage_effect::DamageEffect,
     dirty_region,
-    frame_scheduler::FrameScheduler,
+    frame_scheduler::{FrameScheduler, SoftwareFrameClock},
     render_frame_state::{DEFERRED_CLEANUP_UNUSED_AGE, DeferredCleanupCadence},
     render_server::RenderServer,
+    render_wait::{RenderWait, Wake},
     surface_binding::{
         CandidateCleanup, InstallPhase, PresentationDisposition, RecreateKind,
         RenderSurfaceBinding, SurfaceBindingError, SurfaceInstallFailure, SurfaceRecreateError,
@@ -39,12 +40,12 @@ use crate::{
     },
     surface_system::SurfaceSystem,
 };
-use crossbeam_channel::{Receiver, select, tick};
+use crossbeam_channel::Receiver;
 use glow::HasContext;
 use shared::command_vec_pool::PooledVec;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::CanvasIdSet;
-use shared::protocol::render_cmd::{CanvasBatchPayload, GlBatchPayload, RenderCommand};
+use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
 use shared::render_event::{RenderEvent, RenderEventReceiver, RenderEventSender};
 use shared::surface::{
@@ -534,30 +535,55 @@ where
 /// cross-dependency (e.g. `ctx.drawImage(webglCanvasElement, ...)` —
 /// the WebGL canvas's pixels must be flushed before the Canvas2D
 /// draw reads them), in which case we preserve issue order.
+///
+/// **It gathers nothing.** The question is whether one set intersects another,
+/// which is a boolean, and the ops that answer it are already in hand — so
+/// materialising either side buys nothing and costs a container. The version
+/// that did cost one: an inline thirty-two-entry set, sized against the
+/// thirty-label scene that motivated the reorder, which spilled to the heap on
+/// any busier scene and so allocated and freed on the render thread **every
+/// frame, for as long as the scene was on screen** (measured at eighty
+/// canvases: two heap events per frame, 768 bytes). A capacity cannot fix that,
+/// because nothing bounds how many canvases a game draws to in one frame; not
+/// needing one can.
+///
+/// It is also strictly less work than gathering was. Gathering deduplicated on
+/// insert — a scan per Canvas2D op — and then scanned the gathered list once per
+/// WebGL command. This scans the ops once per *distinct* canvas a WebGL command
+/// binds, which is normally one.
 fn packet_safe_to_reorder(ops: &[FrameOp]) -> bool {
-    let mut canvas_targets = CanvasIdSet::new();
-    for op in ops {
-        if let FrameOp::CanvasBatch(payload) = op {
-            canvas_targets.insert(payload.canvas_id);
-        }
-    }
-
     // Nothing to collide with, so the question is settled before the GL half is
     // walked at all — which is every WebGL-only frame, the common case.
-    if canvas_targets.is_empty() {
+    if !ops.iter().any(|op| matches!(op, FrameOp::CanvasBatch(_))) {
         return true;
     }
 
+    // The canvas most recently *proven not to be* a Canvas2D target. Only a
+    // proven-absent id is ever remembered, because a hit returns immediately —
+    // so a stale or mismatched entry here can cost a repeated scan and can
+    // never change the verdict. That is what makes the memo safe on the one
+    // path in packet execution where a wrong answer is wrong pixels rather than
+    // a slow frame.
+    let mut proven_absent: Option<CanvasId> = None;
+
     // Only the *first* shared canvas matters: one is enough to force issue
-    // order. The set version built both sides in full before comparing them.
+    // order.
     for op in ops {
         if let FrameOp::GlBatch(payload) = op {
             for cmd in &payload.commands {
-                if let Some(cid) = cmd.touches_canvas()
-                    && canvas_targets.contains(cid)
+                let Some(cid) = cmd.touches_canvas() else {
+                    continue;
+                };
+                if proven_absent == Some(cid) {
+                    continue;
+                }
+                if ops
+                    .iter()
+                    .any(|other| matches!(other, FrameOp::CanvasBatch(p) if p.canvas_id == cid))
                 {
                     return false;
                 }
+                proven_absent = Some(cid);
             }
         }
     }
@@ -1029,15 +1055,25 @@ mod tests {
     /// is classified first, so whatever this does, the engine does once a frame
     /// for as long as it runs.
     ///
-    /// It used to build two `HashSet<u32>`, fill them and throw them away — two
-    /// allocations and two frees per frame, to answer a question about a handful
-    /// of small integers.
+    /// **Eighty canvases, deliberately, because thirty proved the wrong thing.**
+    /// This gate first ran against a thirty-canvas fixture — the profiled
+    /// shop-open scene — which fitted inside the classifier's inline
+    /// thirty-two-entry target set and so passed over an implementation that
+    /// allocated on every frame of any busier scene (measured at eighty: 128
+    /// heap events over 64 frames, 49152 bytes). A burst has to hold for the
+    /// workload, not for the workload that happens to fit the constant, and
+    /// nothing bounds how many canvases a game draws to in one frame.
     #[test]
     fn classifying_a_packet_for_reorder_never_reaches_the_heap() {
-        // The shape that motivated the reorder: a scene's worth of offscreen
-        // Canvas2D labels alongside one onscreen WebGL canvas.
-        let mut ops: Vec<FrameOp> = (2..32).map(canvas_batch).collect();
+        // The shape that motivated the reorder, on a UI larger than the one
+        // profiled: a scene's worth of offscreen Canvas2D labels alongside one
+        // onscreen WebGL canvas.
+        let mut ops: Vec<FrameOp> = (2..82).map(canvas_batch).collect();
         ops.push(gl_batch_touching(&[1]));
+        assert!(
+            packet_safe_to_reorder(&ops),
+            "fixture must be reorderable, or the burst measures the refusal path"
+        );
 
         assert_no_steady_state_allocation(
             Burst {
@@ -1049,51 +1085,33 @@ mod tests {
         );
     }
 
-    /// Repeats must be gathered once. A packet whose Canvas2D half is one canvas
-    /// drawn many times is the ordinary shape — every label redrawn in a frame —
-    /// and the set version deduplicated for free where the inline scan has to do
-    /// it deliberately.
+    /// Eighty distinct Canvas2D targets, and the canvas the WebGL half collides
+    /// with is the last of them — so a scan that stopped short would report the
+    /// reorder as safe, and a Canvas2D read of a WebGL canvas would run before
+    /// the WebGL work that fills it. That is the one defect in packet execution
+    /// that produces wrong pixels rather than a slow frame, and it is the shape
+    /// an implementation carrying a fixed-size target list gets wrong.
     ///
-    /// **Gated by allocation rather than by the answer, because the answer does
-    /// not change.** Gathering the same canvas sixty-four times returns exactly
-    /// what gathering it once returns, so an assertion on the verdict cannot see
-    /// the difference; what it costs is the target list spilling past its inline
-    /// capacity onto the heap. A test named for deduplication that only checked
-    /// the verdict would be pinning nothing.
+    /// **What this adds over the small collision fixtures is the scale, and only
+    /// that.** The memo — the last canvas proven absent from the Canvas2D half —
+    /// is already pinned by `a_canvas_the_gl_half_also_touches_forces_issue_order`
+    /// and by the last-command test, both of which put a colliding canvas after a
+    /// proven-absent one; a memo that answered without comparing the id fails all
+    /// three. Truncating the scan at forty ops fails this one alone.
     #[test]
-    fn repeated_canvas_targets_are_gathered_once() {
-        let mut ops: Vec<FrameOp> = (0..64).map(|_| canvas_batch(2)).collect();
-        ops.push(gl_batch_touching(&[1]));
-        assert!(packet_safe_to_reorder(&ops));
-
-        assert_no_steady_state_allocation(
-            Burst {
-                path: "render_thread: reorder admission over one repeated canvas",
-                warmup: WARMUP,
-                measured: MEASURED,
-            },
-            |_| packet_safe_to_reorder(&ops),
-        );
-    }
-
-    /// Past the inline capacity the target list spills to the heap. That costs
-    /// an allocation on a scene nobody has yet produced, and the answer must
-    /// still be right — a spill that lost targets would admit a reorder across
-    /// a shared canvas.
-    #[test]
-    fn more_distinct_canvases_than_the_inline_capacity_stay_correct() {
+    fn a_scene_with_eighty_canvases_still_finds_the_one_the_gl_half_collides_with() {
         let distinct: Vec<u32> = (100..180).collect();
         let mut ops: Vec<FrameOp> = distinct.iter().map(|id| canvas_batch(*id)).collect();
         ops.push(gl_batch_touching(&[1]));
         assert!(
             packet_safe_to_reorder(&ops),
-            "a spilled target list dropped canvases and found a collision that is not there"
+            "a canvas no batch targets was reported as a collision"
         );
 
         ops.push(gl_batch_touching(&[179]));
         assert!(
             !packet_safe_to_reorder(&ops),
-            "a spilled target list lost the canvas the GL half collides with"
+            "the collision on the eightieth canvas went unfound"
         );
     }
 
@@ -1609,11 +1627,17 @@ impl RenderThread {
     /// * `raf_tx` — frame timestamp sender (render → JS async op).
     ///   On Android this is eventfd-backed; on other platforms, tokio mpsc.
     /// * `vsync_rx` — optional crossbeam receiver for Choreographer VSync signals
+    /// * `frame_demand_rx` — optional wakeup for the engine-paced clock. `Some`
+    ///   exactly when `vsync_rx` is `None`: with no external vsync source the
+    ///   clock stops whenever nothing is animating, so a demand source publishing
+    ///   from another thread (`op_await_next_frame`) needs a way to reach an
+    ///   idle render thread. Carries no payload — demand is read from the latch.
     /// * `host_id` — host identifier for debug stats registry
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         raf_tx: RafSender,
         vsync_rx: Option<Receiver<f64>>,
+        frame_demand_rx: Option<Receiver<()>>,
         host_id: i32,
         initial_surface: Option<SurfaceLease>,
         graphics_platform: crate::egl_platform::GraphicsPlatform,
@@ -1650,8 +1674,9 @@ impl RenderThread {
         raf_demand: shared::raf_signal::RafDemandRef,
         // R1: one-shot vsync arm. `Some` on platforms with a demand-driven
         // display clock (Android Choreographer via a native->Java route);
-        // `None` on the software-ticker path and in tests. The render thread
-        // calls it to request exactly one more frame while demand remains;
+        // `None` where the engine paces frames itself and in tests — that path
+        // arms its own `SoftwareFrameClock` instead of asking anyone. The render
+        // thread calls it to request exactly one more frame while demand remains;
         // graphics stays decoupled from `platform` (it only invokes a closure).
         request_vsync: Option<Arc<dyn Fn() + Send + Sync>>,
         // Queue-independent native-lifetime control plane. It owns the
@@ -1770,17 +1795,20 @@ impl RenderThread {
                 };
 
                 // ---- Timing sources ----
-                // When Choreographer VSync is available, use it as primary timing.
-                // Otherwise fall back to a software ticker at the configured FPS.
+                // When an external vsync source is available (Choreographer, or a
+                // C host that drives frames), it is the primary timing and the
+                // engine-paced clock is never armed. Otherwise the engine paces
+                // frames itself, on demand: see `SoftwareFrameClock`.
                 let has_vsync = vsync_rx.is_some();
                 let vsync: Receiver<f64> = vsync_rx.unwrap_or_else(crossbeam_channel::never);
+                // Wakes the render thread when a demand source publishes while the
+                // engine-paced clock is stopped. `never()` on external-vsync
+                // platforms, whose arm route is `request_vsync`.
+                let frame_demand: Receiver<()> =
+                    frame_demand_rx.unwrap_or_else(crossbeam_channel::never);
 
                 let mut fps: u32 = 60;
-                let mut ticker: Receiver<Instant> = if has_vsync {
-                    crossbeam_channel::never()
-                } else {
-                    tick(Duration::from_secs_f32(1.0 / fps as f32))
-                };
+                let mut frame_clock = SoftwareFrameClock::new(fps);
                 let mut frame_scheduler = FrameScheduler::new(fps);
 
                 let start_time = Instant::now();
@@ -1864,7 +1892,7 @@ impl RenderThread {
                                            renderer_gl: &mut RendererGL,
                                            fps: &mut u32,
                                            frame_scheduler: &mut FrameScheduler,
-                                           ticker: &mut Receiver<Instant>,
+                                           frame_clock: &mut SoftwareFrameClock,
                                            dirty: &mut bool,
                                            paused: &mut bool,
                                            has_vsync: bool,
@@ -1885,11 +1913,8 @@ impl RenderThread {
                                 frame_scheduler.set_preferred_fps(new_fps);
                                 info!("RenderThread target fps changed to {} (scheduler)", new_fps);
                             } else if new_fps != *fps {
-                                // Software ticker mode: recreate ticker at new interval.
                                 *fps = new_fps;
-                                if !*paused {
-                                    *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
-                                }
+                                frame_clock.set_fps(new_fps);
                                 info!("RenderThread fps changed to {}", fps);
                             }
                         }
@@ -2106,9 +2131,10 @@ impl RenderThread {
                                 let live_canvases = cm.canvas_count();
                                 let surface_state_before = surface_system.state();
                                 surface_system.on_pause();
-                                if !has_vsync {
-                                    *ticker = crossbeam_channel::never();
-                                }
+                                // R1's engine-paced sibling: retire the pending
+                                // frame wakeup. Resume re-arms it through the
+                                // forced-dirty demand below.
+                                frame_clock.stop();
                                 // R-6: the game just went to background.
                                 // Release GPU memory aggressively so the
                                 // Android lowmemorykiller does not evict
@@ -2148,9 +2174,6 @@ impl RenderThread {
                                 let surface_state_before = surface_system.state();
                                 surface_system.on_resume();
                                 let surface_state_after = surface_system.state();
-                                if !has_vsync {
-                                    *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
-                                }
                                 // Request a frame so the first post-
                                 // resume paint isn't gated on the game
                                 // JS happening to dirty something.
@@ -2375,7 +2398,7 @@ impl RenderThread {
                                        renderer_gl: &mut RendererGL,
                                        fps: &mut u32,
                                        frame_scheduler: &mut FrameScheduler,
-                                       ticker: &mut Receiver<Instant>,
+                                       frame_clock: &mut SoftwareFrameClock,
                                        dirty: &mut bool,
                                        paused: &mut bool,
                                        surface_system: &mut SurfaceSystem,
@@ -2420,7 +2443,7 @@ impl RenderThread {
                         }
                         match cmd_rx.try_recv() {
                             Ok(cmd) => {
-                                match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, frame_scheduler, ticker, dirty, paused, has_vsync, surface_system, render_binding, render_server) {
+                                match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, frame_scheduler, frame_clock, dirty, paused, has_vsync, surface_system, render_binding, render_server) {
                                     LoopCtl::Continue => {}
                                     LoopCtl::Shutdown => return LoopCtl::Shutdown,
                                 }
@@ -2746,15 +2769,21 @@ impl RenderThread {
                 // Idle, paused, or surfaceless => no arm, so the frame clock stops
                 // and there is no idle JNI flood. `vsync_armed` suppresses a
                 // redundant request while one callback is already in flight; Java's
-                // own requested/callbackPosted latch is the authoritative dedup. A
-                // no-op on the software-ticker path (`has_vsync` false / no closure).
+                // own requested/callbackPosted latch is the authoritative dedup.
+                //
+                // Platforms with no external vsync source take the engine-paced
+                // route instead, which is the same policy over a different arm: the
+                // clock schedules one frame and stops again. See
+                // `should_arm_engine_paced` for the one condition the two routes do
+                // not share.
                 let arm_if_needed =
                     |warm: bool,
                      paused: bool,
                      dirty: bool,
                      recovery_pending: bool,
                      cm: &CanvasManager,
-                     surface_system: &SurfaceSystem| {
+                     surface_system: &SurfaceSystem,
+                     frame_clock: &mut SoftwareFrameClock| {
                         // `warm`: an actively-animating loop this frame. Keep the
                         // vsync clock armed continuously (rather than re-deriving
                         // demand from `is_waiting()`, which the free-run signal has
@@ -2768,18 +2797,22 @@ impl RenderThread {
                                 cm.has_outstanding_upload_work(),
                                 recovery_pending,
                             );
-                        if crate::frame_scheduler::should_arm_one_shot(
-                            has_vsync,
-                            request_vsync.is_some(),
-                            paused,
-                            surface_system.can_present(),
-                            demand,
-                            vsync_armed.get(),
-                        ) {
-                            if let Some(rv) = request_vsync.as_ref() {
-                                rv();
+                        if has_vsync {
+                            if crate::frame_scheduler::should_arm_one_shot(
+                                has_vsync,
+                                request_vsync.is_some(),
+                                paused,
+                                surface_system.can_present(),
+                                demand,
+                                vsync_armed.get(),
+                            ) {
+                                if let Some(rv) = request_vsync.as_ref() {
+                                    rv();
+                                }
+                                vsync_armed.set(true);
                             }
-                            vsync_armed.set(true);
+                        } else if crate::frame_scheduler::should_arm_engine_paced(paused, demand) {
+                            frame_clock.arm(Instant::now());
                         }
                     };
 
@@ -2790,6 +2823,33 @@ impl RenderThread {
                 // stops requesting, which stops the clock (idle power preserved).
                 const RAF_WARM_FRAMES: u8 = 3;
                 let mut warm_frames: u8 = 0;
+
+                // The loop's only wait point, built once: registering the four
+                // sources per iteration would allocate.
+                let mut wait = RenderWait::new(
+                    &surface_control_rx,
+                    &vsync,
+                    &frame_demand,
+                    &cmd_rx,
+                );
+
+                // Startup demand (`dirty` is set above so the first frame paints
+                // without waiting for the game to dirty anything) has to arm the
+                // engine-paced clock, or a loop that waits for a deadline nobody
+                // scheduled would never draw. Every later demand source reaches an
+                // arm through the branch that observed it. Not done on the external
+                // vsync path, where the host already kicks the first frame.
+                if !has_vsync {
+                    arm_if_needed(
+                        false,
+                        paused,
+                        dirty,
+                        needs_context_recovery,
+                        &cm,
+                        &surface_system,
+                        &mut frame_clock,
+                    );
+                }
 
                 loop {
                     // Shutdown has an out-of-band level because the bounded
@@ -2863,9 +2923,9 @@ impl RenderThread {
                         }
                     }
 
-                    select! {
-                        recv(surface_control_rx) -> msg => {
-                            if msg.is_ok() {
+                    match wait.next(frame_clock.deadline()) {
+                        Wake::SurfaceControl => {
+                            if surface_control_rx.try_recv().is_ok() {
                                 let Some(generation) = surface_control.latest_retired_generation() else {
                                     continue;
                                 };
@@ -2873,7 +2933,7 @@ impl RenderThread {
                                     generation,
                                     diagnostic: None,
                                 };
-                                match handle_one_cmd(command, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, has_vsync, &mut surface_system, &mut render_binding, &mut render_server) {
+                                match handle_one_cmd(command, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut frame_clock, &mut dirty, &mut paused, has_vsync, &mut surface_system, &mut render_binding, &mut render_server) {
                                     LoopCtl::Continue => {}
                                     LoopCtl::Shutdown => {
                                         shared::stats::unregister_stats(host_id);
@@ -2883,11 +2943,21 @@ impl RenderThread {
                             }
                         }
 
-                        recv(ticker) -> _ => {
-                            // Software ticker path (non-Android fallback).
+                        Wake::FrameDemand => {
+                            // A demand source published while the clock was
+                            // stopped. Nothing to read — the payload is the
+                            // wakeup itself, and demand is read from the latch.
+                            let _ = frame_demand.try_recv();
+                            arm_if_needed(warm_frames > 0, paused, dirty, needs_context_recovery, &cm, &surface_system, &mut frame_clock);
+                        }
+
+                        Wake::FrameDeadline => {
+                            // Engine-paced frame (no external vsync source).
                             // Frame timing: drain -> swap -> RAF signal.
+                            let frame_started = Instant::now();
+                            frame_clock.on_frame_ran(frame_started);
                             crate::render_diagnostics::set_render_queue_len(cmd_rx.len() as u32);
-                            let ts = start_time.elapsed().as_secs_f64() * 1000.0;
+                            let ts = frame_started.duration_since(start_time).as_secs_f64() * 1000.0;
                             render_server.set_raf_time_ms(ts);
 
                             // 1) Signal RAF first (free-run), unconditionally while
@@ -2904,7 +2974,7 @@ impl RenderThread {
                             }
 
                             // 2) Drain all pending commands from the previous frame.
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut frame_clock, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
@@ -2921,21 +2991,22 @@ impl RenderThread {
                             }
                             let should_present = surface_system.can_present();
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, should_present, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery, &render_binding, &mut surface_system);
-                            // No-op on the software-ticker path (has_vsync false);
-                            // kept for symmetry with the vsync branch.
-                            arm_if_needed(false, paused, dirty, needs_context_recovery, &cm, &surface_system);
+                            // Keep the clock running while animating; otherwise arm
+                            // only on residual demand (dirty / upload / recovery),
+                            // else it stops until a demand source wakes the thread.
+                            arm_if_needed(has_waiter || warm_frames > 0, paused, dirty, needs_context_recovery, &cm, &surface_system, &mut frame_clock);
                         }
 
-                        recv(vsync) -> _msg => {
+                        Wake::Vsync => {
+                            let Ok(frame_time_ms) = vsync.try_recv() else {
+                                continue;
+                            };
                             // Choreographer VSync path (Android).
                             // R1: the requested one-shot callback was delivered —
                             // clear the in-flight flag so demand that remains this
                             // frame can re-arm the next one.
                             vsync_armed.set(false);
                             crate::render_diagnostics::set_render_queue_len(cmd_rx.len() as u32);
-                            let Some(frame_time_ms) = _msg.ok() else {
-                                continue;
-                            };
 
                             let decision = next_vsync_frame_decision(
                                 &mut frame_scheduler,
@@ -2966,7 +3037,7 @@ impl RenderThread {
                                 // target-FPS deadline on a 90/120Hz panel, or
                                 // outstanding upload work) — re-arm so we keep
                                 // receiving physical vsyncs until the deadline.
-                                arm_if_needed(warm_frames > 0, paused, dirty, needs_context_recovery, &cm, &surface_system);
+                                arm_if_needed(warm_frames > 0, paused, dirty, needs_context_recovery, &cm, &surface_system, &mut frame_clock);
                                 continue;
                             }
 
@@ -2993,7 +3064,7 @@ impl RenderThread {
 
                             // 2) Drain all pending commands (in parallel with JS
                             // producing the next frame, which the signal above woke).
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut frame_clock, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
@@ -3010,13 +3081,13 @@ impl RenderThread {
                             // Keep the vsync clock at display rate while animating;
                             // otherwise re-arm only on residual demand (dirty /
                             // upload), else the clock stops.
-                            arm_if_needed(animating, paused, dirty, needs_context_recovery, &cm, &surface_system);
+                            arm_if_needed(animating, paused, dirty, needs_context_recovery, &cm, &surface_system, &mut frame_clock);
                         }
 
-                        recv(cmd_rx) -> msg => {
-                            match msg {
+                        Wake::Command => {
+                            match cmd_rx.try_recv() {
                                 Ok(cmd) => {
-                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, has_vsync, &mut surface_system, &mut render_binding, &mut render_server) {
+                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut frame_clock, &mut dirty, &mut paused, has_vsync, &mut surface_system, &mut render_binding, &mut render_server) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
@@ -3024,7 +3095,7 @@ impl RenderThread {
                                         }
                                     }
                                     // Drain remaining pending commands.
-                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
+                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut frame_clock, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
@@ -3058,9 +3129,12 @@ impl RenderThread {
                                     // (dirty onscreen content, or a LoadImage that
                                     // is now in-flight) — arm one frame to present
                                     // / poll the fence. Idle commands don't arm.
-                                    arm_if_needed(false, paused, dirty, needs_context_recovery, &cm, &surface_system);
+                                    arm_if_needed(false, paused, dirty, needs_context_recovery, &cm, &surface_system, &mut frame_clock);
                                 }
-                                Err(_) => {
+                                // `Select` readiness is advisory: an empty queue
+                                // here is a spurious wakeup, not a closed channel.
+                                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                                Err(crossbeam_channel::TryRecvError::Disconnected) => {
                                     info!("Command channel closed, exiting RenderThread");
                                     destroy_render_owner(&mut cm, &mut render_binding);
                                     shared::stats::unregister_stats(host_id);

@@ -182,8 +182,12 @@ def parse_android_methods(source: str) -> tuple[dict[str, tuple[int, int, str]],
     return parsed, problems
 
 
+# The first argument is the session's permission-gate handle, resolved once when its
+# device services are built. It used to be `self.host_id`, which made every gated call
+# look the session up in the gate's process-wide live-host map -- the cross-session lock
+# on a per-event path that Section 7.3 forbids.
 ANDROID_GATE_CALL = re.compile(
-    r"\bpermission_jni_call\s*\(\s*self\.host_id\s*,\s*"
+    r"\bpermission_jni_call\s*\(\s*&self\.session\s*,\s*"
     r"(?P<policy>None|Some\(Scope::(?P<scope>[A-Za-z]+)\))\s*,"
 )
 
@@ -515,7 +519,7 @@ if self_test:
 
     injected_method = """
     fn contract_new_sensitive_method(&self) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::WritePhotosAlbum), || Ok(()))
+        permission_jni_call(&self.session, Some(Scope::WritePhotosAlbum), || Ok(()))
     }
 """
     injected_android = inject_android_method(

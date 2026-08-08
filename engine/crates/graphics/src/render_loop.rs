@@ -21,10 +21,8 @@
 
 use std::time::Instant;
 
-use crossbeam_channel::Receiver;
-
 use crate::canvas2d_dispatcher::Renderer2d;
-use crate::frame_scheduler::FrameScheduler;
+use crate::frame_scheduler::{FrameScheduler, SoftwareFrameClock};
 use crate::render_server::RenderServer;
 use crate::surface_system::SurfaceSystem;
 use crate::{CanvasHandler, CanvasManager, RendererGL};
@@ -51,9 +49,9 @@ pub(crate) struct RenderLoopState {
     pub(crate) frame_scheduler: FrameScheduler,
     pub(crate) surface_system: SurfaceSystem,
 
-    /// Software-ticker fallback for hosts without Choreographer
-    /// VSync.  `crossbeam_channel::never()` when VSync is active.
-    pub(crate) ticker: Receiver<Instant>,
+    /// Engine-paced frame clock for hosts with no external vsync
+    /// source.  Never armed when one is present.
+    pub(crate) frame_clock: SoftwareFrameClock,
     pub(crate) fps: u32,
     pub(crate) dirty: bool,
     pub(crate) paused: bool,

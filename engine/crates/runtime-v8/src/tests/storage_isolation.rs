@@ -115,7 +115,6 @@ mod storage_isolation_tests {
     /// loaded game.
     fn op_state_with(game: Option<GamePaths>) -> OpState {
         let (render_tx, _render_rx) = CommandSender::new();
-        let (audio_raw_tx, _audio_rx) = tokio::sync::mpsc::unbounded_channel();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         let host = HostOpState {
@@ -128,7 +127,7 @@ mod storage_isolation_tests {
             mount_table: None,
             render_tx,
             text_measurer: None,
-            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
             host_tx,
             device_services: None,
             raf_rx: None,

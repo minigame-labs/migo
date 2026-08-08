@@ -12,6 +12,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import com.migo.runtime.internal.PermissionOperationGate.Admission;
 import org.junit.Test;
 
 public final class LocationProviderRetainedRequestTest {
@@ -144,7 +145,7 @@ public final class LocationProviderRetainedRequestTest {
     @Test
     public void callbackCleanupAndGateCloseDoNotInvertRetainedAndSessionLocks() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(77));
+        assertEquals(Admission.ADMITTED, gate.admit(77));
         assertEquals(null,
                 gate.update(77, "scope.userLocation", true, () -> true).failure());
         CountDownLatch listenerRemovalStarted = new CountDownLatch(1);
@@ -198,7 +199,7 @@ public final class LocationProviderRetainedRequestTest {
     @Test
     public void inFlightCleanupFailureMakesGateCloseRetryable() throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(78));
+        assertEquals(Admission.ADMITTED, gate.admit(78));
         assertEquals(null,
                 gate.update(78, "scope.userLocation", true, () -> true).failure());
         CountDownLatch listenerRemovalStarted = new CountDownLatch(1);
@@ -260,7 +261,7 @@ public final class LocationProviderRetainedRequestTest {
     @Test
     public void directGateCloseFailureRetainsCancellationForRetry() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(79));
+        assertEquals(Admission.ADMITTED, gate.admit(79));
         assertEquals(null,
                 gate.update(79, "scope.userLocation", true, () -> true).failure());
         Removal removal = new Removal();

@@ -24,7 +24,7 @@ use migo_capi_abi::{MIGO_ERROR_INVALID_STATE, MIGO_OK};
 use crate::{
     MigoEngine, MigoSession, migo_engine_create, migo_engine_destroy, migo_session_create,
     migo_session_destroy,
-    test_support::{engine_config, scratch_dirs, session_config},
+    test_support::{engine_config, scratch_dirs, session_config, with_engine},
 };
 
 /// A raw engine pointer that is safe to move into another thread.
@@ -269,4 +269,65 @@ fn every_session_of_one_engine_starts_from_the_roots_the_host_named() {
     assert_eq!(unsafe { migo_session_destroy(first) }, MIGO_OK);
     assert_eq!(unsafe { migo_session_destroy(second) }, MIGO_OK);
     assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+}
+
+/// Section 7.3's "no steady-state growth", for the cycle the process measurement
+/// cannot reach.
+///
+/// `scripts/measure-steady-state-growth.sh` watches resident memory over a long
+/// *render* workload, which never creates or destroys a Session; task 0.51 named
+/// session create/destroy as a cycle with no gate of its own. It is the shape the cycle
+/// gate exists for: a Session legitimately allocates for a living, so no burst can be
+/// written over it, and anything it retains is retained for the life of the process.
+///
+/// **The engine, the config and the scratch paths are built once, outside the
+/// measurement.** Everything hoisted out of the loop is something whose own lifecycle
+/// would otherwise be measured as this cycle's growth — and the engine in particular
+/// registers process-wide state on first use.
+///
+/// **What only this can see.** Two tests already watch the handle's own lifetime —
+/// `an_entered_call_pins_the_arc_allocation_across_reentrant_destroy` and its sibling in
+/// `callbacks` — and a `mem::forget` of the exported `Arc` fails all three. That makes
+/// them the same claim at two levels rather than two guards, so the pin is a leak the
+/// strong count cannot see: a Session owns at least one heap block that is *not* the
+/// handle's own, and `pending_surface_releases` is it. An extra clone of that inner
+/// `Arc` escaping the Session — the realistic shape, since the asynchronous
+/// surface-release path is exactly what wants a handle outliving a call — fails this
+/// test and **nothing else in the crate's 143**.
+///
+/// **What it cannot see.** A Session created here has no surface, so no Host and no V8
+/// isolate: what is measured is the C-ABI handle, its inner allocations, the engine's
+/// live-session accounting and the teardown. The isolate's heap across a create/destroy
+/// pair needs a surface and stays uncovered, as does anything a Session would register
+/// process-wide once it had one. And a block allocated *before* the window and leaked
+/// inside it is invisible to any delta, which is why the warm-up is generous rather than
+/// minimal: every bounded structure the first Session touches must have reached its bound
+/// before measurement starts, or a cache filling legitimately reads as growth.
+#[test]
+fn creating_and_destroying_a_session_gives_back_what_it_took() {
+    use migo_alloc_probe::{Cycle, assert_no_steady_state_growth};
+
+    with_engine("session-cycle-growth", |engine| {
+        let config = session_config();
+        assert_no_steady_state_growth(
+            Cycle {
+                path: "migo_session_create/migo_session_destroy",
+                warmup: 16,
+                measured: 64,
+            },
+            |_| {
+                let mut session: *mut MigoSession = ptr::null_mut();
+                assert_eq!(
+                    unsafe { migo_session_create(engine, &config, &mut session) },
+                    MIGO_OK,
+                    "a Session must be creatable, or the cycle measures nothing"
+                );
+                assert_eq!(
+                    unsafe { migo_session_destroy(session) },
+                    MIGO_OK,
+                    "a Session must be destroyable, or the cycle measures a leak it caused"
+                );
+            },
+        );
+    });
 }

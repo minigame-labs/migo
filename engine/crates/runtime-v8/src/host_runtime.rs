@@ -456,6 +456,17 @@ impl HostJsRuntime {
         (host.app_files_dir.clone(), host.app_cache_dir.clone())
     }
 
+    /// The runtime's own op state.
+    ///
+    /// Exists so a caller can put a question to the *production* resolver over
+    /// the state a real `evaluate_module` left behind, rather than over a
+    /// hand-built `OpState` that agrees with it by construction. That is the
+    /// difference between "the resolver separates two `GamePaths`" — already
+    /// covered — and "two live isolates hold two different ones".
+    pub(crate) fn op_state(&self) -> Rc<RefCell<deno_core::OpState>> {
+        self.rt.op_state()
+    }
+
     /// Close the IO scheduler's domain, rejecting all in-flight and future IO.
     /// Call before dropping the runtime during restart to prevent stale async
     /// tasks from executing against an orphaned domain.

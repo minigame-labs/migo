@@ -1425,8 +1425,85 @@ pub(super) fn image_lazy_extensions() -> Vec<deno_core::Extension> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrePin, data_url_cache_identity, resized_rgba_io_cache_key, variant_source_version_token,
+        PrePin, data_url_cache_identity, resized_rgba_io_cache_key, resolve_local_src,
+        variant_source_version_token,
     };
+
+    /// Section 6.5, on the one process-global structure two Sessions both reach
+    /// that holds their *content*: the decoded-image cache. What keeps one game's
+    /// pixels out of another's is the cache key, and for a directory-mounted
+    /// `/code` asset the key's path component is the **virtual** string
+    /// `/code/logo.png` — byte-identical for both games. Separation rests entirely
+    /// on the source-version token, which hashes the real path behind the mount.
+    /// Nothing asserted that until this test; the pack-backed half of the same
+    /// branch got its own identity under task 0.28, and this is the other half.
+    ///
+    /// **The two files are given identical bytes and identical mtimes on purpose.**
+    /// Left to the filesystem they would differ, and the test would then pass on
+    /// metadata while a token that had stopped hashing the real path walked
+    /// straight through it — the keys would still differ, for a reason that has
+    /// nothing to do with isolation. Two titles from one publisher shipping the
+    /// same logo, unpacked by the same reproducible extraction, is that fixture in
+    /// production.
+    ///
+    /// The second assertion is the control the first one needs: a token that
+    /// varied per call would satisfy "the keys differ" while destroying the cache
+    /// it exists to key.
+    #[test]
+    fn two_games_do_not_share_a_cache_entry_for_an_identical_asset() {
+        use shared::vfs::MountTable;
+        use std::fs::{self, File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let root = std::env::temp_dir().join(format!(
+            "migo-image-cache-isolation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        // Identical bytes at the identical virtual path, in two games' own code
+        // directories, with the same modification time.
+        let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let mut code_dirs = Vec::new();
+        for game in ["game-a", "game-b"] {
+            let code = root.join(game).join("code");
+            fs::create_dir_all(&code).expect("game code dir");
+            let asset = code.join("logo.png");
+            fs::write(&asset, b"identical bytes").expect("write asset");
+            File::options()
+                .write(true)
+                .open(&asset)
+                .expect("reopen asset")
+                .set_times(FileTimes::new().set_modified(stamp).set_accessed(stamp))
+                .expect("equalise mtime");
+            code_dirs.push(code);
+        }
+
+        // One mount table per game, rooted at that game's code directory, which is
+        // what `evaluate_module` builds.
+        let key_for = |code: &std::path::Path| {
+            let mount = MountTable::new(code.to_path_buf());
+            let resolved = resolve_local_src(None, Some(&mount), "/code/logo.png")
+                .expect("a mounted /code asset must resolve");
+            resized_rgba_io_cache_key(&resolved.path, None, None, resolved.source_version)
+        };
+
+        let a = key_for(&code_dirs[0]);
+        let b = key_for(&code_dirs[1]);
+        let a_again = key_for(&code_dirs[0]);
+
+        let _ = fs::remove_dir_all(&root);
+
+        assert_ne!(
+            a, b,
+            "two games' identically-named assets share one process-global cache              entry, so one game is served the other's decoded pixels"
+        );
+        assert_eq!(
+            a, a_again,
+            "the same game's asset keyed differently on a second load, so the              cache can never hit and the isolation above holds for the wrong reason"
+        );
+    }
 
     /// A Session torn down or restarted with a load in flight has that op's future
     /// dropped rather than resumed, so nothing on the load path runs again. The pin

@@ -52,6 +52,7 @@ impl RenderService {
     pub(crate) fn new(
         raf_tx: shared::raf_signal::RafSender,
         vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
+        frame_demand_rx: Option<crossbeam_channel::Receiver<()>>,
         host_id: i32,
         initial_surface: SurfaceLease,
         graphics_platform: graphics::egl_platform::GraphicsPlatform,
@@ -75,6 +76,7 @@ impl RenderService {
         let thread = RenderThread::spawn(
             raf_tx,
             vsync_rx,
+            frame_demand_rx,
             host_id,
             Some(initial_surface.clone()),
             graphics_platform,

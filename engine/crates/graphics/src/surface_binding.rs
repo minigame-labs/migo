@@ -835,8 +835,8 @@ mod tests {
             .find("// --- Deferred EGL context recovery ---")
             .expect("deferred recovery block must exist")..];
         let recovery = &loop_source[..loop_source
-            .find("select! {")
-            .expect("recovery gate must precede the render select")];
+            .find("match wait.next(")
+            .expect("recovery gate must precede the render thread's wait point")];
 
         assert!(recovery.contains("render_binding.is_live()"));
         assert!(recovery.contains("render_binding.pending_generation().is_none()"));

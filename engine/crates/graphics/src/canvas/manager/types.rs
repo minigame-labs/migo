@@ -9,6 +9,8 @@ use glow::{
 use shared::error::{EngineError, ErrorCode};
 use shared::protocol::render_cmd::{CanvasId, ProgramId, ShaderId, ShaderType};
 
+use super::gl_object::GlObject;
+
 #[inline]
 pub(crate) fn ee(code: ErrorCode, detail: impl Into<String>) -> EngineError {
     EngineError::from_detail(code, detail)
@@ -490,12 +492,31 @@ pub(crate) struct TextureMeta {
     pub deleted: bool,
 }
 
+/// WebGL framebuffer object. A container object, so its name is local to the
+/// context that created it and `owner` is what makes deletion correct — see
+/// [`super::gl_object`].
 #[derive(Debug)]
 pub(crate) struct FramebufferMeta {
     pub gl_handle: Option<NativeFramebuffer>,
-    #[allow(dead_code)]
-    pub owner_canvas: Option<CanvasId>,
+    pub owner: CanvasId,
     pub deleted: bool,
+}
+
+impl FramebufferMeta {
+    /// Take this object for deletion, once.
+    ///
+    /// The handle leaves as a [`GlObject`], which carries the owning canvas with
+    /// it, so a caller cannot obtain a bare name to delete from whatever context
+    /// happens to be current. That is the whole point: a framebuffer name means a
+    /// different object in every context of the share group.
+    pub(crate) fn take_for_delete(&mut self) -> Option<GlObject> {
+        let handle = self.gl_handle.take()?;
+        self.deleted = true;
+        Some(GlObject::Framebuffer {
+            handle,
+            owner: self.owner,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -508,13 +529,25 @@ pub(crate) struct RenderbufferMeta {
 
 /// WebGL 2 Vertex Array Object.  The owner canvas is tracked so that
 /// destroying a canvas also sweeps its VAOs — VAOs are not shared in
-/// the EGL share-group model WebGL uses.
+/// the EGL share-group model WebGL uses, which is also why deleting one
+/// requires its own context ([`super::gl_object`]).
 #[derive(Clone, Debug)]
 pub(crate) struct VaoMeta {
     pub gl_handle: Option<NativeVertexArray>,
-    #[allow(dead_code)]
-    pub owner_canvas: Option<CanvasId>,
+    pub owner: CanvasId,
     pub deleted: bool,
+}
+
+impl VaoMeta {
+    /// Take this object for deletion, once. See [`FramebufferMeta::take_for_delete`].
+    pub(crate) fn take_for_delete(&mut self) -> Option<GlObject> {
+        let handle = self.gl_handle.take()?;
+        self.deleted = true;
+        Some(GlObject::VertexArray {
+            handle,
+            owner: self.owner,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -525,9 +558,10 @@ pub(crate) struct SamplerMeta {
     pub deleted: bool,
 }
 
-/// Fence sync.  Unlike other GL objects, these are owned by a specific
-/// GL context (no sharing across contexts); we note the owner canvas so
-/// `ClientWaitSync` can rebind before polling.
+/// Fence sync.  Shared across the EGL share group like buffers and textures
+/// (ES 3.0 Appendix C.1), so any context of the group may wait on one or delete
+/// it; the owner canvas is noted only so `ClientWaitSync` polls on a context that
+/// is guaranteed to exist.
 #[derive(Clone, Debug)]
 pub(crate) struct SyncMeta {
     pub gl_handle: Option<NativeFence>,
@@ -535,13 +569,26 @@ pub(crate) struct SyncMeta {
     pub deleted: bool,
 }
 
-/// WebGL 2 query object.  Owned by a specific canvas context
-/// (queries are not shareable across GL contexts per the spec).
+/// WebGL 2 query object.  A container object: owned by one canvas context
+/// (queries are not shareable across GL contexts per the spec), so deletion needs
+/// that context — see [`super::gl_object`].
 #[derive(Clone, Debug)]
 pub(crate) struct QueryMeta {
     pub gl_handle: Option<glow::NativeQuery>,
-    pub owner_canvas: Option<CanvasId>,
+    pub owner: CanvasId,
     pub deleted: bool,
+}
+
+impl QueryMeta {
+    /// Take this object for deletion, once. See [`FramebufferMeta::take_for_delete`].
+    pub(crate) fn take_for_delete(&mut self) -> Option<GlObject> {
+        let handle = self.gl_handle.take()?;
+        self.deleted = true;
+        Some(GlObject::Query {
+            handle,
+            owner: self.owner,
+        })
+    }
 }
 
 /// WebGL 2 transform feedback object.  Same context-locality as
@@ -550,8 +597,20 @@ pub(crate) struct QueryMeta {
 #[derive(Clone, Debug)]
 pub(crate) struct TransformFeedbackMeta {
     pub gl_handle: Option<glow::NativeTransformFeedback>,
-    pub owner_canvas: Option<CanvasId>,
+    pub owner: CanvasId,
     pub deleted: bool,
+}
+
+impl TransformFeedbackMeta {
+    /// Take this object for deletion, once. See [`FramebufferMeta::take_for_delete`].
+    pub(crate) fn take_for_delete(&mut self) -> Option<GlObject> {
+        let handle = self.gl_handle.take()?;
+        self.deleted = true;
+        Some(GlObject::TransformFeedback {
+            handle,
+            owner: self.owner,
+        })
+    }
 }
 
 #[derive(Clone)]

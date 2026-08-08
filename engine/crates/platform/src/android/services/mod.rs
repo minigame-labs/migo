@@ -16,14 +16,20 @@ use migo_core::services::{
 };
 
 use crate::android::jni;
-use crate::android_permission_gate::PermissionGate;
+use crate::android_permission_gate::{PermissionGate, SessionGate};
 
+/// Run one gated Android device call under a session's own admission.
+///
+/// Takes the handle rather than the id because Section 7.3 forbids a per-event path
+/// acquiring a lock shared beyond its own session: resolving the id here would take the
+/// gate's process-wide live-host map on every call, including the Bluetooth
+/// characteristic writes Section 6.1 names as a steady hot path.
 fn permission_jni_call<T>(
-    host_id: i32,
+    session: &SessionGate,
     scope: Option<Scope>,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, ServiceError> {
-    match permission_gate().run(host_id, scope, operation) {
+    match session.run(scope, operation) {
         Ok(result) => result.map_err(ServiceError::from),
         Err(_) => {
             if let Some(scope) = scope {
@@ -41,6 +47,9 @@ fn permission_jni_call<T>(
 /// Android device services aggregator.
 pub struct AndroidDeviceServices {
     host_id: i32,
+    /// The permission gate handle, resolved once here so no gated device call has to
+    /// look this session up in a process-wide map. See [`permission_jni_call`].
+    session: SessionGate,
     /// Set when an embedding host services the keyboard itself; see
     /// `AndroidPlatform::with_host_keyboard`.
     host_keyboard: Option<Arc<dyn KeyboardService>>,
@@ -55,9 +64,9 @@ impl AndroidDeviceServices {
         host_id: i32,
         host_keyboard: Option<Arc<dyn KeyboardService>>,
     ) -> Self {
-        permission_gate().open_or_report(host_id);
         Self {
             host_id,
+            session: permission_gate().open_session(host_id),
             host_keyboard,
         }
     }
@@ -116,19 +125,19 @@ impl MediaServices for AndroidDeviceServices {
     #[cfg(feature = "api-media")]
     fn recorder(&self) -> Option<Arc<dyn RecorderService>> {
         Some(Arc::new(AndroidRecorder {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
     #[cfg(feature = "api-media")]
     fn camera(&self) -> Option<Arc<dyn CameraService>> {
         Some(Arc::new(AndroidCamera {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
     #[cfg(feature = "api-media")]
     fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
         Some(Arc::new(AndroidImageApi {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
     #[cfg(feature = "api-media")]
@@ -150,13 +159,13 @@ impl ConnectivityServices for AndroidDeviceServices {
     #[cfg(feature = "api-connectivity")]
     fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> {
         Some(Arc::new(AndroidBluetooth {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
     #[cfg(feature = "api-sensors")]
     fn location(&self) -> Option<Arc<dyn LocationService>> {
         Some(Arc::new(AndroidLocation {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
 }
@@ -166,13 +175,13 @@ impl CommerceServices for AndroidDeviceServices {
     #[cfg(feature = "api-connectivity")]
     fn game_log(&self) -> Option<Arc<dyn GameLogService>> {
         Some(Arc::new(AndroidGameLog {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
     #[cfg(feature = "api-connectivity")]
     fn auth(&self) -> Option<Arc<dyn AuthService>> {
         Some(Arc::new(AndroidAuth {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
     fn subpackage(&self) -> Option<Arc<dyn SubpackageService>> {
@@ -205,7 +214,7 @@ impl SystemUtilServices for AndroidDeviceServices {
     #[cfg(feature = "api-system")]
     fn permission(&self) -> Option<Arc<dyn PermissionService>> {
         Some(Arc::new(AndroidPermission {
-            host_id: self.host_id,
+            session: self.session.clone(),
         }))
     }
     #[cfg(feature = "api-sensors")]
@@ -467,85 +476,87 @@ impl AudioPlatformService for AndroidAudioPlatform {
 // ==================== Recorder ====================
 
 struct AndroidRecorder {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl RecorderService for AndroidRecorder {
     fn start(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Record), || {
-            jni::recorder_start(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Record), || {
+            jni::recorder_start(self.session.host_id(), options_json)
         })
     }
 
     fn pause(&self) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Record), || {
-            jni::recorder_pause(self.host_id)
+        permission_jni_call(&self.session, Some(Scope::Record), || {
+            jni::recorder_pause(self.session.host_id())
         })
     }
 
     fn resume(&self) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Record), || {
-            jni::recorder_resume(self.host_id)
+        permission_jni_call(&self.session, Some(Scope::Record), || {
+            jni::recorder_resume(self.session.host_id())
         })
     }
 
     fn stop(&self) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, None, || jni::recorder_stop(self.host_id))
+        permission_jni_call(&self.session, None, || {
+            jni::recorder_stop(self.session.host_id())
+        })
     }
 }
 
 // ==================== Camera ====================
 
 struct AndroidCamera {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl CameraService for AndroidCamera {
     fn create(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Camera), || {
-            jni::camera_create(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Camera), || {
+            jni::camera_create(self.session.host_id(), options_json)
         })
     }
 
     fn destroy(&self, camera_id: u32) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, None, || {
-            jni::camera_destroy(self.host_id, camera_id)
+        permission_jni_call(&self.session, None, || {
+            jni::camera_destroy(self.session.host_id(), camera_id)
         })
     }
 
     fn take_photo(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Camera), || {
-            jni::camera_take_photo(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Camera), || {
+            jni::camera_take_photo(self.session.host_id(), options_json)
         })
     }
 
     fn start_record(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Camera), || {
-            jni::camera_start_record(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Camera), || {
+            jni::camera_start_record(self.session.host_id(), options_json)
         })
     }
 
     fn stop_record(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, None, || {
-            jni::camera_stop_record(self.host_id, options_json)
+        permission_jni_call(&self.session, None, || {
+            jni::camera_stop_record(self.session.host_id(), options_json)
         })
     }
 
     fn set_zoom(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Camera), || {
-            jni::camera_set_zoom(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Camera), || {
+            jni::camera_set_zoom(self.session.host_id(), options_json)
         })
     }
 
     fn listen_frame_change(&self, camera_id: u32) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Camera), || {
-            jni::camera_listen_frame_change(self.host_id, camera_id)
+        permission_jni_call(&self.session, Some(Scope::Camera), || {
+            jni::camera_listen_frame_change(self.session.host_id(), camera_id)
         })
     }
 
     fn close_frame_change(&self, camera_id: u32) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, None, || {
-            jni::camera_close_frame_change(self.host_id, camera_id)
+        permission_jni_call(&self.session, None, || {
+            jni::camera_close_frame_change(self.session.host_id(), camera_id)
         })
     }
 }
@@ -625,117 +636,117 @@ impl SystemInfoService for AndroidSystemInfo {
 // ==================== Bluetooth ====================
 
 struct AndroidBluetooth {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl BluetoothService for AndroidBluetooth {
     fn open_adapter(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_open_adapter(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_open_adapter(self.session.host_id(), options_json)
         })
     }
 
     fn close_adapter(&self) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, None, || {
-            jni::bluetooth_close_adapter(self.host_id)
+        permission_jni_call(&self.session, None, || {
+            jni::bluetooth_close_adapter(self.session.host_id())
         })
     }
 
     fn get_adapter_state(&self) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_get_adapter_state(self.host_id)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_get_adapter_state(self.session.host_id())
         })
     }
 
     fn start_devices_discovery(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_start_devices_discovery(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_start_devices_discovery(self.session.host_id(), options_json)
         })
     }
 
     fn stop_devices_discovery(&self) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, None, || {
-            jni::bluetooth_stop_devices_discovery(self.host_id)
+        permission_jni_call(&self.session, None, || {
+            jni::bluetooth_stop_devices_discovery(self.session.host_id())
         })
     }
 
     fn get_devices(&self) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_get_devices(self.host_id)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_get_devices(self.session.host_id())
         })
     }
 
     fn get_connected_devices(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_get_connected_devices(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_get_connected_devices(self.session.host_id(), options_json)
         })
     }
 
     fn make_pair(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_make_pair(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_make_pair(self.session.host_id(), options_json)
         })
     }
 
     fn is_device_paired(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_is_device_paired(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_is_device_paired(self.session.host_id(), options_json)
         })
     }
 
     fn start_beacon_discovery(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_start_beacon_discovery(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_start_beacon_discovery(self.session.host_id(), options_json)
         })
     }
 
     fn stop_beacon_discovery(&self) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, None, || {
-            jni::bluetooth_stop_beacon_discovery(self.host_id)
+        permission_jni_call(&self.session, None, || {
+            jni::bluetooth_stop_beacon_discovery(self.session.host_id())
         })
     }
 
     fn get_beacons(&self) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::bluetooth_get_beacons(self.host_id)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::bluetooth_get_beacons(self.session.host_id())
         })
     }
 
     // ---- BLE GATT ----
 
     fn create_ble_connection(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_create_connection(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_create_connection(self.session.host_id(), options_json)
         })
     }
 
     fn close_ble_connection(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, None, || {
-            jni::ble_close_connection(self.host_id, options_json)
+        permission_jni_call(&self.session, None, || {
+            jni::ble_close_connection(self.session.host_id(), options_json)
         })
     }
 
     fn get_ble_device_services(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_get_device_services(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_get_device_services(self.session.host_id(), options_json)
         })
     }
 
     fn get_ble_device_characteristics(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_get_device_characteristics(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_get_device_characteristics(self.session.host_id(), options_json)
         })
     }
 
     fn read_ble_characteristic_value(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_read_characteristic_value(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_read_characteristic_value(self.session.host_id(), options_json)
         })
     }
 
     fn write_ble_characteristic_value(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_write_characteristic_value(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_write_characteristic_value(self.session.host_id(), options_json)
         })
     }
 
@@ -743,26 +754,26 @@ impl BluetoothService for AndroidBluetooth {
         &self,
         options_json: &str,
     ) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_notify_characteristic_value_change(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_notify_characteristic_value_change(self.session.host_id(), options_json)
         })
     }
 
     fn get_ble_device_rssi(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_get_device_rssi(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_get_device_rssi(self.session.host_id(), options_json)
         })
     }
 
     fn set_ble_mtu(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_set_mtu(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_set_mtu(self.session.host_id(), options_json)
         })
     }
 
     fn get_ble_mtu(&self, options_json: &str) -> Result<String, ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::Bluetooth), || {
-            jni::ble_get_mtu(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::Bluetooth), || {
+            jni::ble_get_mtu(self.session.host_id(), options_json)
         })
     }
 }
@@ -814,34 +825,46 @@ impl FileService for AndroidFile {
 // ==================== Image API ====================
 
 struct AndroidImageApi {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl ImageApiService for AndroidImageApi {
     fn save_image_to_photos_album(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::WritePhotosAlbum), || {
-            jni::image_save_to_photos_album(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::WritePhotosAlbum), || {
+            jni::image_save_to_photos_album(self.session.host_id(), options_json)
         })
     }
 
     fn preview_media(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::image_preview_media(self.host_id, options_json)?)
+        Ok(jni::image_preview_media(
+            self.session.host_id(),
+            options_json,
+        )?)
     }
 
     fn preview_image(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::image_preview_image(self.host_id, options_json)?)
+        Ok(jni::image_preview_image(
+            self.session.host_id(),
+            options_json,
+        )?)
     }
 
     fn compress_image(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::image_compress(self.host_id, options_json)?)
+        Ok(jni::image_compress(self.session.host_id(), options_json)?)
     }
 
     fn choose_message_file(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::image_choose_message_file(self.host_id, options_json)?)
+        Ok(jni::image_choose_message_file(
+            self.session.host_id(),
+            options_json,
+        )?)
     }
 
     fn choose_image(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::image_choose_image(self.host_id, options_json)?)
+        Ok(jni::image_choose_image(
+            self.session.host_id(),
+            options_json,
+        )?)
     }
 }
 
@@ -892,19 +915,19 @@ impl VideoService for AndroidVideo {
 // ==================== Location ====================
 
 struct AndroidLocation {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl LocationService for AndroidLocation {
     fn get_location(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::UserLocation), || {
-            jni::get_location(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::UserLocation), || {
+            jni::get_location(self.session.host_id(), options_json)
         })
     }
 
     fn get_fuzzy_location(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::UserLocation), || {
-            jni::get_fuzzy_location(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::UserLocation), || {
+            jni::get_fuzzy_location(self.session.host_id(), options_json)
         })
     }
 }
@@ -924,12 +947,12 @@ impl ScanCodeService for AndroidScanCode {
 // ==================== Game Log ====================
 
 struct AndroidGameLog {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl GameLogService for AndroidGameLog {
     fn report_log(&self, log_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::game_log_report(self.host_id, log_json)?)
+        Ok(jni::game_log_report(self.session.host_id(), log_json)?)
     }
 }
 
@@ -1036,12 +1059,12 @@ pub(crate) fn clear_permissions(host_id: i32) {
 }
 
 struct AndroidPermission {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl PermissionService for AndroidPermission {
     fn scope_state(&self, scope: Scope) -> ScopeState {
-        let decided = permission_gate().scope_state(self.host_id, scope);
+        let decided = self.session.scope_state(scope);
         match decided {
             Some(true) => ScopeState::Granted,
             Some(false) => ScopeState::Denied,
@@ -1052,33 +1075,42 @@ impl PermissionService for AndroidPermission {
     }
 
     fn request_scope(&self, request_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::permission_request(self.host_id, request_json)?)
+        Ok(jni::permission_request(
+            self.session.host_id(),
+            request_json,
+        )?)
     }
 }
 
 // ==================== Auth ====================
 
 struct AndroidAuth {
-    host_id: i32,
+    session: SessionGate,
 }
 
 impl AuthService for AndroidAuth {
     fn login(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::auth_login(self.host_id, options_json)?)
+        Ok(jni::auth_login(self.session.host_id(), options_json)?)
     }
 
     fn check_session(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::auth_check_session(self.host_id, options_json)?)
+        Ok(jni::auth_check_session(
+            self.session.host_id(),
+            options_json,
+        )?)
     }
 
     fn get_user_info(&self, options_json: &str) -> Result<(), ServiceError> {
-        permission_jni_call(self.host_id, Some(Scope::UserInfo), || {
-            jni::auth_get_user_info(self.host_id, options_json)
+        permission_jni_call(&self.session, Some(Scope::UserInfo), || {
+            jni::auth_get_user_info(self.session.host_id(), options_json)
         })
     }
 
     fn get_phone_number(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::auth_get_phone_number(self.host_id, options_json)?)
+        Ok(jni::auth_get_phone_number(
+            self.session.host_id(),
+            options_json,
+        )?)
     }
 }
 

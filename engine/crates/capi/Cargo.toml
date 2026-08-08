@@ -33,3 +33,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 migo-core = { path = "../core", default-features = false, features = ["test-support"] }
+# Test-only by construction: a `[dependencies]` entry here would carry a
+# `#[global_allocator]` into the cdylib this crate exists to produce.
+migo-alloc-probe = { path = "../../testing/alloc-probe", default-features = false }
