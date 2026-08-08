@@ -2800,14 +2800,102 @@ public final class NativeExports {
     }
 
     /**
-     * Resolve the handler for a session, reporting an error on the ad's own
+     * The ad commands the runtime can send, each with what content is owed when
+     * no advert can be shown.
+     *
+     * <p>{@link #settleWithoutAdvert} is abstract on purpose. Three of these
+     * commands used to resolve the handler with a bare map lookup and
+     * {@code return}, and content that had called {@code hide()} waited for an
+     * {@code onHide} that never came. An abstract method makes a seventh ad
+     * command unable to compile until somebody decides what it settles as, which
+     * a shared default would have quietly answered for them.
+     *
+     * <p>Nothing here may touch the enclosing class's state. {@code NativeExports}
+     * holds {@code android.os.Handler} statics, so initialising it needs a device;
+     * this enum stays reachable from a host-JVM unit test only while it depends on
+     * the sink interface alone.
+     */
+    enum AdOp {
+        CREATE("createAd") {
+            @Override
+            void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
+                sink.emitError(adId, -1, "createAd:fail " + reason);
+            }
+        },
+        LOAD("loadAd") {
+            @Override
+            void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
+                sink.emitError(adId, -1, "loadAd:fail " + reason);
+            }
+        },
+        SHOW("showAd") {
+            @Override
+            void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
+                // The close is not decoration: content following the wx idiom
+                // decides its payout and resumes gameplay in onClose. It carries
+                // isEnded = false, so reporting that no advert was shown mints
+                // nothing.
+                sink.emitShowFailed(adId, -1, "showAd:fail " + reason);
+            }
+        },
+        HIDE("hideAd") {
+            @Override
+            void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
+                // Nothing was ever displayed, so the ad is hidden. Reporting an
+                // error instead would contradict AdHandler#hideAd, whose default
+                // treats hiding an unsupported format as a no-op rather than a
+                // failure.
+                sink.emitHide(adId);
+            }
+        },
+        UPDATE_STYLE("updateAdStyle") {
+            @Override
+            void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
+                // A layout write owes content no event, with a host or without
+                // one: wx has no callback for it.
+            }
+        },
+        DESTROY("destroyAd") {
+            @Override
+            void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
+                // Release is terminal. Content is not waiting, and the contract
+                // is that nothing is emitted for this adId afterwards.
+            }
+        };
+
+        private final String api;
+
+        AdOp(String api) {
+            this.api = api;
+        }
+
+        /** The api name as it appears in an ad error message. */
+        String api() {
+            return api;
+        }
+
+        /**
+         * Report whatever content is waiting for when this command cannot reach
+         * an advert.
+         *
+         * @param reason why, for the error message; ignored by commands that owe
+         *               content no event
+         */
+        abstract void settleWithoutAdvert(AdEventSink sink, int adId, String reason);
+    }
+
+    /**
+     * Resolve the handler for a session, settling the request on the ad's own
      * channel when there is none.
      *
-     * <p>Reporting rather than staying silent matters: content that called
-     * show() is waiting for either a close or an error, and a silent drop
-     * leaves it waiting forever.
+     * <p>Settling rather than staying silent matters: content that called
+     * show() is waiting for either a close or an error, and a silent drop leaves
+     * it waiting forever. Registration is live session state a host may change,
+     * so this is answered per call rather than once per isolate -- a host that
+     * registers its handler a moment late must not lose every ad already
+     * constructed.
      */
-    private static AdHandler adHandlerOrReportError(int sessionId, int adId, String api) {
+    private static AdHandler adHandlerOrSettle(int sessionId, int adId, AdOp op) {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) {
             clearAdHandler(sessionId);
@@ -2816,10 +2904,21 @@ public final class NativeExports {
         }
         AdHandler handler = sAdHandlers.get(sessionId);
         if (handler == null) {
-            adSink(sessionId).emitError(adId, -1, api + ":fail no ad handler");
+            op.settleWithoutAdvert(adSink(sessionId), adId, "no ad handler");
             return null;
         }
         return handler;
+    }
+
+    /**
+     * Report a handler that threw, then settle what content was waiting for.
+     *
+     * <p>A host exception is a host bug, but content cannot be left holding a
+     * pending request because of it.
+     */
+    private static void adHandlerThrew(int sessionId, int adId, AdOp op, Exception e) {
+        android.util.Log.w("NativeExports", op.api() + ": handler threw: " + e);
+        op.settleWithoutAdvert(adSink(sessionId), adId, "handler threw: " + e);
     }
 
     private static JSONObject parseAdRequest(String requestJson) {
@@ -2843,7 +2942,7 @@ public final class NativeExports {
         int adId = parseAdId(request);
         if (adId == 0) return;
 
-        AdHandler handler = adHandlerOrReportError(sessionId, adId, "createAd");
+        AdHandler handler = adHandlerOrSettle(sessionId, adId, AdOp.CREATE);
         if (handler == null) return;
 
         String adType = request.optString("adType", "");
@@ -2854,7 +2953,7 @@ public final class NativeExports {
         try {
             handler.createAd(adId, adType, adUnitId, optionsJson, adSink(sessionId));
         } catch (Exception e) {
-            adSink(sessionId).emitError(adId, -1, "createAd:fail " + e);
+            adHandlerThrew(sessionId, adId, AdOp.CREATE, e);
         }
     }
 
@@ -2864,13 +2963,13 @@ public final class NativeExports {
         int adId = parseAdId(request);
         if (adId == 0) return;
 
-        AdHandler handler = adHandlerOrReportError(sessionId, adId, "loadAd");
+        AdHandler handler = adHandlerOrSettle(sessionId, adId, AdOp.LOAD);
         if (handler == null) return;
 
         try {
             handler.loadAd(adId, adSink(sessionId));
         } catch (Exception e) {
-            adSink(sessionId).emitError(adId, -1, "loadAd:fail " + e);
+            adHandlerThrew(sessionId, adId, AdOp.LOAD, e);
         }
     }
 
@@ -2880,13 +2979,13 @@ public final class NativeExports {
         int adId = parseAdId(request);
         if (adId == 0) return;
 
-        AdHandler handler = adHandlerOrReportError(sessionId, adId, "showAd");
+        AdHandler handler = adHandlerOrSettle(sessionId, adId, AdOp.SHOW);
         if (handler == null) return;
 
         try {
             handler.showAd(adId, adSink(sessionId));
         } catch (Exception e) {
-            adSink(sessionId).emitError(adId, -1, "showAd:fail " + e);
+            adHandlerThrew(sessionId, adId, AdOp.SHOW, e);
         }
     }
 
@@ -2896,13 +2995,13 @@ public final class NativeExports {
         int adId = parseAdId(request);
         if (adId == 0) return;
 
-        AdHandler handler = sAdHandlers.get(sessionId);
+        AdHandler handler = adHandlerOrSettle(sessionId, adId, AdOp.HIDE);
         if (handler == null) return;
 
         try {
             handler.hideAd(adId, adSink(sessionId));
         } catch (Exception e) {
-            android.util.Log.w("NativeExports", "adHide: handler threw: " + e);
+            adHandlerThrew(sessionId, adId, AdOp.HIDE, e);
         }
     }
 
@@ -2912,7 +3011,7 @@ public final class NativeExports {
         int adId = parseAdId(request);
         if (adId == 0) return;
 
-        AdHandler handler = sAdHandlers.get(sessionId);
+        AdHandler handler = adHandlerOrSettle(sessionId, adId, AdOp.UPDATE_STYLE);
         if (handler == null) return;
 
         JSONObject style = request.optJSONObject("style");
@@ -2921,7 +3020,7 @@ public final class NativeExports {
         try {
             handler.updateAdStyle(adId, styleJson, adSink(sessionId));
         } catch (Exception e) {
-            android.util.Log.w("NativeExports", "adUpdateStyle: handler threw: " + e);
+            adHandlerThrew(sessionId, adId, AdOp.UPDATE_STYLE, e);
         }
     }
 
@@ -2931,13 +3030,13 @@ public final class NativeExports {
         int adId = parseAdId(request);
         if (adId == 0) return;
 
-        AdHandler handler = sAdHandlers.get(sessionId);
+        AdHandler handler = adHandlerOrSettle(sessionId, adId, AdOp.DESTROY);
         if (handler == null) return;
 
         try {
             handler.destroyAd(adId);
         } catch (Exception e) {
-            android.util.Log.w("NativeExports", "adDestroy: handler threw: " + e);
+            adHandlerThrew(sessionId, adId, AdOp.DESTROY, e);
         }
     }
 
