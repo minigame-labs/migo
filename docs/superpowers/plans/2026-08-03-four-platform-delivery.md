@@ -393,9 +393,13 @@ review. A commit alone is not completion evidence.
   Verified by `scripts/verify-change.sh --base HEAD`: every host target plus the
   arm64-v8a Android compile, migo-platform 52 tests from a 51 baseline.
 
-- [x] 0.67 Take the BLE notification path off the heap and off the shared registry,
+- [ ] 0.67 Take the BLE notification path off the heap and off the shared registry,
   on both sides of the JNI boundary. The last path Section 6.1's second bullet names,
   and the one both task 0.26 and task 0.27 recorded as remaining.
+  **Implementation, tests, mutation evidence and fresh verification are all done and
+  recorded below; neither independent review has run, so the item stays open** — this
+  document's own status convention requires both, and a completion mark this ledger
+  cannot support is the one thing worse than an open item.
 
   **It was recorded as ungated. It was also unmet, nine times per notification, and
   the two are different states.** Task 0.26 had already counted the Rust half —

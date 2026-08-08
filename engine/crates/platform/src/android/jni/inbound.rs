@@ -1482,6 +1482,13 @@ pub(crate) extern "system" fn onBLECharacteristicValueChange<'local>(
         let mut inline = [0i8; BLE_INLINE_VALUE_BYTES];
         let mut spill: Vec<i8> = Vec::new();
         let Ok(bytes) = read_characteristic_value(&env, &value, &mut inline, &mut spill) else {
+            // Cleared, not propagated. The only way to get here is a JVM
+            // exception, and letting one stay pending as this returns would
+            // deliver it to whichever framework thread runs the GATT callback --
+            // an app-visible crash raised from inside the Bluetooth stack, for a
+            // notification that could simply be dropped. The bounds come from the
+            // array itself, so nothing is expected to raise here at all.
+            let _ = env.exception_clear();
             tracing::debug!("Host {host_id} dropped a BLE notification: value unreadable");
             return;
         };
