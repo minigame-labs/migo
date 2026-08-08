@@ -1682,6 +1682,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "futures",
+ "migo-alloc-probe",
  "migo-audio",
  "migo-contention-probe",
  "migo-graphics",

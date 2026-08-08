@@ -1,0 +1,21 @@
+--- crates/shared/src/payload_pool.rs
++++ replace <impl fmt::Debug for Recycled<T>>::fmt -> fmt::Result with Ok(Default::default())
+@@ -281,17 +281,17 @@
+         self.slot
+             .as_mut()
+             .expect("a live recycled payload owns its slot")
+     }
+ }
+ 
+ impl<T: Recyclable + fmt::Debug> fmt::Debug for Recycled<T> {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        self.deref().fmt(formatter)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl<T: Recyclable> Drop for Recycled<T> {
+     fn drop(&mut self) {
+         let mut slot = self
+             .slot
+             .take()

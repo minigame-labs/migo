@@ -203,6 +203,44 @@ assert_status "$status" 0 "a documentation change plans cleanly"
 assert_absent "$output" "TARGET" "a documentation change requires no target"
 
 # ------------------------------------------------------------
+# The Android SDK's Java half is a target.
+#
+# It was not, and the omission had the exact shape this file exists to catch: a
+# change to `platforms/android/**` -- the shipped AAR's own sources -- produced
+# an empty plan, so the run printed its success line having compiled no Java at
+# all. The plan assertion is what pins the lane; the second one pins that the
+# lane is *reported unproven* rather than skipped where Gradle cannot run, which
+# is the same rule every other target already gets.
+# ------------------------------------------------------------
+repo="$(new_fixture android_java)"
+mkdir -p "$repo/platforms/android/library/src/main/java/com/migo/runtime"
+printf 'class Probe {}\n' \
+    > "$repo/platforms/android/library/src/main/java/com/migo/runtime/Probe.java"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_status "$status" 0 "an Android Java change plans cleanly"
+assert_contains "$output" "TARGET android-java compile" \
+    "a change to the shipped AAR's sources asks for the Java build"
+
+status=0
+output="$(run_verify "$repo")" || status=$?
+assert_status "$status" 1 "the Java lane with no local Gradle fails the run"
+assert_contains "$output" "NOT PROVEN" "a machine without Gradle reports no evidence, not a break"
+assert_contains "$output" "android-java compile" "the Java lane is named in the verdict"
+assert_no_line_starting "$output" "FAIL" \
+    "the Java lane's absence is the only thing that failed this run"
+
+# The other half of the rule: a Gradle build script is an input too, so editing
+# one asks for the lane even though it is not a source file.
+repo="$(new_fixture android_gradle)"
+mkdir -p "$repo/platforms/android/library"
+printf 'android {}\n' > "$repo/platforms/android/library/build.gradle"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_contains "$output" "TARGET android-java compile" \
+    "a Gradle build script is an input to the Java lane"
+
+# ------------------------------------------------------------
 # A target with no local build is NOT PROVEN, and that fails.
 # ------------------------------------------------------------
 repo="$(new_fixture ohos)"

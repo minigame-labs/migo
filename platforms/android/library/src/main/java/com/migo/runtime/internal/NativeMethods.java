@@ -709,10 +709,17 @@ public final class NativeMethods {
         }
     }
 
+    /**
+     * The value of a characteristic that reported none, shared rather than
+     * built: this is a notification path, and Section 6.1 requires it not to
+     * allocate.
+     */
+    private static final byte[] NO_BLE_VALUE = new byte[0];
+
     public static void onBLECharacteristicValueChange(int sessionId, String deviceId,
                                                         String serviceId, String characteristicId, byte[] value) {
         if (sessionId >= 0 && deviceId != null && serviceId != null && characteristicId != null) {
-            NativeBridge.onBLECharacteristicValueChange(sessionId, deviceId, serviceId, characteristicId, value != null ? value : new byte[0]);
+            NativeBridge.onBLECharacteristicValueChange(sessionId, deviceId, serviceId, characteristicId, value != null ? value : NO_BLE_VALUE);
         }
     }
 

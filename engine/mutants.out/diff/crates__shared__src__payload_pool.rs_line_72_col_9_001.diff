@@ -1,0 +1,29 @@
+--- crates/shared/src/payload_pool.rs
++++ replace PayloadPool<T>::try_insert -> Result<Pooled<T>, T> with Ok(Pooled::from_iter([Default::default()]))
+@@ -64,25 +64,17 @@
+     }
+ 
+     /// Move `value` into a free slot without blocking.
+     ///
+     /// Exhaustion returns the unchanged value to the caller. It never grows
+     /// the pool and never allocates a replacement slot.
+     #[inline]
+     pub fn try_insert(&self, value: T) -> Result<Pooled<T>, T> {
+-        let mut slot = match self.inner.free_rx.try_recv() {
+-            Ok(slot) => slot,
+-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Err(value),
+-        };
+-        slot.value.write(value);
+-        Ok(Pooled {
+-            slot: Some(slot),
+-            pool: Arc::clone(&self.inner),
+-        })
++        Ok(Pooled::from_iter([Default::default()])) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// One initialized payload slot.
+ ///
+ /// Dropping it destroys the current value and returns the allocation to its
+ /// originating pool, including when a containing channel command is rejected
+ /// or discarded during shutdown.

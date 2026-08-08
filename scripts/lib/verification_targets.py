@@ -70,6 +70,23 @@ COMPILE = "compile"
 LINK = "link"
 _TIER_ORDER = {COMPILE: 0, LINK: 1}
 
+# The Android SDK's Java half, which is a shipped artifact and not a Rust target.
+#
+# Named as a platform of its own rather than a tier on `android`, because tiers
+# replace each other -- the highest wins -- and a change touching both halves needs
+# both builds, not the later one. Calling it a platform stretches the word; the
+# field really means "lane that must be run", and the alternative was a second
+# dimension for one case.
+ANDROID_JAVA = "android-java"
+
+# Everything under the Android platform directory asks for it, deliberately
+# without trying to be clever about which files matter. Gradle's inputs are the
+# sources, the manifests, the resources, the product-flavour configuration and the
+# build scripts themselves, and a rule that enumerated them would be a list to
+# forget an entry from. Over-running this lane costs a Gradle run against a warm
+# cache; under-running it is the silent gap this module exists to close.
+_ANDROID_PLATFORM_PATH = re.compile(r"^platforms/android/")
+
 _CFG_OPENER = re.compile(r"\bcfg(?:_attr)?!?\s*\(")
 _TARGET_OS = re.compile(r'target_os\s*=\s*"([A-Za-z0-9_]+)"')
 _TARGET_ENV = re.compile(r'target_env\s*=\s*"([A-Za-z0-9_]+)"')
@@ -291,6 +308,9 @@ def select(root: pathlib.Path, changed) -> Plan:
     resolved: dict[str, tuple[dict[str, frozenset[str]], set[str]]] = {}
 
     for path in changed:
+        if _ANDROID_PLATFORM_PATH.match(path):
+            reasons[(ANDROID_JAVA, COMPILE)].add(f"{path} [gradle]")
+
         match = _CRATE_PATH.match(path)
         if match is None:
             continue

@@ -1,0 +1,21 @@
+--- crates/shared/src/payload_pool.rs
++++ replace == with != in RecyclePool<T>::grow
+@@ -224,17 +224,17 @@
+     /// concurrent grower that loses the exchange retries against the new value
+     /// and stops at the cap rather than racing past it.
+     #[cold]
+     fn grow(&self) -> Option<Box<T>> {
+         use std::sync::atomic::Ordering;
+ 
+         let mut population = self.inner.population.load(Ordering::Relaxed);
+         loop {
+-            if population == self.inner.capacity {
++            if population != /* ~ changed by cargo-mutants ~ */ self.inner.capacity {
+                 return None;
+             }
+             match self.inner.population.compare_exchange_weak(
+                 population,
+                 population + 1,
+                 Ordering::Relaxed,
+                 Ordering::Relaxed,
+             ) {

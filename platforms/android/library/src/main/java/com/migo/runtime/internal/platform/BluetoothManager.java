@@ -110,9 +110,101 @@ public class BluetoothManager {
         }
     }
 
+    /**
+     * The admission supplier and the delivery runnable for one GATT attempt,
+     * reused across notifications instead of captured afresh on each one.
+     *
+     * <p>Section 6.1 requires that no per-event path allocate, and names this
+     * one: a characteristic notification arrives at whatever rate the peripheral
+     * chooses. Written closure-style the dispatch built two capturing lambdas
+     * every time — one for the admission gate and one for the delivery — and
+     * neither is a lambda that can be non-capturing, because both need the
+     * event's own values. Carrying those values in fields of one long-lived
+     * object is what removes the allocation; implementing both interfaces on it
+     * is what makes it one object rather than two.
+     *
+     * <p><b>Every use holds this object's own monitor</b> ({@code fill} through
+     * the end of the dispatch it feeds), because the fields are scratch space
+     * shared by whichever thread the platform delivers on. Two notifications
+     * interleaving here would deliver one characteristic's value under another's
+     * identifier, which is worse than the allocation being removed. The lock
+     * order is this monitor, then the permission session's, then the attempt's,
+     * and it is the only order in which those three are ever taken: nothing
+     * reaches a dispatch carrier while holding either of the others.
+     */
+    private static final class CharacteristicDispatch implements BooleanSupplier, Runnable {
+        private final BluetoothManager manager;
+        private final GattAttempt attempt;
+        private String deviceId;
+        private GattConnection connection;
+        private String serviceId;
+        private String characteristicId;
+        private byte[] value;
+
+        CharacteristicDispatch(BluetoothManager manager, GattAttempt attempt) {
+            this.manager = manager;
+            this.attempt = attempt;
+        }
+
+        /** Load one event. The caller holds this object's monitor. */
+        void fill(
+                String deviceId,
+                GattConnection connection,
+                String serviceId,
+                String characteristicId,
+                byte[] value) {
+            this.deviceId = deviceId;
+            this.connection = connection;
+            this.serviceId = serviceId;
+            this.characteristicId = characteristicId;
+            this.value = value;
+        }
+
+        /**
+         * Release the event's references once it has been delivered.
+         *
+         * <p>Not hygiene: the carrier outlives the connection, so a retained
+         * {@link GattConnection} would keep a closed {@code BluetoothGatt}
+         * reachable until the next notification, and there may not be one.
+         */
+        void clear() {
+            deviceId = null;
+            connection = null;
+            serviceId = null;
+            characteristicId = null;
+            value = null;
+        }
+
+        synchronized boolean isEmpty() {
+            return deviceId == null && connection == null && serviceId == null
+                    && characteristicId == null && value == null;
+        }
+
+        @Override public boolean getAsBoolean() {
+            return manager.gattConnections.get(deviceId) == attempt
+                    && attempt.dispatchIfActive(
+                            connection,
+                            manager.gattConnectPermissionGranted,
+                            manager.gattSessionTerminated,
+                            this);
+        }
+
+        @Override public void run() {
+            manager.gattEventReporter.characteristic(
+                    deviceId, serviceId, characteristicId, value);
+        }
+    }
+
     static final class GattAttempt {
         private GattConnection connection;
         private boolean acceptingCallbacks = true;
+        /**
+         * Created with the attempt, on the cold connect path, so no notification
+         * ever pays for it. Shared by the read and notification paths, which its
+         * own monitor serialises against each other as well as against
+         * themselves.
+         */
+        private CharacteristicDispatch dispatch;
 
         synchronized boolean attach(GattConnection candidate) {
             if (!acceptingCallbacks) return false;
@@ -148,6 +240,29 @@ public class BluetoothManager {
             BluetoothGatt raw = connection != null ? connection.raw() : null;
             return raw != null && raw == candidate.raw();
         }
+
+        /**
+         * The carrier for this attempt, created on first use.
+         *
+         * <p>Created here rather than in the constructor because most attempts
+         * never carry a characteristic, and there is no notification cheap
+         * enough to be worth the object for a connection that only ever reports
+         * its state.
+         *
+         * <p><b>This returns before the caller takes the carrier's monitor</b>,
+         * so the attempt's monitor is never held while acquiring the carrier's.
+         * That is what keeps the one order the dispatch path uses -- carrier,
+         * then permission session, then attempt -- from being inverted here.
+         */
+        private synchronized CharacteristicDispatch dispatch(BluetoothManager manager) {
+            if (dispatch == null) dispatch = new CharacteristicDispatch(manager, this);
+            return dispatch;
+        }
+
+        /** Whether the carrier is holding an event's references. */
+        synchronized boolean carrierIsEmptyForTests() {
+            return dispatch == null || dispatch.isEmpty();
+        }
     }
 
     private boolean adapterOpened = false;
@@ -172,6 +287,74 @@ public class BluetoothManager {
      * {@code remove} when {@code closeGatt} throws.
      */
     private final Set<GattConnection> unclosedCandidates = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Orders every connection-state decision against its own delivery.
+     *
+     * <p><b>The bug this exists for.</b> Deciding "does this attempt still speak
+     * for the device?" and delivering the answer were two steps. A retired
+     * attempt could read "no owner", be descheduled, and deliver its
+     * {@code false} after a replacement had already published and reported
+     * {@code true} -- leaving content permanently told the device is
+     * disconnected while it is connected, until some later event happens to
+     * correct it. The decision was right when it was made; nothing kept it right
+     * until it arrived.
+     *
+     * <p><b>Why one monitor per session rather than one per device.</b> Ordering
+     * is only required between reports for the same device, so a per-device
+     * monitor is the narrowest correct answer -- and it needs a lifetime longer
+     * than the attempts it orders, because the whole point is ordering an
+     * outgoing attempt against its replacement. That means a map of monitors
+     * outliving the entries they guard, with its own eviction rule and its own
+     * bound, since content chooses the device ids. A single monitor is strictly
+     * stronger, has no lifecycle, and costs two devices' connect events the time
+     * of one queue push -- on a path that fires when a peripheral connects or
+     * drops, not per notification.
+     *
+     * <p><b>What is deliberately outside it.</b> {@code close()},
+     * {@code disconnect()} and {@code discoverServices()} are framework calls
+     * that can block, and the map mutations they accompany. Only the ownership
+     * re-check and the report itself are inside, which is sufficient: a
+     * publisher's map write happens before its own report in program order, and
+     * the monitor orders the reports, so a reader that acquires the monitor
+     * after that write sees it. Holding it across the report is safe for a
+     * reason worth stating rather than assuming -- the report is a post, not a
+     * wait: it enqueues on a bounded channel and returns, never re-enters Java
+     * and never waits on a Migo lock, which is exactly the property the
+     * permission gate's counted lease exists to preserve elsewhere.
+     */
+    private final Object connectionStateOrder = new Object();
+
+    /**
+     * The value of a characteristic that reported none.
+     *
+     * <p>Shared because a zero-length array is immutable in every way that
+     * matters and {@code new byte[0]} on a notification path is an allocation
+     * for nothing.
+     */
+    private static final byte[] NO_VALUE = new byte[0];
+
+    /**
+     * How many distinct UUID strings one session will cache.
+     *
+     * <p>A device's GATT database is small -- tens of attributes -- so a real
+     * peripheral never approaches this. The bound is for one that misbehaves:
+     * the cache is fed by identifiers the remote end chooses, and an unbounded
+     * map fed by a remote party is a memory pressure the peripheral controls.
+     * Past the bound the text is still produced, just not kept.
+     */
+    private static final int UUID_TEXT_CACHE_LIMIT = 256;
+
+    /**
+     * Canonical text for the UUIDs this session has seen.
+     *
+     * <p>{@code UUID.toString} formats 36 characters every call, and a
+     * notification needs two of them -- the service's and the characteristic's
+     * -- for identifiers that are the same on every notification of one stream.
+     * Section 6.1 forbids the allocation; a lookup keyed by the UUID object the
+     * platform already holds removes it without changing what is delivered.
+     */
+    private final ConcurrentHashMap<UUID, String> uuidText = new ConcurrentHashMap<>();
 
     /** Cached negotiated MTU per device. Updated by onMtuChanged callback. */
     private final ConcurrentHashMap<String, Integer> negotiatedMtu = new ConcurrentHashMap<>();
@@ -796,13 +979,35 @@ public class BluetoothManager {
                 }
 
                 BluetoothGattCallback callback = new BluetoothGattCallback() {
+                    /**
+                     * The wrapper for this connection, kept rather than rebuilt.
+                     *
+                     * <p>The platform hands the same {@code BluetoothGatt} to
+                     * every callback of one connection, so wrapping it per
+                     * callback allocated an object per notification to express
+                     * a value that never changes. Volatile with an identity
+                     * check rather than a lock: the check is what makes it
+                     * correct if the platform ever hands over a different
+                     * handle, and a lost race costs one wrapper.
+                     */
+                    private volatile AndroidGattConnection wrapper;
+
+                    private GattConnection connectionFor(BluetoothGatt gatt) {
+                        AndroidGattConnection current = wrapper;
+                        if (current == null || current.raw() != gatt) {
+                            current = new AndroidGattConnection(gatt);
+                            wrapper = current;
+                        }
+                        return current;
+                    }
+
                     @Override
                     public void onConnectionStateChange(
                             BluetoothGatt gatt, int status, int newState) {
                         boolean connected = newState == BluetoothProfile.STATE_CONNECTED
                                 && hasConnectPermission();
                         handleGattConnectionStateChange(
-                                deviceId, attempt, new AndroidGattConnection(gatt), connected);
+                                deviceId, attempt, connectionFor(gatt), connected);
                     }
 
                     @Override
@@ -817,15 +1022,13 @@ public class BluetoothManager {
                             int status) {
                         if (status != BluetoothGatt.GATT_SUCCESS) return;
                         byte[] value = characteristic.getValue();
-                        if (value == null) value = new byte[0];
-                        String serviceId = characteristic.getService().getUuid().toString();
-                        String charId = characteristic.getUuid().toString();
+                        if (value == null) value = NO_VALUE;
                         handleGattCharacteristicRead(
                                 deviceId,
                                 attempt,
-                                new AndroidGattConnection(gatt),
-                                serviceId,
-                                charId,
+                                connectionFor(gatt),
+                                uuidText(characteristic.getService().getUuid()),
+                                uuidText(characteristic.getUuid()),
                                 value);
                     }
 
@@ -834,15 +1037,13 @@ public class BluetoothManager {
                             BluetoothGatt gatt,
                             BluetoothGattCharacteristic characteristic) {
                         byte[] value = characteristic.getValue();
-                        if (value == null) value = new byte[0];
-                        String serviceId = characteristic.getService().getUuid().toString();
-                        String charId = characteristic.getUuid().toString();
+                        if (value == null) value = NO_VALUE;
                         handleGattCharacteristicChanged(
                                 deviceId,
                                 attempt,
-                                new AndroidGattConnection(gatt),
-                                serviceId,
-                                charId,
+                                connectionFor(gatt),
+                                uuidText(characteristic.getService().getUuid()),
+                                uuidText(characteristic.getUuid()),
                                 value);
                     }
 
@@ -962,9 +1163,35 @@ public class BluetoothManager {
      * device's observable state, so a superseded attempt must never overwrite it.
      */
     private void reportRetiredAttemptDisconnected(String deviceId, GattAttempt attempt) {
-        GattAttempt current = gattConnections.get(deviceId);
-        if (current != null && current != attempt) return;
-        connectionStateReporter.report(deviceId, false);
+        reportConnectionState(deviceId, attempt, false);
+    }
+
+    /**
+     * Deliver one connection-state report, if the attempt making it still speaks
+     * for the device at the moment of delivery.
+     *
+     * <p>The re-check and the delivery are one step under
+     * {@link #connectionStateOrder}, which is the whole of the fix: the same
+     * check outside a monitor is a decision that can go stale between being made
+     * and being acted on.
+     *
+     * <p><b>The two directions are not symmetric, and the asymmetry is the
+     * semantics.</b> A <em>disconnect</em> from an attempt the map no longer
+     * holds is precisely the report that must arrive -- retirement is what
+     * removed the entry. A <em>connect</em> from an attempt the map no longer
+     * holds must not: no owner means nothing is entitled to claim the device is
+     * connected. Reporting `connected` unconditionally is how a superseded
+     * attempt's late service-discovery result used to overwrite a completed
+     * teardown.
+     */
+    private void reportConnectionState(String deviceId, GattAttempt attempt, boolean connected) {
+        synchronized (connectionStateOrder) {
+            GattAttempt current = gattConnections.get(deviceId);
+            if (connected ? current != attempt : current != null && current != attempt) {
+                return;
+            }
+            connectionStateReporter.report(deviceId, connected);
+        }
     }
 
     private void discoverGattServicesAndReport(
@@ -986,7 +1213,42 @@ public class BluetoothManager {
                         "BLE service discovery cleanup", cleanupFailure);
             }
         }
-        connectionStateReporter.report(deviceId, discovered);
+        reportConnectionState(deviceId, attempt, discovered);
+    }
+
+    /**
+     * The canonical text of {@code uuid}, formatted once per session.
+     *
+     * <p>Explicit lookup-then-insert rather than {@code computeIfAbsent}: the
+     * hit path is the one a notification takes, and it must reach the heap
+     * neither for a mapping function nor for anything else. A lost race stores
+     * an equal string twice, which costs nothing but the loser.
+     */
+    String uuidText(UUID uuid) {
+        String text = uuidText.get(uuid);
+        if (text != null) return text;
+        text = uuid.toString();
+        if (uuidText.size() < UUID_TEXT_CACHE_LIMIT) {
+            uuidText.put(uuid, text);
+        }
+        return text;
+    }
+
+    int uuidTextCacheSizeForTests() {
+        return uuidText.size();
+    }
+
+    /**
+     * The report-ordering monitor, so a test can hold it and choose the
+     * interleaving instead of hoping for one.
+     *
+     * <p>Exposed for the same reason the Rust contention probe is handed a
+     * registry's lock: the property under test is that a decision and its
+     * delivery are one step, and the only way to demonstrate that is to stop a
+     * thread between them -- which requires holding what it will block on.
+     */
+    Object connectionStateOrderForTests() {
+        return connectionStateOrder;
     }
 
     boolean hasGattConnection(String deviceId, GattConnection connection) {
@@ -1001,12 +1263,8 @@ public class BluetoothManager {
             String serviceId,
             String characteristicId,
             byte[] value) {
-        return dispatchGattCallback(
-                deviceId,
-                attempt,
-                connection,
-                () -> gattEventReporter.characteristic(
-                        deviceId, serviceId, characteristicId, value));
+        return dispatchCharacteristic(
+                deviceId, attempt, connection, serviceId, characteristicId, value);
     }
 
     boolean handleGattCharacteristicChanged(
@@ -1016,12 +1274,36 @@ public class BluetoothManager {
             String serviceId,
             String characteristicId,
             byte[] value) {
-        return dispatchGattCallback(
-                deviceId,
-                attempt,
-                connection,
-                () -> gattEventReporter.characteristic(
-                        deviceId, serviceId, characteristicId, value));
+        return dispatchCharacteristic(
+                deviceId, attempt, connection, serviceId, characteristicId, value);
+    }
+
+    /**
+     * Admit and deliver one characteristic value without allocating.
+     *
+     * <p>The same admission and liveness sequence {@link #dispatchGattCallback}
+     * performs, reached through the attempt's reusable carrier rather than
+     * through two lambdas built for this event. A read takes it too: it is the
+     * same delivery, and giving the cold path its own closure-shaped copy would
+     * leave two spellings of one sequence to drift apart.
+     */
+    private boolean dispatchCharacteristic(
+            String deviceId,
+            GattAttempt attempt,
+            GattConnection connection,
+            String serviceId,
+            String characteristicId,
+            byte[] value) {
+        if (attempt == null) return false;
+        CharacteristicDispatch dispatch = attempt.dispatch(this);
+        synchronized (dispatch) {
+            dispatch.fill(deviceId, connection, serviceId, characteristicId, value);
+            try {
+                return gattCallbackAdmission.run(dispatch);
+            } finally {
+                dispatch.clear();
+            }
+        }
     }
 
     boolean handleGattMtuChanged(

@@ -43,7 +43,7 @@
 use std::borrow::Cow;
 
 use crate::{
-    payload_pool::Pooled,
+    payload_pool::{Pooled, Recycled},
     surface::{
         PixelRatio, PublicSurfaceGeneration, SurfaceGeneration, SurfaceLease, SurfaceLossReason,
     },
@@ -109,21 +109,126 @@ pub struct GamepadState {
     pub timestamp_ms: f64,
 }
 
-/// BLE characteristic value change payload, boxed inside
+/// Retained capacity limit for one identifier field, in bytes.
+///
+/// A canonical GATT UUID is 36 characters and a Bluetooth device address is 17,
+/// so nothing a conforming stack produces comes close. The limit exists for what
+/// a non-conforming one could: an identifier is a string the platform hands us,
+/// and one absurd value must not leave its buffer resident in a pooled slot for
+/// the life of the process.
+pub const BLE_IDENTIFIER_RETAINED_LIMIT: usize = 128;
+
+/// Retained capacity limit for a characteristic value, in bytes.
+///
+/// Twice the 512-byte maximum attribute value length the ATT specification
+/// permits, so legal traffic — which cannot exceed the negotiated MTU anyway —
+/// never gives the buffer back and never re-grows it. Chosen as a multiple of
+/// the protocol's own bound rather than of an observed payload size, because a
+/// limit set just above what one peripheral sends is a reallocation on every
+/// notification for the next one.
+pub const BLE_VALUE_RETAINED_LIMIT: usize = 1024;
+
+/// BLE characteristic value change payload, carried in a pooled slot inside
 /// `HostCommand::OnBLECharacteristicValueChange`.
 ///
-/// Contains three String UUIDs plus a variable-length byte buffer,
-/// boxed to keep the `HostCommand` enum small on the channel.
-#[derive(Debug)]
+/// Three identifier strings plus a variable-length value, kept out of the enum
+/// itself so `HostCommand` stays small on the channel.
+///
+/// **The fields are private and the only way to fill one is [`Self::overwrite`],
+/// which is the invariant rather than encapsulation for its own sake.** A
+/// notification stream runs at whatever rate the peripheral chooses — a hundred
+/// hertz is ordinary — and Section 7.3 forbids a per-event allocation on it. A
+/// public `String` field invites `device_id: id.to_owned()`, which reads as
+/// obviously correct and allocates on every notification of every stream. There
+/// is no way to write that here.
+#[derive(Debug, Default)]
 pub struct BleCharacteristicData {
-    /// BLE device identifier.
-    pub device_id: String,
-    /// GATT service UUID.
-    pub service_id: String,
-    /// GATT characteristic UUID.
-    pub characteristic_id: String,
-    /// Characteristic value bytes.
-    pub value: Vec<u8>,
+    device_id: String,
+    service_id: String,
+    characteristic_id: String,
+    value: Vec<u8>,
+}
+
+impl BleCharacteristicData {
+    /// Replace the contents in place, reusing the buffers this slot already owns.
+    ///
+    /// `clear` keeps the capacity, so a slot that has carried one notification
+    /// carries every later one of the same shape without touching the heap.
+    pub fn overwrite(
+        &mut self,
+        device_id: &str,
+        service_id: &str,
+        characteristic_id: &str,
+        value: &[u8],
+    ) {
+        self.device_id.clear();
+        self.device_id.push_str(device_id);
+        self.service_id.clear();
+        self.service_id.push_str(service_id);
+        self.characteristic_id.clear();
+        self.characteristic_id.push_str(characteristic_id);
+        self.value.clear();
+        self.value.extend_from_slice(value);
+    }
+
+    #[must_use]
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    #[must_use]
+    pub fn service_id(&self) -> &str {
+        &self.service_id
+    }
+
+    #[must_use]
+    pub fn characteristic_id(&self) -> &str {
+        &self.characteristic_id
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Heap bytes this payload is holding on behalf of its pool.
+    ///
+    /// Capacity rather than length: a recycled slot is empty, so what it costs
+    /// the Session is the buffers it kept for the next notification.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.device_id.capacity()
+            + self.service_id.capacity()
+            + self.characteristic_id.capacity()
+            + self.value.capacity()
+    }
+}
+
+impl crate::payload_pool::Recyclable for BleCharacteristicData {
+    /// Empty the payload, keeping every buffer within its retained limit.
+    ///
+    /// Releasing an over-limit buffer outright rather than shrinking it is the
+    /// point: `shrink_to` reallocates, and this runs on the Host thread as the
+    /// consumer finishes with the notification. A release is a free, so the one
+    /// path that reacts to a malformed event costs nothing that a gate counts.
+    fn recycle(&mut self) {
+        retain_string_within(&mut self.device_id, BLE_IDENTIFIER_RETAINED_LIMIT);
+        retain_string_within(&mut self.service_id, BLE_IDENTIFIER_RETAINED_LIMIT);
+        retain_string_within(&mut self.characteristic_id, BLE_IDENTIFIER_RETAINED_LIMIT);
+        if self.value.capacity() > BLE_VALUE_RETAINED_LIMIT {
+            self.value = Vec::new();
+        } else {
+            self.value.clear();
+        }
+    }
+}
+
+fn retain_string_within(buffer: &mut String, limit: usize) {
+    if buffer.capacity() > limit {
+        *buffer = String::new();
+    } else {
+        buffer.clear();
+    }
 }
 
 /// Commands sent to the host runtime thread.
@@ -657,9 +762,11 @@ pub enum HostCommand {
 
     /// BLE characteristic value changed (notification/indication received).
     ///
-    /// Boxed to keep the `HostCommand` enum small (~56-64 bytes instead of ~216).
+    /// Carried in a pooled slot, which keeps the `HostCommand` enum small and
+    /// keeps the payload's buffers off the heap between notifications: the slot
+    /// returns to its Session's pool when the Host thread drops this command.
     /// Triggers `migo.onBLECharacteristicValueChange` callbacks.
-    OnBLECharacteristicValueChange(Box<BleCharacteristicData>),
+    OnBLECharacteristicValueChange(Recycled<BleCharacteristicData>),
 
     /// BLE MTU changed after negotiation.
     ///

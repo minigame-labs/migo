@@ -1,0 +1,23 @@
+--- crates/shared/src/payload_pool.rs
++++ replace <impl Clone for RecyclePool<T>>::clone -> Self with Default::default()
+@@ -172,19 +172,17 @@
+ /// first burst the high-water mark is already resident. Growth is bounded by
+ /// `capacity`, so the pool can hold no more than the queue it feeds.
+ pub struct RecyclePool<T: Recyclable> {
+     inner: Arc<RecycleInner<T>>,
+ }
+ 
+ impl<T: Recyclable> Clone for RecyclePool<T> {
+     fn clone(&self) -> Self {
+-        Self {
+-            inner: Arc::clone(&self.inner),
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl<T: Recyclable> RecyclePool<T> {
+     /// # Panics
+     /// Panics when `capacity` is zero; a pool that can never hand out a slot
+     /// cannot make progress and is therefore a construction error.
+     #[must_use]

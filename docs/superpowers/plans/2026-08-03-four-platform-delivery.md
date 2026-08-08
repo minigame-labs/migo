@@ -31,6 +31,68 @@ Completion requires all of: implementation, behavioural tests, fresh
 verification output, independent spec review, and independent code-quality
 review. A commit alone is not completion evidence.
 
+## Tooling And Verification
+
+- [x] T.1 Make the Android SDK's Java half a target the verifier knows about.
+  `scripts/verify-change.sh` contained no reference to gradle, java or
+  `platforms/` at all: asked what
+  `platforms/android/.../BluetoothManager.java` requires, the selector returned an
+  **empty plan**. A change to the shipped AAR's own sources therefore ran eleven
+  Rust suites, cross-compiled Rust for Android, and printed "verified for every
+  target this change touches" without compiling a line of Java — the same defect
+  the script's own header says it exists to prevent, one layer out. Task 0.24's
+  Java-only fix was verified by hand for exactly this reason.
+
+  `android-java` is a lane in `verification_targets.py` rather than a tier on
+  `android`, because tiers replace each other and a change touching both halves
+  needs both builds. Any path under `platforms/android/` asks for it, deliberately
+  without enumerating which files matter — Gradle's inputs include manifests,
+  resources and the build scripts, and a list is a thing to forget an entry from.
+  Both product variants run, because the Java sources are variant-independent while
+  `BuildConfig` capability gating is not. The lane is **probed**: a machine without
+  `gradlew` reports NOT PROVEN like every other absent target, rather than FAIL,
+  which would say "your change broke this" about missing evidence.
+  `test-local-verification-contract.sh` grew four assertions (59 checks from 54),
+  including that a Gradle build script is an input.
+
+- [x] T.2 Adopt `cargo-mutants`, and fix what it found immediately.
+  This ledger's mutation evidence has been produced by hand-written apply/restore
+  scripts. `cargo-mutants 27.1.0` runs through `dev-test-host.sh` (which passes any
+  cargo subcommand through, so the host toolchain is inherited) and reports
+  survivors, which is the artifact these entries are actually made of.
+
+  **Its first run found a real hole in work committed one hour earlier.** Scoped to
+  `crates/shared/src/payload_pool.rs`: **13 of 25 mutants survived**, including
+  `try_acquire -> None`, `Drop for Recycled -> ()`, and the capacity check's `==`
+  flipped to `!=`. The cause was not the mutants being exotic — it was that every
+  test for the new `RecyclePool` lived in `migo-core`, one crate away from the
+  mechanism, while the older `PayloadPool` beside it has its own. Five tests later
+  (buffer identity across a return, high-water-mark growth, refusal at capacity,
+  zero-capacity construction, and a steady-state allocation burst over the pool
+  itself) it reports **2 survivors, both `Debug::fmt`** — nothing asserts on debug
+  output, so those are noise. migo-shared 419 tests from 414.
+
+  **One assertion in those tests was wrong and the code was right**, which is worth
+  recording: it required a kept buffer's capacity to equal five after
+  `extend_from_slice(b"hello")`, and `Vec` reserves eight. Buffer *identity* is the
+  property; a capacity is only evidence about `Vec`'s growth strategy.
+
+  Usage and scoping rules are in
+  `docs/superpowers/plans/2026-08-08-four-platform-delivery-handoff.md`.
+
+- [ ] T.3 Make the host suites selective. `verify-change.sh` runs every host cargo
+  suite on every invocation — its header says so — so a Java-only change pays
+  eleven Rust suites. The selector already maps changed files to crates; what is
+  missing is the reverse-dependency closure, and it must be exact: under-running is
+  a silent gap, which is worse than slow.
+
+- [ ] T.4 Add `pitest` for the Java half, for the reason T.2 gives for the Rust half.
+
+- [ ] T.5 Split this file. At ~5,500 lines it burns context on every read and is a
+  merge-conflict magnet — the single biggest obstacle to more than one agent
+  working at once. Split per phase, keep item identifiers stable: other documents
+  and commit messages cite them.
+
 ## Phase 0 — Correctness Foundation
 
 - [ ] 0.1 Close the BLE permission-path locking debt. **Implementation landed,
@@ -393,6 +455,149 @@ review. A commit alone is not completion evidence.
   Verified by `scripts/verify-change.sh --base HEAD`: every host target plus the
   arm64-v8a Android compile, migo-platform 52 tests from a 51 baseline.
 
+- [ ] 0.67 Take the BLE notification path off the heap and off the shared registry,
+  on both sides of the JNI boundary. The last path Section 6.1's second bullet names,
+  and the one both task 0.26 and task 0.27 recorded as remaining.
+  **Implementation, tests, mutation evidence and fresh verification are all done and
+  recorded below; neither independent review has run, so the item stays open** — this
+  document's own status convention requires both, and a completion mark this ledger
+  cannot support is the one thing worse than an open item.
+
+  **It was recorded as ungated. It was also unmet, nine times per notification, and
+  the two are different states.** Task 0.26 had already counted the Rust half —
+  three `String`s, a `Vec<u8>` and a `Box` per notification — and left it as
+  "uncovered". The count was five and the path also took a process-wide lock:
+  `send_command_to_host` reads `HOST_SENDERS` to find the Session's sender, so every
+  notification of every Session met every other one there. That is the same defect
+  task 0.27 found on the input path, on a stream whose rate a peripheral chooses
+  rather than a finger. The Java half added four more — a connection wrapper, two
+  capturing lambdas and two `UUID.toString()` calls, one of which
+  Section 6.1 names verbatim.
+
+  **The recorded obstacle was "no host test binary compiles it", and that was true of
+  the wrong half.** `onBLECharacteristicValueChange` is `cfg(target_os = "android")`,
+  so the enclosing JNI function is indeed unreachable from a host test — but nothing
+  that decides whether the path allocates or takes a shared lock has to live inside
+  it. Reading three strings and a byte array out of the JVM is platform glue; filling
+  a slot and enqueuing it is not. Splitting there produced
+  `HostIngress::try_send_ble_characteristic_value`, which is portable, is what the
+  gates call, and is the whole of the path that was defective. This is the eighth
+  recorded obstacle on this branch to name something other than the real one, and the
+  question that dissolved it is the same one as last time: *which layer can see this
+  property?* — not *how do I reach this code?*
+
+  **The fix's shape was already predicted here, and the prediction was wrong in a way
+  worth keeping.** This ledger recorded the three identifiers as "interning
+  candidates". Interning was rejected on measurement grounds: a hash of a 36-byte
+  UUID costs about what copying it costs, and it buys a bounded cache, an eviction
+  policy and a shared structure that two notification threads would contend on. A
+  pooled slot that keeps its own buffers gets the same zero allocations from
+  `clear` + `push_str`, with no cache, no policy and no sharing. What made this
+  visible is that the pool had to exist anyway for the value bytes; once it did,
+  interning was solving a problem the slot already solved.
+
+  **`RecyclePool` is a second pool rather than a change to the first, and the
+  difference is the point.** `PayloadPool` pools the slot and drops the value in it,
+  which is right for a touch batch — a fixed array owns nothing — and wrong for a
+  payload whose fields are buffers, because the value's `Drop` frees exactly what the
+  next event would have reused. `RecyclePool` keeps the value alive and resets it in
+  place, and it grows on demand instead of preallocating: touch input starts on the
+  first frame of every Session, so preallocation charges a Session for what it is
+  certainly about to use, while BLE charges every Session for a peripheral most
+  content does not have. An unused pool is now one empty channel. Capacity is still
+  the queue's, so the pool never becomes the tighter bound — a peripheral streaming a
+  firmware image must not lose packets while every other command still flows.
+
+  **`BleCharacteristicData`'s fields are now private, and that is a gate rather than
+  taste.** `device_id: id.to_owned()` reads as obviously correct and is the exact
+  defect being removed. The only way to fill one is `overwrite`, and the mutation
+  that reintroduces the owned identifier had to be written *inside* that method
+  because there is nowhere else it can be written.
+
+  **Three JNI calls per notification also went, which nothing had noticed.**
+  `JNIEnv::get_string` does a `FindClass("java/lang/String")` plus an assignability
+  test before every read, so three identifiers cost nine JNI calls and two local
+  references each notification to re-derive what the `native` declaration already
+  guarantees. `get_string_unchecked` is `unsafe` for a condition the JVM has already
+  checked at the call site. The value now lands in a 512-byte stack buffer through
+  `get_byte_array_region` — 512 because that is the ATT maximum attribute value
+  length, so no conforming notification spills, and a larger one is delivered from a
+  heap buffer rather than truncated: a silently shortened value is a payload the
+  content would misread.
+
+  **Mutation evidence, Rust.** Seven mutants, each killing the named gate and leaving
+  the rest of migo-core green; all three files restored byte-identically (sha256).
+
+  | Mutant | Kills | Measured |
+  | --- | --- | --- |
+  | An owned identifier per notification — the shape the code had | the allocation gate, and the buffer-identity test | 64 events / 64 iterations, 1088 bytes |
+  | An owned value per notification | the same two | 64 events, 1280 bytes |
+  | `recycle` keeps nothing | the allocation gate alone | 256 events, 6976 bytes |
+  | `recycle` parks an absurd buffer forever | the retention test alone | — |
+  | A loan that never returns to its pool | the pool-growth test and the allocation gate | — |
+  | The `HOST_SENDERS` lookup restored | the host-registry contention gate alone | blocked for the full 2s |
+  | A `shared::stats` lookup on the path | the stats contention gate alone | blocked for the full 2s |
+
+  **The behavioural tests survive every allocation and contention mutant**, which is
+  the argument for the gates existing: delivery is correct under all seven, so
+  nothing else in the suite can see the defect.
+
+  **Mutation evidence, Java, and it found a hole in the instrument.** Six mutants.
+  The pre-fix dispatch — two capturing lambdas — costs **64 bytes per notification**,
+  and re-formatting one UUID costs **80**.
+
+  | Mutant | Kills |
+  | --- | --- |
+  | Two capturing lambdas per notification — the shape the code had | the dispatch gate alone, at 4096 bytes over 64 |
+  | `uuidText` formats every time | the identifier gate alone, at 5120 bytes over 64 |
+  | The UUID cache is unbounded | the bound test alone |
+  | The carrier keeps the delivered event | both carrier-emptiness tests |
+  | The probe skips its own self-check | **nothing, before the control below existed** |
+  | The probe stops warming itself | the identifier gate, reproducing the false failure below |
+
+  **The self-check mutant killing nothing is the recurring failure of this repository
+  and it appeared again here.** `AllocationProbe` refuses to trust a zero until it has
+  watched the counter observe a known allocation — the property that stops a JVM with
+  counting disabled from turning every gate into a permanent silent pass — and no test
+  covered the refusal. `AllocationProbeControlTest` manufactures a silent instrument by
+  switching the counter off, requires the burst to refuse rather than pass, and requires
+  the refusal to name the instrument rather than the path. Bursts are serialised inside
+  the probe so that process-wide switch cannot redden another gate, for the same reason
+  the contention probe serialises.
+
+  **A real instrument defect, found by measurement rather than review.** The first run
+  of the identifier gate reported **11048 bytes over 64 iterations on a path that
+  allocates nothing**. The path was innocent: these tests compile against `android.jar`,
+  which has no `java.lang.management`, so the counter is reached reflectively, and
+  `Method::invoke` *spins a generated accessor class* after about fifteen calls. That
+  class landed inside the measured window. The body's warm-up cannot cover it, because
+  the instrument is not the body — the probe now warms itself, and the mutant that stops
+  it reproduces 11048 exactly. Attribution was done by measuring three bodies against
+  each other rather than by reading code: an empty body, a bare map lookup and the real
+  one all reported the same 24 bytes, which is the instrument's own cost, while
+  `UUID.toString` reported 5144.
+
+  **Not covered, named rather than implied.** The `BluetoothGattCallback` body itself —
+  where the connection wrapper is memoised — takes a `BluetoothGatt` and a
+  `BluetoothGattCharacteristic`, framework classes a plain JVM test cannot obtain, so
+  that one removed allocation has no gate on either side. Nothing here has run against a
+  peripheral: no device evidence exists for this path at all, which is a gap task 2.2
+  owns and this item does not close.
+
+  **Verified.** migo-core 62 tests from 54, migo-shared 414 unchanged, the Android Java
+  suite 115 with no failures or errors across both product variants, both variants'
+  `compile{Full,Slim}DebugJavaWithJavac`, and `scripts/verify-change.sh --base master`
+  reporting every host target plus **`PASS android compile`** — required here, because
+  the change touches `cfg(target_os = "android")` code that no host run compiles.
+
+  **One thing this change did not make worse, recorded because the next reader will
+  wonder.** The six V8 snapshots are stale, and were already stale on `master` before
+  this branch: the freshness gate reports the same two host profiles with `master`'s own
+  `Cargo.lock` in place. This branch adds one line to that lock — a dev-dependency edge
+  — which moves the fingerprint again but changes nothing about what has to happen,
+  which is one regeneration round for the whole batch. Per this document's own rule,
+  that round belongs last.
+
 - [ ] 0.26 Build the allocation-count gate Section 7.3 requires, then apply it.
   **Mechanism built and applied to three paths; the two paths Section 6.1 names
   remain uncovered, so this item stays open.**
@@ -497,27 +702,25 @@ review. A commit alone is not completion evidence.
   `CRATE_GROUPS` list, and the verify-change fixture grows a faithful `testing/` stub
   rather than folding the new crate into `crates/`.
 
-  **Remaining for this item.** The BLE notification path Section 6.1 names is not
-  covered on either side. Its Rust half is `cfg(target_os = "android")`, so a host
-  test binary never compiles it — closing that needs either an on-target test binary
-  or the allocating core lifted into portable code. Its Java half needs a JVM
-  mechanism (`ThreadMXBean.getThreadAllocatedBytes`), because a Rust allocator
-  observes nothing the JVM allocates; `platforms/android` has no such usage today.
+  ~~**Remaining for this item.** The BLE notification path Section 6.1 names is not
+  covered on either side.~~ **Both sides are now covered, by task 0.67.** What that
+  item found, and this one had recorded otherwise:
 
-  **And it is not merely ungated: it is unmet, five times per notification.** Read on
-  2026-08-08 while auditing this item. `onBLECharacteristicValueChange` in
-  `platform/src/android/jni/inbound.rs` allocates three `String`s (device, service and
-  characteristic UUIDs, via `env.get_string(..).into()`), one `Vec<u8>` for the value
-  (`convert_byte_array`), and one `Box<BleCharacteristicData>` — on every notification,
-  for a stream a peripheral can drive at a hundred hertz or more. The three UUIDs are
-  *the same three strings* on every notification from one characteristic, which is what
-  makes them interning candidates rather than an unavoidable JNI copy; the value and the
-  box are what the input path already solves with a payload pool. So the shape of the
-  fix is known and it is the pool this requirement already built once. What is not
-  known is whether the JNI string extraction can avoid an allocation at all, which is a
-  question about the `jni` crate's API and needs a target to answer honestly. Recorded
-  with its count rather than left as "uncovered", because "no gate exists" and "the
-  requirement is violated" are different states and this item had them conflated.
+  - The count was **five and a lock**, not five. `send_command_to_host` reads the
+    process-wide `HOST_SENDERS` on every notification, which the allocation gate
+    could not have seen — a registry read allocates nothing.
+  - "A host test binary never compiles it" was true of the JNI function and false of
+    the property. The allocating core was lifted into
+    `HostIngress::try_send_ble_characteristic_value`, which is portable, and the gate
+    calls that.
+  - The prediction recorded here that the three identifiers are **interning
+    candidates** was not what the fix used, and the reasoning is in 0.67: a pooled
+    slot that keeps its own buffers gets the same zero allocations without a cache,
+    an eviction policy, or a structure two notification threads share.
+  - The Java half's JVM mechanism now exists —
+    `platforms/android/.../AllocationProbe`, `ThreadMXBean` reached reflectively
+    because these tests compile against `android.jar` — with a negative control that
+    mutation testing proved was missing.
 
   ~~Still unmeasured: the render command path and the audio path.~~ **Both are since
   covered** — the render command path's two enqueues under tasks 0.38 and 0.41, and the
@@ -650,8 +853,33 @@ review. A commit alone is not completion evidence.
   **Remaining for this item.** The permission gate, which is what Section 7.3's
   contention requirement was first written for, is JVM-side: a Rust probe observes
   nothing about a Java monitor, so it needs `ThreadMXBean` blocked-time and stays with
-  task 5.1. The BLE notification path's Rust half is `cfg(target_os = "android")`, so
-  no host test binary compiles it. The audio path is ungated.
+  task 5.1. ~~The BLE notification path's Rust half is `cfg(target_os = "android")`, so
+  no host test binary compiles it.~~ **The BLE notification path is now gated against
+  both process-wide registries** (task 0.67): the `cfg` covers the JNI function, not the
+  property, and the property moved to a portable `HostIngress` method that the probe
+  calls directly. It was a live violation, not a covered path — `send_command_to_host`
+  took `HOST_SENDERS` on every notification, which is the same defect this item found on
+  the input path, on a stream a peripheral paces.
+
+  **The audio path stays ungated, and that is now a decision with a reason rather than
+  a gap.** Enumerated on 2026-08-08: the audio crate's *only* process-wide state is
+  `streaming.rs`'s `OnceLock<tokio::runtime::Runtime>`, reached on the cold streaming
+  path and never on a tick; the real-time paths hold no session id at all, so they
+  cannot reach `shared::stats`, the console registry or the text-cache registry even by
+  mistake — there is no argument to pass. A gate holding one of those locks around an
+  audio tick would pass today and could only fail after a change that first plumbs a
+  session id through the audio thread, which is a design change rather than a regression
+  a gate catches. Writing one would satisfy the requirement's letter with a test that
+  cannot fail for a real reason, which this document rejects elsewhere. The enumeration
+  is the deliverable; if a session id ever does reach the audio thread, the gate becomes
+  writable and required.
+
+  **The enumeration also found two dead counters, and they are deleted rather than
+  wired.** `DebugStats::audio_queue_hwm` and `io_queue_hwm` had no writer and no reader
+  anywhere in the tree — their own comments said "placeholder — wiring to actual sender
+  is deferred". A diagnostic field that is always zero is worse than a missing one: the
+  first HUD to read it reports a queue depth of zero and is believed. Same disposition
+  as this item's `vsync::send_vsync`, for the same reason.
 
   **Deleted rather than documented:** `vsync::send_vsync` took a process-wide read lock
   per frame and had no caller at all — every per-frame producer already goes through
@@ -4366,6 +4594,70 @@ review. A commit alone is not completion evidence.
   older than the last delivered one — and the second only orders if the compare and the
   call are themselves one step, which puts the monitor back. Recorded so the plan starts
   from the real constraint instead of rediscovering it.
+
+  **Fixed on 2026-08-08. Implementation, tests and mutation evidence are below; neither
+  independent review has run, so the item stays open.** The "substantive change to the
+  GATT ownership model" this asked for turned out not to be needed, and saying why is
+  the point of this entry.
+
+  **The narrowest correct structure is not the one recorded here.** This item specified
+  a per-device state record whose monitor orders ownership transfer and reporting.
+  Per-device is indeed the narrowest ordering the property requires — and it is the more
+  expensive answer, because the monitor has to outlive the attempts it orders (ordering
+  an outgoing attempt against its replacement is the entire point), so it becomes a map
+  of monitors with a lifetime rule, an eviction rule, and a bound, since content chooses
+  the device ids. **One monitor per session** is strictly stronger, has no lifecycle at
+  all, and costs two devices' connect events the duration of one queue push, on a path
+  that fires when a peripheral connects or drops. Narrowest and cheapest were different
+  answers here.
+
+  **The recorded constraint — a Migo lock must not be held across a JNI call — is real
+  and does not apply to the whole transition, only to part of it.** What the monitor
+  covers is the ownership re-check and the report. What stays outside it is every
+  framework call: `close()`, `disconnect()` and `discoverServices()`, all of which can
+  block. That split is sufficient rather than merely convenient: a publisher's map write
+  precedes its own report in program order, and the monitor orders the reports, so a
+  thread that acquires the monitor after that write observes it. Holding it across the
+  report itself is safe for the reason the constraint is really about — the report is a
+  **post, not a wait**: it enqueues on a bounded channel and returns, never re-enters
+  Java, and never waits on a Migo lock. That is the same distinction the permission
+  gate's counted lease is built on.
+
+  **A second staleness the description did not name, found while fixing the first.**
+  `discoverGattServicesAndReport` reported its result unconditionally, so a superseded
+  attempt whose service discovery finished after its teardown reported the device
+  **connected** — resurrecting a device whose close had already completed. The two
+  directions are therefore not symmetric, and that asymmetry is now the semantics: a
+  *disconnect* from an attempt the map no longer holds is precisely the report that must
+  arrive, because retirement is what removed the entry; a *connect* from one must not,
+  because no owner means nothing is entitled to claim the device is connected.
+
+  **Mutation evidence, and the third mutant is the one worth reading.**
+
+  | Mutant | Kills |
+  | --- | --- |
+  | Decide, leave the region, then deliver — the shape this item describes | two tests, the first at `the replacement never blocked … it is in TERMINATED` |
+  | The monitor kept, `connected` reported unconditionally as before | the resurrection test, `expected:<[]> but was:<[true]>` |
+  | The monitor kept, the re-check moved back outside it | **nothing, at first** |
+
+  **The third mutant passed every test, and it is a genuine defect.** Moving only the
+  *report* inside the monitor still orders the two reports against each other, so the
+  interleaving test was satisfied — while the stale decision it exists to catch survived
+  untouched. The test could not see it because the fixed implementation has no window
+  between reading the map and delivering, so nothing could be parked there. What
+  discriminates is holding the monitor **from the test**, which stops the retired
+  attempt between its two steps in the mutant and before both of them in the fix: it
+  wakes to a world where a replacement exists and must notice. That needed
+  `connectionStateOrderForTests()`, exposed for the reason the Rust contention probe is
+  handed a registry's lock — a property about two steps being one cannot be demonstrated
+  without stopping a thread between them. **This is the same lesson as the JVM probe's
+  missing self-check control two items ago, in the same session: the first version of a
+  guard covers the side it was designed for.**
+
+  **Verified.** The Android Java suite at 119 tests, no failures or errors, across both
+  product variants; four new tests, three mutants each killing the gate named and no
+  others. No device evidence: this is a race between a peripheral dropping and
+  reconnecting, and nothing here has run against one.
 - [x] 0.25 Snapshot the pending cancellation action safely. Landed with `6825fad`:
   `runCancellations` captures the action into a local while the snapshot is taken
   under the session monitor, so the executed action is exactly the one the snapshot

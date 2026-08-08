@@ -1,0 +1,28 @@
+--- crates/shared/src/payload_pool.rs
++++ replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with None
+@@ -203,24 +203,17 @@
+         }
+     }
+ 
+     /// Take a reset slot, or `None` when every slot is in flight.
+     ///
+     /// Never blocks and never exceeds the configured capacity.
+     #[inline]
+     pub fn try_acquire(&self) -> Option<Recycled<T>> {
+-        let slot = match self.inner.free_rx.try_recv() {
+-            Ok(slot) => slot,
+-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.grow()?,
+-        };
+-        Some(Recycled {
+-            slot: Some(slot),
+-            pool: Arc::clone(&self.inner),
+-        })
++        None /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The one path that allocates, taken at most `capacity` times per pool.
+     ///
+     /// Claiming the population slot before allocating is what bounds it: a
+     /// concurrent grower that loses the exchange retries against the new value
+     /// and stops at the cap rather than racing past it.
+     #[cold]

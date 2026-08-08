@@ -1,0 +1,12 @@
+crates/shared/src/payload_pool.rs:119:9: replace <impl Drop for Pooled<T>>::drop with ()
+crates/shared/src/payload_pool.rs:211:9: replace RecyclePool<T>::try_acquire -> Option<Recycled<T>> with None
+crates/shared/src/payload_pool.rs:228:9: replace RecyclePool<T>::grow -> Option<Box<T>> with Some(Box::new(Default::default()))
+crates/shared/src/payload_pool.rs:232:27: replace == with != in RecyclePool<T>::grow
+crates/shared/src/payload_pool.rs:228:9: replace RecyclePool<T>::grow -> Option<Box<T>> with None
+crates/shared/src/payload_pool.rs:237:28: replace + with - in RecyclePool<T>::grow
+crates/shared/src/payload_pool.rs:237:28: replace + with * in RecyclePool<T>::grow
+crates/shared/src/payload_pool.rs:250:9: replace RecyclePool<T>::population -> usize with 0
+crates/shared/src/payload_pool.rs:250:9: replace RecyclePool<T>::population -> usize with 1
+crates/shared/src/payload_pool.rs:272:9: replace <impl Deref for Recycled<T>>::deref -> &T with Box::leak(Box::new(Default::default()))
+crates/shared/src/payload_pool.rs:281:9: replace <impl DerefMut for Recycled<T>>::deref_mut -> &mut T with Box::leak(Box::new(Default::default()))
+crates/shared/src/payload_pool.rs:295:9: replace <impl Drop for Recycled<T>>::drop with ()

@@ -1,0 +1,37 @@
+--- crates/shared/src/payload_pool.rs
++++ replace RecyclePool<T>::grow -> Option<Box<T>> with None
+@@ -220,33 +220,17 @@
+ 
+     /// The one path that allocates, taken at most `capacity` times per pool.
+     ///
+     /// Claiming the population slot before allocating is what bounds it: a
+     /// concurrent grower that loses the exchange retries against the new value
+     /// and stops at the cap rather than racing past it.
+     #[cold]
+     fn grow(&self) -> Option<Box<T>> {
+-        use std::sync::atomic::Ordering;
+-
+-        let mut population = self.inner.population.load(Ordering::Relaxed);
+-        loop {
+-            if population == self.inner.capacity {
+-                return None;
+-            }
+-            match self.inner.population.compare_exchange_weak(
+-                population,
+-                population + 1,
+-                Ordering::Relaxed,
+-                Ordering::Relaxed,
+-            ) {
+-                Ok(_) => return Some(Box::default()),
+-                Err(observed) => population = observed,
+-            }
+-        }
++        None /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Slots created so far, for tests that need to see growth stop.
+     #[must_use]
+     pub fn population(&self) -> usize {
+         self.inner
+             .population
+             .load(std::sync::atomic::Ordering::Relaxed)

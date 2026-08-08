@@ -1125,10 +1125,10 @@ impl Host {
 
             HostCommand::OnBLECharacteristicValueChange(ble) => {
                 self.js.dispatch_ble_characteristic_value_change(
-                    &ble.device_id,
-                    &ble.service_id,
-                    &ble.characteristic_id,
-                    &ble.value,
+                    ble.device_id(),
+                    ble.service_id(),
+                    ble.characteristic_id(),
+                    ble.value(),
                 );
                 Ok(())
             }
