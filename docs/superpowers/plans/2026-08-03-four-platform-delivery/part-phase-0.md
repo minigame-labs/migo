@@ -52,18 +52,64 @@
   `self_join_rejection_preserves_owner_for_another_thread`; `capi/src/lib.rs`
   `engine_refuses_to_die_while_sessions_are_live`,
   `engine_destroy_waits_for_retired_host_sentinel`,
-  `engine_destroy_holds_no_engine_lock_while_joining`,
   `session_destroy_transfers_host_without_joining_it`,
   `engine_destroy_from_its_retired_host_is_rejected_and_retryable`;
   `platform/src/host_owners.rs` `terminal_take_transfers_ownership_exactly_once`,
   `failed_shutdown_restores_same_owner_for_retry`; `tools/player/src/main.rs`
   `teardown_joins_host_before_dropping_native_resource`.
 
-  **Not closed, and deliberately.** No mutation evidence was taken this session, so
-  the tests above are asserted to exist rather than shown to be load-bearing, and
-  neither independent review has run. The next session's cheapest step is one
-  mutant: join while holding the engine lock and confirm
-  `engine_destroy_holds_no_engine_lock_while_joining` fails at its own assertion.
+  **The mutant this entry asked for was taken, 2026-08-09, and the guard it named
+  did not fail. It could not.** `engine_destroy_holds_no_engine_lock_while_joining`
+  used to hold a Migo lock deliberately across the join and still pass: **50 runs
+  out of 50**. A positive control rules out a stale binary — flipping
+  `join_failed` two lines above the same edit failed the test immediately with
+  `left: -11, right: 0`, so the mutated function was in the binary both times.
+
+  The reason is not a race to be tightened. The probe sampled
+  `retired_hosts.try_lock()` once, from the very thread being joined, and that
+  sample has **no ordering** against the join: it ran before the destroying thread
+  had been scheduled at all. A second attempt — spin until the retirement set is
+  observed drained *and* unlocked — failed the same way for a sharper reason:
+  `take_retired_hosts` releases the lock before the mutant re-acquires it, so the
+  state the probe waits for genuinely occurs, and the probe reliably catches that
+  window. **No sampling probe can establish "this thread is inside a blocking
+  call and holding nothing"**; that is a property of the code, not of an instant.
+
+  **So the bad state was made unexpressible instead.** `capi/src/retirement.rs`
+  holds `RetirementSet`: the `Mutex` is a private field of a private type in its
+  own module, `take` is the only way out and yields owned handles, and the one
+  function that produces a `MutexGuard` is private to that module. The engine's
+  destruction path can no longer name a lock to hold. `EngineInner::retire_host`
+  and `take_retired_hosts` are gone; their callers use the set directly, so there
+  is one place that knows how retirement is stored.
+
+  This is a **deadlock**, not a hygiene rule: a Host on its way out reaches
+  `migo_session_destroy` and `migo_engine_destroy`, which take these locks, so a
+  joiner holding one waits for the thread that is waiting for it.
+
+  **Evidence, and it is compile-time — deliberately labelled, because a mutant the
+  compiler kills is not a test kill.** Both shapes the defect could take now fail
+  to build, at `crates/capi/src/lib.rs:496`:
+
+  | Mutant | Result |
+  |---|---|
+  | `engine_ref.inner.retired_hosts.lock()` held across the join loop | `error[E0599]: no method named 'lock' found for struct 'RetirementSet'` |
+  | the same through the accessor, `.locked()` | `error[E0624]: method 'locked' is private` |
+
+  What replaces the deleted probe as a *runnable* guard is
+  `retirement.rs::take_hands_over_every_host_and_leaves_the_set_empty` and
+  `take_refuses_from_a_retired_host_and_keeps_it_for_a_retry`. Nothing else was
+  lost with it: its other two assertions — destruction waits for its Host, and
+  returns `MIGO_OK` once the Host exits — are `engine_destroy_waits_for_retired_host_sentinel`'s,
+  and the self-join refusal is `engine_destroy_from_its_retired_host_is_rejected_and_retryable`'s.
+
+  `cargo test -p migo-capi --lib`: **147 passed**, up from 146 — one unfalsifiable
+  test removed, two falsifiable ones added. `cargo-mutants --file
+  crates/capi/src/retirement.rs`: **10 mutants, 2 caught, 0 missed, 8 unviable** —
+  the eight are the tool trying to fabricate a `MutexGuard` for the private
+  accessor, which is the encapsulation showing up as "cannot even be written".
+
+  **Still not closed:** neither independent review has run.
 - [ ] 0.3 A2: immutable `PlatformIdentity` with synchronous rejection of
   incompatible reattachment, including the new HarmonyOS identity row.
   Plan: `2026-07-29-a2-platform-identity.md`.
@@ -93,9 +139,24 @@
   size, scale and generation, so it cannot change identity, and it is additionally
   gated on `ptr::eq(active, attachment_ref)` plus `validate_update_generation`.
 
-  **Not closed:** no mutant taken, no review. Cheapest next step: move
-  `validate_platform_identity` after the lease and confirm the contract script fails
-  with "C ABI reattachment identity is not rejected before Surface lease/enqueue".
+  **Mutant taken 2026-08-09, and it is the cleanest discriminating case in this
+  ledger.** `validate_platform_identity` was moved from before
+  `lease_surface_tracked` to immediately after it — a reordering that still
+  rejects the incompatible surface, just one step too late.
+
+  | Scope | Under the mutant |
+  |---|---|
+  | `scripts/test-surface-attachment-contract.sh` | **FAIL**: "C ABI reattachment identity is not rejected before Surface lease/enqueue" |
+  | `cargo test -p migo-capi --lib` | 147 passed |
+  | `cargo test -p migo-shared --lib surface::attachment` | 20 passed |
+
+  The static contract is the **only** thing that sees it, which is what an
+  ordering property looks like: no unit test can observe "before" — both orders
+  return the same code to the same caller. It is also the concrete case for T.6,
+  since until that item this gate ran in CI and not locally. Restored from a copy
+  taken before mutating and verified by `sha256sum`.
+
+  **Not closed:** neither independent review has run.
 - [ ] 0.4 A3: Migo-owned X11 connection; remove the undocumented `XInitThreads`
   precondition. Plan: `2026-07-29-a3-owned-x11-connection.md`.
 
@@ -107,17 +168,66 @@
   `reuse_requires_a_live_connection_to_the_same_server`, plus
   `presenter.rs::x11_context_binds_identity_surface_and_factory_to_one_owned_connection`.
 
-  **One real gap, and it needs no hardware.** The plan's Task 3 Step 1 asks for
-  platform-context tests at the `capi` layer, and `capi/src/platform/linux.rs` has
-  Wayland cases only — no test drives `build_target` down the X11 path, so
-  "cold X11 attach opens one context", "same-server reuse yields an equal
-  `PlatformIdentity`" and "a different server is refused with `INVALID_STATE` before
-  any lease" are asserted at the connection layer and nowhere at the C ABI.
-  `LinuxX11Context::from_render_display_for_test` makes this a host test.
+  **The gap is closed at the C ABI, 2026-08-09.** The plan's Task 3 Step 1 asked for
+  platform-context tests at the `capi` layer; `capi/src/platform/linux.rs` had
+  Wayland cases only, so nothing drove `build_target` down the X11 arm and the
+  reattachment properties were asserted at the connection layer and nowhere at the
+  boundary that decides them. Three tests now drive it:
+  `x11_reattachment_to_the_same_server_reuses_the_one_owned_connection`,
+  `x11_window_from_a_foreign_server_is_refused_and_opens_nothing`, and
+  `a_stored_x11_context_refuses_a_wayland_descriptor`.
 
-  **Genuinely device-blocked, and not on this machine:** Task 2 Step 4's
+  **The seam this entry named did not exist from `capi`, which is the fifteenth
+  recorded obstacle of that shape.** `LinuxX11Context::from_render_display_for_test`
+  is real, but it was `#[cfg(test)] fn` — private, and `cfg(test)` does not cross a
+  crate boundary, so `capi` compiles `platform` without it. Asking *which layer can
+  see this property* rather than *how do I reach this code* gives the answer: the
+  decision is `capi`'s, the evidence is the connection's, and a test seam has to
+  cross between them. It now does, the way `migo-core/test-support` already does —
+  `migo-platform/test-support`, enabled only from `capi`'s `[dev-dependencies]`,
+  which resolver 2 keeps out of every shipped build.
+
+  `X11TestServers` (`platform/src/linux/x11_connection.rs`) declares which
+  `Display*` reaches which X server and opens the render connection through
+  production `open_with_api` — no Xlib, no socket, no server. It **replaced**
+  `from_display_for_test`/`NoopX11Api` rather than joining them: two ways to
+  fabricate one object is the "one rule, two implementations" shape this repository
+  keeps digging out. The eight presenter tests that used the old helper (eleven call
+  sites) are unchanged and now run through the new one.
+
+  **Mutation evidence.** Restores verified by `sha256sum` against copies taken
+  before mutating, not by `git checkout` — the work was uncommitted.
+
+  | Mutant | Killed by | Old scope under the same mutant |
+  |---|---|---|
+  | Delete the `supports_host_display` check in the X11 reuse arm | `x11_window_from_a_foreign_server_is_refused_and_opens_nothing`, `left: None` vs `right: Some(-5)` | **All 10 `migo-platform` X11 tests pass**, including `reuse_requires_a_live_connection_to_the_same_server`, which asserts the deleted property one layer down. That is the gap, made concrete. |
+  | Wayland arm: `Some(_) => Err` becomes a fallthrough | `a_stored_x11_context_refuses_a_wayland_descriptor` **and** the pre-existing `platform_context_rejects_display_or_kind_change_before_native_access` | Old scope **also** kills it, so this mutant does not justify the new test. Recorded because it is the discriminating question. |
+  | Wayland arm guards only `Some(Wayland{..})`, letting an installed X11 context through | `a_stored_x11_context_refuses_a_wayland_descriptor` alone | `platform_context_rejects_display_or_kind_change_before_native_access` **passes** — it starts from a Wayland context, so it never exercises the kind it does not install. The §"guards cover the side they were designed for" shape, and what earns the third test. |
+
+  **What is still device-blocked, stated rather than papered over.** The *cold* arm
+  (`existing: None`) calls `LinuxX11Context::open`, which loads Xlib and
+  dereferences the host `Display*`; no seam changes that, so "a cold attach opens
+  exactly one context" is asserted at the connection layer
+  (`owner_opens_private_connection_and_closes_it_before_api_drop`) and, at the C
+  ABI, only for a context the test itself opened. Task 2 Step 4's
   `native_owned_connection_round_trip` is `#[ignore]`d pending a live X server, and
-  Task 4 Step 4 runs the real C host under `xvfb-run`.
+  Task 4 Step 4 runs the real C host under `xvfb-run`. Both need an X server this
+  machine does not have.
+
+  **Verification, 2026-08-09** — `bash scripts/verify-change.sh --base master`,
+  covering this item together with 0.2, 0.3, T.6 and T.8:
+
+  ```
+  VERIFIED SCOPE  master..HEAD plus the working tree (15 files)
+  PASS  host      19 steps
+  PASS  contract  23 gates (1 CI ONLY: test-local-verification-contract.sh)
+  PASS  android compile  bash scripts/build-android-so.sh --compile-only arm64-v8a
+  PASS  ohos compile     bash scripts/build-ohos-sdk.sh --compile-only x86_64
+  [verify] verified for every target this change touches
+  ```
+
+  The `ohos compile` line is evidence rather than a static argument for the first
+  time; see T.8 for why it used to read `NOT PROVEN`.
 - [x] 0.5 A4: lossless terminal input transitions under bounded saturation.
   Plan: `2026-07-29-a4-lossless-input-state.md`. Evidence recorded 2026-07-29.
 - [ ] 0.6 A5: correct desktop pointer and button semantics, including Qt hover
@@ -178,6 +288,15 @@
 
 - [ ] 0.7 A7: finish Android capability enforcement and revocation across all 30
   protected and 8 cleanup operations.
+
+  Starting note, 2026-08-09, from checking the numbers rather than the sentence:
+  they are current and they are already **derived**, not counted by hand.
+  `scripts/test-permission-coverage-contract.sh` reports "30 gated op(s), 8 cleanup
+  op(s), 38 permission-sensitive op(s)" and fails if an op is in both tables,
+  neither, or carries the wrong wrapper. So the inventory and its classification are
+  enforced; what is open is the enforcement and revocation *behaviour* at those
+  points. This item has no detailed plan of its own — write one before starting, and
+  scope it against that gate's output rather than a fresh survey.
 - [ ] 0.8 A8: retained-intrinsic host bridge, mounted-module URL validation,
   ad-event authority, late callback rejection, reliable asynchronous host-result
   lane.
