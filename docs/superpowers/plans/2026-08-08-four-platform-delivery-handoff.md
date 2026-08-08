@@ -268,7 +268,7 @@ reviews are user-triggered (§6).
 
    | Item | What it needs | Why |
    |---|---|---|
-   | 0.9/A9 | **execute, tasks 1–2 of 12 done** | plan `2026-08-02-runtime-restart-generation-boundary.md`; its §6.6 authority is *not* superseded, checked. **Do not run Task 3 as written** — its step 3 deletes a fallback that Task 6 is what makes safe to delete, and the failure mode is a promise that never settles. Item 0.9 records the safe shape. Tasks 4–5 want a whole session each |
+   | 0.9/A9 | **execute, tasks 1–3 of 12 done** | plan `2026-08-02-runtime-restart-generation-boundary.md`; its §6.6 authority is *not* superseded, checked. Task 3 landed as a **subset**: the fallback its step 3 deletes is what Task 6 makes safe to delete, and deleting early means promises that never settle. Two of the plan's own code blocks were wrong — see 0.9. Resume at Task 4, and give **4–5 a whole session each** |
    | 0.13 | **execute, partly device-blocked** | the entry states four concrete deliverables (ArkTS lifecycle hooks, `OHNativeWindow` release barrier, multi-touch, restart/shutdown barriers); spec §6.2 governs. Compile-level work is now verifiable locally via the T.8 lane; behaviour needs the emulator |
    | 0.8/A8 | **split, then audit** | five clauses in one line, one already closed as 0.12's third; the C ABI half overlaps the branch in 0.11 |
    | 0.11/A11 | **decide** | see item 0 above |

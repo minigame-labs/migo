@@ -474,8 +474,8 @@
   `ohos compile` PASS, `verified for every target this change touches`, and zero
   `migo-core` warnings in the log.
 
-  **⚠️ Task 3 must not be executed as written, and the plan contradicts itself
-  about it.** Its Step 3 says to *"delete the `pending.values().next()`
+  **Task 3 done 2026-08-09 as a deliberate subset, because the plan contradicts
+  itself about the rest of it.** Its Step 3 says to *"delete the `pending.values().next()`
   compatibility path"* in `runtime-v8/src/base/02_async.js`. Task 6, three tasks
   later, is titled "Make Every Android Result Echo Its ID" and its own Step 2 says
   *"Expected: FAIL because these paths currently omit IDs"* — location, scan,
@@ -492,18 +492,55 @@
   fallback — and that fallback settles the *oldest* pending request, so a garbage
   id today mis-settles someone else's call.
 
-  **The safe shape for a future Task 3**, which is a deviation to make
-  deliberately rather than discover: add `op_alloc_host_callback_id` and switch
-  `createDeferredApi` off its per-API `_nextId`, which is the substantive win —
-  ids stop restarting at 1 in each runtime, so a retired runtime's late result can
-  no longer collide with a new request. Make `settle` require a strict
-  `parseHostCallbackId` **whenever `requestId` is present in any form**, and
-  discard rather than fall back when it fails: that alone closes the garbage-id
-  mis-settlement, which is strictly better than today. Keep the fallback for the
-  *absent* case only, and delete it in Task 6 when the paths that omit ids stop
-  omitting them. Note also that `02_async.js` is embedded via `esm=[...]`, so any
-  change to it needs `scripts/gen-snapshot.sh` before it takes effect on a device;
-  host suites run the JS from source and will not show that gap.
+  **What was done**, which is the substantive part: `op_alloc_host_callback_id`
+  in `host_v8_base`, and `createDeferredApi` off its per-API `_nextId` onto the
+  Host's allocator, so ids stop restarting at 1 in each runtime and a retired
+  runtime's late result can no longer collide with a new request. `settle` now
+  requires a strict `parseHostCallbackId` **whenever `requestId` is present in
+  any form** and discards when it fails, which closes the garbage-id
+  mis-settlement on its own.
+
+  **What was deliberately not done:** the FIFO fallback stays for the *absent*
+  case, with a comment at the code naming Task 6 as the thing that makes deleting
+  it safe. Deleting it now would leave those Android promises never settling.
+
+  **The parser the plan specifies is wrong, and the test caught it before it
+  shipped.** `Number(value)` maps `true` to 1, so a result carrying
+  `requestId: true` parsed as the id 1 and settled whichever request held it —
+  observed as a real failure (`ids=[1] settled=["only"]`) on the first run, not
+  reasoned about. `parseHostCallbackId` now checks `typeof` before converting and
+  accepts only numbers and strings; a string is tolerated on purpose, and pinned
+  by `an_id_serialised_as_a_string_still_correlates`, because a platform echoing
+  the id as text is still echoing the exact id.
+
+  **Mutation evidence.** Restoring the per-API `var _nextId = 1` fails exactly
+  the two tests that name the property —
+  `a_replacement_runtime_never_reissues_a_retired_runtimes_id` and
+  `two_deferred_apis_in_one_runtime_do_not_share_a_numbering`
+  (`assertion failed: __otherIds[0] !== __ids[0]`) — while the three strictness
+  tests stay green, so the two groups are discriminating rather than overlapping.
+  Restored from a copy and verified by `sha256sum`. The strictness half needed no
+  synthetic mutant: the plan's own parser was the mutant, and the suite rejected
+  it.
+
+  **Not covered:** the JS `catch` around allocation, which rejects the call when
+  the id space is exhausted. Driving it needs an allocator at its bound, and
+  `CallbackIdAllocator`'s near-exhaustion constructor is `#[cfg(test)]` and
+  private to `shared` — deliberately, since a caller that can choose the starting
+  point can reissue an id. Exhaustion itself is covered where it lives, by
+  `maximum_is_issued_once_then_exhaustion_is_permanent`.
+
+  Suites: the five new cases in
+  `runtime-v8/src/tests/runtime_restart_boundary.rs`, `migo-runtime-v8` 528 from
+  523. Closing gate (46 files in scope): 19 host steps, 23 contract gates,
+  `android compile` and `ohos compile` PASS,
+  `verified for every target this change touches`.
+
+  ⚠️ `02_async.js` is embedded via `esm=[...]`, so this change needs
+  `scripts/gen-snapshot.sh` before it takes effect **on a device**; host suites
+  run the JS from source and will not show that gap. The six snapshots on
+  `master` were already stale, so this does not add a new class of problem — it
+  adds one more reason the regeneration round matters.
 
   **Tasks 3–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
