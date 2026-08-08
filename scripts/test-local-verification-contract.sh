@@ -85,6 +85,10 @@ git_quiet() {
 STUB_CRATES=(
     demo
     shared io runtime-v8 audio graphics core capi platform
+    # The C boundary rules crate. Its host step is the one that names
+    # `--all-targets`, so a fixture without it would fail that step on a missing
+    # package rather than on anything this contract is about.
+    capi-abi
 )
 
 # Mirrors the real tree's third category: `engine/testing/` holds crates that
@@ -149,6 +153,7 @@ new_fixture() {
     # run fail for a reason unrelated to the property under test, which is the
     # shape of an always-red gate.
     cp "$ROOT/scripts/lib/ci_contract_gates.py" "$repo/scripts/lib/"
+    cp "$ROOT/scripts/lib/host_test_coverage.py" "$repo/scripts/lib/"
     {
         printf '[workspace]\nresolver = "2"\nmembers = [\n'
         for crate in "${STUB_CRATES[@]}"; do
@@ -252,6 +257,41 @@ status=0
 output="$(run_verify "$repo" --plan-only)" || status=$?
 assert_status "$status" 1 "a changed source with unknown conditions fails the run"
 assert_contains "$output" "UNDETERMINED" "the unknown-condition file is reported"
+
+# ------------------------------------------------------------
+# A test binary no host step runs stops the run.
+#
+# The same argument as the unreached source above, applied to behaviour instead of
+# to platform conditions: a binary nothing executes has unknown behaviour, and a
+# verdict printed over it covers less than it says. This is the case that was live
+# -- thirteen integration-test binaries, 95 tests, none of them named by any step,
+# because every step in every gate said `--lib`.
+#
+# `--plan-only`, so the assertion is about the audit refusing rather than about any
+# suite's result. A stub crate is used deliberately: `demo` has no host step at all,
+# which is the weaker of the two ways to be uncovered and therefore the one a
+# `--lib`-only check would miss.
+# ------------------------------------------------------------
+repo="$(new_fixture unrun_test_binary)"
+mkdir -p "$repo/engine/crates/demo/tests"
+printf '#[test]\nfn nobody_runs_me() {}\n' > "$repo/engine/crates/demo/tests/orphan.rs"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_status "$status" 1 "a test binary no host step runs fails the run"
+assert_contains "$output" "migo-demo::orphan" "the unrun test binary is named"
+
+# And a compile is not coverage. `build --workspace --all-targets` builds every test
+# binary and runs none, so an audit that accepted it would report the whole class as
+# covered -- which is how these binaries stayed invisible while the tree was green.
+# Asked of the parser directly: that one step alone must leave every test binary in
+# the real workspace unaccounted for.
+compile_only="$(printf 'build --workspace --all-targets\n' \
+    | python3 "$ROOT/scripts/lib/host_test_coverage.py" --root "$ROOT" || true)"
+if [[ "$(printf '%s\n' "$compile_only" | grep -c .)" -ge 10 ]]; then
+    pass "compiling every test binary is not counted as running one"
+else
+    fail "the audit treats a --all-targets *build* as coverage, so it cannot see an unrun binary"
+fi
 
 # ------------------------------------------------------------
 # A change outside the engine needs no target build.
@@ -433,7 +473,12 @@ fi
 # reportable, and the local one has one authority instead of a regular
 # expression guessing at one.
 local_crates="$(bash "$ROOT/scripts/verify-change.sh" --list-host-crates 2>/dev/null || true)"
-ci_crates="$(grep -E 'cargo test' "$ROOT/.github/workflows/pr-ci.yml" \
+# Comments stripped before the extraction, not after: this workflow explains its own
+# `--lib`/`--all-targets` choices in prose next to the commands, and a comment parsed
+# as a command is a list that agrees with itself about the wrong thing.
+ci_test_lines="$(sed 's/#.*//' "$ROOT/.github/workflows/pr-ci.yml" \
+    | grep -E 'cargo test ' || true)"
+ci_crates="$(printf '%s\n' "$ci_test_lines" \
     | grep -oE '\-p migo-[a-z0-9-]+' | grep -oE 'migo-[a-z0-9-]+' | sort -u || true)"
 if [[ -z "$ci_crates" ]]; then
     fail "cannot find the crates pr-ci.yml tests"
@@ -443,6 +488,50 @@ else
     while read -r crate; do
         assert_contains "$ci_crates" "$crate" "pr-ci.yml runs $crate's tests too"
     done <<< "$local_crates"
+
+    # ------------------------------------------------------------
+    # And the other direction, which is the one that was missing.
+    #
+    # Only `local ⊆ CI` was ever asserted, and it is the harmless half: a local step
+    # CI lacks makes CI narrower than a developer's machine, which is a hole in the
+    # merge gate. `CI ⊆ local` is the half that makes the local verdict *false* --
+    # the run prints "verified for every target this change touches" about a change
+    # CI will reject. `migo-capi-abi` lived in exactly that gap: 60 ABI and
+    # versioned-header tests, run by CI, run by no local step, and every assertion
+    # in this file passed.
+    # ------------------------------------------------------------
+    while read -r crate; do
+        assert_contains "$local_crates" "$crate" \
+            "scripts/verify-change.sh runs $crate's tests too"
+    done <<< "$ci_crates"
+fi
+
+# ------------------------------------------------------------
+# CI's own commands leave no test binary unrun.
+#
+# `verify-change.sh` now refuses to produce a verdict when one of its steps does
+# not cover a test binary. CI has no such refusal and had the identical gap for the
+# identical reason -- every command said `--lib` -- so 35 tests in seven binaries
+# ran in no job at all. Asking the *same parser* about the workflow's own cargo
+# lines is what holds the two sides at one scope: a second implementation of "which
+# targets does this flag select" would disagree with the first exactly when it
+# matters.
+# ------------------------------------------------------------
+if [[ -n "$ci_test_lines" ]]; then
+    ci_unrun=""
+    audit_status=0
+    ci_unrun="$(printf '%s\n' "$ci_test_lines" \
+        | grep -oE 'cargo test .*' | sed 's/^cargo //' \
+        | python3 "$ROOT/scripts/lib/host_test_coverage.py" --root "$ROOT")" \
+        || audit_status=$?
+    if [[ "$audit_status" -ne 0 ]]; then
+        fail "the test-binary audit could not describe this workspace, so CI's scope is unknown"
+    elif [[ -n "$ci_unrun" ]]; then
+        fail "no pr-ci.yml cargo command runs these test binaries:"
+        printf '%s\n' "$ci_unrun" | sed 's/^/    /' >&2
+    else
+        pass "every test binary is run by a pr-ci.yml cargo command"
+    fi
 fi
 
 # ------------------------------------------------------------

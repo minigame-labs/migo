@@ -150,10 +150,32 @@ fn clear_rect_erases_content_to_transparent() {
     });
     // Outside the cleared area: original red (premul unmul roundtrip should
     // keep r ~255 and a ~200 in unpremul RGBA).  Inside: fully transparent.
-    let inside = ((16 * 32 + 16) * 4) as usize;
-    assert_eq!(buf[inside + 3], 0, "inside should be transparent");
-    let outside = ((0 * 32 + 0) * 4) as usize;
-    assert!(buf[outside + 3] > 0, "outside should retain pixels");
+    //
+    // Asserted at all four boundaries rather than at one interior pixel. A
+    // centre sample says only that *something* was erased somewhere around it:
+    // it holds for a rect one pixel to the right, one pixel wider, or one pixel
+    // short on any side, and each of those is a visible product defect. The
+    // clear paint disables anti-aliasing and these coordinates are integral, so
+    // every edge is exact and no tolerance is warranted.
+    let alpha = |x: i32, y: i32| buf[((y * w + x) * 4 + 3) as usize];
+
+    assert_eq!(alpha(16, 16), 0, "the middle of the rect is erased");
+    for across in 8..24 {
+        assert_eq!(alpha(7, across), 200, "the column left of the rect is kept");
+        assert_eq!(alpha(8, across), 0, "the rect's first column is erased");
+        assert_eq!(alpha(23, across), 0, "the rect's last column is erased");
+        assert_eq!(
+            alpha(24, across),
+            200,
+            "the column right of the rect is kept"
+        );
+
+        assert_eq!(alpha(across, 7), 200, "the row above the rect is kept");
+        assert_eq!(alpha(across, 8), 0, "the rect's first row is erased");
+        assert_eq!(alpha(across, 23), 0, "the rect's last row is erased");
+        assert_eq!(alpha(across, 24), 200, "the row below the rect is kept");
+    }
+    assert_eq!(alpha(0, 0), 200, "a corner far from the rect is untouched");
 }
 
 #[test]

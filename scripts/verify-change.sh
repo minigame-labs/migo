@@ -70,13 +70,31 @@ HOST_CARGO_STEPS=(
     "test -p migo-alloc-probe"
     "test -p migo-contention-probe"
     "test -p migo-executor-probe"
+    # The C boundary rules, and the only crate here with no dependencies at all --
+    # which is why they were split out of `capi` in the first place: an ABI rule
+    # must be provable without a device or a graphics stack. It ran in CI and in
+    # no local step, so the ABI and versioned-header suites A6 names were absent
+    # from every local verdict that claimed to cover the change touching them.
+    #
+    # `--all-targets`, and the distinction is not cosmetic: all 60 tests live in
+    # `tests/`, the lib has none, so `test -p migo-capi-abi --lib` would run
+    # exactly zero of them and pass forever. A step that cannot fail is the thing
+    # this project treats as decoration, and here it would have been a step that
+    # cannot even run.
+    "test -p migo-capi-abi --all-targets"
     "test -p migo-shared"
     "test -p migo-io --lib"
-    "test -p migo-runtime-v8 --lib"
+    # `--tests` rather than `--lib` for the two crates that own integration
+    # binaries: `snapshot_roundtrip` and `worker_snapshot_roundtrip` for the
+    # runtime, and the five golden-image and decode binaries for graphics. Every
+    # gate in this repository said `--lib`, on both sides, so those 35 tests ran
+    # in no job and no local run -- 1.7 seconds of execution that existed only as
+    # source. They need no GPU: Skia rasterises to memory here.
+    "test -p migo-runtime-v8 --tests"
     # Carries the occupancy gate on the shared audio streaming worker, so a suite
     # that ran nowhere would leave that gate as decoration.
     "test -p migo-audio --lib"
-    "test -p migo-graphics --lib"
+    "test -p migo-graphics --tests"
     "test -p migo-core --lib"
     "test -p migo-capi --lib"
     "test -p migo-platform --lib"
@@ -90,10 +108,22 @@ HOST_CARGO_STEPS=(
     # size and every canvas kept the size the window had before a rotation.
     #
     # `runtime-v8` and `core` are the two crates whose capability surface the
-    # profile selects. `graphics` takes its profile from `core`, and `capi` and
-    # `platform` do not build on the host at all.
-    "test -p migo-runtime-v8 --lib --no-default-features --features profile-slim"
+    # profile selects, and `capi` and `platform` are the two that re-export it to a
+    # host: `platform`'s `profile-slim` drops all five `api-*` features, and A6's
+    # lifecycle, reattachment and input-saturation suites are `capi` lib tests, so
+    # without these two steps "both product profiles" covered neither of the three.
+    # The comment that used to sit here said `capi` and `platform` "do not build on
+    # the host at all", four lines under the two steps that build and test them.
+    #
+    # `graphics` has no Slim step because it cannot have a meaningful one:
+    # `profile-full` and `profile-slim` both expand to exactly `["embed_icudtl"]`,
+    # so the two builds are the same build. `capi-abi` has no step for the stronger
+    # version of the same reason -- it declares no features and has no dependencies,
+    # so one build of it is every build of it.
+    "test -p migo-runtime-v8 --tests --no-default-features --features profile-slim"
     "test -p migo-core --lib --no-default-features --features profile-slim"
+    "test -p migo-capi --lib --no-default-features --features profile-slim"
+    "test -p migo-platform --lib --no-default-features --features profile-slim"
     "fmt --all --check"
 )
 
@@ -101,6 +131,16 @@ if [[ "${1:-}" == "--list-host-crates" ]]; then
     for step in "${HOST_CARGO_STEPS[@]}"; do
         [[ "$step" =~ -p\ (migo-[a-z0-9-]+) ]] && printf '%s\n' "${BASH_REMATCH[1]}"
     done | sort -u
+    exit 0
+fi
+
+# The steps verbatim, because the crate names are not enough to say what runs.
+# Two lists naming the same crates still run different binaries when one of them
+# says `--lib`, and that one word is what hid nine `migo-capi-abi` test binaries
+# from every local run. Scope belongs to whoever checks coverage, so it is
+# published rather than re-derived by a grep with a different idea of the syntax.
+if [[ "${1:-}" == "--list-host-steps" ]]; then
+    printf '%s\n' "${HOST_CARGO_STEPS[@]}"
     exit 0
 fi
 
@@ -113,6 +153,7 @@ while [[ $# -gt 0 ]]; do
         --abi)       shift; [[ $# -gt 0 ]] || { print_error "--abi requires a value"; exit 2; }; ABI="$1" ;;
         --abi=*)     ABI="${1#*=}" ;;
         --list-host-crates) ;;  # handled above, before any work
+        --list-host-steps)  ;;  # handled above, before any work
         --help|-h)   sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)           print_error "unknown argument: $1"; exit 2 ;;
     esac
@@ -138,6 +179,40 @@ if [[ -n "$unreached" ]]; then
     print_error "fix scripts/lib/verification_targets.py's module walk, or the declaration it cannot parse"
     exit 1
 fi
+
+# ------------------------------------------------------------
+# Every test binary the workspace has must be run by one of the steps above.
+#
+# The same argument as the module walk, one layer out: an unreached source file
+# has unknown conditions, and an unrun test binary has unknown behaviour. Nothing
+# checked this, and the result was not marginal -- thirteen integration-test
+# binaries holding 95 tests, of which 35 ran in no job and no local run at all.
+# The cause was uniform and invisible to a crate-name comparison: every step, in
+# every gate, said `--lib`. `migo-capi-abi` is the case that shows the shape,
+# because its lib has no tests, so `--lib` there is a step that cannot fail.
+#
+# A compile is not coverage. `build --workspace --all-targets` builds all of them
+# and runs none, which is how those binaries stayed green-adjacent for months.
+#
+# Fails closed. A binary this cannot account for is one whose behaviour no
+# verdict below covers, and printing the verdict anyway is the precise failure
+# this script exists to prevent.
+# ------------------------------------------------------------
+unrun="$(printf '%s\n' "${HOST_CARGO_STEPS[@]}" \
+    | python3 scripts/lib/host_test_coverage.py --root .)"
+case "$?" in
+    0)  if [[ -n "$unrun" ]]; then
+            print_error "no host step runs these test binaries, so nothing here covers them:"
+            printf '%s\n' "$unrun" | sed 's/^/  /' >&2
+            print_error "add a step to HOST_CARGO_STEPS, or widen one from --lib to --tests"
+            exit 1
+        fi
+        ;;
+    3)  print_info "host: no engine workspace in this tree; no test binaries to account for" ;;
+    *)  print_error "cannot tell which test binaries the host steps run; coverage is unknown"
+        exit 1
+        ;;
+esac
 
 # ------------------------------------------------------------
 # Scope

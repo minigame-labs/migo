@@ -255,10 +255,24 @@ jobs:
       # reason: half its controls are integration tests, because whether a
       # counting `#[global_allocator]` is installed is a property of a binary and
       # its own unit-test binary deliberately installs none.
+      #
+      # `--tests` for shared and runtime-v8 rather than `--lib`, and the difference
+      # is four binaries nothing ran. `shared/tests/frame_cycle_allocation.rs` is
+      # Section 7.3's allocation gate at the frame boundary and has to be its own
+      # binary for two reasons it states itself: a `#[global_allocator]` is unique
+      # per binary, and the command pools have to be uncontended to measure a cycle
+      # at zero. Under `--lib` it never ran here at all. `snapshot_roundtrip` and
+      # `worker_snapshot_roundtrip` are the same shape for the V8 startup snapshot.
+      # `migo-io` keeps `--lib` because it owns no integration binary.
+      #
+      # `scripts/test-local-verification-contract.sh` now audits these commands
+      # with the same parser the local gate uses, so narrowing one back to `--lib`
+      # fails that contract instead of quietly dropping a binary.
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
         run: |
-          cargo test -p migo-shared -p migo-io -p migo-runtime-v8 --lib
+          cargo test -p migo-shared -p migo-runtime-v8 --tests
+          cargo test -p migo-io --lib
           cargo test -p migo-capi-abi --all-targets
           cargo test -p migo-alloc-probe
           cargo test -p migo-contention-probe
@@ -565,7 +579,11 @@ jobs:
       - name: Run Rust tests (graphics, core, capi, platform, audio)
         working-directory: engine
         run: |
-          cargo test -p migo-graphics --lib
+          # `--tests`: the five golden-image and decode binaries under
+          # `crates/graphics/tests/` ran in no job, because this line said `--lib`
+          # and nothing compared the flag against the targets cargo builds. They
+          # need no GPU — Skia rasterises to memory — and take under a second.
+          cargo test -p migo-graphics --tests
           cargo test -p migo-core --lib
           cargo test -p migo-capi --lib
           cargo test -p migo-platform --lib
