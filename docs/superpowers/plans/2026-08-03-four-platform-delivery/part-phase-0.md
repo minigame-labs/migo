@@ -587,7 +587,45 @@
   barrier discipline as the Migo-owned X11 connection; verify multi-touch; apply
   the restart, thread-ownership, and shutdown barriers to HarmonyOS.
 - [ ] 0.14 A13: re-run the post-master integration audit and record exact Full
-  and Slim test counts.
+  and Slim test counts. **Re-run 2026-08-09. Counts below are measured, not
+  carried forward; neither independent review has run.**
+
+  Measured on `delivery/x11-and-mutation-evidence` (master + 7 commits) by
+  `bash scripts/verify-change.sh --base master`, plus both Gradle flavours read
+  from their JUnit XML rather than from console output.
+
+  **Rust host suites — 2,987 passed, 31 ignored, 16 test steps** (the two
+  non-test steps, `build --workspace --all-targets` and `fmt --all --check`,
+  report no counts by design):
+
+  | Profile-independent | | Full | | Slim | |
+  |---|---|---|---|---|---|
+  | `migo-shared` | 432 | `migo-runtime-v8` | 524 | `migo-runtime-v8` | 472 |
+  | `migo-graphics` | 604 | `migo-core` | 62 | `migo-core` | 59 |
+  | `migo-io` | 266 | `migo-capi` | 147 | `migo-capi` | 147 |
+  | `migo-capi-abi` | 60 | `migo-platform` | 53 | `migo-platform` | 53 |
+  | `migo-audio` | 65 | | | | |
+  | `migo-alloc-probe` | 28 | | | | |
+  | `migo-executor-probe` | 8 | | | | |
+  | `migo-contention-probe` | 7 | | | | |
+  | **subtotal** | **1,470** | **subtotal** | **786** | **subtotal** | **731** |
+
+  `migo-capi` is 147 in both profiles rather than the 143 recorded under T.7: this
+  branch adds three X11 cases (item 0.4) and two retirement cases, and removes one
+  test that could not fail (item 0.2). Net +4, and the arithmetic matching is the
+  point of recording exact numbers.
+
+  **Java — 143 Full, 143 Slim, 0 failures, 0 skipped**, identical counts across
+  flavours because the source set is variant-independent while `BuildConfig`
+  gating is not.
+
+  **Contract lane — 23 gates PASS, 1 `CI ONLY`** (`test-local-verification-contract.sh`,
+  which would nest; run separately and green). Those gates execute 32 further Rust
+  tests inside themselves, which is why the host-step total and the run total differ.
+
+  **Targets — `android compile` PASS, `ohos compile` PASS.** The OpenHarmony line is
+  new; see T.8 for why it used to read `NOT PROVEN`. `windows` has no local lane and
+  is not part of this audit.
 - [ ] 0.15 A6: run lifecycle, reattachment, input saturation, ABI, and header
   contract suites with both product profiles. **The Slim host suite now runs, is
   green, and is part of the local gate; it found one product defect, which is fixed
