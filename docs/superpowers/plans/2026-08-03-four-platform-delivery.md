@@ -797,7 +797,27 @@ review. A commit alone is not completion evidence.
   property, and the property moved to a portable `HostIngress` method that the probe
   calls directly. It was a live violation, not a covered path — `send_command_to_host`
   took `HOST_SENDERS` on every notification, which is the same defect this item found on
-  the input path, on a stream a peripheral paces. The audio path is ungated.
+  the input path, on a stream a peripheral paces.
+
+  **The audio path stays ungated, and that is now a decision with a reason rather than
+  a gap.** Enumerated on 2026-08-08: the audio crate's *only* process-wide state is
+  `streaming.rs`'s `OnceLock<tokio::runtime::Runtime>`, reached on the cold streaming
+  path and never on a tick; the real-time paths hold no session id at all, so they
+  cannot reach `shared::stats`, the console registry or the text-cache registry even by
+  mistake — there is no argument to pass. A gate holding one of those locks around an
+  audio tick would pass today and could only fail after a change that first plumbs a
+  session id through the audio thread, which is a design change rather than a regression
+  a gate catches. Writing one would satisfy the requirement's letter with a test that
+  cannot fail for a real reason, which this document rejects elsewhere. The enumeration
+  is the deliverable; if a session id ever does reach the audio thread, the gate becomes
+  writable and required.
+
+  **The enumeration also found two dead counters, and they are deleted rather than
+  wired.** `DebugStats::audio_queue_hwm` and `io_queue_hwm` had no writer and no reader
+  anywhere in the tree — their own comments said "placeholder — wiring to actual sender
+  is deferred". A diagnostic field that is always zero is worse than a missing one: the
+  first HUD to read it reports a queue depth of zero and is believed. Same disposition
+  as this item's `vsync::send_vsync`, for the same reason.
 
   **Deleted rather than documented:** `vsync::send_vsync` took a process-wide read lock
   per frame and had no caller at all — every per-frame producer already goes through

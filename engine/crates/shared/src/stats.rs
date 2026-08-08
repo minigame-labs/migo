@@ -157,12 +157,6 @@ pub struct DebugStats {
     pub upload_queue_depth: AtomicU32,
     /// Cumulative glyph atlas cache misses observed by text rendering.
     pub glyph_atlas_miss: AtomicU32,
-    /// High-water mark of the audio command queue depth (peak pending items).
-    /// Currently a placeholder — wiring to actual sender is deferred.
-    pub audio_queue_hwm: AtomicU32,
-    /// High-water mark of the IO command queue depth (peak pending items).
-    /// Currently a placeholder — wiring to actual sender is deferred.
-    pub io_queue_hwm: AtomicU32,
     // ---- Render optimization metrics ----
     /// Cumulative frames where damage resolved to Partial.
     pub partial_damage_frames: AtomicU32,
