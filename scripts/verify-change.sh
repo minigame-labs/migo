@@ -429,15 +429,27 @@ target_command() {
     esac
 }
 
-while read -r keyword platform tier; do
+# Into an array first, and every target build runs with stdin closed -- the same
+# reason the contract lane above does, and the same bug found twice. Read from a
+# here-string, Gradle inherits the remaining plan as its stdin: the `android-java`
+# lane then sat for twelve minutes having used one second of CPU, while the identical
+# command run by hand finished in nineteen seconds. A build that consumes the loop's
+# input is indistinguishable from a build that is simply slow.
+target_plan=()
+while IFS= read -r line; do
+    [[ "$line" == TARGET* ]] && target_plan+=("$line")
+done <<< "$plan"
+
+for line in "${target_plan[@]}"; do
+    read -r keyword platform tier <<< "$line"
     [[ "$keyword" == "TARGET" ]] || continue
     command="$(target_command "$platform" "$tier")"
     if [[ -z "$command" ]]; then
         record "$platform $tier" "no local build for this target" "NOT PROVEN"
         continue
     fi
-    run_step "$platform $tier" "$command" || true
-done <<< "$plan"
+    run_step "$platform $tier" "$command" </dev/null || true
+done
 
 # ------------------------------------------------------------
 # Verdicts
