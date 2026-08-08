@@ -18,6 +18,7 @@
 # Usage:
 #   scripts/build-ohos-sdk.sh [x86_64|aarch64]   (default: aarch64)
 #   scripts/build-ohos-sdk.sh --all
+#   scripts/build-ohos-sdk.sh --compile-only x86_64   (build the library, stage nothing)
 #
 # ONE COMMAND. From a clean checkout this builds V8, builds migo-capi, stages
 # the package and gates it, in that order, reusing whatever already exists. The
@@ -46,12 +47,23 @@ err()  { echo -e "\033[0;31m[ohos-sdk] $*\033[0m" >&2; }
 ok()   { echo -e "\033[0;32m[ohos-sdk] $*\033[0m"; }
 
 ARCHES=()
-case "${1:-aarch64}" in
-    --all)   ARCHES=(x86_64 aarch64) ;;
-    x86_64)  ARCHES=(x86_64) ;;
-    aarch64) ARCHES=(aarch64) ;;
-    *) err "unknown argument: $1"; exit 1 ;;
-esac
+COMPILE_ONLY=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        # Stop after the library is built and its entry points counted. The
+        # verifier's `ohos` lane uses this so the toolchain pins have exactly one
+        # home: a second copy of the `dev-setup-ohos.sh` exports and
+        # `RUSTY_V8_ARCHIVE` is how a build silently picks up the Android NDK's
+        # clang and bionic headers for a musl target.
+        --compile-only) COMPILE_ONLY=1 ;;
+        --all)   ARCHES=(x86_64 aarch64) ;;
+        x86_64)  ARCHES=(x86_64) ;;
+        aarch64) ARCHES=(aarch64) ;;
+        *) err "unknown argument: $1"; exit 1 ;;
+    esac
+    shift
+done
+[[ ${#ARCHES[@]} -gt 0 ]] || ARCHES=(aarch64)
 
 MIGO_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$REPO_ROOT/engine/crates/capi/Cargo.toml" | head -1)"
 [[ -n "$MIGO_VERSION" ]] || MIGO_VERSION="0.1.0"
@@ -132,6 +144,11 @@ for ARCH in "${ARCHES[@]}"; do
     fi
 
     info "$ARCH: $ENTRY_POINTS migo_* entry points"
+
+    if [[ "$COMPILE_ONLY" == "1" ]]; then
+        ok "$ARCH: compiled; --compile-only, so nothing is staged"
+        continue
+    fi
 
     rm -rf "$PREFIX"
     mkdir -p "$PREFIX/include" "$PREFIX/lib/cmake/migo" "$PREFIX/share/migo"
@@ -323,6 +340,17 @@ done
 # The build script runs the contract itself rather than leaving it to CI. There
 # is no OpenHarmony runner, so a gate that only runs in CI would never run at
 # all -- the same reasoning the Windows SDK script already follows.
+#
+# Returning before them under --compile-only is not an omission: they read
+# `dist/migo-ohos-<arch>`, which that mode deliberately does not write, so
+# running them would gate whichever package an earlier full run happened to
+# leave behind. A gate reading a stale artifact reports PASS about bytes nobody
+# just built.
+if [[ "$COMPILE_ONLY" == "1" ]]; then
+    ok "compile-only: the package contract and API floor gate need a staged package"
+    exit 0
+fi
+
 info "running the package contract"
 for ARCH in "${ARCHES[@]}"; do
     bash "$SCRIPT_DIR/test-ohos-sdk-contract.sh" "$REPO_ROOT/dist/migo-ohos-$ARCH"

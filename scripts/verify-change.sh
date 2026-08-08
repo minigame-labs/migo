@@ -458,8 +458,16 @@ done
 
 # ------------------------------------------------------------
 # Target builds. A platform with no entry here is reported NOT PROVEN, never
-# skipped: `ohos` and `windows` conditional code has no local build on this
-# machine, and that is a fact about the evidence, not a detail to swallow.
+# skipped: `windows` conditional code has no local build on this machine, and
+# that is a fact about the evidence, not a detail to swallow.
+#
+# `ohos` was in that sentence too, and it was wrong. The OpenHarmony SDK,
+# the `*-unknown-linux-ohos` Rust target and the prebuilt V8 archive for the
+# triple are all present here, and the compile takes seconds once warm — so
+# every change to `cfg`-conditional Linux code was collecting a permanent
+# NOT PROVEN that could be evidence. Checked against the objects rather than
+# the sentence: `scripts/dev-setup-ohos.sh` resolves the SDK, and
+# `engine/third_party/rusty_v8/x86_64-linux-ohos/librusty_v8.a` is in tree.
 # ------------------------------------------------------------
 #
 # `android-java` is the Android SDK's other half. It is here because this script
@@ -479,6 +487,23 @@ target_command() {
     case "$1:$2" in
         android:compile)      echo "bash scripts/build-android-so.sh --compile-only $ABI" ;;
         android:link)         echo "bash scripts/build-android-so.sh $ABI" ;;
+        ohos:compile)
+            # Probed like `android-java`, so a machine without the OpenHarmony
+            # SDK reports NOT PROVEN rather than a FAIL that says "your change
+            # broke this" about evidence that machine never had.
+            #
+            # `x86_64` because what the lane proves is that the `target_env =
+            # "ohos"` view of the tree still compiles, and that is the same view
+            # for either architecture; it is also the one whose V8 archive and
+            # target directory are already warm.
+            #
+            # It calls the SDK script rather than restating its cargo line, so
+            # the toolchain pins keep one home.
+            if [[ -f "$ROOT/engine/third_party/rusty_v8/x86_64-linux-ohos/librusty_v8.a" ]] \
+                && bash "$ROOT/scripts/dev-setup-ohos.sh" >/dev/null 2>&1; then
+                echo "bash scripts/build-ohos-sdk.sh --compile-only x86_64"
+            fi
+            ;;
         android-java:compile)
             # Probed rather than assumed, so a machine without the Android
             # build reports NOT PROVEN like every other absent target. Running
