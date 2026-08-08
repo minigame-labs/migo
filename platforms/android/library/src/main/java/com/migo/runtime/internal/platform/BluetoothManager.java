@@ -289,6 +289,43 @@ public class BluetoothManager {
     private final Set<GattConnection> unclosedCandidates = ConcurrentHashMap.newKeySet();
 
     /**
+     * Orders every connection-state decision against its own delivery.
+     *
+     * <p><b>The bug this exists for.</b> Deciding "does this attempt still speak
+     * for the device?" and delivering the answer were two steps. A retired
+     * attempt could read "no owner", be descheduled, and deliver its
+     * {@code false} after a replacement had already published and reported
+     * {@code true} -- leaving content permanently told the device is
+     * disconnected while it is connected, until some later event happens to
+     * correct it. The decision was right when it was made; nothing kept it right
+     * until it arrived.
+     *
+     * <p><b>Why one monitor per session rather than one per device.</b> Ordering
+     * is only required between reports for the same device, so a per-device
+     * monitor is the narrowest correct answer -- and it needs a lifetime longer
+     * than the attempts it orders, because the whole point is ordering an
+     * outgoing attempt against its replacement. That means a map of monitors
+     * outliving the entries they guard, with its own eviction rule and its own
+     * bound, since content chooses the device ids. A single monitor is strictly
+     * stronger, has no lifecycle, and costs two devices' connect events the time
+     * of one queue push -- on a path that fires when a peripheral connects or
+     * drops, not per notification.
+     *
+     * <p><b>What is deliberately outside it.</b> {@code close()},
+     * {@code disconnect()} and {@code discoverServices()} are framework calls
+     * that can block, and the map mutations they accompany. Only the ownership
+     * re-check and the report itself are inside, which is sufficient: a
+     * publisher's map write happens before its own report in program order, and
+     * the monitor orders the reports, so a reader that acquires the monitor
+     * after that write sees it. Holding it across the report is safe for a
+     * reason worth stating rather than assuming -- the report is a post, not a
+     * wait: it enqueues on a bounded channel and returns, never re-enters Java
+     * and never waits on a Migo lock, which is exactly the property the
+     * permission gate's counted lease exists to preserve elsewhere.
+     */
+    private final Object connectionStateOrder = new Object();
+
+    /**
      * The value of a characteristic that reported none.
      *
      * <p>Shared because a zero-length array is immutable in every way that
@@ -1126,9 +1163,35 @@ public class BluetoothManager {
      * device's observable state, so a superseded attempt must never overwrite it.
      */
     private void reportRetiredAttemptDisconnected(String deviceId, GattAttempt attempt) {
-        GattAttempt current = gattConnections.get(deviceId);
-        if (current != null && current != attempt) return;
-        connectionStateReporter.report(deviceId, false);
+        reportConnectionState(deviceId, attempt, false);
+    }
+
+    /**
+     * Deliver one connection-state report, if the attempt making it still speaks
+     * for the device at the moment of delivery.
+     *
+     * <p>The re-check and the delivery are one step under
+     * {@link #connectionStateOrder}, which is the whole of the fix: the same
+     * check outside a monitor is a decision that can go stale between being made
+     * and being acted on.
+     *
+     * <p><b>The two directions are not symmetric, and the asymmetry is the
+     * semantics.</b> A <em>disconnect</em> from an attempt the map no longer
+     * holds is precisely the report that must arrive -- retirement is what
+     * removed the entry. A <em>connect</em> from an attempt the map no longer
+     * holds must not: no owner means nothing is entitled to claim the device is
+     * connected. Reporting `connected` unconditionally is how a superseded
+     * attempt's late service-discovery result used to overwrite a completed
+     * teardown.
+     */
+    private void reportConnectionState(String deviceId, GattAttempt attempt, boolean connected) {
+        synchronized (connectionStateOrder) {
+            GattAttempt current = gattConnections.get(deviceId);
+            if (connected ? current != attempt : current != null && current != attempt) {
+                return;
+            }
+            connectionStateReporter.report(deviceId, connected);
+        }
     }
 
     private void discoverGattServicesAndReport(
@@ -1150,7 +1213,7 @@ public class BluetoothManager {
                         "BLE service discovery cleanup", cleanupFailure);
             }
         }
-        connectionStateReporter.report(deviceId, discovered);
+        reportConnectionState(deviceId, attempt, discovered);
     }
 
     /**
@@ -1173,6 +1236,19 @@ public class BluetoothManager {
 
     int uuidTextCacheSizeForTests() {
         return uuidText.size();
+    }
+
+    /**
+     * The report-ordering monitor, so a test can hold it and choose the
+     * interleaving instead of hoping for one.
+     *
+     * <p>Exposed for the same reason the Rust contention probe is handed a
+     * registry's lock: the property under test is that a decision and its
+     * delivery are one step, and the only way to demonstrate that is to stop a
+     * thread between them -- which requires holding what it will block on.
+     */
+    Object connectionStateOrderForTests() {
+        return connectionStateOrder;
     }
 
     boolean hasGattConnection(String deviceId, GattConnection connection) {
