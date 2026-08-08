@@ -244,6 +244,14 @@ reviews are user-triggered (§6).
 
 ### 3.3 Next, in value order
 
+0. **Decide what to do with `feat/capi-ads-and-permissions` before anything else
+   touches `crates/capi`.** Three commits, ~1730 insertions, **never pushed**, and
+   it implements most of item 0.11. Its merge-base is PR #21 and it already
+   conflicts in four files, two of which this session changed — every further edit
+   to `capi/src/{lib,surface,test_support}.rs` makes it more expensive. It is the
+   only genuinely unmerged work in the repository; item 0.11 has the detail. A
+   `git branch -D` loses it, because there is no remote copy.
+
 1. **The remaining phase-0 epics**: 0.7/A7 (Android capability enforcement, 30
    protected and 8 cleanup operations), 0.8/A8, 0.9/A9, 0.10/A10, 0.11/A11, 0.13
    HarmonyOS, 0.14/A13. Most have their own detailed plan named in the ledger entry.

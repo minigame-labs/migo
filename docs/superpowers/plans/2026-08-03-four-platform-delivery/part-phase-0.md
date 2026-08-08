@@ -300,11 +300,41 @@
 - [ ] 0.8 A8: retained-intrinsic host bridge, mounted-module URL validation,
   ad-event authority, late callback rejection, reliable asynchronous host-result
   lane.
+
+  Five clauses in one line, and at least one is already satisfied: ad-event
+  authority is item 0.12's third clause, closed there. Before starting, split them
+  and check each against its object — `scripts/test-host-bridge-channel-contract.sh`
+  and `scripts/test-ad-reward-integrity-contract.sh` both run in the gate and both
+  pass. The C ABI callback half overlaps the branch recorded under item 0.11.
 - [ ] 0.9 A9: runtime restart as a callback and resource ownership boundary.
   Plan: `2026-08-02-runtime-restart-generation-boundary.md` (12 tasks).
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.
+
+  ⚠️ **An implementation of most of this already exists, on a local branch that has
+  never been pushed. Found 2026-08-09 while auditing branches, not from any record.**
+  `feat/capi-ads-and-permissions`, three commits, ~1730 insertions across 16 files —
+  `capi-abi/src/permission.rs` (232 lines), `capi/src/permission.rs` (356),
+  `capi/src/callbacks.rs`, `include/migo/session.h` (+308) and the three
+  `tests/c_abi/*` contract clients. Neither `permission.rs` exists on `master`.
+
+  It is the **only** genuinely unmerged work in the repository: every other local
+  branch is either content-merged (`perf/audio-realtime-gates`' ID3 fix and
+  `perf/ble-notification-path` both landed by squash, so `git rev-list --count`
+  still shows them "ahead" while the content is in) or already at its upstream.
+
+  **It is not landed here, deliberately.** Its merge-base is `d41389d` (PR #21) with
+  `master` now at #31, and `git merge-tree` reports content conflicts in
+  `capi/src/lib.rs`, `capi/src/surface.rs`, `capi/src/test_support.rs` and
+  `tests/c_abi/core_contract.c`. Two of those are files item 0.2's retirement work
+  touched in this session, so the conflict surface grew slightly. Landing 1730 lines
+  of new public C ABI — headers, layout assertions, an all-or-none callback group —
+  from an unpushed branch of unknown intent is not a verification task; it needs a
+  decision about the surface first.
+
+  **Recorded because it is one `git branch -D` from gone**, and because a later
+  session reading only this ledger would write it a second time.
 - [ ] 0.12 A12: reject invalid host pixel ratios, canonicalise Windows game
   identity, and settle a missing ad handler through its documented error path.
   **Implementation, tests, mutation evidence and fresh verification are done and
