@@ -217,16 +217,61 @@ through its documented error path rather than leaving it pending."*
   three, so a seventh ad op is covered, and (b) a Rust test that a hosted
   `CustomAd.hide()` asks the host rather than self-firing `onHide`.
 
-- **Windows game identity: investigation dispatched but not returned.** Start
-  from `HostJsRuntime::evaluate_module` building
-  `GamePaths::new(files_dir, cache_dir, game_id)`
-  (`engine/crates/runtime-v8/src/host_runtime.rs`, ~831 and ~942), which is what
-  `crate::storage::storage_dir` resolves against. The question is whether the
-  shared canonicaliser is sufficient on Windows: case-insensitivity, backslash
-  separators, reserved device names (`CON`, `NUL`, `COM1`…), trailing dots and
-  spaces silently stripped by the filesystem, and alternate data streams
-  (`name:stream`) can each make two distinct game ids collide on one directory —
-  which would breach per-game storage isolation, a shipped invariant.
+- **Windows game identity: investigated 2026-08-08. A12's clause is wrong as
+  written, and there is one real defect underneath it.**
+
+  **There is no Windows-specific game-identity code at all**, so there is nothing
+  to "canonicalize with the same rules as the other platforms" — every platform
+  already runs one shared function, `validate_game_id`
+  (`engine/crates/shared/src/vfs/game_paths.rs:50`), an allowlist of
+  `[a-zA-Z0-9_-]{1,64}` with **zero `#[cfg]`**. The sole construction site is
+  `GamePaths::new` (`:110-113`), reached from both entry paths (C ABI
+  `capi/src/lib.rs:673`, Android JNI `inbound.rs:800`). Android's Java SDK
+  duplicates the identical rule at
+  `platforms/android/library/src/main/java/com/migo/runtime/GamePaths.java:24`.
+  The ledger's premise — that Windows diverges — is false.
+
+  **The true residual: the rule is case-preserving and does not case-fold.**
+  Every other hazard is already blocked by the allowlist (`\`, `/`, `..`, ADS
+  `name:stream`, trailing dots and spaces, `\\?\`, and 8.3 short names, which
+  always contain `~`). Reserved device names (`CON`, `NUL`, `COM1`…) pass the
+  allowlist but cost availability only — `ensure_directories()` fails and
+  `evaluate_module` returns `IoError`; no collision, no escape. **Case is the
+  live one**, and `game_paths.rs:336` pins the ingredient with
+  `assert!(validate_game_id("GAME").is_ok())`.
+
+  **The scenario, in testable form:** game ids `PuzzleQuest` and `puzzlequest`
+  both pass validation and, on a case-insensitive filesystem, resolve to the same
+  `…\migo\games\puzzlequest\…`. The second title reads the first's saves, its
+  `wx.clearStorage()` wipes them, and they share the 10 MB quota — exactly what
+  the per-game split exists to prevent. `code_dir` collides too, so the second
+  title's deployed code overwrites the first's. **Not a content-driven escape**
+  (the host chooses the id, and id uniqueness is already the host's documented
+  obligation), but a cross-platform divergence in an isolation boundary: a host
+  that deduplicates ids by exact string is correct on three platforms and wrong
+  on the fourth.
+
+  **Fix the shared rule; do not add a `#[cfg(windows)]` branch** — a
+  Windows-only fold would make one id resolve differently per platform, so
+  content moved between platforms would lose its data, and the Java gate would
+  disagree with the Rust one. Two shapes, pick one: **(a) reject** — narrow the
+  allowlist to lower-case, failing closed, at the cost of stranding existing
+  mixed-case directories; or **(b) fold** — lower-case the path component in
+  `GamePaths::new` while `game_id()` keeps the host's spelling, making Windows
+  behaviour the *defined* behaviour, at the cost of silently merging two ids an
+  Android host previously kept apart. Whichever is chosen, `GamePaths.java:24`
+  and `MigoRuntime.java:411` must move in lockstep or the two gates disagree.
+  Separately, reserved device names should be rejected on **every** platform, for
+  the same reason the rest of the rule is portable.
+
+  **No existing test can see this.** `test_valid_game_ids`/`test_invalid_game_ids`
+  (`game_paths.rs:333`, `:342`) cover traversal and separators, no case pair and
+  no reserved name. `storage_isolation.rs` and `two_session_identity.rs` use ids
+  differing in more than case, and — the important part — compare `PathBuf`s,
+  **a comparison structurally blind to a case-insensitive filesystem**. The new
+  property needs a test that touches the disk: create under `GameA`, write a
+  marker, then open `gamea` and assert the marker is invisible. There is no Java
+  test for `isValidGameId` at all.
 
 ### 3.2 Make the host suites selective (speed, ~1 session)
 
