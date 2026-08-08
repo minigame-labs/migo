@@ -500,10 +500,21 @@ tasks.register('pitestFullDebug', JavaExec) {
         // pitest accepts multiple --classPath arguments (one per entry).
         // Passing a single colon-joined string treats the whole value as ONE
         // opaque classpath element; pitest then cannot find the target classes.
+        // Scope, overridable per run. The full package is 4,400 mutations and about
+        // eight minutes, which is a per-batch cost, not a per-edit one -- narrowing to
+        // the class under change brings it under a minute:
+        //   ./gradlew :library:pitestFullDebug -PpitestClasses=com.migo.runtime.internal.TouchEventHandler*
+        // The default stays the whole package so an unscoped run cannot quietly
+        // measure less than the last one did.
+        def targetClasses = project.findProperty('pitestClasses')
+                ?: 'com.migo.runtime.internal.*'
+        def targetTests = project.findProperty('pitestTests')
+                ?: 'com.migo.runtime.internal.*'
+
         def pitestArgs = [
             '--reportDir',            reportDir.get().asFile.absolutePath,
-            '--targetClasses',        'com.migo.runtime.internal.*',
-            '--targetTests',          'com.migo.runtime.internal.*',
+            '--targetClasses',        targetClasses,
+            '--targetTests',          targetTests,
             // A mutated test is not a finding. Without this the survivor count is
             // mostly mutations of the assertions themselves, which buries the
             // production survivors that are the point of running this.

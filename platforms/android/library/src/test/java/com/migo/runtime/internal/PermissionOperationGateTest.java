@@ -76,6 +76,81 @@ public final class PermissionOperationGateTest {
      * The admitted case is asserted here too: without it, a gate that refused everything
      * would satisfy both refusal assertions.
      */
+    /**
+     * The verdicts callers act on, asserted as verdicts.
+     *
+     * Mutation testing found `enter`, `runIfGranted` and `register` returning constants
+     * and killing nothing: the suite drove their state machine thoroughly and then looked
+     * only at side effects. That is a gate covering the half it was designed for -- the
+     * caller does not see the side effect, it sees the boolean, and
+     * `NativeExports.runIfPermissionGranted` hands that boolean straight to a JNI return.
+     *
+     * Each assertion below is paired with its opposite polarity, because a method pinned
+     * only where it returns false is satisfied by one that always returns false.
+     */
+    @Test
+    public void admittedAndRefusedOperationsReportOppositeVerdicts() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertEquals(Admission.ADMITTED, gate.admit(3401));
+        assertNull(gate.update(3401, "scope.camera", true, () -> true).failure());
+
+        List<String> ran = new ArrayList<>();
+
+        PermissionOperationGate.Pending granted = gate.register(3401, "scope.camera");
+        assertNotNull("a granted scope must yield a usable lease", granted);
+        assertTrue(
+                "an admitted framework call reports success",
+                gate.enter(granted, () -> ran.add("admitted")));
+        assertEquals(Collections.singletonList("admitted"), ran);
+
+        // Same lease, after it is finished: the refusal is the same call reporting the
+        // opposite verdict, so neither polarity can be a constant.
+        gate.finish(granted);
+        assertFalse(
+                "a finished lease admits nothing and says so",
+                gate.enter(granted, () -> ran.add("after-finish")));
+        assertEquals(Collections.singletonList("admitted"), ran);
+
+        assertFalse("a null lease is refused, not dereferenced", gate.enter(null, () -> {
+            ran.add("null-lease");
+        }));
+        assertEquals(Collections.singletonList("admitted"), ran);
+    }
+
+    /**
+     * `runIfGranted` returns the callback's own verdict, not a verdict of its own.
+     *
+     * The op behind it reports success or failure to content, so a gate that collapsed
+     * this to a constant would either swallow every failure or discard every success.
+     * A denied scope is asserted too, and it must not run the callback at all.
+     */
+    @Test
+    public void runIfGrantedForwardsTheCallbacksOwnVerdict() {
+        PermissionOperationGate gate = new PermissionOperationGate();
+        assertEquals(Admission.ADMITTED, gate.admit(3402));
+        assertNull(gate.update(3402, "scope.record", true, () -> true).failure());
+
+        assertTrue(
+                "a callback that succeeded is reported as success",
+                gate.runIfGranted(3402, "scope.record", () -> true));
+        assertFalse(
+                "a callback that failed is reported as failure",
+                gate.runIfGranted(3402, "scope.record", () -> false));
+
+        List<String> ran = new ArrayList<>();
+        assertFalse(
+                "an ungranted scope is refused",
+                gate.runIfGranted(3402, "scope.userLocation", () -> {
+                    ran.add("ungranted");
+                    return true;
+                }));
+        assertTrue("a refused admission must not run its callback", ran.isEmpty());
+
+        assertFalse(
+                "an unknown session is refused",
+                gate.runIfGranted(9999, "scope.record", () -> true));
+    }
+
     @Test
     public void admissionSaysWhetherARefusedIdIsLiveOrRetired() {
         PermissionOperationGate gate = new PermissionOperationGate();
