@@ -33,6 +33,11 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 migo-core = { path = "../core", default-features = false, features = ["test-support"] }
+# The X11 arm of `build_target` decides whether a reattachment reuses the owned
+# render connection or opens another, and only the connection can answer that.
+# Enabled from here so the seam exists for this crate's tests and in no shipped
+# build, the same arrangement `migo-core/test-support` already uses.
+platform = { package = "migo-platform", path = "../platform", default-features = false, features = ["test-support"] }
 # Test-only by construction: a `[dependencies]` entry here would carry a
 # `#[global_allocator]` into the cdylib this crate exists to produce.
 migo-alloc-probe = { path = "../../testing/alloc-probe", default-features = false }

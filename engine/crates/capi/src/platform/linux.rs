@@ -186,6 +186,7 @@ mod tests {
         MIGO_ABI_VERSION_CURRENT, VersionedHeader,
         surface::{MigoSurfaceDescriptor, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor},
     };
+    use platform::linux::presenter::X11TestServers;
 
     fn envelope(kind: u32, payload_size: usize, payload: *const c_void) -> MigoSurfaceDescriptor {
         MigoSurfaceDescriptor {
@@ -304,5 +305,112 @@ mod tests {
         // from the stored context before Xlib can inspect that pointer.
         let different_kind = build_target(x11_descriptor(0x4000), Some(&context)).err();
         assert_eq!(different_kind, Some(MIGO_ERROR_INVALID_STATE));
+    }
+
+    // ---- X11 ----
+    //
+    // These drive `build_target` down the X11 arm against a declared server
+    // topology rather than a display server, so they run anywhere. What they
+    // cannot cover is the cold arm: `existing: None` calls
+    // `LinuxX11Context::open`, which loads Xlib and dereferences the host
+    // `Display*`. That one needs a live server and is covered by
+    // `x11_connection`'s `native_owned_connection_round_trip` under `xvfb-run`.
+
+    const TEST_SERVER: u8 = 7;
+    const OTHER_SERVER: u8 = 8;
+
+    fn display(address: usize) -> NonNull<c_void> {
+        NonNull::new(address as *mut c_void).expect("test display address is non-null")
+    }
+
+    /// A host display, its private render connection, and the stored context a
+    /// second attach would find -- all on `TEST_SERVER`.
+    fn attached_x11(servers: &mut X11TestServers) -> (NonNull<c_void>, PlatformContext) {
+        let host = display(0x1000);
+        let render = display(0x2000);
+        servers.place(host, TEST_SERVER).place(render, TEST_SERVER);
+        let context = LinuxX11Context::open_on_test_servers(servers, host, render)
+            .expect("cold X11 attach must open the owned render connection");
+        assert_eq!(
+            servers.opens(),
+            1,
+            "a cold attach opens exactly one context"
+        );
+        (host, PlatformContext::X11(context))
+    }
+
+    #[test]
+    fn x11_reattachment_to_the_same_server_reuses_the_one_owned_connection() {
+        let mut servers = X11TestServers::new();
+        let (host, stored) = attached_x11(&mut servers);
+        let PlatformContext::X11(ref installed) = stored else {
+            panic!("stored context changed platform kind");
+        };
+        let installed_platform = installed.graphics_platform();
+
+        let (_, reused_platform, target, returned) =
+            build_target(x11_descriptor(host.as_ptr() as usize), Some(&stored))
+                .expect("the same X11 server must reattach");
+
+        assert_eq!(
+            servers.opens(),
+            1,
+            "reattachment must reuse the owned connection, not open a second one"
+        );
+        assert_eq!(
+            installed_platform.platform_identity(),
+            reused_platform.platform_identity()
+        );
+        assert!(Arc::ptr_eq(
+            installed_platform.egl_provider(),
+            reused_platform.egl_provider()
+        ));
+        assert!(Arc::ptr_eq(
+            installed_platform.surface_factory(),
+            reused_platform.surface_factory()
+        ));
+        let PlatformContext::X11(returned) = returned else {
+            panic!("returned context changed platform kind");
+        };
+        assert_eq!(
+            returned.graphics_platform().platform_identity(),
+            installed_platform.platform_identity(),
+            "the context handed back for storage must be the one already installed"
+        );
+
+        // A resize rebuilds from the retained target, which carries the same
+        // connection structurally -- so it cannot reach a server either.
+        rebuild_surface(target, 1024, 768).expect("a resize must rebuild from the retained target");
+        assert_eq!(servers.opens(), 1, "a resize must not open a connection");
+    }
+
+    #[test]
+    fn x11_window_from_a_foreign_server_is_refused_and_opens_nothing() {
+        let mut servers = X11TestServers::new();
+        let (_, stored) = attached_x11(&mut servers);
+        let foreign = display(0x3000);
+        servers.place(foreign, OTHER_SERVER);
+
+        let error = build_target(x11_descriptor(foreign.as_ptr() as usize), Some(&stored)).err();
+
+        assert_eq!(error, Some(MIGO_ERROR_INVALID_STATE));
+        assert_eq!(
+            servers.opens(),
+            1,
+            "a refused reattachment must not open a connection to the foreign server"
+        );
+    }
+
+    #[test]
+    fn a_stored_x11_context_refuses_a_wayland_descriptor() {
+        // The other side of the guard `platform_context_rejects_display_or_kind_change`
+        // covers: that one starts from Wayland, so a Wayland arm that ignored an
+        // installed X11 context would still have passed it.
+        let mut servers = X11TestServers::new();
+        let (_, stored) = attached_x11(&mut servers);
+
+        let error = build_target(wayland_descriptor(0x1000, 0x2000), Some(&stored)).err();
+
+        assert_eq!(error, Some(MIGO_ERROR_INVALID_STATE));
     }
 }

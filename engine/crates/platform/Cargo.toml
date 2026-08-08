@@ -15,6 +15,12 @@ crate-type = ["rlib"]
 
 [features]
 default = ["profile-full"]
+# Test-only seams that have to cross a crate boundary. Named and enabled the way
+# `migo-core/test-support` already is -- only from a `[dev-dependencies]` entry,
+# which resolver 2 keeps out of every shipped build. It exists because the C ABI
+# layer's X11 arm is two crates away from the connection it must not reopen, so
+# `#[cfg(test)]`, which does not cross crates, cannot reach it.
+test-support = []
 profile-full = ["v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "migo-core/profile-full", "graphics/profile-full"]
 profile-slim = ["v8-limits", "code-signing", "migo-core/profile-slim", "graphics/profile-slim"]
 worker-snapshot = ["migo-core/worker-snapshot"]
