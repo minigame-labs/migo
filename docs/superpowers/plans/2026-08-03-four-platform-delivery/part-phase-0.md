@@ -289,14 +289,69 @@
 - [ ] 0.7 A7: finish Android capability enforcement and revocation across all 30
   protected and 8 cleanup operations.
 
-  Starting note, 2026-08-09, from checking the numbers rather than the sentence:
-  they are current and they are already **derived**, not counted by hand.
-  `scripts/test-permission-coverage-contract.sh` reports "30 gated op(s), 8 cleanup
-  op(s), 38 permission-sensitive op(s)" and fails if an op is in both tables,
-  neither, or carries the wrong wrapper. So the inventory and its classification are
-  enforced; what is open is the enforcement and revocation *behaviour* at those
-  points. This item has no detailed plan of its own — write one before starting, and
-  scope it against that gate's output rather than a fresh survey.
+  **Audited 2026-08-09 against the spec's own wording, and it is substantially
+  implemented — the one-line summary above is what hid that.** The authority is
+  the design document's acceptance line: *"Every protected platform operation has a
+  declaration appropriate to its product profile and explicit runtime permission and
+  revocation handling, on Android and HarmonyOS alike."* That is three properties,
+  and each was checked against the object rather than the sentence.
+
+  **1. Declaration appropriate to the profile — enforced.**
+  `scripts/test-permission-coverage-contract.sh` parses both Android manifests: every
+  gated scope's permission must be declared in Full, no dangerous permission may
+  merge into Slim, and `maxSdkVersion` must match. It carries self-tests that delete
+  a permission and inject a dangerous Slim one and require the parser to reject both.
+
+  **2. Runtime recheck before entering the framework — enforced structurally, for
+  all 38.** The same gate reports "30 gated op(s), 8 cleanup op(s), 38
+  permission-sensitive op(s)"; the inventory is derived from the service accessors,
+  every matched op must appear in exactly one policy table, gated entries must
+  contain the guard and cleanup entries must not. It strips comments first, so a
+  `// require_scope(...)` reads as nothing rather than as protection.
+
+  **3. Revocation without a leaked resource — two mechanisms, both wired.** Tracing
+  it end to end rather than trusting the class names:
+  `PermissionOperationGate.update(..., granted=false)` (`:128`) drains in-flight
+  operations with `awaitIdle`, then `ResourceCleanup.runAll` runs *both*
+  `runCancellations` and the native update. Cancellations are how a *pending
+  operation* releases what it holds — `LocationProvider.java:412`
+  `pending.setCancellation(() -> request[0].cancel(fallback))` is what removes a
+  retained `LocationListener`, so location needs no special case anywhere.
+  Separately, the native side decides on device objects that outlive one operation:
+  `android_permission_gate.rs:131` calls the cleanup closure only when the scope was
+  revoked, reaching `inbound.rs:1346 permission_revoke_resources` → JNI
+  `revokePermissionResources` → `PermissionRevocation.tearDown`, which routes
+  camera, recorder and bluetooth.
+
+  **The HarmonyOS half is satisfied by construction, and that chain is worth
+  recording because "no implementation" reads like a hole.** There is exactly one
+  `impl PermissionService for` on any platform and it is Android's. OpenHarmony
+  therefore takes the default: `DeviceServices::permission()` returns `None`
+  (`shared/src/services/device.rs:645`), `scope_state` maps that to
+  `ScopeState::Unknown` (`runtime-v8/src/permission.rs:105-113`), and the trait's
+  own defaults refuse — `request_scope` returns
+  `authorize:fail no permission handler`, pinned by
+  `the_default_implementation_grants_nothing`. The package matches: the OHOS SDK is
+  built `--no-default-features --features profile-slim`, Slim carries none of the
+  five optional API groups (`test-product-profiles.sh`), and
+  `platforms/openharmony/entry/src/main/module.json5` declares **no**
+  `requestPermissions` at all. Declared permissions cannot exceed honoured
+  capabilities when there are none of either.
+
+  **One unenforced invariant, recorded rather than built.**
+  `PermissionRevocation.tearDown`'s `switch (scope)` ends in `default: break;`, so a
+  scope that acquires a device object and is not added to the switch would be
+  revoked with nothing torn down, silently. No current scope is in that position —
+  the twelve unrouted ones are request/response, and location is pending-modelled —
+  so a gate for it today would be a guard that cannot fail, and the declaration it
+  would need does not exist. It is a hazard for whoever adds the sixteenth scope,
+  which is why it is written down here rather than mechanised now.
+
+  **What is actually still open:** no mutation evidence was taken for the Rust half
+  of this machinery (the Java half's permission cluster is covered — see T.4, where
+  its only surviving mutants are provably equivalent), the HarmonyOS statement above
+  is a source-and-package argument rather than device evidence (0.13 owns that), and
+  neither independent review has run.
 - [ ] 0.8 A8: retained-intrinsic host bridge, mounted-module URL validation,
   ad-event authority, late callback rejection, reliable asynchronous host-result
   lane.
