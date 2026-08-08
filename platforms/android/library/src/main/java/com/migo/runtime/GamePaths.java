@@ -1,6 +1,9 @@
 package com.migo.runtime;
 
 import java.io.File;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -20,8 +23,35 @@ import java.util.regex.Pattern;
  */
 public final class GamePaths {
 
-    // Game ID validation: alphanumeric, underscore, hyphen, 1-64 chars
-    private static final Pattern GAME_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]{1,64}$");
+    // Game ID validation: lower-case alphanumeric, underscore, hyphen, 1-64
+    // chars. This rule is `shared::vfs::game_paths::validate_game_id` in the
+    // engine, and the two must move together: the engine refuses a session
+    // whose id this class accepted. Both sides are pinned by the shared table
+    // in engine/crates/shared/src/vfs/game-id-vectors.txt.
+    private static final Pattern GAME_ID_PATTERN = Pattern.compile("^[a-z0-9_-]{1,64}$");
+
+    /**
+     * Ids that name a device rather than a file on Windows.
+     *
+     * <p>Refused here too, on Android, so that one id is valid on every
+     * platform the runtime targets or on none of them. A host that ships the
+     * same catalogue to a Windows build would otherwise find these titles
+     * unable to create their storage directory there and nowhere else.
+     */
+    private static final Set<String> RESERVED_GAME_IDS = reservedGameIds();
+
+    private static Set<String> reservedGameIds() {
+        Set<String> reserved = new HashSet<>();
+        reserved.add("con");
+        reserved.add("prn");
+        reserved.add("aux");
+        reserved.add("nul");
+        for (char digit = '0'; digit <= '9'; digit++) {
+            reserved.add("com" + digit);
+            reserved.add("lpt" + digit);
+        }
+        return Collections.unmodifiableSet(reserved);
+    }
 
     private static final String MIGO_GAMES_DIR = "migo/games";
 
@@ -41,7 +71,7 @@ public final class GamePaths {
     public GamePaths(RuntimeConfig config, String gameId) {
         if (!isValidGameId(gameId)) {
             throw new IllegalArgumentException(
-                "Invalid gameId: must be 1-64 alphanumeric characters, underscore or hyphen");
+                "Invalid gameId: must be 1-64 lower-case alphanumeric characters, underscore or hyphen, and not a reserved device name");
         }
         this.gameId = gameId;
 
@@ -59,11 +89,19 @@ public final class GamePaths {
     /**
      * Validate a game ID.
      *
+     * <p>Lower case only, and never a reserved device name. The id becomes one
+     * path component per game and that component is the storage isolation
+     * boundary, so it has to mean the same thing on a case-insensitive
+     * filesystem as it does here: {@code PuzzleQuest} and {@code puzzlequest}
+     * are two games on Android and one directory on Windows.
+     *
      * @param gameId The game ID to validate
      * @return true if valid
      */
     public static boolean isValidGameId(String gameId) {
-        return gameId != null && GAME_ID_PATTERN.matcher(gameId).matches();
+        return gameId != null
+                && GAME_ID_PATTERN.matcher(gameId).matches()
+                && !RESERVED_GAME_IDS.contains(gameId);
     }
 
     /**

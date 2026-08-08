@@ -410,7 +410,7 @@ public final class MigoRuntime {
     private void validateGameId(String gameId) {
         if (!GamePaths.isValidGameId(gameId)) {
             throw new MigoException(ErrorCode.ERR_INVALID_CONFIG,
-                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG) + ": Invalid gameId: must be 1-64 alphanumeric characters, underscore or hyphen");
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG) + ": Invalid gameId: must be 1-64 lower-case alphanumeric characters, underscore or hyphen, and not a reserved device name");
         }
     }
 

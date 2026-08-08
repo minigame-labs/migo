@@ -837,7 +837,7 @@ impl HostJsRuntime {
     /// then sets up the VFS for sandboxed file access.
     ///
     /// # Arguments
-    /// * `game_id` - Unique game identifier (1-64 alphanumeric, underscore, hyphen)
+    /// * `game_id` - Unique game identifier (1-64 lower-case alphanumeric, underscore, hyphen)
     /// * `entry` - Entry point file (e.g., "main.js")
     pub async fn evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
         let t_eval = Instant::now();

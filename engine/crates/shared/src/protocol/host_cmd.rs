@@ -300,7 +300,7 @@ pub enum HostCommand {
     /// }
     /// ```
     EvaluateModule {
-        /// Unique game identifier (1-64 alphanumeric, underscore, hyphen).
+        /// Unique game identifier (1-64 lower-case alphanumeric, underscore, hyphen).
         /// Used to derive all game paths from base directories.
         game_id: String,
         /// Entry point module filename (e.g., “main.js”, “game.js”).
