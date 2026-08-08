@@ -175,6 +175,14 @@ pub(crate) struct Host {
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
     network_policy: shared::op_state::NetworkPolicy,
+
+    /// The Host's one callback-id space. Cloned into every `HostOpState`,
+    /// including each Worker's, and never rebuilt on restart.
+    callback_ids: Arc<shared::callback_id::CallbackIdAllocator>,
+
+    /// The only thing that may advance the runtime generation. Everything else
+    /// holds a `RuntimeGenerationReader`.
+    restart_boundary: crate::runtime::restart_boundary::RestartBoundary,
     render_events: RenderEventReceiver,
 
     last_game_id: Option<String>,
@@ -318,6 +326,7 @@ impl Host {
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
         surface_control: Arc<shared::surface::SurfaceControl>,
+        restart_boundary: crate::runtime::restart_boundary::RestartBoundary,
     ) -> EngineResult<Self> {
         // ---- Startup timing instrumentation ----
         let t_start = Instant::now();
@@ -467,7 +476,10 @@ impl Host {
         // `context_lost` was created above (before the render thread, which is
         // its authoritative writer).
 
+        let callback_ids = Arc::new(shared::callback_id::CallbackIdAllocator::default());
         let host_state = HostOpState {
+            callback_ids: Arc::clone(&callback_ids),
+            runtime_generation: restart_boundary.current(),
             id,
             code_dir: None,
             game_paths: None,  // Set when evaluating a module
@@ -599,6 +611,8 @@ impl Host {
 
         let host = Self {
             id,
+            callback_ids,
+            restart_boundary,
             render,
             audio,
             js: JsRuntimeSlot::new(js),
@@ -1457,6 +1471,10 @@ impl Host {
         let device_services = self.platform.create_device_services(self.id);
 
         let host_state = HostOpState {
+            // Until an unpublished candidate exists (task 10), a restart keeps
+            // the live generation; the allocator is never rebuilt.
+            callback_ids: Arc::clone(&self.callback_ids),
+            runtime_generation: self.restart_boundary.current(),
             id: self.id,
             code_dir: None,
             game_paths: None,

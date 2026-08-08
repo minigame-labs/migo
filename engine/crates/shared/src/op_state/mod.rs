@@ -231,6 +231,19 @@ pub struct HostOpState {
     /// wait and snapshot when their decode worker starts, so the one-way AHB
     /// circuit breaker is observed by queued work.
     pub gpu_caps: Arc<crate::device::gpu_caps::GpuCaps>,
+    /// The Host's one callback-id space, shared with every Worker.
+    ///
+    /// Shared rather than per-runtime because a restart must not reissue an id
+    /// the retired runtime already handed to the platform: the reply would then
+    /// match a registration made by the replacement. Workers clone this `Arc`
+    /// for the same reason — two spaces in one Host is two chances to collide.
+    pub callback_ids: Arc<crate::callback_id::CallbackIdAllocator>,
+    /// The runtime generation this state belongs to.
+    ///
+    /// Copied from the Host's `RestartBoundary` when the state is built, and
+    /// never advanced from here: this is the stamp a callback carries so the
+    /// Host can reject work created by a runtime that has since been retired.
+    pub runtime_generation: i64,
 }
 
 /// Shared GL context-loss state. The render thread is the **sole writer** and

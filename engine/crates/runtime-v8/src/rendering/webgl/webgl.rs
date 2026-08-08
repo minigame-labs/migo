@@ -84,6 +84,10 @@ mod tests {
 
         (
             HostOpState {
+                callback_ids: std::sync::Arc::new(
+                    shared::callback_id::CallbackIdAllocator::default(),
+                ),
+                runtime_generation: 1,
                 id: 1,
                 app_cache_dir: PathBuf::from("/tmp/cache"),
                 app_files_dir: PathBuf::from("/tmp/files"),

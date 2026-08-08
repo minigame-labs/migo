@@ -214,6 +214,8 @@ mod host_watchdog_tests {
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         HostOpState {
+            callback_ids: std::sync::Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
             id: 1,
             app_cache_dir: cache_dir,
             app_files_dir: files_dir,

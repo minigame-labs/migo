@@ -150,6 +150,8 @@ mod tests {
         let (render_tx, _render_rx) = CommandSender::new();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
         let host = HostOpState {
+            callback_ids: std::sync::Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
             id: 1,
             app_cache_dir: std::path::PathBuf::from("/tmp/cache"),
             app_files_dir: std::path::PathBuf::from("/tmp/files"),
