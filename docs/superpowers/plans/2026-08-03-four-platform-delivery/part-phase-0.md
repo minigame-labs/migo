@@ -542,31 +542,59 @@
   `master` were already stale, so this does not add a new class of problem — it
   adds one more reason the regeneration round matters.
 
-  **Task 4 is specified but not started, and its shape is now known rather than
-  guessed.** Three modules — `system/13_login.js`, `payment/01_payment.js`,
+  **Task 4 done 2026-08-09, as a subset for the same reason task 3 was.** Three modules — `system/13_login.js`, `payment/01_payment.js`,
   `base/04_subpackage.js` — each own a module-local `_nextRequestId` starting at
   1, send it out with the request and match it on return, which is the same
   defect `createDeferredApi` had. Payment carries the extra weight: a
   mis-correlated settle there is visible as money.
 
-  Three things to know before starting it:
+  **The "six error conventions" problem dissolved once the code was read rather
+  than counted.** Every login and payment call site already wraps its host call
+  in a `try` whose `catch` *is* that API's failure convention — including
+  `reject` on the Promise-returning ones. Moving the allocation inside that same
+  `try`, ahead of the pending-map insertion, means an exhausted id space takes
+  the site's own existing path with **no new failure-handling code anywhere**.
+  Subpackage was the one exception: its early local-execute returns come before
+  any `try`, so it got a small guard shaped like `_settle`'s own report. Eight
+  sites, not the six the plan implies — login has five, not three.
 
-  * **`02_async.js` does not export the helpers yet.** Task 4 says to import
-    `allocateHostCallbackId` and `parseHostCallbackId` from it; its export list is
-    `{ wrapAsync, promisify, createDeferredApi, createListenerGroup,
-    createCallbackEvent, errorToString }`. Add them there first.
-  * **Its step 3 removes payment's two FIFO branches** (`_pendingMidas`,
-    `_pendingMidasGameItem`). That is the same hazard as task 3's, and payment is
-    *not* in task 6's file list, so whether its platform side echoes the id is
-    unverified. Land the safe subset — allocator plus strict parsing, fallback
-    kept for the *absent* case only — exactly as task 3 did, and delete the
-    branches when the platform side is confirmed.
-  * **Allocation can now throw**, and the plan requires it to fail *before* any
-    pending-map insertion or host call while preserving each API's existing
-    `fail`/`complete` shape. That is six call sites (login 3, payment 2,
-    subpackage 1), each with its own error convention to match. It is the part
-    that wants care rather than speed: a wrong-shaped failure on the payment path
-    is worse than the defect being fixed.
+  **A correction worth recording, because it was mine.** The previous entry
+  stopped short of this task on the grounds that "a wrong-shaped failure on the
+  payment path is worse than the defect being fixed". That weighed the two wrong.
+  Allocation fails only at `i32::MAX` ids in one Host lifetime — effectively
+  unreachable — while the defect being fixed is reachable on every restart: a
+  late Midas result from the retired runtime settling a new purchase. An
+  unreachable cosmetic risk was allowed to outrank a reachable money-path one.
+
+  **Payment's two FIFO branches stay**, absent-key only, with the reason at the
+  code. Payment is *not* in task 6's file list, so whether its platform side
+  echoes the id is unverified — and for money the direction is obvious: a
+  discarded result is recoverable, a result settled against the wrong purchase is
+  not.
+
+  **The first version of the test asserted the product configuration, and the
+  Slim lane caught it.** It probed three APIs and required a fixed total of four
+  ids; Slim drops commerce, so `wx.requestMidasPayment` does not exist there and
+  the total was three — `FAIL host … --features profile-slim`, on a change that
+  was correct. The test now brackets each API individually between two
+  allocations and requires the gap to be exactly one, skipping an API the profile
+  does not ship. It also needed a configured subpackage in the harness:
+  `loadSubpackage` fails resolution before it reaches the allocation, and an
+  unreached allocation site looks exactly like one that does not allocate.
+
+  **Mutation evidence, taken against the final shape of the test rather than the
+  first.** Putting payment back on a private counter fails
+  `modules_with_their_own_pending_maps_draw_from_the_same_space` with
+  `wx.requestMidasPayment took 0 ids from the Host space, want 1`, under both
+  profiles, while the other five tests stay green. The test observes the
+  allocator rather than intercepting outgoing JSON: what matters is that the id
+  came from that space, and the space is what can say so. Restored from a copy,
+  verified by `sha256sum`, and checked for zero leftover references.
+
+  Suites: 6 cases in `runtime_restart_boundary.rs`, `migo-runtime-v8` 528 Full and
+  476 Slim. Closing gate (49 files in scope): 19 host steps, 23 contract gates,
+  `android compile` and `ohos compile` PASS,
+  `verified for every target this change touches`.
 
   **Tasks 5–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
