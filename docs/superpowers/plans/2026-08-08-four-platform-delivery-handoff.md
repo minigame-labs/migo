@@ -158,30 +158,64 @@ through its documented error path rather than leaving it pending."*
   none has an `unwrap_or` fallback. **This clause is stale in the ledger and
   needs only a correction, not work.**
 
-- **Missing ad handler: investigation dispatched but not returned.** What was
-  established before handing off:
-  - `engine/crates/runtime-v8/src/ad/mod.rs:46` — `op_ad_is_supported` reports
-    whether an `AdService` is installed in the OpState; the JS memoises it once
-    per isolate.
-  - `engine/crates/runtime-v8/src/ad/01_ad.js` — the **no-host** path is
-    correct and settles: `load()` resolves and fires `load`; `show()` resolves
-    and fires `close` with `isEnded:false`. Do not re-verify this.
-  - The suspicious case is **an `AdService` installed but no handler
-    registered**: the JS takes the hosted path, sends a fire-and-forget op, and
-    nothing calls back.
-  - Prime suspect, unconfirmed:
-    `platforms/android/library/src/main/java/com/migo/runtime/internal/NativeExports.java`
-    has `adHandlerOrReportError(sessionId, adId, api)` at ~line 2810 which
-    reports an error when no handler exists, but ~lines 2899, 2915 and 2934
-    appear to call `sAdHandlers.get(sessionId)` **directly** instead. Confirm
-    that asymmetry, then check whether capi and the other platforms install an
-    `AdService` unconditionally.
-  - Design rule this must satisfy: Section 3.4 rule 3 — a request with no
-    registered handler settles through its documented error path, never hangs,
-    never returns false success.
-  - Existing coverage to check against:
-    `engine/crates/runtime-v8/src/tests/ad_reward_integrity.rs`,
-    `scripts/test-ad-reward-integrity-contract.sh`.
+- **Missing ad handler: investigated 2026-08-08. The defect is live, but not
+  where A12's wording suggests.** Findings, all with evidence in the source:
+
+  - **Android is unconditionally "hosted".**
+    `engine/crates/platform/src/android/services/mod.rs:204` returns
+    `Some(AndroidAd)` gated only by the `api-commerce` cargo feature, never by
+    handler registration, so `op_ad_is_supported` is `true` for every full-profile
+    Java-SDK session and the JS takes the hosted path with no local fallback.
+    Slim (feature off) cfg-deletes it and gets the correct no-host path.
+  - **Three of six ad entry points settle; three return silently.**
+    `createAd`/`loadAd`/`showAd` go through
+    `NativeExports.adHandlerOrReportError` (~`:2810`), which emits an `error`
+    with `"<api>:fail no ad handler"`. `hideAd`/`updateStyle`/`destroyAd`
+    (~`:2899`, `:2915`, `:2934`) do a bare `sAdHandlers.get` and `return`. Only
+    one of those three leaves anything content-visible pending: `hideAd`, for
+    `CustomAd`, whose `onHide` fires on the no-host path and never on
+    hosted-without-handler. The other two owe content no event. The helper's own
+    javadoc states the rule its siblings break — *"a silent drop leaves it
+    waiting forever"*.
+  - **The larger defect is a contract mismatch, not the silent return.**
+    `platforms/android/library/src/main/java/com/migo/runtime/callback/AdHandler.java:11-16`
+    documents the no-handler path as *"incentivised video closes with
+    `isEnded = false`"* — which is the **no-service** contract, not the
+    **service-installed-but-no-handler** one Android always takes. A rewarded
+    video `show()` with no handler emits `error` and **never `close`**, while
+    `show()` resolves. Content following the wx idiom (`onClose` decides the
+    payout) waits forever, and the SDK's own documentation promised otherwise.
+  - **C ABI, Linux, Windows and OHOS have no defect here.** None installs an
+    `AdService` (`capi/src/host_kit.rs:214`, `platform/src/{linux,windows}/platform.rs`
+    empty `CommerceServices` impls; OHOS has no `DeviceServices` at all), so the
+    correct no-host JS path runs. Their gap is Section 3.4 *parity* — no ad
+    capability exists to register — which is task 3.4 work, not A12.
+
+  **The fix belongs in the Java adapter, and two existing tests prove it cannot
+  go anywhere else.** A JS-side timeout is *prohibited*:
+  `ad_reward_integrity.rs:488 hosted_ads_do_not_self_close_on_a_timer` and
+  `:503 hosted_ads_do_not_self_report_load_on_a_timer` boot a service that
+  records without emitting and assert zero `close`/`load` after ten seconds —
+  correctly, because a slow real host would otherwise be raced by a fabricated
+  close, which is the reward-integrity invariant. An op-layer fix is impossible:
+  `ad_command_op!` knows only whether a *service* exists; handler registration is
+  Java-side state. The adapter is the only layer holding both facts.
+
+  So: route the three silent entry points through `adHandlerOrReportError`; then
+  decide **one** of — correct `AdHandler`'s javadoc to say every call settles as
+  `error`, or have the Java adapter synthesise `close{isEnded:false}` (it may:
+  it knows no advert was shown, and it is the host side of the reward boundary,
+  so the runtime's "never mint a reward" invariant is untouched). Today the code
+  and the documentation disagree and only the documentation is untested.
+
+  **No test catches any of this today.** `ad_reward_integrity.rs` covers
+  *service returns `Err`* (a different mechanism) and asserts the pending state
+  is correct at the JS layer; the contract script is source-level only; and
+  **there are no Java ad tests at all** — 23 test files under
+  `platforms/android/library/src/test`, none referencing `AdHandler`. Pin it with
+  (a) a Java unit test iterating **the entry-point set** rather than a hardcoded
+  three, so a seventh ad op is covered, and (b) a Rust test that a hosted
+  `CustomAd.hide()` asks the host rather than self-firing `onHide`.
 
 - **Windows game identity: investigation dispatched but not returned.** Start
   from `HostJsRuntime::evaluate_module` building
