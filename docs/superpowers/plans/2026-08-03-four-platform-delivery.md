@@ -4289,7 +4289,7 @@ review. A commit alone is not completion evidence.
   Verified at 96 tests per flavour, Full and Slim, up from 94, with no failures,
   errors, or skips; the permission coverage contract still reports 30 gated, 8
   cleanup, 38 sensitive operations.
-- [ ] 0.23 Apply the retired-id tombstone to the Java permission gate.
+- [x] 0.23 Apply the retired-id tombstone to the Java permission gate.
   **Implementation landed, reviews outstanding** (`6825fad`). The gate refused any
   session id at or below the highest ever opened rather than the ids actually
   retired, and because `registerSession` throws on refusal, two Sessions created
@@ -4302,11 +4302,38 @@ review. A commit alone is not completion evidence.
   profile with no failures, errors, or skips; permission coverage contract passes;
   `git diff --check` clean. Mutation-tested: reintroducing the high-water mark
   re-fails both ordering tests.
-  Still to check under this item: `NativeExports.registerSession` treats every
-  refusal as fatal, whereas the Rust gate distinguishes a tolerable live-id refusal
-  from a retired-id bug because restart rebuilds device services for the same live
-  id. Confirm no Java path re-registers a live session id, and if one exists, draw
-  the same distinction.
+  **Checked, and the answer is that no Java path re-registers a live session id.**
+  `registerSession` has exactly one caller — the `GameSession` constructor — and
+  `restart()` calls `NativeMethods.onRestart(sessionId)` without rebuilding the wrapper,
+  so the tolerance the Rust gate needs (because `HostCommand::Restart` *does* rebuild
+  `AndroidDeviceServices` for the same live id) has no counterpart here. Treating every
+  refusal as fatal is therefore correct, and no distinction of that kind was drawn.
+
+  **A different distinction was missing, and it was the diagnostic.** `open` returned a
+  `boolean` for two refusals that mean different things to a host — an id still live is
+  two sessions sharing an id, an id retired is one whose permissions can never be
+  granted again — and the single message `registerSession` threw named the *closing* case
+  for both, telling a host the opposite of what happened in the other half. `open` is now
+  `admit`, returning `ADMITTED | ALREADY_LIVE | RETIRED` answered in the **same**
+  acquisition of the admission guard, so no caller can observe a state between the two and
+  none can recompute the distinction differently. A `boolean` plus an `isRetired`
+  accessor was written first and rejected for exactly that: it is two acquisitions and two
+  chances to disagree about one id.
+
+  `admissionSaysWhetherARefusedIdIsLiveOrRetired` pins it, with the admitted case
+  asserted in the same test because a gate that refused everything satisfies both refusal
+  assertions. Mutation: collapsing a live id's answer into `RETIRED` — the shape that
+  produced the wrong message — fails that test and nothing else. Converting the boolean
+  call sites also made every existing refusal assertion name a cause instead of a
+  polarity. 107 tests per flavour, Full and Slim, from 106, no failures, errors or skips;
+  permission coverage contract unchanged at 30 gated, 8 cleanup, 38 sensitive.
+
+  **Not covered, named rather than implied.** `NativeExports.registerSession` itself has
+  no test. Reaching it needs a `GameSession`, whose constructor starts a
+  Choreographer-driven scheduler and touches framework state, and this module's test
+  classpath has no mocking framework; a production accessor added to reach it was written
+  and deleted rather than shipped. So what is gated is the gate's answer, and what renders
+  it into a message is read rather than executed.
 - [ ] 0.24 Order connection-state reports per device. `reportRetiredAttemptDisconnected`
   reads the current owner and then reports outside any lock, so a retired attempt
   that observes no owner can still deliver a stale `connected=false` after a fresh
