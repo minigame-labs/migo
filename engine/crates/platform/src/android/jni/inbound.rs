@@ -138,9 +138,7 @@ use migo_core::{
     spawn_host_thread,
 };
 use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
-use shared::protocol::host_cmd::{
-    BleCharacteristicData, HostCommand, TouchData, TouchPoint, TouchType,
-};
+use shared::protocol::host_cmd::{HostCommand, TouchData, TouchPoint, TouchType};
 use shared::surface::{PixelRatio, SurfaceRef};
 
 use shared::config::InitOptions;
@@ -1415,8 +1413,58 @@ pub(crate) extern "system" fn onBLEConnectionStateChange<'local>(
     });
 }
 
+/// Bytes of characteristic value read without touching the heap.
+///
+/// The ATT specification caps an attribute value at 512 bytes, and a
+/// notification is further capped by the negotiated MTU, so this covers every
+/// value a conforming peripheral can send. Larger ones are still delivered
+/// correctly — [`read_characteristic_value`] falls back to a heap buffer rather
+/// than truncating, because a silently shortened value is a payload the content
+/// would misread.
+const BLE_INLINE_VALUE_BYTES: usize = 512;
+
+/// Copy a JVM byte array into `inline`, spilling to the heap only if it is
+/// larger than any conforming notification.
+///
+/// `Err` means the JVM raised — a pending exception must reach Java rather than
+/// be papered over with an empty value.
+fn read_characteristic_value<'a>(
+    env: &JNIEnv<'_>,
+    value: &jni::objects::JByteArray<'_>,
+    inline: &'a mut [i8; BLE_INLINE_VALUE_BYTES],
+    spill: &'a mut Vec<i8>,
+) -> Result<&'a [u8], jni::errors::Error> {
+    let len = env.get_array_length(value)?.max(0) as usize;
+    let buffer: &mut [i8] = if len <= BLE_INLINE_VALUE_BYTES {
+        &mut inline[..len]
+    } else {
+        spill.resize(len, 0);
+        spill.as_mut_slice()
+    };
+    env.get_byte_array_region(value, 0, buffer)?;
+    // SAFETY: `i8` and `u8` have the same size, alignment and validity, so a
+    // shared reinterpretation of an initialised `[i8]` is sound. JNI types the
+    // region as `jbyte`; every consumer above this boundary wants bytes.
+    Ok(unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len()) })
+}
+
+/// Read a Java string without the class check `get_string` performs.
+///
+/// # Safety
+/// `obj` must be a `java.lang.String`. Every caller here is a parameter of a
+/// `native` method declared with a `String` parameter in `NativeBridge`, so the
+/// JVM has already type-checked it at the call site; the check `get_string`
+/// repeats is a `FindClass` plus an assignability test, three times per
+/// notification, on a path a peripheral drives at its own rate.
+unsafe fn borrow_java_string<'obj_ref, 'local: 'obj_ref>(
+    env: &JNIEnv<'local>,
+    obj: &'obj_ref JString<'local>,
+) -> Option<jni::strings::JavaStr<'local, 'local, 'obj_ref>> {
+    unsafe { env.get_string_unchecked(obj) }.ok()
+}
+
 pub(crate) extern "system" fn onBLECharacteristicValueChange<'local>(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
     device_id: JString<'local>,
@@ -1425,28 +1473,33 @@ pub(crate) extern "system" fn onBLECharacteristicValueChange<'local>(
     value: jni::objects::JByteArray<'local>,
 ) {
     jni_safe!("onBLECharacteristicValueChange", {
-        let dev: String = env
-            .get_string(&device_id)
-            .map(|s| s.into())
-            .unwrap_or_default();
-        let svc: String = env
-            .get_string(&service_id)
-            .map(|s| s.into())
-            .unwrap_or_default();
-        let chr: String = env
-            .get_string(&characteristic_id)
-            .map(|s| s.into())
-            .unwrap_or_default();
-        let val: Vec<u8> = env.convert_byte_array(&value).unwrap_or_default();
-        let _ = send_command_to_host(
-            host_id,
-            HostCommand::OnBLECharacteristicValueChange(Box::new(BleCharacteristicData {
-                device_id: dev,
-                service_id: svc,
-                characteristic_id: chr,
-                value: val,
-            })),
-        );
+        // Section 7.3: a peripheral chooses this path's rate, so nothing here
+        // may reach the heap or a lock shared beyond this Session. The three
+        // identifiers stay borrowed from the JVM, the value lands in a stack
+        // buffer, and the Session's own recycled slot is the only destination.
+        // `HostIngress::try_send_ble_characteristic_value` is the measured half;
+        // see its gates in `core::runtime::registry`.
+        let mut inline = [0i8; BLE_INLINE_VALUE_BYTES];
+        let mut spill: Vec<i8> = Vec::new();
+        let Ok(bytes) = read_characteristic_value(&env, &value, &mut inline, &mut spill) else {
+            tracing::debug!("Host {host_id} dropped a BLE notification: value unreadable");
+            return;
+        };
+
+        // SAFETY: all three are `String` parameters of a `native` method.
+        let device = unsafe { borrow_java_string(&env, &device_id) };
+        let service = unsafe { borrow_java_string(&env, &service_id) };
+        let characteristic = unsafe { borrow_java_string(&env, &characteristic_id) };
+        // Borrowed for ASCII, which every UUID and device address is; the owned
+        // arm exists so a non-conforming identifier is delivered rather than
+        // dropped, and it is the only allocation this path can make.
+        let device = device.as_deref().map(Cow::from).unwrap_or_default();
+        let service = service.as_deref().map(Cow::from).unwrap_or_default();
+        let characteristic = characteristic.as_deref().map(Cow::from).unwrap_or_default();
+
+        let _ = with_hot_ingress(host_id, |ingress| {
+            ingress.try_send_ble_characteristic_value(&device, &service, &characteristic, bytes)
+        });
     });
 }
 

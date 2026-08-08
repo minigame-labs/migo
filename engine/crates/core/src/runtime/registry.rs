@@ -13,8 +13,8 @@ use tracing::{debug, warn};
 use shared::{
     host_channel::{CriticalHostCommandSender, InputSendOutcome, InputStream},
     op_state::HostTx,
-    payload_pool::PayloadPool,
-    protocol::host_cmd::{GamepadState, HostCommand, TouchData},
+    payload_pool::{PayloadPool, RecyclePool},
+    protocol::host_cmd::{BleCharacteristicData, GamepadState, HostCommand, TouchData},
     surface::{
         PublicSurfaceGeneration, SurfaceControl, SurfaceGeneration, SurfaceLease, SurfaceRef,
         SurfaceResourceLease,
@@ -30,6 +30,19 @@ pub(crate) const HOST_NORMAL_COMMAND_CAPACITY: usize = 512;
 pub(crate) const HOST_RELIABLE_INPUT_RESERVE: usize = 64;
 const HOST_PAYLOAD_POOL_CAPACITY: usize =
     HOST_NORMAL_COMMAND_CAPACITY + HOST_RELIABLE_INPUT_RESERVE + 2;
+
+/// BLE notification slots per Session.
+///
+/// Sized so the pool is never the tighter bound: a notification travels the
+/// normal lane, so the queue can hold `HOST_NORMAL_COMMAND_CAPACITY` of them,
+/// plus the one the consumer holds after dequeue. Sizing it smaller would move
+/// the drop point earlier than the queue's own, and a peripheral streaming a
+/// firmware image would lose packets while every other command still flowed.
+///
+/// Unlike the input pools this costs a Session nothing until it subscribes to a
+/// characteristic: [`RecyclePool`] grows on demand, so the number here is a
+/// ceiling rather than an allocation.
+const HOST_BLE_POOL_CAPACITY: usize = HOST_NORMAL_COMMAND_CAPACITY + 1;
 
 /// Allocation-free error returned by a direct per-Session Host ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +64,7 @@ pub struct HostIngress {
     vsync_tx: Option<crossbeam_channel::Sender<f64>>,
     touch_pool: PayloadPool<TouchData>,
     gamepad_pool: PayloadPool<GamepadState>,
+    ble_pool: RecyclePool<BleCharacteristicData>,
     input_saturation_notified: Arc<AtomicBool>,
     stats: Arc<shared::stats::DebugStats>,
 }
@@ -81,6 +95,42 @@ impl HostIngress {
             }
             Err(TrySendError::Closed(_)) => Err(HostIngressSendError::Closed),
         }
+    }
+
+    /// Enqueue one BLE characteristic notification in a recycled payload slot.
+    ///
+    /// **This is the whole of the notification path that is not platform glue,
+    /// and it lives here so it can be measured.** The Android JNI entry point
+    /// that feeds it is `cfg(target_os = "android")`, so no host test binary
+    /// compiles it; Section 7.3's gates need a function they can call. What is
+    /// left on the platform side is reading three strings and a byte array out
+    /// of the JVM — everything that decides whether the path allocates or takes
+    /// a lock shared beyond this Session is in these few lines.
+    ///
+    /// A peripheral chooses the rate, and a hundred notifications a second is
+    /// ordinary, so this borrows its inputs rather than taking them: an owned
+    /// argument would be an allocation the caller made on the caller's thread,
+    /// which is exactly the cost being removed.
+    ///
+    /// Returns [`HostIngressSendError::Full`] when the queue is saturated or the
+    /// pool is exhausted, which are the same observable outcome — the
+    /// notification is dropped and `command_drops` counts it.
+    #[inline]
+    pub fn try_send_ble_characteristic_value(
+        &self,
+        device_id: &str,
+        service_id: &str,
+        characteristic_id: &str,
+        value: &[u8],
+    ) -> Result<(), HostIngressSendError> {
+        let Some(mut payload) = self.ble_pool.try_acquire() else {
+            self.stats.command_drops.fetch_add(1, Ordering::Relaxed);
+            return Err(HostIngressSendError::Full);
+        };
+        payload.overwrite(device_id, service_id, characteristic_id, value);
+        // The rejected command carries the slot back to the pool as it drops,
+        // so a saturated queue costs the pool nothing.
+        self.try_send(HostCommand::OnBLECharacteristicValueChange(payload))
     }
 
     /// Enqueue a touch batch in a preallocated payload slot.
@@ -301,6 +351,7 @@ pub(crate) struct HostHandle {
     surface_control: Arc<SurfaceControl>,
     touch_pool: PayloadPool<TouchData>,
     gamepad_pool: PayloadPool<GamepadState>,
+    ble_pool: RecyclePool<BleCharacteristicData>,
     input_saturation_notified: Arc<AtomicBool>,
     stats: Arc<shared::stats::DebugStats>,
 }
@@ -337,6 +388,7 @@ pub(crate) fn register_sender(
             surface_control,
             touch_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
             gamepad_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
+            ble_pool: RecyclePool::new(HOST_BLE_POOL_CAPACITY),
             input_saturation_notified: Arc::new(AtomicBool::new(false)),
             stats,
         },
@@ -367,13 +419,14 @@ fn registered_surface_control(host_id: HostId) -> Result<Arc<SurfaceControl>, St
 
 /// Capture direct data-plane handles after Host initialization completes.
 pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
-    let (tx, touch_pool, gamepad_pool, input_saturation_notified, stats) = {
+    let (tx, touch_pool, gamepad_pool, ble_pool, input_saturation_notified, stats) = {
         let map = host_senders().read();
         map.get(&host_id).map(|handle| {
             (
                 handle.tx.clone(),
                 handle.touch_pool.clone(),
                 handle.gamepad_pool.clone(),
+                handle.ble_pool.clone(),
                 Arc::clone(&handle.input_saturation_notified),
                 Arc::clone(&handle.stats),
             )
@@ -387,6 +440,7 @@ pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
         vsync_tx: crate::runtime::vsync::sender(host_id),
         touch_pool,
         gamepad_pool,
+        ble_pool,
         input_saturation_notified,
         stats,
     })
@@ -619,6 +673,7 @@ mod tests {
                 vsync_tx: None,
                 touch_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
                 gamepad_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
+                ble_pool: RecyclePool::new(normal_capacity + 1),
                 input_saturation_notified: Arc::new(AtomicBool::new(false)),
                 stats: Arc::clone(&stats),
             },
@@ -1068,6 +1123,276 @@ mod tests {
             assert_eq!(outcome.0, Ok(InputSendOutcome::Enqueued));
             assert_eq!(outcome.1, Ok(InputSendOutcome::Coalesced));
             assert_eq!(stats.input_coalesced.load(Ordering::Relaxed), 1);
+        }
+
+        /// Section 7.3, for the path Section 6.1 names by hand.
+        ///
+        /// The notification path used to call `send_command_to_host`, whose first
+        /// act is a `HOST_SENDERS` read to find the Session's sender. Every
+        /// notification of every Session met there, on a stream whose rate a
+        /// peripheral chooses.
+        #[test]
+        fn a_ble_notification_does_not_reach_the_host_registry() {
+            let (ingress, _critical_tx, mut rx, _stats, _registered_stats) = test_ingress(4, 2);
+
+            let sent = assert_completes_while_locked(
+                PerEventPath {
+                    path: "HostIngress::try_send_ble_characteristic_value",
+                    shared_lock: "runtime::registry HOST_SENDERS",
+                    patience: PATIENCE,
+                },
+                host_senders(),
+                move || {
+                    ingress.try_send_ble_characteristic_value(
+                        DEVICE,
+                        SERVICE,
+                        CHARACTERISTIC,
+                        &[1, 2, 3],
+                    )
+                },
+            );
+
+            assert_eq!(sent, Ok(()));
+            // Proof the send reached the queue rather than returning early: an
+            // operation that did nothing would satisfy the gate.
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(HostCommand::OnBLECharacteristicValueChange(_))
+            ));
+        }
+
+        /// The second registry the same send could reach, gated separately so a
+        /// failure names which one rather than leaving it to be guessed.
+        #[test]
+        fn a_ble_notification_does_not_reach_the_stats_registry() {
+            let (ingress, _critical_tx, mut rx, _stats, _registered_stats) = test_ingress(4, 2);
+
+            let sent = assert_completes_while_locked(
+                PerEventPath {
+                    path: "HostIngress::try_send_ble_characteristic_value",
+                    shared_lock: "shared::stats STATS",
+                    patience: PATIENCE,
+                },
+                shared::stats::registry_lock_for_contention_probe(),
+                move || {
+                    ingress.try_send_ble_characteristic_value(
+                        DEVICE,
+                        SERVICE,
+                        CHARACTERISTIC,
+                        &[1, 2, 3],
+                    )
+                },
+            );
+
+            assert_eq!(sent, Ok(()));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(HostCommand::OnBLECharacteristicValueChange(_))
+            ));
+        }
+    }
+
+    /// A conforming GATT service UUID, device address and characteristic UUID.
+    ///
+    /// Real shapes rather than short labels: the identifiers are what the pooled
+    /// slot's buffers are sized by, so a two-character stand-in would let a
+    /// capacity bug hide behind the small-string cases that never allocate.
+    const DEVICE: &str = "1A:2B:3C:4D:5E:6F";
+    const SERVICE: &str = "0000180d-0000-1000-8000-00805f9b34fb";
+    const CHARACTERISTIC: &str = "00002a37-0000-1000-8000-00805f9b34fb";
+
+    mod ble_notifications {
+        use super::*;
+        use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+        use shared::protocol::host_cmd::{BLE_VALUE_RETAINED_LIMIT, BleCharacteristicData};
+
+        /// Take the notification's contents out of the pooled slot so the slot
+        /// returns to the pool, which is what a Host thread finishing with a
+        /// command does.
+        fn received(rx: &mut shared::host_channel::HostCommandReceiver) -> BleCharacteristicData {
+            match rx.try_recv() {
+                Ok(HostCommand::OnBLECharacteristicValueChange(payload)) => {
+                    let mut copy = BleCharacteristicData::default();
+                    copy.overwrite(
+                        payload.device_id(),
+                        payload.service_id(),
+                        payload.characteristic_id(),
+                        payload.value(),
+                    );
+                    copy
+                }
+                other => panic!("expected a BLE notification, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_notification_arrives_with_every_field_intact() {
+            let (ingress, _critical_tx, mut rx, _stats, _registered_stats) = test_ingress(4, 2);
+
+            assert_eq!(
+                ingress.try_send_ble_characteristic_value(
+                    DEVICE,
+                    SERVICE,
+                    CHARACTERISTIC,
+                    &[0x5a, 0x00, 0xff]
+                ),
+                Ok(())
+            );
+
+            let delivered = received(&mut rx);
+            assert_eq!(delivered.device_id(), DEVICE);
+            assert_eq!(delivered.service_id(), SERVICE);
+            assert_eq!(delivered.characteristic_id(), CHARACTERISTIC);
+            assert_eq!(delivered.value(), &[0x5a, 0x00, 0xff]);
+        }
+
+        /// A reused slot must not leave anything of the notification before it.
+        ///
+        /// Reuse is the whole design, and the failure it invites is a shorter
+        /// value read against a longer buffer: content would see bytes from a
+        /// previous notification, which is worse than the allocation removed.
+        #[test]
+        fn a_reused_slot_carries_none_of_the_previous_notification() {
+            let (ingress, _critical_tx, mut rx, _stats, _registered_stats) = test_ingress(4, 2);
+
+            ingress
+                .try_send_ble_characteristic_value(DEVICE, SERVICE, CHARACTERISTIC, &[9; 32])
+                .unwrap();
+            drop(received(&mut rx));
+            // The queue is drained, so this send is served by the slot the first
+            // one used.
+            ingress
+                .try_send_ble_characteristic_value("A", "B", "C", &[1])
+                .unwrap();
+
+            let delivered = received(&mut rx);
+            assert_eq!(delivered.device_id(), "A");
+            assert_eq!(delivered.service_id(), "B");
+            assert_eq!(delivered.characteristic_id(), "C");
+            assert_eq!(delivered.value(), &[1]);
+        }
+
+        /// Exhaustion refuses and counts, rather than growing without bound.
+        ///
+        /// The pool is sized to the queue, so this is reachable only by holding
+        /// every slot: a Host thread that has stopped consuming. Dropping the
+        /// notification is what the queue already does when full, and the drop
+        /// must be counted or a stalled Session looks healthy.
+        #[test]
+        fn an_undrained_session_drops_notifications_instead_of_growing() {
+            let (ingress, _critical_tx, _rx, stats, _registered_stats) = test_ingress(4, 2);
+
+            // Four normal slots, then the queue refuses; the pool hands its slot
+            // straight back as the rejected command drops.
+            for _ in 0..4 {
+                assert_eq!(
+                    ingress.try_send_ble_characteristic_value(
+                        DEVICE,
+                        SERVICE,
+                        CHARACTERISTIC,
+                        &[7]
+                    ),
+                    Ok(())
+                );
+            }
+            assert_eq!(
+                ingress.try_send_ble_characteristic_value(DEVICE, SERVICE, CHARACTERISTIC, &[7]),
+                Err(HostIngressSendError::Full)
+            );
+            assert_eq!(stats.command_drops.load(Ordering::Relaxed), 1);
+        }
+
+        /// Section 7.3's allocation gate for the path Section 6.1 names.
+        ///
+        /// The burst sends and drains within each iteration, which is what a
+        /// steady stream is: the slot the Host thread finishes with is the slot
+        /// the next notification uses. Warm-up covers the one-time growth of the
+        /// pool's population and of each slot's buffers.
+        #[test]
+        fn a_notification_stream_never_reaches_the_heap() {
+            let (ingress, _critical_tx, mut rx, _stats, _registered_stats) = test_ingress(8, 2);
+            let value = [0xa5_u8; 20];
+
+            assert_no_steady_state_allocation(
+                Burst {
+                    path: "HostIngress::try_send_ble_characteristic_value: send and drain",
+                    warmup: 4,
+                    measured: 64,
+                },
+                |_| {
+                    ingress
+                        .try_send_ble_characteristic_value(DEVICE, SERVICE, CHARACTERISTIC, &value)
+                        .expect("a drained queue accepts");
+                    match rx.try_recv() {
+                        Ok(HostCommand::OnBLECharacteristicValueChange(payload)) => {
+                            // Read through the payload before it is dropped: a
+                            // burst that never looked would pass over a slot
+                            // that arrived empty.
+                            assert_eq!(payload.value().len(), value.len());
+                            assert_eq!(payload.device_id().len(), DEVICE.len());
+                        }
+                        other => panic!("expected a BLE notification, got {other:?}"),
+                    }
+                },
+            );
+        }
+
+        /// The pool stops growing, which is the property that makes the burst
+        /// above a gate rather than a measurement of one warm iteration.
+        ///
+        /// A recycler that stopped recycling would still hand out payloads —
+        /// freshly allocated ones — and every behavioural test above would still
+        /// pass. What it cannot do is keep the population at the depth the
+        /// traffic actually reached.
+        #[test]
+        fn a_drained_stream_never_grows_the_pool_past_one_slot() {
+            let (ingress, _critical_tx, mut rx, _stats, _registered_stats) = test_ingress(8, 2);
+
+            for _ in 0..64 {
+                ingress
+                    .try_send_ble_characteristic_value(DEVICE, SERVICE, CHARACTERISTIC, &[1, 2])
+                    .unwrap();
+                drop(rx.try_recv().expect("one queued notification"));
+            }
+
+            assert_eq!(ingress.ble_pool.population(), 1);
+        }
+
+        /// One malformed notification must not park its buffer for the life of
+        /// the process, and a conforming one must never give its buffer back.
+        #[test]
+        fn a_recycled_slot_keeps_conforming_buffers_and_releases_absurd_ones() {
+            use shared::payload_pool::Recyclable;
+
+            let mut payload = BleCharacteristicData::default();
+            payload.overwrite(DEVICE, SERVICE, CHARACTERISTIC, &[0; 128]);
+            let (kept_value, kept_device) =
+                (payload.value().as_ptr(), payload.device_id().as_ptr());
+
+            payload.recycle();
+            payload.overwrite(DEVICE, SERVICE, CHARACTERISTIC, &[0; 128]);
+            // Buffer identity rather than capacity: same address means the
+            // second notification did not go to the heap for one.
+            assert_eq!(
+                payload.value().as_ptr(),
+                kept_value,
+                "a conforming value's buffer is the next notification's buffer"
+            );
+            assert_eq!(payload.device_id().as_ptr(), kept_device);
+
+            payload.overwrite(
+                DEVICE,
+                SERVICE,
+                CHARACTERISTIC,
+                &[0; BLE_VALUE_RETAINED_LIMIT + 1],
+            );
+            payload.recycle();
+            assert!(
+                payload.retained_bytes() < BLE_VALUE_RETAINED_LIMIT,
+                "a value past the protocol's own maximum is released, not parked; \
+                 retained {} bytes",
+                payload.retained_bytes()
+            );
         }
     }
 }
