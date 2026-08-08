@@ -4344,6 +4344,28 @@ review. A commit alone is not completion evidence.
   replacing the attempt map with a per-device state record whose monitor orders
   both — which is a substantive change to the GATT ownership model and needs its
   own plan and review rather than a patch.
+
+  **Re-read on 2026-08-08 and the description holds**, which is worth saying because
+  most recorded obstacles on this ledger have not. `gattConnections` is a
+  `ConcurrentHashMap<String, GattAttempt>`; `publishGattConnection` only checks
+  `get(deviceId) == attempt` before attaching, and `reportRetiredAttemptDisconnected`
+  reads the same map and then calls `connectionStateReporter.report` outside it. The
+  window is after `closeAndRemoveGatt` removed the entry and before a replacement is put
+  in: the retired attempt's `false` is *correct at the moment it is decided* and the
+  decision is not atomic with its delivery, so a replacement that publishes and reports
+  `true` in between is overwritten.
+
+  **One constraint the recorded "for example" runs into, found while confirming the
+  race.** Ordering both under a per-device monitor means holding that monitor across
+  `report`, which crosses into native — and this codebase's own rule elsewhere is that a
+  Migo lock is not held across a JNI call: the permission gate runs its external
+  operation under a counted lease precisely so revocation can wait without retaining the
+  host mutex. Reconciling those two is the substance of the plan this item asks for
+  rather than an afterthought. The alternatives are a monitor held across a report that
+  is a post rather than a wait, or a per-device delivery sequence that drops a report
+  older than the last delivered one — and the second only orders if the compare and the
+  call are themselves one step, which puts the monitor back. Recorded so the plan starts
+  from the real constraint instead of rediscovering it.
 - [x] 0.25 Snapshot the pending cancellation action safely. Landed with `6825fad`:
   `runCancellations` captures the action into a local while the snapshot is taken
   under the session monitor, so the executed action is exactly the one the snapshot
