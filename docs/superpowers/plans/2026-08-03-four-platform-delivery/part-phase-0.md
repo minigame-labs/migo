@@ -474,6 +474,37 @@
   `ohos compile` PASS, `verified for every target this change touches`, and zero
   `migo-core` warnings in the log.
 
+  **⚠️ Task 3 must not be executed as written, and the plan contradicts itself
+  about it.** Its Step 3 says to *"delete the `pending.values().next()`
+  compatibility path"* in `runtime-v8/src/base/02_async.js`. Task 6, three tasks
+  later, is titled "Make Every Android Result Echo Its ID" and its own Step 2 says
+  *"Expected: FAIL because these paths currently omit IDs"* — location, scan,
+  compress/choose image, video, modal, action sheet, Bluetooth settings and
+  application settings. Deleting the fallback first does not make those fail
+  loudly; it makes their promises **never settle**, because the result arrives
+  with no id, matches nothing, and is discarded. A silent hang in `wx.getLocation`
+  is the worst available failure mode.
+
+  **What today's code actually does, per input**, read rather than assumed
+  (`02_async.js:196-228`, `Number(parsed.requestId)`): `null` → `0`, and `1.5`,
+  `-1`, `0`, `2147483648` are all finite, so they take the exact-lookup path, miss,
+  and are discarded safely. Only **absent** and **non-numeric** ids reach the FIFO
+  fallback — and that fallback settles the *oldest* pending request, so a garbage
+  id today mis-settles someone else's call.
+
+  **The safe shape for a future Task 3**, which is a deviation to make
+  deliberately rather than discover: add `op_alloc_host_callback_id` and switch
+  `createDeferredApi` off its per-API `_nextId`, which is the substantive win —
+  ids stop restarting at 1 in each runtime, so a retired runtime's late result can
+  no longer collide with a new request. Make `settle` require a strict
+  `parseHostCallbackId` **whenever `requestId` is present in any form**, and
+  discard rather than fall back when it fails: that alone closes the garbage-id
+  mis-settlement, which is strictly better than today. Keep the fallback for the
+  *absent* case only, and delete it in Task 6 when the paths that omit ids stop
+  omitting them. Note also that `02_async.js` is embedded via `esm=[...]`, so any
+  change to it needs `scripts/gen-snapshot.sh` before it takes effect on a device;
+  host suites run the JS from source and will not show that gap.
+
   **Tasks 3–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
   them before invoking JavaScript: that is Task 7's rejection and Task 10's
