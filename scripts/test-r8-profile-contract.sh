@@ -67,10 +67,30 @@ done
 echo "[5/5] compiling the exhaustive Rust-to-R8 contract"
 CONTRACT_TEST="$(mktemp -t migo-r6-jni-contract.XXXXXX)"
 trap 'rm -f "$CONTRACT_TEST"' EXIT
-rustc --edition 2024 --test \
-  -A dead-code -A unused-mut \
-  "$ROOT/engine/crates/platform/src/android/jni/profile_contract.rs" \
-  -o "$CONTRACT_TEST"
-"$CONTRACT_TEST"
+# Once per product profile, with that profile's feature set, because the file now
+# holds a test whose result depends on which profile compiled it:
+# `active_methods` selects the registered JNI surface with a chain of
+# `#[cfg(feature)]` attributes, and `the_registered_surface_is_the_one_this_profile_declares`
+# equates that chain with the declarative rule the other tests use. Compiling with
+# no features at all -- which this step did until 2026-08-08 -- models no shipped
+# product: the chain then contributes nothing, so there is no profile for the rule
+# to be compared against. Passing the features makes both halves of that
+# comparison real here, and this remains the only gate that reaches them without
+# cargo.
+for profile in full slim; do
+  cfgs=(--cfg "feature=\"profile-$profile\"")
+  if [[ "$profile" == "full" ]]; then
+    for group in api-sensors api-media api-connectivity api-commerce api-system; do
+      cfgs+=(--cfg "feature=\"$group\"")
+    done
+  fi
+  echo "  profile-$profile"
+  rustc --edition 2024 --test \
+    -A dead-code -A unused-mut -A unexpected-cfgs \
+    "${cfgs[@]}" \
+    "$ROOT/engine/crates/platform/src/android/jni/profile_contract.rs" \
+    -o "$CONTRACT_TEST"
+  "$CONTRACT_TEST"
+done
 
 echo "PASS: R6 Android flavors and R8 roots are profile exact"

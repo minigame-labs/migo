@@ -445,6 +445,40 @@ mod tests {
         }
     }
 
+    /// The profile this build compiled, read from the features rather than passed
+    /// in as a value.
+    const COMPILED_PROFILE: ProductProfile = if cfg!(feature = "profile-slim") {
+        ProductProfile::Slim
+    } else {
+        ProductProfile::Full
+    };
+
+    /// One rule, two implementations, and until now only the one that never ships
+    /// was tested.
+    ///
+    /// `methods_for` decides by matching a `ProductProfile` and exists only under
+    /// `#[cfg(test)]`. The registration path calls `active_methods`, which decides
+    /// with a chain of five `#[cfg(feature)]` attributes. Every other test in this
+    /// module asserts over `methods_for`, so deleting any one line of that chain
+    /// shipped a build registering fewer JNI methods than its profile declares --
+    /// content calling a missing method would get `UnsatisfiedLinkError` at the
+    /// moment it was used -- with this whole suite green.
+    ///
+    /// This is also the assertion that gives the Slim host suite something to
+    /// observe: under Full it demands the union of every group, under Slim exactly
+    /// Core, and it is the only test whose *result* depends on which profile
+    /// compiled it.
+    #[test]
+    fn the_registered_surface_is_the_one_this_profile_declares() {
+        for direction in [MethodDirection::JavaToNative, MethodDirection::NativeToJava] {
+            assert_eq!(
+                active_methods(direction),
+                methods_for(COMPILED_PROFILE, direction),
+                "active_methods' cfg chain disagrees with the {COMPILED_PROFILE:?} profile rule",
+            );
+        }
+    }
+
     #[test]
     fn full_is_the_disjoint_union_of_core_and_optional_groups() {
         for direction in [MethodDirection::JavaToNative, MethodDirection::NativeToJava] {
