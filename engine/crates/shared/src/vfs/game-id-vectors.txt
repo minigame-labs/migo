@@ -1,0 +1,75 @@
+# Game identity vectors, shared by the Rust and Java validators.
+#
+# Two implementations enforce one rule: `shared::vfs::game_paths::validate_game_id`
+# decides what the engine will create a directory for, and
+# `com.migo.runtime.GamePaths.isValidGameId` decides what the Android SDK will
+# hand it. The id is a storage isolation boundary (separate saves, separate
+# quota, separate `/code`), so the two gates disagreeing means a host is told an
+# id is acceptable by one half of the product and refused by the other.
+#
+# Both sides read *this* file. That is the point: an intentional rule change has
+# to edit one table, and the language that was not updated fails immediately. A
+# per-language table would let one side be widened silently, which is the defect
+# this file exists to make impossible.
+#
+# Format: `<ok|err> <id>`, whitespace separated, `#` comments, blank lines
+# ignored. An id containing whitespace cannot be spelled here and does not need
+# to be: the Rust side covers the character class exhaustively over every byte.
+#
+# Readers:
+#   engine/crates/shared/src/vfs/game_paths.rs   (include_str!, so a moved file
+#                                                 is a compile error)
+#   platforms/android/library/src/test/java/com/migo/runtime/GameIdVectorTest.java
+
+# --- ordinary ids -----------------------------------------------------------
+ok my-game
+ok game_123
+ok a
+ok 0
+ok puzzlequest
+ok wx1234567890abcdef
+ok aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# --- case is not part of the id space ---------------------------------------
+# A case-insensitive filesystem resolves each of these onto an id above, so
+# admitting them makes the isolation boundary hold on Linux and Android and not
+# on Windows.
+err GAME
+err PuzzleQuest
+err puzzleQuest
+err A
+err game_123X
+
+# --- length -----------------------------------------------------------------
+err aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# --- separators, traversal and Windows stream syntax ------------------------
+err ../hack
+err game/sub
+err game\sub
+err game.name
+err game.
+err game:stream
+err game~1
+err .
+err ..
+
+# --- reserved device names, rejected on every platform ----------------------
+err con
+err prn
+err aux
+err nul
+err com0
+err com1
+err com9
+err lpt0
+err lpt1
+err lpt9
+
+# --- neighbours of the reserved names, which are ordinary ids ---------------
+ok null
+ok conx
+ok com
+ok lpt
+ok com10
+ok con-1

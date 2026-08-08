@@ -257,10 +257,44 @@ const dispatchWebglContextEvent = (type) => {
     return prevented;
 };
 
+// The host's surface-change ingress.
+//
+// Deliberately here, in the always-compiled canvas module, rather than beside
+// `wx.onWindowResize`. Adopting the surface size is not a connectivity feature:
+// a Slim build has no window-info service and still has a surface, and a canvas
+// that keeps the size the window had before a rotation is a rendering defect,
+// not a missing API. It used to live in the `system` extension, which
+// `api-connectivity` gates out, so no Slim build followed its surface at all.
+//
+// The optional half - reading window geometry and telling content - registers
+// itself through `setWindowResizeReporter` when it is compiled in.
+let _windowResizeReporter = null;
+
+const setWindowResizeReporter = (reporter) => {
+    _windowResizeReporter = typeof reporter === "function" ? reporter : null;
+};
+
+const handleSurfaceResized = () => {
+    // First, and unconditionally. The main canvas is what the content draws
+    // into, so a listener that reads `canvas.width` must not be handed the size
+    // the surface had a moment ago. Ahead of the reporter for the same reason a
+    // host with no window-info service still has a surface: whether content
+    // learns the new geometry must not decide whether the canvas has it.
+    adoptMainCanvasSurfaceSize();
+    if (_windowResizeReporter === null) return;
+    try {
+        _windowResizeReporter();
+    } catch (e) {
+        console.error("window resize reporter failed:", e);
+    }
+};
+
 export {
     createCanvas,
     createOffscreenCanvas,
     getMainCanvas,
     adoptMainCanvasSurfaceSize,
+    setWindowResizeReporter,
+    handleSurfaceResized,
     dispatchWebglContextEvent,
 };

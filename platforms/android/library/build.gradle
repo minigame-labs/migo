@@ -393,3 +393,139 @@ dependencies {
     // rather than on a device.
     testImplementation 'junit:junit:4.13.2'
 }
+
+// ---------------------------------------------------------------------------
+// Mutation testing — pitest for the Java half of the SDK
+// ---------------------------------------------------------------------------
+//
+// This is an Android *library* module (com.android.library), not a plain
+// java/java-library module. The info.solidsoft.pitest Gradle plugin registers
+// its DSL extension only after detecting a JavaPlugin, which com.android.library
+// never applies — so we drive pitest directly as a JavaExec task, pulling the
+// pitest JARs from their own dependency configuration.
+//
+// We target the `full` flavour / `Debug` build type for two reasons:
+//   1. `full` enables MIGO_API_CONNECTIVITY and MIGO_API_SENSORS, so the BLE
+//      and permission classes (the concurrency invariants we care most about)
+//      are compiled in. `slim` strips them via BuildConfig flags, leaving a
+//      mostly-empty mutation surface for exactly the code we want to gate.
+//   2. `Debug` keeps the bytecode unobfuscated (minifyEnabled false in debug),
+//      so R8 cannot rewrite mutants into dead code before pitest instruments.
+//
+// Run with:
+//   cd platforms/android && ./gradlew :library:pitestFullDebug
+//   Reports land in: library/build/reports/pitest/
+//
+// Read *test strength* (killed / covered), not the mutation score. Most of this
+// package touches android.* and cannot be loaded by a host JVM at all -- this
+// module deliberately has no Robolectric, so those classes report as no-coverage
+// and drag the score down by a constant that says nothing about the tests. The
+// number that moves when a guard stops guarding is test strength.
+//
+
+// ---- pitest dependency configuration ----
+configurations {
+    pitestRuntime
+}
+
+dependencies {
+    // pitest command-line entry point and its JUnit 4 test runner plugin. Kept in
+    // a dedicated configuration so these JARs never enter the AAR, and so an
+    // `--offline` build that does not invoke the task never resolves them.
+    pitestRuntime 'org.pitest:pitest:1.16.1'
+    pitestRuntime 'org.pitest:pitest-command-line:1.16.1'
+    pitestRuntime 'org.pitest:pitest-entry:1.16.1'
+}
+
+// ---- pitestFullDebug task ----
+tasks.register('pitestFullDebug', JavaExec) {
+    group       = 'verification'
+    description = 'Run PIT mutation testing against the fullDebug unit-test variant.'
+
+    // Ensure compiled classes exist before pitest instruments them.
+    // Also depend on the full test task so its classpath is resolved and
+    // android.jar / stub-framework transforms are populated in the cache.
+    dependsOn(
+        'compileFullDebugJavaWithJavac',
+        'compileFullDebugUnitTestJavaWithJavac',
+        'generateFullDebugUnitTestStubRFile',
+        'processFullDebugUnitTestJavaRes'
+    )
+
+    // pitest's main class lives in pitest-command-line.
+    mainClass = 'org.pitest.mutationtest.commandline.MutationCoverageReport'
+
+    // Declared rather than worked around. The classpath pitest must instrument is
+    // whatever Gradle resolved for the unit-test task, and reading another task's
+    // resolved state at execution time is exactly what the configuration cache
+    // forbids -- without this the task fails with "Cannot reference a Gradle
+    // script object from a Groovy closure". Resolving it at configuration time
+    // instead would make every build, including `--offline` ones that never run
+    // pitest, resolve this variant's whole test classpath. This is a
+    // developer-invoked mutation run on no gate's path, so the honest trade is to
+    // opt this one task out and leave the cache on for everything else.
+    notCompatibleWithConfigurationCache(
+        'reads the resolved fullDebugUnitTest classpath at execution time'
+    )
+
+    // The JARs pitest needs on ITS OWN classpath (not the tested code).
+    classpath = configurations.pitestRuntime
+
+    def classesDir       = layout.buildDirectory.dir('intermediates/javac/fullDebug/classes')
+    def testClassesDir   = layout.buildDirectory.dir('intermediates/javac/fullDebugUnitTest/classes')
+    def rJarDir          = layout.buildDirectory.dir('intermediates/compile_r_class_jar/fullDebug')
+    def testRJarDir      = layout.buildDirectory.dir(
+            'intermediates/compile_and_runtime_not_namespaced_r_class_jar/fullDebugUnitTest')
+    def reportDir        = layout.buildDirectory.dir('reports/pitest')
+
+    doFirst {
+        // Build the list of args pitest will use to load and run the tests.
+        // We borrow the testFullDebugUnitTest task's already-resolved classpath
+        // rather than re-resolving fullDebugUnitTestRuntimeClasspath ourselves;
+        // the latter fails with an attribute-ambiguity error when resolved from
+        // within the same Android library project (it tries to consume :library
+        // as a dependency of itself).
+        def testTask = tasks.named('testFullDebugUnitTest').get()
+
+        def cpEntries = [] as List<String>
+        cpEntries << classesDir.get().asFile.absolutePath
+        cpEntries << testClassesDir.get().asFile.absolutePath
+        fileTree(rJarDir).include('*.jar').each    { cpEntries << it.absolutePath }
+        fileTree(testRJarDir).include('*.jar').each { cpEntries << it.absolutePath }
+        // Append the test task's runtime classpath (android.jar stub, JUnit 4,
+        // hamcrest, etc.) — everything Gradle resolved when it last ran the tests.
+        testTask.classpath.each { cpEntries << it.absolutePath }
+        cpEntries = cpEntries.unique()
+
+        // pitest accepts multiple --classPath arguments (one per entry).
+        // Passing a single colon-joined string treats the whole value as ONE
+        // opaque classpath element; pitest then cannot find the target classes.
+        // Scope, overridable per run. The full package is 4,400 mutations and about
+        // eight minutes, which is a per-batch cost, not a per-edit one -- narrowing to
+        // the class under change brings it under a minute:
+        //   ./gradlew :library:pitestFullDebug -PpitestClasses=com.migo.runtime.internal.TouchEventHandler*
+        // The default stays the whole package so an unscoped run cannot quietly
+        // measure less than the last one did.
+        def targetClasses = project.findProperty('pitestClasses')
+                ?: 'com.migo.runtime.internal.*'
+        def targetTests = project.findProperty('pitestTests')
+                ?: 'com.migo.runtime.internal.*'
+
+        def pitestArgs = [
+            '--reportDir',            reportDir.get().asFile.absolutePath,
+            '--targetClasses',        targetClasses,
+            '--targetTests',          targetTests,
+            // A mutated test is not a finding. Without this the survivor count is
+            // mostly mutations of the assertions themselves, which buries the
+            // production survivors that are the point of running this.
+            '--excludedClasses',      'com.migo.runtime.internal.*Test,com.migo.runtime.internal.*Test$*,com.migo.runtime.internal.AllocationProbe',
+            '--sourceDirs',           'src/main/java',
+            '--outputFormats',        'HTML,XML',
+            '--timestampedReports',   'false',
+            '--threads',              '4',
+            '--verbose',              'false',
+        ]
+        cpEntries.each { pitestArgs.addAll(['--classPath', it]) }
+        args = pitestArgs
+    }
+}

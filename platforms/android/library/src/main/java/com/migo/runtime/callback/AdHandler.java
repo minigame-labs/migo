@@ -8,12 +8,21 @@ package com.migo.runtime.callback;
  * GDT/Youliang Hui, Kuaishou Union, ...). The runtime links no ad SDK, holds no
  * ad credentials, and makes no decision about whether an advert was watched.
  *
- * <h2>Without a handler</h2>
- * Content still gets working ad objects and its callbacks still fire, but no
- * advert is displayed and incentivised video closes with
- * {@code isEnded = false}. That is deliberate: a runtime that reported a
+ * <h2>Without a handler, or without this format</h2>
+ * Content still gets working ad objects and no advert is displayed. Every call
+ * settles, because a pending ad request is a stalled game: {@code createAd},
+ * {@code loadAd} and {@code showAd} report an error, {@code showAd} also closes
+ * with {@code isEnded = false}, and {@code hideAd} reports the ad as hidden.
+ * <p>
+ * The close carries {@code false} deliberately: a runtime that reported a
  * completed view with no advert behind it would have publishers paying out
- * rewards while earning nothing.
+ * rewards while earning nothing. It is reported at all because content following
+ * the wx idiom decides its payout and resumes gameplay in {@code onClose} -- an
+ * error alone leaves the player looking at a paused game.
+ * <p>
+ * A handler that sells only some formats gets the same treatment for the rest:
+ * the defaults below are that settlement, so there is one behaviour to reason
+ * about rather than one per way of not having an advert.
  *
  * <h2>Contract</h2>
  * <ul>
@@ -22,8 +31,8 @@ package com.migo.runtime.callback;
  *   <li>Calls arrive on the runtime's host thread. Do not block: hand work to
  *       your ad SDK and return. Events come back through the {@link AdEventSink},
  *       which is safe to use from any thread.</li>
- *   <li>Every method has a default that reports "not supported" on the sink, so
- *       a handler need only implement the ad formats it actually sells.</li>
+ *   <li>Every method has a default that settles the request as "not supported",
+ *       so a handler need only implement the ad formats it actually sells.</li>
  *   <li>After {@link #destroyAd}, emit nothing further for that {@code adId}.</li>
  * </ul>
  */
@@ -87,7 +96,7 @@ public interface AdHandler {
      * @param sink channel to report this ad's events on
      */
     default void showAd(int adId, AdEventSink sink) {
-        sink.emitError(adId, -1, "showAd:fail not supported");
+        sink.emitShowFailed(adId, -1, "showAd:fail not supported");
     }
 
     /**
@@ -97,9 +106,11 @@ public interface AdHandler {
      * @param sink channel to report this ad's events on
      */
     default void hideAd(int adId, AdEventSink sink) {
-        // Hiding an ad format the host does not support is a no-op, not an
-        // error: content that calls hide() on an ad that never appeared has
-        // done nothing wrong.
+        // Hiding an ad format the host does not support is not an error --
+        // content that calls hide() on an ad that never appeared has done
+        // nothing wrong -- but it is not a silent drop either: a custom ad's
+        // onHide is how content learns the space is free again.
+        sink.emitHide(adId);
     }
 
     /**

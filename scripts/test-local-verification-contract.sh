@@ -85,6 +85,10 @@ git_quiet() {
 STUB_CRATES=(
     demo
     shared io runtime-v8 audio graphics core capi platform
+    # The C boundary rules crate. Its host step is the one that names
+    # `--all-targets`, so a fixture without it would fail that step on a missing
+    # package rather than on anything this contract is about.
+    capi-abi
 )
 
 # Mirrors the real tree's third category: `engine/testing/` holds crates that
@@ -99,11 +103,30 @@ STUB_TESTING_CRATES=(
 add_stub_crate() {
     local repo="$1" group="$2" name="$3"
     mkdir -p "$repo/engine/$group/$name/src"
+    # `io` depends on `shared`, mirroring the real graph, because the host-suite
+    # closure is only observable across an edge: without one, a change to a leaf
+    # selects that leaf and the under-running this contract is meant to catch would
+    # look identical to correct behaviour.
+    local dependency=""
+    if [[ "$name" == "io" ]]; then
+        dependency='shared = { path = "../shared", package = "migo-shared" }'
+    fi
     cat > "$repo/engine/$group/$name/Cargo.toml" <<EOF
 [package]
 name = "migo-$name"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+$dependency
+
+# The real crates select their capability surface with these, and the host steps
+# run both, so a stub without them fails the Slim step on a missing feature
+# rather than on anything this contract is about.
+[features]
+default = ["profile-full"]
+profile-full = []
+profile-slim = []
 EOF
     cat > "$repo/engine/$group/$name/src/lib.rs" <<'EOF'
 pub fn present() -> bool {
@@ -126,6 +149,11 @@ new_fixture() {
     mkdir -p "$repo/scripts/lib" "$repo/docs" "$repo/engine"
     cp "$ROOT/scripts/verify-change.sh" "$repo/scripts/"
     cp "$ROOT/scripts/lib/verification_targets.py" "$repo/scripts/lib/"
+    # Every helper the script calls, not just the selector: a missing one makes the
+    # run fail for a reason unrelated to the property under test, which is the
+    # shape of an always-red gate.
+    cp "$ROOT/scripts/lib/ci_contract_gates.py" "$repo/scripts/lib/"
+    cp "$ROOT/scripts/lib/host_test_coverage.py" "$repo/scripts/lib/"
     {
         printf '[workspace]\nresolver = "2"\nmembers = [\n'
         for crate in "${STUB_CRATES[@]}"; do
@@ -147,6 +175,44 @@ new_fixture() {
     git_quiet "$repo" add -A
     git_quiet "$repo" commit -q -m "baseline"
     echo "$repo"
+}
+
+# A fixture whose workflow really has a quality-gate job, so the lane has gates to
+# run. Without one the only contract line a run produces is the "no workflow here"
+# verdict, which is recorded before the loop -- and a mutant that deleted the loop
+# entirely walked past an assertion on that line.
+#
+# Sixteen stubs because the derivation refuses a job with fewer than fifteen gates,
+# on the grounds that a lane that small is a parse which stopped matching. The
+# fixture has to clear the real floor rather than the floor being made tunable: a
+# knob that switches off an anti-vacuity check is a knob that switches it off in
+# production too.
+add_stub_gates() {
+    local repo="$1" failing="${2:-}"
+    mkdir -p "$repo/.github/workflows"
+    {
+        printf 'jobs:\n  quality-gate:\n    steps:\n'
+        for index in $(seq 1 16); do
+            printf '      - name: stub %s\n        run: bash scripts/test-stub-%s-contract.sh\n' \
+                "$index" "$index"
+            # Stub 1 drains stdin on purpose. A real gate does -- one of them runs
+            # `cargo` -- and when the lane iterated a here-string it swallowed
+            # every gate after it, which is how three gates and a verdict line
+            # went missing from a run that still reported success.
+            if [[ "$index" == "1" ]]; then
+                printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' \
+                    > "$repo/scripts/test-stub-$index-contract.sh"
+            else
+                printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/scripts/test-stub-$index-contract.sh"
+            fi
+            chmod +x "$repo/scripts/test-stub-$index-contract.sh"
+        done
+    } > "$repo/.github/workflows/pr-ci.yml"
+    if [[ -n "$failing" ]]; then
+        # The last gate, so a refusal is only observable if the lane got that far.
+        printf '#!/usr/bin/env bash\necho "stub gate refuses"\nexit 1\n' \
+            > "$repo/scripts/test-stub-16-contract.sh"
+    fi
 }
 
 run_verify() {
@@ -193,6 +259,41 @@ assert_status "$status" 1 "a changed source with unknown conditions fails the ru
 assert_contains "$output" "UNDETERMINED" "the unknown-condition file is reported"
 
 # ------------------------------------------------------------
+# A test binary no host step runs stops the run.
+#
+# The same argument as the unreached source above, applied to behaviour instead of
+# to platform conditions: a binary nothing executes has unknown behaviour, and a
+# verdict printed over it covers less than it says. This is the case that was live
+# -- thirteen integration-test binaries, 95 tests, none of them named by any step,
+# because every step in every gate said `--lib`.
+#
+# `--plan-only`, so the assertion is about the audit refusing rather than about any
+# suite's result. A stub crate is used deliberately: `demo` has no host step at all,
+# which is the weaker of the two ways to be uncovered and therefore the one a
+# `--lib`-only check would miss.
+# ------------------------------------------------------------
+repo="$(new_fixture unrun_test_binary)"
+mkdir -p "$repo/engine/crates/demo/tests"
+printf '#[test]\nfn nobody_runs_me() {}\n' > "$repo/engine/crates/demo/tests/orphan.rs"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_status "$status" 1 "a test binary no host step runs fails the run"
+assert_contains "$output" "migo-demo::orphan" "the unrun test binary is named"
+
+# And a compile is not coverage. `build --workspace --all-targets` builds every test
+# binary and runs none, so an audit that accepted it would report the whole class as
+# covered -- which is how these binaries stayed invisible while the tree was green.
+# Asked of the parser directly: that one step alone must leave every test binary in
+# the real workspace unaccounted for.
+compile_only="$(printf 'build --workspace --all-targets\n' \
+    | python3 "$ROOT/scripts/lib/host_test_coverage.py" --root "$ROOT" || true)"
+if [[ "$(printf '%s\n' "$compile_only" | grep -c .)" -ge 10 ]]; then
+    pass "compiling every test binary is not counted as running one"
+else
+    fail "the audit treats a --all-targets *build* as coverage, so it cannot see an unrun binary"
+fi
+
+# ------------------------------------------------------------
 # A change outside the engine needs no target build.
 # ------------------------------------------------------------
 repo="$(new_fixture documentation)"
@@ -227,6 +328,11 @@ output="$(run_verify "$repo")" || status=$?
 assert_status "$status" 1 "the Java lane with no local Gradle fails the run"
 assert_contains "$output" "NOT PROVEN" "a machine without Gradle reports no evidence, not a break"
 assert_contains "$output" "android-java compile" "the Java lane is named in the verdict"
+# Executed, not merely planned. `--plan-only` prints the lane from the same helper,
+# so a mutant that deletes the loop which *runs* the gates would leave the plan
+# check green; only a verdict line proves the run reached them.
+assert_contains "$output" "no .github/workflows/pr-ci.yml in this tree" \
+    "the contract lane appears in the verdict of an actual run"
 assert_no_line_starting "$output" "FAIL" \
     "the Java lane's absence is the only thing that failed this run"
 
@@ -367,7 +473,12 @@ fi
 # reportable, and the local one has one authority instead of a regular
 # expression guessing at one.
 local_crates="$(bash "$ROOT/scripts/verify-change.sh" --list-host-crates 2>/dev/null || true)"
-ci_crates="$(grep -E 'cargo test' "$ROOT/.github/workflows/pr-ci.yml" \
+# Comments stripped before the extraction, not after: this workflow explains its own
+# `--lib`/`--all-targets` choices in prose next to the commands, and a comment parsed
+# as a command is a list that agrees with itself about the wrong thing.
+ci_test_lines="$(sed 's/#.*//' "$ROOT/.github/workflows/pr-ci.yml" \
+    | grep -E 'cargo test ' || true)"
+ci_crates="$(printf '%s\n' "$ci_test_lines" \
     | grep -oE '\-p migo-[a-z0-9-]+' | grep -oE 'migo-[a-z0-9-]+' | sort -u || true)"
 if [[ -z "$ci_crates" ]]; then
     fail "cannot find the crates pr-ci.yml tests"
@@ -377,6 +488,50 @@ else
     while read -r crate; do
         assert_contains "$ci_crates" "$crate" "pr-ci.yml runs $crate's tests too"
     done <<< "$local_crates"
+
+    # ------------------------------------------------------------
+    # And the other direction, which is the one that was missing.
+    #
+    # Only `local ⊆ CI` was ever asserted, and it is the harmless half: a local step
+    # CI lacks makes CI narrower than a developer's machine, which is a hole in the
+    # merge gate. `CI ⊆ local` is the half that makes the local verdict *false* --
+    # the run prints "verified for every target this change touches" about a change
+    # CI will reject. `migo-capi-abi` lived in exactly that gap: 60 ABI and
+    # versioned-header tests, run by CI, run by no local step, and every assertion
+    # in this file passed.
+    # ------------------------------------------------------------
+    while read -r crate; do
+        assert_contains "$local_crates" "$crate" \
+            "scripts/verify-change.sh runs $crate's tests too"
+    done <<< "$ci_crates"
+fi
+
+# ------------------------------------------------------------
+# CI's own commands leave no test binary unrun.
+#
+# `verify-change.sh` now refuses to produce a verdict when one of its steps does
+# not cover a test binary. CI has no such refusal and had the identical gap for the
+# identical reason -- every command said `--lib` -- so 35 tests in seven binaries
+# ran in no job at all. Asking the *same parser* about the workflow's own cargo
+# lines is what holds the two sides at one scope: a second implementation of "which
+# targets does this flag select" would disagree with the first exactly when it
+# matters.
+# ------------------------------------------------------------
+if [[ -n "$ci_test_lines" ]]; then
+    ci_unrun=""
+    audit_status=0
+    ci_unrun="$(printf '%s\n' "$ci_test_lines" \
+        | grep -oE 'cargo test .*' | sed 's/^cargo //' \
+        | python3 "$ROOT/scripts/lib/host_test_coverage.py" --root "$ROOT")" \
+        || audit_status=$?
+    if [[ "$audit_status" -ne 0 ]]; then
+        fail "the test-binary audit could not describe this workspace, so CI's scope is unknown"
+    elif [[ -n "$ci_unrun" ]]; then
+        fail "no pr-ci.yml cargo command runs these test binaries:"
+        printf '%s\n' "$ci_unrun" | sed 's/^/    /' >&2
+    else
+        pass "every test binary is run by a pr-ci.yml cargo command"
+    fi
 fi
 
 # ------------------------------------------------------------
@@ -405,6 +560,105 @@ else
         assert_contains "$clippy_crates" "$crate" "pr-ci.yml lints $crate too"
     done <<< "$ci_crates"
 fi
+
+# ------------------------------------------------------------
+# The contract lane exists, and is derived rather than restated.
+#
+# `verify-change.sh` had no concept of the source-structure gates for months: they
+# lived only in pr-ci.yml, so a change that only one of them can catch -- a
+# resolver an entry point stopped calling, an import a crate must not have -- was
+# reported locally as "verified for every target this change touches". This asserts
+# the lane is present, is not vacuous, and names the ad reward gate specifically,
+# because that is the one whose absence was measured.
+# ------------------------------------------------------------
+lane="$(bash "$ROOT/scripts/verify-change.sh" --base HEAD --plan-only 2>&1 || true)"
+assert_contains "$lane" "CONTRACT" "the plan reports a contract lane"
+assert_contains "$lane" "scripts/test-ad-reward-integrity-contract.sh" \
+    "the contract lane includes the ad reward integrity gate"
+
+derived="$(python3 "$ROOT/scripts/lib/ci_contract_gates.py" "$ROOT" | grep -c . || true)"
+if [[ "$derived" -ge 15 ]]; then
+    pass "the contract lane derives $derived gate(s) from pr-ci.yml"
+else
+    fail "the contract lane derived only $derived gate(s); a lane this small is a parse that stopped matching"
+fi
+
+# Every gate the workflow's quality-gate job runs must be in the lane, answered by
+# the same parse that builds the lane rather than by a second grep -- a grep would
+# also match the build and Qt jobs, whose gates need release artifacts, and would
+# report them as missing forever.
+unaccounted="$(python3 "$ROOT/scripts/lib/ci_contract_gates.py" --audit "$ROOT" || true)"
+if [[ -z "$unaccounted" ]]; then
+    pass "no quality-gate contract script is missing from the local lane"
+else
+    fail "contract script(s) CI runs are absent from the local lane:"
+    printf '%s\n' "$unaccounted" >&2
+fi
+
+# ------------------------------------------------------------
+# The lane is run, and its verdict decides the run.
+#
+# Two properties, and a fixture with real gates is what separates them: that the
+# loop executes (a passing gate appears in the verdict) and that a gate's refusal
+# fails the run (an exit code, not a printed line). A mutant that planned the lane
+# and never ran it satisfied every earlier check.
+# ------------------------------------------------------------
+repo="$(new_fixture lane)"
+add_stub_gates "$repo"
+status=0
+output="$(run_verify "$repo")" || status=$?
+assert_contains "$output" "test-stub-16-contract.sh" \
+    "a gate after one that drains stdin still reaches the verdict"
+assert_contains "$output" "PASS" "a passing gate is recorded as PASS"
+
+repo="$(new_fixture lane_refusal)"
+add_stub_gates "$repo" failing
+status=0
+output="$(run_verify "$repo")" || status=$?
+assert_status "$status" 1 "a contract gate that refuses fails the whole run"
+assert_contains "$output" "FAIL" "the refusing gate is recorded as FAIL"
+
+# ------------------------------------------------------------
+# The host suites are selective, and selective in the safe direction.
+#
+# Running all sixteen on every invocation made a Java-only change pay for the whole
+# Rust tree. The risk of fixing that is the opposite failure, which is silent: a suite
+# that should have run and did not. So the closure is checked in both directions --
+# a leaf change reaches its dependents, and anything unreasonable-about widens to
+# everything.
+# ------------------------------------------------------------
+repo="$(new_fixture hostsuites)"
+printf 'pub fn changed() {}\n' >> "$repo/engine/crates/shared/src/lib.rs"
+
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_contains "$output" "HOSTSUITES" "the plan names the host suites it needs"
+assert_contains "$output" "migo-shared" "a changed crate is in its own closure"
+assert_contains "$output" "migo-io" "a leaf change reaches the crates that depend on it"
+
+status=0
+output="$(run_verify "$repo")" || status=$?
+assert_contains "$output" "test -p migo-io" \
+    "the dependent's suite is actually run, not merely planned"
+assert_absent "$output" "test -p migo-capi" \
+    "a crate that cannot see the change does not pay for it"
+
+# A path the selector cannot reason about must widen, not narrow.
+repo="$(new_fixture hostsuites_unknown)"
+printf 'echo changed\n' >> "$repo/scripts/verify-change.sh"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_contains "$output" "HOSTSUITES ALL" \
+    "a change outside engine/ that could affect anything runs every suite"
+
+repo="$(new_fixture hostsuites_java)"
+mkdir -p "$repo/platforms/android/library/src/main/java/com/migo/runtime"
+printf 'class Changed {}\n' \
+    > "$repo/platforms/android/library/src/main/java/com/migo/runtime/Changed.java"
+status=0
+output="$(run_verify "$repo" --plan-only)" || status=$?
+assert_contains "$output" "HOSTSUITES NONE" \
+    "a Java-only change asks for no cargo suite"
 
 if [[ "$failures" -ne 0 ]]; then
     printf '\033[0;31m%s contract check(s) failed\033[0m\n' "$failures" >&2

@@ -271,6 +271,67 @@ private slots:
         QCOMPARE(fake_migo::touches().size(), std::size_t{0});
     }
 
+    /// A move after a release must not name the button that was released.
+    ///
+    /// `include/migo/input.h` says a move "names the button being held", and the
+    /// view used to answer from an ordinal written on press and on release and
+    /// never cleared. So every hover after a right-click reported the secondary
+    /// button as held, and content saw a drag that was not happening.
+    ///
+    /// The secondary button specifically. The primary's ordinal is 0, which is
+    /// also what a hover must report, so a test that presses the primary passes
+    /// whether the view reads the event or a stale field.
+    void a_move_after_a_release_names_no_held_button() {
+        if (!require_xcb("xcb-only test", __FILE__, __LINE__)) return;
+        AttachedFixture fixture;
+        MigoQtX11SurfaceView &view = fixture.view;
+        QTRY_COMPARE(fake_migo::calls().attach, 1);
+
+        sendMouse(view, QEvent::MouseButtonPress, Qt::RightButton, Qt::RightButton, {1.0, 2.0}, 1);
+        sendMouse(view, QEvent::MouseMove, Qt::NoButton, Qt::RightButton, {3.0, 4.0}, 2);
+        sendMouse(view, QEvent::MouseButtonRelease, Qt::RightButton, Qt::NoButton, {3.0, 4.0}, 3);
+        sendMouse(view, QEvent::MouseMove, Qt::NoButton, Qt::NoButton, {5.0, 6.0}, 4);
+
+        const auto &pointers = fake_migo::pointers();
+        QCOMPARE(pointers.size(), std::size_t{4});
+        QCOMPARE(pointers[0].event_type, MIGO_POINTER_EVENT_DOWN);
+        QCOMPARE(pointers[0].button, 2U);
+        // Held, so the drag names it.
+        QCOMPARE(pointers[1].event_type, MIGO_POINTER_EVENT_MOVE);
+        QCOMPARE(pointers[1].button, 2U);
+        // The button that changed state.
+        QCOMPARE(pointers[2].event_type, MIGO_POINTER_EVENT_UP);
+        QCOMPARE(pointers[2].button, 2U);
+        // Nothing is held any more.
+        QCOMPARE(pointers[3].event_type, MIGO_POINTER_EVENT_MOVE);
+        QCOMPARE(pointers[3].button, 0U);
+    }
+
+    /// With two buttons down, releasing one leaves the other named.
+    ///
+    /// The same stale-ordinal defect in its second form: remembering the button
+    /// last *touched* reports the released one, so a chord that ends with the
+    /// primary still down told content the secondary was held.
+    void releasing_one_of_two_buttons_leaves_the_other_named() {
+        if (!require_xcb("xcb-only test", __FILE__, __LINE__)) return;
+        AttachedFixture fixture;
+        MigoQtX11SurfaceView &view = fixture.view;
+        QTRY_COMPARE(fake_migo::calls().attach, 1);
+
+        sendMouse(view, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, {1.0, 2.0}, 1);
+        sendMouse(view, QEvent::MouseButtonPress, Qt::RightButton,
+                  Qt::LeftButton | Qt::RightButton, {1.0, 2.0}, 2);
+        sendMouse(view, QEvent::MouseButtonRelease, Qt::RightButton, Qt::LeftButton, {1.0, 2.0}, 3);
+        sendMouse(view, QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, {3.0, 4.0}, 4);
+
+        const auto &pointers = fake_migo::pointers();
+        QCOMPARE(pointers.size(), std::size_t{4});
+        QCOMPARE(pointers[2].event_type, MIGO_POINTER_EVENT_UP);
+        QCOMPARE(pointers[2].button, 2U);
+        QCOMPARE(pointers[3].event_type, MIGO_POINTER_EVENT_MOVE);
+        QCOMPARE(pointers[3].button, 0U);
+    }
+
     /// Content that listens for both streams must be able to receive one.
     void pointer_delivery_can_be_narrowed_to_a_single_stream() {
         if (!require_xcb("xcb-only test", __FILE__, __LINE__)) return;

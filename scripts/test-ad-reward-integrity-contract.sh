@@ -251,6 +251,98 @@ else:
             "without it events cannot be routed to an ad object"
         )
 
+    # -----------------------------------------------------------------------
+    # 5. Every ad command must settle a request it cannot forward.
+    #
+    # A full-profile Android session always installs an ad service, so content
+    # takes the hosted path whether or not the embedder registered a handler:
+    # "hosted with no handler" is the ordinary state of an integration in
+    # progress. Three of the six commands used to resolve the handler with a
+    # bare map lookup and `return`, so a hide() was dropped without a word and
+    # a custom ad's onHide never came -- and that lookup also skipped the
+    # dead-session cleanup the resolver performs.
+    #
+    # What each command settles as is checked behaviourally by
+    # AdSettlementTest. This check exists because *which resolver an entry
+    # point calls* is not observable from there: NativeExports holds
+    # android.os.Handler statics, so a host JVM cannot load it, and the module
+    # has no Robolectric.
+    # -----------------------------------------------------------------------
+
+    def blank_strings(text: str) -> str:
+        # Same length, no contents: brace matching below must not trip over a
+        # `"{}"` literal, and offsets have to stay comparable.
+        return re.sub(
+            r'"(?:\\.|[^"\\\n])*"',
+            lambda m: '"' + " " * (len(m.group(0)) - 2) + '"',
+            text,
+        )
+
+    def body_after(text: str, brace_index: int) -> str:
+        depth = 0
+        for index in range(brace_index, len(text)):
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[brace_index : index + 1]
+        return ""
+
+    scan_source = blank_strings(sink_source)
+
+    entry_points = list(
+        re.finditer(
+            r"public\s+static\s+void\s+(ad[A-Z]\w*)\s*\(\s*int\s+sessionId\s*,"
+            r"\s*String\s+requestJson\s*\)\s*\{",
+            scan_source,
+        )
+    )
+    if len(entry_points) < 6:
+        failures.append(
+            f"{sink_java.relative_to(root)}: found {len(entry_points)} ad entry "
+            "point(s), expected at least the six wx ad commands; this check "
+            "stopped matching them and would pass vacuously"
+        )
+
+    for match in entry_points:
+        name = match.group(1)
+        body = body_after(scan_source, match.end() - 1)
+        if not body:
+            failures.append(
+                f"{sink_java.relative_to(root)}: could not read the body of "
+                f"`{name}`; the routing check cannot run"
+            )
+            continue
+        if "adHandlerOrSettle(" not in body:
+            failures.append(
+                f"{sink_java.relative_to(root)}: `{name}` does not resolve its "
+                "handler through `adHandlerOrSettle`, so a request it cannot "
+                "forward is dropped instead of settled and content waits forever"
+            )
+        if "sAdHandlers.get(" in body:
+            failures.append(
+                f"{sink_java.relative_to(root)}: `{name}` reads `sAdHandlers` "
+                "directly; that lookup skips both the settlement and the "
+                "dead-session cleanup"
+            )
+
+    resolver = re.search(
+        r"private\s+static\s+AdHandler\s+adHandlerOrSettle\s*\([^)]*\)\s*\{",
+        scan_source,
+    )
+    if resolver is None:
+        failures.append(
+            f"{sink_java.relative_to(root)}: `adHandlerOrSettle` is gone; the "
+            "entry points above have nothing to route through"
+        )
+    elif "settleWithoutAdvert(" not in body_after(scan_source, resolver.end() - 1):
+        failures.append(
+            f"{sink_java.relative_to(root)}: `adHandlerOrSettle` no longer "
+            "settles the request when no handler is registered, so routing "
+            "through it buys content nothing"
+        )
+
 # ---------------------------------------------------------------------------
 
 if failures:

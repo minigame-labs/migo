@@ -21,8 +21,23 @@ EXPECTED='(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
+# The local verifier's Gradle mode, requested by name.
+#
+# `--offline` because CI has a network and no dependency cache while
+# `scripts/verify-change.sh` has the cache and a network that cannot reach the module
+# repositories quickly -- unconstrained, a build there stalls for tens of minutes with
+# no output at all.
+#
+# `--no-daemon` because a verification run drives more than one Gradle build, and a
+# daemon outlives its build while still holding the project lock: measured with five
+# daemons alive and the owning one parked on a lock for seventeen minutes having used
+# twenty seconds of CPU. Without a daemon, a build's locks die with its JVM. CI already
+# takes this shape for its own Java step.
+GRADLE_FLAGS=()
+[[ -n "${MIGO_GRADLE_VERIFIER:-}" ]] && GRADLE_FLAGS+=(--offline --no-daemon)
+
 echo "[1/4] compiling full/slim debug library Java..."
-( cd "$ANDROID_DIR" && ./gradlew --quiet \
+( cd "$ANDROID_DIR" && ./gradlew --quiet "${GRADLE_FLAGS[@]}" \
     :library:compileFullDebugJavaWithJavac \
     :library:compileSlimDebugJavaWithJavac ) \
     || fail "full/slim debug Java compilation failed"

@@ -170,7 +170,7 @@ public final class NativeBridge {
      * </ul>
      *
      * @param sessionId The session ID
-     * @param gameId    Unique game identifier (1-64 alphanumeric, underscore, hyphen)
+     * @param gameId    Unique game identifier (1-64 lower-case alphanumeric, underscore, hyphen)
      * @param entry     Entry point file name (e.g., "game.js")
      * @return 0 on success, negative error code on failure
      */

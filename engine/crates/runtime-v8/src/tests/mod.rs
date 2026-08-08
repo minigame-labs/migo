@@ -4,14 +4,26 @@
 //! seven `tests_*.rs` files at the crate root, interleaved with production
 //! sources, and three of them were named after internal ticket ids whose
 //! meaning lived only in the performance audit document.
+//!
+//! Three modules are gated on the feature that ships the API they drive. Slim
+//! `cfg`-deletes whole capability extensions, so those tests would fail against a
+//! `wx` namespace that correctly does not have the function -- which is what they
+//! did, silently, for as long as nothing ran a Slim host suite. A gate here is a
+//! statement that the profile does not ship the API; it is not a statement that
+//! the test is optional.
 
+#[cfg(feature = "api-system")]
 mod ad_reward_integrity;
 mod binary_helper;
 mod canvas_follows_surface;
 mod global_surface;
 mod host_bridge_dispatch;
 mod install_receipt;
+#[cfg(feature = "api-connectivity")]
 mod permission_reporting;
+// Camera and recorder scopes come from `api-media`, bluetooth from
+// `api-connectivity`; all four tests need both.
+#[cfg(all(feature = "api-media", feature = "api-connectivity"))]
 mod permission_revocation;
 mod prelude;
 mod published_namespace_isolation;

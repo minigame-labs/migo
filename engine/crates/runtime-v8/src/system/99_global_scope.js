@@ -160,9 +160,13 @@ ObjectDefineProperties(globalThis, {
     getUserGameLabel: core.propNonEnumerable(openDataContext.getUserGameLabel),
 
     // Window Resize
+    //
+    // The host hook is not here: `_internalTriggerWindowResize` is registered by
+    // 98_global_scope_window.js, because the canvas must follow the surface in
+    // every product profile and this extension is one `api-connectivity` away
+    // from not existing. What content can subscribe to does belong here.
     onWindowResize: core.propNonEnumerable(windowResize.onWindowResize),
     offWindowResize: core.propNonEnumerable(windowResize.offWindowResize),
-    _internalTriggerWindowResize: core.propNonEnumerable(windowResize._internalTriggerWindowResize),
 
     // Game Log
     getGameLogManager: core.propNonEnumerable(gameLog.getGameLogManager),

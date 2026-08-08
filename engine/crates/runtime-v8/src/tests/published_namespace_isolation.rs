@@ -200,15 +200,29 @@ mod published_namespace_isolation_tests {
     /// The mirrors must keep working: this fix removes internals, not APIs.
     #[test]
     fn the_wx_and_migo_namespaces_still_publish_content_apis() {
+        // Both halves of this are profile-dependent, and asserting the Full
+        // numbers everywhere would assert the product profile instead of the
+        // publication. Slim cfg-deletes whole capability extensions -- it
+        // published 127 wx names against Full's 300-plus when this was measured --
+        // and `getSystemInfoSync` is one of the names it removes. The floor is
+        // still well above what a collapsed namespace would report, and the API
+        // probed in both profiles is one neither can drop.
+        #[cfg(feature = "api-connectivity")]
+        let (floor, probe) = (300, "globalThis.wx.getSystemInfoSync");
+        #[cfg(not(feature = "api-connectivity"))]
+        let (floor, probe) = (100, "globalThis.wx.getStorageSync");
+
         let mut rt = boot();
         assert_js(
             &mut rt,
-            "const wxNames = Object.getOwnPropertyNames(globalThis.wx || {}); \
-             const migoNames = Object.getOwnPropertyNames(globalThis.migo || {}); \
-             let __ok = wxNames.length > 300 && migoNames.length > 300 \
+            &format!(
+                "const wxNames = Object.getOwnPropertyNames(globalThis.wx || {{}}); \
+             const migoNames = Object.getOwnPropertyNames(globalThis.migo || {{}}); \
+             let __ok = wxNames.length > {floor} && migoNames.length > {floor} \
                  && typeof globalThis.wx.createCanvas === 'function' \
-                 && typeof globalThis.wx.getSystemInfoSync === 'function'; \
-             let __msg = 'wx=' + wxNames.length + ' migo=' + migoNames.length",
+                 && typeof {probe} === 'function'; \
+             let __msg = 'wx=' + wxNames.length + ' migo=' + migoNames.length"
+            ),
         );
     }
 

@@ -9,6 +9,21 @@ import org.junit.Test;
 
 /** Host-JVM tests for the platform lifecycle request state machine. */
 public final class LifecycleRequestStateTest {
+    /**
+     * The destroyed flag is observed in both states.
+     *
+     * It gates every transition, so a reader stuck at one answer either refuses a live
+     * session's requests or admits a destroyed one's. Only one polarity was ever asserted.
+     */
+    @Test
+    public void theDestroyedFlagIsObservedBeforeAndAfterDestruction() {
+        LifecycleRequestState<Boolean> state = new LifecycleRequestState<>(false);
+
+        assertFalse("a fresh state is not destroyed", state.isDestroyed());
+        state.destroy();
+        assertTrue("a destroyed state says so", state.isDestroyed());
+    }
+
     @Test
     public void startAndRestartUseLatestRequest() {
         LifecycleRequestState<String> state = new LifecycleRequestState<>(false);

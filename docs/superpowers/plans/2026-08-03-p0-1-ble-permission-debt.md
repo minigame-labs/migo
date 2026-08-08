@@ -465,6 +465,6 @@ behaviour; whether `awaitIdle` can be starved; and fixture determinism.
 - [ ] **Step 4: Mark the ledger**
 
 Set task 0.1 to `- [x]` in
-`docs/superpowers/plans/2026-08-03-four-platform-delivery.md` only when
+`docs/superpowers/plans/2026-08-03-four-platform-delivery/part-phase-0.md` only when
 implementation, tests, fresh verification, and both approvals all agree. Record
 the exact test counts.

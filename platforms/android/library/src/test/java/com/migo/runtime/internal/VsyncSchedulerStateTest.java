@@ -26,6 +26,38 @@ public final class VsyncSchedulerStateTest {
         assertEquals(message, expected, actual);
     }
 
+    /**
+     * The other polarity of both flags the scheduler is queried about.
+     *
+     * `isCallbackPosted` was only ever asserted false and `isRequested` only ever true, so
+     * either accessor could be replaced by that constant and nothing failed. They are how
+     * the Choreographer half decides whether to post again; a stuck answer is either a
+     * frame that never comes or one posted twice.
+     */
+    @Test
+    public void bothSchedulerFlagsAreObservedInBothStates() {
+        VsyncSchedulerState ready = new VsyncSchedulerState(true, true);
+
+        assertFalse("a fresh scheduler has posted nothing", ready.isCallbackPosted());
+        assertFalse("a fresh scheduler has no demand", ready.isRequested());
+
+        // A postable scheduler posts instead of retaining demand: the callback *is* the
+        // demand, which is why these two flags are not the same fact.
+        ready.requestFrame();
+        assertTrue("a postable request is in flight", ready.isCallbackPosted());
+        assertFalse("a posted request needs no retained demand", ready.isRequested());
+
+        ready.doFrame();
+        assertFalse("delivering clears the posted callback", ready.isCallbackPosted());
+        assertFalse("delivering leaves no demand behind", ready.isRequested());
+
+        // The other branch: nothing can be posted, so the demand has to be kept.
+        VsyncSchedulerState notReady = new VsyncSchedulerState(true, false);
+        notReady.requestFrame();
+        assertFalse("an unpostable request posts nothing", notReady.isCallbackPosted());
+        assertTrue("an unpostable request retains its demand", notReady.isRequested());
+    }
+
     @Test
     public void oneRequestArmsOneCallbackAndDoesNotRepost() {
         VsyncSchedulerState state = started();

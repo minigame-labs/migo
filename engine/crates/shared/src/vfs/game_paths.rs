@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 pub enum GamePathError {
     /// Game ID is invalid (wrong format or length)
     InvalidGameId(String),
+    /// Game ID names a device rather than a file on one of the supported
+    /// platforms, so it cannot become a directory there
+    ReservedGameId(String),
     /// Base directory is invalid
     InvalidBaseDir,
 }
@@ -21,7 +24,14 @@ impl std::fmt::Display for GamePathError {
             GamePathError::InvalidGameId(id) => {
                 write!(
                     f,
-                    "Invalid game ID '{}': must be 1-64 alphanumeric, underscore or hyphen",
+                    "Invalid game ID '{}': must be 1-64 lower-case alphanumeric, underscore or hyphen",
+                    id
+                )
+            }
+            GamePathError::ReservedGameId(id) => {
+                write!(
+                    f,
+                    "Reserved game ID '{}': names a platform device, not a directory",
                     id
                 )
             }
@@ -36,7 +46,24 @@ impl std::error::Error for GamePathError {}
 ///
 /// # Rules
 /// - Length: 1-64 characters
-/// - Allowed characters: a-z, A-Z, 0-9, _, -
+/// - Allowed characters: a-z, 0-9, _, -
+/// - Not a reserved device name (`con`, `nul`, `com1`, ...)
+///
+/// # Why lower case only
+///
+/// The id becomes one path component per game, and that component is the
+/// storage isolation boundary: separate saves, separate `wx.clearStorage()`,
+/// separate quota, separate `/code`. NTFS and the default APFS volume compare
+/// path components case-insensitively, so `PuzzleQuest` and `puzzlequest` are
+/// two games on Linux and Android and one directory on Windows. Restricting the
+/// id space to its own canonical spelling makes the pair unrepresentable
+/// instead of resolving it per platform: folding here would leave `game_id()`
+/// and the directory name two spellings of one identity, and every other
+/// producer of that path (the Java SDK's own `GamePaths`, `GamePathStrings`
+/// across the JNI boundary) would have to repeat the fold or disagree.
+///
+/// A host whose own catalogue uses mixed case owns the mapping, which it
+/// already does: id uniqueness is the host's documented obligation.
 ///
 /// # Examples
 /// ```
@@ -46,20 +73,48 @@ impl std::error::Error for GamePathError {}
 /// assert!(validate_game_id("game_123").is_ok());
 /// assert!(validate_game_id("").is_err());
 /// assert!(validate_game_id("../hack").is_err());
+/// assert!(validate_game_id("MyGame").is_err());
+/// assert!(validate_game_id("nul").is_err());
 /// ```
 pub fn validate_game_id(game_id: &str) -> Result<(), GamePathError> {
     // Hand-rolled validation replaces regex crate dependency for this single use.
-    // Allowed: a-z, A-Z, 0-9, underscore, hyphen. Length: 1-64.
+    // Allowed: a-z, 0-9, underscore, hyphen. Length: 1-64.
     if game_id.is_empty() || game_id.len() > 64 {
         return Err(GamePathError::InvalidGameId(game_id.to_string()));
     }
     for b in game_id.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' => {}
+            b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => {}
             _ => return Err(GamePathError::InvalidGameId(game_id.to_string())),
         }
     }
+    if is_reserved_device_name(game_id) {
+        return Err(GamePathError::ReservedGameId(game_id.to_string()));
+    }
     Ok(())
+}
+
+/// Whether a game ID names a Windows device rather than a file.
+///
+/// Rejected on every platform, not only Windows. These names pass the character
+/// rule, and on Windows every path containing one resolves to a device: the
+/// per-game directory cannot be created, so the session fails at
+/// `ensure_directories`. A platform-conditional rejection would make one id
+/// valid on three platforms and invalid on the fourth, which is the divergence
+/// the rest of this rule exists to avoid.
+///
+/// The caller has already applied the character rule, so `game_id` is lower
+/// case here and the comparison needs no folding.
+fn is_reserved_device_name(game_id: &str) -> bool {
+    if matches!(game_id, "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    // COM0-COM9 and LPT0-LPT9. Windows reserves the whole numbered range, and a
+    // digit suffix is the only thing distinguishing them from ordinary ids.
+    let suffix = game_id
+        .strip_prefix("com")
+        .or_else(|| game_id.strip_prefix("lpt"));
+    matches!(suffix, Some(digit) if digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit())
 }
 
 /// Paths for a specific game instance.
@@ -329,11 +384,145 @@ fn dir_size(path: &Path) -> u64 {
 mod tests {
     use super::*;
 
+    /// The cross-language rule table. Embedded rather than read at run time so
+    /// that moving or deleting it fails the build instead of quietly leaving
+    /// this suite with nothing to check.
+    const VECTORS: &str = include_str!("game-id-vectors.txt");
+
+    fn vectors() -> Vec<(bool, &'static str)> {
+        let mut parsed = Vec::new();
+        for line in VECTORS.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let verdict = fields.next().expect("non-empty line has a verdict");
+            let id = fields.next().unwrap_or_else(|| panic!("no id in {line:?}"));
+            assert!(fields.next().is_none(), "more than two fields in {line:?}");
+            let expected = match verdict {
+                "ok" => true,
+                "err" => false,
+                other => panic!("unknown verdict {other:?} in {line:?}"),
+            };
+            parsed.push((expected, id));
+        }
+        parsed
+    }
+
+    #[test]
+    fn shared_vectors_agree_with_the_rule() {
+        let vectors = vectors();
+        // An emptied or all-one-verdict table would satisfy the loop below
+        // without checking anything.
+        assert!(
+            vectors.len() >= 25,
+            "vector table shrank: {}",
+            vectors.len()
+        );
+        assert!(vectors.iter().any(|(expected, _)| *expected));
+        assert!(vectors.iter().any(|(expected, _)| !*expected));
+
+        for (expected, id) in vectors {
+            assert_eq!(
+                validate_game_id(id).is_ok(),
+                expected,
+                "vector {id:?} expected ok={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_ids_are_their_own_lower_case_spelling() {
+        // The property the case rule exists for, stated over arbitrary input
+        // rather than over the vectors: on a case-insensitive filesystem, two
+        // accepted ids that fold together are one directory. They cannot fold
+        // together if every accepted id is already folded.
+        for id in vectors()
+            .into_iter()
+            .filter(|(expected, _)| *expected)
+            .map(|(_, id)| id)
+            .chain(["game", "a-b_c9", "0000"])
+        {
+            assert_eq!(
+                id,
+                id.to_ascii_lowercase(),
+                "accepted id {id:?} is not case-canonical"
+            );
+        }
+        for id in ["Game", "gamE", "GAME", "My-Game", &("a".repeat(63) + "A")] {
+            assert!(
+                validate_game_id(id).is_err(),
+                "{id:?} folds onto an accepted id and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_accepted_character_set_is_exactly_lower_case_alphanumeric_underscore_and_hyphen() {
+        // Exhaustive over single-byte ids, so no widening of the allowlist can
+        // hide in a character the vectors happen not to name.
+        for byte in 0u8..=255 {
+            let id = char::from(byte).to_string();
+            let expected = matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+            assert_eq!(
+                validate_game_id(&id).is_ok(),
+                expected,
+                "byte {byte:#04x} ({:?})",
+                char::from(byte)
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_device_names_are_rejected_on_every_platform() {
+        // These pass the character rule. On Windows the per-game directory
+        // cannot be created at all, so accepting them here would make one id
+        // work on three platforms and fail on the fourth.
+        let mut reserved: Vec<String> = vec![
+            "con".to_string(),
+            "prn".to_string(),
+            "aux".to_string(),
+            "nul".to_string(),
+        ];
+        for digit in '0'..='9' {
+            reserved.push(format!("com{digit}"));
+            reserved.push(format!("lpt{digit}"));
+        }
+        for id in &reserved {
+            assert_eq!(
+                validate_game_id(id),
+                Err(GamePathError::ReservedGameId(id.clone())),
+                "{id:?} names a device"
+            );
+        }
+        // The boundary: an ordinary id that merely starts with a device name.
+        for id in ["null", "conx", "com", "lpt", "com10", "con-1", "auxiliary"] {
+            assert!(validate_game_id(id).is_ok(), "{id:?} is an ordinary id");
+        }
+    }
+
+    #[test]
+    fn the_two_refusals_name_the_rule_they_broke() {
+        // A reserved id satisfies the character rule, so reporting it with the
+        // character rule's message would send a host looking for a character
+        // that is not there. That distinguishable diagnostic is the whole reason
+        // the two refusals are separate variants.
+        let bad_character = GamePathError::InvalidGameId("Game".to_string()).to_string();
+        let reserved = GamePathError::ReservedGameId("nul".to_string()).to_string();
+
+        assert!(bad_character.contains("lower-case"), "{bad_character}");
+        assert!(bad_character.contains("Game"), "{bad_character}");
+        assert!(reserved.contains("device"), "{reserved}");
+        assert!(reserved.contains("nul"), "{reserved}");
+        assert_ne!(bad_character, reserved);
+    }
+
     #[test]
     fn test_valid_game_ids() {
         assert!(validate_game_id("my-game").is_ok());
         assert!(validate_game_id("game_123").is_ok());
-        assert!(validate_game_id("GAME").is_ok());
+        assert!(validate_game_id("game").is_ok());
         assert!(validate_game_id("a").is_ok());
         assert!(validate_game_id("a".repeat(64).as_str()).is_ok());
     }
@@ -388,8 +577,19 @@ mod tests {
     fn delete_all_removes_a_sealed_code_tree_and_receipt() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let root = std::env::temp_dir().join("migo_game_paths_sealed_delete");
-        let _ = std::fs::remove_dir_all(&root);
+        // Unique per invocation. This test clears write bits, so a run that dies
+        // between sealing and `delete_all` leaves a tree `remove_dir_all` cannot
+        // traverse; a fixed path then fails every later run of the whole suite,
+        // which is how this was found -- one mutation run poisoned it and the
+        // failure read as a regression in the change under test.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after the epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "migo_game_paths_sealed_delete_{}_{nanos}",
+            std::process::id()
+        ));
         let paths = GamePaths::new(root.join("files"), root.join("cache"), "sealed").unwrap();
         paths.ensure_directories().unwrap();
         std::fs::create_dir_all(paths.code_dir().join("nested")).unwrap();

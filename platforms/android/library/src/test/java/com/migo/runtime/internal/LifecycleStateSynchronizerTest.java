@@ -1,5 +1,6 @@
 package com.migo.runtime.internal;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -55,6 +56,33 @@ public final class LifecycleStateSynchronizerTest {
         assertFalse("factory sync thread did not finish", factorySync.isAlive());
         assertFalse("lifecycle thread did not finish", lifecycle.isAlive());
         assertTrue("the later lifecycle transition must win", managerSuspended.get());
+    }
+
+    /**
+     * The synchronizer applies what it read, and nothing else in the test can do it for it.
+     *
+     * The interleaving test above cannot see this: its lifecycle thread also writes the
+     * manager flag, so deleting the whole `applier.setSuspended(reader.isSuspended())` call
+     * left its final assertion true and the mutation survived. Two writers and one
+     * assertion cannot attribute a value to either.
+     *
+     * Both polarities, because an applier stuck at one of them would satisfy the other
+     * test too, and the call count, because applying twice is a different defect from not
+     * applying at all.
+     */
+    @Test
+    public void theSynchronizerAppliesTheStateItRead() {
+        for (boolean suspended : new boolean[] {true, false}) {
+            java.util.List<Boolean> applied = new java.util.ArrayList<>();
+            LifecycleStateSynchronizer.synchronize(
+                    new Object(),
+                    () -> suspended,
+                    applied::add);
+            assertEquals(
+                    "the state read is the state applied",
+                    java.util.Collections.singletonList(suspended),
+                    applied);
+        }
     }
 
     private static void await(CountDownLatch latch) {

@@ -38,6 +38,12 @@ const WindowGlobalScope = {
     // bridge, from where js_bindings resolves it to fire webglcontextlost/
     // restored on the main canvas after a context-loss rebuild.
     _internalTriggerWebglContextEvent: core.propNonEnumerable(canvas.dispatchWebglContextEvent),
+    // Host hook: the surface changed. In the core scope because the main canvas
+    // must follow the surface in every product profile. The window-geometry half
+    // of a resize lives in the `system` extension, which `api-connectivity`
+    // gates out, and a Slim build that never adopted its surface size kept
+    // drawing at the size the window had before the rotation.
+    _internalTriggerWindowResize: core.propNonEnumerable(canvas.handleSurfaceResized),
     requestAnimationFrame: core.propWritable(raf.requestAnimationFrame),
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),
     setPreferredFramesPerSecond: core.propWritable(raf.setPreferredFramesPerSecond),

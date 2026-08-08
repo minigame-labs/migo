@@ -28,6 +28,14 @@ pub mod ohos;
 pub mod windows;
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
+// The other half, so "which profile is this" is a total question rather than a
+// mostly-true one. `active_methods` selects the JNI surface with a chain of
+// `#[cfg(feature)]` attributes and the profile rule states it declaratively;
+// tying the two together needs a build to have exactly one answer, not zero.
+// Every dependent already forwards a profile through its own `default`, so this
+// only rejects a bare `--no-default-features`, which is not a product.
+#[cfg(not(any(feature = "profile-full", feature = "profile-slim")))]
+compile_error!("exactly one of profile-full and profile-slim must be enabled");
 #[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]
 compile_error!("worker-snapshot requires profile-full");
 #[cfg(all(

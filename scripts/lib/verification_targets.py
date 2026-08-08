@@ -38,8 +38,10 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+import json
 import pathlib
 import re
+import subprocess
 import sys
 
 
@@ -115,6 +117,154 @@ class Requirement:
 class Plan:
     requirements: tuple[Requirement, ...]
     undetermined: tuple[str, ...]
+    # The packages whose host suites this change needs, or `None` for "every suite",
+    # which is what anything unreasonable-about resolves to. Never an empty tuple by
+    # accident: an empty tuple means "no Rust package is implicated", which a
+    # Java-only or documentation-only change legitimately is.
+    host_packages: tuple[str, ...] | None = None
+    host_reasons: tuple[str, ...] = ()
+
+
+# Paths outside `engine/` that cannot change a host suite's outcome. Everything else
+# outside `engine/` widens to every suite, because guessing is how a gap reopens:
+# `scripts/dev-test-host.sh` decides how the suites run at all, and a workspace
+# manifest or lock file can change what they compile.
+_NO_HOST_EFFECT = (
+    re.compile(r"^docs/"),
+    re.compile(r"^platforms/"),
+    re.compile(r"^\.github/"),
+)
+
+
+def _workspace_graph(root: pathlib.Path):
+    """Workspace members and the edges between them, from `cargo metadata`.
+
+    `--no-deps` keeps this to the workspace, and dev-dependencies are included on
+    purpose: a crate whose *tests* use another crate is a crate whose suite a change
+    to that other crate can break, which is exactly the closure being computed.
+
+    Returns `None` when cargo cannot answer, so the caller can widen to every suite
+    rather than compute a closure from half a graph.
+    """
+    manifest = root / "engine" / "Cargo.toml"
+    if not manifest.is_file():
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--offline",
+                "--manifest-path",
+                str(manifest),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    directories: dict[str, pathlib.Path] = {}
+    dependencies: dict[str, set[str]] = {}
+    for package in data.get("packages", ()):
+        name = package.get("name")
+        manifest_path = package.get("manifest_path")
+        if not name or not manifest_path:
+            return None
+        directories[name] = pathlib.Path(manifest_path).parent
+        dependencies[name] = {
+            dependency.get("name")
+            for dependency in package.get("dependencies", ())
+            if dependency.get("name")
+        }
+    if not directories:
+        return None
+    members = set(directories)
+    for name in dependencies:
+        dependencies[name] &= members
+    return directories, dependencies
+
+
+def _owning_package(path: pathlib.Path, directories: dict[str, pathlib.Path]) -> str | None:
+    """The workspace member a file belongs to, by longest matching manifest directory."""
+    best: tuple[int, str] | None = None
+    for name, directory in directories.items():
+        try:
+            path.relative_to(directory)
+        except ValueError:
+            continue
+        depth = len(directory.parts)
+        if best is None or depth > best[0]:
+            best = (depth, name)
+    return None if best is None else best[1]
+
+
+def host_suites(root: pathlib.Path, changed) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
+    """The packages whose host suites a change needs, and why.
+
+    `verify-change.sh` ran every host suite on every invocation, which made a
+    Java-only change pay for sixteen of them. The selection here is the changed
+    packages plus their reverse-dependency closure: a change to a leaf crate still
+    runs the suites of everything that depends on it, because that is where its
+    behaviour is observed.
+
+    It fails closed in every direction. `None` -- every suite -- is the answer for a
+    tree cargo cannot describe, for a file under `engine/` that belongs to no member,
+    and for any path outside `engine/` that is not provably irrelevant. Under-running
+    is a silent gap, and a silent gap is worse than a slow run.
+    """
+    root = pathlib.Path(root)
+    graph = _workspace_graph(root)
+    if graph is None:
+        return None, ("cargo metadata could not describe the workspace",)
+    directories, dependencies = graph
+
+    dependents: dict[str, set[str]] = collections.defaultdict(set)
+    for name, deps in dependencies.items():
+        for dependency in deps:
+            dependents[dependency].add(name)
+
+    seeds: dict[str, str] = {}
+    reasons: list[str] = []
+    for entry in changed:
+        path = pathlib.Path(entry)
+        if not entry.startswith("engine/"):
+            if any(pattern.match(entry) for pattern in _NO_HOST_EFFECT):
+                continue
+            return None, (f"{entry} is outside engine/ and could change any suite",)
+        owner = _owning_package((root / path).resolve(), directories)
+        if owner is None:
+            return None, (f"{entry} belongs to no workspace member",)
+        seeds.setdefault(owner, entry)
+
+    if not seeds:
+        return (), ("no workspace member changed",)
+
+    required: set[str] = set()
+    queue = collections.deque(seeds)
+    while queue:
+        name = queue.popleft()
+        if name in required:
+            continue
+        required.add(name)
+        queue.extend(dependents.get(name, ()))
+
+    for name in sorted(seeds):
+        reasons.append(f"{seeds[name]} [{name}]")
+    inherited = sorted(required - set(seeds))
+    if inherited:
+        reasons.append("dependents: " + ", ".join(inherited))
+    return tuple(sorted(required)), tuple(reasons)
 
 
 def platforms_in(condition: str) -> frozenset[str]:
@@ -350,7 +500,13 @@ def select(root: pathlib.Path, changed) -> Plan:
                 collected |= entries
         requirements.append(Requirement(platform, tier, tuple(sorted(collected))))
 
-    return Plan(tuple(requirements), tuple(sorted(undetermined)))
+    host_packages, host_reasons = host_suites(root, changed)
+    return Plan(
+        tuple(requirements),
+        tuple(sorted(undetermined)),
+        host_packages,
+        host_reasons,
+    )
 
 
 def format_report(plan: Plan) -> str:
@@ -359,6 +515,16 @@ def format_report(plan: Plan) -> str:
     for requirement in plan.requirements:
         lines.append(f"TARGET {requirement.platform} {requirement.tier}")
         lines.extend(f"  {reason}" for reason in requirement.reasons)
+    # `HOSTSUITES ALL` and `HOSTSUITES NONE` are spelled out rather than left implicit,
+    # because the shell has to tell "run everything" apart from "run nothing" and an
+    # empty list cannot say which it meant.
+    if plan.host_packages is None:
+        lines.append("HOSTSUITES ALL")
+    elif not plan.host_packages:
+        lines.append("HOSTSUITES NONE")
+    else:
+        lines.append("HOSTSUITES " + " ".join(plan.host_packages))
+    lines.extend(f"  {reason}" for reason in plan.host_reasons)
     if plan.undetermined:
         lines.append("UNDETERMINED")
         lines.extend(f"  {path}" for path in plan.undetermined)

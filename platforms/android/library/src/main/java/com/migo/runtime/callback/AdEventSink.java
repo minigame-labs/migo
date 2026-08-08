@@ -72,6 +72,28 @@ public interface AdEventSink {
     void emitClose(int adId, boolean isEnded);
 
     /**
+     * Report that a full-screen ad could not be shown at all.
+     * <p>
+     * Both halves matter. The error tells content (and your logcat) why, and the
+     * close is what lets content continue: the wx idiom decides the payout and
+     * resumes gameplay in {@code onClose}, so a rewarded video that reports only
+     * an error leaves the player looking at a paused game forever. The verdict is
+     * {@code false}, so nothing is minted -- this reports the absence of an
+     * advert, it does not invent one.
+     * <p>
+     * Ad formats with no {@code close} event ignore the second half, so this is
+     * safe to use for any {@code showAd} failure.
+     *
+     * @param adId    the handle passed to {@link AdHandler#createAd}
+     * @param errCode SDK-specific error code, or -1 if there is none
+     * @param errMsg  human-readable reason; must not be null
+     */
+    default void emitShowFailed(int adId, int errCode, String errMsg) {
+        emitError(adId, errCode, errMsg);
+        emitClose(adId, false);
+    }
+
+    /**
      * Report the rendered size of a positioned ad, in CSS pixels.
      * <p>
      * These are CSS pixels, not physical pixels: divide by the display density

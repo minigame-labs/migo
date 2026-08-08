@@ -201,7 +201,12 @@ jobs:
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
         run: |
-          cargo test -p migo-shared -p migo-io -p migo-runtime-v8 --lib
+          # `--tests`, matching pr-ci.yml: `--lib` here skipped the frame-boundary
+          # allocation gate and both snapshot round-trips, so the tag gate was
+          # narrower than the PR gate on exactly the binaries that exist because
+          # a property belongs to a binary rather than to a lib.
+          cargo test -p migo-shared -p migo-runtime-v8 --tests
+          cargo test -p migo-io --lib
           cargo test -p migo-capi-abi --all-targets
         env:
           RUST_BACKTRACE: 1

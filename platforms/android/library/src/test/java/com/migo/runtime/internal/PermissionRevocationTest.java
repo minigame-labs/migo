@@ -19,6 +19,42 @@ public final class PermissionRevocationTest {
         @Override public void destroyBluetooth(int sessionId) { values.add("bluetooth"); }
     }
 
+    /**
+     * The boolean a host reads back from `updatePermission`.
+     *
+     * Mutation testing found both of `update`'s returns replaceable by constants without
+     * killing anything: the suite asserted which side effects happened and never the
+     * verdict, which is the only part of this the embedder sees. A host that records a
+     * standing decision and is told "true" for a refusal has a permission it believes is
+     * set and the runtime does not.
+     *
+     * Both polarities, and the refusals must also not reach native at all.
+     */
+    @Test
+    public void everyRefusalReportsFailureAndReachesNothing() {
+        java.util.List<String> native_ = new java.util.ArrayList<>();
+        java.util.function.BooleanSupplier reachedNative = () -> {
+            native_.add("native");
+            return true;
+        };
+
+        assertFalse(
+                "a null scope is refused",
+                PermissionRevocation.update(null, () -> false, reachedNative));
+        assertFalse(
+                "an empty scope is refused",
+                PermissionRevocation.update("", () -> false, reachedNative));
+        assertFalse(
+                "a terminated session is refused",
+                PermissionRevocation.update("scope.camera", () -> true, reachedNative));
+        assertTrue("a refused update must not reach native", native_.isEmpty());
+
+        assertTrue(
+                "a live update reports the native verdict",
+                PermissionRevocation.update("scope.camera", () -> false, reachedNative));
+        assertEquals(java.util.Collections.singletonList("native"), native_);
+    }
+
     @Test
     public void revocationTearsDownOnlyTheTargetedResource() {
         assertRevokesOnly("scope.camera", "camera");
