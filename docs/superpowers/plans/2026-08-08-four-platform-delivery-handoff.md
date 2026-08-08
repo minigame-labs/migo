@@ -207,22 +207,26 @@ redo them. Ledger tasks T.4, T.5, T.6 and item 0.15.
 - **The ledger is split** per phase with a stable index, so several agents can work
   without colliding on one 5,900-line file.
 
-### 3.3 One Gradle invocation per run, because three of them deadlock
+### 3.3 Fixed: the verifier's Gradle lane blocked on the loop's own stdin
 
-**Open, diagnosed, not fixed.** A `--base master` run now makes three separate Gradle
-builds: `test-android-host-api-contract.sh`, `test-camera-frame-jni-contract.sh` and the
-`android-java` lane. Run one after another in the same invocation, the last one waits many
-minutes on a project lock the earlier builds' daemons still hold -- and because the lane
-passes `--quiet`, Gradle prints nothing at all while it waits. The same command standalone
-is seventeen seconds, and both halves are green run that way, so this is a serialisation
-problem in the verifier rather than a defect in the code under test.
+Kept because the diagnosis took four wrong turns and the shape recurs. The
+`android-java` lane sat for twelve minutes having used **one second of CPU**, while the
+identical command run by hand finished in nineteen seconds. The cause was stdin: the
+target loop read the plan from a here-string, so Gradle inherited the remaining plan as
+its own input and blocked. Exactly the defect the contract lane had a few commits
+earlier -- found twice in one run.
 
-Measured while diagnosing it: a client killed mid-build leaves its daemon holding the lock,
-and `./gradlew --stop` is what clears it. `--quiet` hiding a lock wait is the part worth
-fixing first -- a gate that stalls with no output is indistinguishable from a hang.
-Candidates, in order: have the two contract gates reuse one build (they compile the same
-variants), drop `--quiet` for `--console=plain` so a wait is visible, or drive all three
-from one Gradle invocation.
+The wrong turns, in order, each plausible and each measurable: network resolution (real,
+and `--offline` is kept -- an unconstrained resolve here does stall for tens of minutes);
+daemon lifetime (real, and `--no-daemon` is kept -- a daemon outlives its build while
+able to hold the project lock); a project lock held by a straggler daemon (five were
+alive; killing them changed nothing); and finally the manual-versus-in-gate comparison,
+which is what isolated it in one command.
+
+**The lesson worth keeping: a build that consumes its caller's stdin is
+indistinguishable from a build that is simply slow**, and `--quiet` prints nothing while
+it waits. When a step in a loop hangs, compare it against the same command run by hand
+before theorising about the tool.
 
 ### 3.3 Make the host suites selective (speed, ~1 session)
 
