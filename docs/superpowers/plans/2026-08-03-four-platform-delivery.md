@@ -31,6 +31,68 @@ Completion requires all of: implementation, behavioural tests, fresh
 verification output, independent spec review, and independent code-quality
 review. A commit alone is not completion evidence.
 
+## Tooling And Verification
+
+- [x] T.1 Make the Android SDK's Java half a target the verifier knows about.
+  `scripts/verify-change.sh` contained no reference to gradle, java or
+  `platforms/` at all: asked what
+  `platforms/android/.../BluetoothManager.java` requires, the selector returned an
+  **empty plan**. A change to the shipped AAR's own sources therefore ran eleven
+  Rust suites, cross-compiled Rust for Android, and printed "verified for every
+  target this change touches" without compiling a line of Java — the same defect
+  the script's own header says it exists to prevent, one layer out. Task 0.24's
+  Java-only fix was verified by hand for exactly this reason.
+
+  `android-java` is a lane in `verification_targets.py` rather than a tier on
+  `android`, because tiers replace each other and a change touching both halves
+  needs both builds. Any path under `platforms/android/` asks for it, deliberately
+  without enumerating which files matter — Gradle's inputs include manifests,
+  resources and the build scripts, and a list is a thing to forget an entry from.
+  Both product variants run, because the Java sources are variant-independent while
+  `BuildConfig` capability gating is not. The lane is **probed**: a machine without
+  `gradlew` reports NOT PROVEN like every other absent target, rather than FAIL,
+  which would say "your change broke this" about missing evidence.
+  `test-local-verification-contract.sh` grew four assertions (59 checks from 54),
+  including that a Gradle build script is an input.
+
+- [x] T.2 Adopt `cargo-mutants`, and fix what it found immediately.
+  This ledger's mutation evidence has been produced by hand-written apply/restore
+  scripts. `cargo-mutants 27.1.0` runs through `dev-test-host.sh` (which passes any
+  cargo subcommand through, so the host toolchain is inherited) and reports
+  survivors, which is the artifact these entries are actually made of.
+
+  **Its first run found a real hole in work committed one hour earlier.** Scoped to
+  `crates/shared/src/payload_pool.rs`: **13 of 25 mutants survived**, including
+  `try_acquire -> None`, `Drop for Recycled -> ()`, and the capacity check's `==`
+  flipped to `!=`. The cause was not the mutants being exotic — it was that every
+  test for the new `RecyclePool` lived in `migo-core`, one crate away from the
+  mechanism, while the older `PayloadPool` beside it has its own. Five tests later
+  (buffer identity across a return, high-water-mark growth, refusal at capacity,
+  zero-capacity construction, and a steady-state allocation burst over the pool
+  itself) it reports **2 survivors, both `Debug::fmt`** — nothing asserts on debug
+  output, so those are noise. migo-shared 419 tests from 414.
+
+  **One assertion in those tests was wrong and the code was right**, which is worth
+  recording: it required a kept buffer's capacity to equal five after
+  `extend_from_slice(b"hello")`, and `Vec` reserves eight. Buffer *identity* is the
+  property; a capacity is only evidence about `Vec`'s growth strategy.
+
+  Usage and scoping rules are in
+  `docs/superpowers/plans/2026-08-08-four-platform-delivery-handoff.md`.
+
+- [ ] T.3 Make the host suites selective. `verify-change.sh` runs every host cargo
+  suite on every invocation — its header says so — so a Java-only change pays
+  eleven Rust suites. The selector already maps changed files to crates; what is
+  missing is the reverse-dependency closure, and it must be exact: under-running is
+  a silent gap, which is worse than slow.
+
+- [ ] T.4 Add `pitest` for the Java half, for the reason T.2 gives for the Rust half.
+
+- [ ] T.5 Split this file. At ~5,500 lines it burns context on every read and is a
+  merge-conflict magnet — the single biggest obstacle to more than one agent
+  working at once. Split per phase, keep item identifiers stable: other documents
+  and commit messages cite them.
+
 ## Phase 0 — Correctness Foundation
 
 - [ ] 0.1 Close the BLE permission-path locking debt. **Implementation landed,
