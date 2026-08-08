@@ -5,10 +5,8 @@
 status convention, and every closed item's evidence, lives there. Read its
 "Status Convention" section before marking anything.
 
-**Branch:** `perf/ble-notification-path`, 10 commits ahead of `master`.
-
-> ⚠️ **The branch is local-only. Push it before this handoff is usable from
-> another machine** — nothing below can be checked out otherwise.
+**Branch:** `master`. The `perf/ble-notification-path` work merged as `0a53199`
+(#30), so nothing here depends on an unpushed branch any more.
 
 ---
 
@@ -31,15 +29,31 @@ else.
    Missing archives fail the Android build with a linker error, not a clear
    "download this" message. A `git reset --hard` also wipes them.
 
-2. **Host builds need a linux-gnu V8 that this repository does not ship.** The
-   in-tree archives are Android builds; linking them into a host binary fails
-   with `incompatible with elf64-x86-64`. The host toolchain expects a sibling
-   checkout of `rusty_v8` built for `x86_64-unknown-linux-gnu`, found by default
-   at `../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out/obj/`.
-   Override with `MIGO_HOST_V8_DIR`. Without it, every host suite fails for a
-   reason unrelated to any change — `verify-change.sh` says so out loud when it
-   probes and cannot find the toolchain, and that message is the one to read
-   first when a fresh machine reports a wall of red.
+2. **Host builds need a linux-gnu V8, and it is a fetch rather than a sibling
+   build.** The `aarch64`/`x86_64` in-tree archives are Android builds; linking
+   one into a host binary fails with `incompatible with elf64-x86-64`. The
+   linux-gnu archive is a *third* release asset and is fetched the same way:
+   ```bash
+   bash scripts/fetch-v8-archives.sh x86_64-linux-gnu
+   ```
+   That writes `engine/third_party/rusty_v8/x86_64-linux-gnu/librusty_v8.a`, which
+   is **not** the layout `dev-test-host.sh` expects — it wants
+   `$MIGO_HOST_V8_DIR/obj/librusty_v8.a` plus `$MIGO_HOST_V8_DIR/src_binding.rs`.
+   Build that layout once, with **hard links, not symlinks**: the script's
+   LFS-pointer check uses `stat -c %s`, which reports a symlink's own size and
+   rejects it as a pointer file.
+   ```bash
+   D=engine/third_party/rusty_v8/x86_64-linux-gnu
+   mkdir -p $D/gn_out/obj
+   ln -f $D/librusty_v8.a $D/gn_out/obj/librusty_v8.a
+   ln -f $D/src_binding.rs $D/gn_out/src_binding.rs
+   export MIGO_HOST_V8_DIR=$PWD/$D/gn_out    # gitignored, costs no disk
+   ```
+   The default path (`../rusty_v8_src/target/x86_64-unknown-linux-gnu/...`) needs a
+   source build of V8 and does not exist on this machine. Without either, every
+   host suite fails for a reason unrelated to any change — `verify-change.sh` says
+   so out loud, and that message is the one to read first when a fresh machine
+   reports a wall of red.
 
 3. **Host Skia needs headers and libraries** that `scripts/dev-setup-skia.sh`
    installs into `~/.local` (Khronos headers, `libEGL`/fontconfig/freetype
@@ -59,7 +73,7 @@ else.
    ```
    Prebuilt binaries deliberately: building them from source inside this
    repository hits the toolchain trap in §4. `pitest` needs no install — it is a
-   Gradle plugin, and adding it is an open task (§3.3). **`sccache` is not needed
+   Gradle plugin, and adding it is an open task (§3.4). **`sccache` is not needed
    yet**; it only matters for parallel worktrees (§5).
 
 6. **Sanity check before doing any work**, so a broken environment is not
@@ -124,7 +138,9 @@ bash scripts/dev-test-host.sh mutants \
 ```
 
 **Always scope with `--file`.** The whole workspace would generate thousands of
-mutants, each a rebuild.
+mutants, each a rebuild. Also pass `--output /tmp/<somewhere>`: the default
+`mutants.out` goes next to the workspace manifest, `engine/` is root-owned, and
+the run dies on `lock.json` with a bare `Permission denied`.
 
 **Read the survivors, do not just run it.** Its first run here reported 13
 survivors out of 25 in `payload_pool.rs`; the cause was that the new
@@ -142,169 +158,108 @@ kills; deciding whether a survivor is noise or a hole is still yours.
 
 ## 3. What to do next, in order
 
-### 3.1 Finish A12 (ledger task 0.12) — two of its three clauses
+### 3.1 A12 (ledger task 0.12) — done, pending only the two reviews
 
-A12 reads: *"reject zero, negative, non-finite, and otherwise invalid host pixel
-ratios; canonicalize Windows game identity with the same rules as the other
-platforms; and make a missing ad handler settle the content-visible request
-through its documented error path rather than leaving it pending."*
+**Superseded by the ledger.** All three clauses are settled and the evidence,
+including the `verify-change.sh` verdict block and every mutant, is in ledger item
+0.12. In short:
 
-- **Pixel ratios: already done.** Verified 2026-08-08. `PixelRatio::new`
-  (`engine/crates/shared/src/surface/geometry.rs:13`) requires finite and
-  positive; `engine/crates/capi-abi/src/surface.rs` rejects invalid scale
-  factors at the ABI boundary, with
-  `generation_dimensions_and_scale_are_strictly_validated` iterating
-  `[0.0, -1.0, NaN, INFINITY, -INFINITY]`. Every construction site validates and
-  none has an `unwrap_or` fallback. **This clause is stale in the ledger and
-  needs only a correction, not work.**
+- **Pixel ratios:** already satisfied; the clause was stale and is corrected.
+- **Game identity:** the "Windows diverges" premise was false — one shared rule,
+  zero `#[cfg]`. The live defect was that the rule was case-*preserving*, so
+  `PuzzleQuest` and `puzzlequest` became one directory on NTFS/APFS. Fixed by
+  narrowing the id space to lower case (making the folding pair unrepresentable
+  rather than resolved per platform) and rejecting reserved device names on every
+  platform. Both language gates now read one vector table,
+  `engine/crates/shared/src/vfs/game-id-vectors.txt`, so widening one side alone
+  fails that side.
+- **Missing ad handler:** every one of the six ad entry points now settles what
+  content waits for, and the *interface defaults* settle identically — that second
+  half was the larger hole, because a registered handler that does not sell
+  rewarded video stalled content exactly as a missing handler did. The settlement
+  method is abstract on the command enum, so a seventh ad command cannot compile
+  until somebody decides what it settles as.
 
-- **Missing ad handler: investigated 2026-08-08. The defect is live, but not
-  where A12's wording suggests.** Findings, all with evidence in the source:
+**Two things this turned up that are now the top of the list.**
 
-  - **Android is unconditionally "hosted".**
-    `engine/crates/platform/src/android/services/mod.rs:204` returns
-    `Some(AndroidAd)` gated only by the `api-commerce` cargo feature, never by
-    handler registration, so `op_ad_is_supported` is `true` for every full-profile
-    Java-SDK session and the JS takes the hosted path with no local fallback.
-    Slim (feature off) cfg-deletes it and gets the correct no-host path.
-  - **Three of six ad entry points settle; three return silently.**
-    `createAd`/`loadAd`/`showAd` go through
-    `NativeExports.adHandlerOrReportError` (~`:2810`), which emits an `error`
-    with `"<api>:fail no ad handler"`. `hideAd`/`updateStyle`/`destroyAd`
-    (~`:2899`, `:2915`, `:2934`) do a bare `sAdHandlers.get` and `return`. Only
-    one of those three leaves anything content-visible pending: `hideAd`, for
-    `CustomAd`, whose `onHide` fires on the no-host path and never on
-    hosted-without-handler. The other two owe content no event. The helper's own
-    javadoc states the rule its siblings break — *"a silent drop leaves it
-    waiting forever"*.
-  - **The larger defect is a contract mismatch, not the silent return.**
-    `platforms/android/library/src/main/java/com/migo/runtime/callback/AdHandler.java:11-16`
-    documents the no-handler path as *"incentivised video closes with
-    `isEnded = false`"* — which is the **no-service** contract, not the
-    **service-installed-but-no-handler** one Android always takes. A rewarded
-    video `show()` with no handler emits `error` and **never `close`**, while
-    `show()` resolves. Content following the wx idiom (`onClose` decides the
-    payout) waits forever, and the SDK's own documentation promised otherwise.
-  - **C ABI, Linux, Windows and OHOS have no defect here.** None installs an
-    `AdService` (`capi/src/host_kit.rs:214`, `platform/src/{linux,windows}/platform.rs`
-    empty `CommerceServices` impls; OHOS has no `DeviceServices` at all), so the
-    correct no-host JS path runs. Their gap is Section 3.4 *parity* — no ad
-    capability exists to register — which is task 3.4 work, not A12.
+### 3.2 Done this session: the contract lane, the Slim profile, pitest, the split
 
-  **The fix belongs in the Java adapter, and two existing tests prove it cannot
-  go anywhere else.** A JS-side timeout is *prohibited*:
-  `ad_reward_integrity.rs:488 hosted_ads_do_not_self_close_on_a_timer` and
-  `:503 hosted_ads_do_not_self_report_load_on_a_timer` boot a service that
-  records without emitting and assert zero `close`/`load` after ten seconds —
-  correctly, because a slow real host would otherwise be raced by a fabricated
-  close, which is the reward-integrity invariant. An op-layer fix is impossible:
-  `ad_command_op!` knows only whether a *service* exists; handler registration is
-  Java-side state. The adapter is the only layer holding both facts.
+Recorded in the ledger with evidence; listed here only so the next session does not
+redo them. Ledger tasks T.4, T.5, T.6 and item 0.15.
 
-  So: route the three silent entry points through `adHandlerOrReportError`; then
-  decide **one** of — correct `AdHandler`'s javadoc to say every call settles as
-  `error`, or have the Java adapter synthesise `close{isEnded:false}` (it may:
-  it knows no advert was shown, and it is the host side of the reward boundary,
-  so the runtime's "never mint a reward" invariant is untouched). Today the code
-  and the documentation disagree and only the documentation is untested.
+- **The local verifier ran none of the ~24 source-structure contract gates** -- they
+  lived only in `.github/workflows/pr-ci.yml`. Found by A12's own mutant: reverting
+  one ad entry point to a bare handler lookup passes every unit test in both
+  languages and is caught by one contract script, so the local gate called a change
+  "verified" that CI rejects. The lane is now derived from the workflow (so it
+  cannot drift from CI), runs on every invocation, and is pinned by six new checks
+  in `scripts/test-local-verification-contract.sh`. **Its own first version
+  under-ran silently** -- a gate that runs `cargo` drained the here-string the loop
+  was reading, and three gates plus a verdict line vanished from a run that still
+  reported success. Read T.6 before touching it.
+- **Nothing had ever run a Slim host suite**, and the first one reported 36
+  failures. Six were a real defect: the window-resize ingress lived in the
+  `api-connectivity` extension, so on a Slim build no canvas ever followed its
+  surface. Both Slim suites are host steps now.
+- **pitest is wired** (`:library:pitestFullDebug`), and its 57 production survivors
+  are listed in T.4. The published Gradle plugin cannot be used on an Android
+  library module; read T.4 before reaching for it.
+- **The ledger is split** per phase with a stable index, so several agents can work
+  without colliding on one 5,900-line file.
 
-  **No test catches any of this today.** `ad_reward_integrity.rs` covers
-  *service returns `Err`* (a different mechanism) and asserts the pending state
-  is correct at the JS layer; the contract script is source-level only; and
-  **there are no Java ad tests at all** — 23 test files under
-  `platforms/android/library/src/test`, none referencing `AdHandler`. Pin it with
-  (a) a Java unit test iterating **the entry-point set** rather than a hardcoded
-  three, so a seventh ad op is covered, and (b) a Rust test that a hosted
-  `CustomAd.hide()` asks the host rather than self-firing `onHide`.
+### 3.3 Make the host suites selective (speed, ~1 session)
 
-- **Windows game identity: investigated 2026-08-08. A12's clause is wrong as
-  written, and there is one real defect underneath it.**
+`scripts/verify-change.sh` runs **all** host cargo suites on every invocation, and
+there are now sixteen of them, so a Java-only change pays for every Rust suite plus
+both Slim profiles. `scripts/lib/verification_targets.py` already maps changed files
+to crates (`_CRATE_PATH`), so the missing piece is a reverse-dependency closure from
+`cargo metadata`: run the changed crate's suite plus every crate that depends on it,
+dev-dependencies included.
 
-  **There is no Windows-specific game-identity code at all**, so there is nothing
-  to "canonicalize with the same rules as the other platforms" — every platform
-  already runs one shared function, `validate_game_id`
-  (`engine/crates/shared/src/vfs/game_paths.rs:50`), an allowlist of
-  `[a-zA-Z0-9_-]{1,64}` with **zero `#[cfg]`**. The sole construction site is
-  `GamePaths::new` (`:110-113`), reached from both entry paths (C ABI
-  `capi/src/lib.rs:673`, Android JNI `inbound.rs:800`). Android's Java SDK
-  duplicates the identical rule at
-  `platforms/android/library/src/main/java/com/migo/runtime/GamePaths.java:24`.
-  The ledger's premise — that Windows diverges — is false.
+**Get this right or not at all** -- under-running is a silent gap, which is strictly
+worse than slow, and the contract lane above already demonstrated how quietly it
+happens. Fail closed: anything outside `engine/crates/**` (`Cargo.lock`,
+`.cargo/config.toml`, a workspace manifest, a script), or a `cargo metadata` that
+does not run, must fall back to every suite and say why.
+`scripts/test-local-verification-contract.sh` must grow an assertion that a change
+in a leaf crate still runs its dependents. **Leave the contract lane
+unconditional** -- each gate is seconds, and keying them to changed files means a
+file list per gate, which is a list to forget an entry from.
 
-  **The true residual: the rule is case-preserving and does not case-fold.**
-  Every other hazard is already blocked by the allowlist (`\`, `/`, `..`, ADS
-  `name:stream`, trailing dots and spaces, `\\?\`, and 8.3 short names, which
-  always contain `~`). Reserved device names (`CON`, `NUL`, `COM1`…) pass the
-  allowlist but cost availability only — `ensure_directories()` fails and
-  `evaluate_module` returns `IoError`; no collision, no escape. **Case is the
-  live one**, and `game_paths.rs:336` pins the ingredient with
-  `assert!(validate_game_id("GAME").is_ok())`.
+### 3.4 Kill the pitest survivors, starting with the permission ones
 
-  **The scenario, in testable form:** game ids `PuzzleQuest` and `puzzlequest`
-  both pass validation and, on a case-insensitive filesystem, resolve to the same
-  `…\migo\games\puzzlequest\…`. The second title reads the first's saves, its
-  `wx.clearStorage()` wipes them, and they share the 10 MB quota — exactly what
-  the per-game split exists to prevent. `code_dir` collides too, so the second
-  title's deployed code overwrites the first's. **Not a content-driven escape**
-  (the host chooses the id, and id uniqueness is already the host's documented
-  obligation), but a cross-platform divergence in an isolation boundary: a host
-  that deduplicates ids by exact string is correct on three platforms and wrong
-  on the fourth.
+T.4 lists 57. The ones that matter on this project's own standard that a guard which
+cannot fail is decoration: `PermissionOperationGate` and `PermissionRevocation`
+survive having their return values inverted, `BluetoothManager.hasConnectPermission`
+survives both negation and a forced `true`, and `NativeMethods.updatePermission`
+survives negation of its whole argument guard. `TouchEventHandler`'s 19 are the
+largest cluster.
 
-  **Fix the shared rule; do not add a `#[cfg(windows)]` branch** — a
-  Windows-only fold would make one id resolve differently per platform, so
-  content moved between platforms would lose its data, and the Java gate would
-  disagree with the Rust one. Two shapes, pick one: **(a) reject** — narrow the
-  allowlist to lower-case, failing closed, at the cost of stranding existing
-  mixed-case directories; or **(b) fold** — lower-case the path component in
-  `GamePaths::new` while `game_id()` keeps the host's spelling, making Windows
-  behaviour the *defined* behaviour, at the cost of silently merging two ids an
-  Android host previously kept apart. Whichever is chosen, `GamePaths.java:24`
-  and `MigoRuntime.java:411` must move in lockstep or the two gates disagree.
-  Separately, reserved device names should be rejected on **every** platform, for
-  the same reason the rest of the rule is portable.
+### 3.5 The rest of A6, and then the open epics
 
-  **No existing test can see this.** `test_valid_game_ids`/`test_invalid_game_ids`
-  (`game_paths.rs:333`, `:342`) cover traversal and separators, no case pair and
-  no reserved name. `storage_isolation.rs` and `two_session_identity.rs` use ids
-  differing in more than case, and — the important part — compare `PathBuf`s,
-  **a comparison structurally blind to a case-insensitive filesystem**. The new
-  property needs a test that touches the disk: create under `GameA`, write a
-  marker, then open `gamea` and assert the marker is invisible. There is no Java
-  test for `isValidGameId` at all.
-
-### 3.2 Make the host suites selective (speed, ~1 session)
-
-`scripts/verify-change.sh` runs **all** host cargo suites on every invocation —
-its own header says so at line 20: *"runs the host suites, always"*. A Java-only
-change therefore pays eleven Rust suites. `scripts/lib/verification_targets.py`
-already maps changed files to crates (`_CRATE_PATH`), so the missing piece is a
-reverse-dependency closure from `cargo metadata`: run the changed crate's suite
-plus every crate that depends on it.
-
-**Get this right or not at all** — under-running is a silent gap, which is
-strictly worse than slow. `scripts/test-local-verification-contract.sh` must
-grow an assertion that a change in a leaf crate still runs its dependents.
-
-### 3.3 Add pitest for the Java half
-
-Java mutation testing is hand-rolled today. The Gradle plugin
-(`info.solidsoft.pitest`) would do for `platforms/android/library` what
-cargo-mutants does for the Rust crates. Scope it to
-`com.migo.runtime.internal.*` and start with the BLE and permission classes,
-which are where the concurrency invariants live.
-
-### 3.4 Split the ledger
-
-`docs/superpowers/plans/2026-08-03-four-platform-delivery.md` is ~5,500 lines.
-It burns context on every read and is a merge-conflict magnet — it is the single
-biggest obstacle to running several agents at once. Split it per phase with a
-stable index, keeping item identifiers (`0.67`, `1.1a`, …) unchanged, because
-other documents and commit messages cite them.
-
----
+Task 0.15 ran the two crate suites under both profiles; the lifecycle,
+reattachment, input-saturation, ABI and header contract suites it also names have
+not been run under Slim, and the last two need the C package rather than a host
+suite. After that the open work is the epics in phase 0 (A1, A2, A5, A7 through
+A11, HarmonyOS) and phase 1's hermetic builds, several of which need the device,
+the emulator or the Windows toolchain named in Section 0 and cannot be closed on
+this machine.
 
 ## 4. Traps that cost real time here
+
+- **The ledger's new part files are invisible to git, and committing without them
+  would publish an index pointing at nothing.** `.gitignore` line 116 is `docs/`.
+  The ledger and spec predate that rule and are tracked, so `git add -u <path>`
+  updates them -- but the four `2026-08-03-four-platform-delivery/part-*.md` files
+  created by the split are new, and `git add` refuses them as ignored. They need
+  `git add -f`:
+  ```bash
+  git add -f docs/superpowers/plans/2026-08-03-four-platform-delivery/*.md
+  git add -u docs/superpowers/plans/2026-08-03-four-platform-delivery.md
+  ```
+  Re-including them through `.gitignore` is not possible without rewriting that
+  rule: git does not descend into an excluded directory, so a `!docs/superpowers/`
+  negation under `docs/` has no effect.
 
 - **The NDK poisons host builds.** Global `CC`/`CXX` point at the NDK clang and
   `engine/.cargo/config.toml` has an `[env]` block, so `cargo install` of
