@@ -4512,6 +4512,70 @@ review. A commit alone is not completion evidence.
   older than the last delivered one — and the second only orders if the compare and the
   call are themselves one step, which puts the monitor back. Recorded so the plan starts
   from the real constraint instead of rediscovering it.
+
+  **Fixed on 2026-08-08. Implementation, tests and mutation evidence are below; neither
+  independent review has run, so the item stays open.** The "substantive change to the
+  GATT ownership model" this asked for turned out not to be needed, and saying why is
+  the point of this entry.
+
+  **The narrowest correct structure is not the one recorded here.** This item specified
+  a per-device state record whose monitor orders ownership transfer and reporting.
+  Per-device is indeed the narrowest ordering the property requires — and it is the more
+  expensive answer, because the monitor has to outlive the attempts it orders (ordering
+  an outgoing attempt against its replacement is the entire point), so it becomes a map
+  of monitors with a lifetime rule, an eviction rule, and a bound, since content chooses
+  the device ids. **One monitor per session** is strictly stronger, has no lifecycle at
+  all, and costs two devices' connect events the duration of one queue push, on a path
+  that fires when a peripheral connects or drops. Narrowest and cheapest were different
+  answers here.
+
+  **The recorded constraint — a Migo lock must not be held across a JNI call — is real
+  and does not apply to the whole transition, only to part of it.** What the monitor
+  covers is the ownership re-check and the report. What stays outside it is every
+  framework call: `close()`, `disconnect()` and `discoverServices()`, all of which can
+  block. That split is sufficient rather than merely convenient: a publisher's map write
+  precedes its own report in program order, and the monitor orders the reports, so a
+  thread that acquires the monitor after that write observes it. Holding it across the
+  report itself is safe for the reason the constraint is really about — the report is a
+  **post, not a wait**: it enqueues on a bounded channel and returns, never re-enters
+  Java, and never waits on a Migo lock. That is the same distinction the permission
+  gate's counted lease is built on.
+
+  **A second staleness the description did not name, found while fixing the first.**
+  `discoverGattServicesAndReport` reported its result unconditionally, so a superseded
+  attempt whose service discovery finished after its teardown reported the device
+  **connected** — resurrecting a device whose close had already completed. The two
+  directions are therefore not symmetric, and that asymmetry is now the semantics: a
+  *disconnect* from an attempt the map no longer holds is precisely the report that must
+  arrive, because retirement is what removed the entry; a *connect* from one must not,
+  because no owner means nothing is entitled to claim the device is connected.
+
+  **Mutation evidence, and the third mutant is the one worth reading.**
+
+  | Mutant | Kills |
+  | --- | --- |
+  | Decide, leave the region, then deliver — the shape this item describes | two tests, the first at `the replacement never blocked … it is in TERMINATED` |
+  | The monitor kept, `connected` reported unconditionally as before | the resurrection test, `expected:<[]> but was:<[true]>` |
+  | The monitor kept, the re-check moved back outside it | **nothing, at first** |
+
+  **The third mutant passed every test, and it is a genuine defect.** Moving only the
+  *report* inside the monitor still orders the two reports against each other, so the
+  interleaving test was satisfied — while the stale decision it exists to catch survived
+  untouched. The test could not see it because the fixed implementation has no window
+  between reading the map and delivering, so nothing could be parked there. What
+  discriminates is holding the monitor **from the test**, which stops the retired
+  attempt between its two steps in the mutant and before both of them in the fix: it
+  wakes to a world where a replacement exists and must notice. That needed
+  `connectionStateOrderForTests()`, exposed for the reason the Rust contention probe is
+  handed a registry's lock — a property about two steps being one cannot be demonstrated
+  without stopping a thread between them. **This is the same lesson as the JVM probe's
+  missing self-check control two items ago, in the same session: the first version of a
+  guard covers the side it was designed for.**
+
+  **Verified.** The Android Java suite at 119 tests, no failures or errors, across both
+  product variants; four new tests, three mutants each killing the gate named and no
+  others. No device evidence: this is a race between a peripheral dropping and
+  reconnecting, and nothing here has run against one.
 - [x] 0.25 Snapshot the pending cancellation action safely. Landed with `6825fad`:
   `runCancellations` captures the action into a local while the snapshot is taken
   under the session monitor, so the executed action is exactly the one the snapshot
