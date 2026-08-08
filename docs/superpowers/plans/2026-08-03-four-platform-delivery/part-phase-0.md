@@ -33,15 +33,149 @@
   Prior state: `docs/superpowers/plans/2026-08-03-p1-ble-admission-status.md`.
 - [ ] 0.2 A1: own and join every Host thread; make Engine destruction the final
   lifecycle barrier. Plan: `2026-07-29-a1-owned-host-lifecycle.md`.
+
+  **Implementation and behavioural tests are already in the tree; this item is
+  stale bookkeeping, not open work.** Audited 2026-08-08 against `06e358a`. The
+  plan's four unchecked implementation steps each carry an "Expected: FAIL
+  because…" sentence, and all four premises are false:
+
+  | Plan says missing | Actually at |
+  |---|---|
+  | "no owning handle or join API exists" | `core/src/runtime/thread.rs:41` `HostThread`, with `join`, `shutdown_and_join`, `request_shutdown`, self-join rejection and a fail-safe `Drop` |
+  | "Engine has no retirement set and Session stores only an integer Host ID" | `capi/src/lib.rs:118` `retired_hosts: Mutex<Vec<HostThread>>`; `retire_host`/`take_retired_hosts`; `:502-512` drains before joining, so no engine lock is held across a join |
+  | "JNI discards `HostThread` and stores only the returned ID" | `platform/src/android/jni/inbound.rs:475` `host_owners().insert(host)`; `:839` `shutdown_with(id, HostThread::shutdown_and_join)` |
+  | "the player discards the `JoinHandle`" | `tools/player/src/main.rs:260` `shutdown_before_drop(host, window)`, which joins before the native window drops |
+
+  Named tests already asserting the properties: `thread.rs`
+  `join_waits_for_named_host_and_observes_sentinel_drop`,
+  `failed_start_joins_the_spawned_thread`,
+  `self_join_rejection_preserves_owner_for_another_thread`; `capi/src/lib.rs`
+  `engine_refuses_to_die_while_sessions_are_live`,
+  `engine_destroy_waits_for_retired_host_sentinel`,
+  `engine_destroy_holds_no_engine_lock_while_joining`,
+  `session_destroy_transfers_host_without_joining_it`,
+  `engine_destroy_from_its_retired_host_is_rejected_and_retryable`;
+  `platform/src/host_owners.rs` `terminal_take_transfers_ownership_exactly_once`,
+  `failed_shutdown_restores_same_owner_for_retry`; `tools/player/src/main.rs`
+  `teardown_joins_host_before_dropping_native_resource`.
+
+  **Not closed, and deliberately.** No mutation evidence was taken this session, so
+  the tests above are asserted to exist rather than shown to be load-bearing, and
+  neither independent review has run. The next session's cheapest step is one
+  mutant: join while holding the engine lock and confirm
+  `engine_destroy_holds_no_engine_lock_while_joining` fails at its own assertion.
 - [ ] 0.3 A2: immutable `PlatformIdentity` with synchronous rejection of
   incompatible reattachment, including the new HarmonyOS identity row.
   Plan: `2026-07-29-a2-platform-identity.md`.
+
+  **Also implemented; also stale bookkeeping.** Audited 2026-08-08. The plan's
+  "Add failing platform-pair tests" step is unchecked, but those tests landed in
+  `c6645bd` alongside the step below it:
+  `platform_identity_distinguishes_linux_domain_and_display`,
+  `platform_identity_rejects_mixed_linux_provider_and_factory`,
+  `provider_and_factory_share_backend_id` in `platform/src/linux/presenter.rs`, with
+  a `platform_identity_is_stable_*` case in each of the Android, Windows and ohos
+  presenters.
+
+  **The synchronous-rejection property holds, checked by reading the order rather
+  than trusting the note.** In `capi/src/surface.rs::migo_session_attach_surface`:
+  `validate_platform_identity` at `:285` → `lease_surface_tracked` at `:320` →
+  `HostCommand::UpdateSurface` at `:334`, and the failure path runs
+  `rollback_surface_transition` and returns rather than falling through.
+  `scripts/test-surface-attachment-contract.sh:158-160` asserts
+  `identity_check_line < first_lease_line` statically, and that gate is in the local
+  contract lane as of task T.6.
+
+  One claim checked separately because "the resize path quietly carries a new native
+  handle" is exactly this ledger's recurring shape: `migo_surface_update` at `:520`
+  also sends `UpdateSurface`, at `:607`, with **no** identity check. It is sound —
+  its signature is `(attachment, metrics)` and `MigoSurfaceMetrics` carries only
+  size, scale and generation, so it cannot change identity, and it is additionally
+  gated on `ptr::eq(active, attachment_ref)` plus `validate_update_generation`.
+
+  **Not closed:** no mutant taken, no review. Cheapest next step: move
+  `validate_platform_identity` after the lease and confirm the contract script fails
+  with "C ABI reattachment identity is not rejected before Surface lease/enqueue".
 - [ ] 0.4 A3: Migo-owned X11 connection; remove the undocumented `XInitThreads`
   precondition. Plan: `2026-07-29-a3-owned-x11-connection.md`.
+
+  Audited 2026-08-08. `XInitThreads` is absent from the tree,
+  `scripts/test-x11-owned-connection-contract.sh` passes, and the connection layer
+  is covered by `platform/src/linux/x11_connection.rs`
+  `owner_opens_private_connection_and_closes_it_before_api_drop`,
+  `server_mismatch_closes_candidate_and_returns_error`,
+  `reuse_requires_a_live_connection_to_the_same_server`, plus
+  `presenter.rs::x11_context_binds_identity_surface_and_factory_to_one_owned_connection`.
+
+  **One real gap, and it needs no hardware.** The plan's Task 3 Step 1 asks for
+  platform-context tests at the `capi` layer, and `capi/src/platform/linux.rs` has
+  Wayland cases only — no test drives `build_target` down the X11 path, so
+  "cold X11 attach opens one context", "same-server reuse yields an equal
+  `PlatformIdentity`" and "a different server is refused with `INVALID_STATE` before
+  any lease" are asserted at the connection layer and nowhere at the C ABI.
+  `LinuxX11Context::from_render_display_for_test` makes this a host test.
+
+  **Genuinely device-blocked, and not on this machine:** Task 2 Step 4's
+  `native_owned_connection_round_trip` is `#[ignore]`d pending a live X server, and
+  Task 4 Step 4 runs the real C host under `xvfb-run`.
 - [x] 0.5 A4: lossless terminal input transitions under bounded saturation.
   Plan: `2026-07-29-a4-lossless-input-state.md`. Evidence recorded 2026-07-29.
 - [ ] 0.6 A5: correct desktop pointer and button semantics, including Qt hover
-  and pressed-button state.
+  and pressed-button state. **One shipped defect found and fixed; neither
+  independent review has run, so the item stays open.**
+
+  **Hover reported a button nobody was holding.** `include/migo/input.h:150-151`
+  defines the field: "button follows DOM MouseEvent.button… On a move it names the
+  button being held." `MigoQtX11SurfaceView` answered that from `held_button_`, a
+  cached ordinal written on press and on release and **never cleared**. So after any
+  right-click, every subsequent hover move reported `button = 2`, and content saw a
+  secondary-button drag that was not happening. The same field got the two-button
+  chord wrong too: press primary, press secondary, release secondary, and moves
+  reported the released button while the primary was still down.
+
+  The field's own doc comment is where this is visible in hindsight — it read "the
+  mouse button currently held, tracked so a focus loss can retract the press", which
+  is the rationale for `mouse_pressed_`, the boolean beside it. One comment covered
+  two fields and the second inherited a reason that never applied to it.
+
+  **Fixed by deletion.** `QMouseEvent` already carries both halves — `button()` is
+  what changed state, `buttons()` is what is still down — so `deliverPointer` asks
+  the event: `button()` for DOWN and UP, `dom_button_held(buttons())` for MOVE, zero
+  when nothing is held. `held_button_` is gone, so the stale state is
+  unrepresentable rather than reset, and the file is shorter than before. Lowest
+  ordinal wins when several are down, because the ABI's field is one button while
+  Qt's is a mask.
+
+  Two new tests, both pressing the **secondary** button on purpose: the primary's
+  ordinal is 0, which is also what a hover must report, so a test that presses the
+  primary passes whether the view reads the event or a stale field.
+  `a_move_after_a_release_names_no_held_button` walks press → drag → release → hover;
+  `releasing_one_of_two_buttons_leaves_the_other_named` covers the chord.
+
+  Mutation evidence, two mutants killing the same test at **different assertion
+  lines**, which is what shows both of its claims carry weight:
+
+  - **M-A5-1** restores the cached ordinal exactly as it was. **20 passed, 2 failed** —
+    both new tests die at `pointers[3].button: 2, expected 0` (lines 307 and 332),
+    while the two pre-existing pointer tests
+    (`a_press_drag_and_release_reach_both_streams_in_css_pixels`,
+    `motion_without_a_button_reaches_the_mouse_stream_but_not_touch`) **pass**. That
+    pair passing is the proof the defect was unguarded rather than newly introduced.
+  - **M-A5-2** a move asks `event.button()` instead of `event.buttons()` — the
+    wrong-accessor slip that produces this bug class. **21 passed, 1 failed**, dying at
+    `pointers[1].button: 0, expected 2` (line 301), i.e. the drag no longer names the
+    held button.
+
+  Worth keeping about the harness: the host kit builds with
+  `-Werror=unused-function`, so M-A5-1 had to remove `dom_button_held` as well. Left
+  in place it became a *compile* failure, and a mutant killed by the compiler yields
+  no named test failure and therefore no evidence.
+
+  Verified: `bash scripts/test-linux-qt-host-kit.sh` → `Linux Qt Host Kit contract:
+  PASS`, 22 input tests and 13 managed-session tests, zero failures, both under the
+  offscreen platform and under xcb. This lane links a fake C ABI and builds neither
+  the engine nor V8, so it is not covered by `verify-change.sh` and is run on its own.
+
 - [ ] 0.7 A7: finish Android capability enforcement and revocation across all 30
   protected and 8 cleanup operations.
 - [ ] 0.8 A8: retained-intrinsic host bridge, mounted-module URL validation,
@@ -318,6 +452,63 @@
   header contract suites named in A6 have not been run under Slim; only the two
   crate suites have. The ABI and header ones need the C package, which is a target
   build rather than a host suite.
+
+  **All five are now run, and both sentences above were wrong.** They are corrected
+  in place rather than deleted, because what they got wrong is the pattern this
+  ledger keeps repeating.
+
+  - **The lifecycle, reattachment and input-saturation suites are `migo-capi` lib
+    tests**, not suites of their own: `lifecycle_calls_are_accepted_before_a_surface_exists`,
+    `lifecycle_state_and_session_levels_are_retained_without_a_surface`,
+    `returning_to_the_created_state_is_still_rejected` and
+    `unknown_lifecycle_states_are_told_apart_from_unsupported_transitions` for
+    lifecycle; `platform_context_rejects_display_or_kind_change_before_native_access`
+    and `platform_context_reuses_the_exact_wayland_graphics_domain` for reattachment;
+    `input_saturation_callback_is_once_per_episode` for saturation. Both profiles now
+    run them: **capi Full 143, Slim 143; platform Full 53, Slim 53** (52 before this
+    item's new test, plus one ignored X11 case needing a live server).
+  - **The ABI and header suites need no C package.** `migo-capi-abi` has no
+    dependencies and no features -- that is why it was split out of `capi` -- and its
+    **60 tests** across nine binaries, including
+    `tests/header_validation.rs`, run on the host in 0.01s. "Both product profiles"
+    is satisfied there by construction rather than by running twice: a crate that
+    declares no features has exactly one build.
+  - `verify-change.sh` had **no step for that crate at all**, and the comment
+    justifying the absent Slim steps read "`capi` and `platform` do not build on the
+    host at all" -- four lines below the two steps that build and test them. Four
+    steps were added: `capi-abi --all-targets` and Slim for `runtime-v8 --tests`,
+    `capi`, `platform`. `graphics` gets no Slim step for a reason worth stating:
+    its `profile-full` and `profile-slim` both expand to exactly `["embed_icudtl"]`,
+    so the two builds are the same build.
+
+  Pulling that thread found a larger gap than the item -- 95 tests in thirteen
+  integration binaries that no local step ran -- and the audit that makes it
+  unrepresentable is **task T.7**, with its mutation evidence.
+
+  **The Slim steps are not decoration, and one defect proves it.** `crates/capi/src`
+  contains no `cfg(feature)` at all, so a Slim capi run differs only in the graph
+  beneath it; the profile-conditional host-compiled code is
+  `jni_profile_contract::active_methods`, which selects the Android JNI surface with a
+  chain of five `#[cfg(feature)]` attributes. **It had no test.** Every profile test
+  asserted over `methods_for`, a `#[cfg(test)]`-only restatement of the same rule, so
+  the production chain and the declared rule were two implementations of one rule with
+  only the unshipped one checked. `the_registered_surface_is_the_one_this_profile_declares`
+  equates them, and `platform/src/lib.rs` now rejects a build with *neither* profile
+  feature so "which profile is this" is a total question -- every dependent already
+  forwards one through its own `default`, so only a bare `--no-default-features` is
+  refused, and that is not a product.
+
+  Two mutants, and the pair is the point:
+
+  - **M-A6-5** delete `#[cfg(feature = "api-system")]` and its `extend_from_slice`, so
+    a Full build registers no System JNI methods. The suite **as it was** -- the same
+    run with the new test skipped -- reports **52 passed, 0 failed**. With the new test:
+    FAILED. A Full build would have shipped four JNI methods short, and content calling
+    one would get `UnsatisfiedLinkError` at the moment it used it.
+  - **M-A6-6** drop the `#[cfg(feature = "api-sensors")]` attribute so Sensors is
+    registered unconditionally. **Full passes** -- that feature is on there, so no Full
+    run can see it -- and **Slim fails**. That is the evidence the Slim step earns its
+    place: a defect no Full suite can observe.
 
 - [x] 0.16 Fix the process-global text texture cache. **Closed: implementation,
   both reviews, Section 7.3's gate, the recorded residual, and — last — the

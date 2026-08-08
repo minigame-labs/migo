@@ -271,3 +271,141 @@
 
 
 
+
+- [ ] T.7 Make an unrun test binary fail the verifier. **Implemented and pinned;
+  neither independent review has run, so the item stays open.**
+
+  **Thirteen integration-test binaries holding 95 tests were run by no local step,
+  and 35 of them by no job anywhere.** The cause was uniform and invisible to every
+  check that existed: each gate names its suites per crate, and each one said
+  `--lib`. `cargo test -p <crate> --lib` runs the lib's unit tests and *none* of that
+  crate's `tests/*.rs` binaries, so a binary could exist, compile on every run, and
+  never execute.
+
+  Found while closing task 0.15, from the opposite direction: A6 names an "ABI and
+  header contract" suite, and the recorded reason it had not been run was that it
+  "needs the C package, which is a target build rather than a host suite". That is
+  false. `migo-capi-abi` has no dependencies and no features at all -- it was split
+  out of `capi` precisely so the boundary rules would be provable without a device or
+  a graphics stack -- and its 60 tests run on the host in 0.01s. The real defect was
+  that **the local verifier ran that crate not at all**, while CI ran it with
+  `--all-targets`.
+
+  The breakdown, measured:
+
+  | Crate | Binaries | Tests | Ran locally | Ran in CI |
+  |-------|---------:|------:|-------------|-----------|
+  | `migo-capi-abi` | 9 | 60 | no | yes |
+  | `migo-graphics` | 5 | 33 | no | no |
+  | `migo-runtime-v8` | 2 | 2 | no | no |
+  | `migo-shared` | 2 | 4 | yes | no |
+
+  The graphics five are golden-image and decode tests and need no GPU -- Skia
+  rasterises to memory -- and the whole set costs under two seconds.
+  `shared/tests/frame_cycle_allocation.rs` is Section 7.3's allocation gate at the
+  frame boundary and states its own reason for being a separate binary: a
+  `#[global_allocator]` is unique per binary, and the command pools must be
+  uncontended to measure a cycle at zero. CI never ran it.
+
+  **Why the existing contract could not see this.**
+  `scripts/test-local-verification-contract.sh` compared the two crate lists, and
+  compared them one way: `local ⊆ CI`. That is the harmless direction -- a local step
+  CI lacks makes CI narrower than a developer's machine. The direction that makes the
+  *local verdict false* is `CI ⊆ local`, and it was unasserted, so `migo-capi-abi`
+  passed every check in that file. Both directions are asserted now. Worse, a
+  crate-name comparison cannot see scope at all: two lists naming the same crates run
+  different binaries when one says `--lib`, and adding `test -p migo-capi-abi --lib`
+  would have satisfied a name check while running **zero** of the 60 tests.
+
+  **The fix is an audit, not a longer list.** `scripts/lib/host_test_coverage.py`
+  asks `cargo metadata` for every `kind: ["test"]` target and reports the ones no host
+  step runs; `verify-change.sh` runs it at startup and **refuses to produce a
+  verdict** when the list is non-empty. Same argument as the module-walk audit
+  directly above it: an unreached source file has unknown conditions, and an unrun
+  test binary has unknown behaviour. `cargo metadata` is the authority on purpose --
+  globbing `tests/*.rs` is a second implementation of cargo's target discovery that
+  counts `tests/common/mod.rs` as a binary and cannot see an explicit `[[test]]`.
+  A compile is deliberately not coverage: `build --workspace --all-targets` builds
+  every one of these binaries and runs none, which is how they stayed invisible in a
+  green tree.
+
+  `--list-host-steps` was added beside `--list-host-crates` so the contract can see
+  scope rather than re-derive it with a regular expression that has its own opinion of
+  cargo's syntax. The same parser then audits CI's own `cargo test` lines, so the two
+  sides are held at one scope by one implementation.
+
+  Mutation evidence, four mutants, each showing the new scope fails while the scope it
+  replaced stays green -- the second half matters, because a kill that the old scope
+  also catches would not justify widening anything:
+
+  - **M-T7-1** `validate_header` stops checking the ABI version. `--lib`: **0 passed,
+    0 failed** -- the step passes with the defect live, which is what "a gate that
+    cannot fail" looks like when measured. `--all-targets`:
+    `foreign_abi_version_is_rejected_before_size` FAILED.
+  - **M-T7-2** `99_main.js` deletes `globalThis.Deno` again, the historical
+    snapshot defect. lib 522 passed; `snapshot_roundtrip_restores_deno_core` FAILED
+    with `ReferenceError: Deno is not defined`, the original symptom.
+  - **M-T7-3** `ClearRect` erases one pixel to the right. lib 571 passed;
+    `clear_rect_erases_content_to_transparent` FAILED at "the rect's first column is
+    erased". **This mutant survived the first time**: the test sampled one interior
+    pixel and one far corner, both of which a one-pixel shift preserves. It is now
+    asserted at all four boundaries, and the fixed test kills it.
+  - **M-T7-4** the frame packet's op vector starts from `Vec::new()` again. lib 424
+    passed, including all five `command_vec_pool` tests;
+    `a_steady_state_frame_never_reaches_the_heap` FAILED with `64 fresh, 64 resize,
+    43008 bytes`.
+
+  The audit itself is pinned three ways in the contract: a fixture crate gains a
+  `tests/orphan.rs` and the run fails naming `migo-demo::orphan`; the parser is asked
+  directly whether a `--all-targets` *build* counts as coverage and must say no; and
+  CI's own commands must leave no binary unrun. Its first version also proved it fails
+  closed for the right reason -- the fixture helper did not copy the new script, and
+  every fixture run refused with "cannot tell which test binaries the host steps run"
+  rather than passing vacuously.
+
+  Residual, recorded and not fixed here: `crates/io/src/image_cache.rs:1532` carries a
+  duplicated `#[test]` attribute, and `ImageCache::clear` is dead. Both are
+  pre-existing and unrelated to this item.
+
+  **The widened gate found one thing immediately, and it was this change's own.**
+  `scripts/test-r8-profile-contract.sh` step 5 compiles
+  `platform/src/android/jni/profile_contract.rs` standalone with bare `rustc --test`
+  and no `--cfg` at all, so the crate root never participates and the
+  `compile_error!` added to `platform/src/lib.rs` — which makes a build with neither
+  profile feature impossible — could not fire there. Item 0.15's new test then failed
+  in the full gate: with no features, `active_methods` contributes nothing while the
+  rule it is compared against says Full. Every *cargo* dependent had been checked and
+  every one forwards a profile; the harness that does not use cargo had not been.
+  Fixed by giving the standalone compilation each profile's feature set, one `rustc`
+  run per profile, rather than by weakening the test — a profile-less compilation
+  modelled no shipped product, which is why the gap existed. Verified load-bearing:
+  deleting `#[cfg(feature = "api-system")]` and its `extend_from_slice` now fails that
+  script under `profile-full`.
+
+  **Verification for this item and the whole working tree, one run,
+  `scripts/verify-change.sh --base master` over 15 changed files: 47 verdict lines,
+  44 PASS, one `CI ONLY`, two `NOT PROVEN`.**
+
+  The `CI ONLY` is `test-local-verification-contract.sh`, which runs this script
+  against fixture repositories. The two `NOT PROVEN` are **`ohos compile` and
+  `windows compile`, and they are toolchain-blocked on this machine, not skipped**:
+  the selector demands them because `engine/crates/platform/src/lib.rs` changed and
+  that file is the crate root declaring `#[cfg(target_env = "ohos")] pub mod ohos`
+  and `#[cfg(target_os = "windows")] pub mod windows`. Neither toolchain exists here.
+
+  What was done instead of compiling them, since the change to that file is a
+  `compile_error!` and the risk is precisely that it fires on a target build:
+  both target builds were read for the features they pass. `build-ohos-host.sh:61`
+  and `build-ohos-sdk.sh:116` both pass `--no-default-features --features
+  profile-slim`; `build-windows-sdk.sh:162` runs `cargo build -p migo-capi --release`
+  with no `--no-default-features`, so `capi`'s own `default = ["profile-full"]`
+  forwards `platform/profile-full`. Both therefore satisfy the new requirement. That
+  is a static argument, not a compile, and it is recorded as such.
+
+  Lanes and counts: 18 host steps (the four new ones among them), 24 contract gates
+  (23 run here), `android compile` for `arm64-v8a` and `android-java compile` over
+  both product flavours. 43 host suite results, zero failures. Inside them:
+  capi-abi 60 across nine binaries, shared 424 + 4 integration, runtime-v8 Full 522
+  + 2 integration and Slim 471 + 1, graphics 571 + 33 integration, io 266, audio 65,
+  core Full 62 and Slim 59, capi Full 143 and Slim 143, platform Full 53 and Slim 53.
+  The Qt host kit is not part of this run and was verified separately for item 0.6.

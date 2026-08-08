@@ -5,8 +5,17 @@
 status convention, and every closed item's evidence, lives there. Read its
 "Status Convention" section before marking anything.
 
-**Branch:** `master`. The `perf/ble-notification-path` work merged as `0a53199`
-(#30), so nothing here depends on an unpushed branch any more.
+**Branch:** `delivery/a12-and-verification-lanes`, 21 commits ahead of
+`origin/master`, never pushed. Do not push it and do not commit to `master`. The
+`perf/ble-notification-path` work merged as `0a53199` (#30), so nothing here
+depends on any other unpushed branch.
+
+**Every shell needs this**, or every host suite fails for a reason unrelated to
+your change (see §0.2):
+
+```bash
+export MIGO_HOST_V8_DIR=$PWD/engine/third_party/rusty_v8/x86_64-linux-gnu/gn_out
+```
 
 ---
 
@@ -119,9 +128,30 @@ clang, the Khronos headers and the linux-gnu V8 archive that four Skia-linked
 crates need. It passes any cargo subcommand through, so `cargo-mutants` runs
 inside it too (§2).
 
-⚠️ **Confirm `Compiling <crate>` really appears** in an Android build before
-concluding a fix did or did not work. Under WSL2 cargo misses mtimes written by
-scripts and happily hands back a stale artifact; `touch` the source to force it.
+**Two lanes `verify-change.sh` does not cover, and both matter:**
+
+```bash
+bash scripts/test-linux-qt-host-kit.sh     # Qt 6 host kit: 22 input + 13 session tests, ~1 min
+```
+
+The Qt host kit links a fake C ABI and builds neither the engine nor V8, so it is
+outside the verifier entirely and has to be run by hand when
+`platforms/linux/host-kit/**` changes. It builds in a temp dir and cleans up. It
+runs each suite twice — once offscreen, where `xcb`-only tests report `SKIP`, and
+once under xcb where they run — so **check for `PASS` on the test you care about,
+not just for a zero exit**. It compiles with `-Werror=unused-function`.
+
+The second is CI: `.github/workflows/pr-ci.yml` and `release.yml` are the merge and
+tag gates, and `scripts/test-local-verification-contract.sh` now audits their
+`cargo test` lines with the same parser the local gate uses. A change to the local
+step list that is not mirrored in CI fails that contract.
+
+⚠️ **Confirm the crate really recompiled** before concluding a mutant survived.
+Under WSL2 cargo misses mtimes written by scripts — a `mv`-based write is not
+enough either — so `touch` the source after mutating. And grep the build log for
+the **package** name: cargo prints `Compiling migo-graphics`, not
+`Compiling graphics`, and one wasted round here came from grepping the lib name and
+reading "no recompile" when it had recompiled fine.
 
 ---
 
@@ -158,113 +188,68 @@ kills; deciding whether a survivor is noise or a hole is still yours.
 
 ## 3. What to do next, in order
 
-### 3.1 A12 (ledger task 0.12) — done, pending only the two reviews
+Rewritten 2026-08-08 at the end of the second session. Everything the earlier
+version of this section listed as "next" is now either done and recorded in the
+ledger, or corrected below because its premise was wrong.
 
-**Superseded by the ledger.** All three clauses are settled and the evidence,
-including the `verify-change.sh` verdict block and every mutant, is in ledger item
-0.12. In short:
+### 3.1 Done and recorded this session
 
-- **Pixel ratios:** already satisfied; the clause was stale and is corrected.
-- **Game identity:** the "Windows diverges" premise was false — one shared rule,
-  zero `#[cfg]`. The live defect was that the rule was case-*preserving*, so
-  `PuzzleQuest` and `puzzlequest` became one directory on NTFS/APFS. Fixed by
-  narrowing the id space to lower case (making the folding pair unrepresentable
-  rather than resolved per platform) and rejecting reserved device names on every
-  platform. Both language gates now read one vector table,
-  `engine/crates/shared/src/vfs/game-id-vectors.txt`, so widening one side alone
-  fails that side.
-- **Missing ad handler:** every one of the six ad entry points now settles what
-  content waits for, and the *interface defaults* settle identically — that second
-  half was the larger hole, because a registered handler that does not sell
-  rewarded video stalled content exactly as a missing handler did. The settlement
-  method is abstract on the command enum, so a seventh ad command cannot compile
-  until somebody decides what it settles as.
+Read the ledger entry rather than redoing any of it. Each is implemented, has
+mutation evidence, and is deliberately left `- [ ]` because both independent
+reviews are user-triggered (§6).
 
-**Two things this turned up that are now the top of the list.**
+- **Task T.7 — an unrun test binary now fails the verifier.** Thirteen
+  integration-test binaries holding 95 tests were run by no local step, and 35 of
+  them by no job anywhere, because every gate on both sides said `--lib`.
+  `scripts/lib/host_test_coverage.py` asks `cargo metadata` for every
+  `kind: ["test"]` target and `verify-change.sh` refuses to print a verdict when a
+  step covers none of them. Four mutants, each showing the new scope fails while the
+  scope it replaced stays green.
+- **Item 0.15 (A6) — the remaining suites run.** The two recorded obstacles were
+  both false: the ABI and header suites need no C package (`migo-capi-abi` has no
+  dependencies and no features; 60 host tests in 0.01s), and the comment saying
+  "`capi` and `platform` do not build on the host at all" sat four lines below the two
+  steps that build and test them. The lifecycle, reattachment and input-saturation
+  suites A6 names are `migo-capi` lib tests, now run under both profiles.
+- **Item 0.6 (A5) — a shipped defect fixed.** The Qt view cached the held mouse
+  button and never cleared it, so every hover after a right-click told content the
+  secondary button was down. Fixed by deleting the cache and asking the event.
+- **Items 0.2 (A1) and 0.3 (A2) — audited, found already implemented.** Their plans'
+  unchecked steps carry "Expected: FAIL because…" premises that are all false. The
+  ledger entries name the file and line for each, and the tests that already assert
+  the properties.
 
-### 3.2 Done this session: the contract lane, the Slim profile, pitest, the split
+### 3.2 Next, in value order
 
-Recorded in the ledger with evidence; listed here only so the next session does not
-redo them. Ledger tasks T.4, T.5, T.6 and item 0.15.
+1. **Item 0.4 (A3): three `capi`-layer X11 tests, no hardware needed.**
+   `capi/src/platform/linux.rs` has Wayland cases only, so nothing drives
+   `build_target` down the X11 path. Assert cold attach opens one context,
+   same-server reuse yields an equal `PlatformIdentity`, and a different server is
+   refused with `INVALID_STATE` **before any lease**.
+   `LinuxX11Context::from_render_display_for_test` is the seam. Task 2 Step 4 and
+   Task 4 Step 4 of that plan are genuinely device-blocked (live X server / xvfb).
+2. **Cheap mutants for 0.2 and 0.3**, to turn "implementation present" into "guard
+   proven". For A1: join while holding the engine lock, expect
+   `engine_destroy_holds_no_engine_lock_while_joining` to fail at its own assertion.
+   For A2: move `validate_platform_identity` after the lease, expect
+   `scripts/test-surface-attachment-contract.sh` to fail with "C ABI reattachment
+   identity is not rejected before Surface lease/enqueue".
+3. **Task T.4's pitest survivors**, starting with the permission cluster:
+   `PermissionOperationGate` and `PermissionRevocation` survive having their return
+   values inverted, and `NativeMethods.updatePermission` survives negation of its
+   whole argument guard. `TouchEventHandler`'s 19 are the largest cluster. Twelve of
+   the 20 Rust survivors are android-stub-limited and seven are mathematically
+   equivalent — **do not write tests for those**, that is writing a test that cannot
+   fail. T.4 has the classification.
+4. **The remaining phase-0 epics**: 0.7/A7 (Android capability enforcement, 30
+   protected and 8 cleanup operations), 0.8/A8, 0.9/A9, 0.10/A10, 0.11/A11, 0.13
+   HarmonyOS, 0.14/A13. Most have their own detailed plan named in the ledger entry.
+5. **Phase 1 hermetic builds** — `part-phase-1.md`, 18 open items.
 
-- **The local verifier ran none of the ~24 source-structure contract gates** -- they
-  lived only in `.github/workflows/pr-ci.yml`. Found by A12's own mutant: reverting
-  one ad entry point to a bare handler lookup passes every unit test in both
-  languages and is caught by one contract script, so the local gate called a change
-  "verified" that CI rejects. The lane is now derived from the workflow (so it
-  cannot drift from CI), runs on every invocation, and is pinned by six new checks
-  in `scripts/test-local-verification-contract.sh`. **Its own first version
-  under-ran silently** -- a gate that runs `cargo` drained the here-string the loop
-  was reading, and three gates plus a verdict line vanished from a run that still
-  reported success. Read T.6 before touching it.
-- **Nothing had ever run a Slim host suite**, and the first one reported 36
-  failures. Six were a real defect: the window-resize ingress lived in the
-  `api-connectivity` extension, so on a Slim build no canvas ever followed its
-  surface. Both Slim suites are host steps now.
-- **pitest is wired** (`:library:pitestFullDebug`), and its 57 production survivors
-  are listed in T.4. The published Gradle plugin cannot be used on an Android
-  library module; read T.4 before reaching for it.
-- **The ledger is split** per phase with a stable index, so several agents can work
-  without colliding on one 5,900-line file.
-
-### 3.3 Fixed: the verifier's Gradle lane blocked on the loop's own stdin
-
-Kept because the diagnosis took four wrong turns and the shape recurs. The
-`android-java` lane sat for twelve minutes having used **one second of CPU**, while the
-identical command run by hand finished in nineteen seconds. The cause was stdin: the
-target loop read the plan from a here-string, so Gradle inherited the remaining plan as
-its own input and blocked. Exactly the defect the contract lane had a few commits
-earlier -- found twice in one run.
-
-The wrong turns, in order, each plausible and each measurable: network resolution (real,
-and `--offline` is kept -- an unconstrained resolve here does stall for tens of minutes);
-daemon lifetime (real, and `--no-daemon` is kept -- a daemon outlives its build while
-able to hold the project lock); a project lock held by a straggler daemon (five were
-alive; killing them changed nothing); and finally the manual-versus-in-gate comparison,
-which is what isolated it in one command.
-
-**The lesson worth keeping: a build that consumes its caller's stdin is
-indistinguishable from a build that is simply slow**, and `--quiet` prints nothing while
-it waits. When a step in a loop hangs, compare it against the same command run by hand
-before theorising about the tool.
-
-### 3.3 Make the host suites selective (speed, ~1 session)
-
-`scripts/verify-change.sh` runs **all** host cargo suites on every invocation, and
-there are now sixteen of them, so a Java-only change pays for every Rust suite plus
-both Slim profiles. `scripts/lib/verification_targets.py` already maps changed files
-to crates (`_CRATE_PATH`), so the missing piece is a reverse-dependency closure from
-`cargo metadata`: run the changed crate's suite plus every crate that depends on it,
-dev-dependencies included.
-
-**Get this right or not at all** -- under-running is a silent gap, which is strictly
-worse than slow, and the contract lane above already demonstrated how quietly it
-happens. Fail closed: anything outside `engine/crates/**` (`Cargo.lock`,
-`.cargo/config.toml`, a workspace manifest, a script), or a `cargo metadata` that
-does not run, must fall back to every suite and say why.
-`scripts/test-local-verification-contract.sh` must grow an assertion that a change
-in a leaf crate still runs its dependents. **Leave the contract lane
-unconditional** -- each gate is seconds, and keying them to changed files means a
-file list per gate, which is a list to forget an entry from.
-
-### 3.4 Kill the pitest survivors, starting with the permission ones
-
-T.4 lists 57. The ones that matter on this project's own standard that a guard which
-cannot fail is decoration: `PermissionOperationGate` and `PermissionRevocation`
-survive having their return values inverted, `BluetoothManager.hasConnectPermission`
-survives both negation and a forced `true`, and `NativeMethods.updatePermission`
-survives negation of its whole argument guard. `TouchEventHandler`'s 19 are the
-largest cluster.
-
-### 3.5 The rest of A6, and then the open epics
-
-Task 0.15 ran the two crate suites under both profiles; the lifecycle,
-reattachment, input-saturation, ABI and header contract suites it also names have
-not been run under Slim, and the last two need the C package rather than a host
-suite. After that the open work is the epics in phase 0 (A1, A2, A5, A7 through
-A11, HarmonyOS) and phase 1's hermetic builds, several of which need the device,
-the emulator or the Windows toolchain named in Section 0 and cannot be closed on
-this machine.
+**Before starting any of them, check the recorded obstacle against the object it
+names.** The count of wrong ones reached fourteen this session. The reflex that
+dissolves most of them is asking *"which layer can see this property?"* rather than
+*"how do I reach this code?"*.
 
 ## 4. Traps that cost real time here
 
@@ -298,6 +283,29 @@ this machine.
   item says something is impossible, verify it against the code before believing
   it. The question that has dissolved most of them is *"which layer can see this
   property?"* rather than *"how do I reach this code?"*.
+- **A gate can be absent rather than weak, and a crate-name comparison cannot see
+  that.** The contract compared the local and CI suite lists one way only,
+  `local ⊆ CI`, which is the harmless direction. `CI ⊆ local` is the one that makes
+  the *local verdict false*, and `migo-capi-abi` sat in it for months. Scope is not
+  visible in a name either: `test -p migo-capi-abi --lib` names the crate and runs
+  zero of its 60 tests. Ask `cargo metadata` what targets exist (task T.7).
+
+- **A mutant killed by the compiler yields no evidence.** Reintroducing the Qt
+  held-button cache left `dom_button_held` unused, and the host kit builds with
+  `-Werror=unused-function`, so the run failed to compile instead of failing a named
+  test. The mutant has to be the *whole* original shape, dead helper removed.
+
+- **Pick the mutant a point sample cannot survive.** A one-pixel shift of
+  `clearRect` walked past the golden test, because it sampled one interior pixel and
+  one far corner — both preserved by the shift. Before trusting any pixel or field
+  assertion, ask what it admits.
+
+- **A test-only restatement of a production rule is a warning sign.**
+  `active_methods` selects the Android JNI surface with a `#[cfg(feature)]` chain and
+  `methods_for` states the same rule declaratively under `#[cfg(test)]`. Every test
+  asserted over the one that never ships, so deleting a line of the production chain
+  was a survivor. The missing test is always the one that equates them.
+
 - **Guards cover the side they were designed for.** Twice in one session a new
   guard passed its own mutant while the defect it existed for survived. After
   writing one, ask what it does *not* cover, and write the mutant that exploits
