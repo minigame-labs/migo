@@ -21,8 +21,16 @@ EXPECTED='(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
+# Offline when the caller says so. CI has a network and no dependency cache, so it
+# must resolve; `scripts/verify-change.sh` has the cache and a network that cannot
+# reach the module repositories quickly, where an unconstrained build stalls for
+# tens of minutes with no output. Named rather than inferred, so the two situations
+# stay distinguishable in both directions.
+GRADLE_FLAGS=()
+[[ -n "${MIGO_GRADLE_OFFLINE:-}" ]] && GRADLE_FLAGS+=(--offline)
+
 echo "[1/4] compiling full/slim debug library Java..."
-( cd "$ANDROID_DIR" && ./gradlew --quiet \
+( cd "$ANDROID_DIR" && ./gradlew --quiet "${GRADLE_FLAGS[@]}" \
     :library:compileFullDebugJavaWithJavac \
     :library:compileSlimDebugJavaWithJavac ) \
     || fail "full/slim debug Java compilation failed"

@@ -314,6 +314,13 @@ run_step "host" "git diff --check" || true
 # them to changed files means maintaining a file list per gate -- a list to
 # forget an entry from, which is how a gate stops covering what it names.
 # ------------------------------------------------------------
+# Every Gradle build this run drives is offline, for the reason the `android-java`
+# lane below gives: this script verifies sources, not the dependency graph, and an
+# unconstrained resolve here stalls for tens of minutes. Exported rather than passed,
+# because the contract gates are invoked with the command line CI uses -- that parity
+# is the point of deriving them -- so the flag cannot live in the command string.
+export MIGO_GRADLE_OFFLINE=1
+
 have_tool() {
     case "$1" in
         rg)      command -v rg >/dev/null 2>&1 ;;
