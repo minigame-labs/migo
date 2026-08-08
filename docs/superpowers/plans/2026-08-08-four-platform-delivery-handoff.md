@@ -274,7 +274,13 @@ reviews are user-triggered (§6).
    | 0.11/A11 | **decide** | see item 0 above |
    | 0.10/A10 | **write the requirement first** | "Canvas recovery as one transactional resource operation" has no plan file and no acceptance line in the spec — §6 runs 6.1–6.6 and none is canvas recovery. It cannot be audited against an object that does not exist, and inventing the criterion is a design decision, not verification |
    | 0.7/A7, 0.14/A13 | **audited 2026-08-09** | read the entries; 0.7 is substantially in place, 0.14 has measured counts |
-2. **Phase 1 hermetic builds** — `part-phase-1.md`, 18 open items.
+2. **Phase 1 hermetic builds** — `part-phase-1.md`, 18 open items, and **spot-audited
+   2026-08-09: six checked, six genuinely open**. Do not carry phase 0's expectation
+   here that an audit dissolves the item — it does not. The note at the top of that
+   file has the evidence, names **1.10** as the near-free one (its two-sysroot
+   support is written; it needs a second, newer OpenHarmony SDK) and **1.4** as the
+   one to think about first, because `--allow-multiple-definition` is masking
+   duplicate Skia/V8 symbols rather than decorating the link line.
 
 **Before starting any of them, check the recorded obstacle against the object it
 names.** The count of wrong ones reached **fifteen** on 2026-08-09, and the

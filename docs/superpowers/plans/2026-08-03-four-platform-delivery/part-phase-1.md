@@ -2,6 +2,29 @@
 
 ## Phase 1 — Hermetic Four-Platform Builds
 
+> **Spot-audit 2026-08-09, and the result reverses the prior this ledger has been
+> building.** Seven phase-0 items audited this month turned out already
+> implemented, so it was reasonable to expect the same here. It does not hold:
+> six phase-1 items were checked against the objects they name and **all six are
+> genuinely open**, with nothing started.
+>
+> | Item | Checked | Found |
+> |---|---|---|
+> | 1.2 one release-version source under `release/` | directory listing | `release/` does not exist |
+> | 1.4 remove every `--allow-multiple-definition` | tree-wide grep | still in `engine/.cargo/config.toml` ×5, `platforms/openharmony/.../CMakeLists.txt`, and `scripts/build-android-so.sh`, whose comment calls it required on every Android target |
+> | 1.6 release must reject `--skip-rust` | grep | `scripts/build-aar.sh` still documents and accepts it |
+> | 1.9 HarmonyOS V8 component manifest | directory listing | neither `*-linux-ohos/` has `component-manifest.json`; `x86_64-linux-gnu/` does, which is the shape to copy |
+> | 1.10 two-sysroot HarmonyOS floor | ran it | `scripts/test-ohos-symbol-floor.sh` supports the mode at `:195` but it is opt-in via `MIGO_OHOS_NEWER_SYSROOT`, and today's run printed the hint rather than the second audit |
+> | 1.12 byte-equal rebuild for every shipping archive | `ls scripts/` | no reproducibility or determinism gate exists |
+>
+> **Budget these as implementation, not as audits.** The one near-free item is
+> **1.10**: the two-sysroot support is already written, so it needs a second and
+> newer OpenHarmony SDK unpacked beside the current one and the variable set —
+> §0 of the handoff records the download recipe. **1.4 is the one to think about
+> before touching**: `--allow-multiple-definition` is masking duplicate symbols
+> that Skia and V8 each contribute, so removing it is resolving those symbols per
+> platform, not deleting a flag.
+
 - [x] 1.1 Build the Android V8 archives from source. **Both architectures now
   reproduce bit-identically.** `aarch64` produced
   `engine/third_party/rusty_v8/aarch64/librusty_v8.a` at 121,784,912 bytes, sha256
