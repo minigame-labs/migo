@@ -99,14 +99,29 @@ public final class PermissionOperationGate {
      */
     private final Set<Integer> retiredSessionIds = new HashSet<>();
 
-    /** Opens a previously unseen session. A closing tombstone is never reopened. */
-    public boolean open(int sessionId) {
+    /** What an admission attempt did, and when it refused, which refusal it was. */
+    public enum Admission {
+        ADMITTED,
+        /** The id is still live, so this is a duplicate registration. */
+        ALREADY_LIVE,
+        /** The id belonged to a closed session; every permission check for it is denied. */
+        RETIRED
+    }
+
+    /**
+     * Admit a previously unseen session, or say why not. A closing tombstone is never
+     * reopened.
+     *
+     * The two refusals mean different things to a caller and are answered in the *same*
+     * acquisition of {@link #openGuard} rather than by a second query, so no caller can
+     * observe a state between them and none can recompute the distinction differently.
+     */
+    public Admission admit(int sessionId) {
         synchronized (openGuard) {
-            if (retiredSessionIds.contains(sessionId) || sessions.containsKey(sessionId)) {
-                return false;
-            }
+            if (retiredSessionIds.contains(sessionId)) return Admission.RETIRED;
+            if (sessions.containsKey(sessionId)) return Admission.ALREADY_LIVE;
             sessions.put(sessionId, new Session());
-            return true;
+            return Admission.ADMITTED;
         }
     }
 

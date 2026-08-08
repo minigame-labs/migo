@@ -211,9 +211,28 @@ public final class NativeExports {
      */
     public static void registerSession(int sessionId, GameSession session) {
         if (session != null) {
-            if (!sPermissionOperations.open(sessionId)) {
+            PermissionOperationGate.Admission admission = sPermissionOperations.admit(sessionId);
+            if (admission != PermissionOperationGate.Admission.ADMITTED) {
+                // The gate refuses two different things and they mean different things to
+                // a host, so the message says which. A retired id was closed and can
+                // never be granted anything again; a live one is a duplicate
+                // registration. The single message this used to throw named the closing
+                // case for both, which told a host the opposite of what happened in the
+                // other half.
+                //
+                // Both are fatal here, unlike on the native side, where a live-id refusal
+                // is tolerated because `HostCommand::Restart` rebuilds device services for
+                // the same live id. Nothing re-registers on this side: this is the
+                // `GameSession` constructor's only call, and `restart()` goes straight to
+                // native without rebuilding the wrapper.
                 throw new IllegalStateException(
-                        "permission lifecycle is already closing for session " + sessionId);
+                        admission == PermissionOperationGate.Admission.RETIRED
+                                ? "session " + sessionId + " was already closed; its id"
+                                        + " must not be reused, and every permission check"
+                                        + " for it is denied"
+                                : "session " + sessionId + " is already registered;"
+                                        + " concurrently live sessions must have distinct"
+                                        + " ids");
             }
             sSessions.put(sessionId, session);
         }

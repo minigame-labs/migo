@@ -13,6 +13,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import com.migo.runtime.internal.PermissionOperationGate.Admission;
 import org.junit.Test;
 
 public final class BluetoothManagerGattCleanupTest {
@@ -285,7 +286,7 @@ public final class BluetoothManagerGattCleanupTest {
     public void standingScopeDenialDrainsAdmittedCallbackBeforeClosingGattAndRejectsLateData()
             throws Exception {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(14));
+        assertEquals(Admission.ADMITTED, gate.admit(14));
         assertEquals(null, gate.update(14, "scope.bluetooth", true, () -> true).failure());
         List<String> events = Collections.synchronizedList(new ArrayList<>());
         CountDownLatch callbackEntered = new CountDownLatch(1);
@@ -538,7 +539,7 @@ public final class BluetoothManagerGattCleanupTest {
     @Test
     public void standingScopeDenialRejectsConnectedDiscoveryWhileGattIsStillLive() {
         PermissionOperationGate gate = new PermissionOperationGate();
-        assertTrue(gate.open(20));
+        assertEquals(Admission.ADMITTED, gate.admit(20));
         assertEquals(null, gate.update(20, "scope.bluetooth", true, () -> true).failure());
         assertEquals(null, gate.update(20, "scope.bluetooth", false, () -> true).failure());
         List<String> states = new ArrayList<>();
