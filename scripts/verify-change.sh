@@ -402,8 +402,15 @@ target_command() {
             # build reports NOT PROVEN like every other absent target. Running
             # a missing `gradlew` would record FAIL, which says "your change
             # broke this" about a machine that never had the evidence.
+            # `--offline` because this lane verifies the sources, not the dependency
+            # graph, and without it Gradle tries to refresh its external modules:
+            # measured at over twenty minutes against seventeen seconds offline on a
+            # machine whose network cannot reach the repositories quickly. A gate that
+            # can hang that long is a gate people learn to skip. The failure mode it
+            # introduces is loud and names its own cause -- "No cached version
+            # available for offline mode" -- unlike a silent stall.
             [[ -x "$ROOT/platforms/android/gradlew" ]] && echo "cd platforms/android && \
-./gradlew --quiet :library:testFullDebugUnitTest :library:testSlimDebugUnitTest"
+./gradlew --quiet --offline :library:testFullDebugUnitTest :library:testSlimDebugUnitTest"
             ;;
         *)                    echo "" ;;
     esac
