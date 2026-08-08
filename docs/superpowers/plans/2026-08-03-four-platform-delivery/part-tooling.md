@@ -49,11 +49,46 @@
   Usage and scoping rules are in
   `docs/superpowers/plans/2026-08-08-four-platform-delivery-handoff.md`.
 
-- [ ] T.3 Make the host suites selective. `verify-change.sh` runs every host cargo
-  suite on every invocation — its header says so — so a Java-only change pays
-  eleven Rust suites. The selector already maps changed files to crates; what is
-  missing is the reverse-dependency closure, and it must be exact: under-running is
-  a silent gap, which is worse than slow.
+- [ ] T.3 Make the host suites selective. **Implemented, measured and pinned in both
+  directions; neither independent review has run, so the item stays open.**
+
+  Sixteen host suites ran on every invocation — the count grew when task 0.15 added
+  the two Slim ones — so a Java-only change paid for the whole Rust tree. The
+  selector now answers with the changed packages plus their **reverse-dependency
+  closure**, taken from `cargo metadata --no-deps`: a change to a leaf crate still
+  runs the suites of everything that depends on it, because that is where its
+  behaviour is observed. Dev-dependencies are edges too — a crate whose *tests* use
+  another crate is a crate whose suite a change to that other crate can break.
+
+  **The dangerous direction is the quiet one**, so every branch fails towards running
+  more. `HOSTSUITES ALL` is the answer for a tree `cargo metadata` cannot describe,
+  for a file under `engine/` belonging to no workspace member (a lock file, a
+  workspace manifest), and for any path outside `engine/` that is not provably
+  irrelevant — `scripts/` decides how the suites run at all. A missing `HOSTSUITES`
+  line lands in the same branch. `build --workspace --all-targets` and
+  `fmt --all --check` stay whenever any package is implicated, because several
+  members have no suite of their own and that build is the only thing compiling them.
+  `NONE` keeps `fmt` alone: it costs a second, and a stray unformatted file is worth
+  catching wherever it came from.
+
+  Measured closures: a change to `crates/shared` selects 12 packages (it is the root
+  of the graph, so there is nothing to save there and the selector correctly says so),
+  `crates/audio` selects 7, `crates/capi` selects 2, a Java-only change selects none.
+  End to end, a Java-only change now takes **2m0s** against roughly thirteen minutes
+  before — the remaining time is the contract lane and both Gradle flavours, which is
+  what such a change actually needs.
+
+  Pinned in both directions, and each mutant dies at the check named for it: deleting
+  the closure fails *"a leaf change reaches the crates that depend on it"* and *"the
+  dependent's suite is actually run, not merely planned"*; treating an unknown path as
+  needing nothing fails *"a change outside engine/ that could affect anything runs
+  every suite"*. The fixture needed one real dependency edge for this — with
+  standalone stub crates, under-running and correct behaviour produce identical
+  output, which is the shape of a gate that cannot fail.
+
+  **The contract lane stays unconditional** (task T.6). Each of its gates is seconds,
+  and keying them to changed files would mean a file list per gate — a list to forget
+  an entry from, which is how a gate stops covering what it names.
 
 - [ ] T.4 Add `pitest` for the Java half, for the reason T.2 gives for the Rust half.
   **Wired and run; the survivors it found are listed below and are not yet fixed, so
