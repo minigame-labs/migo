@@ -324,10 +324,31 @@ requirements as well as design requirements:
   releasing it while retaining the transition lock, then reacquire to remove
   successes and retain failures for retry.
 - No per-event path may take a lock shared across sessions, and no per-event
-  path may allocate. The permission gate's session lookup currently takes a
+  path may allocate. ~~The permission gate's session lookup currently takes a
   monitor on a map shared by every session on each BLE notification, and each
-  callback allocates a connection wrapper plus capturing lambdas. Section 8
+  callback allocates a connection wrapper plus capturing lambdas.~~ Section 8
   defines the regression tests that make this a gate rather than a note.
+
+  **Both halves of this bullet are closed, and the notification path was worse
+  than it says.** The shared lookup is gone from the Rust gate (a `SessionGate`
+  resolved when a Session's device services are built) and from the Java one (a
+  handle held rather than a session id looked up), each with a
+  manufactured-contention test. On the notification path itself the Rust side was
+  also allocating five times per notification *and* reading the process-wide
+  `HOST_SENDERS` to find its own Session's sender — a lock this bullet did not
+  name, on a stream a peripheral paces — and the Java side was allocating four
+  times, of which the wrapper and the lambdas are the two named here. What is now
+  true: the Rust half fills a recycled slot through a portable
+  `HostIngress::try_send_ble_characteristic_value`, gated for allocation and
+  against both process-wide registries; the Java half carries the event in one
+  reusable per-attempt object and formats each UUID once per Session, gated by a
+  JVM allocation probe with its own negative control. The pre-fix shapes cost 64
+  bytes per notification in the JVM and five heap events per notification in Rust,
+  measured by reintroducing each.
+
+  **Still open on this path:** the `BluetoothGattCallback` body cannot be reached
+  from a JVM unit test, so the wrapper's memoisation is unmeasured, and nothing on
+  this path has run against a peripheral.
 
 ### 6.2 HarmonyOS Correctness
 
@@ -820,10 +841,32 @@ These are enforced by tests, not by inspection:
   first-call gate and passes the steady one, and an allocation on the path only
   the steady gate exercises does the reverse.
 
-  **Not covered, and named rather than implied.** The BLE notification path's Rust
+  **A second counting instrument exists, for the allocations that happen inside the
+  JVM.** A Rust allocator observes nothing the JVM allocates, and the Android half of
+  the BLE notification path is entirely JVM allocation, so
+  `platforms/android/.../AllocationProbe` counts per-thread allocated bytes across a
+  burst with the same three properties: mandatory warm-up, a self-check that refuses
+  to trust a zero until the counter has observed a known allocation, and a measured
+  rather than assumed instrument cost — it reaches `ThreadMXBean` reflectively,
+  because Android unit tests compile against `android.jar`, and the reads are
+  subtracted through a control run over an empty body. Two properties are specific to
+  it and both were found by measurement, not review. The reflective read *spins a
+  generated accessor class* after about fifteen calls, which landed inside the first
+  measured window and reported eleven kilobytes on a path that allocates nothing, so
+  the probe warms itself as well as the body. And the self-check needed a negative
+  control of its own — deleting it killed no test — so a control switches the counter
+  off, requires the burst to refuse, and requires the refusal to name the instrument
+  rather than the path.
+
+  ~~**Not covered, and named rather than implied.** The BLE notification path's Rust
   half is `cfg(target_os = "android")`, so a host test binary never compiles it and
-  the gate cannot run there; its Java half needs a JVM mechanism entirely, because a
-  Rust allocator observes nothing the JVM allocates. Of the audio path, what is
+  the gate cannot run there; its Java half needs a JVM mechanism entirely.~~ **Both
+  halves are covered.** The `cfg` covers the JNI function and not the property: the
+  allocating core is now a portable `HostIngress` method, and what stays on the
+  platform side is reading three strings and a byte array out of the JVM. What
+  genuinely cannot be reached is the `BluetoothGattCallback` body, which needs
+  framework classes a JVM unit test cannot obtain — one memoised connection wrapper
+  is unmeasured there. Of the audio path, what is
   measured stops where a device or a socket begins: the rest of `run_audio_thread`
   — the command drain, the decode-result drain and the refill loop's write into
   the ring — needs an `AudioOutput`, so what is lifted out and gated is the
@@ -907,7 +950,8 @@ These are enforced by tests, not by inspection:
 
   **Covered:** the per-event input send, gated separately against the host registry
   and the debug-stats registry, the per-frame text cache hit against the session
-  registry, and — the path this requirement was first written for — a gated Android
+  registry, the BLE characteristic notification against both process-wide registries,
+  and — the path this requirement was first written for — a gated Android
   device call against the permission gate's live-host map. Applying it showed the
   input send acquiring the process-wide stats registry on every event, the very path
   this section recorded as satisfied, and the stats handle is now captured at bring-up
@@ -951,8 +995,11 @@ These are enforced by tests, not by inspection:
   first test asserts an absence a guard nobody held would satisfy. The review's own
   counterexample, taking the guard inside the per-event lookup, fails the first and not
   the second.
-  The BLE notification path's Rust half is `cfg(target_os = "android")`, so a host test
-  binary never compiles the *notification* traffic itself, and the android-only half of
+  ~~The BLE notification path's Rust half is `cfg(target_os = "android")`, so a host test
+  binary never compiles the *notification* traffic itself~~ — **the notification traffic
+  is now gated too**: its allocating and locking core is a portable `HostIngress`
+  method, and the probe found it reading `HOST_SENDERS` on every notification, which is
+  this same defect a third time. The android-only half of
   this fix — the nine service types that now hold the handle — compiled for
   `aarch64-linux-android` and was not run. What the contention test cannot see is a
   regression *inside* `SessionGate::run`: the handle holds no path back to the gate, so
