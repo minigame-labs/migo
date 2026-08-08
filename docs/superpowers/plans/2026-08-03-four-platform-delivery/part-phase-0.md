@@ -542,7 +542,33 @@
   `master` were already stale, so this does not add a new class of problem — it
   adds one more reason the regeneration round matters.
 
-  **Tasks 3–12 are not started, and the property is not enforced yet.** Ids and
+  **Task 4 is specified but not started, and its shape is now known rather than
+  guessed.** Three modules — `system/13_login.js`, `payment/01_payment.js`,
+  `base/04_subpackage.js` — each own a module-local `_nextRequestId` starting at
+  1, send it out with the request and match it on return, which is the same
+  defect `createDeferredApi` had. Payment carries the extra weight: a
+  mis-correlated settle there is visible as money.
+
+  Three things to know before starting it:
+
+  * **`02_async.js` does not export the helpers yet.** Task 4 says to import
+    `allocateHostCallbackId` and `parseHostCallbackId` from it; its export list is
+    `{ wrapAsync, promisify, createDeferredApi, createListenerGroup,
+    createCallbackEvent, errorToString }`. Add them there first.
+  * **Its step 3 removes payment's two FIFO branches** (`_pendingMidas`,
+    `_pendingMidasGameItem`). That is the same hazard as task 3's, and payment is
+    *not* in task 6's file list, so whether its platform side echoes the id is
+    unverified. Land the safe subset — allocator plus strict parsing, fallback
+    kept for the *absent* case only — exactly as task 3 did, and delete the
+    branches when the platform side is confirmed.
+  * **Allocation can now throw**, and the plan requires it to fail *before* any
+    pending-map insertion or host call while preserving each API's existing
+    `fail`/`complete` shape. That is six call sites (login 3, payment 2,
+    subpackage 1), each with its own error convention to match. It is the part
+    that wants care rather than speed: a wrong-shaped failure on the payment path
+    is worse than the defect being fixed.
+
+  **Tasks 5–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
   them before invoking JavaScript: that is Task 7's rejection and Task 10's
   unpublished candidate. Until then this is plumbing that changes no behaviour.

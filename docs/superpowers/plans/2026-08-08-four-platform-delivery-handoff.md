@@ -268,7 +268,7 @@ reviews are user-triggered (§6).
 
    | Item | What it needs | Why |
    |---|---|---|
-   | 0.9/A9 | **execute, tasks 1–3 of 12 done** | plan `2026-08-02-runtime-restart-generation-boundary.md`; its §6.6 authority is *not* superseded, checked. Task 3 landed as a **subset**: the fallback its step 3 deletes is what Task 6 makes safe to delete, and deleting early means promises that never settle. Two of the plan's own code blocks were wrong — see 0.9. Resume at Task 4, and give **4–5 a whole session each** |
+   | 0.9/A9 | **execute, tasks 1–3 of 12 done** | plan `2026-08-02-runtime-restart-generation-boundary.md`; its §6.6 authority is *not* superseded, checked. Task 3 landed as a **subset**: the fallback its step 3 deletes is what Task 6 makes safe to delete, and deleting early means promises that never settle. Two of the plan's own code blocks were wrong — see 0.9. Resume at **Task 4**, whose shape is written out in 0.9 — 3 JS files, but six allocation sites each needing that API's own failure shape, and payment's FIFO removal carries the task-3 hazard. **Task 5** is the big one: 11 files reaching into Rust services and Android |
    | 0.13 | **execute, partly device-blocked** | the entry states four concrete deliverables (ArkTS lifecycle hooks, `OHNativeWindow` release barrier, multi-touch, restart/shutdown barriers); spec §6.2 governs. Compile-level work is now verifiable locally via the T.8 lane; behaviour needs the emulator |
    | 0.8/A8 | **split, then audit** | five clauses in one line, one already closed as 0.12's third; the C ABI half overlaps the branch in 0.11 |
    | 0.11/A11 | **decide** | see item 0 above |
