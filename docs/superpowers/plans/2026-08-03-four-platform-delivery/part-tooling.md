@@ -130,15 +130,57 @@
   `TouchInputNormalizer` 2, one each in `LifecycleRequestState`,
   `LocationProvider$RetainedRequest`, `BluetoothManager$CharacteristicDispatch`.
 
-  The ones to read first, on this repository's own standard that a guard which cannot
-  fail is decoration: `PermissionOperationGate` and `PermissionRevocation` survive
-  having their return values inverted, so the suites exercise their state machines
-  without asserting what the caller acts on; `BluetoothManager.hasConnectPermission`
-  survives negation *and* a forced `true`, on the permission path; and
-  `NativeMethods.updatePermission` survives negation of its whole
-  `sessionId >= 0 && scope != null && !scope.isEmpty()` guard. `TouchEventHandler`'s 19
-  are the largest cluster and the input path is where task 0.31's compile errors landed,
-  so it is the natural first target.
+  **The survivors were then worked through, and the useful artifact is the triage rather
+  than the count.** Of the original 57, only about a third could ever be killed:
+
+  - **~12 are harness-bound.** The `BluetoothManager` family and `LocationProvider`
+    reach `Activity`, `BluetoothAdapter` and `Build.VERSION.SDK_INT`, and the stub
+    `android.jar` reports `SDK_INT == 0`. Below API 31 the connect policy ignores the
+    grant entirely, so *no* mutation of `hasConnectPermission`'s grant computation is
+    observable here. The policy itself is a pure function and is fully tested; only the
+    wiring is invisible. Adding a production seam to kill such a mutant is the
+    anti-pattern this ledger already rejected once, so these stay recorded rather than
+    chased.
+  - **7 are equivalent mutants -- unkillable by construction.**
+    `BooleanFalseReturnValsMutator` applied to a line that already reads `return false`
+    produces identical bytecode, and pitest does not filter these. Five sit on
+    `PermissionOperationGate`'s guard clauses (`return null`, `return false`,
+    `return true`) and two on `TouchInputNormalizer`'s clamp, where `>` against `>=` at
+    exactly `0.0f` and `<` against `<=` at exactly `1.0f` both yield the same value. A
+    test written to kill one of these would be a test that cannot fail.
+  - **The rest were real, and are now killed.** What they had in common is worth more
+    than the list: every one was a *verdict a caller acts on* that the suite never
+    asserted, because it asserted side effects instead. The gates drove their state
+    machines thoroughly and then looked at what changed rather than at what was
+    returned — and the caller does not see the side effect, it sees the boolean, which
+    `NativeExports` hands straight to a JNI return.
+
+  Killed in this round: `PermissionOperationGate.enter` and `runIfGranted` (admitted and
+  refused now report opposite verdicts, and `runIfGranted` forwards the callback's own
+  verdict); `PermissionRevocation.update` (both polarities, and a refusal reaches nothing);
+  `NativeMethods.updatePermission` (one guard clause at a time, plus session id 0, which
+  is the only case telling `>= 0` from `> 0`); `TouchEventHandler` in full — the packed
+  flags against the Web Touch Events contract, the y coordinate that had no assertion at
+  all, the pack loop's bound, and `updateDensity`'s fail-closed validation, which is the
+  Java-side twin of the host pixel-ratio property in item 0.12;
+  `NativeExports$SessionPermissionSink` (a successful grant settles quietly, and the
+  suppressed "failed to schedule terminal close" appears exactly when the close could not
+  be posted); `TerminalCloseQueue` to 100%; `LifecycleStateSynchronizer` (its interleaving
+  test had a second writer, so deleting the application outright left the assertion true);
+  `VsyncSchedulerState`, `TerminalCleanupState.Result` and `LifecycleRequestState`
+  accessors, each of which had only ever been asserted in one state.
+
+  Measured: **57 survivors to 20, test strength 85.8% to 94.5%**, Java 143 tests per
+  flavour from 126. What remains is 12 harness-bound, 7 equivalent, and one marginal
+  (`LifecycleRequestState`'s no-op `Action.NONE` return) -- so everything killable in this
+  harness is killed. Two fixture faults were found on the way and are the transferable
+  part: an assertion that two writers can both satisfy attributes nothing, and a test that
+  only ever drives a failing dependency cannot tell "reports failure correctly" from
+  "always reports failure".
+
+  **The run is also now cheap enough to use per edit.** `-PpitestClasses` narrows it to
+  one class — twelve seconds against about eight minutes for the package — so the loop is
+  a focused run per change and one full run per batch.
 
 
 - [x] T.5 Split this file. At ~5,500 lines it burned context on every read and was
