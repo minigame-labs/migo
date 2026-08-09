@@ -316,6 +316,20 @@ the crate needing it cannot see. The reflex that dissolves most of them is askin
   this branch. One regeneration round covers the whole batch and belongs
   **last**: the fingerprint includes every `runtime-v8` `.rs` file and
   `engine/Cargo.lock`, so a `cargo fmt` or one added test invalidates it again.
+
+  **This branch raised the stakes rather than only the count.** Until now the
+  staleness was `.rs` churn, which the snapshot carries but does not change the
+  behaviour of. `delivery/x11-and-mutation-evidence` edits four files that are
+  *embedded into the snapshot as source* — `base/02_async.js`, `base/04_subpackage.js`,
+  `payment/01_payment.js`, `system/13_login.js` — and they carry the A9 correlation
+  fix. So **on a device, until `scripts/gen-snapshot.sh` runs, deferred results
+  still correlate the old way**, while every host suite reports the new behaviour
+  because it evaluates the JS from source. That gap is invisible to the gate by
+  construction; it is written here because nothing else can see it.
+
+  Regeneration is also **partly device-blocked**: x86_64 can be produced here, and
+  aarch64 needs the physical device. Do not regenerate a subset and call the batch
+  done.
 - **A recorded obstacle in this ledger has been wrong eight times.** When an
   item says something is impossible, verify it against the code before believing
   it. The question that has dissolved most of them is *"which layer can see this
