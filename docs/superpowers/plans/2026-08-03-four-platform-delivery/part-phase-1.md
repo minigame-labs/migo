@@ -752,6 +752,60 @@
   runtime symbols at component build boundaries.
 - [ ] 1.5 Make release metadata and archives deterministic under
   `SOURCE_DATE_EPOCH` on all four platforms.
+
+  **Metadata half done 2026-08-09. The archive half cannot be done yet, and that is
+  a finding rather than a delay: nothing in this repository creates a release
+  archive.** The four SDK scripts populate a prefix *directory*
+  (`$PREFIX/lib/cmake/migo/...`); the only archive that exists today is the AAR,
+  which Gradle builds. Item 1.11 is what produces packages, so archive determinism
+  is a property of code that is not written. `scripts/lib/reproducible-timestamp.sh`
+  exists so 1.11 has the stamp to use rather than inventing a third one.
+
+  **Three shipped or committed artifacts recorded when they were built.** One wall
+  clock anywhere in the set defeats 1.12 for the whole release:
+
+  * `build-aar.sh` wrote `"sourceDateEpoch": <the epoch>` and then
+    `"buildTime": "<local wall clock>"` **on the next line** — the input for
+    reproducibility recorded and unused for the one field that broke it. Local, not
+    UTC, so the same source differed between two timezones as well as between two
+    minutes. `build-aar.ps1:225` did the same on Windows.
+  * `generate-sbom.sh` stamped `metadata.timestamp`, and `release.yml:376` writes
+    that SBOM into the Android dist directory, so it is a release asset.
+  * `write-snapshot-manifest.sh` stamped `generated_at` into the manifests under
+    `engine/crates/runtime-v8/snapshots/`, which are **committed** — three of them
+    currently carry distinct 2026-08-06 wall clocks. Every regeneration diffs on the
+    timestamp alone, and a tracked file that cannot be reproduced from the sources
+    it describes is not a manifest of anything. Those values will settle the next
+    time the snapshots are regenerated; nothing here rewrites them, because the
+    aarch64 round needs a device.
+
+  All three take `SOURCE_DATE_EPOCH` when set and a wall clock when not, always
+  UTC, and refuse a malformed value rather than treating it as absent — a caller
+  that set it believes it is producing something reproducible.
+
+  **Verified by measurement, not assertion.** The SBOM is byte-identical across two
+  runs a second apart under a fixed epoch (`08c878bf…`) **and changes when the
+  epoch changes** (`ff41012d…`). The second half matters more than the first: bytes
+  that are merely stable prove the timestamp was removed, not that it tracks the
+  epoch. The bash helper was exercised on four inputs — absent, fixed, zero,
+  malformed. `build-aar.ps1` is inspection-only: there is no `pwsh` here, so it was
+  written to assume as little as possible — self-contained rather than reading an
+  outer-scope variable, and one expression per line, because PowerShell ends a
+  statement at a newline and leading-dot continuation is a C# habit that does not
+  parse.
+
+  `scripts/test-reproducible-timestamp-contract.sh` holds the rule: a script under
+  `scripts/` that reads a clock must name `SOURCE_DATE_EPOCH` or be listed as
+  producing something that does not ship. The list is per file with a reason each
+  rather than a directory exclusion, and a **stale exemption is an error** — one
+  that no longer applies grants more than it needs to. Both directions were proved
+  red: a reintroduced wall clock, and an exemption left behind after its clock was
+  removed. A stopwatch and a build stamp look identical to a regular expression, so
+  which is which has to be stated by a human.
+
+  **What remains for 1.5:** archive determinism (sorted entries, fixed mtime, no
+  gzip timestamp, fixed uid/gid) on all four platforms, which is 1.11's code, and
+  the Windows and HarmonyOS packaging paths cannot be run on a Linux workstation.
 - [ ] 1.6 Repair Android PowerShell packaging and reject release `--skip-rust`.
 - [ ] 1.7 Replace the Windows warm-target link flow with a clean Windows-native
   MSVC and ANGLE build graph.
