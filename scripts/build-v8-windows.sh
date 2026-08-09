@@ -190,10 +190,21 @@ EXPORTS_DEF="$PATCH_DIR/rusty_v8-windows-exports.def"
 # shellcheck source=scripts/lib/v8-patch-apply.sh
 source "$SCRIPT_DIR/lib/v8-patch-apply.sh"
 
+# The declared set comes from the lock, not from literals here. The lock already
+# carried `required_patches` and nothing read it, so it stated a requirement it did not
+# enforce while this script named its own three globs -- the same declared-in-two-places
+# shape task 1.1b removed from the Android build, and the reason a Windows V8 could have
+# been built with a patch set the lock did not describe. A command substitution, so a
+# parser that fails part-way cannot leave a truncated declaration behind.
+V8_DECLARED_OUTPUT="$(v8_read_declared_patches "$V8_BUILD_LOCK")" \
+    || { err "cannot read the declared patch set from $V8_BUILD_LOCK"; exit 1; }
+[[ -n "$V8_DECLARED_OUTPUT" ]] || { err "the V8 lock declares no patches"; exit 1; }
+mapfile -t V8_DECLARED_PATCHES <<<"$V8_DECLARED_OUTPUT"
+
 apply_windows_patches() {
     # 0007 spans five files, so applied-ness may not key off any single one.
     local glob
-    for glob in '0005-*.patch' '0006-*.patch' '0007-*.patch'; do
+    for glob in "${V8_DECLARED_PATCHES[@]}"; do
         v8_require_patch "$SRC_UNIX" "$PATCH_DIR" "$glob" || return 1
     done
 

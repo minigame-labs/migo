@@ -196,16 +196,49 @@
   now stale rather than wrong — nothing compares a manifest's patches against the
   lock at validation time, so they still validate. Regenerating them is blocked on
   1.1f, and doing so will change each `component_id`.
-- [ ] 1.1l Wire or delete `required_patches` in the Windows V8 lock.
-  `contracts/artifact-manifest/windows-v8.lock.json` declares three
-  `required_patches` and **nothing reads them**:
-  `scripts/write-windows-v8-component-manifest.py` never references the field, and
-  `scripts/build-v8-windows.sh` names its patches as its own literals. So the
-  Windows lock states a requirement it does not enforce, which is the same
-  declared-but-unenforced shape task 1.1b just removed from Android. Give it the
-  `id`/`file` shape, have the Windows build and writer read it, or delete the field
-  rather than leave it decorative. The Windows build is not runnable on this host, so
-  this needs a machine that can run it.
+- [x] 1.1l Wire or delete `required_patches` in the Windows V8 lock. **Wired
+  2026-08-09.** The lock declared three bare id strings that nothing read, while
+  `scripts/build-v8-windows.sh:196` named its own three globs — the same
+  declared-in-two-places shape task 1.1b removed from Android, in the other direction.
+  The lock now carries the `id`/`file`/`notes` entries, and the build reads it.
+
+  **The reader is shared rather than copied.** Android had the lock parser inline; a
+  second copy in the Windows script would be the drift this item exists to remove, so
+  it moved to `v8_read_declared_patches` in `scripts/lib/v8-patch-apply.sh`, which both
+  scripts already source. Verified against both locks: four entries for Android, three
+  for Windows, and `test-v8-patch-application-contract.sh` now counts 1 patch declared
+  as a script literal (OpenHarmony's) and **7 in locks**, with all 8 still resolving to
+  exactly one file each. The dual-source guard is what makes that safe: Windows'
+  literals leaving the scripts would otherwise have narrowed the check silently, which
+  is exactly how it once went from 8 to 4.
+
+  **Not done, and it needs a Windows run:** `write-windows-v8-component-manifest.py`
+  still records no patch provenance, so a Windows manifest does not attest which patches
+  produced it the way the Android one now does. The field is no longer decorative —
+  the build enforces it — but the manifest half is open and belongs with 1.1g/1.1j.
+
+  **Doing this exposed a real defect in the shared checkout, found by the contract test
+  going red mid-session while an OpenHarmony V8 build was running.** One vendored
+  `rusty_v8_src` serves all four platforms, and `0008-ohos-toolchain.patch` *creates*
+  `build/toolchain/ohos/BUILD.gn`, which the Android declaration does not touch — so
+  building OpenHarmony made the Android replay refuse a file that **is** explained by a
+  committed patch, just not by one that build applies. The two platforms were mutually
+  exclusive on one checkout, and the earlier note under 1.1i predicted this before it
+  happened.
+
+  `--accounted-patch <glob>` answers it inside the existing mechanism: the accounted
+  paths are **derived from the patch** rather than listed, so they cannot drift from
+  what it creates, and only paths a patch *creates* may be accounted for — accounting
+  for one a foreign patch merely *modifies* would skip content verification on a file
+  this platform's own patches may also touch, so it is refused. Three fixtures: the
+  foreign-created file is refused when not accounted for, accounted for when it is, and
+  a modify-only patch cannot grant an accounting at all (checked against an otherwise
+  exactly-patched tree, so the refusal can only come from that guard).
+
+  Second defect from the same red run, and simpler: `build-v8-ohos.sh` wrote its build
+  log **into** `$RUSTY_V8_SRC`, where it is an untracked file no patch explains, so it
+  broke every provenance gate over that tree. `build-v8-android.sh` already wrote its
+  log under `$TMPDIR`; the OpenHarmony script now does the same.
 - [x] 1.1c Pin and assert `gn`. The script resolved `gn` from `V8_GN_PATH`, then a
   prefetched path, then the system `PATH`, and merely **logged** the version it
   found — so a system `gn` of any revision was accepted and failed later somewhere

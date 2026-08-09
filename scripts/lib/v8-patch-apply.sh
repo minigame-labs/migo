@@ -173,6 +173,34 @@ _v8_changed_paths() {
     done
 }
 
+# The declared patch set, read from a build lock. One reader, because a second copy
+# of "where the declaration lives" is how the declaration and the thing that applies
+# it drift -- the defect task 1.1b removed for Android by collapsing three statements
+# into one, and which the Windows lock still had in the other direction: it declared
+# three `required_patches` that nothing read, while the build named its own literals.
+#
+# Prints one entry per line. A caller must use a command substitution rather than
+# `mapfile < <(...)`: a process substitution's exit status is not what `||` observes,
+# so a parser that printed a valid prefix and then rejected a malformed entry would
+# leave a truncated declaration behind and pass a non-empty check -- the build would
+# apply fewer patches than the lock requires and only discover it at manifest time.
+v8_read_declared_patches() {
+    local lock="$1"
+    [[ -f "$lock" ]] || { _v8_patch_err "missing V8 build lock: $lock"; return 1; }
+    python3 - "$lock" <<'PY'
+import json, sys
+
+lock = json.load(open(sys.argv[1]))
+required = lock.get("required_patches")
+if not isinstance(required, list) or not required:
+    sys.exit("V8 lock declares no required_patches")
+for entry in required:
+    if not isinstance(entry, dict) or "file" not in entry:
+        sys.exit(f"required_patches entry carries no file: {entry!r}")
+    print(entry["file"])
+PY
+}
+
 # Proves that a checkout is its committed HEAD plus exactly the declared patches,
 # and nothing else.
 #
@@ -195,13 +223,43 @@ _v8_changed_paths() {
 # Exemptions are arguments rather than a variable the library reads, so an exported
 # value in a release environment cannot grant one: a caller that needs an exemption
 # has to say so at the call site.
+#
+# `--accounted-patch <glob>` is for the one case a single checkout forces: the
+# vendored tree is shared by every platform's V8 build, and OpenHarmony's
+# `0008-ohos-toolchain.patch` *creates* `build/toolchain/ohos/BUILD.gn`, which the
+# Android declaration does not touch. Without this, building OpenHarmony makes the
+# Android build refuse a file that is explained by a committed patch, just not by one
+# this build applies -- so the two platforms became mutually exclusive on one
+# checkout. The paths are derived from the patch rather than listed, so they cannot
+# drift from it, and **only paths the patch creates may be accounted for**: accounting
+# for a path a foreign patch *modifies* would skip content verification on a file this
+# platform also cares about, so that is refused rather than trusted.
 v8_assert_tree_is_exactly_patched() {
     local tree="$1" dir="$2"
     shift 2
     local -A accounted=()
-    while [[ "${1:-}" == "--accounted" ]]; do
-        [[ -n "${2:-}" ]] || { _v8_patch_err "--accounted needs a path"; return 1; }
-        accounted["$2"]=1
+    while [[ "${1:-}" == "--accounted" || "${1:-}" == "--accounted-patch" ]]; do
+        [[ -n "${2:-}" ]] || { _v8_patch_err "$1 needs a value"; return 1; }
+        if [[ "$1" == "--accounted" ]]; then
+            accounted["$2"]=1
+        else
+            local foreign target
+            foreign="$(v8_resolve_patch "$dir" "$2")" || return 1
+            local -a created=()
+            while IFS= read -r target; do
+                [[ -n "$target" ]] && created+=("$target")
+            done < <(awk '
+                /^--- / { from = $2 }
+                /^\+\+\+ / { if (from == "/dev/null") { sub("^b/", "", $2); print $2 } }
+            ' "$foreign")
+            if (( ${#created[@]} == 0 )); then
+                _v8_patch_err "$(basename "$foreign") creates no file, so it cannot account for one"
+                return 1
+            fi
+            for target in "${created[@]}"; do
+                accounted["$target"]=1
+            done
+        fi
         shift 2
     done
     local -a globs=("$@")

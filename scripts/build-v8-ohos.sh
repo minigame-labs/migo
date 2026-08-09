@@ -207,7 +207,11 @@ export GN_ARGS
     export GN="$RUSTY_V8_SRC/third_party/v8_correct_gn/gn"
 command -v ninja >/dev/null 2>&1 && export NINJA="$(command -v ninja)"
 
-BUILD_LOG="$RUSTY_V8_SRC/.migo_ohos_build_$ARCH.log"
+# Outside the vendored checkout, the way build-v8-android.sh already does it. A log
+# written into $RUSTY_V8_SRC is an untracked file no committed patch explains, so it
+# makes every provenance gate over that tree -- including the Android build's own --
+# refuse it, and the tree is shared by all four platforms.
+BUILD_LOG="${TMPDIR:-/tmp}/migo-v8-ohos-build-${ARCH}.$$.log"
 info "building (log: $BUILD_LOG)"
 info "GN_ARGS = $GN_ARGS"
 if ! (cd "$RUSTY_V8_SRC" && cargo build --release --target "$RUST_TRIPLE" > "$BUILD_LOG" 2>&1); then

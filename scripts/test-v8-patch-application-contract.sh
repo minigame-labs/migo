@@ -360,6 +360,31 @@ EOP
     tcheck "the exemption does not persist once it is not passed" fail
     rm -f "$super/tool-binary"
 
+    # A file another platform's committed patch *creates*. One checkout serves every
+    # platform's V8 build, so this is the shape that made two of them mutually
+    # exclusive: the file is explained by a committed patch, just not by one this
+    # declaration applies.
+    cat > "$w/patches/t-foreign-create.diff" <<'EOP'
+--- /dev/null
++++ b/foreign/toolchain.gn
+@@ -0,0 +1 @@
++foreign
+EOP
+    mkdir -p "$super/foreign"
+    printf 'foreign\n' > "$super/foreign/toolchain.gn"
+    tcheck "a file only a foreign patch creates is refused when not accounted for" fail
+    exempt=(--accounted-patch 't-foreign-create.diff')
+    tcheck "a foreign patch accounts for the path it creates" pass
+    rm -rf "$super/foreign"
+
+    # Accounting is derived from what the patch creates, so a patch that only modifies
+    # cannot grant one: doing so would skip content verification on a file this
+    # platform's own patches may also touch. With the tree otherwise exactly patched,
+    # a refusal here can only come from that guard.
+    exempt=(--accounted-patch 't-top.diff')
+    tcheck "a foreign patch that creates nothing cannot account for a path" fail
+    exempt=()
+
     # A submodule moved off the commit its parent records. The declared patch still
     # applies to inner.txt there, so descending would take that foreign HEAD as the
     # pristine baseline and report the tree clean -- certifying an artifact built
@@ -464,9 +489,12 @@ import json, sys
 for e in json.load(open(sys.argv[1]))['required_patches']:
     print(e['file'])
 " "$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json")
+    # `--accounted-patch` before `--accounted` in the alternation: the shorter one is
+    # a prefix of the longer, so the other order silently turns a patch glob into a
+    # literal path and the accounting stops applying.
     mapfile -t accounted_args < <(
         sed -n '/^V8_ACCOUNTED_ARGS=(/,/^)/p' "$SCRIPT_DIR/build-v8-android.sh" \
-        | grep -oE -- "--accounted|'[^']*'" | tr -d "'")
+        | grep -oE -- "--accounted-patch|--accounted|'[^']*'" | tr -d "'")
     if (( ${#declared[@]} == 0 )); then
         fail "cannot read V8_DECLARED_PATCHES out of build-v8-android.sh"
     else

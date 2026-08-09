@@ -116,20 +116,8 @@ source "$SCRIPT_DIR/lib/v8-patch-apply.sh"
 # failed on a malformed entry would leave a truncated declaration behind and pass
 # the non-empty guard. This build would then apply fewer patches than the lock
 # requires and only find out at manifest time, after producing artifacts.
-V8_DECLARED_OUTPUT="$(
-    python3 - "$V8_BUILD_LOCK" <<'PY'
-import json, sys
-
-lock = json.load(open(sys.argv[1]))
-required = lock.get("required_patches")
-if not isinstance(required, list) or not required:
-    sys.exit("V8 lock declares no required_patches")
-for entry in required:
-    if not isinstance(entry, dict) or "file" not in entry:
-        sys.exit(f"required_patches entry carries no file: {entry!r}")
-    print(entry["file"])
-PY
-)" || { err "cannot read the declared patch set from $V8_BUILD_LOCK"; exit 1; }
+V8_DECLARED_OUTPUT="$(v8_read_declared_patches "$V8_BUILD_LOCK")" \
+    || { err "cannot read the declared patch set from $V8_BUILD_LOCK"; exit 1; }
 [[ -n "$V8_DECLARED_OUTPUT" ]] || { err "the V8 lock declares no patches"; exit 1; }
 mapfile -t V8_DECLARED_PATCHES <<<"$V8_DECLARED_OUTPUT"
 
@@ -142,6 +130,12 @@ mapfile -t V8_DECLARED_PATCHES <<<"$V8_DECLARED_OUTPUT"
 V8_ACCOUNTED_ARGS=(
     --accounted 'third_party/v8_correct_gn/gn'
     --accounted 'third_party/v8_correct_gn/gn-receipt.json'
+    # One checkout serves every platform's V8 build, and the OpenHarmony one creates
+    # a GN toolchain file this declaration does not touch. Accounted from the patch
+    # itself rather than by naming the path, so it cannot drift from what that patch
+    # creates; the library refuses to account for a path a foreign patch merely
+    # modifies, which is the case that would skip real verification.
+    --accounted-patch '0008-ohos-toolchain.patch'
 )
 
 apply_patches() {

@@ -13,9 +13,21 @@
   },
   "notes": "V8 is built as a shared library (rusty_v8.dll + import lib) WITH its own bundled libc++ -- use_custom_libcxx stays on. An earlier plan set it false so V8 and Skia would share the MSVC STL, and this lock recorded that; it was measured infeasible on 2026-07-24 (clang-cl crashes on 32 torque-generated translation units, preceded by 78 -Wctad-maybe-unsupported errors, because Chromium compiles them with -D_HAS_EXCEPTIONS=0 and /std:c++23preview, which Microsoft's STL does not support). The Skia/V8 std::terminate collision is instead answered by the shared-library form keeping V8's libc++ internal. Note use_custom_libcxx is a cargo feature, not a GN argument: build.rs derives the GN value from CARGO_FEATURE_USE_CUSTOM_LIBCXX and overrides EXTRA_GN_ARGS, so it is recorded under cargo_features. component_kind, gn_args and cargo_features are Windows-specific extensions to the migo-v8-build-lock/v1 shape used by android-v8.lock.json.",
   "required_patches": [
-    "0005-windows-host-callback-registration",
-    "0006-windows-rusty-v8-shared-library",
-    "0007-windows-register-host-callbacks-from-rust"
+    {
+      "file": "0005-*.patch",
+      "id": "0005-windows-host-callback-registration",
+      "notes": "Adds the host-callback registration surface rusty_v8 does not expose; the Windows DLL boundary needs it because the callbacks are registered from Rust rather than linked in."
+    },
+    {
+      "file": "0006-*.patch",
+      "id": "0006-windows-rusty-v8-shared-library",
+      "notes": "Builds rusty_v8 as a shared library so V8 keeps its own bundled libc++ internal, which is what answers the Skia/V8 std::terminate collision recorded in this lock's notes."
+    },
+    {
+      "file": "0007-*.patch",
+      "id": "0007-windows-register-host-callbacks-from-rust",
+      "notes": "Registers the host callbacks from Rust. Spans five files, which is why applied-ness cannot key off any single one -- see scripts/lib/v8-patch-apply.sh."
+    }
   ],
   "rusty_v8_revision": "0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
   "rusty_v8_version": "145.0.0",
