@@ -118,6 +118,15 @@ jobs:
           python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
           bash scripts/test-release-asset-ordering-contract.sh
 
+      # A release version is a fact about a set of bytes, and it was stated
+      # independently in four build systems. They drifted: the Android AAR said
+      # 0.9.0 while the Android C-API SDK beside it defaulted to 0.1.0, the Windows
+      # SDK hardcoded 0.1.1 and discarded the version it had read, and HarmonyOS
+      # fell back to 0.1.0 in silence. A package labelled with a version nobody
+      # chose is not recallable.
+      - name: Release version contract
+        run: bash scripts/test-release-version-contract.sh
+
       # Source-only, so it belongs here rather than in the device lane -- which
       # is the point: the failure it catches (content calling a capability on
       # the wx namespace, which does not carry it) presents on a device as a

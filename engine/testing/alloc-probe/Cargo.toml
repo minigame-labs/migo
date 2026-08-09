@@ -1,6 +1,6 @@
 [package]
 name = "migo-alloc-probe"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 publish = false
 description = "Counting allocator and burst assertion for the steady-state allocation gate. Test-only."

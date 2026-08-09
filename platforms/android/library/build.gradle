@@ -76,6 +76,20 @@ if (!sourceDateEpoch.isEmpty()) {
     }
 }
 
+// The repository's single release-version source. `rootProject.rootDir` is
+// `platforms/android`, so the file sits two levels up.
+def migoReleaseVersion() {
+    def source = new File(rootProject.rootDir, "../../release/VERSION")
+    if (!source.isFile()) {
+        throw new GradleException("release version source missing: ${source.canonicalPath}")
+    }
+    def version = source.text.trim()
+    if (version.isEmpty()) {
+        throw new GradleException("release version source is empty: ${source.canonicalPath}")
+    }
+    return version
+}
+
 android {
     namespace 'com.migo.runtime'
     compileSdk 34
@@ -92,7 +106,12 @@ android {
         minSdk 26
         targetSdk 34
         versionCode 1
-        versionName "0.9.0"
+        // Read from the repository's single release-version source rather than
+        // restated here. This value reaches an embedder through BuildInfo.VERSION,
+        // and the AAR and the Android C-API SDK are built by different scripts --
+        // which is how the two came to disagree, the AAR reporting one version
+        // while the SDK metadata reported another.
+        versionName migoReleaseVersion()
 
         consumerProguardFiles "consumer-rules-common.pro"
 

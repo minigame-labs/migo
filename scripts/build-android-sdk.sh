@@ -16,7 +16,8 @@ ENGINE_DIR="$REPO_ROOT/engine"
 
 ARCH="aarch64"
 PREFIX=""
-VERSION="0.1.0"
+# Filled from the release-version source below unless `--version` overrides it.
+VERSION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
@@ -25,6 +26,17 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# The repository's single release-version source, unless the caller named one.
+# No fallback default: a package labelled with a version nobody chose is worse
+# than a build that refuses, and this script's default was `0.1.0` while the AAR
+# built beside it reported something else entirely.
+if [[ -z "$VERSION" ]]; then
+    SOURCE="$REPO_ROOT/release/VERSION"
+    [[ -f "$SOURCE" ]] || { echo "[android-sdk] release version source missing: $SOURCE" >&2; exit 1; }
+    VERSION="$(tr -d '[:space:]' < "$SOURCE")"
+    [[ -n "$VERSION" ]] || { echo "[android-sdk] release version source is empty: $SOURCE" >&2; exit 1; }
+fi
 
 case "$ARCH" in
     aarch64) TARGET="aarch64-linux-android"; ABI="arm64-v8a" ;;

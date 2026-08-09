@@ -129,7 +129,20 @@ cargo rustc --manifest-path "$ENGINE_DIR/Cargo.toml" \
 grep -q 'native-static-libs:' "$LINK_NOTE" \
     || { echo "[linux-sdk] cargo did not report native-static-libs" >&2; exit 1; }
 
-VERSION="$(grep -m1 '^version' "$ENGINE_DIR/crates/capi/Cargo.toml" | cut -d'"' -f2)"
+# The repository's single release-version source. Read rather than derived from a
+# crate manifest, and with no fallback: a default here ships a package labelled
+# with a version nobody chose, which is how the Linux and HarmonyOS SDKs could
+# have been built as `0.1.0` from a tree that was not.
+read_release_version() {
+    local source="$1/release/VERSION"
+    [[ -f "$source" ]] || { echo "[sdk] release version source missing: $source" >&2; exit 1; }
+    local version
+    version="$(tr -d '[:space:]' < "$source")"
+    [[ -n "$version" ]] || { echo "[sdk] release version source is empty: $source" >&2; exit 1; }
+    printf '%s' "$version"
+}
+
+VERSION="$(read_release_version "$REPO_ROOT")"
 
 # ------------------------------------------------------------
 # libmigo.so
