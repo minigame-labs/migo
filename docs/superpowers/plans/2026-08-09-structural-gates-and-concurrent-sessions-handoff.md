@@ -8,7 +8,7 @@ lists the git-ignored prerequisites — Android V8 archives via
 in every shell. Without them every host suite fails for a reason unrelated to your
 change. Nothing there has changed.
 
-**Branch:** `gate/runtime-generation-fence`, thirteen commits on top of `origin/master`
+**Branch:** `gate/runtime-generation-fence`, fifteen commits on top of `origin/master`
 (`3196c3a`), **unpushed**. Verify before believing: `git log --oneline 3196c3a..HEAD`.
 
 **The main line is Phase 1, four-platform delivery**, not further Phase 0 polish. Item
@@ -154,6 +154,28 @@ than inventing a third.
 When measuring a determinism fix, assert **both** halves: identical bytes across two
 runs under a fixed epoch, *and* different bytes under a different epoch. The first
 alone is satisfied by deleting the timestamp entirely.
+
+**Item 1.6's `--skip-rust` half is done.** A release AAR is now refused if its native
+libraries were not built by that invocation: `--skip-rust` packaged whatever `.so`
+was on disk and `validate_native_libraries` only checks existence, so a release
+could ship natives from another commit with nothing recording it. The refusal is at
+argument time, which is also what protects `release.yml` without a separate gate --
+the workflow never passed `--skip-rust` and now it cannot start to.
+`--unverified-native-libs` exists because the worker-snapshot `jniLibs` check is
+reachable only through a release build; refusing that path outright would have
+deleted its only test. The PowerShell half of 1.6 (Android packaging on Windows) is
+untouched and unrunnable here.
+
+**A red test on `origin/master`, found while verifying the above and worth picking
+up.** `scripts/test-r9-worker-snapshot.sh` fails at `origin/master`: its hermetic
+fixture copies `scripts/build-aar.sh` but never `scripts/lib/`, so under
+`set -euo pipefail` the fixture build dies at its first `source` and the assertion
+fails on a missing file rather than on the property it names. Copying the library in
+(done) moves the failure one layer deeper, and that layer is the real finding: the
+worker-snapshot build then **reaches Gradle instead of refusing**, i.e. it borrows
+the baseline `full` `jniLibs` rather than requiring `full-worker-snapshot` — exactly
+what that case was written to forbid. Diagnosing `EXTERNAL_JNI_LIBS`/`ARTIFACT_SUFFIX`
+resolution under `--worker-snapshot` is the next step and was out of budget here.
 
 What remains in Phase 1, with what this machine can and cannot do:
 
