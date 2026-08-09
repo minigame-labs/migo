@@ -869,6 +869,60 @@
 - [ ] 1.4 Remove every `--allow-multiple-definition`, including both HarmonyOS
   target entries in `engine/.cargo/config.toml`, and resolve duplicate C++
   runtime symbols at component build boundaries.
+
+  **Both HarmonyOS entries are gone, and the Android duplicate is now measured rather
+  than described — 2026-08-10.** Five occurrences remain three: `engine/.cargo/config.toml`
+  ×3 (Android), `scripts/build-android-so.sh`, `scripts/build-android-so.ps1`,
+  `scripts/gen-snapshot.sh`, and `platforms/openharmony/.../CMakeLists.txt`.
+
+  **What the linker actually says.** Removing the flag from the Android build fails with
+  **exactly six** duplicate symbols, every one of them a function libc++ explicitly
+  instantiates in `stdexcept.cpp`: `std::runtime_error` and `std::logic_error`'s
+  `char const*` constructor, copy constructor and copy assignment. lld names both
+  providers, and they are not what the comments claimed:
+
+  | Provider | Origin |
+  |---|---|
+  | `stdexcept.o` in `libv8-*.rlib` | **Chromium's** libc++, carried inside V8 |
+  | `stdexcept.o` in `libc++_static.a` | the **NDK r23** sysroot's libc++ |
+
+  So "the linker picks the first definition, which is safe because both archives are built
+  against the same libc++ ABI" — the justification in `config.toml`,
+  `build-android-so.sh` and the OpenHarmony `CMakeLists.txt` — **was false**. They are two
+  different libc++ implementations. Taking the first definition is safe for a narrower
+  reason: no `std` exception object crosses the V8/Skia boundary, because each side throws
+  and catches internally and the surface between them is a C ABI. The comments now say
+  that instead, because the old wording made the flag look like a formality.
+
+  **Why the HarmonyOS entries could go, with evidence rather than a guess.** `migo-capi`
+  is a `staticlib` on those targets, so rustc never invokes a linker and the `link-arg`s
+  were inert; a cargo-driven link for the triple does not work at all today, failing on
+  `unable to find library -lstdc++`; and the shipped consumption path — an OpenHarmony
+  consumer linking the staged archive through CMake — is exercised by
+  `test-ohos-sdk-contract.sh`, which passes `-Wl,--gc-sections` and nothing else and
+  succeeds. The package was rebuilt and re-gated after removal: consumer link, musl loader,
+  entry-point count and API floor all still pass.
+
+  **What is left, and it is not a flag.** One provider of those six symbols, on Android.
+  Two candidates, both of which change shipped bytes and need runtime verification this
+  machine cannot do:
+
+  * Have skia-bindings link `c++_shared` rather than `-lc++_static`. The AAR already ships
+    `libc++_shared.so` and `engine/crates/audio/Cargo.toml` states one-STL-per-process as
+    the intent, so this is the arrangement the project already believes it has.
+  * Rebuild the Android V8 with `use_custom_libcxx=false`. That is what the Cargo comment
+    claims is already true and the build log contradicts — the `use_custom_libcxx` feature
+    is on. It also costs an 85-minute build per architecture and invalidates both verified
+    archive hashes and their component manifests, and OpenHarmony cannot follow, because
+    its SDK's libc++ 15 is too old for V8 145 (see `build-v8-ohos.sh`'s recorded attempts).
+
+  Getting either wrong is a mismatched-STL crash at runtime, so neither is a change to
+  make without an emulator or a device to run afterwards.
+
+  **`platforms/openharmony/.../CMakeLists.txt` is not touched yet**, and deliberately: it
+  links `migohost` as a **shared** library, which is a different link from the static
+  consumer the contract exercises, and building it needs DevEco on the Windows side. The
+  contract's success is evidence about the archive, not about that module.
 - [ ] 1.5 Make release metadata and archives deterministic under
   `SOURCE_DATE_EPOCH` on all four platforms.
 
