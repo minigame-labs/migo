@@ -119,18 +119,25 @@ public final class LocationProviderRetainedRequestTest {
         callback.start();
         assertTrue(listenerRemovalStarted.await(1, TimeUnit.SECONDS));
 
-        CountDownLatch revokeAttempting = new CountDownLatch(1);
         RuntimeException[] cancelFailure = {null};
         Thread revoke = new Thread(() -> {
-            revokeAttempting.countDown();
             try {
                 request.cancel("revoke fallback");
             } catch (RuntimeException failure) {
                 cancelFailure[0] = failure;
             }
         });
+        revoke.setDaemon(true);
         revoke.start();
-        assertTrue(revokeAttempting.await(1, TimeUnit.SECONDS));
+        // Parked inside the in-flight cleanup, not merely started. A latch this
+        // thread counts down before calling `cancel` proves only that it was
+        // scheduled once: the release below could then land before it reaches the
+        // monitor, the callback would win, and the assertion at the bottom would
+        // fail for a reason that has nothing to do with the property. That is a
+        // race in the test, and it is what turned this red on CI while passing
+        // every local run. The two sibling interleaving cases here already wait
+        // for the same state; this one did not.
+        awaitParkedOnInFlightCleanup(revoke);
 
         releaseListenerRemoval.countDown();
         callback.join();
