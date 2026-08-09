@@ -1005,9 +1005,65 @@
 - [ ] 1.7 Replace the Windows warm-target link flow with a clean Windows-native
   MSVC and ANGLE build graph.
 - [ ] 1.8 Implement HarmonyOS audio playback through OHAudio.
-- [ ] 1.9 Add the HarmonyOS V8 component manifest binding the shipped archive to
-  a source revision and GN argument set. The current HarmonyOS package manifest
-  records this absence as a known gap.
+- [x] 1.9 Add the HarmonyOS V8 component manifest binding the shipped archive to
+  a source revision and GN argument set.
+
+  **Done 2026-08-10** for `x86_64`, the architecture whose archive exists. The gap
+  `scripts/build-ohos-sdk.sh` recorded in its own package manifest — "no component
+  manifest binds this archive's embedded V8 to a source revision and GN argument set" —
+  is removed, because it is no longer true.
+
+  Four pieces, each mirroring what Android and Linux already do rather than inventing a
+  fourth arrangement: `contracts/artifact-manifest/ohos-v8.lock.json` (the single
+  declaration of revisions, patch set, SDK pin and per-arch target shapes), a
+  `("linux", "ohos")` arm in the Rust validator, `write-ohos-v8-component-manifest.py`,
+  and a seal step in `build-v8-ohos.sh`. Sealed and verified:
+  `component_id` `78fa8c66…`, and `migo-artifact-manifest verify-v8-component` passes
+  against the real 172,812,984-byte archive and its binding.
+
+  **`linux`/`ohos`, not `os = "ohos"`.** That is the pair the compiler reports
+  (`target_os = "linux"`, `target_env = "ohos"`) and the pair `capi/src/platform/mod.rs`
+  selects on, so a third spelling would be a fact about nothing. The floor is
+  `ohos_api = 18`: what V8 was *compiled against*, i.e. the SDK's own sysroot, not the
+  higher product floor `build-ohos-sdk.sh` declares to consumers — those are different
+  claims and both are now recorded where they belong.
+
+  **The writer reproduced two of 1.1f's defects before they were fixed, which is why
+  that entry's lessons were worth reading first.** `rustc --version` run from the
+  repository root reported **1.93.0** while the vendored checkout pins **1.89.0** —
+  recording a compiler that had built nothing in it — so it is now resolved with the
+  working directory inside that checkout. And `clang --version` embeds its
+  `InstalledDir`, which for this platform is Chromium's clang *inside* the vendored
+  tree, so the manifest carried an absolute machine path; it is normalised to
+  `${RUSTY_V8_SRC}`, as the GN args already were to `${OHOS_NDK_HOME}`. Verified by
+  sealing twice: byte-identical.
+
+  **The archive now verifies through the same path as every other target.**
+  `bash scripts/fetch-v8-archives.sh --check --all` reports four archives verified
+  including `x86_64-linux-ohos`, so the fetcher's own rule — "a target with no committed
+  manifest cannot be fetched, by design" — is satisfied rather than worked around.
+  `aarch64-linux-ohos` is deliberately still absent: no archive, so nothing to verify
+  against.
+
+  **It also runs the replay proof, which no OpenHarmony build had ever done**, so a
+  stray edit in the shared checkout could previously have reached this archive
+  unrecorded. Android's declared patches are accounted for by path here — the mirror
+  image of `--accounted-patch` on that side — because one checkout serves both and each
+  platform's patches touch files the other does not declare.
+
+  **A drift found on the way, and the reason it went unnoticed for so long:** the
+  committed JSON schemas are enforced by nothing. `v8-component-schema-v1.json` listed
+  Android and Linux under `target` while the Rust validator had been accepting Windows,
+  so a Windows manifest was valid to the tool and invalid to the document describing it.
+  Both are now listed, and `test-artifact-manifest-contract.sh` equates the schema's
+  target set with the validator's arms — checked load-bearing by deleting the
+  OpenHarmony entry, which fails naming `validator-only targets: [('linux', 'ohos')]`.
+  All four committed manifests were also validated against the schema with `jsonschema`
+  as one-off evidence; that is deliberately not a permanent gate, since the drift to
+  prevent is between the two statements rather than inside either one.
+
+  **Still open here:** `aarch64` needs its own archive (and a Skia) before it can be
+  sealed, and the Windows writer still records no patch provenance — see 1.1l.
 - [ ] 1.10 Prove the HarmonyOS API floor with the two-sysroot symbol audit
   (`MIGO_OHOS_FLOOR_SYSROOT` at the floor plus `MIGO_OHOS_NEWER_SYSROOT`), set
   `compatibleSdkVersion` to the proven floor, and record any symbol that forces

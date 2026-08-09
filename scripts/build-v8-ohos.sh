@@ -267,3 +267,26 @@ fi
 ok "no PartitionAlloc hijack symbols"
 
 ok "installed $OUT_DIR/librusty_v8.a ($(du -h "$OUT_DIR/librusty_v8.a" | cut -f1))"
+
+# ---- seal ------------------------------------------------------------------
+# Binds these bytes to a source revision, a GN argument set and an SDK identity.
+# Until this existed, `scripts/build-ohos-sdk.sh` recorded the absence as a known gap
+# in its own package manifest: the archive shipped with nothing saying which V8 it is.
+# The writer also runs the shared replay proof over the vendored checkout, which no
+# OpenHarmony build had ever done, so a stray edit there could reach this archive
+# unrecorded.
+V8_COMPONENT_WRITER="$SCRIPT_DIR/write-ohos-v8-component-manifest.py"
+python3 "$V8_COMPONENT_WRITER" \
+    --repo-root "$PROJECT_ROOT" \
+    --rusty-v8-src "$RUSTY_V8_SRC" \
+    --sdk-home "$OHOS_NDK_HOME" \
+    --arch "$ARCH" \
+    --gn-args "$GN_ARGS" \
+    --archive "$OUT_DIR/librusty_v8.a" \
+    --binding "$OUT_DIR/src_binding.rs" \
+    --compiler "$WRAP_DIR/$RUST_TRIPLE-clang++" \
+    --linker "$CHROMIUM_CLANG_BIN/ld.lld" \
+    --accounted 'third_party/v8_correct_gn/gn' \
+    --accounted 'third_party/v8_correct_gn/gn-receipt.json' \
+    --output "$OUT_DIR/component-manifest.json"
+ok "component manifest -> $OUT_DIR/component-manifest.json"

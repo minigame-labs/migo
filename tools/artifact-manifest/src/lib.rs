@@ -1636,11 +1636,63 @@ fn validate_v8_component_target(target: &TargetIdentity) -> Result<(), ManifestE
     match (target.os.as_str(), target.abi.as_str()) {
         ("android", "android") => validate_android_target(target),
         ("linux", "gnu") => validate_linux_v8_target(target),
+        ("linux", "ohos") => validate_ohos_v8_target(target),
         ("windows", "msvc") => validate_windows_v8_target(target),
         (os, abi) => Err(ManifestError::new(format!(
             "unsupported V8 component target OS/ABI: {os}/{abi}"
         ))),
     }
+}
+
+/// OpenHarmony, whose `os`/`abi` pair is `linux`/`ohos` because that is what the
+/// compiler says: Rust reports `target_os = "linux"` with `target_env = "ohos"`, and the
+/// engine's own conditional code selects on exactly that pair. Recording `os = "ohos"`
+/// would be a third spelling of the platform that nothing else in the tree uses.
+///
+/// The floor is an API level, as on Android, and it is what V8 was *compiled against* --
+/// the SDK's own sysroot -- not the higher product floor a package declares. musl rather
+/// than glibc is the reason an OpenHarmony archive is not interchangeable with a Linux
+/// GNU one even at the same triple prefix, so the two validators stay separate.
+fn validate_ohos_v8_target(target: &TargetIdentity) -> Result<(), ManifestError> {
+    let (expected_baseline, expected_features): (&str, &[&str]) = match target.arch.as_str() {
+        "x86_64" => ("x86-64-v1", &["cmov", "sse2"]),
+        "aarch64" => ("armv8-a", &["neon"]),
+        arch => {
+            return Err(ManifestError::new(format!(
+                "unsupported OpenHarmony V8 target arch: {arch}"
+            )))
+        }
+    };
+    require_equal(
+        "target.triple",
+        &target.triple,
+        &format!("{}-unknown-linux-ohos", target.arch),
+    )?;
+    require_equal("target.os", &target.os, "linux")?;
+    require_equal("target.abi", &target.abi, "ohos")?;
+    require_equal("target.cpu_baseline", &target.cpu_baseline, expected_baseline)?;
+    require_sorted_unique(
+        "target.required_cpu_features",
+        &target.required_cpu_features,
+    )?;
+    if target.required_cpu_features != expected_features {
+        return Err(ManifestError::new(format!(
+            "target.required_cpu_features for OpenHarmony {} must be {expected_features:?}",
+            target.arch
+        )));
+    }
+    if target.runtime_floor.len() != 1 || !target.runtime_floor.contains_key("ohos_api") {
+        return Err(ManifestError::new(
+            "OpenHarmony V8 target.runtime_floor must be exactly one ohos_api entry",
+        ));
+    }
+    let api = &target.runtime_floor["ohos_api"];
+    if api.is_empty() || !api.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ManifestError::new(format!(
+            "OpenHarmony V8 target.runtime_floor.ohos_api must be a decimal API level, got {api:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_linux_v8_target(target: &TargetIdentity) -> Result<(), ManifestError> {

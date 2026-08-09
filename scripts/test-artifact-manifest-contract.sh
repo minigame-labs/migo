@@ -445,4 +445,45 @@ grep -F "test-android-release-manifest-gate.sh" "$ROOT/.github/workflows/pr-ci.y
 grep -F "test-android-release-manifest-gate.sh" "$ROOT/.github/workflows/release.yml" >/dev/null || \
   fail "Android release CI does not exercise the Gradle release gate graph"
 
+# The committed JSON schema and the Rust validator are two statements of "which V8
+# component targets exist", and the unenforced one had already drifted: the schema's
+# target `oneOf` named Android and Linux while the validator had been accepting Windows,
+# so a Windows manifest was valid to the tool and invalid to the document meant to
+# describe it. Adding OpenHarmony is what surfaced that. Equated here rather than checked
+# with a JSON-schema library, because the drift is *between the two statements* and this
+# needs no dependency the CI image does not already have.
+python3 - "$ROOT" <<'PY' || fail "the component schema and the Rust validator disagree on which targets exist"
+import json, pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+contracts = root / "contracts/artifact-manifest"
+component = json.loads((contracts / "v8-component-schema-v1.json").read_text())
+defs = json.loads((contracts / "schema-v1.json").read_text())["$defs"]
+
+refs = [entry["$ref"].rsplit("/", 1)[-1] for entry in component["properties"]["target"]["oneOf"]]
+if not refs:
+    sys.exit("the component schema's target oneOf is empty")
+schema_pairs = set()
+for ref in refs:
+    definition = defs[ref]
+    for variant in definition.get("oneOf", [definition]):
+        properties = variant["properties"]
+        schema_pairs.add((properties["os"]["const"], properties["abi"]["const"]))
+
+source = (root / "tools/artifact-manifest/src/lib.rs").read_text()
+body = re.search(r"fn validate_v8_component_target.*?\n}\n", source, re.DOTALL)
+if body is None:
+    sys.exit("cannot find validate_v8_component_target in lib.rs")
+rust_pairs = set(re.findall(r'\("([a-z0-9_]+)", "([a-z0-9_]+)"\) =>', body.group(0)))
+if not rust_pairs:
+    sys.exit("extracted no target arms from validate_v8_component_target")
+
+if schema_pairs != rust_pairs:
+    sys.exit(
+        f"schema-only targets: {sorted(schema_pairs - rust_pairs)}; "
+        f"validator-only targets: {sorted(rust_pairs - schema_pairs)}"
+    )
+print(f"component schema and validator agree on {len(rust_pairs)} target(s)")
+PY
+
 echo "artifact manifest contract: ok"
