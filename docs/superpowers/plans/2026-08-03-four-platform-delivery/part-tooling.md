@@ -520,3 +520,18 @@
   reported `NOT PROVEN` an hour earlier. `scripts/test-local-verification-contract.sh`
   was also run directly — it is `CI ONLY` from inside the verifier because it would
   nest, and this item changes the verifier — and reports all checks passed.
+
+  **Correction, 2026-08-09: "the prebuilt V8 archive for the triple is in tree" is not
+  true of this workstation, so neither the `PASS` nor "13 seconds warm" reproduces
+  here.** `engine/third_party/rusty_v8/x86_64-linux-ohos/` holds only `src_binding.rs`.
+  The archive is gitignored, so being "in tree" is a fact about whichever machine built
+  it rather than about the repository, and on a fresh checkout this lane costs the hours
+  `scripts/build-v8-ohos.sh` takes before it costs thirteen seconds.
+
+  The lane's own reporting was checked before being blamed, and it is honest: the
+  planner emits `TARGET ohos compile` from the *changed sources'* cfg conditions
+  (`verification_targets.py:516`), and the archive/SDK probe runs at execution time
+  (`verify-change.sh:546`), so an unavailable toolchain records `NOT PROVEN` rather than
+  passing or failing. What was weak is the *reason*: both probes failing produced the
+  same generic "no local build for this target", which cannot tell a reader whether to
+  install an SDK or to build an archive. The two causes are now named separately.

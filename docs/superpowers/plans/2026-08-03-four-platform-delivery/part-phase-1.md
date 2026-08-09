@@ -946,10 +946,63 @@
   **Still open before this can be `- [x]`:** it is not wired into any gate — the
   variable is opt-in and `build-ohos-sdk.sh` does not set it — and neither
   independent review has run.
+
+  **Correction, 2026-08-09: the evidence above was not produced on this workstation
+  and cannot be reproduced here yet.** `ls -d ~/ohos-sdk*` finds only `~/ohos-sdk`
+  (5.1.0.107, API 18); there is no `~/ohos-sdk-6.1`, and `dist/` does not exist, so
+  neither the newer sysroot nor the `libmigo_capi.a` the run measured is present. The
+  entry's own lesson — check the object before believing a claim about it — applies to
+  the claim itself. Reproducing it here needs the 6.1 SDK downloaded and an
+  OpenHarmony build, which is blocked behind 1.9.
 - [ ] 1.11 Produce deterministic Android, Linux, Windows, and HarmonyOS packages
   carrying manifests, checksums, BSL 1.1 text, notices, SBOMs, and provenance.
 - [ ] 1.12 Prove same-source rebuild byte equality for every shipping archive.
-- [ ] 1.13 Verify the Android permission contract from the built Full and Slim
+- [x] 1.13 Verify the Android permission contract from the built Full and Slim
   merged manifests at API 26, 28, and 31.
+
+  **Done 2026-08-09**, and the gap was narrower than the wording suggests, because
+  `test-permission-coverage-contract.sh` already holds the *source* manifests to a
+  policy table including each `maxSdkVersion`. Two things it does not do, both of which
+  are what "built ... merged" means: it reads
+  `library/src/{full,main}/AndroidManifest.xml` rather than what Gradle produces, so a
+  permission contributed by a dependency or a `tools:` directive is invisible to it;
+  and it iterates the policy, so it checks every expected permission is **present** and
+  never that an unexpected one is **absent**. A `READ_CONTACTS` added to the Full
+  manifest passed it.
+
+  `scripts/test-android-merged-manifest-permissions.sh` compares the merged manifests
+  exactly, in both directions, per profile, and is in `pr-ci.yml` — so
+  `verify-change.sh` derives it too (confirmed: it appears in `--plan-only`, and
+  `test-local-verification-contract.sh` passes).
+
+  **The policy is not restated.** It moved to
+  `scripts/lib/android_permission_policy.py` and both gates import it; the older gate
+  still reports the same 30 gated / 8 cleanup / 38 sensitive ops, so the extraction
+  changed nothing it asserts. A second copy of that table is the "two implementations
+  of one rule" shape, where the tests end up over the one that never ships.
+
+  **The debug variants are used, and why that is evidence about the release artifact.**
+  `processFullReleaseManifest` depends on `verifyMigoReleaseArtifactPackaging<Profile>`,
+  which refuses unless a release build has staged verified inputs, so requesting it
+  would gate on whatever an earlier run left behind. Instead the gate asserts no
+  build-type source set declares a manifest (`src/debug`, `src/release`: neither
+  exists) *and*, whenever a release merged manifest is present, that it is identical to
+  the debug one. On this run it was: `fullDebug` and `fullRelease` merged manifests are
+  byte-identical.
+
+  **The contract, measured rather than derived by hand:**
+
+  | Profile | API 26 | API 28 | API 31 |
+  |---|---|---|---|
+  | Full | 12 | 12 | **9** |
+  | Slim | 3 | 3 | 3 |
+
+  Full loses `BLUETOOTH`, `BLUETOOTH_ADMIN` (`maxSdkVersion` 30) and
+  `WRITE_EXTERNAL_STORAGE` (28) by API 31, and API 28 still requests storage because
+  the bound is inclusive. Slim requests only `INTERNET`, `ACCESS_NETWORK_STATE` and
+  `VIBRATE` on every level, and carries no Full-only permission.
+
+  Falsifiable: `--self-test` injects `READ_CONTACTS` and both profiles reject it,
+  naming the permission.
 - [ ] 1.14 Package the HarmonyOS HAR reproducibly with the unified version.
 
