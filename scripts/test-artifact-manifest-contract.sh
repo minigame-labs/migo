@@ -511,10 +511,6 @@ EXEMPT = {
     "dev-run-player.sh": "runs the local player; may use a development archive",
     "dev-test-host.sh": "runs host suites against the local linux-gnu archive",
     "test-capi-platform-contract.sh": "a contract check, not a producer",
-    "gen-snapshot.sh": (
-        "produces committed V8 snapshots and is NOT verified -- a real gap, recorded "
-        "rather than silently excluded: its archive should be materialised too"
-    ),
 }
 
 consumers = {

@@ -24,7 +24,8 @@
 #   --keep            leave the pushed binary/lib on the device afterwards.
 #
 # Environment:
-#   ANDROID_NDK_HOME  NDK root (default: ~/Android/Ndk)
+#   ANDROID_NDK_HOME  an NDK to prefer; checked against the pin like any other
+#                     candidate, and found in the standard SDK layouts when unset
 #   ADB               adb path (default: ~/Android/Sdk/platform-tools/adb, then PATH)
 #
 # Output:
@@ -89,26 +90,31 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/engine"
 # shellcheck source=scripts/lib/android-ndk.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/android-ndk.sh"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v8-materialise.sh"
 android_ndk_read_pin "$ROOT/contracts/artifact-manifest/android-v8.lock.json" || exit 1
 android_ndk_resolve || die "cannot resolve the pinned Android NDK"
 NDK="$ANDROID_NDK_HOME"
 
+# The archive is verified before adb is required, and that ordering is deliberate: this
+# check is local and deterministic, while the device is neither, so failing on the cheap
+# one first is what makes the archive handling observable without hardware.
+#
+# What a snapshot is makes this the strictest case in the tree rather than the loosest.
+# A startup snapshot serialises a live V8 heap, so it is only valid for the exact V8 that
+# produced it -- and the result is *committed* under engine/crates/runtime-v8/snapshots/
+# and embedded by build.rs into every shipping Android .so. This used to check existence
+# plus "larger than a megabyte", a heuristic for an unresolved LFS pointer, which cannot
+# tell one real archive from another. The hash subsumes it: a stub fails the comparison
+# for the same reason a wrong archive does.
+if ! v8_materialise "$ENGINE/third_party/rusty_v8/$V8_DIR" "$ENGINE/target/v8-materialised"; then
+    die "cannot use the android V8 archive for $V8_DIR (run: bash scripts/fetch-v8-archives.sh)"
+fi
+c_info "V8 archive verified: ${V8_MATERIALISED_ARCHIVE#"$ROOT"/}"
+
 ADB="${ADB:-$HOME/Android/Sdk/platform-tools/adb}"
 [[ -x "$ADB" ]] || ADB="$(command -v adb || true)"
 [[ -n "$ADB" && -x "$ADB" ]] || die "adb not found (set ADB=/path/to/adb)"
-
-V8_ARCHIVE="$ENGINE/third_party/rusty_v8/$V8_DIR/librusty_v8.a"
-V8_BINDING="$ENGINE/third_party/rusty_v8/$V8_DIR/src_binding.rs"
-# The archives are build products fetched from a release asset, not tracked, so
-# a fresh checkout legitimately has none. Name the command that gets them:
-# pointing at LFS, which this repository no longer uses, sends the reader after
-# a mechanism that is gone.
-[[ -f "$V8_ARCHIVE" ]] || die "android V8 archive missing: $V8_ARCHIVE (run: bash scripts/fetch-v8-archives.sh)"
-# Guard against an unresolved Git LFS pointer (a ~130-byte text stub).
-# A truncated or partial download is the failure this catches now that the
-# archive arrives over HTTP rather than as an LFS pointer; fetch-v8-archives.sh
-# verifies the sha256, so reaching here with a small file means it was bypassed.
-[[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] || die "V8 archive is too small to be real: $V8_ARCHIVE (run: bash scripts/fetch-v8-archives.sh)"
 
 LIBCXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$LIBCXX_TRIPLE/libc++_shared.so"
 [[ -f "$LIBCXX" ]] || die "libc++_shared.so not found: $LIBCXX"
@@ -135,8 +141,8 @@ fi
 
 c_info "cross-compiling migo-snapshot-gen for $TRIPLE ..."
 ( cd "$ENGINE"
-  RUSTY_V8_ARCHIVE="$V8_ARCHIVE" \
-  RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING" \
+  RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE" \
+  RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING" \
   RUSTFLAGS="$RUSTFLAGS_COMMON" \
   cargo ndk -t "$NDK_TARGET" --platform 26 build -p migo-snapshot-gen \
     --no-default-features --features "profile-$PRODUCT_PROFILE" --locked )

@@ -916,10 +916,23 @@
     there is nothing to content-address it against yet. That is the same
     "no manifest, so no verification" position V8 was in before its lock existed.
   * **ANGLE** is Windows-only and cannot be exercised here.
-  * **`gen-snapshot.sh` consumes an archive without verifying it**, and it produces
-    *committed* V8 snapshots — so a snapshot's provenance is not yet tied to a verified
-    archive. It is exempted by name in the gate with exactly that reason, so the gap is
-    recorded where someone will trip over it rather than silently excluded.
+
+  **`gen-snapshot.sh` was the seventh consumer and is now the strictest case, not an
+  exemption.** It produces *committed* snapshots under
+  `engine/crates/runtime-v8/snapshots/` that `runtime-v8/build.rs` embeds into every
+  shipping Android `.so`, and a startup snapshot serialises a live V8 heap, so it is valid
+  only for the exact V8 that produced it — yet it checked existence plus "larger than a
+  megabyte", a heuristic for an unresolved LFS pointer that cannot tell one real archive
+  from another. The hash subsumes that heuristic, so both checks are gone in favour of the
+  materialiser, and its exemption was removed from the gate, which treats a stale exemption
+  as an error and so enforced the follow-through.
+
+  The archive is verified **before** `adb` is required, deliberately: that check is local
+  and deterministic while a device is neither, so failing on the cheap one first is what
+  makes the archive handling observable without hardware. Confirmed by running it with no
+  device attached — it prints
+  `V8 archive verified: engine/target/v8-materialised/ce14223a…/librusty_v8.a` and then
+  stops on the missing device, which is as far as this machine can go.
 - [ ] 1.4 Remove every `--allow-multiple-definition`, including both HarmonyOS
   target entries in `engine/.cargo/config.toml`, and resolve duplicate C++
   runtime symbols at component build boundaries.
