@@ -1323,6 +1323,14 @@
   `scripts/test-android-aar-reproducibility.sh` is one, wired into `pr-ci.yml` beside the
   symbol floor because both need the natives the AAR step stages.
 
+  **It runs in CI but not in `verify-change.sh`, and that is a property of where it
+  lives.** The verifier derives its contract lane from `pr-ci.yml`'s `quality-gate` job
+  only, and this gate is in the Android job — the same position as
+  `test-android-symbol-floor.sh` next to it, which is also CI-only for the same reason. So
+  it is an arrangement rather than an oversight, but a local `verify-change.sh` run does
+  **not** cover it, and reading a green local verdict as covering archive reproducibility
+  would be wrong. Run it by hand after touching packaging.
+
   **Measured, and the result was not assumed either way:** two release AAR builds under
   one `SOURCE_DATE_EPOCH` are **byte-identical** at 17,391,073 bytes, and a third under a
   different epoch **differs**. That pairing is required rather than tidy — an archive that
