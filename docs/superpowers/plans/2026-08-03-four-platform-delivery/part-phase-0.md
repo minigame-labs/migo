@@ -6556,6 +6556,61 @@
      the id — and the profile contract is what will catch a half-done one.
      `getCacheDirPath` and `getAppAuthorizationSettingJson` return app-scoped values
      and are only latently wrong.
+
+     **Fixed 2026-08-09, and cheaper than this entry predicted.** The session id was
+     already in scope: the Android `SystemInfo` service holds `self.host_id` and the
+     method directly above passes it to `jni::get_window_info(self.host_id)`. So the
+     descriptors widen to `(I)` and the id is threaded one line each — no trait
+     change, no other platform touched, nothing like the keyboard's shape.
+     `getAppAuthorizationSettingJson` took the id too: the value is app-scoped, but
+     which Activity answers should be a decision rather than an iteration order.
+
+     **`getCacheDirPath` is deleted rather than given an id.** No engine code calls
+     it — it was registered in `JAVA_CORE` and invoked from nowhere — and it returns
+     an app-scoped path, so threading a session into it would only make dead code
+     look deliberate. Its R8 keep roots went with it, which
+     `test-r8-profile-contract.sh` checks in both profiles, and the `java.len()` pin
+     moved 127 → 126 with the reason written at the assertion.
+
+     That left `RuntimeRegistry.getAny()` with no callers, so it is gone — it is the
+     mechanism, and leaving it invites the next export to reach for it.
+     `RuntimeRegistry.clear()` went with it, which closes the first half of item 8:
+     a nuke-every-Session static with zero callers is a footgun waiting for a
+     plausible-looking use.
+
+     **This entry's last sentence was wrong, and the correction is now a gate.**
+     "The profile contract is what will catch a half-done one" — it does not. It
+     compares method *names*. Measured: widening `getSystemSettingInfoBytes` to
+     `(I)[B` on the Rust side while leaving the Java method no-arg passes the product
+     profile contract, both R8 root checks, the Android host-API contract and
+     `javac`. Nothing would have caught it before
+     `GetStaticMethodID` failed on a device, at the moment the feature was first
+     used. `scripts/test-jni-outbound-signature-contract.sh` now decodes every
+     `JAVA_*` descriptor and compares it against the `public static` declaration in
+     `NativeExports`, for all 126 — which is `test-camera-frame-jni-contract.sh`'s
+     one-method check generalised, and it is wired into `pr-ci.yml`.
+
+     Reference types compare by simple name, because that is how the Java source
+     spells them under its imports, and a declaration that writes a type out in full
+     is reduced the same way so two spellings of one type cannot read as a mismatch.
+     Only `public static` answers for a descriptor: a private helper sharing a name
+     must not be able to. Ten checks proved it can fail — the measured half-done
+     widening, a changed return type, a swapped reference parameter, `int` where a
+     `long` is declared, an undecodable descriptor, a renamed method, a method that
+     lost `public`, and three vacuity guards in a fixture tree.
+
+     The reading both JNI gates need — masking comments and literals so structure can
+     be scanned, bracket matching, argument splitting, the descriptor tables — moved
+     to `scripts/lib/jni_source.py`, and the fence gate lost 169 duplicated lines to
+     it. A parser bug fixed in one copy and not the other is how two gates end up
+     unequal while looking alike.
+
+     Verified: `build-android-so.sh --compile-only arm64-v8a` (which is what caught
+     `jint` not being in scope in `outbound.rs` — the host lane cannot see that file),
+     `cargo test -p migo-platform --lib`, `fmt --check`, Java 201 per flavour in both
+     profiles, and the r8-profile, camera-frame-jni, android-owned-host-shutdown,
+     android-host-api, runtime-generation-fence and jni-outbound-signature gates,
+     plus `test-local-verification-contract.sh` at 26 derived gates.
   3. **The log level is one process-wide switch on both sides**
      (`internal/util/Logger.java:17`, `platform/src/android/logging.rs:10`, written
      per Session at `jni/inbound.rs:452`). `RuntimeConfig` carries a per-Session
