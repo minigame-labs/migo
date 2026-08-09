@@ -239,6 +239,30 @@
   log **into** `$RUSTY_V8_SRC`, where it is an untracked file no patch explains, so it
   broke every provenance gate over that tree. `build-v8-android.sh` already wrote its
   log under `$TMPDIR`; the OpenHarmony script now does the same.
+
+  **Independent review found six issues, and one was a regression this change
+  introduced.** `V8_ACCOUNTED_ARGS` is forwarded to
+  `write-v8-component-manifest.py` as well as to the shell proof, and that parser knew
+  only `--accounted` — so every Android V8 build would have died on
+  `unrecognized arguments: --accounted-patch` **after** the expensive build. Separating
+  the arrays would only have moved the failure, because the writer runs the same replay
+  proof and so needs the same accounting; `accounted_paths_from_patch` now lives in
+  `scripts/lib/v8_source_proof.py` and enforces the identical create-only rule. Verified
+  against the real tree: the option is accepted, the proof passes, and
+  `--accounted-patch 0002-install-sysroot.patch` is refused with
+  `creates no file, so it cannot account for one`.
+
+  **And the recipe hash is verified, so editing a V8 build script is not a cosmetic
+  change.** `generate-android-artifact-manifests.py` compares
+  `provenance.build_recipe_sha256` against the script's current bytes, so both committed
+  component manifests became **wrong rather than stale** the moment
+  `build-v8-android.sh` changed — every AAR build failed with
+  `V8 build recipe bytes hash mismatch`. That correction matters: the earlier judgement
+  here, borrowed from 1.1b's patch-set note, was that nothing validates such staleness.
+  Both manifests were regenerated from warm builds rather than edited, which also
+  produced a **second reproducibility data point**: `aarch64` came back at
+  `681aaa39…` and `x86_64` at `ce14223a…`, both matching their recorded hashes, with new
+  ids `3a5841af…` and `21613b7e…` recording recipe `62d717ff…`.
 - [x] 1.1c Pin and assert `gn`. The script resolved `gn` from `V8_GN_PATH`, then a
   prefetched path, then the system `PATH`, and merely **logged** the version it
   found — so a system `gn` of any revision was accepted and failed later somewhere
@@ -958,6 +982,26 @@
   the new case passes an argument that is not (`--artifact-manifest off`), which the
   bug turns into `Unknown argument: off`. The three argument-time refusals are now
   asserted through both entry points; the ps1 half skips when `pwsh` is absent.
+
+  **Independent review found four more, all real, and two of them meant a PowerShell
+  release was still not the shell's package.** (a) `$IsWindows` does not exist in
+  Windows PowerShell 5.1, where it evaluates false — so on the one host this entry point
+  exists for, it would have chosen the Unix `gradlew` and an extensionless manifest tool.
+  `#Requires -Version 7.0` makes that unrepresentable instead of adding a second
+  host-detection rule to keep in agreement. (b) It never produced the external
+  `<aar>.attestation.json` sidecar, and never removed a stale one, so a successful
+  release left an attestation describing different bytes or none at all; it now runs the
+  same `attest` and `verify-attestation` steps and clears the outputs first. (c) The
+  resolver omitted Windows' documented `%LOCALAPPDATA%\Android\Sdk`, so a normal Android
+  Studio install could hold the pinned NDK and still be rejected. (d) A single-ABI build
+  wrote `migo-full-release.aar` where the shell writes
+  `migo-full-release-arm64-v8a.aar`, so the two overwrote each other under one name —
+  found here rather than by the review, and the per-ABI figure is the one a host weighs
+  against its APK budget.
+
+  Verified after the fixes: `pwsh -File scripts/build-aar.ps1 -BuildType release …`
+  completes, passes `verifyMigoReleaseArtifactPackagingFull`, and writes
+  `migo-full-release-arm64-v8a.aar` beside `….aar.attestation.json`.
 - [ ] 1.7 Replace the Windows warm-target link flow with a clean Windows-native
   MSVC and ANGLE build graph.
 - [ ] 1.8 Implement HarmonyOS audio playback through OHAudio.
@@ -1057,5 +1101,14 @@
 
   Falsifiable: `--self-test` injects `READ_CONTACTS` and both profiles reject it,
   naming the permission.
+
+  **Two holes an independent review found, both closed.** The parser read only
+  `<uses-permission>`, so a `<uses-permission-sdk-23>` declaration — effective on every
+  device this library supports, since its floor is API 26 — would have passed both gates
+  while looking like a different element. And the debug-variant argument rested on
+  source sets alone: a `releaseImplementation` dependency brings its own manifest into
+  the merge and could add a permission to the shipped Release manifest only, so the gate
+  now also refuses any build-type-scoped dependency configuration, which forces the
+  release manifest to be compared directly if one is ever added.
 - [ ] 1.14 Package the HarmonyOS HAR reproducibly with the unified version.
 

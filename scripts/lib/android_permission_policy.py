@@ -41,22 +41,29 @@ BASE_PERMISSIONS: dict[str, str | None] = {
 
 
 def manifest_permissions(source: str) -> tuple[dict[str, str | None], list[str]]:
-    """Maps each declared permission to its `maxSdkVersion`, or None if unbounded."""
+    """Maps each declared permission to its `maxSdkVersion`, or None if unbounded.
+
+    Both declaration forms are read. `<uses-permission-sdk-23>` requests a permission
+    only from API 23 upwards, which on this library -- whose floor is API 26 -- is every
+    supported device, so ignoring it would let a sensitive permission through both the
+    source and the merged-manifest gate while looking like a different element.
+    """
     found: dict[str, str | None] = {}
     problems: list[str] = []
     try:
         manifest = ET.fromstring(source)
     except ET.ParseError as error:
         return {}, [f"invalid Android manifest XML: {error}"]
-    for element in manifest.findall("uses-permission"):
-        name = element.get(ANDROID_NS + "name")
-        if not name:
-            problems.append("uses-permission without android:name")
-            continue
-        if name in found:
-            problems.append(f"duplicate manifest permission `{name}`")
-            continue
-        found[name] = element.get(ANDROID_NS + "maxSdkVersion")
+    for tag in ("uses-permission", "uses-permission-sdk-23"):
+        for element in manifest.findall(tag):
+            name = element.get(ANDROID_NS + "name")
+            if not name:
+                problems.append(f"{tag} without android:name")
+                continue
+            if name in found:
+                problems.append(f"duplicate manifest permission `{name}`")
+                continue
+            found[name] = element.get(ANDROID_NS + "maxSdkVersion")
     return found, problems
 
 

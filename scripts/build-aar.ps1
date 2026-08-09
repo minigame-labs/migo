@@ -1,3 +1,11 @@
+#Requires -Version 7.0
+# PowerShell 7 or newer, and this is a refusal rather than a preference: the host checks
+# below use `$IsWindows`, which Windows PowerShell 5.1 does not define. There it would
+# evaluate false and the script would silently choose the Unix `gradlew` wrapper and an
+# extensionless manifest tool -- on Windows, the one host this entry point exists for. A
+# version requirement makes that unrepresentable; handling it would leave two
+# host-detection rules to keep in agreement.
+
 param(
     [ValidateSet("release", "debug")]
     [string]$BuildType = "release",
@@ -400,14 +408,33 @@ function Build-AAR {
 # Collect Outputs
 # =========================
 function Collect-Outputs {
+    param([Parameter(Mandatory)][string[]]$TargetArchitectures)
+
     Write-Host "Collecting outputs..."
 
     $outDir = Join-Path $AndroidDir $OutputDir
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
+    # A single-ABI build is a distinct product, not a variant spelling of the
+    # multi-ABI one: per-ABI size is what a host weighs against its APK budget. Without
+    # this suffix the two overwrite each other under one name, and the shell twin
+    # already distinguishes them.
+    $abiSuffix = if ($TargetArchitectures.Count -eq 1) { "-$($TargetArchitectures[0])" } else { "" }
+
     $aarDir = Join-Path $LibraryDir "build/outputs/aar"
     $aar = Join-Path $aarDir "migo-$ProductProfile-$BuildType.aar"
     if (-not (Test-Path $aar)) { throw "Expected AAR not found: $aar" }
+
+    $artifactName = "migo-$ProductProfile-$BuildType$ArtifactSuffix$abiSuffix.aar"
+    $outputAar = Join-Path $outDir $artifactName
+    $attestation = "$outputAar.attestation.json"
+    $versionMetadata = Join-Path $outDir "version-$ProductProfile$ArtifactSuffix$abiSuffix.json"
+    # Removed before anything is written, the way the shell twin does it: an
+    # attestation left from an earlier run would otherwise sit beside an AAR it does
+    # not describe, and a sidecar that names the wrong bytes is worse than none.
+    foreach ($stale in $outputAar, $attestation, $versionMetadata) {
+        if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+    }
 
     # The attestation is checked against the AAR that was actually produced, not
     # inferred from the fact that staging succeeded before Gradle ran.
@@ -419,8 +446,18 @@ function Collect-Outputs {
         throw "Required package index was not generated: $ManifestIndex"
     }
 
-    $artifactName = "migo-$ProductProfile-$BuildType$ArtifactSuffix.aar"
-    Copy-Item $aar (Join-Path $outDir $artifactName) -Force
+    Copy-Item $aar $outputAar -Force
+
+    # The external sidecar, which the embedded-index check does not produce. Without
+    # it a PowerShell release is not the same package as a shell one: release.yml and
+    # the consumers expect `<aar>.attestation.json` beside the archive.
+    if (Test-Path -LiteralPath $ManifestIndex) {
+        & $ManifestTool attest $outputAar $ManifestIndex $attestation | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Producing the release attestation failed" }
+        & $ManifestTool verify-attestation $attestation $outputAar $ManifestIndex | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Verifying the release attestation failed" }
+        Write-Host "✓ Release attestation -> $attestation"
+    }
 
     @{
         productProfile = $ProductProfile
@@ -430,7 +467,7 @@ function Collect-Outputs {
         workerSnapshot = $WorkerSnapshot.IsPresent
         sourceDateEpoch = $SourceDateEpochMetadata
         buildTime = (Get-ReproducibleTimestamp)
-    } | ConvertTo-Json | Out-File (Join-Path $outDir "version-$ProductProfile$ArtifactSuffix.json") -Encoding utf8
+    } | ConvertTo-Json | Out-File $versionMetadata -Encoding utf8
 
     Write-Host "✓ Outputs ready: $outDir"
 }
@@ -478,7 +515,7 @@ else {
 Build-RustLibrary -TargetArchitectures $ResolvedArchitectures
 Test-NativeLibraries -TargetArchitectures $ResolvedArchitectures
 Build-AAR -TargetArchitectures $ResolvedArchitectures
-Collect-Outputs
+Collect-Outputs -TargetArchitectures $ResolvedArchitectures
 
 Write-Host ""
 Write-Host "========================================"

@@ -167,6 +167,16 @@ def main() -> int:
     # scripts/build-v8-android.sh passes to the shell-side proof, so one array in
     # that script feeds both.
     parser.add_argument("--accounted", action="append", default=[])
+    # A patch this manifest does not declare, whose *created* paths are accounted for.
+    # One vendored checkout serves every platform's V8 build, and OpenHarmony's
+    # toolchain patch creates a file the Android declaration does not touch -- so
+    # without this the proof below refuses a path that is explained by a committed
+    # patch, just not by one this manifest claims. Same spelling and same rule as the
+    # shell-side proof, because scripts/build-v8-android.sh feeds one array to both:
+    # only created paths may be accounted for, since accounting for a path a foreign
+    # patch merely modifies would skip content verification on a file this platform's
+    # own patches may also touch.
+    parser.add_argument("--accounted-patch", action="append", default=[])
     arguments = parser.parse_args()
 
     try:
@@ -197,8 +207,13 @@ def main() -> int:
         # is about to claim. The previous check compared modified paths against a
         # hardcoded allowlist, which restated what the patches touch and could not
         # see an edit inside an allowed file.
+        accounted = set(arguments.accounted)
+        for glob in arguments.accounted_patch:
+            accounted |= v8_source_proof.accounted_paths_from_patch(
+                repo / "engine/third_party/v8-patches", glob
+            )
         v8_source_proof.assert_tree_is_exactly_patched(
-            source, patch_files, frozenset(arguments.accounted)
+            source, patch_files, frozenset(accounted)
         )
 
         properties = ndk / "source.properties"

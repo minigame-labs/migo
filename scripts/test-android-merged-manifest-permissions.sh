@@ -40,6 +40,7 @@ python3 - "$ROOT_DIR" "$@" <<'PY'
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -83,8 +84,11 @@ def info(message: str) -> None:
 
 
 # A debug merged manifest is only evidence about the shipped artifact if the build type
-# cannot contribute to it. Asserted rather than assumed: an AndroidManifest.xml under a
-# build-type source set would make these two manifests different documents.
+# cannot contribute to it. Asserted rather than assumed, and in two ways: an
+# AndroidManifest.xml under a build-type source set would make these two different
+# documents, and so would a build-type-scoped dependency, because a library dependency
+# brings its own manifest into the merge. A `releaseImplementation` could otherwise add a
+# permission to the shipped Release manifest alone while this gate stayed green.
 info("no build type contributes to the library manifest")
 build_type_manifests = sorted(
     path.relative_to(root).as_posix()
@@ -96,6 +100,26 @@ if build_type_manifests:
     fail(f"build-type manifest source sets exist: {', '.join(build_type_manifests)}")
 else:
     ok("neither src/debug nor src/release declares a manifest")
+
+BUILD_TYPE_DEPENDENCY = re.compile(
+    r"^\s*(debug|release)"
+    r"(Implementation|Api|CompileOnly|RuntimeOnly|AnnotationProcessor)\b",
+    re.MULTILINE,
+)
+scoped = sorted({
+    "".join(match)
+    for match in BUILD_TYPE_DEPENDENCY.findall(
+        (LIBRARY / "build.gradle").read_text(encoding="utf-8")
+    )
+})
+if scoped:
+    fail(
+        f"build-type-scoped dependencies exist ({', '.join(scoped)}); a dependency brings "
+        "its own manifest into the merge, so the release merged manifest has to be "
+        "compared directly rather than through the debug one"
+    )
+else:
+    ok("no build-type-scoped dependency can contribute a manifest to one type only")
 
 for profile, expected in EXPECTED.items():
     variant = f"{profile}Debug"

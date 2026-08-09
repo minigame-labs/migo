@@ -52,6 +52,7 @@ function Resolve-MigoPinnedNdk {
         if (-not [string]::IsNullOrWhiteSpace($direct)) { $candidates.Add($direct) }
     }
     foreach ($root in $env:ANDROID_HOME, $env:ANDROID_SDK_ROOT,
+                      $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Android/Sdk" }),
                       (Join-Path $HOME "Android/Sdk"),
                       (Join-Path $HOME "Library/Android/sdk")) {
         if (-not [string]::IsNullOrWhiteSpace($root)) {
