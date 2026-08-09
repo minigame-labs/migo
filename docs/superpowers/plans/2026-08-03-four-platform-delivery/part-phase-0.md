@@ -6512,6 +6512,18 @@
   the answer is that this is a *deliberate* design on both sides and almost all of it
   is right, so what is left is a short ranked list rather than a rework.
 
+  **A gate this item's own work left red, found by a full verification run on
+  2026-08-10 and fixed there.** Per-session log levels added
+  `Logger.unregisterSession` as a fourth ownership-release action in
+  `GameSession.close()`, and `test-android-owned-host-shutdown-contract.sh` still
+  required exactly three, so it failed with `found 6 arguments`. Reproduced in a clean
+  extraction of the base commit, so it predated this session's changes. The exact,
+  ordered list is deliberate rather than sloppy — it forbids an action being dropped as
+  much as one being added, and the order matters (stop resolving the session, clean the
+  directory it owns, stop its logging, drop the native registration last) — so the fix
+  was to add the fourth action, not to loosen the check. Still sensitive: removing the
+  logger entry from the expectation makes it fail again.
+
   **What already proves the intent**, so that none of it is re-litigated:
   `NativeExports.registerSession` refuses a duplicate id with "concurrently live
   sessions must have distinct ids"; `ExclusiveDeviceArbiter` exists only to arbitrate
