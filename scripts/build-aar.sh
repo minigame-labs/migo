@@ -131,7 +131,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --unverified-native-libs)
             UNVERIFIED_NATIVE_LIBS=true
-            shift
             ;;
         --skip-rust)
             SKIP_RUST=true

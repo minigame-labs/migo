@@ -508,14 +508,56 @@
   invoked on every single build. It is stamp-guarded and so does not re-download,
   but it makes the Android build reach the network unconditionally. Recorded under
   task 1.1d.
-- [ ] 1.1i Verify the aarch64 archive is unchanged now that patch 0002 applies.
-  Re-run `./scripts/build-v8-android.sh aarch64` and confirm sha256
-  `681aaa39367a9aa35ab7e584ddd4b36273acbc0ccb4177648c43b9b55b7eb273`. The reasoning
-  in task 1.1e says it must be, and a same-source reproducibility data point is
-  worth having either way; if it differs, the reasoning about `sysroot.gni` or about
-  duplicate GN args is wrong and the difference must be explained before the
-  archive is trusted. The first run of this build will download the Debian arm64
-  sysroot (~100MB) that the Android target never consults.
+- [x] 1.1i Verify the aarch64 archive is unchanged now that patch 0002 applies.
+  **Re-run 2026-08-09: sha256 `681aaa39367a9aa35ab7e584ddd4b36273acbc0ccb4177648c43b9b55b7eb273`,
+  unchanged.** Task 1.1e's reasoning holds, and the run shows the mechanism rather
+  than only the conclusion: patch 0002 is in effect, so the Debian arm64 sysroot
+  **was** downloaded (`chrome-linux-sysroot/2f915d82…`), `gn gen` re-ran, and the
+  regenerated `args.gn` carries `use_sysroot = true` **twice** — the duplicate GN
+  assignment 1.1e predicted, which GN accepts. `ninja: no work to do` followed, which
+  is the actual evidence: the regenerated build graph is identical to the previous
+  one, so `sysroot.gni` testing `is_android` before `is_linux && use_sysroot` really
+  does keep an Android toolchain off the Debian sysroot. The binding is byte-identical
+  to the verified prebuilt input, and re-sealing produced a **byte-identical**
+  `component-manifest.json` (`b5299a05…`, `component_id` `ee0fb437a33fcd9c…`), which
+  independently confirms 1.1f's determinism fix on a live re-seal.
+
+  **Scope of the claim, stated because it is narrower than "the archive reproduces":**
+  this was a warm build, so no C++ was recompiled. What is proved is that applying
+  0002 does not change the build graph. From-scratch reproduction of both
+  architectures is task 1.1's evidence, not this one's.
+
+  **Running it found two defects in the gate 1.1c and 1.1d built, and the first made
+  the Android V8 build impossible on this machine.** `_v8_git` passed
+  `-c safe.directory=$tree` — but git compares that value *literally* against the
+  repository path it discovers, and every caller derives the tree as
+  `$PROJECT_ROOT/../rusty_v8_src`. The unnormalised `..` never matches, so the
+  exception did not apply, every git call failed `dubious ownership`, and the replay
+  reported **"the rusty_v8 tree carries changes the committed patches do not
+  explain"** — an accusation about the tree for what was a refusal to read it. The
+  path is now canonicalised at that single choke point, which also covers the
+  submodule descent and any caller's `RUSTY_V8_SRC`. Note the contract test could
+  never have seen this: it derives its own `real_tree` through `cd .. && pwd`, so the
+  test normalised what the build script did not.
+
+  Second, the failure was **fail-open**. `_v8_changed_paths` read `git status` through
+  a process substitution and the enumeration was read through another, so neither
+  exit status was observable and a git failure arrived as "no changed paths". With a
+  declared patch that only *creates* a file — the shape of `0008-ohos-toolchain.patch`
+  — the replay then succeeds into the scratch directory, the byte comparison has
+  nothing to iterate, and the function **certifies a tree it never managed to read**.
+  Both producers now propagate. Two mutants, each killing exactly one of the two new
+  contract cases at its own assertion: dropping the canonicalisation kills "a checkout
+  this user does not own is read through a path carrying ..", and restoring the process
+  substitution kills "a tree whose git status fails is refused, not read as unchanged".
+
+  **Recorded, not fixed: the vendored checkout can only be in one platform's declared
+  state at a time.** `build-v8-ohos.sh` applies 0008 to the same
+  `../rusty_v8_src` and never reverts it, and 0008 is not in the Android declaration,
+  so an OpenHarmony V8 build leaves the tree in a state the Android replay refuses.
+  `build-v8-ohos.sh` does not call the replay at all, so it does not notice. Either
+  each platform accounts for the others' patches or the OpenHarmony build needs its
+  own checkout; until then, run the Android build before the OpenHarmony one.
 - [x] 1.1f The component manifest can be sealed again, and what it records is now
   reproducible. Both Android manifests were regenerated and re-verified:
   `aarch64` `component_id` `ee0fb437a33fcd9c…`, `x86_64` `1c6b7b20dde62eff…`, and
@@ -806,7 +848,63 @@
   **What remains for 1.5:** archive determinism (sorted entries, fixed mtime, no
   gzip timestamp, fixed uid/gid) on all four platforms, which is 1.11's code, and
   the Windows and HarmonyOS packaging paths cannot be run on a Linux workstation.
-- [ ] 1.6 Repair Android PowerShell packaging and reject release `--skip-rust`.
+- [x] 1.6 Repair Android PowerShell packaging and reject release `--skip-rust`.
+
+  **Done 2026-08-09.** The `--skip-rust` half landed earlier; what remained was the
+  PowerShell entry point, and the reason it was still broken is that it could not be
+  run: it probed only for `gradlew.bat`, so it was unrunnable under the `pwsh` that
+  exists on Linux. Both wrappers are committed, so it now selects by host — and every
+  finding below came from actually executing it.
+
+  **The serious defect was an unpinned NDK, not the packaging.** Task 1.1a pinned the
+  NDK so "an AAR can no longer be built with a different NDK than the V8 archive it
+  links"; `build-android-so.ps1` tested only that `$env:ANDROID_NDK_HOME` was
+  non-empty and used whatever it named. The NDK supplies the compiler, sysroot and
+  linker that the component manifest records, so a Windows build could link the pinned
+  V8 archive with any toolchain and be stamped as if it had not. It survived because
+  the enumeration meant to prevent exactly this globs `*.sh`
+  (`test-android-ndk-pin-contract.sh:137`) — the gate's *scope*, not its assertions.
+  `scripts/lib/AndroidNdk.psm1` is the PowerShell counterpart of
+  `scripts/lib/android-ndk.sh`: same lock field, same candidate order, selection by
+  the NDK's own `Pkg.Revision`, and a rejected override is reported as it happens
+  rather than only when nothing matches, because falling through in silence is the
+  substitution the pin exists to prevent.
+
+  The gate is behavioural rather than a grep for `Pkg.Revision`, which occurs in the
+  module's own prose and would pass over a module that had stopped reading it. The
+  discriminating case is a directory named **exactly** like the pin whose
+  `source.properties` reports `1.2.3456789`: refused. An NDK reporting the pin is
+  accepted. Mutation: replacing the resolver call with `$env:ANDROID_NDK_HOME` makes
+  the enumeration fail `build-android-so.ps1 uses ANDROID_NDK_HOME without resolving
+  it`.
+
+  **The packaging defect was that a release could not succeed at all.** The ps1 never
+  staged the verified package index and never passed
+  `-PmigoVerifiedReleasePackaging`, so `verifyMigoReleaseArtifactPackaging<Profile>`
+  refused with a message naming `scripts/build-aar.sh` — a bash script, to a Windows
+  user, after the Rust build and the Gradle clean. It now takes `-ArtifactManifest`
+  with the shell twin's policy (release means `required`, refused otherwise, at
+  argument time), stages through the **same** generator, metadata writer and Rust tool
+  rather than reimplementing what a manifest says, and verifies the produced AAR
+  against the index afterwards.
+
+  **Proved by comparison, which is what specification §7.4 asks for.** Under a fixed
+  `SOURCE_DATE_EPOCH`, a debug AAR staged through each entry point produced
+  byte-identical inputs — `package-index.json` `59b5b7b3…`, `slices/arm64-v8a.json`
+  `e7cffba7…`, `build-metadata.json` `1297b7f6…`. Then the case that was previously
+  impossible: `pwsh -File scripts/build-aar.ps1 -BuildType release …` ran
+  `:library:verifyMigoReleaseArtifactPackagingFull` and **passed** it. Staging
+  correctness needs no separate assertion, because that Gradle task is what reads the
+  staged inputs, so a script staging the wrong thing fails there.
+
+  **One bash defect found on the way, introduced with the refusal itself.**
+  `--unverified-native-libs` shifted inside its own `case` *and* at the loop tail, so
+  it silently swallowed the following argument: an explicit `arm64-v8a` disappeared
+  and the build widened to every ABI. The pre-existing gate case could not see it —
+  what it swallows there (`release`) is a valid positional and also the default — so
+  the new case passes an argument that is not (`--artifact-manifest off`), which the
+  bug turns into `Unknown argument: off`. The three argument-time refusals are now
+  asserted through both entry points; the ps1 half skips when `pwsh` is absent.
 - [ ] 1.7 Replace the Windows warm-target link flow with a clean Windows-native
   MSVC and ANGLE build graph.
 - [ ] 1.8 Implement HarmonyOS audio playback through OHAudio.
