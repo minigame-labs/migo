@@ -414,6 +414,7 @@ class ReportTest(unittest.TestCase):
                 targets.Requirement("android", "link", ("a.rs [cdylib]", "b.rs [cfg]")),
             ),
             undetermined=(),
+            host_packages=(),
         )
         self.assertEqual(
             targets.format_report(plan).splitlines(),
@@ -421,18 +422,66 @@ class ReportTest(unittest.TestCase):
                 "TARGET android link",
                 "  a.rs [cdylib]",
                 "  b.rs [cfg]",
+                "HOSTSUITES NONE",
             ],
         )
 
     def test_undetermined_files_appear_under_their_own_header(self):
-        plan = targets.Plan(requirements=(), undetermined=("x.rs",))
+        plan = targets.Plan(
+            requirements=(), undetermined=("x.rs",), host_packages=()
+        )
         self.assertEqual(
             targets.format_report(plan).splitlines(),
-            ["UNDETERMINED", "  x.rs"],
+            ["HOSTSUITES NONE", "UNDETERMINED", "  x.rs"],
         )
 
-    def test_an_empty_plan_reports_nothing(self):
-        self.assertEqual(targets.format_report(targets.Plan((), ())), "")
+    def test_an_otherwise_empty_plan_still_says_which_host_suites_to_run(self):
+        # There is no such thing as a report with no HOSTSUITES line. The shell
+        # reads this to decide between running everything and running nothing,
+        # and an absent line would be read as neither.
+        self.assertEqual(
+            targets.format_report(targets.Plan((), ())).splitlines(),
+            ["HOSTSUITES ALL"],
+        )
+
+    def test_the_three_host_suite_answers_are_each_spelled_out(self):
+        # `None` and `()` are different answers that an empty list cannot tell
+        # apart, which is the whole reason this line is emitted rather than left
+        # implicit. Each is asserted separately so a change that collapses two of
+        # them fails here rather than in whichever lane silently stops running.
+        self.assertEqual(
+            targets.format_report(
+                targets.Plan((), (), host_packages=None)
+            ).splitlines(),
+            ["HOSTSUITES ALL"],
+        )
+        self.assertEqual(
+            targets.format_report(
+                targets.Plan((), (), host_packages=())
+            ).splitlines(),
+            ["HOSTSUITES NONE"],
+        )
+        self.assertEqual(
+            targets.format_report(
+                targets.Plan((), (), host_packages=("migo-shared", "migo-io"))
+            ).splitlines(),
+            ["HOSTSUITES migo-shared migo-io"],
+        )
+
+    def test_host_suite_reasons_follow_their_header_and_are_indented(self):
+        # Same shape as a requirement's reasons, because the shell parses both by
+        # the leading two spaces.
+        self.assertEqual(
+            targets.format_report(
+                targets.Plan(
+                    (),
+                    (),
+                    host_packages=("migo-shared",),
+                    host_reasons=("engine/crates/shared/src/lib.rs",),
+                )
+            ).splitlines(),
+            ["HOSTSUITES migo-shared", "  engine/crates/shared/src/lib.rs"],
+        )
 
 
 class AuditTest(unittest.TestCase):
