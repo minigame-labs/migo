@@ -32,7 +32,7 @@
 //! ```rust,ignore
 //! use shared::vfs::{GamePaths, VirtualFS, VfsPolicy};
 //!
-//! let paths = GamePaths::new("/data/files", "/data/cache", "my-game")?;
+//! let paths = GamePaths::new("/data/files", "/data/cache", "my-game", 1)?;
 //! paths.ensure_directories()?;
 //!
 //! let vfs = VirtualFS::from_game_paths(&paths);
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn no_vfs_mapping_contains_the_runtime_cache_root() {
         let base = std::env::temp_dir().join("migo_vfs_runtime_state_containment");
-        let paths = GamePaths::new(base.join("files"), base.join("cache"), "game-a").unwrap();
+        let paths = GamePaths::new(base.join("files"), base.join("cache"), "game-a", 1).unwrap();
         let vfs = VirtualFS::from_game_paths(&paths);
 
         let runtime_root = paths.cache_dir();

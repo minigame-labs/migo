@@ -133,7 +133,7 @@ public final class GameSession implements Closeable {
         this.gameId = gameId;
         this.config = config;
         this.context = context;
-        this.paths = new GamePaths(config, gameId);
+        this.paths = new GamePaths(config, gameId, sessionId);
         this.touchHandler = new TouchEventHandler(config.getDisplayDensity());
         this.audioFocusManager = BuildConfig.MIGO_API_MEDIA ? new AudioFocusManager(sessionId, context) : null;
         this.vsyncScheduler = new VsyncScheduler(sessionId);
@@ -146,6 +146,15 @@ public final class GameSession implements Closeable {
                     .getDefaultDisplay().getRefreshRate();
         }
         this.vsyncScheduler.setTargetFps(config.getTargetFps(), displayRefreshRate);
+
+        // Reclaim the temp directories of sessions that died without running their
+        // own teardown, before this session's own directory exists. Ordering is
+        // what makes it safe and what makes /tmp start empty: sessions are only
+        // created on the main thread and are registered as they are created, so
+        // every other live session is already registered here, while this one is
+        // not -- so a directory left by a dead session that held this id is swept
+        // rather than inherited.
+        this.paths.sweepAbandonedTemp(RuntimeRegistry::contains);
 
         // Ensure game directories exist
         this.paths.ensureDirectories();

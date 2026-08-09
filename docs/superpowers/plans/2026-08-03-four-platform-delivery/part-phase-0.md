@@ -1487,6 +1487,70 @@
   `clearMessageHandler`, `clearPermissionHandler`, `clearGameLogHandler`) must
   **not** be swept: the embedder registered those once for the session, not the
   isolate.
+
+  **Task 7 continued 2026-08-09 (fifth): the fence is checked structurally, so
+  the five groups no host test can construct are covered too.**
+
+  `scripts/test-runtime-generation-fence-contract.sh`, wired into
+  `pr-ci.yml`'s `quality-gate` (and therefore into `verify-change.sh`'s contract
+  lane, which derives that list). It was chosen over finishing Bluetooth because
+  it covers all six producer groups rather than one, and because the failure it
+  catches is invisible in review: a call site passing a re-read of the live
+  generation looks exactly like a correct one, and five of the six groups need a
+  `Context` or a main `Looper`, so nothing on a host JVM can build one and restart
+  a session behind it.
+
+  **The derivation rule this document proposed was wrong, and the gate does not
+  use it.** "Every `NATIVE_*` descriptor matching `^\(IJ` carries a generation"
+  over-selects by three of seventeen: `onVsync(IJ)V`,
+  `setDisplayRefreshRate(IJ)V` and `getConsoleLogs(IJ)Ljava/lang/String;` put a
+  *payload* long in that slot — `frame_time_nanos`, a refresh period, a log
+  cursor. A gate built on the signature would have demanded `token.generation()`
+  where a frame timestamp belongs, and the only way to satisfy it would have been
+  to break vsync. What declares the intent is the JNI handler's own parameter
+  list in `inbound.rs`: `host_id: jint, generation: jlong`. Fourteen handlers
+  declare it and all fourteen convert it with `captured_generation(generation)`.
+
+  Three engine facts are cross-checked against each other rather than one being
+  trusted — the parameter, the conversion, and the descriptor beginning `(IJ` —
+  and the descriptor set is read *backwards* as well, because `(IJ` is the whole
+  surface a generation can arrive on and every method on it must be a handler the
+  parse can see. That last check exists because `inbound.rs` generates handlers
+  from `jni_json_callback!`, and one generated that way is invisible to a text
+  parse: without it the fenced set could shrink by one silently, which is the
+  failure the gate exists to prevent.
+
+  On the Java side the receiver of `.generation()` must be a
+  **`final RuntimeGenerationBoundary.Token` field of the same file**. That is
+  stricter than "looks like a token" deliberately: a final field can only have
+  been assigned once, at construction, which is exactly the captured-at-creation
+  property, so every way of re-deriving the value at report time fails without
+  the gate enumerating them. `RuntimeGenerationBoundary.UNFENCED` is the other
+  accepted form, and it is a real answer rather than a hole — the difference
+  between it and a literal `0` is that it says so at the call site.
+
+  | injection | detected as |
+  |---|---|
+  | `1L` in place of `token.generation()` | `ScreenCaptureObserver.java:149`, neither a captured token nor UNFENCED |
+  | `RuntimeGenerationBoundary.acquire(sessionId).generation()` | not a final Token field of this file |
+  | the Token field loses its `final` | the same, at the call site that reads it |
+  | a literal inside a call wrapped across lines | `DeviceSensorManager.java:214` — whitespace normalisation reaches it |
+  | the only call site deleted | `onUserCaptureScreen` is fenced with no Java caller |
+  | wrapper forwards `0L` instead of its parameter | `NativeMethods.java:755` |
+  | wrapper drops its `generation` parameter | its second parameter must be `long generation` |
+  | handler stops calling `captured_generation` | takes a generation and never converts it |
+  | descriptor `(IJ)V` → `(II)V` | the call frame is decoded wrongly at registration |
+  | handler renamed out of the parse's view | `(IJ)V` with no visible handler |
+
+  Six vacuity guards proved the same way, in a fixture tree: a missing authority
+  file, no handler parsed, every fence removed, no descriptor parsed, the producer
+  sources deleted, the producer package removed. Each reports the reason rather
+  than passing over nothing.
+
+  Verified: the gate green on a clean tree (14 fenced callbacks, 52 handler
+  definitions, 29 call sites), `ci_contract_gates.py` deriving it into the local
+  lane as `run` with nothing unaccounted, `test-local-verification-contract.sh`
+  green at 25 derived gates, `scripts/ci/tests` 119 green.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.
@@ -6419,6 +6483,69 @@
      content itself (`shared::vfs::game_paths`), so changing only the Java side would
      move what is deleted without moving what is written. Both sides move together or
      neither does.
+
+     **Fixed 2026-08-09.** `/tmp` is now
+     `cacheDir/migo/games/{gameId}/tmp/{sessionId}`, derived identically by
+     `shared::vfs::game_paths::GamePaths::new` (which takes the session id and gets
+     it from `HostRuntime::host_id`, so every platform is covered by the one
+     construction site) and by the Java `GamePaths` constructor. `/user`, `/cache`
+     and `/code` stay per game, because two sessions of one title are one save file.
+
+     **A directory level rather than a name suffix**, so the sweep below walks a
+     subtree that cannot reach the subpackage install store or the staging
+     directories that sit directly under the cache root — the same reason `/cache`
+     is a subdirectory rather than the root itself.
+
+     **The sweep and the empty-at-start guarantee are one mechanism, and ordering is
+     what makes it work.** `GameSession` sweeps every `tmp/` entry no live session
+     owns *before* creating its own directory. At that moment this session is not
+     yet registered — sessions are created on the main thread
+     (`ThreadCheck.ensureMainThread`) and registered as they are created, so every
+     *other* live session already is — which means a directory left at this id by a
+     session whose process died is swept as abandoned rather than inherited. Session
+     ids are a per-process counter from 1 (`registry.rs:352`), so a reused id is the
+     common case after an app kill, not a remote one. The same pass removes the loose
+     files a build from before the split left directly in `tmp/`.
+
+     Liveness is passed in as an `IntPredicate` rather than read from
+     `RuntimeRegistry` inside `GamePaths`: it keeps a path class free of runtime
+     state and it is what makes the sweep testable without a registry. `IntPredicate`
+     rather than a new nested interface because a new type in `com.migo.runtime`
+     lands in the frozen host-API baseline, and this one has no reason to be there
+     (minSdk is 26; `java.util.function` is already used across the SDK).
+
+     **`host-api-v0.txt` moved by exactly one line**, the constructor, updated
+     deliberately.
+
+     Proved by mutation, not assertion — every kill names the test:
+
+     | mutation | killed by |
+     |---|---|
+     | temp keyed by game only, as before | `closingOneSessionLeavesTheOtherSessionsTempFiles` (+4 more) |
+     | teardown deletes the whole temp root | the same case |
+     | the sweep spares a directory no live session owns | `theSweepRemovesTemporaryDirectoriesNoLiveSessionOwns` |
+     | the sweep keeps everything no session id claims | `theSweepRemovesTemporaryFilesFromBeforeTheSplit` |
+
+     A fifth mutation was written and discarded as equivalent: reporting a loose
+     file as owned by session `0` still deletes it, since `0` is not live either.
+     It was recorded as NOT DETECTED and replaced rather than counted.
+
+     Verified: `cargo test -p migo-shared -p migo-runtime-v8 --tests` (532 + 438 +
+     integration targets green), `cargo check -p migo-core -p migo-platform -p
+     migo-capi` clean, Java 201 per flavour in both product profiles, the
+     android-host-api and runtime-generation-fence contracts green. No
+     `cfg(target_os = "android")` code is involved — `GamePaths` has one
+     construction site and it is not target-gated — so the android compile lane
+     adds nothing here.
+
+     **What is left, honestly:** a session whose process dies leaves its temp
+     directory until some later session of that game sweeps it. That is strictly
+     better than before (the shared directory was never cleaned at start either) and
+     it is inside `cacheDir`, which the OS reclaims under pressure. `clean_temp()`
+     on the Rust side still has no caller, so on desktop nothing removes a temp
+     directory at session end; that was true before this change and is item 7's
+     neighbour rather than part of this one.
+
   2. **Three JNI exports have no `sessionId` at all** and resolve an Activity through
      `RuntimeRegistry.getAny()` (`RuntimeRegistry.java:56`, used at
      `NativeExports.java:588, 962, 1198`). `getSystemSettingInfoBytes` reads

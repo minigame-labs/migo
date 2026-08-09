@@ -845,11 +845,12 @@ impl HostJsRuntime {
         let (files_dir, cache_dir) = self.get_base_dirs();
 
         // Create GamePaths from base dirs + game_id
-        let game_paths = GamePaths::new(&files_dir, &cache_dir, &game_id).map_err(|e| {
-            EngineError::new(ErrorCode::InvalidArgument)
-                .with_msg("create game paths")
-                .with_detail(e.to_string())
-        })?;
+        let game_paths =
+            GamePaths::new(&files_dir, &cache_dir, &game_id, self.host_id).map_err(|e| {
+                EngineError::new(ErrorCode::InvalidArgument)
+                    .with_msg("create game paths")
+                    .with_detail(e.to_string())
+            })?;
 
         // Ensure directories exist
         game_paths.ensure_directories().map_err(|e| {

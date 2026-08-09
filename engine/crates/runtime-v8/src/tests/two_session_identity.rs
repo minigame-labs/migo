@@ -69,8 +69,12 @@ mod tests {
     /// than spelled out: the on-disk layout is `game_paths.rs`'s property and has
     /// its own tests, and repeating it here would make this test fail on a layout
     /// change while saying nothing about identity binding.
+    ///
+    /// The session id is arbitrary because only `code_dir` and `user_data_dir` are
+    /// read from the result, and neither is session-scoped — `/tmp` is the only
+    /// one that is.
     fn paths(files: &Path, cache: &Path, game_id: &str) -> GamePaths {
-        GamePaths::new(files, cache, game_id).expect("game paths")
+        GamePaths::new(files, cache, game_id, 1).expect("game paths")
     }
 
     /// A trivial entry module where `evaluate_module` will look for it. It must
