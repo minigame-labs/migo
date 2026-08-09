@@ -448,9 +448,11 @@ pub(crate) extern "system" fn init(
             .with_workers_path(workers_path)
             .with_prelude_scripts(prelude_scripts);
 
-        // Apply RuntimeConfig log level to the tracing subscriber.
-        logging::update_log_level(log_level);
-
+        // The session's level is published by its Host's registration, which has
+        // not happened yet: this session does not exist, so it has no level to speak
+        // with, and setting one process-wide here is exactly the last-writer-wins
+        // that let a new session silence a live one. The line below is emitted at
+        // the process default, or at whatever a live session already asked for.
         info!(
             "init: density={}, target_fps={}, debug={}, log_level={:?}",
             display_density,

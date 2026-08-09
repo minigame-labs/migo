@@ -6617,6 +6617,81 @@
      `LogLevel` that nothing on the Java side ever applies, and the Rust side is
      last-writer-wins: starting a second game with `logLevel=Off` silences the first
      game that was started with `Debug`. Two halves of one defect.
+
+     **Fixed 2026-08-09.** `shared::log_level` answers "which level applies to the
+     record this thread is about to emit" in three tiers, most specific first: the
+     **thread's session**, bound once at host-thread start; the **join over live
+     sessions** — the most verbose — for threads belonging to no session; and the
+     **process default** from the build type or from a C host that installs
+     diagnostics without ever creating a session.
+
+     **Why a join and not simply per-session.** A level arrives per session but the
+     sink does not: one logcat, one subscriber. A record can only be filtered by a
+     session's level if it can be attributed to that session. On the engine's host
+     thread it can, which is why that tier exists and is exact. On a shared thread —
+     the IO pool, a platform callback, the JNI caller — it cannot, and the safe
+     answer is the level of whichever session asked to see the most. Silence is the
+     answer that loses evidence, and evidence destroyed by an *unrelated* session is
+     the defect being fixed.
+
+     **The thread tier is what keeps it cheap, and the cost is documented in-tree.**
+     `log_throttle` measures `tracing` at ~300 bytes allocated per event. Without the
+     binding, a session configured `Off` would format and emit at another live
+     session's `Trace` — in its own game loop. With it, that session emits nothing
+     from its own thread. Reading the level costs a thread-local read plus, when
+     unbound, one relaxed atomic; the registry behind the join is locked only by
+     bring-up and teardown, which is the discipline the per-isolate console sink
+     already follows (`runtime-v8/src/console/mod.rs`, resolved once at bring-up for
+     exactly this reason).
+
+     **The lifetime is the Host's, so registration lives with the Host's.**
+     `register_sender` takes the level and `unregister_sender` retires it — every
+     path that retires a Host goes through that one function, so a session cannot
+     leak an entry that holds the join open for the rest of the process. That also
+     makes it platform-agnostic: one call site covers Android, Linux, Windows and
+     OHOS, and the Android-specific `logging::update_log_level(log_level)` at
+     `inbound.rs:452` is gone. A session that does not exist yet has no level to
+     speak with, which is what that line was asserting.
+
+     **The Java half had never been wired at all.** `Logger.setLogLevel` had zero
+     callers, so an embedder's configured level was ignored and every record was
+     filtered at the hardcoded `WARN`. Wiring it naively would have reproduced the
+     engine's defect here. It now registers per session and joins, and the twelve
+     level checks read one named accessor rather than the field directly — which is
+     what makes the cached value and the checks provably the same thing, and is
+     load-bearing rather than a test seam.
+
+     Java records carry one tag and no session id, so the thread tier has no
+     counterpart there and is not pretended at.
+
+     Proved by mutation, every kill naming its test:
+
+     | mutation | killed by |
+     |---|---|
+     | the join takes the least verbose level | `a_new_session_cannot_silence_an_existing_one` |
+     | registering overwrites one level for everybody | the same case |
+     | a closing session keeps holding the join open | `a_closing_session_stops_holding_the_join_open` |
+     | the thread binding is ignored on the event path | `a_thread_bound_to_a_session_uses_that_session_level` |
+     | re-registering adds a second entry | `re_registering_a_session_replaces_its_level_rather_than_adding_one` |
+     | Java: the level is the least verbose live session's | `aSecondSessionCannotSilenceALiveOne` (+3) |
+     | Java: registering assigns, as last-writer-wins did | the same case (+1) |
+     | Java: a closing session keeps holding the level open | `closingTheVerboseSessionLetsTheLevelComeBackDown` (+2) |
+     | Java: an unconfigured session is treated as most verbose | `aSessionWithNoConfiguredLevelGetsTheDefault` |
+
+     **The harness lied once, and the correction belongs here.** It first reported
+     all five Rust mutants as "killed by the type system", because cargo prints
+     `error: test failed` after a red suite and the harness matched that as a compile
+     error. Five of five caught by the compiler is not a credible result for a
+     `.min()` → `.max()` mutation, which is what prompted checking. Test failures are
+     now read before compile errors. A `TYPE SYSTEM` line that names no test is a
+     claim to distrust by default.
+
+     Verified: `cargo test -p migo-shared -p migo-runtime-v8 --tests`, `-p migo-core
+     --lib` (which is where three `register_sender` callers in `#[cfg(test)]` code
+     surfaced — the non-test build hid them), `-p migo-capi --lib`, `-p migo-platform
+     --lib`, `build-android-so.sh --compile-only arm64-v8a`, `fmt --check`, Java 207
+     per flavour in both profiles, and the r8-profile, android-host-api,
+     runtime-generation-fence and jni-outbound-signature gates.
   4. **Image decode has no per-Session partition** (`io/src/image_ops.rs:83-84` `SEM`,
      three permits, and `:160-161` `BUDGET`, 48 MB), while the sibling IO executor
      next door does per-host fair queuing. One game's `preload_images` over a large
