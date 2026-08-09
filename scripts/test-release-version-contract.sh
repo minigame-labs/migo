@@ -161,25 +161,54 @@ else:
 
 # A consumer is checked by what it *reads*, not by comparing a value: a script that
 # names the source cannot drift from it, and one that hardcodes a version cannot be
-# made to agree by anything but an edit. So the assertion is textual and the failure
-# names the source it should be reading.
+# made to agree by anything but an edit.
+#
+# The marker is the **assignment**, not the name of the reader, and it is searched
+# with comments stripped. Both of those were learned by watching the check fail to
+# fail: `migoReleaseVersion()` also appears in the helper's own definition and
+# `read_release_version` in the function body, so a call site replaced by a
+# hardcoded literal left the name in the file and the gate passed.
 DERIVES = {
     "platforms/android/library/build.gradle": (
-        "migoReleaseVersion()",
+        "versionName migoReleaseVersion()",
         "the AAR's `versionName`, which reaches an embedder through BuildInfo.VERSION",
     ),
-    "scripts/build-linux-sdk.sh": ("read_release_version", "the Linux SDK's CMake package files"),
-    "scripts/build-ohos-sdk.sh": ("read_release_version", "the HarmonyOS SDK's CMake package files"),
-    "scripts/build-windows-sdk.sh": ("read_release_version", "the Windows SDK's CMake package files"),
-    "scripts/build-android-sdk.sh": ("release/VERSION", "the Android C-API SDK's package metadata"),
+    "scripts/build-linux-sdk.sh": (
+        'VERSION="$(read_release_version "$REPO_ROOT")"',
+        "the Linux SDK's CMake package files",
+    ),
+    "scripts/build-ohos-sdk.sh": (
+        'MIGO_VERSION="$(read_release_version "$REPO_ROOT")"',
+        "the HarmonyOS SDK's CMake package files",
+    ),
+    "scripts/build-windows-sdk.sh": (
+        'VERSION="$(read_release_version "$REPO_ROOT")"',
+        "the Windows SDK's CMake package files",
+    ),
+    "scripts/build-android-sdk.sh": (
+        'SOURCE="$REPO_ROOT/release/VERSION"',
+        "the Android C-API SDK's package metadata",
+    ),
 }
+
+
+def code_only(text: str, relative: str) -> str:
+    """`text` with comment bodies blanked, so a mention is not a use."""
+    lines = []
+    for line in text.splitlines():
+        head = line.split("#", 1)[0] if relative.endswith(".sh") else line
+        if "//" in head:
+            head = head.split("//", 1)[0]
+        lines.append(head)
+    return "\n".join(lines)
+
 
 for relative, (marker, what) in sorted(DERIVES.items()):
     path = root / relative
     if not path.is_file():
         errors.append(f"{relative} not found; it writes {what} and this gate cannot check it")
         continue
-    if marker not in path.read_text(encoding="utf-8"):
+    if marker not in code_only(path.read_text(encoding="utf-8"), relative):
         errors.append(
             f"{relative} no longer reads the release version (`{marker}` is gone). It "
             f"writes {what}, so whatever it uses instead is what ships"
@@ -193,7 +222,11 @@ for relative, (marker, what) in sorted(DERIVES.items()):
 # `org.pitest:pitest:1.16.1`) and bumping one is routine. An allowlist of those
 # would need editing every time a dependency moved, and a gate that has to be
 # edited to stay green is a gate people edit without reading.
-LITERAL = re.compile(r'(?<![\w.-])\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?![\w.-])')
+# The lookbehind excludes `\w` and `.` so a match cannot start inside a longer
+# token, but deliberately NOT `-`: in `${MIGO_VERSION:-0.1.0}` the character
+# before the number is a dash, and excluding it let exactly the fallback this
+# gate exists to forbid pass unnoticed.
+LITERAL = re.compile(r'(?<![\w.])\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?![\w.-])')
 SETS_A_VERSION = re.compile(r"version", re.I)
 ALLOWED_LITERALS = {
     # Gradle's fallback for a task that reads a `versionName` which is somehow unset.
