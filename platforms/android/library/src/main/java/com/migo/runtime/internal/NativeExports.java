@@ -772,16 +772,16 @@ public final class NativeExports {
      *
      * @param sessionId The session ID to receive the callback
      */
-    public static void openSystemBluetoothSetting(int sessionId) {
+    public static void openSystemBluetoothSetting(int sessionId, int requestId) {
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onBluetoothSettingResult(sessionId, false);
+            NativeMethods.onBluetoothSettingResult(sessionId, requestId, false);
             return;
         }
 
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onBluetoothSettingResult(sessionId, false);
+            NativeMethods.onBluetoothSettingResult(sessionId, requestId, false);
             return;
         }
 
@@ -792,10 +792,10 @@ public final class NativeExports {
                         android.bluetooth.BluetoothAdapter adapter =
                                 android.bluetooth.BluetoothAdapter.getDefaultAdapter();
                         boolean enabled = adapter != null && adapter.isEnabled();
-                        NativeMethods.onBluetoothSettingResult(sessionId, enabled);
+                        NativeMethods.onBluetoothSettingResult(sessionId, requestId, enabled);
                     });
         } catch (Exception e) {
-            NativeMethods.onBluetoothSettingResult(sessionId, false);
+            NativeMethods.onBluetoothSettingResult(sessionId, requestId, false);
         }
     }
 
@@ -804,16 +804,16 @@ public final class NativeExports {
      *
      * @param sessionId The session ID to receive the callback
      */
-    public static void openAppAuthorizeSetting(int sessionId) {
+    public static void openAppAuthorizeSetting(int sessionId, int requestId) {
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, -1);
             return;
         }
 
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, -1);
             return;
         }
 
@@ -823,9 +823,9 @@ public final class NativeExports {
             intent.setData(uri);
             ResultProxyActivity.launch(activity, intent, APP_AUTHORIZE_SETTING_REQUEST_CODE,
                     (requestCode, resultCode, data) ->
-                            NativeMethods.onAppAuthorizeSettingResult(sessionId, 0));
+                            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, 0));
         } catch (Exception e) {
-            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, -1);
         }
     }
 
@@ -1090,14 +1090,17 @@ public final class NativeExports {
      * @param json      JSON params: {title, content, showCancel, cancelText, confirmText, cancelColor, confirmColor}
      */
     public static void showModal(int sessionId, String json) {
+        // Bound before anything can fail, so a refusal still answers the call
+        // that asked rather than the oldest one waiting.
+        final int requestId = CallbackCorrelation.requestIdOf(json);
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onModalResult(sessionId, 0, 1);
+            NativeMethods.onModalResult(sessionId, requestId, 0, 1);
             return;
         }
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onModalResult(sessionId, 0, 1);
+            NativeMethods.onModalResult(sessionId, requestId, 0, 1);
             return;
         }
         InteractionUI.showModal(activity, sessionId, json);
@@ -1137,14 +1140,15 @@ public final class NativeExports {
      * @param json      JSON params: {alertText, itemList, itemColor}
      */
     public static void showActionSheet(int sessionId, String json) {
+        final int requestId = CallbackCorrelation.requestIdOf(json);
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onActionSheetResult(sessionId, -1);
+            NativeMethods.onActionSheetResult(sessionId, requestId, -1);
             return;
         }
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onActionSheetResult(sessionId, -1);
+            NativeMethods.onActionSheetResult(sessionId, requestId, -1);
             return;
         }
         InteractionUI.showActionSheet(activity, sessionId, json);

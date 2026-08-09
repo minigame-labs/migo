@@ -25,8 +25,8 @@ mod runtime_restart_boundary_tests {
     use shared::op_state::{AudioSender, HostOpState, NetworkPolicy};
     use shared::render_command_sender::CommandSender;
     use shared::services::{
-        AdService, CommerceServices, ConnectivityServices, DeviceServices, MediaServices,
-        SensorServices, SystemUtilServices,
+        AdService, CommerceServices, ConnectivityServices, InteractionService, MediaServices,
+        SensorServices, SystemInfoService, SystemUtilServices,
     };
 
     /// A host that only claims to do advertising, refusing every command.
@@ -40,11 +40,55 @@ mod runtime_restart_boundary_tests {
     struct HostedAdService;
     impl AdService for HostedAdService {}
 
+    /// A host that accepts every dialog and settings request and answers none.
+    ///
+    /// Accepting is the point: an op that fails takes `invoke`'s executor
+    /// `catch`, which settles the promise and removes the pending entry, so a
+    /// refusing host leaves nothing to correlate. Answering nothing is also the
+    /// point — the tests deliver the results themselves, in the order they
+    /// choose.
+    struct AcceptingUiService;
+    impl InteractionService for AcceptingUiService {
+        fn show_modal(&self, _json: &str) -> Result<(), shared::protocol::error::ServiceError> {
+            Ok(())
+        }
+
+        fn show_action_sheet(
+            &self,
+            _json: &str,
+        ) -> Result<(), shared::protocol::error::ServiceError> {
+            Ok(())
+        }
+    }
+    impl SystemInfoService for AcceptingUiService {
+        fn open_bluetooth_settings(
+            &self,
+            _request_id: i32,
+        ) -> Result<(), shared::protocol::error::ServiceError> {
+            Ok(())
+        }
+
+        fn open_app_authorize_setting(
+            &self,
+            _request_id: i32,
+        ) -> Result<(), shared::protocol::error::ServiceError> {
+            Ok(())
+        }
+    }
+
     struct AdOnlyServices;
     impl SensorServices for AdOnlyServices {}
     impl MediaServices for AdOnlyServices {}
     impl ConnectivityServices for AdOnlyServices {}
-    impl SystemUtilServices for AdOnlyServices {}
+    impl SystemUtilServices for AdOnlyServices {
+        fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
+            Some(Arc::new(AcceptingUiService))
+        }
+
+        fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
+            Some(Arc::new(AcceptingUiService))
+        }
+    }
     impl CommerceServices for AdOnlyServices {
         fn ad(&self) -> Option<Arc<dyn AdService>> {
             Some(Arc::new(HostedAdService))
@@ -126,6 +170,15 @@ mod runtime_restart_boundary_tests {
                     { success: function () { globalThis.__settled.push(tag); } },
                     function (_opts, id) { globalThis.__ids.push(id); },
                 ).catch(function () {});
+            };
+            // Results arrive through the host bridge, not through a global: the
+            // `_internalOn*` names are retired from `globalThis` by hardening
+            // and travel by handle. Going through the real dispatcher also puts
+            // the argument encoding under test -- these hooks are called with
+            // exactly the JSON array `hook_args_two`/`hook_args_three` build.
+            globalThis.__hook = function (name, args) {
+                globalThis[Symbol.for('Migo.hostBridge')]
+                    ._internalDispatch(name, JSON.stringify(args));
             };
             "#,
         );
@@ -328,11 +381,129 @@ mod runtime_restart_boundary_tests {
                 'wx.createRewardedVideoAd',
                 wx.createRewardedVideoAd && function () { return wx.createRewardedVideoAd({ adUnitId: 'x' }); },
             );
+            // The UI results that had no id at all until now: each settled by
+            // `shift()` on its own array, so nothing about them was correlated.
+            __assertTakesOneId('wx.showModal', wx.showModal && function () { return wx.showModal({}); });
+            __assertTakesOneId(
+                'wx.showActionSheet',
+                wx.showActionSheet && function () { return wx.showActionSheet({ itemList: ['a'] }); },
+            );
+            __assertTakesOneId(
+                'wx.openAppAuthorizeSetting',
+                wx.openAppAuthorizeSetting && function () { return wx.openAppAuthorizeSetting({}); },
+            );
+            // `_timeout: 0` because this one keeps `createDeferredApi`'s default
+            // 30s auto-reject, and scheduling a timer in a harness with no Tokio
+            // reactor aborts the process instead of failing a test.
+            __assertTakesOneId(
+                'wx.openSystemBluetoothSetting',
+                wx.openSystemBluetoothSetting
+                    && function () { return wx.openSystemBluetoothSetting({ _timeout: 0 }); },
+            );
             "#,
         );
 
         // At least one had to be present, or the test proved nothing at all.
         assert_js(&mut rt, "__checked.length > 0");
+    }
+
+    #[test]
+    fn two_modals_settle_by_id_even_when_answered_out_of_order() {
+        // These used to be an array settled by `shift()`, so the first result
+        // answered the first call whatever it was actually a result for. A host
+        // that answers two dialogs in the order the user dismissed them -- not
+        // the order they were raised -- settled each with the other's outcome.
+        //
+        // Settlement is observed through `success`/`fail`, which
+        // `createDeferredApi` invokes synchronously, so this needs no event
+        // loop turn and nothing settles on a clock.
+        let mut rt = boot(Arc::new(CallbackIdAllocator::default()));
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__out = [];
+            // Slim does not ship the UI APIs, and a test that requires one is a
+            // test that asserts the product configuration. The Full lane runs
+            // the scenario; this records which lane did, so a skip cannot be
+            // read as a pass.
+            globalThis.__ran = typeof showModal === 'function';
+            if (__ran) {
+                const base = globalThis.__allocId();
+                showModal({ success: function (r) { __out.push('first:' + r.confirm); } })
+                    .catch(function () {});
+                showModal({ success: function (r) { __out.push('second:' + r.confirm); } })
+                    .catch(function () {});
+
+                // Second one first, by its own id.
+                __hook('_internalOnModalResult', [base + 2, 1, 0]);
+                __hook('_internalOnModalResult', [base + 1, 0, 1]);
+            }
+            "#,
+        );
+
+        assert_js(
+            &mut rt,
+            "!__ran || __out.join('|') === 'second:true|first:false'",
+        );
+    }
+
+    #[test]
+    fn an_action_sheet_result_reaches_its_own_call_and_an_unknown_id_reaches_none() {
+        let mut rt = boot(Arc::new(CallbackIdAllocator::default()));
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__out = [];
+            globalThis.__ran = typeof showActionSheet === 'function';
+            if (__ran) {
+                const base = globalThis.__allocId();
+                showActionSheet({
+                    itemList: ['a'],
+                    success: function (r) { __out.push('first:' + r.tapIndex); },
+                    fail: function () { __out.push('first:cancel'); },
+                }).catch(function () {});
+                showActionSheet({
+                    itemList: ['b'],
+                    success: function (r) { __out.push('second:' + r.tapIndex); },
+                    fail: function () { __out.push('second:cancel'); },
+                }).catch(function () {});
+
+                // An id neither call holds settles neither, not the oldest.
+                __hook('_internalOnActionSheetResult', [base + 99, 0]);
+                __hook('_internalOnActionSheetResult', [base + 2, -1]);
+                __hook('_internalOnActionSheetResult', [base + 1, 3]);
+            }
+            "#,
+        );
+
+        assert_js(
+            &mut rt,
+            "!__ran || __out.join('|') === 'second:cancel|first:3'",
+        );
+    }
+
+    #[test]
+    fn a_ui_result_carrying_no_id_still_settles_through_the_fallback() {
+        // The id crosses this boundary as an integer, and an integer cannot be
+        // absent -- the platform says "no id" by sending 0. If that 0 were
+        // written into the result the settler would read it as present and
+        // invalid and discard the reply, which is worse than the fallback:
+        // nothing would ever settle the call.
+        let mut rt = boot(Arc::new(CallbackIdAllocator::default()));
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__out = [];
+            globalThis.__ran = typeof openAppAuthorizeSetting === 'function';
+            if (__ran) {
+                openAppAuthorizeSetting({ success: function () { __out.push('ok'); } })
+                    .catch(function () {});
+                __hook('_internalOnOpenAppAuthorizeSettingFinished', [0, 0]);
+            }
+            "#,
+        );
+
+        assert_js(&mut rt, "!__ran || __out.join('|') === 'ok'");
     }
 
     #[test]

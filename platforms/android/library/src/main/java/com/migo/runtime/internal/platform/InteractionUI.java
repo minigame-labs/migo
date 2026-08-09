@@ -23,6 +23,7 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
+import com.migo.runtime.internal.CallbackCorrelation;
 import com.migo.runtime.internal.NativeMethods;
 
 import org.json.JSONObject;
@@ -120,6 +121,10 @@ public final class InteractionUI {
     // ==================== Modal ====================
 
     public static void showModal(final Activity activity, final int sessionId, final String json) {
+        // Bound before the parse, not inside it: a malformed options string
+        // still has to answer the request that sent it, and `requestIdOf`
+        // reads ABSENT rather than throwing.
+        final int requestId = CallbackCorrelation.requestIdOf(json);
         sHandler.post(() -> {
             try {
                 JSONObject params = new JSONObject(json);
@@ -131,21 +136,21 @@ public final class InteractionUI {
                 String cancelColor = params.optString("cancelColor", "#000000");
                 String confirmColor = params.optString("confirmColor", "#576B95");
 
-                showModalDialog(activity, sessionId, title, content, showCancel,
+                showModalDialog(activity, sessionId, requestId, title, content, showCancel,
                         cancelText, confirmText, cancelColor, confirmColor);
             } catch (Exception e) {
                 // Report cancel on error
-                NativeMethods.onModalResult(sessionId, 0, 1);
+                NativeMethods.onModalResult(sessionId, requestId, 0, 1);
             }
         });
     }
 
-    private static void showModalDialog(Activity activity, int sessionId,
+    private static void showModalDialog(Activity activity, int sessionId, int requestId,
                                          String title, String content, boolean showCancel,
                                          String cancelText, String confirmText,
                                          String cancelColor, String confirmColor) {
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-            NativeMethods.onModalResult(sessionId, 0, 1);
+            NativeMethods.onModalResult(sessionId, requestId, 0, 1);
             return;
         }
 
@@ -196,13 +201,13 @@ public final class InteractionUI {
 
         // Confirm button
         builder.setPositiveButton(confirmText, (dialog, which) ->
-                NativeMethods.onModalResult(sessionId, 1, 0)
+                NativeMethods.onModalResult(sessionId, requestId, 1, 0)
         );
 
         // Cancel button
         if (showCancel) {
             builder.setNegativeButton(cancelText, (dialog, which) ->
-                    NativeMethods.onModalResult(sessionId, 0, 1)
+                    NativeMethods.onModalResult(sessionId, requestId, 0, 1)
             );
         }
 
@@ -224,6 +229,7 @@ public final class InteractionUI {
     // ==================== Action Sheet ====================
 
     public static void showActionSheet(final Activity activity, final int sessionId, final String json) {
+        final int requestId = CallbackCorrelation.requestIdOf(json);
         sHandler.post(() -> {
             try {
                 JSONObject params = new JSONObject(json);
@@ -236,17 +242,17 @@ public final class InteractionUI {
                     items[i] = itemArray.getString(i);
                 }
 
-                showActionSheetDialog(activity, sessionId, alertText, items, itemColor);
+                showActionSheetDialog(activity, sessionId, requestId, alertText, items, itemColor);
             } catch (Exception e) {
-                NativeMethods.onActionSheetResult(sessionId, -1);
+                NativeMethods.onActionSheetResult(sessionId, requestId, -1);
             }
         });
     }
 
-    private static void showActionSheetDialog(Activity activity, int sessionId,
+    private static void showActionSheetDialog(Activity activity, int sessionId, int requestId,
                                                String alertText, String[] items, String itemColor) {
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-            NativeMethods.onActionSheetResult(sessionId, -1);
+            NativeMethods.onActionSheetResult(sessionId, requestId, -1);
             return;
         }
 
@@ -326,7 +332,7 @@ public final class InteractionUI {
 
             itemView.setOnClickListener(v -> {
                 removeOverlay(activity, root);
-                NativeMethods.onActionSheetResult(sessionId, index);
+                NativeMethods.onActionSheetResult(sessionId, requestId, index);
             });
 
             itemsGroup.addView(itemView, new LinearLayout.LayoutParams(
@@ -367,7 +373,7 @@ public final class InteractionUI {
 
         cancelBtn.setOnClickListener(v -> {
             removeOverlay(activity, root);
-            NativeMethods.onActionSheetResult(sessionId, -1);
+            NativeMethods.onActionSheetResult(sessionId, requestId, -1);
         });
 
         bottomContainer.addView(cancelBtn, new LinearLayout.LayoutParams(
@@ -379,7 +385,7 @@ public final class InteractionUI {
         // Tap on background to cancel
         root.setOnClickListener(v -> {
             removeOverlay(activity, root);
-            NativeMethods.onActionSheetResult(sessionId, -1);
+            NativeMethods.onActionSheetResult(sessionId, requestId, -1);
         });
 
         // Prevent click-through on bottom container

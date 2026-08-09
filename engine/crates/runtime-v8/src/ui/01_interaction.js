@@ -6,7 +6,7 @@ import {
     op_hide_loading,
     op_show_action_sheet,
 } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createDeferredApi } from "ext:host_v8_base/02_async.js";
 
 // ==================== Toast (Mode A) ====================
 
@@ -28,51 +28,45 @@ function hideToast(options) {
     }, options);
 }
 
-// ==================== Modal (FIFO queue + Promise) ====================
+// ==================== Modal (correlated by request id) ====================
 
-var _pendingModals = [];
+// The same `createDeferredApi` every other deferred API uses, rather than a
+// fourth hand-rolled pending registry. This one settled by `shift()` on an
+// array, so with two dialogs queued the first result answered whichever call
+// arrived first -- and a host that answers out of order, or a runtime restart
+// between them, made that the wrong one. Timeout disabled: a modal legitimately
+// waits for a person, and rejecting one on a clock is not this change's job.
+const _modalApi = createDeferredApi('showModal', 0);
 
 function showModal(options) {
     var opts = options || {};
-    var success = typeof opts.success === 'function' ? opts.success : null;
-    var fail = typeof opts.fail === 'function' ? opts.fail : null;
-    var complete = typeof opts.complete === 'function' ? opts.complete : null;
-
-    return new Promise(function (resolve, reject) {
-        _pendingModals.push({ success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
-
-        try {
-            op_show_modal(JSON.stringify({
-                title: opts.title || '',
-                content: opts.content || '',
-                showCancel: opts.showCancel !== false,
-                cancelText: opts.cancelText || '\u53d6\u6d88',
-                confirmText: opts.confirmText || '\u786e\u5b9a',
-                cancelColor: opts.cancelColor || '#000000',
-                confirmColor: opts.confirmColor || '#576B95',
-            }));
-        } catch (e) {
-            _pendingModals.pop();
-            var res = { errMsg: 'showModal:fail ' + e.message };
-            if (fail) fail(res);
-            if (complete) complete(res);
-            reject(res);
-        }
+    return _modalApi.invoke(opts, function (o, requestId) {
+        op_show_modal(JSON.stringify({
+            requestId: requestId,
+            title: o.title || '',
+            content: o.content || '',
+            showCancel: o.showCancel !== false,
+            cancelText: o.cancelText || '\u53d6\u6d88',
+            confirmText: o.confirmText || '\u786e\u5b9a',
+            cancelColor: o.cancelColor || '#000000',
+            confirmColor: o.confirmColor || '#576B95',
+        }));
     });
 }
 
-function _internalOnModalResult(confirm, cancel) {
-    var pending = _pendingModals.shift();
-    if (!pending) return;
-
-    var res = {
-        confirm: !!confirm,
-        cancel: !!cancel,
-        errMsg: 'showModal:ok',
-    };
-    if (pending.success) pending.success(res);
-    if (pending.complete) pending.complete(res);
-    pending.resolve(res);
+// The platform hands these back as integers over JNI, so there is no JSON to
+// parse -- the object is built here and correlated by the same rule.
+//
+// A non-positive id is *omitted* rather than passed through, and that is the
+// whole reason this is not a one-liner: an integer parameter cannot be absent
+// the way a JSON key can, so the platform signals "this request carried no id"
+// with 0. Writing that 0 into the result would make the settler read it as
+// present-and-invalid and discard the reply, losing the FIFO fallback that is
+// the only thing left to settle it.
+function _internalOnModalResult(requestId, confirm, cancel) {
+    var result = { confirm: !!confirm, cancel: !!cancel };
+    if (requestId > 0) result.requestId = requestId;
+    _modalApi.settleParsed(result);
 }
 
 // ==================== Loading (Mode A) ====================
@@ -93,50 +87,32 @@ function hideLoading(options) {
     }, options);
 }
 
-// ==================== Action Sheet (FIFO queue + Promise) ====================
+// ==================== Action Sheet (correlated by request id) ====================
 
-var _pendingActionSheets = [];
+const _actionSheetApi = createDeferredApi('showActionSheet', 0);
 
 function showActionSheet(options) {
     var opts = options || {};
-    var success = typeof opts.success === 'function' ? opts.success : null;
-    var fail = typeof opts.fail === 'function' ? opts.fail : null;
-    var complete = typeof opts.complete === 'function' ? opts.complete : null;
-
-    return new Promise(function (resolve, reject) {
-        _pendingActionSheets.push({ success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
-
-        try {
-            op_show_action_sheet(JSON.stringify({
-                alertText: opts.alertText || '',
-                itemList: opts.itemList || [],
-                itemColor: opts.itemColor || '#000000',
-            }));
-        } catch (e) {
-            _pendingActionSheets.pop();
-            var res = { errMsg: 'showActionSheet:fail ' + e.message };
-            if (fail) fail(res);
-            if (complete) complete(res);
-            reject(res);
-        }
+    return _actionSheetApi.invoke(opts, function (o, requestId) {
+        op_show_action_sheet(JSON.stringify({
+            requestId: requestId,
+            alertText: o.alertText || '',
+            itemList: o.itemList || [],
+            itemColor: o.itemColor || '#000000',
+        }));
     });
 }
 
-function _internalOnActionSheetResult(tapIndex) {
-    var pending = _pendingActionSheets.shift();
-    if (!pending) return;
-
-    if (tapIndex < 0) {
-        var res = { errMsg: 'showActionSheet:fail cancel' };
-        if (pending.fail) pending.fail(res);
-        if (pending.complete) pending.complete(res);
-        pending.reject(res);
-    } else {
-        var res = { tapIndex: tapIndex, errMsg: 'showActionSheet:ok' };
-        if (pending.success) pending.success(res);
-        if (pending.complete) pending.complete(res);
-        pending.resolve(res);
-    }
+function _internalOnActionSheetResult(requestId, tapIndex) {
+    // A negative index is the cancellation, and `error` is what makes the
+    // shared settler take the fail/reject path -- the same wording content
+    // received before. The id is omitted when non-positive, for the reason
+    // spelled out above `_internalOnModalResult`.
+    var result = tapIndex < 0
+        ? { error: 'showActionSheet:fail cancel' }
+        : { tapIndex: tapIndex };
+    if (requestId > 0) result.requestId = requestId;
+    _actionSheetApi.settleParsed(result);
 }
 
 export {

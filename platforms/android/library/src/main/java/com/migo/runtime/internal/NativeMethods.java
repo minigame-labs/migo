@@ -456,11 +456,13 @@ public final class NativeMethods {
      * Callback for Bluetooth setting result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param enabled   Whether Bluetooth is now enabled
      */
-    public static void onBluetoothSettingResult(int sessionId, boolean enabled) {
+    public static void onBluetoothSettingResult(int sessionId, int requestId, boolean enabled) {
         if (sessionId >= 0) {
-            NativeBridge.onOpenSystemBluetoothSetting(sessionId, enabled ? 1 : 0);
+            NativeBridge.onOpenSystemBluetoothSetting(sessionId, requestId, enabled ? 1 : 0);
         }
     }
 
@@ -468,11 +470,13 @@ public final class NativeMethods {
      * Callback for app authorization setting result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param code      0 on success, negative on failure
      */
-    public static void onAppAuthorizeSettingResult(int sessionId, int code) {
+    public static void onAppAuthorizeSettingResult(int sessionId, int requestId, int code) {
         if (sessionId >= 0) {
-            NativeBridge.onOpenAppAuthorizeSetting(sessionId, code);
+            NativeBridge.onOpenAppAuthorizeSetting(sessionId, requestId, code);
         }
     }
 
@@ -480,12 +484,14 @@ public final class NativeMethods {
      * Callback for modal dialog result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param confirm   1 if user tapped confirm, 0 otherwise
      * @param cancel    1 if user tapped cancel, 0 otherwise
      */
-    public static void onModalResult(int sessionId, int confirm, int cancel) {
+    public static void onModalResult(int sessionId, int requestId, int confirm, int cancel) {
         if (sessionId >= 0) {
-            NativeBridge.onModalResult(sessionId, confirm, cancel);
+            NativeBridge.onModalResult(sessionId, requestId, confirm, cancel);
         }
     }
 
@@ -493,11 +499,13 @@ public final class NativeMethods {
      * Callback for action sheet result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
      */
-    public static void onActionSheetResult(int sessionId, int tapIndex) {
+    public static void onActionSheetResult(int sessionId, int requestId, int tapIndex) {
         if (sessionId >= 0) {
-            NativeBridge.onActionSheetResult(sessionId, tapIndex);
+            NativeBridge.onActionSheetResult(sessionId, requestId, tapIndex);
         }
     }
 

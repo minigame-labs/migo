@@ -819,29 +819,149 @@
   counters while every host suite reports the new behaviour. Same class as task 3's
   note; the regeneration round still belongs last.
 
-  **Task 5's UI half is surveyed and not started, and the survey is the useful
-  part.** `showModal`, `showActionSheet` and `openAppAuthorizeSetting` push onto
-  arrays and settle with `shift()`; none sends an id, so this is genuinely task 5's
-  work and not task 6's. `openSystemBluetoothSetting` is different and easier: it
-  already uses `createDeferredApi` and is *handed* a `requestId` in its invoke
-  callback, then calls `op_open_system_bluetooth_setting()` without it — a task-6
-  shape hiding in task 5's list. The blast radius is smaller than the file list
-  suggests: **only Android implements any of these four service methods**
-  (`platform/src/android/services/mod.rs:579,591,603,607`); every other platform
-  takes the trait default. The JNI descriptors that must widen with it are pinned
-  at `profile_contract.rs:151-152`, which fails loudly if one side moves alone.
+  **Task 5's UI half done 2026-08-09, and Task 6's `InteractionUI` half falls out
+  of it.** Modal, action sheet, application-authorisation settings and the system
+  Bluetooth setting now correlate by request id end to end: JavaScript allocates
+  it, the platform carries it, and every result names the call it answers.
+
+  * **The best part of this change is what it deleted.** Modal, action sheet and
+    app-authorise each kept their own `_pending*` **array** settled by `shift()`,
+    which is not weak correlation — it is *no* correlation: the first result
+    answered the first call whatever it was a result for. All three now use
+    `createDeferredApi`, the same factory every other deferred API uses, so there
+    is **one** settlement implementation instead of four. They inherit its strict
+    id parsing, its `_settleEntry` conventions and its perf logging for free.
+    Timeout is passed as `0` for all three: a modal waits for a person, and
+    inheriting the 30-second auto-reject would have been a behaviour change
+    smuggled in by a refactor.
+  * **`settleParsed` is why that reuse is honest.** These results cross JNI as
+    *integers* — a modal's confirm/cancel, an action sheet's tap index — so there
+    is no JSON. Stringifying them just so `settle` could parse them back would
+    have made the encoding exist only to be undone. `settle(json)` is now
+    `settleParsed(JSON.parse(json))`, and the hooks build the object directly.
+  * **`openSystemBluetoothSetting` was a task-6 shape hiding in task 5's list.**
+    It already used `createDeferredApi` and was already *handed* a `requestId` in
+    its invoke callback — and then called `op_open_system_bluetooth_setting()`
+    without it. Every result came back bare and settled the oldest pending
+    request. One argument.
+
+  **The hazard this change had to invent an answer for: an integer cannot be
+  absent.** `CallbackCorrelation`'s rule is *absent stays absent* — a request with
+  no id gets a reply with no `requestId` **key**, because a key present and
+  invalid is discarded where a missing key still reaches the fallback. That works
+  for JSON results. These four cross the boundary as `int`, and an `int` has no
+  "missing": the platform says *no id* by sending `0`. Writing that `0` into the
+  result object would have made the settler discard the reply and settle nothing,
+  ever. So each hook **omits** the key when the id is not positive, and
+  `onOpenSystemBluetoothSetting`'s Rust-built JSON does the same. This is the one
+  place in the correlation work where the two boundaries do not have the same
+  shape, and it is the one that would have shipped silently: the reply simply
+  never arrives.
+
+  **Mutation evidence — one mutant per *direction* of the rule, because a guard
+  that only covers the side it was designed for is this ledger's recurring trap.**
+
+  | mutant | killed by | and left green |
+  |---|---|---|
+  | modal ignores the id (FIFO again) | `two_modals_settle_by_id_even_when_answered_out_of_order` | `a_ui_result_carrying_no_id_still_settles_through_the_fallback` |
+  | app-authorise stamps an id that is not one | `a_ui_result_carrying_no_id_still_settles_through_the_fallback` | `two_modals_settle_by_id…` |
+
+  Each mutant fails exactly one test and leaves the other's green, which is what
+  makes the pair discriminating rather than two names for one assertion. Restored
+  from copies, `sha256sum` verified.
+
+  **The tests go through the real host bridge, and that was not the first
+  attempt.** Calling `_internalOnModalResult(...)` directly failed with *"is not
+  defined"*: the `_internalOn*` names are retired from `globalThis` by
+  `harden_global_scope` and travel by handle — the property
+  `test-host-bridge-channel-contract.sh` pins. Routing through
+  `globalThis[Symbol.for('Migo.hostBridge')]._internalDispatch(name, json)`
+  instead is strictly better evidence: it puts the **argument encoding** under
+  test too, since the hooks receive exactly the JSON array `hook_args_two` and the
+  new `hook_args_three` build.
+
+  **A second harness abort, same cause as the ad one and worth the pattern.**
+  `openSystemBluetoothSetting` keeps `createDeferredApi`'s default 30-second
+  auto-reject, so probing it scheduled a `setTimeout`, and a timer in a harness
+  with no Tokio reactor **aborts the process** — the failure that cannot unwind,
+  which discards every other test's output including the three real failures it
+  was hiding. The probe passes `_timeout: 0`. Rule of thumb for this harness: any
+  API that can schedule a timer needs the timer disabled or a hosted service that
+  stops it being scheduled.
+
+  **Six JNI descriptors widened on both sides at once**, `(III)V` → `(IIII)V` for
+  `onModalResult` and `(II)V` → `(III)V` for the other three inbound hooks, plus
+  `(I)V` → `(II)V` for the two `NativeExports` entry points. Verified against the
+  **compiled bytecode** rather than against the source that was just edited:
+  `javap -s` on `fullDebug` reports exactly the six descriptors
+  `profile_contract.rs` now pins. The frozen host API v0 is untouched because
+  `NativeExports` lives in `internal`, which that gate excludes by design.
+
+  ⚠️ **Correction to this entry's earlier claim, and it matters for the next
+  change of this shape.** It said `profile_contract.rs` "fails loudly if one side
+  widens alone". It does — but at **engine startup on a device**, not in any local
+  gate. `register_native_methods` and `get_static_method_id` are both fail-closed
+  and name the offending method and signature, so a one-sided edit cannot ship
+  silently; it simply is not caught here. There is **no general Java-vs-Rust
+  descriptor gate**: `test-camera-frame-jni-contract.sh`,
+  `test-input-transport-contract.sh` and `test-surface-attachment-contract.sh`
+  each do this for their own concern, and nothing covers the other ~70 methods.
+  **The gate worth building** (a tooling item, not A9): have Rust *emit*
+  `active_methods` for the profile it was compiled with — so the cfg gating is
+  never restated in a script, which is how it would drift — and compare that
+  emission to `javap` for both flavours. This session's evidence for why is
+  direct: six descriptors were changed by hand across two languages and only a
+  manual `javap` read confirmed them.
+
+  **The FIFO fallback stays, and its reason has changed rather than expired.** It
+  is no longer "Android does not echo" — Android now echoes on every path. What is
+  unverified is whether any *other* host can produce an id-less deferred result at
+  all. The evidence so far says probably not: Linux, Windows and the C ABI host
+  provide no `interaction()` service, and take the trait default for both
+  `SystemInfoService` methods, so those ops fail synchronously and never leave a
+  pending entry for a platform result to reach. Settling that for **every**
+  `createDeferredApi` user on every platform is the audit that makes the fallback
+  deletable, and payment's two Midas branches need their own answer because
+  payment is in nobody's echo list. Deleting on today's evidence would trade a
+  wrong settle for a promise that never settles.
+
+  **The Slim lane caught the same mistake this ledger already records once, and
+  that is worth noticing.** The first version of all three tests called
+  `showModal` / `showActionSheet` / `openAppAuthorizeSetting` unguarded, and Slim
+  does not ship them (`api-system` gates `host_v8_ui`): three FAILs on a change
+  that was correct. Item 0.9's task-4 entry records the identical shape — a test
+  requiring a fixed id total that Slim's missing `requestMidasPayment` broke. The
+  fix is the same one: run the scenario only where the API exists, and record in
+  `__ran` which lane did, so a skip cannot be read as a pass. **A profile-gated
+  API is never safe to name unguarded in a test**, and the Full/Slim pair is what
+  makes the skip honest rather than vacuous.
+
+  Suites: `runtime_restart_boundary` 9 from 6 — three new cases covering
+  out-of-order settlement, an unknown id settling nothing, and the id-less
+  fallback — and four more families in the host-space probe (`wx.showModal`,
+  `wx.showActionSheet`, `wx.openAppAuthorizeSetting`,
+  `wx.openSystemBluetoothSetting`). Java 168 per flavour, unchanged and green.
+
+  Closing gate over the final state (18 files in scope): **14 host steps, 23
+  contract gates, `android compile` (arm64-v8a) and `android-java compile` PASS,
+  `verified for every target this change touches`** — both profiles on all four
+  Rust crates, and `test-host-bridge-channel-contract` green, which is the gate
+  that owns the handle-not-global property these tests had to route through.
+
+  ⚠️ Four more snapshot-embedded JS files carry behaviour the snapshot does not:
+  `base/02_async.js`, `ui/01_interaction.js`, `system/02_authorize.js`,
+  `system/01_bluetooth.js`. The regeneration round still belongs last.
 
   **Tasks 7–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
   them before invoking JavaScript: that is Task 7's rejection and Task 10's
   unpublished candidate. Until then this is plumbing that changes no behaviour.
 
-  **"A half-migrated correlation registry is worse than an unmigrated one" is why
-  task 5 stops where it does.** Its resource half is whole: every counter that
-  named a host-owned object is gone, and nothing correlates by two schemes at
-  once. Its UI half is untouched rather than begun — modal, action sheet and
-  app-authorize settle by `shift()` exactly as they always did. That is a seam,
-  not a half-migration: the two halves share no registry.
+  **"A half-migrated correlation registry is worse than an unmigrated one" no
+  longer applies: task 5 is whole.** Every counter that named a host-owned object
+  is gone, every id-less UI result now carries one, and nothing correlates by two
+  schemes at once. Task 6 is whole with it — its `InteractionUI` half was always
+  task 5's work wearing task 6's number, and it landed as part of it.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.

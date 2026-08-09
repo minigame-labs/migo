@@ -184,7 +184,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param enabled   1 if Bluetooth was enabled, 0 otherwise
      */
-    public static native void onOpenSystemBluetoothSetting(int sessionId, int enabled);
+    public static native void onOpenSystemBluetoothSetting(int sessionId, int requestId, int enabled);
 
     /**
      * Callback when app authorization setting result is received.
@@ -192,7 +192,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param code      0 on success, negative on failure
      */
-    public static native void onOpenAppAuthorizeSetting(int sessionId, int code);
+    public static native void onOpenAppAuthorizeSetting(int sessionId, int requestId, int code);
 
     /**
      * Callback when modal dialog is dismissed.
@@ -201,7 +201,7 @@ public final class NativeBridge {
      * @param confirm   1 if user tapped confirm, 0 otherwise
      * @param cancel    1 if user tapped cancel, 0 otherwise
      */
-    public static native void onModalResult(int sessionId, int confirm, int cancel);
+    public static native void onModalResult(int sessionId, int requestId, int confirm, int cancel);
 
     /**
      * Callback when action sheet is dismissed.
@@ -209,7 +209,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
      */
-    public static native void onActionSheetResult(int sessionId, int tapIndex);
+    public static native void onActionSheetResult(int sessionId, int requestId, int tapIndex);
 
     // ==================== Device Sensor Callbacks ====================
 

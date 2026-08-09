@@ -150,7 +150,7 @@ mod host_bridge_dispatch_tests {
         );
     }
 
-    /// Shape 4: plain numbers -- `_internalOnModalResult(confirm, cancel)`.
+    /// Shape 4: plain numbers -- `_internalOnModalResult(requestId, confirm, cancel)`.
     #[test]
     fn dispatches_a_hook_with_numeric_arguments() {
         let mut rt = boot();

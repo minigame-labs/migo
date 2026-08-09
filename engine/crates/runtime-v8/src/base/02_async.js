@@ -238,7 +238,17 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
     function settle(resultJson) {
         var parsed;
         try { parsed = JSON.parse(resultJson); } catch (e) { parsed = {}; }
+        settleParsed(parsed);
+    }
 
+    // The same settlement from an object the caller already holds.
+    //
+    // The results that cross JNI as integers -- a modal's confirm/cancel, an
+    // action sheet's tap index -- have no JSON to parse, and stringifying them
+    // just so this function could parse them back would be the only reason the
+    // encoding existed. Correlation is one implementation either way: the hooks
+    // build the object, this decides whose request it answers.
+    function settleParsed(parsed) {
         // A result that carries the key at all is correlated by it, in any
         // form. `null`, `1.5`, `-1`, `0`, `2147483648` and `"abc"` are all
         // *present and not an id*, so they are discarded rather than allowed
@@ -259,11 +269,13 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
         // Fallback: settle the oldest pending request (FIFO), reached only when
         // the platform omits `requestId` entirely.
         //
-        // Do not delete this yet. Several Android result paths (location,
-        // scan, image, video, modal, action sheet, Bluetooth and application
-        // settings) still omit the id; task 6 of the runtime-restart plan is
-        // what makes them echo it. Removing the fallback first does not make
-        // them fail loudly -- their promises would simply never settle.
+        // Do not delete this yet, and the reason has moved. Every Android path
+        // now echoes the id -- location, scan, image, video, modal, action
+        // sheet, Bluetooth and application settings. What is left is the other
+        // three platforms: a host that answers without an id is not a bug in
+        // this file, and deleting the fallback would not make it fail loudly,
+        // it would leave its promises unsettled forever. This goes when every
+        // shipped host echoes, not when Android does.
         var iter = _pending.keys();
         var first = iter.next();
         if (!first.done) {
@@ -278,7 +290,7 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
         }
     }
 
-    return { invoke: invoke, settle: settle };
+    return { invoke: invoke, settle: settle, settleParsed: settleParsed };
 }
 
 // Factory for event listener groups (on/off/trigger pattern).

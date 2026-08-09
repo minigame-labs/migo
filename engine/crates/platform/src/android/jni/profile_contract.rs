@@ -118,8 +118,8 @@ const NATIVE_MEDIA: &[JniMethod] = methods![
 ];
 
 const NATIVE_CONNECTIVITY: &[JniMethod] = methods![
-    ("onOpenSystemBluetoothSetting", "(II)V"),
-    ("onOpenAppAuthorizeSetting", "(II)V"),
+    ("onOpenSystemBluetoothSetting", "(III)V"),
+    ("onOpenAppAuthorizeSetting", "(III)V"),
     ("onBluetoothAdapterStateChange", "(IZZ)V"),
     ("onBluetoothDeviceFound", "(ILjava/lang/String;)V"),
     ("onBeaconUpdate", "(ILjava/lang/String;)V"),
@@ -148,8 +148,8 @@ const NATIVE_COMMERCE: &[JniMethod] = methods![
 const NATIVE_SYSTEM: &[JniMethod] = methods![
     ("onAuthorizeResult", "(ILjava/lang/String;)V"),
     ("updatePermission", "(ILjava/lang/String;Z)Z"),
-    ("onModalResult", "(III)V"),
-    ("onActionSheetResult", "(II)V"),
+    ("onModalResult", "(IIII)V"),
+    ("onActionSheetResult", "(III)V"),
 ];
 
 const JAVA_CORE: &[JniMethod] = methods![
@@ -242,8 +242,8 @@ const JAVA_MEDIA: &[JniMethod] = methods![
 ];
 
 const JAVA_CONNECTIVITY: &[JniMethod] = methods![
-    ("openSystemBluetoothSetting", "(I)V"),
-    ("openAppAuthorizeSetting", "(I)V"),
+    ("openSystemBluetoothSetting", "(II)V"),
+    ("openAppAuthorizeSetting", "(II)V"),
     ("getWindowInfoBytes", "(I)[B"),
     ("getSystemSettingInfoBytes", "()[B"),
     ("getDeviceInfoJson", "()Ljava/lang/String;"),

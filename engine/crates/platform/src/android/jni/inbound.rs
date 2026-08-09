@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use shared::js_escape::{hook_args_one, hook_args_two};
+use shared::js_escape::{hook_args_one, hook_args_three, hook_args_two};
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -629,18 +629,28 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     enabled: jint,
 ) {
     jni_safe!("onOpenSystemBluetoothSetting", {
+        // Absent stays absent: a non-positive id means the request carried
+        // none, and writing `0` would make the runtime discard the reply as
+        // *present and not an id* -- strictly worse than the fallback it would
+        // otherwise take.
+        let correlation = if request_id > 0 {
+            format!(r#","requestId":{}"#, request_id)
+        } else {
+            String::new()
+        };
         let json = if enabled >= 0 {
             format!(
-                r#"{{"errMsg":"openBluetoothAdapterSetting:ok","code":{}}}"#,
-                enabled
+                r#"{{"errMsg":"openBluetoothAdapterSetting:ok","code":{}{}}}"#,
+                enabled, correlation
             )
         } else {
             format!(
-                r#"{{"errMsg":"openBluetoothAdapterSetting:fail","code":{}}}"#,
-                enabled
+                r#"{{"errMsg":"openBluetoothAdapterSetting:fail","code":{}{}}}"#,
+                enabled, correlation
             )
         };
         let cmd = HostCommand::InvokeHostHook {
@@ -655,12 +665,13 @@ pub(crate) extern "system" fn onOpenAppAuthorizeSetting<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     code: jint,
 ) {
     jni_safe!("onOpenAppAuthorizeSetting", {
         let cmd = HostCommand::InvokeHostHook {
             hook: "_internalOnOpenAppAuthorizeSettingFinished",
-            args_json: hook_args_one(code),
+            args_json: hook_args_two(request_id, code),
         };
         let _ = send_reliable_command_to_host(host_id, cmd);
     });
@@ -930,13 +941,14 @@ pub(crate) extern "system" fn onModalResult<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     confirm: jint,
     cancel: jint,
 ) {
     jni_safe!("onModalResult", {
         let cmd = HostCommand::InvokeHostHook {
             hook: "_internalOnModalResult",
-            args_json: hook_args_two(confirm, cancel),
+            args_json: hook_args_three(request_id, confirm, cancel),
         };
         let _ = send_reliable_command_to_host(host_id, cmd);
     });
@@ -946,12 +958,13 @@ pub(crate) extern "system" fn onActionSheetResult<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     tap_index: jint,
 ) {
     jni_safe!("onActionSheetResult", {
         let cmd = HostCommand::InvokeHostHook {
             hook: "_internalOnActionSheetResult",
-            args_json: hook_args_one(tap_index),
+            args_json: hook_args_two(request_id, tap_index),
         };
         let _ = send_reliable_command_to_host(host_id, cmd);
     });

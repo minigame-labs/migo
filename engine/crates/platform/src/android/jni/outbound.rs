@@ -149,9 +149,25 @@ macro_rules! jni_json {
     };
 }
 
-jni_void!(open_bluetooth_settings, "openSystemBluetoothSetting");
+/// Generate a void JNI call with host_id + one int parameter.
+macro_rules! jni_void_int {
+    ($fn_name:ident, $method:expr) => {
+        pub fn $fn_name(host_id: i32, value: i32) -> Result<(), String> {
+            call_static_method(
+                $method,
+                ReturnType::Primitive(Primitive::Void),
+                |_env, _| Ok(()),
+                &[jvalue { i: host_id }, jvalue { i: value }],
+            )
+        }
+    };
+}
 
-jni_void!(open_app_authorize_setting, "openAppAuthorizeSetting");
+// Both carry the request id the result must echo. Java cannot invent one, and a
+// result with no id settles the oldest pending request rather than its own.
+jni_void_int!(open_bluetooth_settings, "openSystemBluetoothSetting");
+
+jni_void_int!(open_app_authorize_setting, "openAppAuthorizeSetting");
 
 // R1: request one Choreographer frame callback (Rust render/host -> Java).
 // `NativeExports.requestVsync` posts to the main thread and rechecks the live
