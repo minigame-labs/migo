@@ -637,29 +637,6 @@ public final class NativeExports {
 
     // ==================== File System ====================
 
-    /**
-     * Get the app's cache directory path.
-     *
-     * @return Cache directory path, or empty string if unavailable
-     */
-    public static String getCacheDirPath() {
-        RuntimeContext context = RuntimeRegistry.getAny();
-        if (context == null) {
-            return "";
-        }
-        Activity activity = context.getActivity();
-        if (activity == null) {
-            Context appContext = AppContext.getOrNull();
-            if (appContext != null) {
-                File cacheDir = appContext.getCacheDir();
-                return cacheDir != null ? cacheDir.getAbsolutePath() : "";
-            }
-            return "";
-        }
-        File cacheDir = activity.getCacheDir();
-        return cacheDir != null ? cacheDir.getAbsolutePath() : "";
-    }
-
     // Zip-bomb defense budget. MUST stay in sync with the Rust
     // `ExtractBudget::DEFAULT` in engine/crates/io/zip_extract.rs so
     // the Android (java.util.zip) unzip path enforces the same limits
@@ -1016,8 +993,8 @@ public final class NativeExports {
      *
      * @return Packed byte array
      */
-    public static byte[] getSystemSettingInfoBytes() {
-        RuntimeContext context = RuntimeRegistry.getAny();
+    public static byte[] getSystemSettingInfoBytes(int sessionId) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
         Activity activity = context != null ? context.getActivity() : null;
         Context appContext = activity != null ? activity : AppContext.getOrNull();
 
@@ -1252,8 +1229,8 @@ public final class NativeExports {
      *
      * @return JSON string with permission states
      */
-    public static String getAppAuthorizationSettingJson() {
-        RuntimeContext runtimeContext = RuntimeRegistry.getAny();
+    public static String getAppAuthorizationSettingJson(int sessionId) {
+        RuntimeContext runtimeContext = RuntimeRegistry.get(sessionId);
         Context context = runtimeContext != null ? runtimeContext.getActivity() : null;
         if (context == null) {
             context = AppContext.getOrNull();

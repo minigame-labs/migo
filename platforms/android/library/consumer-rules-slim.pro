@@ -31,7 +31,6 @@
 -keepclassmembers,allowoptimization class com.migo.runtime.internal.NativeExports {
     public static *** beginRuntimeRestart(...);
     public static *** completeRuntimeRestart(...);
-    public static *** getCacheDirPath(...);
     public static *** unzipFile(...);
     public static *** encodeGbk(...);
     public static *** decodeGbk(...);
