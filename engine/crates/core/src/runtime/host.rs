@@ -9,7 +9,20 @@ use std::{
 };
 
 use serde_json::Value;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Whether `cmd` was produced for a runtime that is no longer the current one.
+///
+/// The only implementation of the rule, called by `handle_command_inner`; it is
+/// a free function purely so it can be driven without a live `Host`, which needs
+/// V8, a render thread and an audio thread to exist.
+///
+/// A command carrying no generation is never retired — see
+/// [`HostCommand::callback_generation`] for the two reasons it may carry none,
+/// neither of which means "stale".
+fn is_retired_callback(cmd: &HostCommand, current_generation: i64) -> bool {
+    matches!(cmd.callback_generation(), Some(produced_for) if produced_for != current_generation)
+}
 
 use shared::{
     config::InitOptions,
@@ -806,6 +819,29 @@ impl Host {
     }
 
     async fn handle_command_inner(&mut self, cmd: HostCommand) -> EngineResult<()> {
+        // A callback produced for a runtime that has since been replaced is
+        // dropped here, before any JavaScript runs.
+        //
+        // This is the only place it can be done once for every producer. The
+        // alternative -- each platform checking before it enqueues -- loses the
+        // race by construction: the command sits in the queue while `on_restart`
+        // runs on this same thread, so whatever was true at enqueue can stop
+        // being true before dispatch. Here the comparison and the dispatch are
+        // not separated by anything.
+        //
+        // `None` is delivered: see `callback_generation` for the two distinct
+        // reasons a command carries no generation.
+        let current_generation = self.restart_boundary.current();
+        if is_retired_callback(&cmd, current_generation) {
+            debug!(
+                "[Host {}] dropping callback from generation {:?} (current {})",
+                self.id,
+                cmd.callback_generation(),
+                current_generation
+            );
+            return Ok(());
+        }
+
         match cmd {
             HostCommand::EvaluateModule { game_id, entry } => {
                 self.on_evaluate_module(game_id, entry).await
@@ -994,22 +1030,22 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnKeyboardInput { value } => {
+            HostCommand::OnKeyboardInput { value, .. } => {
                 self.js.dispatch_keyboard_input(&value);
                 Ok(())
             }
 
-            HostCommand::OnKeyboardHeightChange { height } => {
+            HostCommand::OnKeyboardHeightChange { height, .. } => {
                 self.js.dispatch_keyboard_height_change(height);
                 Ok(())
             }
 
-            HostCommand::OnKeyboardConfirm { value } => {
+            HostCommand::OnKeyboardConfirm { value, .. } => {
                 self.js.dispatch_keyboard_confirm(&value);
                 Ok(())
             }
 
-            HostCommand::OnKeyboardComplete { value } => {
+            HostCommand::OnKeyboardComplete { value, .. } => {
                 self.js.dispatch_keyboard_complete(&value);
                 Ok(())
             }
@@ -1470,11 +1506,21 @@ impl Host {
         let (files_dir, cache_dir) = self.js.get_base_dirs();
         let device_services = self.platform.create_device_services(self.id);
 
+        // The replacement runtime is a new generation, and it is a *candidate*
+        // until it exists: `candidate_generation` reads without mutating, so a
+        // restart that fails to build a runtime leaves the live generation
+        // exactly where it was and nothing downstream is fenced against an
+        // isolate that never appeared. The commit is at the bottom, once the new
+        // isolate is installed.
+        let retired_generation = self.restart_boundary.current();
+        let candidate_generation = self.restart_boundary.candidate_generation()?;
+
         let host_state = HostOpState {
-            // Until an unpublished candidate exists (task 10), a restart keeps
-            // the live generation; the allocator is never rebuilt.
+            // The allocator is never rebuilt -- ids outlive the isolate on
+            // purpose -- but the generation does advance, and it is what tells a
+            // retired runtime's still-queued callbacks from this one's.
             callback_ids: Arc::clone(&self.callback_ids),
-            runtime_generation: self.restart_boundary.current(),
+            runtime_generation: candidate_generation,
             id: self.id,
             code_dir: None,
             game_paths: None,
@@ -1606,6 +1652,17 @@ impl Host {
 
         self.js.set(new_js);
 
+        // Publish the candidate. Every callback still queued behind this restart
+        // was produced for `retired_generation` and is dropped at dispatch from
+        // here on; anything the new isolate creates carries the new value.
+        //
+        // After `js.set` rather than before: until the isolate exists there is
+        // nothing for the new generation to name, and a commit that ran first
+        // would fence the retired runtime's callbacks against a runtime that
+        // might still fail to appear.
+        self.restart_boundary
+            .commit(retired_generation, candidate_generation)?;
+
         // If we have a last evaluated module, reload it. Even if re-evaluation
         // fails, resume render/audio below so the session doesn't stay paused.
         let reload_result = if let (Some(game_id), Some(entry)) =
@@ -1642,5 +1699,58 @@ impl Host {
         self.reconcile_context_lost();
 
         reload_result
+    }
+}
+
+#[cfg(test)]
+mod retired_callback_tests {
+    use super::is_retired_callback;
+    use shared::HostCommand;
+
+    fn keyboard(generation: Option<i64>) -> HostCommand {
+        HostCommand::OnKeyboardComplete {
+            value: "done".to_owned(),
+            runtime_generation: generation,
+        }
+    }
+
+    #[test]
+    fn retired_callback_generation_is_dropped_at_host_dispatch() {
+        // The whole property in one place: the same command, the same current
+        // generation, differing only in what it was produced for.
+        assert!(is_retired_callback(&keyboard(Some(1)), 2));
+        assert!(!is_retired_callback(&keyboard(Some(2)), 2));
+    }
+
+    #[test]
+    fn a_generation_stays_retired_however_far_the_runtime_moves_on() {
+        // Not "one behind": a callback held by a slow platform across several
+        // restarts is as stale as one held across a single restart, and an
+        // off-by-one comparison would let the older one through.
+        for current in [2, 3, 10, i64::MAX] {
+            assert!(
+                is_retired_callback(&keyboard(Some(1)), current),
+                "{current}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_carries_no_generation_is_delivered() {
+        // Two distinct cases, and neither means stale: a command that is not a
+        // runtime-owned callback at all, and a producer this plan has not fenced
+        // yet. Dropping either would lose input nobody is fencing.
+        assert!(!is_retired_callback(&keyboard(None), 7));
+        assert!(!is_retired_callback(&HostCommand::OnHide, 7));
+        assert!(!is_retired_callback(
+            &HostCommand::OnKeyUp {
+                key: "a".to_owned(),
+                code: "KeyA".to_owned(),
+                timestamp_ms: 0.0,
+                modifiers: 0,
+                repeat: false,
+            },
+            7
+        ));
     }
 }

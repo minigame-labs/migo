@@ -33,21 +33,45 @@ use migo_capi_abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE};
 /// becomes the right engine command or the wrong one, and the entry point's
 /// state checks cannot tell those apart.
 ///
-fn validated_keyboard_to_command(event: ValidatedKeyboardEvent) -> HostCommand {
+///
+/// `runtime_generation` is the generation the *calling* host observed, taken
+/// from the ingress it is about to enqueue on. Stamping it here rather than
+/// reading the current one at dispatch is the whole point: an event a host
+/// submitted before a restart committed carries the retired value and is
+/// dropped, where a value read later would always match.
+fn validated_keyboard_to_command(
+    event: ValidatedKeyboardEvent,
+    runtime_generation: i64,
+) -> HostCommand {
+    let runtime_generation = Some(runtime_generation);
     match event {
-        ValidatedKeyboardEvent::Input(value) => HostCommand::OnKeyboardInput { value },
-        ValidatedKeyboardEvent::Confirm(value) => HostCommand::OnKeyboardConfirm { value },
-        ValidatedKeyboardEvent::Complete(value) => HostCommand::OnKeyboardComplete { value },
-        ValidatedKeyboardEvent::HeightChange(height) => {
-            HostCommand::OnKeyboardHeightChange { height }
-        }
+        ValidatedKeyboardEvent::Input(value) => HostCommand::OnKeyboardInput {
+            value,
+            runtime_generation,
+        },
+        ValidatedKeyboardEvent::Confirm(value) => HostCommand::OnKeyboardConfirm {
+            value,
+            runtime_generation,
+        },
+        ValidatedKeyboardEvent::Complete(value) => HostCommand::OnKeyboardComplete {
+            value,
+            runtime_generation,
+        },
+        ValidatedKeyboardEvent::HeightChange(height) => HostCommand::OnKeyboardHeightChange {
+            height,
+            runtime_generation,
+        },
     }
 }
 
 /// Testable composition of pure boundary validation and command conversion.
 #[cfg(test)]
-unsafe fn to_host_command(event: &MigoKeyboardEvent) -> Result<HostCommand, MigoResult> {
-    unsafe { event.validate() }.map(validated_keyboard_to_command)
+unsafe fn to_host_command(
+    event: &MigoKeyboardEvent,
+    runtime_generation: i64,
+) -> Result<HostCommand, MigoResult> {
+    unsafe { event.validate() }
+        .map(|event| validated_keyboard_to_command(event, runtime_generation))
 }
 
 /// Translate a validated composition event into the engine's command.
@@ -194,8 +218,8 @@ pub unsafe extern "C" fn migo_session_send_keyboard_event(
         };
         // Validated before the session lock so a malformed event is rejected on
         // its own terms rather than reporting whatever the session state is.
-        let command = match unsafe { MigoKeyboardEvent::parse(event) } {
-            Ok(event) => validated_keyboard_to_command(event),
+        let validated = match unsafe { MigoKeyboardEvent::parse(event) } {
+            Ok(event) => event,
             Err(error) => return error,
         };
 
@@ -203,6 +227,10 @@ pub unsafe extern "C" fn migo_session_send_keyboard_event(
             Ok(ingress) => ingress,
             Err(error) => return error,
         };
+
+        // Read from the ingress this event is about to be queued on, so the
+        // stamp names the runtime the caller was talking to.
+        let command = validated_keyboard_to_command(validated, ingress.runtime_generation());
 
         // Dropping a COMPLETE would leave content believing the keyboard is
         // still open, and no later event corrects that -- the same reason the
@@ -573,15 +601,21 @@ mod tests {
         ];
         for (kind, value) in cases {
             let event = text_event(kind, value);
-            let command = unsafe { to_host_command(&event) }.expect("well-formed");
+            let command = unsafe { to_host_command(&event, 1) }.expect("well-formed");
             match (kind, command) {
-                (MIGO_KEYBOARD_EVENT_INPUT, HostCommand::OnKeyboardInput { value: got }) => {
+                (MIGO_KEYBOARD_EVENT_INPUT, HostCommand::OnKeyboardInput { value: got, .. }) => {
                     assert_eq!(got, value)
                 }
-                (MIGO_KEYBOARD_EVENT_CONFIRM, HostCommand::OnKeyboardConfirm { value: got }) => {
+                (
+                    MIGO_KEYBOARD_EVENT_CONFIRM,
+                    HostCommand::OnKeyboardConfirm { value: got, .. },
+                ) => {
                     assert_eq!(got, value)
                 }
-                (MIGO_KEYBOARD_EVENT_COMPLETE, HostCommand::OnKeyboardComplete { value: got }) => {
+                (
+                    MIGO_KEYBOARD_EVENT_COMPLETE,
+                    HostCommand::OnKeyboardComplete { value: got, .. },
+                ) => {
                     assert_eq!(got, value)
                 }
                 (kind, other) => panic!("event type {kind} produced {other:?}"),
@@ -590,10 +624,37 @@ mod tests {
     }
 
     #[test]
+    fn soft_keyboard_commands_capture_ingress_generation() {
+        // Every one of the four, because the conversion builds each arm
+        // separately and a stamp is exactly the kind of thing that gets added to
+        // three of four. The value is the caller's, not a re-read: a keyboard
+        // event submitted before a restart commits must carry the retired
+        // generation so the Host drops it.
+        let events = [
+            text_event(MIGO_KEYBOARD_EVENT_INPUT, "hello"),
+            text_event(MIGO_KEYBOARD_EVENT_CONFIRM, "hello"),
+            text_event(MIGO_KEYBOARD_EVENT_COMPLETE, "hello"),
+            height_event(320.5),
+        ];
+        for event in &events {
+            let command = unsafe { to_host_command(event, 7) }.expect("well-formed");
+            assert_eq!(
+                command.callback_generation(),
+                Some(7),
+                "{command:?} lost its generation"
+            );
+        }
+
+        // A second value, so a hard-coded constant cannot pass the first half.
+        let command = unsafe { to_host_command(&events[0], 8) }.expect("well-formed");
+        assert_eq!(command.callback_generation(), Some(8));
+    }
+
+    #[test]
     fn a_height_change_carries_its_height() {
         let event = height_event(320.5);
-        match unsafe { to_host_command(&event) }.expect("well-formed") {
-            HostCommand::OnKeyboardHeightChange { height } => assert_eq!(height, 320.5),
+        match unsafe { to_host_command(&event, 1) }.expect("well-formed") {
+            HostCommand::OnKeyboardHeightChange { height, .. } => assert_eq!(height, 320.5),
             other => panic!("expected a height change, got {other:?}"),
         }
     }
@@ -601,7 +662,7 @@ mod tests {
     /// Zero is how a host reports the keyboard closing, so it must convert.
     #[test]
     fn a_zero_height_is_valid_because_it_means_dismissed() {
-        assert!(unsafe { to_host_command(&height_event(0.0)) }.is_ok());
+        assert!(unsafe { to_host_command(&height_event(0.0), 1) }.is_ok());
     }
 
     /// NaN would reach content's layout arithmetic with no way back out.
@@ -609,7 +670,7 @@ mod tests {
     fn a_non_finite_or_negative_height_is_rejected() {
         for bad in [f64::NAN, f64::INFINITY, -1.0] {
             assert_eq!(
-                unsafe { to_host_command(&height_event(bad)) }.err(),
+                unsafe { to_host_command(&height_event(bad), 1) }.err(),
                 Some(MIGO_ERROR_INVALID_ARGUMENT),
                 "height {bad} must be rejected"
             );
@@ -621,8 +682,8 @@ mod tests {
     #[test]
     fn an_empty_value_is_valid() {
         let event = text_event(MIGO_KEYBOARD_EVENT_INPUT, "");
-        match unsafe { to_host_command(&event) }.expect("well-formed") {
-            HostCommand::OnKeyboardInput { value } => assert_eq!(value, ""),
+        match unsafe { to_host_command(&event, 1) }.expect("well-formed") {
+            HostCommand::OnKeyboardInput { value, .. } => assert_eq!(value, ""),
             other => panic!("expected an input, got {other:?}"),
         }
     }
@@ -636,8 +697,8 @@ mod tests {
         let backing = "abcXXXXX";
         let mut event = text_event(MIGO_KEYBOARD_EVENT_INPUT, backing);
         event.value_length = 3;
-        match unsafe { to_host_command(&event) }.expect("well-formed") {
-            HostCommand::OnKeyboardInput { value } => assert_eq!(value, "abc"),
+        match unsafe { to_host_command(&event, 1) }.expect("well-formed") {
+            HostCommand::OnKeyboardInput { value, .. } => assert_eq!(value, "abc"),
             other => panic!("expected an input, got {other:?}"),
         }
     }
@@ -650,7 +711,7 @@ mod tests {
         event.value_utf8 = bytes.as_ptr() as *const std::os::raw::c_char;
         event.value_length = 3;
         assert_eq!(
-            unsafe { to_host_command(&event) }.err(),
+            unsafe { to_host_command(&event, 1) }.err(),
             Some(MIGO_ERROR_INVALID_ARGUMENT)
         );
     }
@@ -660,7 +721,7 @@ mod tests {
         let mut event = text_event(MIGO_KEYBOARD_EVENT_INPUT, "abc");
         event.value_utf8 = std::ptr::null();
         assert_eq!(
-            unsafe { to_host_command(&event) }.err(),
+            unsafe { to_host_command(&event, 1) }.err(),
             Some(MIGO_ERROR_INVALID_ARGUMENT)
         );
     }
@@ -669,7 +730,7 @@ mod tests {
     fn an_unknown_event_type_is_rejected() {
         let event = text_event(99, "abc");
         assert_eq!(
-            unsafe { to_host_command(&event) }.err(),
+            unsafe { to_host_command(&event, 1) }.err(),
             Some(MIGO_ERROR_INVALID_ARGUMENT)
         );
     }

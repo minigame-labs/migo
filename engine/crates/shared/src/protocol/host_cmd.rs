@@ -533,6 +533,8 @@ pub enum HostCommand {
     OnKeyboardInput {
         /// Current text value of the keyboard input.
         value: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<i64>,
     },
 
     /// Keyboard height changed (soft keyboard shown/hidden or resized).
@@ -541,6 +543,8 @@ pub enum HostCommand {
     OnKeyboardHeightChange {
         /// Keyboard height in CSS pixels (0 when hidden).
         height: f64,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<i64>,
     },
 
     /// User pressed the confirm button on the soft keyboard.
@@ -549,6 +553,8 @@ pub enum HostCommand {
     OnKeyboardConfirm {
         /// Current text value of the keyboard input.
         value: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<i64>,
     },
 
     /// Soft keyboard dismissed/completed.
@@ -557,6 +563,8 @@ pub enum HostCommand {
     OnKeyboardComplete {
         /// Current text value of the keyboard input.
         value: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<i64>,
     },
 
     /// Physical/PC keyboard key down event.
@@ -849,6 +857,100 @@ pub enum HostCommand {
     /// The host thread forwards this to `PlatformServices::notify_host_message`,
     /// which calls `NativeExports.onHostMessage` via JNI outbound.
     SendToHost { json: String },
+}
+
+impl HostCommand {
+    /// The runtime generation this command was produced *for*, when its producer
+    /// captured one.
+    ///
+    /// A runtime restart replaces the JavaScript isolate but not the platform
+    /// objects around it: an Android manager, a proxy Activity, a C host's
+    /// keyboard. Those keep producing events, and an event aimed at the isolate
+    /// that has just been retired must not be delivered to the one that replaced
+    /// it. The generation is what tells them apart, and it has to be *captured
+    /// where the event was produced* — reading the current one at enqueue would
+    /// always match and prove nothing.
+    ///
+    /// `None` means this command is not subject to that check, for one of two
+    /// reasons that are deliberately not distinguished here:
+    ///
+    /// * it is not a runtime-owned callback at all — `Restart`, `UpdateSurface`,
+    ///   a touch, a physical key. Dropping a key *up* because a restart happened
+    ///   would leave content believing the key is still held, which is a worse
+    ///   failure than delivering it late;
+    /// * or its producer has not been fenced yet. Android's managers are in that
+    ///   state until this plan's task 7 gives them tokens, and `None` says so
+    ///   out loud rather than passing the current generation and pretending.
+    ///
+    /// The match is exhaustive **by construction**: there is no wildcard, so a
+    /// new command cannot be added without deciding which of the two it is.
+    pub fn callback_generation(&self) -> Option<i64> {
+        match self {
+            Self::OnKeyboardInput {
+                runtime_generation, ..
+            }
+            | Self::OnKeyboardHeightChange {
+                runtime_generation, ..
+            }
+            | Self::OnKeyboardConfirm {
+                runtime_generation, ..
+            }
+            | Self::OnKeyboardComplete {
+                runtime_generation, ..
+            } => *runtime_generation,
+
+            Self::EvaluateModule { .. }
+            | Self::EvalScript { .. }
+            | Self::InvokeHostHook { .. }
+            | Self::Restart
+            | Self::Shutdown
+            | Self::OnShow { .. }
+            | Self::OnHide
+            | Self::OnFocusChanged { .. }
+            | Self::OnAudioInterruptionBegin
+            | Self::OnAudioInterruptionEnd
+            | Self::InnerAudioEvent { .. }
+            | Self::UpdateSurface { .. }
+            | Self::SurfaceDestroyed { .. }
+            | Self::SurfaceLost { .. }
+            | Self::OnTouch(..)
+            | Self::OnDeviceMotionChange { .. }
+            | Self::OnGyroscopeChange { .. }
+            | Self::OnDeviceOrientationChange { .. }
+            | Self::OnCompassChange { .. }
+            | Self::OnAccelerometerChange { .. }
+            | Self::OnNetworkStatusChange { .. }
+            | Self::RecorderEvent { .. }
+            | Self::RecorderFrameData { .. }
+            | Self::CameraEvent { .. }
+            | Self::CameraFrameData { .. }
+            | Self::OnKeyDown { .. }
+            | Self::OnKeyUp { .. }
+            | Self::OnMouseDown { .. }
+            | Self::OnMouseMove { .. }
+            | Self::OnMouseUp { .. }
+            | Self::OnWheel { .. }
+            | Self::OnCompositionStart { .. }
+            | Self::OnCompositionUpdate { .. }
+            | Self::OnCompositionEnd { .. }
+            | Self::OnGamepadConnected { .. }
+            | Self::OnGamepadDisconnected { .. }
+            | Self::OnGamepadState(..)
+            | Self::OnBluetoothAdapterStateChange { .. }
+            | Self::OnBluetoothDeviceFound { .. }
+            | Self::OnBLEConnectionStateChange { .. }
+            | Self::OnBLECharacteristicValueChange(..)
+            | Self::OnBLEMTUChange { .. }
+            | Self::OnBeaconUpdate { .. }
+            | Self::OnBeaconServiceChange { .. }
+            | Self::OnVideoStateChange { .. }
+            | Self::OnMemoryWarning { .. }
+            | Self::OnUserCaptureScreen
+            | Self::OnThermalStatusChanged { .. }
+            | Self::SetDisplayRefreshRate { .. }
+            | Self::SendToHost { .. } => None,
+        }
+    }
 }
 
 // Guard against future regressions — if a new variant re-inflates the enum,

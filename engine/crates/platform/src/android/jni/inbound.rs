@@ -1547,6 +1547,12 @@ pub(crate) extern "system" fn onBLEMTUChange<'local>(
 
 // ==================== Keyboard Callbacks ====================
 
+// Android's `KeyboardManager` does not capture a generation yet, so these four
+// carry `None`: "this producer is unfenced", which is the truth. Passing the
+// *current* generation instead would always match at dispatch and turn the drop
+// into decoration -- the one outcome worse than not fencing at all, because it
+// would read as fenced. Task 7's remaining steps give the manager a token, and
+// these become `Some(captured)`.
 pub(crate) extern "system" fn onKeyboardInput<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -1555,7 +1561,13 @@ pub(crate) extern "system" fn onKeyboardInput<'local>(
 ) {
     jni_safe!("onKeyboardInput", {
         let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
-        let _ = send_command_to_host(host_id, HostCommand::OnKeyboardInput { value: val });
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnKeyboardInput {
+                value: val,
+                runtime_generation: None,
+            },
+        );
     });
 }
 
@@ -1567,7 +1579,13 @@ pub(crate) extern "system" fn onKeyboardConfirm<'local>(
 ) {
     jni_safe!("onKeyboardConfirm", {
         let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
-        let _ = send_command_to_host(host_id, HostCommand::OnKeyboardConfirm { value: val });
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnKeyboardConfirm {
+                value: val,
+                runtime_generation: None,
+            },
+        );
     });
 }
 
@@ -1579,7 +1597,13 @@ pub(crate) extern "system" fn onKeyboardComplete<'local>(
 ) {
     jni_safe!("onKeyboardComplete", {
         let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
-        let _ = send_command_to_host(host_id, HostCommand::OnKeyboardComplete { value: val });
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnKeyboardComplete {
+                value: val,
+                runtime_generation: None,
+            },
+        );
     });
 }
 
@@ -1594,6 +1618,7 @@ pub(crate) extern "system" fn onKeyboardHeightChange(
             host_id,
             HostCommand::OnKeyboardHeightChange {
                 height: height as f64,
+                runtime_generation: None,
             },
         );
     });

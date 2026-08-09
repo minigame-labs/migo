@@ -1002,12 +1002,14 @@ mod tests {
             1
         );
 
-        let (keyboard_ingress, _critical_tx, _rx, keyboard_stats, _registered_stats) =
+        let (keyboard_ingress, _critical_tx, mut keyboard_rx, keyboard_stats, _registered_stats) =
             test_ingress(1, 1);
         keyboard_ingress.try_send(HostCommand::Restart).unwrap();
+        let stamped = keyboard_ingress.runtime_generation();
         assert_eq!(
             keyboard_ingress.try_send_keyboard(HostCommand::OnKeyboardComplete {
                 value: "done".to_owned(),
+                runtime_generation: Some(stamped),
             }),
             Ok(InputSendOutcome::Reserved)
         );
@@ -1017,6 +1019,15 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+
+        // The reserve path must deliver the command it was handed, stamp and
+        // all. Rebuilding a terminal keyboard event on the way through would
+        // hand it whatever generation is current at that moment -- which is the
+        // one case where the drop at dispatch is guaranteed to be wrong.
+        assert!(matches!(keyboard_rx.try_recv(), Ok(HostCommand::Restart)));
+        let reserved = keyboard_rx.try_recv().expect("reserved keyboard command");
+        assert!(matches!(reserved, HostCommand::OnKeyboardComplete { .. }));
+        assert_eq!(reserved.callback_generation(), Some(stamped));
     }
 
     #[test]

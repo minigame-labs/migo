@@ -952,10 +952,113 @@
   `base/02_async.js`, `ui/01_interaction.js`, `system/02_authorize.js`,
   `system/01_bluetooth.js`. The regeneration round still belongs last.
 
-  **Tasks 7–12 are not started, and the property is not enforced yet.** Ids and
-  generations are now carried everywhere they need to be, but nothing compares
-  them before invoking JavaScript: that is Task 7's rejection and Task 10's
-  unpublished candidate. Until then this is plumbing that changes no behaviour.
+  **Task 7 started 2026-08-09: the chokepoint exists, and the generation now
+  actually moves.** Task 7 is 12 steps over ~57 files and is not one sitting.
+  What landed is the part everything else plugs into — and the part that stops
+  tasks 1–6 being plumbing that changes nothing.
+
+  **Until now a restart did not advance the generation at all.** `on_restart`
+  carried `runtime_generation: self.restart_boundary.current()` with a comment
+  deferring the advance to task 10, so `RestartBoundary::candidate_generation`
+  and `commit` — both built and tested by task 2 — had no caller and carried
+  `#[allow(dead_code)]`. A comparison against a value that never changes is
+  decoration however carefully it is written, so the advance came first:
+  `candidate_generation()` before the new `HostOpState`, `commit(retired,
+  candidate)` immediately after `js.set(new_js)`. That ordering is the point —
+  `candidate_generation` reads without mutating, so a restart that fails to build
+  a runtime leaves the live generation exactly where it was and nothing is fenced
+  against an isolate that never appeared. This is task 10's *generation* half done
+  properly, not a stand-in for its cleanup barriers.
+
+  **One place decides, and it is the only place that can.** `HostCommand::
+  callback_generation() -> Option<i64>`, compared at the top of
+  `Host::handle_command_inner` before any JavaScript runs. Each platform checking
+  before it enqueues loses the race by construction: the command sits in the queue
+  while `on_restart` runs on that same thread, so whatever was true at enqueue can
+  stop being true before dispatch. At dispatch the comparison and the delivery are
+  not separated by anything.
+
+  **`Option<i64>` rather than the plan's `i64`, and the reason is honesty.** An
+  `int` has no "absent", so an unfenced producer would have to pass *something* —
+  and the only available something is the current generation, which always
+  matches and proves nothing. `None` says "this producer captures no generation
+  yet" out loud. It covers two cases that are deliberately not distinguished:
+  commands that are not runtime-owned callbacks at all, and producers task 7 has
+  not fenced yet (every Android manager). Physical `OnKeyDown`/`OnKeyUp` are in
+  the first group on purpose: dropping a key *up* because a restart happened
+  leaves content believing the key is still held, which is worse than late
+  delivery — the same reasoning the C ABI already applies to a dropped END.
+
+  **The exhaustive match is a real guard, and it proved itself twice.** No
+  wildcard: all 54 variants are named, so a new command cannot be added without
+  deciding which group it is in. The first evidence was accidental — a bad arm
+  list built from a regex that ran past the enum's closing brace was rejected by
+  the compiler (`E0599`, ten names from the *next* enum). The deliberate evidence
+  is mutant M4 below: deleting one arm fails to compile with `non-exhaustive
+  patterns: &HostCommand::OnUserCaptureScreen not covered`.
+
+  **The C API soft keyboard is the first fenced producer, end to end.**
+  `validated_keyboard_to_command` takes the generation and stamps all four
+  commands; the entry point now resolves the ingress *before* building the
+  command so the stamp comes from `HostIngress::runtime_generation()` — the
+  accessor task 2 added and left with **zero callers**, which is exactly what its
+  entry said it was for. A host that submits a keyboard event before a restart
+  commits now carries the retired value and is dropped. The public C ABI is
+  unchanged.
+
+  **Mutation evidence: four mutants, four killed, and the pair covers both
+  directions of the rule.**
+
+  | mutant | result |
+  |---|---|
+  | `is_retired_callback` always false | `retired_callback_generation_is_dropped_at_host_dispatch` + `a_generation_stays_retired…` FAIL; the no-generation test stays green |
+  | `None` treated as retired | only `a_command_that_carries_no_generation_is_delivered` FAILs; the other two stay green |
+  | one conversion arm drops the stamp | `soft_keyboard_commands_capture_ingress_generation` FAILs, naming `OnKeyboardHeightChange { runtime_generation: None }` |
+  | one variant removed from the match | **compile error**, `non-exhaustive patterns` |
+
+  The first two are the deliberate pair for §"guards cover the side they were
+  designed for": each fails exactly the test the other leaves green. Restored from
+  copies, `sha256sum` verified.
+
+  **Two things this deliberately does not have, stated rather than implied.**
+
+  1. **The early return itself has no local test.** `handle_command_inner` needs a
+     live `Host` — V8, a render thread, an audio thread — and there is no harness
+     for one anywhere in the tree. The *rule* is tested where it lives:
+     `is_retired_callback` is a free function precisely so it can be driven
+     without a Host, and it is the only implementation, not a restatement beside
+     one. What is untested is the two-line wiring, and the same gap covers
+     `on_restart`'s commit. A Host test harness is the thing that would close
+     both, and it belongs with task 11's race-regression gates rather than being
+     invented here.
+  **The host build cannot see the Android producers, and the gate is what said
+  so.** Every host suite and both profiles were green while
+  `platform/src/android/jni/inbound.rs` still constructed all four keyboard
+  commands without the new field — it is behind `#[cfg(target_os = "android")]`,
+  so nothing on this machine compiled it until
+  `build-android-so.sh --compile-only arm64-v8a` ran and failed with four
+  `E0063`s. This is §"ABI assertions' dead branches" in its ordinary form: a
+  change that touches a shared type reaches conditional code the host lane never
+  builds, and only the target build can report it. Those four now pass `None`
+  with the reason at the code.
+
+  2. **Android producers are still unfenced**, so in practice the only commands
+     subject to the drop today are the C ABI's four keyboard events. Tasks 7's
+     remaining steps (the Java `RuntimeGenerationBoundary`, manager tokens, ad and
+     permission tracking, the restart cleanup barrier and `GameSession.close`
+     ordering) are what move Android from `None` to `Some(captured)`. The
+     mechanism they plug into now exists.
+
+  Closing gate over the final state (6 files in scope): **48 PASS, zero non-PASS,
+  `android compile` (arm64-v8a) included, `verified for every target this change
+  touches`** — both profiles on all four Rust crates, and the C ABI surface
+  candidate contract green on both lanes, since the entry point's signature did
+  not move.
+
+  **Tasks 8–12 are not started.** The comparison exists and the generation moves;
+  what is missing is every producer other than the C ABI keyboard, plus the
+  ordered audio and render resets (8, 9) and the transaction that makes a restart
+  atomic across platforms (10).
 
   **"A half-migrated correlation registry is worse than an unmigrated one" no
   longer applies: task 5 is whole.** Every counter that named a host-owned object
