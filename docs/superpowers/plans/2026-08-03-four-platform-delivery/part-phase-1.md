@@ -679,9 +679,71 @@
   it corrupts the FFI ABI, so the gate must also require a usable sibling
   `bin/clang` and the regenerated binding must be diffed against the recorded one
   before it is accepted.
-- [ ] 1.2 Add one repository release-version source under `release/` and verify
+- [x] 1.2 Add one repository release-version source under `release/` and verify
   propagation to Cargo, Gradle, CMake, the HAR, archives, manifests, examples,
   and documentation.
+
+  **Done 2026-08-09.** `release/VERSION` is the source; every consumer reads it and
+  `scripts/test-release-version-contract.sh` (in `pr-ci.yml`, so also in
+  `verify-change.sh`'s contract lane) is what makes that true rather than intended.
+
+  **Four build systems had four answers, and two were wrong in ways that ship.**
+  The Android AAR reported `0.9.0` while the Android C-API SDK built beside it
+  defaulted to `0.1.0` — one platform disagreeing with itself, because two scripts
+  build the two artifacts and only one had been told. The Windows SDK read a
+  version from `crates/capi/Cargo.toml` and then *discarded* it, hardcoding `0.1.1`,
+  so it announced a version no other platform had heard of. Linux and HarmonyOS
+  derived theirs from that same crate manifest, HarmonyOS with a silent `0.1.0`
+  fallback. A build that stops is recoverable; an archive labelled with a version
+  nobody chose is not, so every reader now refuses instead of defaulting.
+
+  **Plain text, and the reason is not taste.** All four toolchains must read it
+  with no dependency: bash, Python, Gradle, and CMake 3.16, which has no JSON
+  parser. A JSON source would need `jq` in bash and a parser bump in CMake.
+
+  **Cargo is the one mirror.** A manifest takes a literal, so `[workspace.package]
+  version` cannot read a file; the gate holds the two equal instead. Sixteen
+  per-crate literals collapsed into it via `version.workspace = true`, and
+  `Cargo.lock` moved 16 version lines and nothing else — checked, because CI runs
+  `cargo fetch --locked` and a stale lock fails there rather than here.
+
+  **The Windows literal's reasoning is kept, not deleted.** `0.1.0` shipped a DLL
+  that could attach no surface kind and the fix went out as `0.1.1` so those bytes
+  would not arrive under a version a consumer already held. A single forward-moving
+  source honours that; a detached per-platform literal is what lost it.
+
+  **Left independent deliberately, and checked so it cannot be folded in later:**
+  `platforms/openharmony/entry/` + `AppScope/` are a demo *application*
+  (`"type": "entry"`, `com.migo.ohoshost`, vendor `example`), not the shipped
+  library; `tests/c_host/android/` is a test application; `MIGO_ABI_VERSION_*` in
+  `include/migo/types.h` answers a different question from which release a binary
+  came from; `adapter/` is a separately publishable npm package.
+
+  **The version stays at the value already shipped in the AAR.** Nothing here
+  proposes a new one — the `0.10.0-rc.1` bump is now a single edit, which is the
+  point.
+
+  Proved end to end and by injection. `release/VERSION` set to `0.9.1-probe`
+  reached the generated `BuildInfo.java`, and was restored. The shared bash reader
+  was extracted and exercised on four inputs — normal, padded, empty, missing —
+  because three of the four SDK scripts cannot run on this machine. Ten gate
+  checks go red: the Cargo mirror drifting, a crate reintroducing its literal, the
+  workspace losing `[workspace.package]`, Gradle re-hardcoding `versionName`, a
+  packaging script re-hardcoding, the HarmonyOS fallback returning, a non-semver
+  source, stray whitespace in the source, the demo application being folded in,
+  and the source missing entirely.
+
+  **Two of those ten passed at first, and both were the gate's fault.** The marker
+  check looked for the reader's *name*, which also appears in the reader's own
+  definition, so a call site replaced by a literal left the name behind and the
+  gate stayed green; the marker is now the assignment, searched with comments
+  stripped. And the literal scan's lookbehind excluded a preceding `-`, so
+  `${MIGO_VERSION:-0.1.0}` — the exact fallback being forbidden — did not match.
+  Neither would have been found by reading the gate.
+
+  Verified: `cargo metadata` (16 members, all `0.9.0`), `cargo check --locked`,
+  Java 207 per flavour in both profiles, the android-host-api gate, and
+  `test-local-verification-contract.sh` at 27 derived gates.
 - [ ] 1.3 Materialise V8, Skia, and ANGLE under immutable content-addressed
   paths before any Cargo or native link, covering the HarmonyOS path that
   currently builds V8 from an external checkout.
