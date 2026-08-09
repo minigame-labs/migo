@@ -3048,6 +3048,32 @@
   the windows half. Until then the entry point will keep reporting both as
   `NOT PROVEN`, which is the correct reading and not noise to be silenced.
 
+  **The OpenHarmony SDK is now installed, and it was not sufficient — 2026-08-09.**
+  `~/ohos-sdk`, version 5.1.0.107 (API 18), validated by
+  `scripts/dev-setup-ohos.sh --check`: sysroots for `aarch64-linux-ohos`,
+  `arm-linux-ohos` and `x86_64-linux-ohos`, both target-prefixed clangs present, and
+  the Rust targets were already pinned in `rust-toolchain.toml`. So the unblock this
+  entry names is done.
+
+  `cargo check -p migo-capi --target aarch64-unknown-linux-ohos` now reaches a
+  **different** wall: `failed to run custom build command for v8 v145.0.0`.
+  `engine/third_party/rusty_v8/{aarch64,x86_64}-linux-ohos/` contain only
+  `src_binding.rs` and no `librusty_v8.a`, and `scripts/fetch-v8-archives.sh` knows
+  only `aarch64`, `x86_64` and `x86_64-linux-gnu` — "a target with no committed
+  manifest cannot be fetched, by design". That committed manifest is item **1.9**.
+
+  So this entry's prediction was one dependency short: the OpenHarmony half is
+  blocked behind **1.9** (or behind running `scripts/build-v8-ohos.sh` from source,
+  for which `dev-setup-ohos.sh` warns clang 15 is older than V8's vendored libc++
+  headers and that `V8_PREBUILT_BINDING` will likely be needed), and then behind a
+  Skia for `aarch64-unknown-linux-ohos`. The Windows half is unchanged in substance
+  but cheaper than "needs a Windows machine": `cmd.exe` is reachable from this WSL2
+  session, so it needs VS Build Tools on the *existing* host, not another machine.
+  There is no Visual Studio on `C:` today.
+
+  Recorded rather than silenced: both halves still read `NOT PROVEN`, and the reason
+  for the OpenHarmony half has moved from "no SDK" to "no V8 archive for the target".
+
 - [x] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
   correcting `pr-ci.yml`'s stale comment for task 0.31. The new `host-engine-tests`
   job now has the system packages those crates need, so the missing coverage is one
