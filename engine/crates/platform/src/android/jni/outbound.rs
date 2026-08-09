@@ -165,6 +165,38 @@ macro_rules! jni_void_int {
 
 // Both carry the request id the result must echo. Java cannot invent one, and a
 // result with no id settles the oldest pending request rather than its own.
+/// Generate a void JNI call with host_id + one long parameter.
+macro_rules! jni_void_long {
+    ($fn_name:ident, $method:expr) => {
+        pub fn $fn_name(host_id: i32, value: i64) -> Result<(), String> {
+            call_static_method(
+                $method,
+                ReturnType::Primitive(Primitive::Void),
+                |_env, _| Ok(()),
+                &[jvalue { i: host_id }, jvalue { j: value }],
+            )
+        }
+    };
+}
+
+// The Java mirror of the engine's runtime generation. It is told, never asked:
+// the engine owns the numbering, and a Java side that read it back would be a
+// second authority.
+pub fn begin_runtime_restart(host_id: i32, retired: i64, next: i64) -> Result<(), String> {
+    call_static_method(
+        "beginRuntimeRestart",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[
+            jvalue { i: host_id },
+            jvalue { j: retired },
+            jvalue { j: next },
+        ],
+    )
+}
+
+jni_void_long!(complete_runtime_restart, "completeRuntimeRestart");
+
 jni_void_int!(open_bluetooth_settings, "openSystemBluetoothSetting");
 
 jni_void_int!(open_app_authorize_setting, "openAppAuthorizeSetting");

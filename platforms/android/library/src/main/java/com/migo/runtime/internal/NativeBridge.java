@@ -405,7 +405,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardInput(int sessionId, String value);
+    public static native void onKeyboardInput(int sessionId, long generation, String value);
 
     /**
      * Callback when user presses confirm on soft keyboard.
@@ -413,7 +413,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardConfirm(int sessionId, String value);
+    public static native void onKeyboardConfirm(int sessionId, long generation, String value);
 
     /**
      * Callback when soft keyboard is dismissed/completed.
@@ -421,7 +421,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardComplete(int sessionId, String value);
+    public static native void onKeyboardComplete(int sessionId, long generation, String value);
 
     /**
      * Callback when soft keyboard height changes.
@@ -429,7 +429,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param height    Keyboard height in CSS pixels (0 when hidden)
      */
-    public static native void onKeyboardHeightChange(int sessionId, double height);
+    public static native void onKeyboardHeightChange(int sessionId, long generation, double height);
 
     // ==================== Screen Capture ====================
 

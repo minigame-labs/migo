@@ -106,13 +106,47 @@ pub trait HostNotifier: Send + Sync {
     }
 }
 
-/// Backend-neutral services supplied by a platform Host Kit, composed of the
-/// device, frame-clock, and notification capability interfaces.
+/// Runtime-replacement notifications for a platform that keeps per-session
+/// objects outside the JavaScript isolate.
 ///
-/// A platform (Android, iOS, etc.) implements the three capability traits; the
+/// A restart replaces the isolate but not the platform objects around it: on
+/// Android a manager's listeners stay registered and keep firing. Those objects
+/// need to know which runtime they belong to so their events can be told apart
+/// from the replacement's, and only the engine knows when the numbering moves.
+///
+/// The engine remains the sole authority; these are notifications, not requests.
+/// A platform that keeps no per-session objects — Linux, Windows, the C ABI host
+/// kit — takes the defaults and needs to know nothing about generations.
+pub trait RuntimeGenerationNotifier: Send + Sync {
+    /// The runtime at `retired` is going away and `next` will replace it.
+    ///
+    /// Between this and `complete_runtime_restart` there is no live runtime, so
+    /// a platform that hands out per-session resources should refuse rather than
+    /// issue them against the generation that is leaving.
+    fn begin_runtime_restart(&self, _host_id: i32, _retired: i64, _next: i64) {
+        // Default: this platform keeps nothing that outlives the isolate.
+    }
+
+    /// `next` is live, and every object created from now belongs to it.
+    fn complete_runtime_restart(&self, _host_id: i32, _next: i64) {
+        // Default: as above.
+    }
+}
+
+/// Backend-neutral services supplied by a platform Host Kit, composed of the
+/// device, frame-clock, notification, and runtime-generation capability
+/// interfaces.
+///
+/// A platform (Android, iOS, etc.) implements the capability traits; the
 /// blanket impl below provides this marker automatically, so `core` can keep a
 /// single `Arc<dyn PlatformServices>` handle while platforms implement focused
 /// interfaces rather than one growing trait.
-pub trait PlatformServices: DeviceServiceProvider + FrameClock + HostNotifier {}
+pub trait PlatformServices:
+    DeviceServiceProvider + FrameClock + HostNotifier + RuntimeGenerationNotifier
+{
+}
 
-impl<T> PlatformServices for T where T: DeviceServiceProvider + FrameClock + HostNotifier {}
+impl<T> PlatformServices for T where
+    T: DeviceServiceProvider + FrameClock + HostNotifier + RuntimeGenerationNotifier
+{
+}

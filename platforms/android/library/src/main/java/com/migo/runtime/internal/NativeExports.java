@@ -235,7 +235,37 @@ public final class NativeExports {
                                         + " ids");
             }
             sSessions.put(sessionId, session);
+            // Ordered after the gate's admission so the two agree on which ids
+            // are live: the gate is what rejects a reused or duplicate id, and
+            // registering a generation for one it refused would leave a session
+            // numbered here that exists nowhere else.
+            RuntimeGenerationBoundary.registerSession(sessionId);
         }
+    }
+
+    /**
+     * The runtime at {@code retired} is being replaced by {@code next}.
+     *
+     * <p>Called by the engine as it drops the old isolate. Between this and
+     * {@link #completeRuntimeRestart} nothing can be acquired for this session:
+     * there is no live runtime for a new manager to belong to.
+     *
+     * @hide
+     */
+    public static void beginRuntimeRestart(int sessionId, long retired, long next) {
+        RuntimeGenerationBoundary.beginRestart(sessionId, retired, next);
+    }
+
+    /**
+     * The runtime at {@code next} is live.
+     *
+     * <p>Every object created from here belongs to it, and every token issued
+     * before the matching {@link #beginRuntimeRestart} is now stale.
+     *
+     * @hide
+     */
+    public static void completeRuntimeRestart(int sessionId, long next) {
+        RuntimeGenerationBoundary.completeRestart(sessionId, next);
     }
 
     /**
@@ -244,6 +274,9 @@ public final class NativeExports {
      */
     public static void unregisterSession(int sessionId) {
         sSessions.remove(sessionId);
+        // Every token this session issued becomes stale rather than current by
+        // default, so anything still holding one stops reporting.
+        RuntimeGenerationBoundary.unregisterSession(sessionId);
     }
 
     /** Closes permission operations and retries any retained deferred cancellations. */

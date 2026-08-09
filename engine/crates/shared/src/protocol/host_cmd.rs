@@ -859,6 +859,20 @@ pub enum HostCommand {
     SendToHost { json: String },
 }
 
+/// Read a generation a platform captured, rejecting anything a token cannot be.
+///
+/// Platforms that carry the generation over a boundary with no "absent" — an
+/// Android `long` across JNI, a C `int64_t` — signal *unfenced* with a
+/// non-positive value. Trusting it as a generation instead would compare a
+/// producer that captured nothing against a real one, and `0 != current` reads
+/// as retired: every event from an unfenced producer would be silently dropped.
+///
+/// One implementation because every producer needs the same answer, and there
+/// are about twenty more of them to fence.
+pub fn captured_generation(generation: i64) -> Option<i64> {
+    (generation > 0).then_some(generation)
+}
+
 impl HostCommand {
     /// The runtime generation this command was produced *for*, when its producer
     /// captured one.
@@ -1082,4 +1096,66 @@ pub enum TouchType {
     End = 2,
     /// Touch cancelled (interrupted by system).
     Cancel = 3,
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::{HostCommand, captured_generation};
+
+    #[test]
+    fn only_a_positive_value_is_a_captured_generation() {
+        assert_eq!(captured_generation(1), Some(1));
+        assert_eq!(captured_generation(i64::MAX), Some(i64::MAX));
+        // The unfenced signal, and the values a corrupted or defaulted field
+        // could hold. None of them may read as "produced for generation N",
+        // because that would drop the event instead of delivering it.
+        for unfenced in [0, -1, i64::MIN] {
+            assert_eq!(captured_generation(unfenced), None, "{unfenced}");
+        }
+    }
+
+    #[test]
+    fn the_four_soft_keyboard_commands_carry_their_generation() {
+        // Each is built in its own arm, and a stamp is exactly the sort of thing
+        // that gets added to three of four.
+        let commands = [
+            HostCommand::OnKeyboardInput {
+                value: String::new(),
+                runtime_generation: Some(5),
+            },
+            HostCommand::OnKeyboardConfirm {
+                value: String::new(),
+                runtime_generation: Some(5),
+            },
+            HostCommand::OnKeyboardComplete {
+                value: String::new(),
+                runtime_generation: Some(5),
+            },
+            HostCommand::OnKeyboardHeightChange {
+                height: 0.0,
+                runtime_generation: Some(5),
+            },
+        ];
+        for command in &commands {
+            assert_eq!(command.callback_generation(), Some(5), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_command_that_is_not_a_runtime_callback_reports_no_generation() {
+        // Dropping a key *up* because a restart happened leaves content
+        // believing the key is still held, so these must never be fenced.
+        assert_eq!(HostCommand::OnHide.callback_generation(), None);
+        assert_eq!(
+            HostCommand::OnKeyUp {
+                key: "a".to_owned(),
+                code: "KeyA".to_owned(),
+                timestamp_ms: 0.0,
+                modifiers: 0,
+                repeat: false,
+            }
+            .callback_generation(),
+            None
+        );
+    }
 }

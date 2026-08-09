@@ -102,6 +102,10 @@ impl FrameClock for WindowsPlatform {}
 
 impl HostNotifier for WindowsPlatform {}
 
+// Nothing per-session lives outside the isolate here, so a runtime
+// replacement needs no bookkeeping on this platform.
+impl migo_core::RuntimeGenerationNotifier for WindowsPlatform {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

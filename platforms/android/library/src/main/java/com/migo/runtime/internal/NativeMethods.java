@@ -803,48 +803,52 @@ public final class NativeMethods {
     /**
      * Callback for keyboard input text change.
      *
-     * @param sessionId The session ID
-     * @param value     Current text value
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param value      Current text value
      */
-    public static void onKeyboardInput(int sessionId, String value) {
+    public static void onKeyboardInput(int sessionId, long generation, String value) {
         if (sessionId >= 0 && value != null) {
-            NativeBridge.onKeyboardInput(sessionId, value);
+            NativeBridge.onKeyboardInput(sessionId, generation, value);
         }
     }
 
     /**
      * Callback for keyboard confirm action.
      *
-     * @param sessionId The session ID
-     * @param value     Current text value
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param value      Current text value
      */
-    public static void onKeyboardConfirm(int sessionId, String value) {
+    public static void onKeyboardConfirm(int sessionId, long generation, String value) {
         if (sessionId >= 0 && value != null) {
-            NativeBridge.onKeyboardConfirm(sessionId, value);
+            NativeBridge.onKeyboardConfirm(sessionId, generation, value);
         }
     }
 
     /**
      * Callback for keyboard complete (dismissed).
      *
-     * @param sessionId The session ID
-     * @param value     Current text value
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param value      Current text value
      */
-    public static void onKeyboardComplete(int sessionId, String value) {
+    public static void onKeyboardComplete(int sessionId, long generation, String value) {
         if (sessionId >= 0 && value != null) {
-            NativeBridge.onKeyboardComplete(sessionId, value);
+            NativeBridge.onKeyboardComplete(sessionId, generation, value);
         }
     }
 
     /**
      * Callback for keyboard height change.
      *
-     * @param sessionId The session ID
-     * @param height    Keyboard height in CSS pixels (0 when hidden)
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param height     Keyboard height in CSS pixels (0 when hidden)
      */
-    public static void onKeyboardHeightChange(int sessionId, double height) {
+    public static void onKeyboardHeightChange(int sessionId, long generation, double height) {
         if (sessionId >= 0) {
-            NativeBridge.onKeyboardHeightChange(sessionId, height);
+            NativeBridge.onKeyboardHeightChange(sessionId, generation, height);
         }
     }
 

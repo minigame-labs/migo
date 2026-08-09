@@ -1515,6 +1515,15 @@ impl Host {
         let retired_generation = self.restart_boundary.current();
         let candidate_generation = self.restart_boundary.candidate_generation()?;
 
+        // Tell the platform before the old isolate goes away, so anything it
+        // hands out per session is refused for the window in which no runtime
+        // owns it. Platforms that keep nothing outside the isolate ignore this.
+        self.platform.begin_runtime_restart(
+            self.id as i32,
+            retired_generation,
+            candidate_generation,
+        );
+
         let host_state = HostOpState {
             // The allocator is never rebuilt -- ids outlive the isolate on
             // purpose -- but the generation does advance, and it is what tells a
@@ -1662,6 +1671,16 @@ impl Host {
         // might still fail to appear.
         self.restart_boundary
             .commit(retired_generation, candidate_generation)?;
+        self.platform
+            .complete_runtime_restart(self.id as i32, candidate_generation);
+
+        // There is deliberately no abort path between the two notifications:
+        // nothing between them returns early, and `HostJsRuntime::new` does not
+        // fail -- it panics, taking the thread. Adding a `?` in that stretch
+        // means adding an abort, because a platform left between begin and
+        // complete refuses every acquisition for the rest of the session. That
+        // is the fail-closed direction, which is why it is safe to leave it
+        // rather than invent an abort with no caller.
 
         // If we have a last evaluated module, reload it. Even if re-evaluation
         // fails, resume render/audio below so the session doesn't stay paused.

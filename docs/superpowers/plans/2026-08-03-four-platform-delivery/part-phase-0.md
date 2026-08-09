@@ -1055,10 +1055,102 @@
   candidate contract green on both lanes, since the entry point's signature did
   not move.
 
-  **Tasks 8–12 are not started.** The comparison exists and the generation moves;
-  what is missing is every producer other than the C ABI keyboard, plus the
-  ordered audio and render resets (8, 9) and the transaction that makes a restart
-  atomic across platforms (10).
+  **Task 7 continued 2026-08-09: Android has a generation boundary, and one
+  producer is fenced end to end.** The chokepoint above needed a producer that
+  actually captures; this is the first, and the vertical slice proves the whole
+  path rather than each layer separately.
+
+  * **`RuntimeGenerationBoundary` (Java)** mirrors the engine's numbering per
+    session: `ACTIVE` at a generation, or `RESTARTING` between the retired
+    runtime going away and the replacement being live. `acquire` refuses while
+    restarting — there is no runtime for a new manager to belong to, and handing
+    out the generation that is leaving is the one answer that reads as fine and
+    is not. `Token` is immutable: a token that could refresh itself is a token
+    whose holder can be talked into believing it is current. An unregistered
+    session holds no current tokens, so an object outliving its session finds
+    itself stale rather than current by default.
+  * **The engine tells, and is never asked.** `RuntimeGenerationNotifier` is a
+    new capability sub-trait beside `DeviceServiceProvider`, `FrameClock` and
+    `HostNotifier`, with both methods defaulted — Linux, Windows and the C ABI
+    host kit keep nothing outside the isolate and take the default, one line
+    each. `on_restart` calls `begin_runtime_restart` before the old isolate goes
+    away and `complete_runtime_restart` immediately after the commit. A Java side
+    that *read* the generation back would be a second authority, and two
+    authorities disagree.
+  * **`KeyboardManager` is the fenced producer**, chosen because its four
+    commands already carried the field from the previous entry — so the slice
+    cost four JNI descriptors rather than twenty. It captures one token in its
+    constructor and stamps `token.generation()` on every event; the four
+    callbacks widen to `(IJLjava/lang/String;)V` / `(IJD)V` across
+    `NativeMethods`, `NativeBridge`, the JNI handlers and the pinned contract.
+
+  **There is deliberately no abort path, and the reason is checked rather than
+  assumed.** Nothing between `begin` and `complete` returns early:
+  `candidate_generation()?` is *before* the begin, and `HostJsRuntime::new` does
+  not return an error — it panics, taking the thread. A platform left between the
+  two refuses every acquisition for the rest of the session, which is the
+  fail-closed direction, so an abort with no caller would be dead surface. The
+  comment at the code says that adding a `?` in that stretch means adding an
+  abort.
+
+  **`captured_generation` moved to `shared` rather than staying in the JNI
+  file.** In `inbound.rs` it sat behind `#[cfg(target_os = "android")]` and no
+  host test could reach it — the same blind spot that had just cost a failed
+  target build. It is one line, but it is the line that decides whether an
+  unfenced producer's `0` is read as "no generation" or as "produced for
+  generation 0": the second drops every event that producer ever sends. It now
+  lives beside `callback_generation`, has tests, and is the one implementation
+  the ~20 remaining producers will use.
+
+  **Mutation evidence: five mutants, five killed.**
+
+  | mutant | killed by |
+  |---|---|
+  | `acquire` ignores the phase | `nothing_can_be_acquired_while_a_restart_is_in_flight` + `a_completion_that_does_not_match_the_candidate_is_refused` |
+  | `isCurrent` ignores the generation | `a_token_is_current_until…`, `a_retired_token_stays_retired…`, `a_token_from_one_session_is_never_current_in_another` |
+  | `beginRestart` trusts the caller | `a_restart_that_names_the_wrong_generations_is_refused_and_changes_nothing` |
+  | `unregisterSession` leaves the session | `an_unregistered_session_holds_no_current_tokens` |
+  | `captured_generation` trusts a non-positive value | `only_a_positive_value_is_a_captured_generation` |
+
+  Restored from copies, `sha256sum` verified on both files.
+
+  **The profile contract caught a placement bug that would have shipped as a
+  Slim-only hang.** The two new `NativeExports` methods were added next to
+  `openSystemBluetoothSetting` by textual proximity, which put them in
+  `JAVA_CONNECTIVITY` — an *optional* group Slim drops. Every profile restarts
+  its runtime, so on Slim `complete_runtime_restart` would have found no cached
+  method id, the Java boundary would have stayed `RESTARTING`, and **every
+  acquisition for the rest of that session would have been refused**. Three gates
+  reported it in sequence and each said something different: the pinned surface
+  count (`125` → `127`, the deliberate-edit gate), then
+  `slim_r8_rules_are_the_exact_core_jni_name_sets` once the methods moved to
+  `JAVA_CORE` and the two `.pro` keep-rule files had not followed. "Put it where
+  it compiles" is the mistake; the contract is what makes it visible.
+
+  **Untested, and named rather than implied:** `KeyboardManager` itself. Its
+  constructor calls `new Handler(Looper.getMainLooper())`, which throws in a
+  host unit test, so nothing device-free can construct one — the same wall
+  `VideoManager` hit. What is covered is every piece it is made of: the boundary
+  it acquires from, the helper that reads its stamp back, the pinned descriptors
+  that fail if one side of the JNI signature moves alone, and the dispatch drop
+  itself. What is not covered is the wiring in between. A Robolectric-free way to
+  construct these managers — or the emitted-surface descriptor gate this ledger
+  already asks for — is what would close it.
+
+  Java 177 tests per flavour (from 168), zero failures. `migo-shared` gains three
+  cases; `runtime_restart_boundary` and the C ABI keyboard suites unchanged and
+  green.
+
+  **What remains of task 7** is the same shape repeated: every other Android
+  manager captures a token and stamps it, which means adding `runtime_generation`
+  to their `HostCommand` variants (the exhaustive match makes each one a
+  compile-time decision), then steps 9 and 10 — ad and permission tracking, the
+  cleanup barrier and `GameSession.close`'s ordered phases. None of it needs a new
+  mechanism now.
+
+  **Tasks 8–12 are not started.** The ordered audio and render resets (8, 9) and
+  the transaction that makes a restart atomic across platforms (10) are
+  untouched; task 10's *generation* half is done, its cleanup barriers are not.
 
   **"A half-migrated correlation registry is worse than an unmigrated one" no
   longer applies: task 5 is whole.** Every counter that named a host-owned object

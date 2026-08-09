@@ -90,6 +90,24 @@ impl HostNotifier for AndroidPlatform {
     }
 }
 
+impl migo_core::RuntimeGenerationNotifier for AndroidPlatform {
+    fn begin_runtime_restart(&self, host_id: i32, retired: i64, next: i64) {
+        if let Err(e) = jni::begin_runtime_restart(host_id, retired, next) {
+            // Logged rather than propagated: the restart is already under way and
+            // there is nothing useful to do with a failure here. The Java side
+            // stays at `retired` and keeps issuing tokens for it, which the Host
+            // then drops at dispatch -- the fail-closed direction.
+            error!("[Host {host_id}] begin_runtime_restart({retired} -> {next}) failed: {e}");
+        }
+    }
+
+    fn complete_runtime_restart(&self, host_id: i32, next: i64) {
+        if let Err(e) = jni::complete_runtime_restart(host_id, next) {
+            error!("[Host {host_id}] complete_runtime_restart({next}) failed: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -75,10 +75,10 @@ const NATIVE_CORE: &[JniMethod] = methods![
         "nativeAhbPointerFromHardwareBuffer",
         "(Landroid/hardware/HardwareBuffer;)J"
     ),
-    ("onKeyboardInput", "(ILjava/lang/String;)V"),
-    ("onKeyboardConfirm", "(ILjava/lang/String;)V"),
-    ("onKeyboardComplete", "(ILjava/lang/String;)V"),
-    ("onKeyboardHeightChange", "(ID)V"),
+    ("onKeyboardInput", "(IJLjava/lang/String;)V"),
+    ("onKeyboardConfirm", "(IJLjava/lang/String;)V"),
+    ("onKeyboardComplete", "(IJLjava/lang/String;)V"),
+    ("onKeyboardHeightChange", "(IJD)V"),
     ("onMemoryWarning", "(II)V"),
     ("onThermalStatusChanged", "(II)V"),
     ("onSubpackageProgress", "(ILjava/lang/String;)V"),
@@ -153,6 +153,12 @@ const NATIVE_SYSTEM: &[JniMethod] = methods![
 ];
 
 const JAVA_CORE: &[JniMethod] = methods![
+    // Core, not an optional group: every profile restarts its runtime, and a
+    // Slim session that could not be told would leave its Java generation
+    // boundary stuck in RESTARTING -- refusing every acquisition for the rest
+    // of the session.
+    ("beginRuntimeRestart", "(IJJ)V"),
+    ("completeRuntimeRestart", "(IJ)V"),
     ("getCacheDirPath", "()Ljava/lang/String;"),
     (
         "unzipFile",
@@ -431,7 +437,9 @@ mod tests {
         // (`permissionRequest`). Permission revocation adds +1 Java
         // (`revokePermissionResources`) for synchronous targeted teardown.
         assert_eq!(native.len(), 69, "full NativeBridge surface changed");
-        assert_eq!(java.len(), 125, "full NativeExports surface changed");
+        // Runtime-generation fencing adds +2 Java (`beginRuntimeRestart`,
+        // `completeRuntimeRestart`), both Core: every profile restarts.
+        assert_eq!(java.len(), 127, "full NativeExports surface changed");
         assert_unique(&native);
         assert_unique(&java);
     }

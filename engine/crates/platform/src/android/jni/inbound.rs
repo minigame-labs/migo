@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
 use shared::js_escape::{hook_args_one, hook_args_three, hook_args_two};
+// The generation Java captured when the manager was built, not one read here.
+use shared::protocol::host_cmd::captured_generation;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -1547,16 +1549,11 @@ pub(crate) extern "system" fn onBLEMTUChange<'local>(
 
 // ==================== Keyboard Callbacks ====================
 
-// Android's `KeyboardManager` does not capture a generation yet, so these four
-// carry `None`: "this producer is unfenced", which is the truth. Passing the
-// *current* generation instead would always match at dispatch and turn the drop
-// into decoration -- the one outcome worse than not fencing at all, because it
-// would read as fenced. Task 7's remaining steps give the manager a token, and
-// these become `Some(captured)`.
 pub(crate) extern "system" fn onKeyboardInput<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardInput", {
@@ -1565,7 +1562,7 @@ pub(crate) extern "system" fn onKeyboardInput<'local>(
             host_id,
             HostCommand::OnKeyboardInput {
                 value: val,
-                runtime_generation: None,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1575,6 +1572,7 @@ pub(crate) extern "system" fn onKeyboardConfirm<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardConfirm", {
@@ -1583,7 +1581,7 @@ pub(crate) extern "system" fn onKeyboardConfirm<'local>(
             host_id,
             HostCommand::OnKeyboardConfirm {
                 value: val,
-                runtime_generation: None,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1593,6 +1591,7 @@ pub(crate) extern "system" fn onKeyboardComplete<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardComplete", {
@@ -1601,7 +1600,7 @@ pub(crate) extern "system" fn onKeyboardComplete<'local>(
             host_id,
             HostCommand::OnKeyboardComplete {
                 value: val,
-                runtime_generation: None,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1611,6 +1610,7 @@ pub(crate) extern "system" fn onKeyboardHeightChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     height: jdouble,
 ) {
     jni_safe!("onKeyboardHeightChange", {
@@ -1618,7 +1618,7 @@ pub(crate) extern "system" fn onKeyboardHeightChange(
             host_id,
             HostCommand::OnKeyboardHeightChange {
                 height: height as f64,
-                runtime_generation: None,
+                runtime_generation: captured_generation(generation),
             },
         );
     });

@@ -387,6 +387,11 @@ impl HostNotifier for CapiHostKit {
     }
 }
 
+// A C ABI host owns no per-session objects that outlive the isolate: every
+// resource it holds is reached through the session handle, which a restart does
+// not replace.
+impl migo_core::RuntimeGenerationNotifier for CapiHostKit {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

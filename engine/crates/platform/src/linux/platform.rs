@@ -104,6 +104,10 @@ impl FrameClock for LinuxPlatform {}
 
 impl HostNotifier for LinuxPlatform {}
 
+// Nothing per-session lives outside the isolate here, so a runtime
+// replacement needs no bookkeeping on this platform.
+impl migo_core::RuntimeGenerationNotifier for LinuxPlatform {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
