@@ -17,7 +17,7 @@
 // This module is baked into the V8 startup snapshot, so it must stay ASCII and
 // must not call ops at module scope (there is no HostOpState at snapshot time).
 
-import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { allocateHostCallbackId, createListenerGroup } from "ext:host_v8_base/02_async.js";
 import { primordials } from "ext:core/mod.js";
 import {
   op_ad_is_supported,
@@ -68,8 +68,6 @@ function _hostAdsAvailable() {
 
 // ==================== Ad handle registry ====================
 
-let _nextAdId = 1;
-
 // adId -> private event ingress closure. Strong references on purpose, and not
 // a WeakRef registry:
 // the host holds native resources for every live ad and may deliver an event at
@@ -80,10 +78,15 @@ let _nextAdId = 1;
 const _adRegistry = new SafeMap();
 const _adCapabilities = new SafeMap();
 
+// From the Host's id space rather than a module counter. The host keeps native
+// resources per ad in a registry that outlives this isolate, so a counter
+// restarting at 1 would let a replacement runtime's ad receive the retired
+// one's events -- including a reward verdict, which is the one event here that
+// must never reach the wrong ad. Exhaustion throws out of the `AdBase`
+// constructor, which is what `wx.createRewardedVideoAd` and its siblings
+// already do for a refused creation: they return an ad or they do not return.
 function _allocAdId() {
-  const id = _nextAdId;
-  _nextAdId += 1;
-  return id;
+  return allocateHostCallbackId();
 }
 
 function _parseEventJson(json) {

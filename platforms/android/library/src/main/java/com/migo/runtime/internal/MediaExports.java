@@ -297,22 +297,33 @@ public final class MediaExports {
     public static void imageCompress(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
         if (mgr == null) {
-            NativeMethods.onCompressImageResult(sessionId,
-                    "{\"error\":\"compressImage:fail no context\"}");
+            NativeMethods.onCompressImageResult(sessionId, CallbackCorrelation.failure(
+                    CallbackCorrelation.requestIdOf(optionsJson), "compressImage", "no context"));
             return;
         }
-        mgr.compressAsync(sessionId, optionsJson);
+        mgr.compressAsync(optionsJson);
     }
 
     public static void imageChooseMessageFile(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
-        if (mgr == null) return;
+        if (mgr == null) {
+            // Returning silently leaves the request pending until the runtime's
+            // thirty-second timeout, and under the FIFO fallback that timeout
+            // then rejects whichever request happens to be oldest.
+            NativeMethods.onChooseMessageFileResult(sessionId, CallbackCorrelation.failure(
+                    CallbackCorrelation.requestIdOf(optionsJson), "chooseMessageFile", "no context"));
+            return;
+        }
         mgr.chooseMessageFile(optionsJson);
     }
 
     public static void imageChooseImage(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
-        if (mgr == null) return;
+        if (mgr == null) {
+            NativeMethods.onChooseImageResult(sessionId, CallbackCorrelation.failure(
+                    CallbackCorrelation.requestIdOf(optionsJson), "chooseImage", "no context"));
+            return;
+        }
         mgr.chooseImage(optionsJson);
     }
 

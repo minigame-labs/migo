@@ -24,6 +24,32 @@ mod runtime_restart_boundary_tests {
     use shared::device::gpu_caps::GpuCaps;
     use shared::op_state::{AudioSender, HostOpState, NetworkPolicy};
     use shared::render_command_sender::CommandSender;
+    use shared::services::{
+        AdService, CommerceServices, ConnectivityServices, DeviceServices, MediaServices,
+        SensorServices, SystemUtilServices,
+    };
+
+    /// A host that only claims to do advertising, refusing every command.
+    ///
+    /// Present so ads take the *hosted* construction path, which is not a
+    /// convenience: an unhosted ad schedules its fallback `load` through
+    /// `setTimeout`, this harness runs without a Tokio reactor, and the panic
+    /// that follows cannot unwind — it aborts the process instead of failing a
+    /// test. Every command failing is fine here; the id is allocated before any
+    /// of them, which is the property under test.
+    struct HostedAdService;
+    impl AdService for HostedAdService {}
+
+    struct AdOnlyServices;
+    impl SensorServices for AdOnlyServices {}
+    impl MediaServices for AdOnlyServices {}
+    impl ConnectivityServices for AdOnlyServices {}
+    impl SystemUtilServices for AdOnlyServices {}
+    impl CommerceServices for AdOnlyServices {
+        fn ad(&self) -> Option<Arc<dyn AdService>> {
+            Some(Arc::new(HostedAdService))
+        }
+    }
 
     // Exposes the real factory rather than a copy of it: these tests are about
     // `createDeferredApi`'s own correlation, so a reimplementation here would
@@ -60,7 +86,7 @@ mod runtime_restart_boundary_tests {
             text_measurer: None,
             audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
             host_tx,
-            device_services: None,
+            device_services: Some(Arc::new(AdOnlyServices)),
             raf_rx: None,
             raf_demand: Arc::new(shared::raf_signal::RafDemand::new()),
             request_vsync: None,
@@ -283,6 +309,25 @@ mod runtime_restart_boundary_tests {
                 wx.requestMidasPayment && function () { return wx.requestMidasPayment({ offerId: 'x' }); },
             );
             __assertTakesOneId('wx.loadSubpackage', function () { return wx.loadSubpackage({ name: 'sub' }); });
+            // Not a deferred call: the id names a player the platform keeps in
+            // a map that outlives this isolate, and it is what every later
+            // `onVideoEvent` routes by. A module counter restarting at 1 aims
+            // the retired runtime's events at the replacement's objects.
+            __assertTakesOneId('wx.createVideo', wx.createVideo && function () { return wx.createVideo({}); });
+            // The same property for the callback-routed resources: each id names
+            // something the host owns in a table that outlives this isolate, so
+            // a module counter restarting at 1 points the retired runtime's
+            // events -- camera frames, audio playback, an ad's reward verdict --
+            // at the replacement runtime's objects.
+            __assertTakesOneId('wx.createCamera', wx.createCamera && function () { return wx.createCamera({}); });
+            __assertTakesOneId(
+                'wx.createInnerAudioContext',
+                wx.createInnerAudioContext && function () { return wx.createInnerAudioContext(); },
+            );
+            __assertTakesOneId(
+                'wx.createRewardedVideoAd',
+                wx.createRewardedVideoAd && function () { return wx.createRewardedVideoAd({ adUnitId: 'x' }); },
+            );
             "#,
         );
 

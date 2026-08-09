@@ -9,13 +9,14 @@ import {
     op_video_set_property,
     op_video_destroy,
 } from "ext:core/ops";
-import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
+import {
+    allocateHostCallbackId,
+    createListenerGroup,
+    wrapAsync,
+} from "ext:host_v8_base/02_async.js";
 
 // Video instance registry: videoId -> Video
 var _videos = new Map();
-
-// Auto-incrementing video ID counter
-var _nextVideoId = 1;
 
 /**
  * Video - Provides video playback capability.
@@ -361,7 +362,11 @@ class Video {
  */
 function createVideo(options) {
     var opts = options || {};
-    var videoId = _nextVideoId++;
+    // From the Host's id space, not a module counter: the platform keeps its
+    // players in a map that outlives this isolate, so a counter restarting at 1
+    // hands the replacement runtime an id the retired one still owns -- and the
+    // events of the video that is still playing would arrive at the new object.
+    var videoId = allocateHostCallbackId();
     var createJson = JSON.stringify({
         videoId: videoId,
         src: opts.src !== undefined ? String(opts.src) : '',

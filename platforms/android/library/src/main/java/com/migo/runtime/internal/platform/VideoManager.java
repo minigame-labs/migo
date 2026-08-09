@@ -15,10 +15,9 @@ import com.migo.runtime.internal.NativeMethods;
 import org.json.JSONObject;
 
 import java.lang.ref.WeakReference;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Manages video player instances for a session.
@@ -31,8 +30,7 @@ public class VideoManager {
     private final int sessionId;
     private final WeakReference<Activity> activityRef;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Map<Integer, VideoPlayer> players = new ConcurrentHashMap<>();
-    private final AtomicInteger nextVideoId = new AtomicInteger(1);
+    private final ConcurrentMap<Integer, VideoPlayer> players = new ConcurrentHashMap<>();
     private final AtomicBoolean lifecycleSuspendedTarget;
     private final AtomicBoolean destroyed = new AtomicBoolean(false);
     private boolean lifecycleSuspended;
@@ -60,15 +58,56 @@ public class VideoManager {
         }
     }
 
+    /**
+     * The video id this create request carries.
+     *
+     * <p>The runtime allocates it, keys its own registry by it, and routes every
+     * {@code onVideoEvent} through it, so Android has to honour it rather than
+     * number its own. The counter this replaced started at 1 in both places and
+     * agreed only while nothing ever failed on one side alone.
+     *
+     * <p>{@code optInt} is deliberately not used: it truncates, so {@code 1.5}
+     * reads back as video 1 — an id that names a different, live player.
+     */
+    static int requestedVideoId(JSONObject opts) {
+        Object raw = opts == null ? null : opts.opt("videoId");
+        long id;
+        if (raw instanceof Integer) {
+            id = (Integer) raw;
+        } else if (raw instanceof Long) {
+            id = (Long) raw;
+        } else {
+            throw new IllegalArgumentException("videoId is missing or not an integer");
+        }
+        if (id <= 0 || id > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("videoId " + id + " is outside 1..2147483647");
+        }
+        return (int) id;
+    }
+
+    /**
+     * Registers {@code player} under {@code videoId}, refusing an id already live.
+     *
+     * <p>The map is the claim: {@code putIfAbsent} decides and inserts in one
+     * step, so two creates racing for one id cannot both be told they have it.
+     * A plain {@code Map} could not promise that, which is why the parameter
+     * names the concurrent one.
+     */
+    static <T> void claimVideoId(ConcurrentMap<Integer, T> live, int videoId, T player) {
+        if (live.putIfAbsent(videoId, player) != null) {
+            throw new IllegalStateException("videoId " + videoId + " is already live");
+        }
+    }
+
     public String create(String optionsJson) {
         try {
             if (destroyed.get()) throw new IllegalStateException("session destroyed");
             JSONObject opts = new JSONObject(optionsJson);
-            int videoId = nextVideoId.getAndIncrement();
+            int videoId = requestedVideoId(opts);
             String src = opts.optString("src", "");
             // Store initial properties
             VideoPlayer player = new VideoPlayer(videoId, src, opts);
-            players.put(videoId, player);
+            claimVideoId(players, videoId, player);
             if (destroyed.get() && players.remove(videoId, player)) {
                 runOnMain(player::release);
                 throw new IllegalStateException("session destroyed");

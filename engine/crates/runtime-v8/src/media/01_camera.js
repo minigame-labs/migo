@@ -9,13 +9,12 @@ import {
   op_camera_listen_frame_change,
   op_camera_close_frame_change,
 } from "ext:core/ops";
-import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { allocateHostCallbackId, wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // Camera instance registry: cameraId -> Camera
 const _cameras = new Map();
 
 // Auto-incrementing camera ID counter
-let _nextCameraId = 1;
 
 /**
  * Camera - Provides access to device camera for photo capture,
@@ -239,20 +238,27 @@ class Camera {
  * @returns {Camera}
  */
 function createCamera(options = {}) {
-  const cameraId = _nextCameraId++;
-  const opts = JSON.stringify({
-    cameraId,
-    x: options.x ?? 0,
-    y: options.y ?? 0,
-    width: options.width ?? 300,
-    height: options.height ?? 150,
-    devicePosition: options.devicePosition ?? "back",
-    flash: options.flash ?? "auto",
-    size: options.size ?? "small",
-  });
-
+  let cameraId;
   let camera;
   try {
+    // From the Host's id space rather than a module counter: the platform keeps
+    // the camera slot in a table that outlives this isolate, so a counter
+    // restarting at 1 aims the retired runtime's frames at the replacement's
+    // camera. Inside this `try` on purpose -- an exhausted id space then takes
+    // the same `fail`/`complete` path everything else here takes, and needs no
+    // failure convention of its own.
+    cameraId = allocateHostCallbackId();
+    const opts = JSON.stringify({
+      cameraId,
+      x: options.x ?? 0,
+      y: options.y ?? 0,
+      width: options.width ?? 300,
+      height: options.height ?? 150,
+      devicePosition: options.devicePosition ?? "back",
+      flash: options.flash ?? "auto",
+      size: options.size ?? "small",
+    });
+
     op_camera_create(opts);
     camera = new Camera(cameraId);
     _cameras.set(cameraId, camera);
@@ -265,7 +271,11 @@ function createCamera(options = {}) {
     if (typeof options.fail === "function") {
       options.fail({ errMsg });
     }
-    if (!camera) {
+    // The host refused, but the id is this runtime's: content still gets a
+    // handle so its later calls fail cleanly instead of on `undefined`. With no
+    // id there is no handle to give -- a Camera under an id nobody allocated
+    // would route somebody else's frames.
+    if (!camera && cameraId !== undefined) {
       camera = new Camera(cameraId);
       _cameras.set(cameraId, camera);
     }

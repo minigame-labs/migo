@@ -662,20 +662,186 @@
   hazard: a side changed alone fails the contract loudly instead of silently
   mis-correlating.
 
-  Still task 6's own, and still the JSON-shaped kind that follows the pattern
-  above: `ImageApiManager` (53 JSON sites), `VideoManager`, `ResultProxyActivity`.
+  **Task 6's remaining three families done 2026-08-09, and Task 5's resource half
+  with them.** The two are recorded together because the ordering below made them
+  one change rather than two.
 
-  **Tasks 5, 7–12 are not started, and the property is not enforced yet.** Ids and
+  * **`ImageApiManager`** — `chooseImage`, `chooseMessageFile` and `compressImage`
+    now bind the id once at entry and carry it into every success, cancel,
+    no-selection, missing-activity and exception reply. The three result documents
+    are `static` and free of Android types (`chooseImageResultJson`,
+    `chooseMessageFileResultJson`, `compressImageResultJson`), because whether a
+    reply answers the request that asked is a property of the JSON and belongs
+    where a test can read it.
+  * **Three mutable manager fields were the same defect one level down.**
+    `pendingChooseImageCount`, `pendingChooseImageCompress` and
+    `pendingCameraTempUri` were per-request state on the manager, so a second
+    `chooseImage` overwrote the first one's while the first picker was still open
+    — the first reply then carried the second's id *and* the second's item limit.
+    They are now a `PickerRequest` captured by the launch callback, which is what
+    the plan's "store the request ID in the individual `PendingRequest`" asks for;
+    a capture is that storage, and it keeps the proxy Activity ignorant of
+    correlation.
+  * **The hand-rolled error JSON was a real escaping bug, not a style point.**
+    `"{\"error\":\"" + msg.replace("\"", "\\\"") + "\"}"` escapes the quote but not
+    the backslash before it, so a reason containing `C:\pics\"a".jpg` produced a
+    document the runtime cannot parse — and an unparseable reply settles nothing at
+    all, which is worse than the mis-correlation this task is about. Every error
+    path now goes through `CallbackCorrelation.failure`, pinned by
+    `a_failure_reason_carrying_a_quote_stays_one_json_document`.
+  * **`MediaExports` dropped two requests on the floor.** `imageChooseImage` and
+    `imageChooseMessageFile` returned silently when no manager could be built, so
+    the promise sat until the runtime's thirty-second timeout — and under the FIFO
+    fallback that timeout then rejects whichever request is *oldest*. Both now
+    answer, with the id echoed. `imageCompress` already answered, but with an
+    unstamped literal.
+
+  * **`VideoManager` honours the runtime's id, and the divergence it fixes was
+    live rather than theoretical.** JavaScript allocated `videoId` from
+    `_nextVideoId`, sent it in the create JSON, keyed its own registry by it — and
+    Java **ignored it**, allocating from its own `nextVideoId`. Both started at 1,
+    so they agreed only while no create ever failed on one side alone. One failed
+    `videoCreate` puts Java permanently one behind, and from then on every
+    `onVideoEvent` names a different player in Java than it does in JavaScript.
+    `requestedVideoId` refuses anything the runtime's space cannot produce
+    (`optInt` is not used: it truncates, so `1.5` reads back as video 1, which is a
+    real player), and `claimVideoId` makes the map itself the claim through
+    `putIfAbsent` — two creates racing for one id cannot both be told they have it.
+    The parameter is `ConcurrentMap`, not `Map`, because that atomicity is the
+    guarantee.
+
+  * **The ordering finding that made this one change.** A strict duplicate refusal
+    is only correct once video ids stop restarting at 1, and `on_restart`
+    (`core/src/runtime/host.rs:1458`) rebuilds the isolate **without** destroying
+    the Java `VideoManager` — `destroyAllManagers` runs only from `GameSession`'s
+    terminal cleanup. Landing the Java half alone would have turned a silent
+    mis-delivery into `createVideo` failing outright after every restart. So
+    `media/04_video.js` moved to `allocateHostCallbackId()` in the same change,
+    which is Task 5's step 3 for that file. Checked rather than assumed: the
+    grep for `destroyVideoManager` finds one caller, and it is teardown.
+
+  * **`ResultProxyActivity`: two reachable defects, both structural now.** The
+    token was `10000 + (sNextRequestCode.getAndIncrement() % 55000)`, so launch
+    55,001 repeated launch 1's token and `put` dropped the first request's callback
+    — its promise never settles. (Past `Integer.MAX_VALUE` the modulo also goes
+    negative, and a negative token failed the `>= 0` check, so the proxy finished
+    without launching and leaked the entry.) And every launch evicted entries older
+    than sixty seconds, which is how long a user browsing a gallery takes. Both now
+    live in `ProxyRequestTable`, which **has no clock** — age-based eviction is
+    unrepresentable rather than merely removed — and whose tokens are a
+    non-wrapping `AtomicLong` refusing permanently at `Long.MAX_VALUE` rather than
+    wrapping onto a live entry. Nothing accumulates without a sweeper because every
+    entry leaves through exactly one `take`: the result, the proxy's destruction,
+    or a launch that failed to start (new — `launch` now removes the entry before
+    the failure propagates, so the caller's own error path answers it once).
+
+  **Mutation evidence — nine mutants, nine killed, each by the test that names its
+  property.** Restored from copies and verified by `sha256sum`; the JS ones needed
+  `touch` after the write (§4).
+
+  | mutant | killed by |
+  |---|---|
+  | `chooseImageResultJson` stops stamping | `a_chosen_image_result_carries_the_id…`, `two_results_built_for_two_requests…` |
+  | `requestedVideoId` uses truncating `optInt` | `a_create_without_a_usable_id_is_refused_rather_than_renumbered` |
+  | `claimVideoId` uses `put` | `an_id_already_live_is_refused_and_leaves_the_live_player_in_place` |
+  | tokens back to `% 55000` | `a_token_is_never_reissued…`, `the_last_token_is_issued_once…` |
+  | `take` reads without removing | `a_request_is_taken_exactly_once`, `taking_one_request_leaves_the_others_untouched` |
+  | `04_video.js` back to a module counter | `modules_with_their_own_pending_maps…` — *"wx.createVideo took 0 ids"* |
+  | `01_ad.js` back to a module counter | same — *"wx.createRewardedVideoAd took 0 ids"* |
+  | `01_camera.js` back to a module counter | same — *"wx.createCamera took 0 ids"* |
+  | `02_inner_audio_context.js` back to a counter | same — *"wx.createInnerAudioContext took 0 ids"* |
+
+  **The four JS mutants were needed as positive controls, not only as evidence.**
+  That test skips an API the profile does not ship, so a probe that silently
+  reached nothing would read exactly like a passing one. Each mutant failing *by
+  name* is what proves its probe reached the allocation.
+
+  **The replaced scope was checked too:** under the first mutant,
+  `CallbackCorrelationTest` — which covers the same boundary one level up — stays
+  green. The new tests are what see this property.
+
+  **Task 5's resource half done: `ad`, `camera`, `inner audio`, `video`.** Each
+  named a host-owned object in a table that outlives the isolate, from a module
+  counter restarting at 1 — so the retired runtime's camera frames, audio playback
+  and *ad reward verdict* would arrive at the replacement's objects. Camera's
+  allocation moved **inside** its existing `try`, so an exhausted space takes the
+  `fail`/`complete` path already there and needs no failure convention of its own
+  (task 4's shape); its `catch` now checks `cameraId !== undefined` before handing
+  back a fallback handle, since a `Camera` under an id nobody allocated would route
+  somebody else's frames. Ad and inner audio throw out of their constructors, which
+  is those APIs' only convention — they return an object or they do not return.
+
+  **Two of the plan's premises for these files were wrong.** Step 3 says to
+  *"delete the ad wrap-and-probe loop"*: there is no such loop, `_allocAdId` was a
+  two-line counter. And step 3's *"a malformed or non-positive request fails
+  immediately"* is not adopted for the **absent** case — `CallbackCorrelation`'s
+  rule is that absent stays absent, and refusing an id-less request would destroy
+  the very fallback that rule exists to preserve. A malformed *options* string
+  still throws synchronously, which `createDeferredApi`'s `invoke` already turns
+  into a rejection.
+
+  **A harness limitation found on the way.** An unhosted ad schedules its fallback
+  `load` through `setTimeout`; `runtime_restart_boundary`'s harness runs without a
+  Tokio reactor, and the resulting panic **cannot unwind** — it aborts the test
+  process instead of failing a test. The harness now supplies an `AdOnlyServices`
+  whose every command fails, which is enough to take the hosted path. Worth
+  remembering for any future test that constructs an ad.
+
+  **Two dead options found and removed, recorded rather than silently dropped.**
+  `pendingChooseImageCompress` and `chooseMessageFile`'s `extensionArr` were both
+  written and never read. So `chooseImage`'s `sizeType: ['compressed']` and
+  `chooseMessageFile`'s `extension` filter are **not honoured on Android** — they
+  were not honoured before either, but a field written and never read tells the
+  next reader they are. Implementing them is a separate API-completeness item.
+
+  **Found and not fixed, deliberately:** `copyUriToTemp` does its file copy on the
+  main thread, from the proxy Activity's result callback, so choosing a large image
+  blocks the UI thread. Pre-existing and unchanged by this work; moving it needs a
+  threading decision this task should not make on its own.
+
+  Java 168 tests per flavour (from 151), zero failures, Full and Slim.
+  `migo-runtime-v8` 530 from 528. Seventeen new Java tests in
+  `ProxyRequestTableTest`, `ImageApiResultCorrelationTest`, `VideoIdOwnershipTest`.
+
+  Closing gate over the final state (13 files in scope): **11 host steps, 23
+  contract gates, `android-java compile` PASS, `verified for every target this
+  change touches`**, including `test-android-host-api-contract` (v0 unchanged at
+  357 entries), `test-camera-frame-jni-contract`, `test-ad-reward-integrity-contract`
+  and both product profiles. No `android compile` or `ohos compile` step appears
+  in this run and that is correct rather than missing: nothing here is behind a
+  `#[cfg]`, so `verification_targets.py` asks for no target build — the earlier
+  entries' target lines came from changes that touched conditional code.
+
+  ⚠️ **Four more files that are embedded into the snapshot as source** —
+  `ad/01_ad.js`, `media/01_camera.js`, `media/04_video.js`,
+  `audio/02_inner_audio_context.js` — now carry behaviour the snapshot does not. On
+  a device, until `scripts/gen-snapshot.sh` runs, these ids still come from module
+  counters while every host suite reports the new behaviour. Same class as task 3's
+  note; the regeneration round still belongs last.
+
+  **Task 5's UI half is surveyed and not started, and the survey is the useful
+  part.** `showModal`, `showActionSheet` and `openAppAuthorizeSetting` push onto
+  arrays and settle with `shift()`; none sends an id, so this is genuinely task 5's
+  work and not task 6's. `openSystemBluetoothSetting` is different and easier: it
+  already uses `createDeferredApi` and is *handed* a `requestId` in its invoke
+  callback, then calls `op_open_system_bluetooth_setting()` without it — a task-6
+  shape hiding in task 5's list. The blast radius is smaller than the file list
+  suggests: **only Android implements any of these four service methods**
+  (`platform/src/android/services/mod.rs:579,591,603,607`); every other platform
+  takes the trait default. The JNI descriptors that must widen with it are pinned
+  at `profile_contract.rs:151-152`, which fails loudly if one side moves alone.
+
+  **Tasks 7–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
   them before invoking JavaScript: that is Task 7's rejection and Task 10's
   unpublished candidate. Until then this is plumbing that changes no behaviour.
 
-  **The next task to be careful with is 4–5, not 3.** Those migrate the request,
-  progress and resource registries off their existing counters, and a
-  half-migrated correlation registry is worse than an unmigrated one — some
-  results correlate by the new id and some by the old counter, and the two
-  disagree exactly when a restart happens. Task 2 was safe to land alone because
-  it only adds fields; 4 and 5 are not.
+  **"A half-migrated correlation registry is worse than an unmigrated one" is why
+  task 5 stops where it does.** Its resource half is whole: every counter that
+  named a host-owned object is gone, and nothing correlates by two schemes at
+  once. Its UI half is untouched rather than begun — modal, action sheet and
+  app-authorize settle by `shift()` exactly as they always did. That is a seam,
+  not a half-migration: the two halves share no registry.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.
