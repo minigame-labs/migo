@@ -92,7 +92,8 @@ public final class InputExports {
         ScanCodeManager mgr = getOrCreateScanCodeManager(sessionId);
         if (mgr == null) {
             NativeMethods.onScanCodeResult(sessionId,
-                    "{\"error\":\"scanCode:fail no context\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson), "scanCode", "no context"));
             return;
         }
         mgr.scanCode(optionsJson);

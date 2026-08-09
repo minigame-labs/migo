@@ -12,6 +12,8 @@ import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.ResultProxyActivity;
 
 import org.json.JSONArray;
+import com.migo.runtime.internal.CallbackCorrelation;
+
 import org.json.JSONObject;
 
 import java.lang.ref.WeakReference;
@@ -33,6 +35,17 @@ public final class ScanCodeManager {
     private static final int REQUEST_SCAN_CODE = 9001;
 
     private final int sessionId;
+
+    /**
+     * The id of the scan currently in flight, or {@link CallbackCorrelation#ABSENT}.
+     *
+     * <p>Held on the instance rather than passed down because the result comes
+     * back through an Activity result, not through the call that started it.
+     * One field is enough for the same reason the manager holds one pending
+     * scan: the platform surfaces one scanner at a time, and a second request
+     * replaces the first here exactly as it does there.
+     */
+    private int requestId = CallbackCorrelation.ABSENT;
     private final WeakReference<Activity> activityRef;
     private final Handler mainHandler;
 
@@ -55,6 +68,7 @@ public final class ScanCodeManager {
         mainHandler.post(() -> {
             try {
                 JSONObject opts = new JSONObject(optionsJson);
+                requestId = CallbackCorrelation.requestIdOf(opts);
                 JSONArray scanType = opts.optJSONArray("scanType");
 
                 Intent intent = new Intent(ZXING_SCAN_ACTION);
@@ -115,6 +129,7 @@ public final class ScanCodeManager {
                 json.put("rawData", "");
             }
 
+            CallbackCorrelation.stamp(json, requestId);
             NativeMethods.onScanCodeResult(sessionId, json.toString());
         } catch (Exception e) {
             Log.e(TAG, "scanCode result error", e);
@@ -190,10 +205,11 @@ public final class ScanCodeManager {
         try {
             JSONObject json = new JSONObject();
             json.put("error", errMsg);
+            CallbackCorrelation.stamp(json, requestId);
             NativeMethods.onScanCodeResult(sessionId, json.toString());
         } catch (Exception e) {
             NativeMethods.onScanCodeResult(sessionId,
-                    "{\"error\":\"scanCode:fail internal error\"}");
+                    CallbackCorrelation.failure(requestId, "scanCode", "internal error"));
         }
     }
 
