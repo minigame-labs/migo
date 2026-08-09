@@ -197,6 +197,16 @@ jobs:
       - name: Runtime generation fence contract
         run: bash scripts/test-runtime-generation-fence-contract.sh
 
+      # The engine resolves every outbound call on NativeExports by name *and*
+      # descriptor, and the two sides are one contract written twice: string
+      # literals in Rust, a method in Java, with nothing a compiler can tie
+      # together. A mismatch fails GetStaticMethodID on a device, at the moment the
+      # feature is first used. Measured: widening a descriptor and leaving the Java
+      # method alone passes the profile contract, both R8 root checks, the host API
+      # contract and javac -- the profile contract compares names, never shapes.
+      - name: JNI outbound signature contract
+        run: bash scripts/test-jni-outbound-signature-contract.sh
+
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
         # (scripts/test-linux-sdk-contract.sh) needs the Debian bullseye

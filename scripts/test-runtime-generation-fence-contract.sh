@@ -95,173 +95,23 @@ for required in (INBOUND, CONTRACT, JAVA_MAIN, NATIVE_METHODS):
         sys.exit(1)
 
 
-# ---------------------------------------------------------------- source masking
-#
-# Structural scanning -- matching a call's parentheses, splitting its arguments at
-# top-level commas -- has to ignore anything inside a comment or a literal. A
-# javadoc line mentioning `NativeMethods.onCameraEvent(` is not a call site, and
-# `")"` is not a closing parenthesis. Blanking rather than deleting keeps every
-# offset and line number equal to the original, so an argument's text is still
-# read out of the real source and reported at its real line.
-#
-# One masker per language, because the hazards are not the same ones. Rust's are
-# not hypothetical in the file this gate reads: 137 lifetime annotations, which a
-# char-literal rule would each read as an opening quote and blank the parameter
-# list behind, and 11 raw strings, whose interior escapes mean nothing.
+# The reading of both sides -- masking comments and literals so structure can be
+# scanned, matching brackets, splitting argument lists, and the descriptor tables
+# themselves -- is shared with `test-jni-outbound-signature-contract.sh`. A parser
+# bug fixed in one copy and not the other is how two gates end up unequal while
+# looking alike.
+sys.path.insert(0, str(root / "scripts/lib"))
 
-
-def _blank(out: list[str], start: int, end: int) -> None:
-    """Blank `out[start:end]`, leaving newlines so line numbers survive."""
-    for index in range(start, end):
-        if out[index] != "\n":
-            out[index] = " "
-
-
-def mask_java(source: str) -> str:
-    out = list(source)
-    index, length = 0, len(source)
-    while index < length:
-        if source.startswith("//", index):
-            end = source.find("\n", index)
-            end = length if end == -1 else end
-            _blank(out, index, end)
-            index = end
-            continue
-        if source.startswith("/*", index):
-            end = source.find("*/", index + 2)
-            end = length if end == -1 else end + 2
-            _blank(out, index, end)
-            index = end
-            continue
-        if source[index] in ('"', "'"):
-            index = _mask_quoted(source, out, index, source[index])
-            continue
-        index += 1
-    return "".join(out)
-
-
-def _mask_quoted(source: str, out: list[str], open_quote: int, quote: str) -> int:
-    """Blank the interior of a backslash-escaped literal; return the offset past it."""
-    index, length = open_quote + 1, len(source)
-    while index < length:
-        if source[index] == "\\":
-            _blank(out, index, min(index + 2, length))
-            index += 2
-            continue
-        if source[index] == quote:
-            return index + 1
-        _blank(out, index, index + 1)
-        index += 1
-    return length
-
-
-# A char literal, and not a lifetime: `'a'`, `'\n'`, `'\u{1f}'`. A lifetime has no
-# closing quote, so requiring one is the whole distinction.
-_RUST_CHAR = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|.)|[^\\'])'")
-# `r"..."`, `r#"..."#`, `br##"..."##`: the hash count picks the terminator.
-_RUST_RAW = re.compile(r"b?r(#*)\"")
-_IDENT_CHAR = re.compile(r"[0-9A-Za-z_]")
-
-
-def mask_rust(source: str) -> str:
-    out = list(source)
-    index, length = 0, len(source)
-    while index < length:
-        if source.startswith("//", index):
-            end = source.find("\n", index)
-            end = length if end == -1 else end
-            _blank(out, index, end)
-            index = end
-            continue
-        if source.startswith("/*", index):
-            # Rust nests block comments, so a `/*` inside one is not text.
-            depth, cursor = 0, index
-            while cursor < length:
-                if source.startswith("/*", cursor):
-                    depth += 1
-                    cursor += 2
-                elif source.startswith("*/", cursor):
-                    depth -= 1
-                    cursor += 2
-                    if depth == 0:
-                        break
-                else:
-                    cursor += 1
-            _blank(out, index, cursor)
-            index = cursor
-            continue
-        raw = _RUST_RAW.match(source, index)
-        if raw is not None and not (
-            index and _IDENT_CHAR.match(source[index - 1])
-        ):
-            terminator = '"' + "#" * len(raw.group(1))
-            end = source.find(terminator, raw.end())
-            end = length if end == -1 else end + len(terminator)
-            _blank(out, raw.end(), end - len(terminator))
-            index = end
-            continue
-        if source[index] == '"':
-            index = _mask_quoted(source, out, index, '"')
-            continue
-        if source[index] == "'":
-            literal = _RUST_CHAR.match(source, index)
-            if literal is None:
-                index += 1  # a lifetime
-                continue
-            _blank(out, index + 1, literal.end() - 1)
-            index = literal.end()
-            continue
-        index += 1
-    return "".join(out)
-
-
-def balanced_end(masked: str, open_bracket: int) -> int | None:
-    """Offset of the bracket closing the one at `open_bracket`, or None."""
-    depth = 0
-    for index in range(open_bracket, len(masked)):
-        char = masked[index]
-        if char in "([{":
-            depth += 1
-        elif char in ")]}":
-            depth -= 1
-            if depth == 0:
-                return index
-    return None
-
-
-def split_arguments(text: str, masked: str) -> list[str]:
-    """`text` split at its top-level commas, nesting read from `masked`."""
-    parts, depth, start = [], 0, 0
-    for index, char in enumerate(masked):
-        if char in "([{":
-            depth += 1
-        elif char in ")]}":
-            depth -= 1
-        elif char == "," and depth == 0:
-            parts.append(text[start:index])
-            start = index + 1
-    parts.append(text[start:])
-    return parts
-
-
-def normalise(argument: str) -> str:
-    """One argument with its whitespace removed.
-
-    Several call sites wrap their argument list across lines and indent the
-    continuation, so an argument's text arrives with newlines and runs of spaces
-    inside it. Comparing that against `token.generation()` without normalising
-    would report the formatting as a violation.
-    """
-    return re.sub(r"\s+", "", argument)
-
-
-def spaced(text: str) -> str:
-    """`text` with each run of whitespace collapsed to one space."""
-    return re.sub(r"\s+", " ", text)
-
-
-def line_of(source: str, offset: int) -> int:
-    return source.count("\n", 0, offset) + 1
+from jni_source import (  # noqa: E402
+    balanced_end,
+    descriptor_table,
+    line_of,
+    mask_java,
+    mask_rust,
+    normalise,
+    spaced,
+    split_arguments,
+)
 
 
 # ------------------------------------------------- authority 1: the JNI handlers
@@ -344,17 +194,7 @@ if not fenced:
 
 # ---------------------------------------- authority 2: the JNI method descriptors
 
-contract_source = CONTRACT.read_text(encoding="utf-8")
-descriptors: dict[str, str] = {}
-for block in re.finditer(
-    r"const\s+NATIVE_[A-Z_]+\s*:\s*&\[JniMethod\]\s*=\s*methods!\[(.*?)\n\];",
-    contract_source,
-    re.S,
-):
-    for entry in re.finditer(
-        r'\(\s*"([A-Za-z0-9_]+)"\s*,\s*"([^"]+)"\s*\)', block.group(1)
-    ):
-        descriptors[entry.group(1)] = entry.group(2)
+descriptors = descriptor_table(CONTRACT.read_text(encoding="utf-8"), "NATIVE_")
 
 if not descriptors:
     print(
