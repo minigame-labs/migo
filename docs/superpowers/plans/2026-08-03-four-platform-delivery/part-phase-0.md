@@ -1337,14 +1337,25 @@
   reporting to nothing, until the session ended. The fence made those events
   harmless; it never made them free.
 
-  **Only fenced groups are swept, and the criterion is their own teardown.**
-  Destroying a manager can report — the keyboard's emits an
-  `onKeyboardComplete`, a camera's emits a stop — and those land on the queue
-  while `on_restart` is still running on the engine thread, so they are dispatched
-  to the runtime that *replaces* this one, as if it had produced them. A fenced
-  producer stamps the retired generation and the engine drops them. An unfenced
+  **What decides whether a group can be swept is its own teardown — not whether
+  its producer is fenced**, and the first draft of this rule was the narrower,
+  wrong one. Destroying a manager can report: the keyboard's emits an
+  `onKeyboardComplete`, a camera's emits a stop. Those land on the queue while
+  `on_restart` is still running on the engine thread, so they are dispatched to
+  the runtime that *replaces* this one, as if it had produced them. A fenced
+  producer stamps the retired generation and the engine drops them; an unfenced
   one would have the sweep inject exactly the cross-talk the mechanism exists to
-  remove. Media, Bluetooth and Network join when they capture tokens, not before.
+  remove.
+
+  So a group qualifies if its teardown reports nothing, **or** if what it reports
+  is fenced. Sensors and input qualify on the second count. `NetworkMonitor`
+  qualifies on the first — it unregisters a `ConnectivityManager` callback and
+  says nothing — and it is swept without being fenced, because it belongs with
+  `OnDeviceOrientationChange` rather than with the sensor streams: a network
+  status is a *current fact about the device*, so a replacement isolate needs it
+  as much as the retired one did, and fencing it would drop the one message that
+  tells a fresh runtime the phone is offline. Media and Bluetooth report as they
+  close, so they wait for their tokens.
   The two orderings that make it safe: the boundary closes *before* the teardown,
   so nothing acquired during it gets the generation that is leaving; and a
   teardown that throws leaves the session `RESTARTING`, which only reopens because

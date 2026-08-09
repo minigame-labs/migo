@@ -271,15 +271,23 @@ public final class NativeExports {
      * fence makes those events harmless; it does not stop them costing battery
      * and memory.
      *
-     * <p><b>Only groups whose producers are fenced are swept, and the reason is
-     * their own teardown.</b> Destroying a manager can report: the keyboard's
-     * emits an {@code onKeyboardComplete}, and a camera's emits a stop. Those
-     * land on the queue while {@code on_restart} is still running on the engine
-     * thread, so they are dispatched to the runtime that replaces this one — as
-     * if it had produced them. A fenced producer stamps the retired generation
-     * and the engine drops them; an unfenced one would inject exactly the
-     * cross-talk this whole mechanism exists to remove. Media, Bluetooth and
-     * Network join this list when they capture tokens, not before.
+     * <p><b>What decides whether a group can be swept is its own teardown, not
+     * whether its producer is fenced.</b> Destroying a manager can report: the
+     * keyboard's emits an {@code onKeyboardComplete}, and a camera's emits a
+     * stop. Those land on the queue while {@code on_restart} is still running on
+     * the engine thread, so they are dispatched to the runtime that replaces this
+     * one — as if it had produced them. A fenced producer stamps the retired
+     * generation and the engine drops them; an unfenced one would have this sweep
+     * inject exactly the cross-talk the fence exists to remove.
+     *
+     * <p>So a group qualifies if its teardown reports nothing, or if what it
+     * reports is fenced. Sensors and input are here on the second count.
+     * {@code NetworkMonitor} is here on the first: it unregisters a
+     * {@link android.net.ConnectivityManager} callback and says nothing, and it
+     * is not fenced *by design* — a network status is a current fact about the
+     * device, like a screen rotation, so a replacement isolate needs it as much
+     * as the retired one did. Media and Bluetooth report as they close and so
+     * wait for their tokens.
      *
      * <p>Handlers the embedder registered ({@code AdHandler}, {@code AuthHandler},
      * the message and permission sinks) are deliberately not here: they belong to
@@ -291,6 +299,9 @@ public final class NativeExports {
         ResourceCleanup.runAll(
                 () -> {
                     if (BuildConfig.MIGO_API_SENSORS) SensorExports.destroyAll(sessionId);
+                },
+                () -> {
+                    if (BuildConfig.MIGO_API_SENSORS) NetworkExports.destroyAll(sessionId);
                 },
                 () -> InputExports.destroyAll(sessionId),
                 () -> InteractionUI.destroy(sessionId));
