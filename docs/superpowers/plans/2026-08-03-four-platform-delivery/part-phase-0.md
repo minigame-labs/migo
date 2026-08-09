@@ -1213,6 +1213,34 @@
   what sets the priority of the rest of task 7: this is a public embedder API
   whose sessions must survive it, not a per-frame path.
 
+  **The completion is now authoritative, because refusing it could kill a whole
+  session in silence.** Both notifications reach Java over JNI, and
+  `call_static_method` turns a Java exception into a cleared exception and a
+  `Result::Err` that `AndroidPlatform` can only log — by design, since the
+  restart is already under way. Under the previous rule, a lost `begin` (exactly
+  what the mis-grouped `NativeExports` methods would have caused on Slim) made
+  the following `completeRestart` throw "is not restarting"; the mirror then sat
+  at the retired generation **for the rest of the session**, every manager built
+  afterwards stamped a value the engine drops at dispatch, and nothing in the
+  system could ever move it again. Two logged lines, and every Android event for
+  that game gone.
+
+  So the two calls are now deliberately asymmetric, by which refusal a session
+  can recover from. A refused `begin` costs a window — acquisition is not closed
+  while the isolate is replaced, and anything issued in it is stale the moment
+  the completion lands, then swept by `liveEntry` when the new runtime first asks
+  for it. A refused `completion` is permanent. So `beginRestart` keeps its
+  validation and `completeRestart` keeps one rule: **a generation never moves
+  backwards**. The remembered `candidate` field went with it — the completion
+  carries the number and is authoritative, so a stored candidate was a second
+  opinion whose only power was to refuse the first.
+
+  | mutant | killed by |
+  |---|---|
+  | a completion without its `begin` is refused (the old rule, restored) | `a_completion_whose_begin_never_arrived_still_publishes` |
+  | a completion can move the generation backwards | `a_completion_can_never_move_a_session_backwards` |
+  | the completion publishes but never reopens acquisition | 5 cases, including `nothing_can_be_acquired_while_a_restart_is_in_flight` |
+
   **Windows: NOT PROVEN became evidence.** This branch touches
   `windows/platform.rs`, which made `windows compile` a required target that this
   machine reported as having no local build — the verdict line the script's own

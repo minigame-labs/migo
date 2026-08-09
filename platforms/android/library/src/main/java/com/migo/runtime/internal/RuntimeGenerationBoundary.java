@@ -79,8 +79,6 @@ public final class RuntimeGenerationBoundary {
         /** The live generation while {@link Phase#ACTIVE}; the retired one while restarting. */
         long current = FIRST_GENERATION;
         Phase phase = Phase.ACTIVE;
-        /** The generation a restart in flight will publish; meaningless while ACTIVE. */
-        long candidate;
     }
 
     /** Begin tracking {@code sessionId} at the first generation. */
@@ -133,25 +131,40 @@ public final class RuntimeGenerationBoundary {
                 throw new IllegalArgumentException("session " + sessionId + " is not active at "
                         + retired + " (is " + state.phase + " at " + state.current + ")");
             }
+            // `next` is not recorded: the completion carries it and is
+            // authoritative, so a remembered candidate would be a second opinion
+            // whose only power is to refuse the first.
             state.phase = Phase.RESTARTING;
-            state.candidate = next;
         }
     }
 
     /**
      * Publish {@code next} as the live generation.
      *
-     * <p>Only the candidate a matching {@link #beginRestart} named is accepted;
-     * anything else means the caller is describing a different restart than the
-     * one in flight, and the session stays closed rather than opening at a
-     * generation nobody agreed on.
+     * <p>Accepted whenever it moves the session forward, including when no
+     * {@link #beginRestart} named it. That asymmetry with {@code beginRestart},
+     * which validates its arguments and refuses, is deliberate and is about
+     * which refusal a session can recover from.
+     *
+     * <p>These are notifications the engine makes over JNI, and it can do
+     * nothing with a failure but log it. A refused <em>begin</em> costs a
+     * window: acquisition is not closed while the isolate is being replaced, and
+     * anything issued in it is stale the moment the completion lands — swept by
+     * {@link #liveEntry} the first time the new runtime asks for it. A refused
+     * <em>completion</em> is permanent: this mirror would sit at the retired
+     * generation for the rest of the session, every manager built afterwards
+     * would stamp a value the engine drops at dispatch, and the whole session's
+     * Android event surface would go silently dead with nothing left to recover
+     * it. So the completion is authoritative — the engine is the only thing that
+     * knows which runtime is live — and the one rule kept is that a generation
+     * never moves backwards.
      */
     public static void completeRestart(int sessionId, long next) {
         SessionState state = require(sessionId);
         synchronized (state) {
-            if (state.phase != Phase.RESTARTING || state.candidate != next) {
-                throw new IllegalArgumentException("session " + sessionId + " is not restarting to "
-                        + next + " (is " + state.phase + " at " + state.current + ")");
+            if (next <= state.current) {
+                throw new IllegalArgumentException("session " + sessionId + " is at "
+                        + state.current + " and cannot complete a restart to " + next);
             }
             state.current = next;
             state.phase = Phase.ACTIVE;

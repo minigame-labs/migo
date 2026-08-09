@@ -109,11 +109,11 @@ public final class RuntimeGenerationBoundaryTest {
     }
 
     @Test
-    public void a_completion_that_does_not_match_the_candidate_is_refused() {
+    public void a_completion_can_never_move_a_session_backwards() {
         int session = freshSession();
         RuntimeGenerationBoundary.beginRestart(session, 1L, 2L);
 
-        for (long wrong : new long[] {1L, 3L, 0L}) {
+        for (long wrong : new long[] {1L, 0L, -1L, Long.MIN_VALUE}) {
             try {
                 RuntimeGenerationBoundary.completeRestart(session, wrong);
                 fail("completeRestart(" + wrong + ") was accepted");
@@ -122,7 +122,7 @@ public final class RuntimeGenerationBoundaryTest {
             }
         }
 
-        // Still closed, and still expecting exactly 2.
+        // Still closed, and the restart in flight can still finish.
         try {
             RuntimeGenerationBoundary.acquire(session);
             fail("a rejected completion opened acquisition");
@@ -131,6 +131,39 @@ public final class RuntimeGenerationBoundaryTest {
         }
         RuntimeGenerationBoundary.completeRestart(session, 2L);
         assertEquals(2L, RuntimeGenerationBoundary.acquire(session).generation());
+    }
+
+    @Test
+    public void a_completion_whose_begin_never_arrived_still_publishes() {
+        // `begin` is a notification, not a request, and it can be lost: the
+        // engine calls it over JNI and can do nothing with a failure but log it.
+        // Refusing the completion that follows would leave this mirror at the
+        // retired generation for the rest of the session, so every manager built
+        // afterwards would stamp a generation the engine drops at dispatch --
+        // the whole session's Android event surface silently dead, with nothing
+        // left that could recover it. The engine is the authority; a completion
+        // is it saying which runtime is live.
+        int session = freshSession();
+        RuntimeGenerationBoundary.Token retired = RuntimeGenerationBoundary.acquire(session);
+
+        RuntimeGenerationBoundary.completeRestart(session, 2L);
+
+        assertFalse("the retired token survived a begin-less restart", retired.isCurrent());
+        assertEquals(2L, RuntimeGenerationBoundary.acquire(session).generation());
+    }
+
+    @Test
+    public void a_completion_that_outruns_its_begin_is_taken_as_authoritative() {
+        // The same lost notification one step along: a `begin` arrived for one
+        // restart and the completion names a later one. Accepting the higher
+        // number keeps the mirror with the engine; refusing it would wedge the
+        // session exactly as above.
+        int session = freshSession();
+        RuntimeGenerationBoundary.beginRestart(session, 1L, 2L);
+
+        RuntimeGenerationBoundary.completeRestart(session, 3L);
+
+        assertEquals(3L, RuntimeGenerationBoundary.acquire(session).generation());
     }
 
     @Test
