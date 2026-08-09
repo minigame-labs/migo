@@ -111,6 +111,8 @@ mod ad_reward_integrity_tests {
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         HostOpState {
+            callback_ids: std::sync::Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
             id: 1,
             app_cache_dir: PathBuf::from("/tmp/cache"),
             app_files_dir: PathBuf::from("/tmp/files"),

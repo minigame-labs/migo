@@ -184,7 +184,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param enabled   1 if Bluetooth was enabled, 0 otherwise
      */
-    public static native void onOpenSystemBluetoothSetting(int sessionId, int enabled);
+    public static native void onOpenSystemBluetoothSetting(int sessionId, int requestId, int enabled);
 
     /**
      * Callback when app authorization setting result is received.
@@ -192,7 +192,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param code      0 on success, negative on failure
      */
-    public static native void onOpenAppAuthorizeSetting(int sessionId, int code);
+    public static native void onOpenAppAuthorizeSetting(int sessionId, int requestId, int code);
 
     /**
      * Callback when modal dialog is dismissed.
@@ -201,7 +201,7 @@ public final class NativeBridge {
      * @param confirm   1 if user tapped confirm, 0 otherwise
      * @param cancel    1 if user tapped cancel, 0 otherwise
      */
-    public static native void onModalResult(int sessionId, int confirm, int cancel);
+    public static native void onModalResult(int sessionId, int requestId, int confirm, int cancel);
 
     /**
      * Callback when action sheet is dismissed.
@@ -209,7 +209,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
      */
-    public static native void onActionSheetResult(int sessionId, int tapIndex);
+    public static native void onActionSheetResult(int sessionId, int requestId, int tapIndex);
 
     // ==================== Device Sensor Callbacks ====================
 
@@ -221,7 +221,8 @@ public final class NativeBridge {
      * @param beta      Rotation around X axis in degrees (-180 to 180)
      * @param gamma     Rotation around Y axis in degrees (-90 to 90)
      */
-    public static native void onDeviceMotionChange(int sessionId, double alpha, double beta, double gamma);
+    public static native void onDeviceMotionChange(
+            int sessionId, long generation, double alpha, double beta, double gamma);
 
     /**
      * Callback when gyroscope data is available.
@@ -231,7 +232,8 @@ public final class NativeBridge {
      * @param y         Angular velocity around Y axis in rad/s
      * @param z         Angular velocity around Z axis in rad/s
      */
-    public static native void onGyroscopeChange(int sessionId, double x, double y, double z);
+    public static native void onGyroscopeChange(
+            int sessionId, long generation, double x, double y, double z);
 
     /**
      * Callback when device screen orientation changes.
@@ -248,7 +250,8 @@ public final class NativeBridge {
      * @param direction Direction in degrees (0-360, 0 = north)
      * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable"
      */
-    public static native void onCompassChange(int sessionId, double direction, String accuracy);
+    public static native void onCompassChange(
+            int sessionId, long generation, double direction, String accuracy);
 
     /**
      * Callback when accelerometer data is available.
@@ -258,7 +261,8 @@ public final class NativeBridge {
      * @param y         Acceleration along Y axis in m/s^2
      * @param z         Acceleration along Z axis in m/s^2
      */
-    public static native void onAccelerometerChange(int sessionId, double x, double y, double z);
+    public static native void onAccelerometerChange(
+            int sessionId, long generation, double x, double y, double z);
 
     // ==================== Network Callbacks ====================
 
@@ -301,7 +305,8 @@ public final class NativeBridge {
      * @param eventType   Event type string
      * @param jsonPayload JSON-encoded event data
      */
-    public static native void onRecorderEvent(int sessionId, String eventType, String jsonPayload);
+    public static native void onRecorderEvent(
+            int sessionId, long generation, String eventType, String jsonPayload);
 
     /**
      * Callback when recorder frame data is available.
@@ -310,7 +315,8 @@ public final class NativeBridge {
      * @param frameData   Raw audio frame bytes
      * @param isLastFrame Whether this is the last frame before stop
      */
-    public static native void onRecorderFrameData(int sessionId, byte[] frameData, boolean isLastFrame);
+    public static native void onRecorderFrameData(
+            int sessionId, long generation, byte[] frameData, boolean isLastFrame);
 
     // ==================== Camera Callbacks ====================
 
@@ -322,7 +328,8 @@ public final class NativeBridge {
      * @param eventType   Event type string
      * @param jsonPayload JSON-encoded event data
      */
-    public static native void onCameraEvent(int sessionId, int cameraId, String eventType, String jsonPayload);
+    public static native void onCameraEvent(
+            int sessionId, long generation, int cameraId, String eventType, String jsonPayload);
 
     /**
      * Callback when camera frame data is available.
@@ -346,7 +353,7 @@ public final class NativeBridge {
      * @param width     Frame width in pixels
      * @param height    Frame height in pixels
      */
-    public static native void onCameraFrameData(int sessionId, int cameraId,
+    public static native void onCameraFrameData(int sessionId, long generation, int cameraId,
             ByteBuffer yBuffer, int yOffset, int yLength,
             ByteBuffer uBuffer, int uOffset, int uLength,
             ByteBuffer vBuffer, int vOffset, int vLength,
@@ -405,7 +412,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardInput(int sessionId, String value);
+    public static native void onKeyboardInput(int sessionId, long generation, String value);
 
     /**
      * Callback when user presses confirm on soft keyboard.
@@ -413,7 +420,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardConfirm(int sessionId, String value);
+    public static native void onKeyboardConfirm(int sessionId, long generation, String value);
 
     /**
      * Callback when soft keyboard is dismissed/completed.
@@ -421,7 +428,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardComplete(int sessionId, String value);
+    public static native void onKeyboardComplete(int sessionId, long generation, String value);
 
     /**
      * Callback when soft keyboard height changes.
@@ -429,7 +436,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param height    Keyboard height in CSS pixels (0 when hidden)
      */
-    public static native void onKeyboardHeightChange(int sessionId, double height);
+    public static native void onKeyboardHeightChange(int sessionId, long generation, double height);
 
     // ==================== Screen Capture ====================
 
@@ -439,7 +446,7 @@ public final class NativeBridge {
      *
      * @param sessionId The session ID
      */
-    public static native void onUserCaptureScreen(int sessionId);
+    public static native void onUserCaptureScreen(int sessionId, long generation);
 
     // ==================== Memory Warning ====================
 
@@ -673,7 +680,8 @@ public final class NativeBridge {
      * @param eventType Event type string
      * @param dataJson  JSON-encoded event data
      */
-    public static native void onVideoEvent(int sessionId, int videoId, String eventType, String dataJson);
+    public static native void onVideoEvent(
+            int sessionId, long generation, int videoId, String eventType, String dataJson);
 
     // ==================== Script Execution ====================
 

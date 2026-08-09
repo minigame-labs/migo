@@ -5,12 +5,15 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-
 /**
  * A transparent proxy Activity that handles {@code startActivityForResult} internally,
  * so the host Activity does not need to override {@code onActivityResult}.
+ *
+ * <p>The request itself lives in {@link ProxyRequestTable} until this Activity
+ * is created; from then on this instance owns it and answers it exactly once,
+ * whether the answer is a result, a cancellation, or the target never starting.
+ * Activity lifecycle callbacks all arrive on the main thread, which is what
+ * makes a plain field enough to hold that ownership.
  *
  * @hide
  */
@@ -23,22 +26,22 @@ public class ResultProxyActivity extends Activity {
         void onResult(int requestCode, int resultCode, Intent data);
     }
 
-    private static final ConcurrentHashMap<Integer, PendingRequest> sPendingRequests =
-            new ConcurrentHashMap<>();
-    private static final AtomicInteger sNextRequestCode = new AtomicInteger(0);
+    /**
+     * Names the request in the Intent. Distinct from the {@code int} key this
+     * replaced, so an Intent left over from an older build cannot be read as a
+     * token that names somebody else's request.
+     */
+    private static final String EXTRA_TOKEN = "_proxy_request_token";
 
-    private static int nextRequestCode() {
-        return 10000 + (sNextRequestCode.getAndIncrement() % 55000);
-    }
+    private static final ProxyRequestTable<PendingRequest> sPending = new ProxyRequestTable<>();
 
-    private int assignedRequestCode = -1;
-    private boolean launched = false;
+    /** The request this instance owes a result to; null once it has answered. */
+    private PendingRequest owned;
 
     private static final class PendingRequest {
         final Intent intent;
         final int requestCode;
         final ResultCallback callback;
-        final long createdAt = System.currentTimeMillis();
 
         PendingRequest(Intent intent, int requestCode, ResultCallback callback) {
             this.intent = intent;
@@ -51,6 +54,11 @@ public class ResultProxyActivity extends Activity {
      * Launch a transparent proxy Activity that will call {@code startActivityForResult}
      * on behalf of the caller and deliver the result via {@code callback}.
      *
+     * <p>If the proxy cannot be started, the recorded request is removed before
+     * the failure propagates: the caller's own error path then answers it, and
+     * a token that nothing will ever arrive for is not left behind. The caller
+     * must not also treat the throw as a delivery — it is one or the other.
+     *
      * @param context       A Context (typically an Activity) used to start this proxy
      * @param targetIntent  The Intent to forward to {@code startActivityForResult}
      * @param requestCode   The request code (used for callback identification only)
@@ -58,18 +66,18 @@ public class ResultProxyActivity extends Activity {
      */
     public static void launch(Context context, Intent targetIntent, int requestCode,
                               ResultCallback callback) {
-        // Clean up stale requests older than 60 seconds
-        long now = System.currentTimeMillis();
-        sPendingRequests.entrySet().removeIf(e -> now - e.getValue().createdAt > 60_000);
-
-        int uniqueCode = nextRequestCode();
-        sPendingRequests.put(uniqueCode, new PendingRequest(targetIntent, requestCode, callback));
+        long token = sPending.register(new PendingRequest(targetIntent, requestCode, callback));
         Intent proxy = new Intent(context, ResultProxyActivity.class);
-        proxy.putExtra("_proxy_request_code", uniqueCode);
+        proxy.putExtra(EXTRA_TOKEN, token);
         if (!(context instanceof Activity)) {
             proxy.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         }
-        context.startActivity(proxy);
+        try {
+            context.startActivity(proxy);
+        } catch (RuntimeException notStarted) {
+            sPending.take(token);
+            throw notStarted;
+        }
     }
 
     @Override
@@ -77,30 +85,33 @@ public class ResultProxyActivity extends Activity {
         super.onCreate(savedInstanceState);
         overridePendingTransition(0, 0);
 
-        assignedRequestCode = getIntent().getIntExtra("_proxy_request_code", -1);
-        PendingRequest req = assignedRequestCode >= 0
-                ? sPendingRequests.get(assignedRequestCode) : null;
-        if (req == null) {
-            // Process was killed and recreated — static state lost, nothing to do
+        Intent intent = getIntent();
+        PendingRequest request = intent != null && intent.hasExtra(EXTRA_TOKEN)
+                ? sPending.take(intent.getLongExtra(EXTRA_TOKEN, 0L))
+                : null;
+        if (request == null) {
+            // Process was killed and recreated — the table naming this request
+            // died with it, so there is nobody left to answer.
             finish();
             overridePendingTransition(0, 0);
             return;
         }
 
-        launched = true;
-        startActivityForResult(req.intent, req.requestCode);
+        owned = request;
+        try {
+            startActivityForResult(request.intent, request.requestCode);
+        } catch (RuntimeException notStarted) {
+            deliver(request.requestCode, Activity.RESULT_CANCELED, null);
+            finish();
+            overridePendingTransition(0, 0);
+        }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
 
-        PendingRequest req = assignedRequestCode >= 0
-                ? sPendingRequests.remove(assignedRequestCode) : null;
-
-        if (req != null && req.callback != null) {
-            req.callback.onResult(requestCode, resultCode, data);
-        }
+        deliver(requestCode, resultCode, data);
 
         finish();
         overridePendingTransition(0, 0);
@@ -109,13 +120,21 @@ public class ResultProxyActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        // If destroyed without receiving a result (e.g. target Activity crashed, user pressed
-        // back before the target launched), deliver a cancellation result and clean up
-        if (assignedRequestCode >= 0) {
-            PendingRequest req = sPendingRequests.remove(assignedRequestCode);
-            if (req != null && req.callback != null) {
-                req.callback.onResult(req.requestCode, Activity.RESULT_CANCELED, null);
-            }
+        // Destroyed without receiving a result (e.g. target Activity crashed, user pressed
+        // back before the target launched): the request is still owed an answer.
+        PendingRequest request = owned;
+        if (request != null) {
+            deliver(request.requestCode, Activity.RESULT_CANCELED, null);
+        }
+    }
+
+    /** Answers the owned request, if it has not been answered already. */
+    private void deliver(int requestCode, int resultCode, Intent data) {
+        PendingRequest request = owned;
+        if (request == null) return;
+        owned = null;
+        if (request.callback != null) {
+            request.callback.onResult(requestCode, resultCode, data);
         }
     }
 }

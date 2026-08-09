@@ -600,12 +600,12 @@ struct AndroidSystemInfo {
 }
 
 impl SystemInfoService for AndroidSystemInfo {
-    fn open_bluetooth_settings(&self) -> Result<(), ServiceError> {
-        Ok(jni::open_bluetooth_settings(self.host_id)?)
+    fn open_bluetooth_settings(&self, request_id: i32) -> Result<(), ServiceError> {
+        Ok(jni::open_bluetooth_settings(self.host_id, request_id)?)
     }
 
-    fn open_app_authorize_setting(&self) -> Result<(), ServiceError> {
-        Ok(jni::open_app_authorize_setting(self.host_id)?)
+    fn open_app_authorize_setting(&self, request_id: i32) -> Result<(), ServiceError> {
+        Ok(jni::open_app_authorize_setting(self.host_id, request_id)?)
     }
 
     fn get_window_info_json(&self) -> Result<String, ServiceError> {

@@ -20,6 +20,8 @@ import android.widget.FrameLayout;
 import java.lang.ref.WeakReference;
 
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.RuntimeGenerationBoundary;
+import com.migo.runtime.internal.RuntimeScoped;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -42,7 +44,7 @@ import org.json.JSONObject;
  *
  * @hide
  */
-public class KeyboardManager {
+public class KeyboardManager implements RuntimeScoped {
 
     private static final String TAG = "KeyboardManager";
     private static final int INPUT_BAR_HORIZONTAL_MARGIN_DP = 0;
@@ -65,8 +67,24 @@ public class KeyboardManager {
         return activityRef.get();
     }
 
+    /**
+     * The runtime this keyboard belongs to.
+     *
+     * <p>Captured once, here, and stamped on every event this manager reports.
+     * Reading the current generation at report time instead would always match,
+     * and the engine's comparison would drop nothing — which is exactly the
+     * failure that reads as working.
+     */
+    private final RuntimeGenerationBoundary.Token token;
+
+    @Override
+    public RuntimeGenerationBoundary.Token runtimeToken() {
+        return token;
+    }
+
     public KeyboardManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
+        this.token = RuntimeGenerationBoundary.acquire(sessionId);
         this.activityRef = new WeakReference<>(activity);
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
@@ -194,7 +212,7 @@ public class KeyboardManager {
             editText.clearFocus();
             updateInputBarBottomMargin(0);
 
-            NativeMethods.onKeyboardComplete(sessionId, value);
+            NativeMethods.onKeyboardComplete(sessionId, token.generation(), value);
         }
 
         stopKeyboardHeightMonitoring();
@@ -249,7 +267,7 @@ public class KeyboardManager {
             }
 
             String value = editText.getText().toString();
-            NativeMethods.onKeyboardConfirm(sessionId, value);
+            NativeMethods.onKeyboardConfirm(sessionId, token.generation(), value);
             if (!confirmHold) {
                 hideOnUiThread();
             }
@@ -277,7 +295,7 @@ public class KeyboardManager {
 
         @Override
         public void afterTextChanged(Editable s) {
-            NativeMethods.onKeyboardInput(sessionId, s.toString());
+            NativeMethods.onKeyboardInput(sessionId, token.generation(), s.toString());
         }
     };
 
@@ -304,7 +322,7 @@ public class KeyboardManager {
                 // Convert physical pixels to CSS pixels (dp)
                 float density = activity.getResources().getDisplayMetrics().density;
                 double cssHeight = keyboardHeight / density;
-                NativeMethods.onKeyboardHeightChange(sessionId, cssHeight);
+                NativeMethods.onKeyboardHeightChange(sessionId, token.generation(), cssHeight);
 
                 if (isShowing && previousKeyboardHeight > 0 && keyboardHeight == 0) {
                     completeBySystemDismiss();
@@ -337,7 +355,7 @@ public class KeyboardManager {
             editText.setVisibility(View.GONE);
             editText.clearFocus();
             updateInputBarBottomMargin(0);
-            NativeMethods.onKeyboardComplete(sessionId, value);
+            NativeMethods.onKeyboardComplete(sessionId, token.generation(), value);
         }
 
         stopKeyboardHeightMonitoring();

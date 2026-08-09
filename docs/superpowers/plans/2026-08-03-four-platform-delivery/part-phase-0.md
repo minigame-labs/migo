@@ -52,18 +52,64 @@
   `self_join_rejection_preserves_owner_for_another_thread`; `capi/src/lib.rs`
   `engine_refuses_to_die_while_sessions_are_live`,
   `engine_destroy_waits_for_retired_host_sentinel`,
-  `engine_destroy_holds_no_engine_lock_while_joining`,
   `session_destroy_transfers_host_without_joining_it`,
   `engine_destroy_from_its_retired_host_is_rejected_and_retryable`;
   `platform/src/host_owners.rs` `terminal_take_transfers_ownership_exactly_once`,
   `failed_shutdown_restores_same_owner_for_retry`; `tools/player/src/main.rs`
   `teardown_joins_host_before_dropping_native_resource`.
 
-  **Not closed, and deliberately.** No mutation evidence was taken this session, so
-  the tests above are asserted to exist rather than shown to be load-bearing, and
-  neither independent review has run. The next session's cheapest step is one
-  mutant: join while holding the engine lock and confirm
-  `engine_destroy_holds_no_engine_lock_while_joining` fails at its own assertion.
+  **The mutant this entry asked for was taken, 2026-08-09, and the guard it named
+  did not fail. It could not.** `engine_destroy_holds_no_engine_lock_while_joining`
+  used to hold a Migo lock deliberately across the join and still pass: **50 runs
+  out of 50**. A positive control rules out a stale binary — flipping
+  `join_failed` two lines above the same edit failed the test immediately with
+  `left: -11, right: 0`, so the mutated function was in the binary both times.
+
+  The reason is not a race to be tightened. The probe sampled
+  `retired_hosts.try_lock()` once, from the very thread being joined, and that
+  sample has **no ordering** against the join: it ran before the destroying thread
+  had been scheduled at all. A second attempt — spin until the retirement set is
+  observed drained *and* unlocked — failed the same way for a sharper reason:
+  `take_retired_hosts` releases the lock before the mutant re-acquires it, so the
+  state the probe waits for genuinely occurs, and the probe reliably catches that
+  window. **No sampling probe can establish "this thread is inside a blocking
+  call and holding nothing"**; that is a property of the code, not of an instant.
+
+  **So the bad state was made unexpressible instead.** `capi/src/retirement.rs`
+  holds `RetirementSet`: the `Mutex` is a private field of a private type in its
+  own module, `take` is the only way out and yields owned handles, and the one
+  function that produces a `MutexGuard` is private to that module. The engine's
+  destruction path can no longer name a lock to hold. `EngineInner::retire_host`
+  and `take_retired_hosts` are gone; their callers use the set directly, so there
+  is one place that knows how retirement is stored.
+
+  This is a **deadlock**, not a hygiene rule: a Host on its way out reaches
+  `migo_session_destroy` and `migo_engine_destroy`, which take these locks, so a
+  joiner holding one waits for the thread that is waiting for it.
+
+  **Evidence, and it is compile-time — deliberately labelled, because a mutant the
+  compiler kills is not a test kill.** Both shapes the defect could take now fail
+  to build, at `crates/capi/src/lib.rs:496`:
+
+  | Mutant | Result |
+  |---|---|
+  | `engine_ref.inner.retired_hosts.lock()` held across the join loop | `error[E0599]: no method named 'lock' found for struct 'RetirementSet'` |
+  | the same through the accessor, `.locked()` | `error[E0624]: method 'locked' is private` |
+
+  What replaces the deleted probe as a *runnable* guard is
+  `retirement.rs::take_hands_over_every_host_and_leaves_the_set_empty` and
+  `take_refuses_from_a_retired_host_and_keeps_it_for_a_retry`. Nothing else was
+  lost with it: its other two assertions — destruction waits for its Host, and
+  returns `MIGO_OK` once the Host exits — are `engine_destroy_waits_for_retired_host_sentinel`'s,
+  and the self-join refusal is `engine_destroy_from_its_retired_host_is_rejected_and_retryable`'s.
+
+  `cargo test -p migo-capi --lib`: **147 passed**, up from 146 — one unfalsifiable
+  test removed, two falsifiable ones added. `cargo-mutants --file
+  crates/capi/src/retirement.rs`: **10 mutants, 2 caught, 0 missed, 8 unviable** —
+  the eight are the tool trying to fabricate a `MutexGuard` for the private
+  accessor, which is the encapsulation showing up as "cannot even be written".
+
+  **Still not closed:** neither independent review has run.
 - [ ] 0.3 A2: immutable `PlatformIdentity` with synchronous rejection of
   incompatible reattachment, including the new HarmonyOS identity row.
   Plan: `2026-07-29-a2-platform-identity.md`.
@@ -93,9 +139,24 @@
   size, scale and generation, so it cannot change identity, and it is additionally
   gated on `ptr::eq(active, attachment_ref)` plus `validate_update_generation`.
 
-  **Not closed:** no mutant taken, no review. Cheapest next step: move
-  `validate_platform_identity` after the lease and confirm the contract script fails
-  with "C ABI reattachment identity is not rejected before Surface lease/enqueue".
+  **Mutant taken 2026-08-09, and it is the cleanest discriminating case in this
+  ledger.** `validate_platform_identity` was moved from before
+  `lease_surface_tracked` to immediately after it — a reordering that still
+  rejects the incompatible surface, just one step too late.
+
+  | Scope | Under the mutant |
+  |---|---|
+  | `scripts/test-surface-attachment-contract.sh` | **FAIL**: "C ABI reattachment identity is not rejected before Surface lease/enqueue" |
+  | `cargo test -p migo-capi --lib` | 147 passed |
+  | `cargo test -p migo-shared --lib surface::attachment` | 20 passed |
+
+  The static contract is the **only** thing that sees it, which is what an
+  ordering property looks like: no unit test can observe "before" — both orders
+  return the same code to the same caller. It is also the concrete case for T.6,
+  since until that item this gate ran in CI and not locally. Restored from a copy
+  taken before mutating and verified by `sha256sum`.
+
+  **Not closed:** neither independent review has run.
 - [ ] 0.4 A3: Migo-owned X11 connection; remove the undocumented `XInitThreads`
   precondition. Plan: `2026-07-29-a3-owned-x11-connection.md`.
 
@@ -107,17 +168,75 @@
   `reuse_requires_a_live_connection_to_the_same_server`, plus
   `presenter.rs::x11_context_binds_identity_surface_and_factory_to_one_owned_connection`.
 
-  **One real gap, and it needs no hardware.** The plan's Task 3 Step 1 asks for
-  platform-context tests at the `capi` layer, and `capi/src/platform/linux.rs` has
-  Wayland cases only — no test drives `build_target` down the X11 path, so
-  "cold X11 attach opens one context", "same-server reuse yields an equal
-  `PlatformIdentity`" and "a different server is refused with `INVALID_STATE` before
-  any lease" are asserted at the connection layer and nowhere at the C ABI.
-  `LinuxX11Context::from_render_display_for_test` makes this a host test.
+  **The gap is closed at the C ABI, 2026-08-09.** The plan's Task 3 Step 1 asked for
+  platform-context tests at the `capi` layer; `capi/src/platform/linux.rs` had
+  Wayland cases only, so nothing drove `build_target` down the X11 arm and the
+  reattachment properties were asserted at the connection layer and nowhere at the
+  boundary that decides them. Three tests now drive it:
+  `x11_reattachment_to_the_same_server_reuses_the_one_owned_connection`,
+  `x11_window_from_a_foreign_server_is_refused_and_opens_nothing`, and
+  `a_stored_x11_context_refuses_a_wayland_descriptor`.
 
-  **Genuinely device-blocked, and not on this machine:** Task 2 Step 4's
+  **The seam this entry named did not exist from `capi`, which is the fifteenth
+  recorded obstacle of that shape.** `LinuxX11Context::from_render_display_for_test`
+  is real, but it was `#[cfg(test)] fn` — private, and `cfg(test)` does not cross a
+  crate boundary, so `capi` compiles `platform` without it. Asking *which layer can
+  see this property* rather than *how do I reach this code* gives the answer: the
+  decision is `capi`'s, the evidence is the connection's, and a test seam has to
+  cross between them. It now does, the way `migo-core/test-support` already does —
+  `migo-platform/test-support`, enabled only from `capi`'s `[dev-dependencies]`,
+  which resolver 2 keeps out of every shipped build.
+
+  `X11TestServers` (`platform/src/linux/x11_connection.rs`) declares which
+  `Display*` reaches which X server and opens the render connection through
+  production `open_with_api` — no Xlib, no socket, no server. It **replaced**
+  `from_display_for_test`/`NoopX11Api` rather than joining them: two ways to
+  fabricate one object is the "one rule, two implementations" shape this repository
+  keeps digging out. The eight presenter tests that used the old helper (eleven call
+  sites) are unchanged and now run through the new one.
+
+  **Mutation evidence.** Restores verified by `sha256sum` against copies taken
+  before mutating, not by `git checkout` — the work was uncommitted.
+
+  | Mutant | Killed by | Old scope under the same mutant |
+  |---|---|---|
+  | Delete the `supports_host_display` check in the X11 reuse arm | `x11_window_from_a_foreign_server_is_refused_and_opens_nothing`, `left: None` vs `right: Some(-5)` | **All 10 `migo-platform` X11 tests pass**, including `reuse_requires_a_live_connection_to_the_same_server`, which asserts the deleted property one layer down. That is the gap, made concrete. |
+  | Wayland arm: `Some(_) => Err` becomes a fallthrough | `a_stored_x11_context_refuses_a_wayland_descriptor` **and** the pre-existing `platform_context_rejects_display_or_kind_change_before_native_access` | Old scope **also** kills it, so this mutant does not justify the new test. Recorded because it is the discriminating question. |
+  | Wayland arm guards only `Some(Wayland{..})`, letting an installed X11 context through | `a_stored_x11_context_refuses_a_wayland_descriptor` alone | `platform_context_rejects_display_or_kind_change_before_native_access` **passes** — it starts from a Wayland context, so it never exercises the kind it does not install. The §"guards cover the side they were designed for" shape, and what earns the third test. |
+
+  **What is still device-blocked, stated rather than papered over.** The *cold* arm
+  (`existing: None`) calls `LinuxX11Context::open`, which loads Xlib and
+  dereferences the host `Display*`; no seam changes that, so "a cold attach opens
+  exactly one context" is asserted at the connection layer
+  (`owner_opens_private_connection_and_closes_it_before_api_drop`) and, at the C
+  ABI, only for a context the test itself opened. Task 2 Step 4's
   `native_owned_connection_round_trip` is `#[ignore]`d pending a live X server, and
   Task 4 Step 4 runs the real C host under `xvfb-run`.
+
+  **Correction, 2026-08-09: this machine has `xvfb-run`, so the first of those was
+  never blocked here.** Run as
+  `xvfb-run -a … test -p migo-platform --lib native_owned_connection_round_trip -- --ignored`
+  it **passes**, and it is not vacuous: with `DISPLAY` unset the same invocation
+  fails at `DISPLAY must be set by the test gate: NotPresent`. It stays `#[ignore]`d
+  because the gate does not provide a display, which is the right default — but
+  "device-blocked" was wrong, and it was written several times before anyone typed
+  `command -v xvfb-run`. Task 4 Step 4 (the real C host under `xvfb-run`) is
+  therefore also reachable here and remains genuinely unrun.
+
+  **Verification, 2026-08-09** — `bash scripts/verify-change.sh --base master`,
+  covering this item together with 0.2, 0.3, T.6 and T.8:
+
+  ```
+  VERIFIED SCOPE  master..HEAD plus the working tree (15 files)
+  PASS  host      19 steps
+  PASS  contract  23 gates (1 CI ONLY: test-local-verification-contract.sh)
+  PASS  android compile  bash scripts/build-android-so.sh --compile-only arm64-v8a
+  PASS  ohos compile     bash scripts/build-ohos-sdk.sh --compile-only x86_64
+  [verify] verified for every target this change touches
+  ```
+
+  The `ohos compile` line is evidence rather than a static argument for the first
+  time; see T.8 for why it used to read `NOT PROVEN`.
 - [x] 0.5 A4: lossless terminal input transitions under bounded saturation.
   Plan: `2026-07-29-a4-lossless-input-state.md`. Evidence recorded 2026-07-29.
 - [ ] 0.6 A5: correct desktop pointer and button semantics, including Qt hover
@@ -178,14 +297,1223 @@
 
 - [ ] 0.7 A7: finish Android capability enforcement and revocation across all 30
   protected and 8 cleanup operations.
+
+  **Audited 2026-08-09 against the spec's own wording, and it is substantially
+  implemented — the one-line summary above is what hid that.** The authority is
+  the design document's acceptance line: *"Every protected platform operation has a
+  declaration appropriate to its product profile and explicit runtime permission and
+  revocation handling, on Android and HarmonyOS alike."* That is three properties,
+  and each was checked against the object rather than the sentence.
+
+  **1. Declaration appropriate to the profile — enforced.**
+  `scripts/test-permission-coverage-contract.sh` parses both Android manifests: every
+  gated scope's permission must be declared in Full, no dangerous permission may
+  merge into Slim, and `maxSdkVersion` must match. It carries self-tests that delete
+  a permission and inject a dangerous Slim one and require the parser to reject both.
+
+  **2. Runtime recheck before entering the framework — enforced structurally, for
+  all 38.** The same gate reports "30 gated op(s), 8 cleanup op(s), 38
+  permission-sensitive op(s)"; the inventory is derived from the service accessors,
+  every matched op must appear in exactly one policy table, gated entries must
+  contain the guard and cleanup entries must not. It strips comments first, so a
+  `// require_scope(...)` reads as nothing rather than as protection.
+
+  **3. Revocation without a leaked resource — two mechanisms, both wired.** Tracing
+  it end to end rather than trusting the class names:
+  `PermissionOperationGate.update(..., granted=false)` (`:128`) drains in-flight
+  operations with `awaitIdle`, then `ResourceCleanup.runAll` runs *both*
+  `runCancellations` and the native update. Cancellations are how a *pending
+  operation* releases what it holds — `LocationProvider.java:412`
+  `pending.setCancellation(() -> request[0].cancel(fallback))` is what removes a
+  retained `LocationListener`, so location needs no special case anywhere.
+  Separately, the native side decides on device objects that outlive one operation:
+  `android_permission_gate.rs:131` calls the cleanup closure only when the scope was
+  revoked, reaching `inbound.rs:1346 permission_revoke_resources` → JNI
+  `revokePermissionResources` → `PermissionRevocation.tearDown`, which routes
+  camera, recorder and bluetooth.
+
+  **The HarmonyOS half is satisfied by construction, and that chain is worth
+  recording because "no implementation" reads like a hole.** There is exactly one
+  `impl PermissionService for` on any platform and it is Android's. OpenHarmony
+  therefore takes the default: `DeviceServices::permission()` returns `None`
+  (`shared/src/services/device.rs:645`), `scope_state` maps that to
+  `ScopeState::Unknown` (`runtime-v8/src/permission.rs:105-113`), and the trait's
+  own defaults refuse — `request_scope` returns
+  `authorize:fail no permission handler`, pinned by
+  `the_default_implementation_grants_nothing`. The package matches: the OHOS SDK is
+  built `--no-default-features --features profile-slim`, Slim carries none of the
+  five optional API groups (`test-product-profiles.sh`), and
+  `platforms/openharmony/entry/src/main/module.json5` declares **no**
+  `requestPermissions` at all. Declared permissions cannot exceed honoured
+  capabilities when there are none of either.
+
+  **One unenforced invariant, recorded rather than built.**
+  `PermissionRevocation.tearDown`'s `switch (scope)` ends in `default: break;`, so a
+  scope that acquires a device object and is not added to the switch would be
+  revoked with nothing torn down, silently. No current scope is in that position —
+  the twelve unrouted ones are request/response, and location is pending-modelled —
+  so a gate for it today would be a guard that cannot fail, and the declaration it
+  would need does not exist. It is a hazard for whoever adds the sixteenth scope,
+  which is why it is written down here rather than mechanised now.
+
+  **What is actually still open:** no mutation evidence was taken for the Rust half
+  of this machinery (the Java half's permission cluster is covered — see T.4, where
+  its only surviving mutants are provably equivalent), the HarmonyOS statement above
+  is a source-and-package argument rather than device evidence (0.13 owns that), and
+  neither independent review has run.
 - [ ] 0.8 A8: retained-intrinsic host bridge, mounted-module URL validation,
   ad-event authority, late callback rejection, reliable asynchronous host-result
   lane.
+
+  Five clauses in one line, and at least one is already satisfied: ad-event
+  authority is item 0.12's third clause, closed there. Before starting, split them
+  and check each against its object — `scripts/test-host-bridge-channel-contract.sh`
+  and `scripts/test-ad-reward-integrity-contract.sh` both run in the gate and both
+  pass. The C ABI callback half overlaps the branch recorded under item 0.11.
 - [ ] 0.9 A9: runtime restart as a callback and resource ownership boundary.
   Plan: `2026-08-02-runtime-restart-generation-boundary.md` (12 tasks).
+
+  **Task 1 of 12 done 2026-08-09. Its premise was checked first and, unusually
+  for this ledger, held:** neither `shared/src/callback_id.rs` nor
+  `scripts/run-cargo-lib-test-filter.sh` existed and no callback-id allocator
+  existed anywhere, so the plan's "Expected: FAIL because `shared::callback_id`
+  does not exist" was true.
+
+  **The plan's own authority was the thing worth checking.** It names Section 6.6
+  of `docs/superpowers/specs/2026-07-29-three-platform-delivery-design.md`, which
+  reads as superseded — it is not. The four-platform spec replaces only Sections 3
+  and 15 of that document and states that every other section stays authoritative,
+  so §6.6 still governs this item.
+
+  **Two deviations from the plan, both stated rather than silent.** It says to work
+  in `.worktrees/three-platform-delivery`; a worktree has no `engine/target` and
+  would rebuild Skia, and `dev-test-host.sh`'s V8 path resolves from the repository
+  root — so the work is on `delivery/x11-and-mutation-evidence` with the index
+  scoped per task instead, which is what that rule is actually for. And the runner
+  drives cargo through `dev-test-host.sh` rather than invoking it bare: several
+  members link Skia and a bare `cargo test` fails for reasons unrelated to any
+  filter.
+
+  **`scripts/run-cargo-lib-test-filter.sh` earns its place independently of A9.**
+  A filtered `cargo test` exits 0 when the filter matches nothing, so a typo reads
+  as a passing suite — the "prefix filter as the criterion" mistake this repository
+  has made twice in one day. It lists first, fails on zero matches, and has a
+  `--self-test` over zero, one, several, and benchmark-only listings. That
+  self-test is falsifiable: loosening its parser to `grep -cE 'test'` fails four of
+  its five cases. Its first real use produced this item's red state —
+  `filter 'callback_id' matched no test in migo-shared` — rather than a green run
+  over nothing.
+
+  **`CallbackIdAllocator` has no reset, release or free, and the near-exhaustion
+  constructor is `#[cfg(test)]` and private.** A caller able to choose the starting
+  point is a caller able to reissue an identifier, which is the one thing the type
+  exists to prevent, so reuse is unexpressible rather than merely untested.
+  Exhaustion at `i32::MAX` is permanent and asked twice in the test, because an
+  "exhausted" that recovers on the next call is a wrap wearing an error's name.
+  `Relaxed` ordering is sufficient and the comment says why: a read-modify-write is
+  atomic whatever its ordering, and this call publishes no other memory.
+
+  **Mutation evidence: `cargo-mutants --file crates/shared/src/callback_id.rs` —
+  11 mutants, 11 caught, 0 missed, 0 unviable.** Among them both boundary
+  directions on `last < i32::MAX`, `+` to `-` and `*` in the increment and the
+  cast, and `Display::fmt`, which is caught only because a fifth test asserts the
+  message — T.2 recorded `Debug::fmt` survivors as noise for exactly the opposite
+  reason.
+
+  Verification, the same closing run recorded under item 0.14: 19 host steps,
+  23 contract gates, `android compile` and `ohos compile` both PASS,
+  `verified for every target this change touches`.
+
+  **Task 2 of 12 done 2026-08-09.** One callback-id space and one runtime
+  generation now reach every `HostOpState`, including each Worker's, through
+  `core/src/runtime/restart_boundary.rs`, the registry, `HostIngress`, and
+  `Host`. 21 files.
+
+  **The writer/reader split is in the types, not in a convention.**
+  `RestartBoundary` can advance the generation; `RuntimeGenerationReader` is what
+  the registry, ingress and every clone hold, and it has no mutation API at all —
+  not a private one. A reader that could store would be a second authority, and
+  two authorities disagree. `commit(retired, candidate)` requires
+  `candidate == retired + 1` and compare-exchanges against the live value, so a
+  stale committer is refused outright rather than winning by being last; that is
+  what makes an abandoned candidate harmless. `candidate_generation()` mutates
+  nothing, because a candidate that fails to initialise must leave the live
+  generation exactly as it was.
+
+  **Checked rather than assumed: production constructs exactly one boundary.**
+  All four `RestartBoundary::new()` sites in `registry.rs` sit under its
+  `#[cfg(test)]`; the only production construction is in
+  `thread.rs::spawn_host_thread_inner`, before `register_sender`, so no sender is
+  ever reachable without a generation to stamp with. A second production boundary
+  would be precisely the defect the module documents against.
+
+  **`inherited_correlation` was extracted from `op_worker_create`.** The two lines
+  a Worker inherits were inline in an async op, which no unit test can reach.
+  Production calls the extracted function — it is the only implementation, not a
+  restatement beside one, which is the distinction §"a test-only restatement of a
+  production rule" turns on.
+
+  **The plan's "exact files" list was one short**, and its own instruction caught
+  it: `rg -n 'HostOpState \{'` finds `runtime-v8/src/tests/two_session_identity.rs`,
+  which post-dates the plan (it arrived with the session-isolation work in #29).
+  A hand-listed file set drifts; the completeness command is the part to trust.
+
+  **Three items have no production caller yet, and that is deliberate.**
+  `HostIngress::runtime_generation()` is the read-only accessor a later task
+  stamps direct ingress with; `candidate_generation` and `commit` are the restart
+  pair the plan requires now *"so later tasks cannot invent a second generation
+  authority"*. The two `RestartBoundary` methods carry a narrow
+  `#[allow(dead_code)]` with the reason above them, which is this repository's
+  existing shape for planned surface (73 sites). Measured rather than waved
+  through: `migo-core` emitted **zero** warnings before this task and exactly one
+  after, and that one was these methods — a new warning left for the next reader
+  to triage is decay, so it was closed at the two items rather than tolerated.
+
+  **Mutation evidence: `cargo-mutants --file crates/core/src/runtime/restart_boundary.rs`
+  — 24 mutants, 9 caught, 0 missed, 15 unviable.** The caught nine include
+  `commit`'s successor guard inverted (`!=` to `==`) and its `+` turned into `-`
+  and `*`, and every constant substitution on both `current` methods. The fifteen
+  unviable are the tool fabricating `EngineResult` and `RuntimeGenerationReader`
+  through constructors that do not exist — which is the read-only type refusing to
+  be forged, showing up as "cannot even be written".
+
+  Suites: `restart_boundary` 6, `worker_and_parent_share_host_callback_id_space` 1,
+  `migo-core` 68, `migo-runtime-v8` 523. Closing gate over the final state
+  (42 files in scope): 19 host steps, 23 contract gates, `android compile` and
+  `ohos compile` PASS, `verified for every target this change touches`, and zero
+  `migo-core` warnings in the log.
+
+  **Task 3 done 2026-08-09 as a deliberate subset, because the plan contradicts
+  itself about the rest of it.** Its Step 3 says to *"delete the `pending.values().next()`
+  compatibility path"* in `runtime-v8/src/base/02_async.js`. Task 6, three tasks
+  later, is titled "Make Every Android Result Echo Its ID" and its own Step 2 says
+  *"Expected: FAIL because these paths currently omit IDs"* — location, scan,
+  compress/choose image, video, modal, action sheet, Bluetooth settings and
+  application settings. Deleting the fallback first does not make those fail
+  loudly; it makes their promises **never settle**, because the result arrives
+  with no id, matches nothing, and is discarded. A silent hang in `wx.getLocation`
+  is the worst available failure mode.
+
+  **What today's code actually does, per input**, read rather than assumed
+  (`02_async.js:196-228`, `Number(parsed.requestId)`): `null` → `0`, and `1.5`,
+  `-1`, `0`, `2147483648` are all finite, so they take the exact-lookup path, miss,
+  and are discarded safely. Only **absent** and **non-numeric** ids reach the FIFO
+  fallback — and that fallback settles the *oldest* pending request, so a garbage
+  id today mis-settles someone else's call.
+
+  **What was done**, which is the substantive part: `op_alloc_host_callback_id`
+  in `host_v8_base`, and `createDeferredApi` off its per-API `_nextId` onto the
+  Host's allocator, so ids stop restarting at 1 in each runtime and a retired
+  runtime's late result can no longer collide with a new request. `settle` now
+  requires a strict `parseHostCallbackId` **whenever `requestId` is present in
+  any form** and discards when it fails, which closes the garbage-id
+  mis-settlement on its own.
+
+  **What was deliberately not done:** the FIFO fallback stays for the *absent*
+  case, with a comment at the code naming Task 6 as the thing that makes deleting
+  it safe. Deleting it now would leave those Android promises never settling.
+
+  **The parser the plan specifies is wrong, and the test caught it before it
+  shipped.** `Number(value)` maps `true` to 1, so a result carrying
+  `requestId: true` parsed as the id 1 and settled whichever request held it —
+  observed as a real failure (`ids=[1] settled=["only"]`) on the first run, not
+  reasoned about. `parseHostCallbackId` now checks `typeof` before converting and
+  accepts only numbers and strings; a string is tolerated on purpose, and pinned
+  by `an_id_serialised_as_a_string_still_correlates`, because a platform echoing
+  the id as text is still echoing the exact id.
+
+  **Mutation evidence.** Restoring the per-API `var _nextId = 1` fails exactly
+  the two tests that name the property —
+  `a_replacement_runtime_never_reissues_a_retired_runtimes_id` and
+  `two_deferred_apis_in_one_runtime_do_not_share_a_numbering`
+  (`assertion failed: __otherIds[0] !== __ids[0]`) — while the three strictness
+  tests stay green, so the two groups are discriminating rather than overlapping.
+  Restored from a copy and verified by `sha256sum`. The strictness half needed no
+  synthetic mutant: the plan's own parser was the mutant, and the suite rejected
+  it.
+
+  **Not covered:** the JS `catch` around allocation, which rejects the call when
+  the id space is exhausted. Driving it needs an allocator at its bound, and
+  `CallbackIdAllocator`'s near-exhaustion constructor is `#[cfg(test)]` and
+  private to `shared` — deliberately, since a caller that can choose the starting
+  point can reissue an id. Exhaustion itself is covered where it lives, by
+  `maximum_is_issued_once_then_exhaustion_is_permanent`.
+
+  Suites: the five new cases in
+  `runtime-v8/src/tests/runtime_restart_boundary.rs`, `migo-runtime-v8` 528 from
+  523. Closing gate (46 files in scope): 19 host steps, 23 contract gates,
+  `android compile` and `ohos compile` PASS,
+  `verified for every target this change touches`.
+
+  ⚠️ `02_async.js` is embedded via `esm=[...]`, so this change needs
+  `scripts/gen-snapshot.sh` before it takes effect **on a device**; host suites
+  run the JS from source and will not show that gap. The six snapshots on
+  `master` were already stale, so this does not add a new class of problem — it
+  adds one more reason the regeneration round matters.
+
+  **Task 4 done 2026-08-09, as a subset for the same reason task 3 was.** Three modules — `system/13_login.js`, `payment/01_payment.js`,
+  `base/04_subpackage.js` — each own a module-local `_nextRequestId` starting at
+  1, send it out with the request and match it on return, which is the same
+  defect `createDeferredApi` had. Payment carries the extra weight: a
+  mis-correlated settle there is visible as money.
+
+  **The "six error conventions" problem dissolved once the code was read rather
+  than counted.** Every login and payment call site already wraps its host call
+  in a `try` whose `catch` *is* that API's failure convention — including
+  `reject` on the Promise-returning ones. Moving the allocation inside that same
+  `try`, ahead of the pending-map insertion, means an exhausted id space takes
+  the site's own existing path with **no new failure-handling code anywhere**.
+  Subpackage was the one exception: its early local-execute returns come before
+  any `try`, so it got a small guard shaped like `_settle`'s own report. Eight
+  sites, not the six the plan implies — login has five, not three.
+
+  **A correction worth recording, because it was mine.** The previous entry
+  stopped short of this task on the grounds that "a wrong-shaped failure on the
+  payment path is worse than the defect being fixed". That weighed the two wrong.
+  Allocation fails only at `i32::MAX` ids in one Host lifetime — effectively
+  unreachable — while the defect being fixed is reachable on every restart: a
+  late Midas result from the retired runtime settling a new purchase. An
+  unreachable cosmetic risk was allowed to outrank a reachable money-path one.
+
+  **Payment's two FIFO branches stay**, absent-key only, with the reason at the
+  code. Payment is *not* in task 6's file list, so whether its platform side
+  echoes the id is unverified — and for money the direction is obvious: a
+  discarded result is recoverable, a result settled against the wrong purchase is
+  not.
+
+  **The first version of the test asserted the product configuration, and the
+  Slim lane caught it.** It probed three APIs and required a fixed total of four
+  ids; Slim drops commerce, so `wx.requestMidasPayment` does not exist there and
+  the total was three — `FAIL host … --features profile-slim`, on a change that
+  was correct. The test now brackets each API individually between two
+  allocations and requires the gap to be exactly one, skipping an API the profile
+  does not ship. It also needed a configured subpackage in the harness:
+  `loadSubpackage` fails resolution before it reaches the allocation, and an
+  unreached allocation site looks exactly like one that does not allocate.
+
+  **Mutation evidence, taken against the final shape of the test rather than the
+  first.** Putting payment back on a private counter fails
+  `modules_with_their_own_pending_maps_draw_from_the_same_space` with
+  `wx.requestMidasPayment took 0 ids from the Host space, want 1`, under both
+  profiles, while the other five tests stay green. The test observes the
+  allocator rather than intercepting outgoing JSON: what matters is that the id
+  came from that space, and the space is what can say so. Restored from a copy,
+  verified by `sha256sum`, and checked for zero leftover references.
+
+  Suites: 6 cases in `runtime_restart_boundary.rs`, `migo-runtime-v8` 528 Full and
+  476 Slim. Closing gate (49 files in scope): 19 host steps, 23 contract gates,
+  `android compile` and `ohos compile` PASS,
+  `verified for every target this change touches`.
+
+  **Task 6 started 2026-08-09: two of its result families now echo their id.**
+  The premise held — `requestId` appeared **zero** times in all five platform
+  Java files, while the runtime has been sending it in the request JSON all
+  along, so every reply was landing on the FIFO fallback.
+
+  `CallbackCorrelation` (`internal/CallbackCorrelation.java`) is the one place
+  that knows how an id crosses this boundary, and it carries the rule that is
+  easy to get backwards: **absent stays absent**. A request with no id must get
+  a reply with no `requestId` key, because stamping `0` makes the runtime
+  discard it as "present and not an id" — strictly worse than the fallback it
+  would otherwise have taken.
+
+  * **Location** (`getLocation`, `getFuzzyLocation`): the id threads through all
+    three result builders, and through the **eight** hard-coded failure literals
+    in `NativeExports` that fire before any parse. Bound *before* the `try`, so a
+    malformed options string still answers the request that sent it.
+  * **Scan code**: the id is held on the manager instance, because the result
+    returns through an Activity result rather than through the call that started
+    it.
+
+  **The test caught two defects in this work before it landed**, which is the
+  point of writing it first. `JSONObject.optInt` **truncates**, so
+  `{"requestId":1.5}` read back as the id `1` — and `1` is a real id, so a reply
+  would have settled whichever request held it. Same shape as the runtime's
+  `Number(true) === 1`. The parser now checks the type before the value. Second:
+  Android's unit-test `android.jar` stubs `org.json` to throw "not mocked", so
+  the first host test over JSON-building code fails on its first `put`. Fixed by
+  adding the real `org.json` as a **test-only** dependency rather than the
+  platform's `returnDefaultValues = true`, which is module-wide and turns every
+  unmocked `android.*` call into a silent default — the opposite of what a test
+  should do.
+
+  Java 151 tests per flavour (from 143), zero failures; Android host API v0
+  unchanged at 357 entries; camera-frame JNI descriptor contract holds.
+
+  **`InteractionUI` is in task 6's file list, but its half of the work cannot be
+  done from task 6 — and the reason is not the JNI signature.** Read end to end:
+  `showModal` sends **no id at all**. `ui/01_interaction.js` pushes onto a
+  `_pendingModals` **array** and `_internalOnModalResult(confirm, cancel)` calls
+  `shift()`, so the oldest pending modal is settled by construction, and the
+  `op_show_modal` payload has no `requestId` field to echo. Modal is not "a reply
+  that omits its id"; it is an API that never had one — which is exactly what
+  task **5** is named for, *ID-Less UI Results*, and why task 5's file list
+  carries `ui/01_interaction.js` and `ui/mod.rs`.
+
+  So the two tasks are coupled in the direction the plan's numbering hides:
+  **Java cannot echo an id the runtime never sent**, so task 6's `InteractionUI`
+  work depends on task 5's. The earlier note here that "6 may want to come before
+  5" holds for the families that *are* given an id and drop it; it does not hold
+  for modal and action sheet.
+
+  When it is done, the JNI signature has to widen with it —
+  `profile_contract.rs:151-152` pins `("onModalResult", "(III)V")` and
+  `("onActionSheetResult", "(II)V")` — but that pin is a help rather than a
+  hazard: a side changed alone fails the contract loudly instead of silently
+  mis-correlating.
+
+  **Task 6's remaining three families done 2026-08-09, and Task 5's resource half
+  with them.** The two are recorded together because the ordering below made them
+  one change rather than two.
+
+  * **`ImageApiManager`** — `chooseImage`, `chooseMessageFile` and `compressImage`
+    now bind the id once at entry and carry it into every success, cancel,
+    no-selection, missing-activity and exception reply. The three result documents
+    are `static` and free of Android types (`chooseImageResultJson`,
+    `chooseMessageFileResultJson`, `compressImageResultJson`), because whether a
+    reply answers the request that asked is a property of the JSON and belongs
+    where a test can read it.
+  * **Three mutable manager fields were the same defect one level down.**
+    `pendingChooseImageCount`, `pendingChooseImageCompress` and
+    `pendingCameraTempUri` were per-request state on the manager, so a second
+    `chooseImage` overwrote the first one's while the first picker was still open
+    — the first reply then carried the second's id *and* the second's item limit.
+    They are now a `PickerRequest` captured by the launch callback, which is what
+    the plan's "store the request ID in the individual `PendingRequest`" asks for;
+    a capture is that storage, and it keeps the proxy Activity ignorant of
+    correlation.
+  * **The hand-rolled error JSON was a real escaping bug, not a style point.**
+    `"{\"error\":\"" + msg.replace("\"", "\\\"") + "\"}"` escapes the quote but not
+    the backslash before it, so a reason containing `C:\pics\"a".jpg` produced a
+    document the runtime cannot parse — and an unparseable reply settles nothing at
+    all, which is worse than the mis-correlation this task is about. Every error
+    path now goes through `CallbackCorrelation.failure`, pinned by
+    `a_failure_reason_carrying_a_quote_stays_one_json_document`.
+  * **`MediaExports` dropped two requests on the floor.** `imageChooseImage` and
+    `imageChooseMessageFile` returned silently when no manager could be built, so
+    the promise sat until the runtime's thirty-second timeout — and under the FIFO
+    fallback that timeout then rejects whichever request is *oldest*. Both now
+    answer, with the id echoed. `imageCompress` already answered, but with an
+    unstamped literal.
+
+  * **`VideoManager` honours the runtime's id, and the divergence it fixes was
+    live rather than theoretical.** JavaScript allocated `videoId` from
+    `_nextVideoId`, sent it in the create JSON, keyed its own registry by it — and
+    Java **ignored it**, allocating from its own `nextVideoId`. Both started at 1,
+    so they agreed only while no create ever failed on one side alone. One failed
+    `videoCreate` puts Java permanently one behind, and from then on every
+    `onVideoEvent` names a different player in Java than it does in JavaScript.
+    `requestedVideoId` refuses anything the runtime's space cannot produce
+    (`optInt` is not used: it truncates, so `1.5` reads back as video 1, which is a
+    real player), and `claimVideoId` makes the map itself the claim through
+    `putIfAbsent` — two creates racing for one id cannot both be told they have it.
+    The parameter is `ConcurrentMap`, not `Map`, because that atomicity is the
+    guarantee.
+
+  * **The ordering finding that made this one change.** A strict duplicate refusal
+    is only correct once video ids stop restarting at 1, and `on_restart`
+    (`core/src/runtime/host.rs:1458`) rebuilds the isolate **without** destroying
+    the Java `VideoManager` — `destroyAllManagers` runs only from `GameSession`'s
+    terminal cleanup. Landing the Java half alone would have turned a silent
+    mis-delivery into `createVideo` failing outright after every restart. So
+    `media/04_video.js` moved to `allocateHostCallbackId()` in the same change,
+    which is Task 5's step 3 for that file. Checked rather than assumed: the
+    grep for `destroyVideoManager` finds one caller, and it is teardown.
+
+  * **`ResultProxyActivity`: two reachable defects, both structural now.** The
+    token was `10000 + (sNextRequestCode.getAndIncrement() % 55000)`, so launch
+    55,001 repeated launch 1's token and `put` dropped the first request's callback
+    — its promise never settles. (Past `Integer.MAX_VALUE` the modulo also goes
+    negative, and a negative token failed the `>= 0` check, so the proxy finished
+    without launching and leaked the entry.) And every launch evicted entries older
+    than sixty seconds, which is how long a user browsing a gallery takes. Both now
+    live in `ProxyRequestTable`, which **has no clock** — age-based eviction is
+    unrepresentable rather than merely removed — and whose tokens are a
+    non-wrapping `AtomicLong` refusing permanently at `Long.MAX_VALUE` rather than
+    wrapping onto a live entry. Nothing accumulates without a sweeper because every
+    entry leaves through exactly one `take`: the result, the proxy's destruction,
+    or a launch that failed to start (new — `launch` now removes the entry before
+    the failure propagates, so the caller's own error path answers it once).
+
+  **Mutation evidence — nine mutants, nine killed, each by the test that names its
+  property.** Restored from copies and verified by `sha256sum`; the JS ones needed
+  `touch` after the write (§4).
+
+  | mutant | killed by |
+  |---|---|
+  | `chooseImageResultJson` stops stamping | `a_chosen_image_result_carries_the_id…`, `two_results_built_for_two_requests…` |
+  | `requestedVideoId` uses truncating `optInt` | `a_create_without_a_usable_id_is_refused_rather_than_renumbered` |
+  | `claimVideoId` uses `put` | `an_id_already_live_is_refused_and_leaves_the_live_player_in_place` |
+  | tokens back to `% 55000` | `a_token_is_never_reissued…`, `the_last_token_is_issued_once…` |
+  | `take` reads without removing | `a_request_is_taken_exactly_once`, `taking_one_request_leaves_the_others_untouched` |
+  | `04_video.js` back to a module counter | `modules_with_their_own_pending_maps…` — *"wx.createVideo took 0 ids"* |
+  | `01_ad.js` back to a module counter | same — *"wx.createRewardedVideoAd took 0 ids"* |
+  | `01_camera.js` back to a module counter | same — *"wx.createCamera took 0 ids"* |
+  | `02_inner_audio_context.js` back to a counter | same — *"wx.createInnerAudioContext took 0 ids"* |
+
+  **The four JS mutants were needed as positive controls, not only as evidence.**
+  That test skips an API the profile does not ship, so a probe that silently
+  reached nothing would read exactly like a passing one. Each mutant failing *by
+  name* is what proves its probe reached the allocation.
+
+  **The replaced scope was checked too:** under the first mutant,
+  `CallbackCorrelationTest` — which covers the same boundary one level up — stays
+  green. The new tests are what see this property.
+
+  **Task 5's resource half done: `ad`, `camera`, `inner audio`, `video`.** Each
+  named a host-owned object in a table that outlives the isolate, from a module
+  counter restarting at 1 — so the retired runtime's camera frames, audio playback
+  and *ad reward verdict* would arrive at the replacement's objects. Camera's
+  allocation moved **inside** its existing `try`, so an exhausted space takes the
+  `fail`/`complete` path already there and needs no failure convention of its own
+  (task 4's shape); its `catch` now checks `cameraId !== undefined` before handing
+  back a fallback handle, since a `Camera` under an id nobody allocated would route
+  somebody else's frames. Ad and inner audio throw out of their constructors, which
+  is those APIs' only convention — they return an object or they do not return.
+
+  **Two of the plan's premises for these files were wrong.** Step 3 says to
+  *"delete the ad wrap-and-probe loop"*: there is no such loop, `_allocAdId` was a
+  two-line counter. And step 3's *"a malformed or non-positive request fails
+  immediately"* is not adopted for the **absent** case — `CallbackCorrelation`'s
+  rule is that absent stays absent, and refusing an id-less request would destroy
+  the very fallback that rule exists to preserve. A malformed *options* string
+  still throws synchronously, which `createDeferredApi`'s `invoke` already turns
+  into a rejection.
+
+  **A harness limitation found on the way.** An unhosted ad schedules its fallback
+  `load` through `setTimeout`; `runtime_restart_boundary`'s harness runs without a
+  Tokio reactor, and the resulting panic **cannot unwind** — it aborts the test
+  process instead of failing a test. The harness now supplies an `AdOnlyServices`
+  whose every command fails, which is enough to take the hosted path. Worth
+  remembering for any future test that constructs an ad.
+
+  **Two dead options found and removed, recorded rather than silently dropped.**
+  `pendingChooseImageCompress` and `chooseMessageFile`'s `extensionArr` were both
+  written and never read. So `chooseImage`'s `sizeType: ['compressed']` and
+  `chooseMessageFile`'s `extension` filter are **not honoured on Android** — they
+  were not honoured before either, but a field written and never read tells the
+  next reader they are. Implementing them is a separate API-completeness item.
+
+  **Found and not fixed, deliberately:** `copyUriToTemp` does its file copy on the
+  main thread, from the proxy Activity's result callback, so choosing a large image
+  blocks the UI thread. Pre-existing and unchanged by this work; moving it needs a
+  threading decision this task should not make on its own.
+
+  Java 168 tests per flavour (from 151), zero failures, Full and Slim.
+  `migo-runtime-v8` 530 from 528. Seventeen new Java tests in
+  `ProxyRequestTableTest`, `ImageApiResultCorrelationTest`, `VideoIdOwnershipTest`.
+
+  Closing gate over the final state (13 files in scope): **11 host steps, 23
+  contract gates, `android-java compile` PASS, `verified for every target this
+  change touches`**, including `test-android-host-api-contract` (v0 unchanged at
+  357 entries), `test-camera-frame-jni-contract`, `test-ad-reward-integrity-contract`
+  and both product profiles. No `android compile` or `ohos compile` step appears
+  in this run and that is correct rather than missing: nothing here is behind a
+  `#[cfg]`, so `verification_targets.py` asks for no target build — the earlier
+  entries' target lines came from changes that touched conditional code.
+
+  ⚠️ **Four more files that are embedded into the snapshot as source** —
+  `ad/01_ad.js`, `media/01_camera.js`, `media/04_video.js`,
+  `audio/02_inner_audio_context.js` — now carry behaviour the snapshot does not. On
+  a device, until `scripts/gen-snapshot.sh` runs, these ids still come from module
+  counters while every host suite reports the new behaviour. Same class as task 3's
+  note; the regeneration round still belongs last.
+
+  **Task 5's UI half done 2026-08-09, and Task 6's `InteractionUI` half falls out
+  of it.** Modal, action sheet, application-authorisation settings and the system
+  Bluetooth setting now correlate by request id end to end: JavaScript allocates
+  it, the platform carries it, and every result names the call it answers.
+
+  * **The best part of this change is what it deleted.** Modal, action sheet and
+    app-authorise each kept their own `_pending*` **array** settled by `shift()`,
+    which is not weak correlation — it is *no* correlation: the first result
+    answered the first call whatever it was a result for. All three now use
+    `createDeferredApi`, the same factory every other deferred API uses, so there
+    is **one** settlement implementation instead of four. They inherit its strict
+    id parsing, its `_settleEntry` conventions and its perf logging for free.
+    Timeout is passed as `0` for all three: a modal waits for a person, and
+    inheriting the 30-second auto-reject would have been a behaviour change
+    smuggled in by a refactor.
+  * **`settleParsed` is why that reuse is honest.** These results cross JNI as
+    *integers* — a modal's confirm/cancel, an action sheet's tap index — so there
+    is no JSON. Stringifying them just so `settle` could parse them back would
+    have made the encoding exist only to be undone. `settle(json)` is now
+    `settleParsed(JSON.parse(json))`, and the hooks build the object directly.
+  * **`openSystemBluetoothSetting` was a task-6 shape hiding in task 5's list.**
+    It already used `createDeferredApi` and was already *handed* a `requestId` in
+    its invoke callback — and then called `op_open_system_bluetooth_setting()`
+    without it. Every result came back bare and settled the oldest pending
+    request. One argument.
+
+  **The hazard this change had to invent an answer for: an integer cannot be
+  absent.** `CallbackCorrelation`'s rule is *absent stays absent* — a request with
+  no id gets a reply with no `requestId` **key**, because a key present and
+  invalid is discarded where a missing key still reaches the fallback. That works
+  for JSON results. These four cross the boundary as `int`, and an `int` has no
+  "missing": the platform says *no id* by sending `0`. Writing that `0` into the
+  result object would have made the settler discard the reply and settle nothing,
+  ever. So each hook **omits** the key when the id is not positive, and
+  `onOpenSystemBluetoothSetting`'s Rust-built JSON does the same. This is the one
+  place in the correlation work where the two boundaries do not have the same
+  shape, and it is the one that would have shipped silently: the reply simply
+  never arrives.
+
+  **Mutation evidence — one mutant per *direction* of the rule, because a guard
+  that only covers the side it was designed for is this ledger's recurring trap.**
+
+  | mutant | killed by | and left green |
+  |---|---|---|
+  | modal ignores the id (FIFO again) | `two_modals_settle_by_id_even_when_answered_out_of_order` | `a_ui_result_carrying_no_id_still_settles_through_the_fallback` |
+  | app-authorise stamps an id that is not one | `a_ui_result_carrying_no_id_still_settles_through_the_fallback` | `two_modals_settle_by_id…` |
+
+  Each mutant fails exactly one test and leaves the other's green, which is what
+  makes the pair discriminating rather than two names for one assertion. Restored
+  from copies, `sha256sum` verified.
+
+  **The tests go through the real host bridge, and that was not the first
+  attempt.** Calling `_internalOnModalResult(...)` directly failed with *"is not
+  defined"*: the `_internalOn*` names are retired from `globalThis` by
+  `harden_global_scope` and travel by handle — the property
+  `test-host-bridge-channel-contract.sh` pins. Routing through
+  `globalThis[Symbol.for('Migo.hostBridge')]._internalDispatch(name, json)`
+  instead is strictly better evidence: it puts the **argument encoding** under
+  test too, since the hooks receive exactly the JSON array `hook_args_two` and the
+  new `hook_args_three` build.
+
+  **A second harness abort, same cause as the ad one and worth the pattern.**
+  `openSystemBluetoothSetting` keeps `createDeferredApi`'s default 30-second
+  auto-reject, so probing it scheduled a `setTimeout`, and a timer in a harness
+  with no Tokio reactor **aborts the process** — the failure that cannot unwind,
+  which discards every other test's output including the three real failures it
+  was hiding. The probe passes `_timeout: 0`. Rule of thumb for this harness: any
+  API that can schedule a timer needs the timer disabled or a hosted service that
+  stops it being scheduled.
+
+  **Six JNI descriptors widened on both sides at once**, `(III)V` → `(IIII)V` for
+  `onModalResult` and `(II)V` → `(III)V` for the other three inbound hooks, plus
+  `(I)V` → `(II)V` for the two `NativeExports` entry points. Verified against the
+  **compiled bytecode** rather than against the source that was just edited:
+  `javap -s` on `fullDebug` reports exactly the six descriptors
+  `profile_contract.rs` now pins. The frozen host API v0 is untouched because
+  `NativeExports` lives in `internal`, which that gate excludes by design.
+
+  ⚠️ **Correction to this entry's earlier claim, and it matters for the next
+  change of this shape.** It said `profile_contract.rs` "fails loudly if one side
+  widens alone". It does — but at **engine startup on a device**, not in any local
+  gate. `register_native_methods` and `get_static_method_id` are both fail-closed
+  and name the offending method and signature, so a one-sided edit cannot ship
+  silently; it simply is not caught here. There is **no general Java-vs-Rust
+  descriptor gate**: `test-camera-frame-jni-contract.sh`,
+  `test-input-transport-contract.sh` and `test-surface-attachment-contract.sh`
+  each do this for their own concern, and nothing covers the other ~70 methods.
+  **The gate worth building** (a tooling item, not A9): have Rust *emit*
+  `active_methods` for the profile it was compiled with — so the cfg gating is
+  never restated in a script, which is how it would drift — and compare that
+  emission to `javap` for both flavours. This session's evidence for why is
+  direct: six descriptors were changed by hand across two languages and only a
+  manual `javap` read confirmed them.
+
+  **The FIFO fallback stays, and its reason has changed rather than expired.** It
+  is no longer "Android does not echo" — Android now echoes on every path. What is
+  unverified is whether any *other* host can produce an id-less deferred result at
+  all. The evidence so far says probably not: Linux, Windows and the C ABI host
+  provide no `interaction()` service, and take the trait default for both
+  `SystemInfoService` methods, so those ops fail synchronously and never leave a
+  pending entry for a platform result to reach. Settling that for **every**
+  `createDeferredApi` user on every platform is the audit that makes the fallback
+  deletable, and payment's two Midas branches need their own answer because
+  payment is in nobody's echo list. Deleting on today's evidence would trade a
+  wrong settle for a promise that never settles.
+
+  **The Slim lane caught the same mistake this ledger already records once, and
+  that is worth noticing.** The first version of all three tests called
+  `showModal` / `showActionSheet` / `openAppAuthorizeSetting` unguarded, and Slim
+  does not ship them (`api-system` gates `host_v8_ui`): three FAILs on a change
+  that was correct. Item 0.9's task-4 entry records the identical shape — a test
+  requiring a fixed id total that Slim's missing `requestMidasPayment` broke. The
+  fix is the same one: run the scenario only where the API exists, and record in
+  `__ran` which lane did, so a skip cannot be read as a pass. **A profile-gated
+  API is never safe to name unguarded in a test**, and the Full/Slim pair is what
+  makes the skip honest rather than vacuous.
+
+  Suites: `runtime_restart_boundary` 9 from 6 — three new cases covering
+  out-of-order settlement, an unknown id settling nothing, and the id-less
+  fallback — and four more families in the host-space probe (`wx.showModal`,
+  `wx.showActionSheet`, `wx.openAppAuthorizeSetting`,
+  `wx.openSystemBluetoothSetting`). Java 168 per flavour, unchanged and green.
+
+  Closing gate over the final state (18 files in scope): **14 host steps, 23
+  contract gates, `android compile` (arm64-v8a) and `android-java compile` PASS,
+  `verified for every target this change touches`** — both profiles on all four
+  Rust crates, and `test-host-bridge-channel-contract` green, which is the gate
+  that owns the handle-not-global property these tests had to route through.
+
+  ⚠️ Four more snapshot-embedded JS files carry behaviour the snapshot does not:
+  `base/02_async.js`, `ui/01_interaction.js`, `system/02_authorize.js`,
+  `system/01_bluetooth.js`. The regeneration round still belongs last.
+
+  **Task 7 started 2026-08-09: the chokepoint exists, and the generation now
+  actually moves.** Task 7 is 12 steps over ~57 files and is not one sitting.
+  What landed is the part everything else plugs into — and the part that stops
+  tasks 1–6 being plumbing that changes nothing.
+
+  **Until now a restart did not advance the generation at all.** `on_restart`
+  carried `runtime_generation: self.restart_boundary.current()` with a comment
+  deferring the advance to task 10, so `RestartBoundary::candidate_generation`
+  and `commit` — both built and tested by task 2 — had no caller and carried
+  `#[allow(dead_code)]`. A comparison against a value that never changes is
+  decoration however carefully it is written, so the advance came first:
+  `candidate_generation()` before the new `HostOpState`, `commit(retired,
+  candidate)` immediately after `js.set(new_js)`. That ordering is the point —
+  `candidate_generation` reads without mutating, so a restart that fails to build
+  a runtime leaves the live generation exactly where it was and nothing is fenced
+  against an isolate that never appeared. This is task 10's *generation* half done
+  properly, not a stand-in for its cleanup barriers.
+
+  **One place decides, and it is the only place that can.** `HostCommand::
+  callback_generation() -> Option<i64>`, compared at the top of
+  `Host::handle_command_inner` before any JavaScript runs. Each platform checking
+  before it enqueues loses the race by construction: the command sits in the queue
+  while `on_restart` runs on that same thread, so whatever was true at enqueue can
+  stop being true before dispatch. At dispatch the comparison and the delivery are
+  not separated by anything.
+
+  **`Option<i64>` rather than the plan's `i64`, and the reason is honesty.** An
+  `int` has no "absent", so an unfenced producer would have to pass *something* —
+  and the only available something is the current generation, which always
+  matches and proves nothing. `None` says "this producer captures no generation
+  yet" out loud. It covers two cases that are deliberately not distinguished:
+  commands that are not runtime-owned callbacks at all, and producers task 7 has
+  not fenced yet (every Android manager). Physical `OnKeyDown`/`OnKeyUp` are in
+  the first group on purpose: dropping a key *up* because a restart happened
+  leaves content believing the key is still held, which is worse than late
+  delivery — the same reasoning the C ABI already applies to a dropped END.
+
+  **The exhaustive match is a real guard, and it proved itself twice.** No
+  wildcard: all 54 variants are named, so a new command cannot be added without
+  deciding which group it is in. The first evidence was accidental — a bad arm
+  list built from a regex that ran past the enum's closing brace was rejected by
+  the compiler (`E0599`, ten names from the *next* enum). The deliberate evidence
+  is mutant M4 below: deleting one arm fails to compile with `non-exhaustive
+  patterns: &HostCommand::OnUserCaptureScreen not covered`.
+
+  **The C API soft keyboard is the first fenced producer, end to end.**
+  `validated_keyboard_to_command` takes the generation and stamps all four
+  commands; the entry point now resolves the ingress *before* building the
+  command so the stamp comes from `HostIngress::runtime_generation()` — the
+  accessor task 2 added and left with **zero callers**, which is exactly what its
+  entry said it was for. A host that submits a keyboard event before a restart
+  commits now carries the retired value and is dropped. The public C ABI is
+  unchanged.
+
+  **Mutation evidence: four mutants, four killed, and the pair covers both
+  directions of the rule.**
+
+  | mutant | result |
+  |---|---|
+  | `is_retired_callback` always false | `retired_callback_generation_is_dropped_at_host_dispatch` + `a_generation_stays_retired…` FAIL; the no-generation test stays green |
+  | `None` treated as retired | only `a_command_that_carries_no_generation_is_delivered` FAILs; the other two stay green |
+  | one conversion arm drops the stamp | `soft_keyboard_commands_capture_ingress_generation` FAILs, naming `OnKeyboardHeightChange { runtime_generation: None }` |
+  | one variant removed from the match | **compile error**, `non-exhaustive patterns` |
+
+  The first two are the deliberate pair for §"guards cover the side they were
+  designed for": each fails exactly the test the other leaves green. Restored from
+  copies, `sha256sum` verified.
+
+  **Two things this deliberately does not have, stated rather than implied.**
+
+  1. **The early return itself has no local test.** `handle_command_inner` needs a
+     live `Host` — V8, a render thread, an audio thread — and there is no harness
+     for one anywhere in the tree. The *rule* is tested where it lives:
+     `is_retired_callback` is a free function precisely so it can be driven
+     without a Host, and it is the only implementation, not a restatement beside
+     one. What is untested is the two-line wiring, and the same gap covers
+     `on_restart`'s commit. A Host test harness is the thing that would close
+     both, and it belongs with task 11's race-regression gates rather than being
+     invented here.
+  **The host build cannot see the Android producers, and the gate is what said
+  so.** Every host suite and both profiles were green while
+  `platform/src/android/jni/inbound.rs` still constructed all four keyboard
+  commands without the new field — it is behind `#[cfg(target_os = "android")]`,
+  so nothing on this machine compiled it until
+  `build-android-so.sh --compile-only arm64-v8a` ran and failed with four
+  `E0063`s. This is §"ABI assertions' dead branches" in its ordinary form: a
+  change that touches a shared type reaches conditional code the host lane never
+  builds, and only the target build can report it. Those four now pass `None`
+  with the reason at the code.
+
+  2. **Android producers are still unfenced**, so in practice the only commands
+     subject to the drop today are the C ABI's four keyboard events. Tasks 7's
+     remaining steps (the Java `RuntimeGenerationBoundary`, manager tokens, ad and
+     permission tracking, the restart cleanup barrier and `GameSession.close`
+     ordering) are what move Android from `None` to `Some(captured)`. The
+     mechanism they plug into now exists.
+
+  Closing gate over the final state (6 files in scope): **48 PASS, zero non-PASS,
+  `android compile` (arm64-v8a) included, `verified for every target this change
+  touches`** — both profiles on all four Rust crates, and the C ABI surface
+  candidate contract green on both lanes, since the entry point's signature did
+  not move.
+
+  **Task 7 continued 2026-08-09: Android has a generation boundary, and one
+  producer is fenced end to end.** The chokepoint above needed a producer that
+  actually captures; this is the first, and the vertical slice proves the whole
+  path rather than each layer separately.
+
+  * **`RuntimeGenerationBoundary` (Java)** mirrors the engine's numbering per
+    session: `ACTIVE` at a generation, or `RESTARTING` between the retired
+    runtime going away and the replacement being live. `acquire` refuses while
+    restarting — there is no runtime for a new manager to belong to, and handing
+    out the generation that is leaving is the one answer that reads as fine and
+    is not. `Token` is immutable: a token that could refresh itself is a token
+    whose holder can be talked into believing it is current. An unregistered
+    session holds no current tokens, so an object outliving its session finds
+    itself stale rather than current by default.
+  * **The engine tells, and is never asked.** `RuntimeGenerationNotifier` is a
+    new capability sub-trait beside `DeviceServiceProvider`, `FrameClock` and
+    `HostNotifier`, with both methods defaulted — Linux, Windows and the C ABI
+    host kit keep nothing outside the isolate and take the default, one line
+    each. `on_restart` calls `begin_runtime_restart` before the old isolate goes
+    away and `complete_runtime_restart` immediately after the commit. A Java side
+    that *read* the generation back would be a second authority, and two
+    authorities disagree.
+  * **`KeyboardManager` is the fenced producer**, chosen because its four
+    commands already carried the field from the previous entry — so the slice
+    cost four JNI descriptors rather than twenty. It captures one token in its
+    constructor and stamps `token.generation()` on every event; the four
+    callbacks widen to `(IJLjava/lang/String;)V` / `(IJD)V` across
+    `NativeMethods`, `NativeBridge`, the JNI handlers and the pinned contract.
+
+  **There is deliberately no abort path, and the reason is checked rather than
+  assumed.** Nothing between `begin` and `complete` returns early:
+  `candidate_generation()?` is *before* the begin, and `HostJsRuntime::new` does
+  not return an error — it panics, taking the thread. A platform left between the
+  two refuses every acquisition for the rest of the session, which is the
+  fail-closed direction, so an abort with no caller would be dead surface. The
+  comment at the code says that adding a `?` in that stretch means adding an
+  abort.
+
+  **`captured_generation` moved to `shared` rather than staying in the JNI
+  file.** In `inbound.rs` it sat behind `#[cfg(target_os = "android")]` and no
+  host test could reach it — the same blind spot that had just cost a failed
+  target build. It is one line, but it is the line that decides whether an
+  unfenced producer's `0` is read as "no generation" or as "produced for
+  generation 0": the second drops every event that producer ever sends. It now
+  lives beside `callback_generation`, has tests, and is the one implementation
+  the ~20 remaining producers will use.
+
+  **Mutation evidence: five mutants, five killed.**
+
+  | mutant | killed by |
+  |---|---|
+  | `acquire` ignores the phase | `nothing_can_be_acquired_while_a_restart_is_in_flight` + `a_completion_that_does_not_match_the_candidate_is_refused` |
+  | `isCurrent` ignores the generation | `a_token_is_current_until…`, `a_retired_token_stays_retired…`, `a_token_from_one_session_is_never_current_in_another` |
+  | `beginRestart` trusts the caller | `a_restart_that_names_the_wrong_generations_is_refused_and_changes_nothing` |
+  | `unregisterSession` leaves the session | `an_unregistered_session_holds_no_current_tokens` |
+  | `captured_generation` trusts a non-positive value | `only_a_positive_value_is_a_captured_generation` |
+
+  Restored from copies, `sha256sum` verified on both files.
+
+  **The profile contract caught a placement bug that would have shipped as a
+  Slim-only hang.** The two new `NativeExports` methods were added next to
+  `openSystemBluetoothSetting` by textual proximity, which put them in
+  `JAVA_CONNECTIVITY` — an *optional* group Slim drops. Every profile restarts
+  its runtime, so on Slim `complete_runtime_restart` would have found no cached
+  method id, the Java boundary would have stayed `RESTARTING`, and **every
+  acquisition for the rest of that session would have been refused**. Three gates
+  reported it in sequence and each said something different: the pinned surface
+  count (`125` → `127`, the deliberate-edit gate), then
+  `slim_r8_rules_are_the_exact_core_jni_name_sets` once the methods moved to
+  `JAVA_CORE` and the two `.pro` keep-rule files had not followed. "Put it where
+  it compiles" is the mistake; the contract is what makes it visible.
+
+  **Untested, and named rather than implied:** `KeyboardManager` itself. Its
+  constructor calls `new Handler(Looper.getMainLooper())`, which throws in a
+  host unit test, so nothing device-free can construct one — the same wall
+  `VideoManager` hit. What is covered is every piece it is made of: the boundary
+  it acquires from, the helper that reads its stamp back, the pinned descriptors
+  that fail if one side of the JNI signature moves alone, and the dispatch drop
+  itself. What is not covered is the wiring in between. A Robolectric-free way to
+  construct these managers — or the emitted-surface descriptor gate this ledger
+  already asks for — is what would close it.
+
+  Java 177 tests per flavour (from 168), zero failures. `migo-shared` gains three
+  cases; `runtime_restart_boundary` and the C ABI keyboard suites unchanged and
+  green.
+
+  **What remains of task 7** is the same shape repeated: every other Android
+  manager captures a token and stamps it, which means adding `runtime_generation`
+  to their `HostCommand` variants (the exhaustive match makes each one a
+  compile-time decision), then steps 9 and 10 — ad and permission tracking, the
+  cleanup barrier and `GameSession.close`'s ordered phases. None of it needs a new
+  mechanism now.
+
+  **Tasks 8–12 are not started.** The ordered audio and render resets (8, 9) and
+  the transaction that makes a restart atomic across platforms (10) are
+  untouched; task 10's *generation* half is done, its cleanup barriers are not.
+
+  **"A half-migrated correlation registry is worse than an unmigrated one" no
+  longer applies: task 5 is whole.** Every counter that named a host-owned object
+  is gone, every id-less UI result now carries one, and nothing correlates by two
+  schemes at once. Task 6 is whole with it — its `InteractionUI` half was always
+  task 5's work wearing task 6's number, and it landed as part of it.
+
+  **Task 7 continued 2026-08-09 (later): a fence with no sweep is worse than no
+  fence, and Windows stopped being unproven.** The entry above fenced the
+  keyboard and left a defect standing that it had itself created.
+
+  **Managers are cached per session, not per runtime.** `sKeyboardManagers` is
+  keyed by `sessionId`, so the isolate that replaces a retired one is handed the
+  object the retired one built — which now stamps the generation it captured, and
+  the engine drops that at dispatch. The fence therefore converted *"events reach
+  the wrong runtime"* into *"events reach nothing at all"*: after
+  `GameSession.restart()` the keyboard would come up, accept typing and report
+  none of it, looking exactly like a feature that was never wired up. Fencing a
+  producer and sweeping its cache are one change, not two, and every one of the
+  ~20 producers still to come has this same pair.
+
+  **`RuntimeScoped` + `RuntimeGenerationBoundary.liveEntry` is the sweep, once.**
+  A manager exposes the token it captured; the lookup returns it only while that
+  token is current, and otherwise removes it, destroys it and returns `null` so
+  the caller builds one against the runtime that is actually running. Three
+  details are decisions rather than defaults:
+
+  * **Removed before destroyed** — the opposite of
+    `ResourceCleanup.destroyMatching`, which keeps an entry whose destroy failed
+    so cleanup can be retried. Here keeping it is precisely wrong: the next
+    caller would be handed it again. Removing first also means a teardown that
+    re-enters the cache (stopping a manager notifies listeners, and a listener
+    may ask for one) is not undone by a removal that comes after it.
+  * **The removal is conditional on identity, and a lost race is retried** rather
+    than reported as an absence. Two callers can read the same retired entry; the
+    first sweeps it and its caller installs a replacement, and an unconditional
+    removal by the second would delete that replacement — leaving the live
+    manager orphaned on screen and a duplicate built behind it.
+  * **All three keyboard accessors route through it**, `keyboardHide` and
+    `keyboardUpdate` included. A retired keyboard is destroyed by the lookup, and
+    destroying it hides it — so the view the previous runtime left on screen
+    still goes away, and nothing comes back from it.
+
+  **`Token.isCurrent()` had no production caller until now.** It was built and
+  tested by the entry above and used by nothing; this is what it was for.
+
+  **Mutation evidence: four mutants, four killed.**
+
+  | mutant | killed by |
+  |---|---|
+  | `liveEntry` never sweeps a retired entry | 6 of the 8 cases, including `an_entry_is_retired_the_moment_a_restart_begins` |
+  | destroy runs before the entry leaves the cache | `the_entry_leaves_the_cache_before_it_is_destroyed` |
+  | removal is not conditional on identity | `losing_the_removal_race_returns_the_replacement_rather_than_destroying_it` |
+  | the swept entry is returned instead of `null` | `an_entry_from_a_retired_runtime_is_destroyed_removed_and_not_returned` + 2 |
+
+  Restored from a copy, `sha256sum` verified. Java 185 per flavour (from 177).
+
+  **`GameSession.restart()` is the only production sender of
+  `HostCommand::Restart`** — every other sender in the tree is a test. That is
+  what sets the priority of the rest of task 7: this is a public embedder API
+  whose sessions must survive it, not a per-frame path.
+
+  **The completion is now authoritative, because refusing it could kill a whole
+  session in silence.** Both notifications reach Java over JNI, and
+  `call_static_method` turns a Java exception into a cleared exception and a
+  `Result::Err` that `AndroidPlatform` can only log — by design, since the
+  restart is already under way. Under the previous rule, a lost `begin` (exactly
+  what the mis-grouped `NativeExports` methods would have caused on Slim) made
+  the following `completeRestart` throw "is not restarting"; the mirror then sat
+  at the retired generation **for the rest of the session**, every manager built
+  afterwards stamped a value the engine drops at dispatch, and nothing in the
+  system could ever move it again. Two logged lines, and every Android event for
+  that game gone.
+
+  So the two calls are now deliberately asymmetric, by which refusal a session
+  can recover from. A refused `begin` costs a window — acquisition is not closed
+  while the isolate is replaced, and anything issued in it is stale the moment
+  the completion lands, then swept by `liveEntry` when the new runtime first asks
+  for it. A refused `completion` is permanent. So `beginRestart` keeps its
+  validation and `completeRestart` keeps one rule: **a generation never moves
+  backwards**. The remembered `candidate` field went with it — the completion
+  carries the number and is authoritative, so a stored candidate was a second
+  opinion whose only power was to refuse the first.
+
+  | mutant | killed by |
+  |---|---|
+  | a completion without its `begin` is refused (the old rule, restored) | `a_completion_whose_begin_never_arrived_still_publishes` |
+  | a completion can move the generation backwards | `a_completion_can_never_move_a_session_backwards` |
+  | the completion publishes but never reopens acquisition | 5 cases, including `nothing_can_be_acquired_while_a_restart_is_in_flight` |
+
+  **Windows: NOT PROVEN became evidence.** This branch touches
+  `windows/platform.rs`, which made `windows compile` a required target that this
+  machine reported as having no local build — the verdict line the script's own
+  header says must never be swallowed. It was wrong in the same way the `ohos`
+  sentence had been: `platforms/windows/spike/probe-layer.sh` already runs one
+  `cargo check` per package on the real MSVC toolchain, and LLVM, VS BuildTools
+  and the Windows V8 artifacts are all present here. Synced to `105605f` and run:
+  **`migo-platform` and `migo-capi` both `EXIT=0` for `x86_64-pc-windows-msvc`**,
+  zero `error[`. What keeps it out of `verify-change.sh` is not the toolchain but
+  the scope: `require_synced_worktree` refuses a dirty tree, because the Windows
+  copy is cloned over `file://` and carries committed refs only — so a lane there
+  would report NOT PROVEN for exactly the working-tree runs the script is for.
+  Making it a lane means teaching the sync to carry an uncommitted tree, which is
+  its own change.
+
+  **Overlay ownership: a process-wide slot for a per-session thing, found by
+  asking whether two games can run at once.** `InteractionUI` kept
+  `static View sToastOverlay` / `sLoadingOverlay` — one toast and one loading
+  spinner for the whole process. The second session's `showLoading` therefore
+  took back the *first* session's spinner, except that a view belongs to its own
+  Activity's decor, so the removal did nothing while the reference was dropped:
+  the first game's overlay left on screen with nothing able to remove it. It
+  leaked with one session too — nothing on the teardown path cleared those
+  fields, so a session closing with a toast up held a destroyed Activity and its
+  whole window hierarchy alive until some later session happened to call hide.
+
+  The fix separates lifetime from views: `SessionOverlays` keeps a slot per
+  session and the views live inside the removers, so the part that was wrong is
+  the part that can now be checked without an Activity. `InteractionUI` builds
+  and attaches; the registry owns what is on screen. `hideToast`/`hideLoading`
+  no longer take an `Activity` at all — the object to remove and the parent to
+  remove it from both live in the remover, so the two can no longer disagree.
+  The teardown joins `destroyAllManagers`, inline rather than posted when the
+  caller is already the main thread, so a failure is reported by the terminal
+  cleanup's aggregate instead of landing after `close()` has returned.
+
+  Two orderings are decisions, and the same one twice: **the slot is emptied
+  before its remover runs** (removing a view can call back into content, and a
+  toast shown from inside that callback must survive the teardown that provoked
+  it), and **`install` releases before it stores**. Eight cases, four mutants,
+  four killed: install-without-release by
+  `showing_again_takes_back_what_was_already_in_the_slot`, run-while-occupying by
+  `the_slot_is_empty_while_its_remover_runs`, a teardown that forgets the session
+  without detaching its views by three cases, and a teardown that reaches past
+  its own session by
+  `closing_one_session_leaves_the_other_sessions_overlays_alone`. Java 195 per
+  flavour.
+
+  **Task 7 continued 2026-08-09 (third): the fence field shrank to eight bytes,
+  the sensor streams joined it, and the restart now releases what it fences.**
+
+  **`HostCommand` measures exactly 64 bytes, which is exactly its own cap.**
+  Measured, not assumed — the assertion beneath the enum says `<= 64` and the
+  comment above `OnTouch` says why ("up to 512 normal commands can be pending, so
+  enum size directly affects queue memory"), but nobody had written down that the
+  headroom was zero. Fencing a variant with `Option<i64>` spends sixteen bytes of
+  a budget that has none, and there are twenty-odd producers left to fence, some
+  of which carry two strings already. So the field became
+  `Option<NonZeroI64>`: **eight bytes, the same as a bare `i64`**, because the
+  niche is the `None`. Doing it now cost four variants; doing it after the
+  Bluetooth and camera producers would have cost twenty-six and a redesign of
+  whichever one hit the cap first.
+
+  It is also better than a size trick. `captured_generation` existed to reject
+  non-positive values, and its result type now makes "zero is not a generation"
+  something the type cannot express rather than a rule one function remembers to
+  enforce. A second static assertion pins the niche itself, because the day it is
+  lost nothing observable changes — every test still passes and every command
+  costs a word more.
+
+  **Five more producers are fenced**: the four sensor streams
+  (`OnDeviceMotionChange`, `OnGyroscopeChange`, `OnCompassChange`,
+  `OnAccelerometerChange`) and the screenshot observer (`OnUserCaptureScreen`,
+  which was a unit variant and is now a struct one). Both Android managers capture
+  a token in their constructor, both implement `RuntimeScoped`, and **every**
+  lookup in `SensorExports` — not just the create path — goes through
+  `liveEntry`, so a retired sensor manager is destroyed and rebuilt rather than
+  handed to the isolate that replaced its owner.
+
+  **`OnDeviceOrientationChange` is deliberately left unfenced**, and it sits one
+  line away from four that are not. It is produced by the Activity, not by the
+  sensor manager, and a rotation is a *current fact about the device*: dropping
+  one because a restart happened would leave the replacement isolate believing the
+  screen is the way it was two runtimes ago, with nothing that ever corrects it.
+  Same reasoning as a physical key going up. `a_device_orientation_change_is_never_fenced`
+  is the test, and mutant M14 is what makes it load-bearing.
+
+  **The restart now releases the groups it fences.** `beginRuntimeRestart` closes
+  the boundary and then tears down the sensors, the input managers and the
+  overlays. Until now nothing did: `destroyAllManagers` had exactly one caller,
+  `GameSession.close()`, so a restart left every listener the retired isolate
+  registered still registered — an accelerometer still sampling at 20 ms, a
+  screenshot observer still querying MediaStore — owned by no runtime and
+  reporting to nothing, until the session ended. The fence made those events
+  harmless; it never made them free.
+
+  **What decides whether a group can be swept is its own teardown — not whether
+  its producer is fenced**, and the first draft of this rule was the narrower,
+  wrong one. Destroying a manager can report: the keyboard's emits an
+  `onKeyboardComplete`, a camera's emits a stop. Those land on the queue while
+  `on_restart` is still running on the engine thread, so they are dispatched to
+  the runtime that *replaces* this one, as if it had produced them. A fenced
+  producer stamps the retired generation and the engine drops them; an unfenced
+  one would have the sweep inject exactly the cross-talk the mechanism exists to
+  remove.
+
+  So a group qualifies if its teardown reports nothing, **or** if what it reports
+  is fenced. Sensors and input qualify on the second count. `NetworkMonitor`
+  qualifies on the first — it unregisters a `ConnectivityManager` callback and
+  says nothing — and it is swept without being fenced, because it belongs with
+  `OnDeviceOrientationChange` rather than with the sensor streams: a network
+  status is a *current fact about the device*, so a replacement isolate needs it
+  as much as the retired one did, and fencing it would drop the one message that
+  tells a fresh runtime the phone is offline. Media and Bluetooth report as they
+  close, so they wait for their tokens.
+  The two orderings that make it safe: the boundary closes *before* the teardown,
+  so nothing acquired during it gets the generation that is leaving; and a
+  teardown that throws leaves the session `RESTARTING`, which only reopens because
+  the completion is authoritative — the two changes in this session hold each
+  other up.
+
+  | mutant | killed by |
+  |---|---|
+  | the accelerometer stream is left in the unfenced group | `the_sensor_streams_and_the_screenshot_observer_carry_their_generation` |
+  | the screenshot observer is left in the unfenced group | the same case |
+  | device orientation is fenced along with the streams | `a_device_orientation_change_is_never_fenced` |
+  | one fenced variant reverts to a 16-byte field | the type system — no test can see this, which is why the assertion is written down |
+
+  ⚠️ **The mutation harness reported a survivor it had never made.** M14's target
+  text did not match, `mutate` failed, and the suite then ran against the
+  *unmutated* file and passed — printed as `SURVIVED`. Under §"gate measurement
+  pitfalls" this is the whole family in one line: a measurement whose failure mode
+  is indistinguishable from its negative result. The harness now aborts loudly
+  when a mutation does not apply. A second mutant in the same run was "killed" by
+  a syntax error rather than by anything meaning anything; rebuilt as a real arm
+  move, it is killed by a named test.
+
+  Verified: host suites for `shared`, `core`, `capi` and `platform` (both
+  profiles), Java 195 per flavour on both variants, `build-android-so.sh
+  --compile-only arm64-v8a`, `test-android-host-api-contract`,
+  `test-r8-profile-contract`, `test-input-trigger-producer-contract`,
+  `test-host-bridge-channel-contract`, the C ABI surface candidate, `fmt --check`
+  and `git diff --check`. The five JNI descriptors moved in the pinned table with
+  their signatures; nothing was added, so the surface counts are unchanged.
+
+  **Untested, and named rather than implied:** `DeviceSensorManager` and
+  `ScreenCaptureObserver` themselves, for the same reason as `KeyboardManager` —
+  their constructors need a `Context` and a main `Looper`, and nothing device-free
+  can build one. What is covered is every piece: the boundary, the sweep, the
+  arm each command sits in, and the pinned descriptors that fail if one side of a
+  JNI signature moves alone.
+
+  **Task 7 continued 2026-08-09 (fourth): the camera and the microphone stop
+  being held by a runtime that no longer exists.**
+
+  This was the worst thing left. `GameSession.restart()` released nothing the
+  media managers held, so after a restart the camera stayed open and the
+  microphone stayed recording — the OS privacy indicator lit, the hardware
+  unavailable to every other app — until the session ended. Not a leak in the
+  accounting sense: a device held open by no runtime, visible to the user.
+
+  Five commands join the fence — `CameraEvent`, `CameraFrameData`,
+  `RecorderEvent`, `RecorderFrameData`, `OnVideoStateChange` — **frames as well
+  as events**, because a camera still delivering into the isolate that replaced
+  the one which opened it is the same defect at thirty times the rate.
+  `CameraManager`, `AudioRecorderManager` and `VideoManager` capture tokens;
+  media joins the restart sweep, which is what actually releases the hardware.
+
+  **The eight-byte field was a prerequisite, and this is measured rather than
+  argued.** Reverting `CameraEvent` alone to `Option<i64>` fails the build with
+  the enum's own assertion: `HostCommand grew past 64 bytes`. A `u32` and two
+  `String`s leave exactly enough room for the niche-optimised field and not for
+  the other one. The change made one entry ago as headroom turned out to be the
+  thing that made this entry possible at all; had it been deferred, the media
+  fence would have arrived as "and also redesign whichever variant hit the cap
+  first".
+
+  **The camera cache is swept by hand, and the comment says why.** It is keyed by
+  `"sessionId:cameraId"` and holds a `CameraSlot`, not the manager, so
+  `liveEntry`'s `ConcurrentHashMap<Integer, T>` signature does not fit. The same
+  three steps are written out in `getCameraManager`: a camera built by a replaced
+  runtime still owns the device, and handing it over would leave the new isolate
+  with a camera whose frames the engine drops while the arbiter still records
+  this session as the owner.
+
+  **`suspendPowerSensitiveManagers` deliberately does not sweep**, and is
+  annotated so nobody makes it consistent later. It is driven by the Activity's
+  lifecycle, not by a runtime: a manager left over from a replaced runtime still
+  owns the camera, so suspending it when the app backgrounds is exactly right,
+  while destroying it as a side effect of backgrounding is not.
+
+  **`RuntimeGenerationBoundary.UNFENCED`** names the zero that an export stamps
+  when it reports a failure before any manager exists — `recorderStart` with no
+  Activity, for instance. A synchronous failure reply answers a call the live
+  runtime has just made, so it cannot be stale and must never be dropped. It had
+  been a bare `0`; a named constant is what stops the next reader from "fixing"
+  it into the current generation, which would make it droppable for the first
+  time.
+
+  **The camera-frame JNI contract earned its keep.** `test-camera-frame-jni-contract.sh`
+  pins `onCameraFrameData`'s descriptor independently of the profile table, in
+  both product flavours, and failed the moment the signature widened — exactly
+  the deliberate-edit gate it was written to be. Updated with the reason at the
+  pin.
+
+  | mutant | killed by |
+  |---|---|
+  | `CameraFrameData` left in the unfenced group | `the_hardware_managers_carry_their_generation_on_events_and_on_frames` |
+  | `RecorderEvent` left in the unfenced group | the same case |
+  | `OnVideoStateChange` left in the unfenced group | the same case |
+  | `CameraEvent` reverts to a 16-byte field | the 64-byte assertion, measured above |
+
+  Restored from a copy, `sha256sum` verified before and after. Verified: host
+  suites for `shared`/`core`/`capi`/`platform` (both profiles), Java 195 per
+  flavour, `build-android-so.sh --compile-only arm64-v8a`, the camera-frame,
+  android-host-api, r8-profile, product-profiles and input-trigger contracts,
+  `fmt --check`, `git diff --check`.
+
+  **Bluetooth is the only group left**, and it is left for a reason that is
+  written down rather than assumed: its teardown reports unfenced, and its
+  notification path is the one this repository has already tuned to zero
+  allocations. Fencing it means touching that path, which deserves its own
+  sitting.
+
+  **The restart sweep for the remaining groups is deliberately not here, and the
+  interlock is the reason.**
+  Today nothing tears down Android managers on a restart — `destroyAllManagers`
+  has exactly one caller, `GameSession.close()` — so a retired session's sensors,
+  BLE connections and camera keep running, owned by no runtime, until the session
+  ends. The fix is a sweep at `beginRuntimeRestart`, and it cannot simply be
+  posted: **a sweep is only safe for caches that `liveEntry` already guards**,
+  because otherwise the replacement isolate can be handed an unfenced manager
+  that the posted sweep then destroys underneath it — the same silent-death
+  failure one layer along. Two orders work, and the choice belongs with task 10's
+  transaction rather than being made in passing: run it *synchronously* on the
+  engine thread, where no JavaScript runs between `begin` and the new isolate
+  (but then camera, BLE and recorder teardown moves off the main thread, which is
+  where `close()` drives it today), or fence every producer first and post it.
+  What is already known: `NetworkMonitor`, `ScreenCaptureObserver`, `AdpfManager`
+  and `ScanCodeManager` unregister a listener and are thread-agnostic;
+  `KeyboardManager` and `VideoManager` post to the main looper themselves;
+  `CameraManager` and `AudioRecorderManager` own hardware and want their own
+  ordering. The handler slots (`clearAdHandler`, `clearAuthHandler`,
+  `clearMessageHandler`, `clearPermissionHandler`, `clearGameLogHandler`) must
+  **not** be swept: the embedder registered those once for the session, not the
+  isolate.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.
+
+  ⚠️ **An implementation of most of this already exists, on a local branch that has
+  never been pushed. Found 2026-08-09 while auditing branches, not from any record.**
+  `feat/capi-ads-and-permissions`, three commits, ~1730 insertions across 16 files —
+  `capi-abi/src/permission.rs` (232 lines), `capi/src/permission.rs` (356),
+  `capi/src/callbacks.rs`, `include/migo/session.h` (+308) and the three
+  `tests/c_abi/*` contract clients. Neither `permission.rs` exists on `master`.
+
+  It is the **only** genuinely unmerged work in the repository: every other local
+  branch is either content-merged (`perf/audio-realtime-gates`' ID3 fix and
+  `perf/ble-notification-path` both landed by squash, so `git rev-list --count`
+  still shows them "ahead" while the content is in) or already at its upstream.
+
+  **It is not landed here, deliberately.** Its merge-base is `d41389d` (PR #21) with
+  `master` now at #31, and `git merge-tree` reports content conflicts in
+  `capi/src/lib.rs`, `capi/src/surface.rs`, `capi/src/test_support.rs` and
+  `tests/c_abi/core_contract.c`. Two of those are files item 0.2's retirement work
+  touched in this session, so the conflict surface grew slightly. Landing 1730 lines
+  of new public C ABI — headers, layout assertions, an all-or-none callback group —
+  from an unpushed branch of unknown intent is not a verification task; it needs a
+  decision about the surface first.
+
+  **Recorded because it is one `git branch -D` from gone**, and because a later
+  session reading only this ledger would write it a second time.
 - [ ] 0.12 A12: reject invalid host pixel ratios, canonicalise Windows game
   identity, and settle a missing ad handler through its documented error path.
   **Implementation, tests, mutation evidence and fresh verification are done and
@@ -383,7 +1711,49 @@
   barrier discipline as the Migo-owned X11 connection; verify multi-touch; apply
   the restart, thread-ownership, and shutdown barriers to HarmonyOS.
 - [ ] 0.14 A13: re-run the post-master integration audit and record exact Full
-  and Slim test counts.
+  and Slim test counts. **Re-run 2026-08-09. Counts below are measured, not
+  carried forward; neither independent review has run.**
+
+  Measured on `delivery/x11-and-mutation-evidence` (master + 10 commits) by
+  `bash scripts/verify-change.sh --base master`, plus both Gradle flavours read
+  from their JUnit XML rather than from console output.
+
+  **Rust host suites — 2,992 passed, 31 ignored, 16 test steps** (the two
+  non-test steps, `build --workspace --all-targets` and `fmt --all --check`,
+  report no counts by design):
+
+  | Profile-independent | | Full | | Slim | |
+  |---|---|---|---|---|---|
+  | `migo-shared` | 437 | `migo-runtime-v8` | 524 | `migo-runtime-v8` | 472 |
+  | `migo-graphics` | 604 | `migo-core` | 62 | `migo-core` | 59 |
+  | `migo-io` | 266 | `migo-capi` | 147 | `migo-capi` | 147 |
+  | `migo-capi-abi` | 60 | `migo-platform` | 53 | `migo-platform` | 53 |
+  | `migo-audio` | 65 | | | | |
+  | `migo-alloc-probe` | 28 | | | | |
+  | `migo-executor-probe` | 8 | | | | |
+  | `migo-contention-probe` | 7 | | | | |
+  | **subtotal** | **1,475** | **subtotal** | **786** | **subtotal** | **731** |
+
+  Two deltas against T.7's earlier record, and both reconcile — which is the point
+  of recording exact numbers rather than round ones. `migo-capi` is 147 in both
+  profiles rather than 143: three X11 cases (item 0.4) and two retirement cases,
+  less one test that could not fail (item 0.2), net +4. `migo-shared` is 437 rather
+  than 432 as first measured earlier the same day: the five `callback_id` cases
+  added by item 0.9's Task 1. The counts here are from the closing run, not the
+  first one — an audit that is stale before it is committed is the defect it exists
+  to catch.
+
+  **Java — 143 Full, 143 Slim, 0 failures, 0 skipped**, identical counts across
+  flavours because the source set is variant-independent while `BuildConfig`
+  gating is not.
+
+  **Contract lane — 23 gates PASS, 1 `CI ONLY`** (`test-local-verification-contract.sh`,
+  which would nest; run separately and green). Those gates execute 32 further Rust
+  tests inside themselves, which is why the host-step total and the run total differ.
+
+  **Targets — `android compile` PASS, `ohos compile` PASS.** The OpenHarmony line is
+  new; see T.8 for why it used to read `NOT PROVEN`. `windows` has no local lane and
+  is not part of this audit.
 - [ ] 0.15 A6: run lifecycle, reattachment, input saturation, ABI, and header
   contract suites with both product profiles. **The Slim host suite now runs, is
   green, and is part of the local gate; it found one product defect, which is fixed
@@ -5019,3 +6389,85 @@
   mutator is reachable solely from a monitor-holding path. Mutation-tested:
   restoring the late field read re-fails the replacement test.
 
+- [ ] 0.68 Close the concurrent-Session holes both audits found. Asked because the
+  engine is meant to run several games at once and "some things have to be shared":
+  the answer is that this is a *deliberate* design on both sides and almost all of it
+  is right, so what is left is a short ranked list rather than a rework.
+
+  **What already proves the intent**, so that none of it is re-litigated:
+  `NativeExports.registerSession` refuses a duplicate id with "concurrently live
+  sessions must have distinct ids"; `ExclusiveDeviceArbiter` exists only to arbitrate
+  the camera and microphone *between* Sessions and keys per physical camera so two
+  Sessions on different cameras are not refused; `io/src/pools.rs` does per-host fair
+  queuing with a test named for it; `io/src/image_cache.rs` shares one decoded copy
+  between two games loading the same file and has `clear_for_session` precisely
+  because the process-wide `clear` discarded what another game was holding;
+  `capi/src/concurrent_sessions.rs`, `runtime-v8/src/tests/two_session_identity.rs`
+  and `storage_isolation.rs` are the standing evidence. `GameSession.close()` is
+  `sessionId`-scoped in nine of its ten steps, and `ExclusiveDeviceArbiter.releaseAll`
+  uses the two-argument `remove(resource, sessionId)` so it cannot drop another
+  Session's claim even under a race.
+
+  Ranked by what a second live Session actually loses:
+
+  1. **`GamePaths.cleanupTemp` is keyed by `gameId`, not `sessionId`**
+     (`GamePaths.java:184`, called from `GameSession.java:605`). Two Sessions of the
+     *same* game share `cacheDir/migo/games/{gameId}/tmp`, so the first to close
+     recursively deletes the other's live temp directory mid-write. `/user` and
+     `/cache` are shared by the same pair with no locking. This one is data loss, and
+     the fix crosses the Java/Rust path contract — the engine resolves `/tmp` for
+     content itself (`shared::vfs::game_paths`), so changing only the Java side would
+     move what is deleted without moving what is written. Both sides move together or
+     neither does.
+  2. **Three JNI exports have no `sessionId` at all** and resolve an Activity through
+     `RuntimeRegistry.getAny()` (`RuntimeRegistry.java:56`, used at
+     `NativeExports.java:588, 962, 1198`). `getSystemSettingInfoBytes` reads
+     `DisplayCompat.isLandscape(activity)` off whichever Session iteration order
+     returns first, so a portrait game can be told it is landscape because another
+     game's Activity is. The single-Session assumption is baked into the *signature*;
+     fixing it is the keyboard's shape — widen the descriptor, move the pin, thread
+     the id — and the profile contract is what will catch a half-done one.
+     `getCacheDirPath` and `getAppAuthorizationSettingJson` return app-scoped values
+     and are only latently wrong.
+  3. **The log level is one process-wide switch on both sides**
+     (`internal/util/Logger.java:17`, `platform/src/android/logging.rs:10`, written
+     per Session at `jni/inbound.rs:452`). `RuntimeConfig` carries a per-Session
+     `LogLevel` that nothing on the Java side ever applies, and the Rust side is
+     last-writer-wins: starting a second game with `logLevel=Off` silences the first
+     game that was started with `Debug`. Two halves of one defect.
+  4. **Image decode has no per-Session partition** (`io/src/image_ops.rs:83-84` `SEM`,
+     three permits, and `:160-161` `BUDGET`, 48 MB), while the sibling IO executor
+     next door does per-host fair queuing. One game's `preload_images` over a large
+     atlas set can hold every permit and the whole budget while another live game's
+     `drawImage` waits. This is the fairness hole in an otherwise fair policy, and it
+     is the one item here that is about latency rather than correctness.
+  5. **Diagnostics are attributed to the process, not the Session**:
+     `SEND_OVERFLOW`/`DROP_COUNTERS` (`shared/src/render_command_sender.rs:58,82`) are
+     summed into *each* Session's `command_drops` (`shared/src/stats.rs:399`), and
+     `IO_METRICS`/`WEBGL_ERROR_OVERFLOW` likewise. `stats.rs:380-386` already admits
+     it. A host polling Session A sees Session B's backpressure — wrong exactly when
+     backpressure is what is being investigated. Host-app visible only; the game-JS
+     path was already fixed by `stats_for_session`.
+  6. **`graphics/src/frame_capture.rs:21-22` is a last-presented-frame singleton**
+     written from *every* render thread, so with two Sessions `take()` returns
+     whichever swapped last. Contained today only because its one caller is the
+     single-Session dev player — the writer is in every build.
+  7. **`audio/src/streaming.rs:245` is one single-worker runtime for every Session's
+     streaming downloads**, so a stalled HTTP body in one game delays another's audio
+     start, and nothing drains it at Session end.
+  8. Latent, no in-tree caller, listed so they are not discovered twice:
+     `RuntimeRegistry.clear()` (`:77`) is a nuke-every-Session static with zero
+     callers; `PACKAGE_SIGNATURE_VERIFIER` (`shared/src/vfs/package.rs:1288`) is a
+     first-writer-wins trust root on a per-Session concept; `isolate_pool.rs:41` is a
+     process-global prewarmed-isolate pool whose `unsafe impl Send` is unenforced
+     across concurrent Session starts.
+
+  **Not defects, recorded so they are not "fixed":** `AudioFocusManager` deliberately
+  does not arbitrate — "Android already owns that decision… adding a second policy on
+  top would either contradict the platform or duplicate it" — so B starting audio
+  legitimately interrupts A. The `9001`/`10001` request-code collisions between
+  `ImageApiManager`, `ScanCodeManager` and `NativeExports` are harmless: every one
+  goes through `ResultProxyActivity`, where each launch owns one Activity instance and
+  is disambiguated by a never-reissued token, not by the code. `image_cache.trim` on
+  OS memory pressure evicting another Session's unpinned bytes is arguably correct,
+  since the pressure is process-wide and pins protect live aliases.

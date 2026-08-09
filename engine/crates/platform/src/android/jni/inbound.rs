@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
-use shared::js_escape::{hook_args_one, hook_args_two};
+use shared::js_escape::{hook_args_one, hook_args_three, hook_args_two};
+// The generation Java captured when the manager was built, not one read here.
+use shared::protocol::host_cmd::captured_generation;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -629,18 +631,28 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     enabled: jint,
 ) {
     jni_safe!("onOpenSystemBluetoothSetting", {
+        // Absent stays absent: a non-positive id means the request carried
+        // none, and writing `0` would make the runtime discard the reply as
+        // *present and not an id* -- strictly worse than the fallback it would
+        // otherwise take.
+        let correlation = if request_id > 0 {
+            format!(r#","requestId":{}"#, request_id)
+        } else {
+            String::new()
+        };
         let json = if enabled >= 0 {
             format!(
-                r#"{{"errMsg":"openBluetoothAdapterSetting:ok","code":{}}}"#,
-                enabled
+                r#"{{"errMsg":"openBluetoothAdapterSetting:ok","code":{}{}}}"#,
+                enabled, correlation
             )
         } else {
             format!(
-                r#"{{"errMsg":"openBluetoothAdapterSetting:fail","code":{}}}"#,
-                enabled
+                r#"{{"errMsg":"openBluetoothAdapterSetting:fail","code":{}{}}}"#,
+                enabled, correlation
             )
         };
         let cmd = HostCommand::InvokeHostHook {
@@ -655,12 +667,13 @@ pub(crate) extern "system" fn onOpenAppAuthorizeSetting<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     code: jint,
 ) {
     jni_safe!("onOpenAppAuthorizeSetting", {
         let cmd = HostCommand::InvokeHostHook {
             hook: "_internalOnOpenAppAuthorizeSettingFinished",
-            args_json: hook_args_one(code),
+            args_json: hook_args_two(request_id, code),
         };
         let _ = send_reliable_command_to_host(host_id, cmd);
     });
@@ -920,9 +933,19 @@ pub(crate) extern "system" fn onAudioInterruptionEnd(_env: JNIEnv, _class: JClas
     });
 }
 
-pub(crate) extern "system" fn onUserCaptureScreen(_env: JNIEnv, _class: JClass, host_id: jint) {
+pub(crate) extern "system" fn onUserCaptureScreen(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    generation: jlong,
+) {
     jni_safe!("onUserCaptureScreen", {
-        let _ = send_command_to_host(host_id, HostCommand::OnUserCaptureScreen);
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnUserCaptureScreen {
+                runtime_generation: captured_generation(generation),
+            },
+        );
     });
 }
 
@@ -930,13 +953,14 @@ pub(crate) extern "system" fn onModalResult<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     confirm: jint,
     cancel: jint,
 ) {
     jni_safe!("onModalResult", {
         let cmd = HostCommand::InvokeHostHook {
             hook: "_internalOnModalResult",
-            args_json: hook_args_two(confirm, cancel),
+            args_json: hook_args_three(request_id, confirm, cancel),
         };
         let _ = send_reliable_command_to_host(host_id, cmd);
     });
@@ -946,12 +970,13 @@ pub(crate) extern "system" fn onActionSheetResult<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    request_id: jint,
     tap_index: jint,
 ) {
     jni_safe!("onActionSheetResult", {
         let cmd = HostCommand::InvokeHostHook {
             hook: "_internalOnActionSheetResult",
-            args_json: hook_args_one(tap_index),
+            args_json: hook_args_two(request_id, tap_index),
         };
         let _ = send_reliable_command_to_host(host_id, cmd);
     });
@@ -963,6 +988,7 @@ pub(crate) extern "system" fn onDeviceMotionChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     alpha: jdouble,
     beta: jdouble,
     gamma: jdouble,
@@ -974,6 +1000,7 @@ pub(crate) extern "system" fn onDeviceMotionChange(
                 alpha: alpha as f64,
                 beta: beta as f64,
                 gamma: gamma as f64,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -983,6 +1010,7 @@ pub(crate) extern "system" fn onGyroscopeChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     x: jdouble,
     y: jdouble,
     z: jdouble,
@@ -994,6 +1022,7 @@ pub(crate) extern "system" fn onGyroscopeChange(
                 x: x as f64,
                 y: y as f64,
                 z: z as f64,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1019,6 +1048,7 @@ pub(crate) extern "system" fn onCompassChange<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     direction: jdouble,
     accuracy: JString<'local>,
 ) {
@@ -1030,6 +1060,7 @@ pub(crate) extern "system" fn onCompassChange<'local>(
             HostCommand::OnCompassChange {
                 direction: direction as f64,
                 accuracy: acc,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1039,6 +1070,7 @@ pub(crate) extern "system" fn onAccelerometerChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     x: jdouble,
     y: jdouble,
     z: jdouble,
@@ -1050,6 +1082,7 @@ pub(crate) extern "system" fn onAccelerometerChange(
                 x: x as f64,
                 y: y as f64,
                 z: z as f64,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1081,6 +1114,7 @@ pub(crate) extern "system" fn onRecorderEvent<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     event_type: JString<'local>,
     json_payload: JString<'local>,
 ) {
@@ -1098,6 +1132,7 @@ pub(crate) extern "system" fn onRecorderEvent<'local>(
             HostCommand::RecorderEvent {
                 event_type: evt,
                 json_payload: payload,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1107,6 +1142,7 @@ pub(crate) extern "system" fn onRecorderFrameData(
     env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     frame_data: jni::sys::jbyteArray,
     is_last_frame: jni::sys::jboolean,
 ) {
@@ -1126,6 +1162,7 @@ pub(crate) extern "system" fn onRecorderFrameData(
             HostCommand::RecorderFrameData {
                 data,
                 is_last_frame: is_last_frame != 0,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1137,6 +1174,7 @@ pub(crate) extern "system" fn onCameraEvent<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     camera_id: jint,
     event_type: JString<'local>,
     json_payload: JString<'local>,
@@ -1156,6 +1194,7 @@ pub(crate) extern "system" fn onCameraEvent<'local>(
                 camera_id: camera_id as u32,
                 event_type: evt,
                 json_payload: payload,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1165,6 +1204,7 @@ pub(crate) extern "system" fn onCameraFrameData<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     camera_id: jint,
     y_buf: JByteBuffer<'local>,
     y_off: jint,
@@ -1258,6 +1298,7 @@ pub(crate) extern "system" fn onCameraFrameData<'local>(
                 data: packed,
                 width: width as u32,
                 height: height as u32,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1538,11 +1579,18 @@ pub(crate) extern "system" fn onKeyboardInput<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardInput", {
         let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
-        let _ = send_command_to_host(host_id, HostCommand::OnKeyboardInput { value: val });
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnKeyboardInput {
+                value: val,
+                runtime_generation: captured_generation(generation),
+            },
+        );
     });
 }
 
@@ -1550,11 +1598,18 @@ pub(crate) extern "system" fn onKeyboardConfirm<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardConfirm", {
         let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
-        let _ = send_command_to_host(host_id, HostCommand::OnKeyboardConfirm { value: val });
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnKeyboardConfirm {
+                value: val,
+                runtime_generation: captured_generation(generation),
+            },
+        );
     });
 }
 
@@ -1562,11 +1617,18 @@ pub(crate) extern "system" fn onKeyboardComplete<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardComplete", {
         let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
-        let _ = send_command_to_host(host_id, HostCommand::OnKeyboardComplete { value: val });
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnKeyboardComplete {
+                value: val,
+                runtime_generation: captured_generation(generation),
+            },
+        );
     });
 }
 
@@ -1574,6 +1636,7 @@ pub(crate) extern "system" fn onKeyboardHeightChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     height: jdouble,
 ) {
     jni_safe!("onKeyboardHeightChange", {
@@ -1581,6 +1644,7 @@ pub(crate) extern "system" fn onKeyboardHeightChange(
             host_id,
             HostCommand::OnKeyboardHeightChange {
                 height: height as f64,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1769,6 +1833,7 @@ pub(crate) extern "system" fn onVideoEvent<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     video_id: jint,
     event_type: JString<'local>,
     data_json: JString<'local>,
@@ -1788,6 +1853,7 @@ pub(crate) extern "system" fn onVideoEvent<'local>(
                 video_id: video_id as u32,
                 event_type: evt,
                 data,
+                runtime_generation: captured_generation(generation),
             },
         );
     });

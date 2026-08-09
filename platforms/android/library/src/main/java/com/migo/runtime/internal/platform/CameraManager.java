@@ -26,6 +26,8 @@ import android.util.Size;
 
 import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.RuntimeGenerationBoundary;
+import com.migo.runtime.internal.RuntimeScoped;
 import com.migo.runtime.internal.ResourceCleanup;
 
 import org.json.JSONException;
@@ -51,7 +53,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * @hide
  */
-public final class CameraManager {
+public final class CameraManager implements RuntimeScoped {
 
     private static final String TAG = "CameraManager";
 
@@ -116,6 +118,21 @@ public final class CameraManager {
     private Size photoSize;
     private Size videoSize;
 
+    /**
+     * The runtime this camera belongs to.
+     *
+     * <p>Captured once, here, and stamped on every event and frame it reports.
+     * The teardown that releases the camera reports a
+     * {@code stop} as it goes, and that report belongs to the isolate that
+     * opened it, not to the one replacing it.
+     */
+    private final RuntimeGenerationBoundary.Token token;
+
+    @Override
+    public RuntimeGenerationBoundary.Token runtimeToken() {
+        return token;
+    }
+
     public CameraManager(int sessionId, int cameraId, Activity activity) {
         this(sessionId, cameraId, activity, false);
     }
@@ -126,6 +143,7 @@ public final class CameraManager {
             Activity activity,
             boolean lifecycleSuspended) {
         this.sessionId = sessionId;
+        this.token = RuntimeGenerationBoundary.acquire(sessionId);
         this.cameraId = cameraId;
         this.activity = activity;
         this.mainHandler = new Handler(Looper.getMainLooper());
@@ -1005,7 +1023,7 @@ public final class CameraManager {
                     int vLen = vBuffer.remaining();
 
                     // Synchronous native copy while the Image is still open.
-                    NativeMethods.onCameraFrameData(sessionId, cameraId,
+                    NativeMethods.onCameraFrameData(sessionId, token.generation(), cameraId,
                             yBuffer, yOff, yLen,
                             uBuffer, uOff, uLen,
                             vBuffer, vOff, vLen,
@@ -1313,7 +1331,8 @@ public final class CameraManager {
 
     private void fireEvent(String eventType, String jsonPayload) {
         Log.d(TAG, "fireEvent() eventType: " + eventType + ", payload: " + jsonPayload);
-        NativeMethods.onCameraEvent(sessionId, cameraId, eventType, jsonPayload);
+        NativeMethods.onCameraEvent(
+                sessionId, token.generation(), cameraId, eventType, jsonPayload);
     }
 
     private String createResultJson() throws JSONException {

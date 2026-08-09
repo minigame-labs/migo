@@ -456,11 +456,13 @@ public final class NativeMethods {
      * Callback for Bluetooth setting result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param enabled   Whether Bluetooth is now enabled
      */
-    public static void onBluetoothSettingResult(int sessionId, boolean enabled) {
+    public static void onBluetoothSettingResult(int sessionId, int requestId, boolean enabled) {
         if (sessionId >= 0) {
-            NativeBridge.onOpenSystemBluetoothSetting(sessionId, enabled ? 1 : 0);
+            NativeBridge.onOpenSystemBluetoothSetting(sessionId, requestId, enabled ? 1 : 0);
         }
     }
 
@@ -468,11 +470,13 @@ public final class NativeMethods {
      * Callback for app authorization setting result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param code      0 on success, negative on failure
      */
-    public static void onAppAuthorizeSettingResult(int sessionId, int code) {
+    public static void onAppAuthorizeSettingResult(int sessionId, int requestId, int code) {
         if (sessionId >= 0) {
-            NativeBridge.onOpenAppAuthorizeSetting(sessionId, code);
+            NativeBridge.onOpenAppAuthorizeSetting(sessionId, requestId, code);
         }
     }
 
@@ -480,12 +484,14 @@ public final class NativeMethods {
      * Callback for modal dialog result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param confirm   1 if user tapped confirm, 0 otherwise
      * @param cancel    1 if user tapped cancel, 0 otherwise
      */
-    public static void onModalResult(int sessionId, int confirm, int cancel) {
+    public static void onModalResult(int sessionId, int requestId, int confirm, int cancel) {
         if (sessionId >= 0) {
-            NativeBridge.onModalResult(sessionId, confirm, cancel);
+            NativeBridge.onModalResult(sessionId, requestId, confirm, cancel);
         }
     }
 
@@ -493,11 +499,13 @@ public final class NativeMethods {
      * Callback for action sheet result.
      *
      * @param sessionId The session ID
+     * @param requestId The id the request carried, or
+     *                  {@link CallbackCorrelation#ABSENT}
      * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
      */
-    public static void onActionSheetResult(int sessionId, int tapIndex) {
+    public static void onActionSheetResult(int sessionId, int requestId, int tapIndex) {
         if (sessionId >= 0) {
-            NativeBridge.onActionSheetResult(sessionId, tapIndex);
+            NativeBridge.onActionSheetResult(sessionId, requestId, tapIndex);
         }
     }
 
@@ -512,9 +520,10 @@ public final class NativeMethods {
      * @param beta      Rotation around X axis in degrees (-180 to 180)
      * @param gamma     Rotation around Y axis in degrees (-90 to 90)
      */
-    public static void onDeviceMotionChange(int sessionId, double alpha, double beta, double gamma) {
+    public static void onDeviceMotionChange(
+            int sessionId, long generation, double alpha, double beta, double gamma) {
         if (sessionId >= 0) {
-            NativeBridge.onDeviceMotionChange(sessionId, alpha, beta, gamma);
+            NativeBridge.onDeviceMotionChange(sessionId, generation, alpha, beta, gamma);
         }
     }
 
@@ -527,9 +536,10 @@ public final class NativeMethods {
      * @param y         Angular velocity around Y axis in rad/s
      * @param z         Angular velocity around Z axis in rad/s
      */
-    public static void onGyroscopeChange(int sessionId, double x, double y, double z) {
+    public static void onGyroscopeChange(
+            int sessionId, long generation, double x, double y, double z) {
         if (sessionId >= 0) {
-            NativeBridge.onGyroscopeChange(sessionId, x, y, z);
+            NativeBridge.onGyroscopeChange(sessionId, generation, x, y, z);
         }
     }
 
@@ -552,9 +562,10 @@ public final class NativeMethods {
      * @param direction Direction in degrees (0-360, 0 = north)
      * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable", or "unknow X"
      */
-    public static void onCompassChange(int sessionId, double direction, String accuracy) {
+    public static void onCompassChange(
+            int sessionId, long generation, double direction, String accuracy) {
         if (sessionId >= 0) {
-            NativeBridge.onCompassChange(sessionId, direction, accuracy);
+            NativeBridge.onCompassChange(sessionId, generation, direction, accuracy);
         }
     }
 
@@ -567,9 +578,10 @@ public final class NativeMethods {
      * @param y         Acceleration along Y axis in m/s^2
      * @param z         Acceleration along Z axis in m/s^2
      */
-    public static void onAccelerometerChange(int sessionId, double x, double y, double z) {
+    public static void onAccelerometerChange(
+            int sessionId, long generation, double x, double y, double z) {
         if (sessionId >= 0) {
-            NativeBridge.onAccelerometerChange(sessionId, x, y, z);
+            NativeBridge.onAccelerometerChange(sessionId, generation, x, y, z);
         }
     }
 
@@ -600,9 +612,10 @@ public final class NativeMethods {
      * @param eventType   Event type: "stop", "error", "authCancel", "timeoutCallback"
      * @param jsonPayload JSON-encoded event data
      */
-    public static void onCameraEvent(int sessionId, int cameraId, String eventType, String jsonPayload) {
+    public static void onCameraEvent(
+            int sessionId, long generation, int cameraId, String eventType, String jsonPayload) {
         if (sessionId >= 0 && eventType != null) {
-            NativeBridge.onCameraEvent(sessionId, cameraId, eventType,
+            NativeBridge.onCameraEvent(sessionId, generation, cameraId, eventType,
                     jsonPayload != null ? jsonPayload : "{}");
         }
     }
@@ -625,7 +638,7 @@ public final class NativeMethods {
      * @param width     Frame width in pixels
      * @param height    Frame height in pixels
      */
-    public static void onCameraFrameData(int sessionId, int cameraId,
+    public static void onCameraFrameData(int sessionId, long generation, int cameraId,
             ByteBuffer yBuffer, int yOffset, int yLength,
             ByteBuffer uBuffer, int uOffset, int uLength,
             ByteBuffer vBuffer, int vOffset, int vLength,
@@ -637,7 +650,7 @@ public final class NativeMethods {
                 && yBuffer != null && yBuffer.isDirect()
                 && uBuffer != null && uBuffer.isDirect()
                 && vBuffer != null && vBuffer.isDirect()) {
-            NativeBridge.onCameraFrameData(sessionId, cameraId,
+            NativeBridge.onCameraFrameData(sessionId, generation, cameraId,
                     yBuffer, yOffset, yLength,
                     uBuffer, uOffset, uLength,
                     vBuffer, vOffset, vLength,
@@ -737,9 +750,9 @@ public final class NativeMethods {
      *
      * @param sessionId The session ID
      */
-    public static void onUserCaptureScreen(int sessionId) {
+    public static void onUserCaptureScreen(int sessionId, long generation) {
         if (sessionId >= 0) {
-            NativeBridge.onUserCaptureScreen(sessionId);
+            NativeBridge.onUserCaptureScreen(sessionId, generation);
         }
     }
 
@@ -795,48 +808,52 @@ public final class NativeMethods {
     /**
      * Callback for keyboard input text change.
      *
-     * @param sessionId The session ID
-     * @param value     Current text value
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param value      Current text value
      */
-    public static void onKeyboardInput(int sessionId, String value) {
+    public static void onKeyboardInput(int sessionId, long generation, String value) {
         if (sessionId >= 0 && value != null) {
-            NativeBridge.onKeyboardInput(sessionId, value);
+            NativeBridge.onKeyboardInput(sessionId, generation, value);
         }
     }
 
     /**
      * Callback for keyboard confirm action.
      *
-     * @param sessionId The session ID
-     * @param value     Current text value
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param value      Current text value
      */
-    public static void onKeyboardConfirm(int sessionId, String value) {
+    public static void onKeyboardConfirm(int sessionId, long generation, String value) {
         if (sessionId >= 0 && value != null) {
-            NativeBridge.onKeyboardConfirm(sessionId, value);
+            NativeBridge.onKeyboardConfirm(sessionId, generation, value);
         }
     }
 
     /**
      * Callback for keyboard complete (dismissed).
      *
-     * @param sessionId The session ID
-     * @param value     Current text value
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param value      Current text value
      */
-    public static void onKeyboardComplete(int sessionId, String value) {
+    public static void onKeyboardComplete(int sessionId, long generation, String value) {
         if (sessionId >= 0 && value != null) {
-            NativeBridge.onKeyboardComplete(sessionId, value);
+            NativeBridge.onKeyboardComplete(sessionId, generation, value);
         }
     }
 
     /**
      * Callback for keyboard height change.
      *
-     * @param sessionId The session ID
-     * @param height    Keyboard height in CSS pixels (0 when hidden)
+     * @param sessionId  The session ID
+     * @param generation The generation the keyboard manager captured
+     * @param height     Keyboard height in CSS pixels (0 when hidden)
      */
-    public static void onKeyboardHeightChange(int sessionId, double height) {
+    public static void onKeyboardHeightChange(int sessionId, long generation, double height) {
         if (sessionId >= 0) {
-            NativeBridge.onKeyboardHeightChange(sessionId, height);
+            NativeBridge.onKeyboardHeightChange(sessionId, generation, height);
         }
     }
 
@@ -1078,9 +1095,11 @@ public final class NativeMethods {
      *                    "interruptionBegin", "interruptionEnd"
      * @param jsonPayload JSON-encoded event data
      */
-    public static void onRecorderEvent(int sessionId, String eventType, String jsonPayload) {
+    public static void onRecorderEvent(
+            int sessionId, long generation, String eventType, String jsonPayload) {
         if (sessionId >= 0 && eventType != null) {
-            NativeBridge.onRecorderEvent(sessionId, eventType, jsonPayload != null ? jsonPayload : "{}");
+            NativeBridge.onRecorderEvent(
+                    sessionId, generation, eventType, jsonPayload != null ? jsonPayload : "{}");
         }
     }
 
@@ -1092,9 +1111,10 @@ public final class NativeMethods {
      * @param frameData   Raw audio frame bytes
      * @param isLastFrame Whether this is the last frame before stop
      */
-    public static void onRecorderFrameData(int sessionId, byte[] frameData, boolean isLastFrame) {
+    public static void onRecorderFrameData(
+            int sessionId, long generation, byte[] frameData, boolean isLastFrame) {
         if (sessionId >= 0 && frameData != null) {
-            NativeBridge.onRecorderFrameData(sessionId, frameData, isLastFrame);
+            NativeBridge.onRecorderFrameData(sessionId, generation, frameData, isLastFrame);
         }
     }
 
@@ -1152,9 +1172,10 @@ public final class NativeMethods {
      *                  "progress", "fullscreenchange"
      * @param dataJson  JSON-encoded event data
      */
-    public static void onVideoEvent(int sessionId, int videoId, String eventType, String dataJson) {
+    public static void onVideoEvent(
+            int sessionId, long generation, int videoId, String eventType, String dataJson) {
         try {
-            NativeBridge.onVideoEvent(sessionId, videoId,
+            NativeBridge.onVideoEvent(sessionId, generation, videoId,
                 eventType != null ? eventType : "",
                 dataJson != null ? dataJson : "{}");
         } catch (Exception e) {

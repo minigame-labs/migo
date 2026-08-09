@@ -11,14 +11,15 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.RuntimeGenerationBoundary;
+import com.migo.runtime.internal.RuntimeScoped;
 
 import org.json.JSONObject;
 
 import java.lang.ref.WeakReference;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Manages video player instances for a session.
@@ -27,15 +28,28 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * @hide
  */
-public class VideoManager {
+public class VideoManager implements RuntimeScoped {
     private final int sessionId;
     private final WeakReference<Activity> activityRef;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Map<Integer, VideoPlayer> players = new ConcurrentHashMap<>();
-    private final AtomicInteger nextVideoId = new AtomicInteger(1);
+    private final ConcurrentMap<Integer, VideoPlayer> players = new ConcurrentHashMap<>();
     private final AtomicBoolean lifecycleSuspendedTarget;
     private final AtomicBoolean destroyed = new AtomicBoolean(false);
     private boolean lifecycleSuspended;
+
+    /**
+     * The runtime this video manager belongs to.
+     *
+     * <p>Captured once, here, and stamped on every event and frame it reports.
+     * Releasing a player reports {@code ended} and
+     * {@code pause}; those belong to the isolate that was playing.
+     */
+    private final RuntimeGenerationBoundary.Token token;
+
+    @Override
+    public RuntimeGenerationBoundary.Token runtimeToken() {
+        return token;
+    }
 
     public VideoManager(int sessionId, Activity activity) {
         this(sessionId, activity, false);
@@ -43,6 +57,7 @@ public class VideoManager {
 
     public VideoManager(int sessionId, Activity activity, boolean lifecycleSuspended) {
         this.sessionId = sessionId;
+        this.token = RuntimeGenerationBoundary.acquire(sessionId);
         this.activityRef = new WeakReference<>(activity);
         this.lifecycleSuspendedTarget = new AtomicBoolean(lifecycleSuspended);
         this.lifecycleSuspended = lifecycleSuspended;
@@ -60,15 +75,56 @@ public class VideoManager {
         }
     }
 
+    /**
+     * The video id this create request carries.
+     *
+     * <p>The runtime allocates it, keys its own registry by it, and routes every
+     * {@code onVideoEvent} through it, so Android has to honour it rather than
+     * number its own. The counter this replaced started at 1 in both places and
+     * agreed only while nothing ever failed on one side alone.
+     *
+     * <p>{@code optInt} is deliberately not used: it truncates, so {@code 1.5}
+     * reads back as video 1 — an id that names a different, live player.
+     */
+    static int requestedVideoId(JSONObject opts) {
+        Object raw = opts == null ? null : opts.opt("videoId");
+        long id;
+        if (raw instanceof Integer) {
+            id = (Integer) raw;
+        } else if (raw instanceof Long) {
+            id = (Long) raw;
+        } else {
+            throw new IllegalArgumentException("videoId is missing or not an integer");
+        }
+        if (id <= 0 || id > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("videoId " + id + " is outside 1..2147483647");
+        }
+        return (int) id;
+    }
+
+    /**
+     * Registers {@code player} under {@code videoId}, refusing an id already live.
+     *
+     * <p>The map is the claim: {@code putIfAbsent} decides and inserts in one
+     * step, so two creates racing for one id cannot both be told they have it.
+     * A plain {@code Map} could not promise that, which is why the parameter
+     * names the concurrent one.
+     */
+    static <T> void claimVideoId(ConcurrentMap<Integer, T> live, int videoId, T player) {
+        if (live.putIfAbsent(videoId, player) != null) {
+            throw new IllegalStateException("videoId " + videoId + " is already live");
+        }
+    }
+
     public String create(String optionsJson) {
         try {
             if (destroyed.get()) throw new IllegalStateException("session destroyed");
             JSONObject opts = new JSONObject(optionsJson);
-            int videoId = nextVideoId.getAndIncrement();
+            int videoId = requestedVideoId(opts);
             String src = opts.optString("src", "");
             // Store initial properties
             VideoPlayer player = new VideoPlayer(videoId, src, opts);
-            players.put(videoId, player);
+            claimVideoId(players, videoId, player);
             if (destroyed.get() && players.remove(videoId, player)) {
                 runOnMain(player::release);
                 throw new IllegalStateException("session destroyed");
@@ -118,13 +174,13 @@ public class VideoManager {
         try {
             JSONObject obj = new JSONObject(json);
             int videoId = obj.optInt("videoId", 0);
-            NativeMethods.onVideoEvent(sessionId, videoId, "fullscreenchange", "{\"fullScreen\":true}");
+            NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "fullscreenchange", "{\"fullScreen\":true}");
         } catch (Exception ignored) {}
     }
 
     public void exitFullscreen(int videoId) {
         if (destroyed.get()) return;
-        NativeMethods.onVideoEvent(sessionId, videoId, "fullscreenchange", "{\"fullScreen\":false}");
+        NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "fullscreenchange", "{\"fullScreen\":false}");
     }
 
     public void setProperty(String json) {
@@ -244,7 +300,7 @@ public class VideoManager {
                 mediaPlayer.start();
                 startTimeUpdates();
                 pendingPlay = false;
-                NativeMethods.onVideoEvent(sessionId, videoId, "play", "{}");
+                NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "play", "{}");
             } else {
                 pendingPlay = true;
             }
@@ -257,7 +313,7 @@ public class VideoManager {
             if (mediaPlayer != null && mediaPlayer.isPlaying()) {
                 mediaPlayer.pause();
                 stopTimeUpdates();
-                NativeMethods.onVideoEvent(sessionId, videoId, "pause", "{}");
+                NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "pause", "{}");
             }
         }
 
@@ -269,7 +325,7 @@ public class VideoManager {
                 mediaPlayer.stop();
                 prepared = false;
                 stopTimeUpdates();
-                NativeMethods.onVideoEvent(sessionId, videoId, "ended", "{}");
+                NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "ended", "{}");
             }
         }
 
@@ -390,7 +446,7 @@ public class VideoManager {
             } catch (Exception e) {
                 String msg = e.getMessage();
                 if (msg == null) msg = "unknown error";
-                NativeMethods.onVideoEvent(sessionId, videoId, "error",
+                NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "error",
                     "{\"errMsg\":\"" + msg.replace("\"", "\\\"") + "\"}");
             }
         }
@@ -409,7 +465,7 @@ public class VideoManager {
                             && mediaPlayer.isPlaying()) {
                         int pos = mediaPlayer.getCurrentPosition();
                         int dur = mediaPlayer.getDuration();
-                        NativeMethods.onVideoEvent(sessionId, videoId, "timeupdate",
+                        NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "timeupdate",
                             "{\"position\":" + (pos / 1000.0) + ",\"duration\":" + (dur / 1000.0) + "}");
                         timeUpdateHandler.postDelayed(this, 250);
                     }
@@ -453,7 +509,7 @@ public class VideoManager {
                 pendingPlay = false;
                 mp.start();
                 startTimeUpdates();
-                NativeMethods.onVideoEvent(sessionId, videoId, "play", "{}");
+                NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "play", "{}");
             }
         }
         public void onCompletion(MediaPlayer mp) {
@@ -461,11 +517,11 @@ public class VideoManager {
             pendingPlay = false;
             resumeAfterLifecyclePause = false;
             stopTimeUpdates();
-            NativeMethods.onVideoEvent(sessionId, videoId, "ended", "{}");
+            NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "ended", "{}");
         }
         public boolean onError(MediaPlayer mp, int what, int extra) {
             if (!lifetime.canRun()) return true;
-            NativeMethods.onVideoEvent(sessionId, videoId, "error",
+            NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "error",
                 "{\"errCode\":" + what + ",\"errMsg\":\"MediaPlayer error " + what + "/" + extra + "\"}");
             return true;
         }
@@ -473,7 +529,7 @@ public class VideoManager {
             if (lifetime.canRun() && prepared && !lifecycleSuspended) {
                 int dur = mp.getDuration();
                 double buffered = dur > 0 ? (percent / 100.0) * (dur / 1000.0) : 0;
-                NativeMethods.onVideoEvent(sessionId, videoId, "progress",
+                NativeMethods.onVideoEvent(sessionId, token.generation(), videoId, "progress",
                     "{\"buffered\":" + buffered + "}");
             }
         }

@@ -22,6 +22,7 @@ use shared::{
 };
 
 use crate::runtime::HostId;
+use crate::runtime::restart_boundary::RuntimeGenerationReader;
 
 /// Pending normal commands allowed per Host. Payload pools carry two extra
 /// slots: one for a command held by the consumer after dequeue, and one for the
@@ -61,6 +62,7 @@ pub enum HostIngressSendError {
 pub struct HostIngress {
     host_id: HostId,
     tx: HostTx,
+    runtime_generation: RuntimeGenerationReader,
     vsync_tx: Option<crossbeam_channel::Sender<f64>>,
     touch_pool: PayloadPool<TouchData>,
     gamepad_pool: PayloadPool<GamepadState>,
@@ -73,6 +75,15 @@ impl HostIngress {
     #[inline]
     pub const fn host_id(&self) -> HostId {
         self.host_id
+    }
+
+    /// The generation the Host is running right now.
+    ///
+    /// An acquire load with no setter beside it: ingress stamps what it
+    /// enqueues, and only the Host's `RestartBoundary` advances the value.
+    #[inline]
+    pub fn runtime_generation(&self) -> i64 {
+        self.runtime_generation.current()
     }
 
     /// Claim the adapter notification for the current input-saturation episode.
@@ -347,6 +358,13 @@ static NEXT_HOST_ID: AtomicI32 = AtomicI32::new(1);
 /// generation live.
 pub(crate) struct HostHandle {
     tx: HostTx,
+    /// The Host's live runtime generation, read-only.
+    ///
+    /// Held here so direct ingress can stamp what it enqueues without asking
+    /// the Host thread, which is the whole point of direct ingress. The reader
+    /// type has no setter, so nothing reachable from here can become a second
+    /// generation authority.
+    runtime_generation: RuntimeGenerationReader,
     critical_tx: CriticalHostCommandSender,
     surface_control: Arc<SurfaceControl>,
     touch_pool: PayloadPool<TouchData>,
@@ -374,6 +392,7 @@ pub(crate) fn register_sender(
     tx: HostTx,
     critical_tx: CriticalHostCommandSender,
     surface_control: Arc<SurfaceControl>,
+    runtime_generation: RuntimeGenerationReader,
 ) -> Option<HostHandle> {
     // Resolved before the registry lock is taken. Acquiring one process-wide lock
     // while holding another is how a lock cycle starts, and these two are reached
@@ -384,6 +403,7 @@ pub(crate) fn register_sender(
         id,
         HostHandle {
             tx,
+            runtime_generation,
             critical_tx,
             surface_control,
             touch_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
@@ -419,11 +439,20 @@ fn registered_surface_control(host_id: HostId) -> Result<Arc<SurfaceControl>, St
 
 /// Capture direct data-plane handles after Host initialization completes.
 pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
-    let (tx, touch_pool, gamepad_pool, ble_pool, input_saturation_notified, stats) = {
+    let (
+        tx,
+        runtime_generation,
+        touch_pool,
+        gamepad_pool,
+        ble_pool,
+        input_saturation_notified,
+        stats,
+    ) = {
         let map = host_senders().read();
         map.get(&host_id).map(|handle| {
             (
                 handle.tx.clone(),
+                handle.runtime_generation.clone(),
                 handle.touch_pool.clone(),
                 handle.gamepad_pool.clone(),
                 handle.ble_pool.clone(),
@@ -437,6 +466,7 @@ pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
     Ok(HostIngress {
         host_id,
         tx,
+        runtime_generation,
         vsync_tx: crate::runtime::vsync::sender(host_id),
         touch_pool,
         gamepad_pool,
@@ -598,6 +628,7 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
 mod tests {
     use shared::host_channel::InputSendOutcome;
     use shared::surface::{Surface, SurfaceControl, SurfaceRef};
+    use std::num::NonZeroI64;
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -640,7 +671,16 @@ mod tests {
     fn register_test_host(id: HostId) -> RegisteredHost {
         let (tx, critical_tx, _rx) = shared::host_channel::channel(1);
         let control = Arc::new(SurfaceControl::new());
-        assert!(register_sender(id, tx, critical_tx, control).is_none());
+        assert!(
+            register_sender(
+                id,
+                tx,
+                critical_tx,
+                control,
+                crate::runtime::restart_boundary::RestartBoundary::new().reader()
+            )
+            .is_none()
+        );
         RegisteredHost(id)
     }
 
@@ -670,6 +710,8 @@ mod tests {
             HostIngress {
                 host_id: id,
                 tx,
+                runtime_generation: crate::runtime::restart_boundary::RestartBoundary::new()
+                    .reader(),
                 vsync_tx: None,
                 touch_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
                 gamepad_pool: PayloadPool::new(normal_capacity + reliable_capacity + 2),
@@ -737,7 +779,16 @@ mod tests {
     fn critical_commands_bypass_saturated_normal_budget_in_fifo_order() {
         let id = alloc_host_id();
         let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
-        assert!(register_sender(id, tx, critical_tx, Arc::new(SurfaceControl::new()),).is_none());
+        assert!(
+            register_sender(
+                id,
+                tx,
+                critical_tx,
+                Arc::new(SurfaceControl::new()),
+                crate::runtime::restart_boundary::RestartBoundary::new().reader(),
+            )
+            .is_none()
+        );
         let _registration = RegisteredHost(id);
 
         send_command_to_host(id, HostCommand::Restart).unwrap();
@@ -757,7 +808,16 @@ mod tests {
     fn reliable_host_callback_bypasses_saturated_normal_budget() {
         let id = alloc_host_id();
         let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
-        assert!(register_sender(id, tx, critical_tx, Arc::new(SurfaceControl::new()),).is_none());
+        assert!(
+            register_sender(
+                id,
+                tx,
+                critical_tx,
+                Arc::new(SurfaceControl::new()),
+                crate::runtime::restart_boundary::RestartBoundary::new().reader(),
+            )
+            .is_none()
+        );
         let _registration = RegisteredHost(id);
 
         send_command_to_host(id, HostCommand::Restart).unwrap();
@@ -943,12 +1003,14 @@ mod tests {
             1
         );
 
-        let (keyboard_ingress, _critical_tx, _rx, keyboard_stats, _registered_stats) =
+        let (keyboard_ingress, _critical_tx, mut keyboard_rx, keyboard_stats, _registered_stats) =
             test_ingress(1, 1);
         keyboard_ingress.try_send(HostCommand::Restart).unwrap();
+        let stamped = keyboard_ingress.runtime_generation();
         assert_eq!(
             keyboard_ingress.try_send_keyboard(HostCommand::OnKeyboardComplete {
                 value: "done".to_owned(),
+                runtime_generation: NonZeroI64::new(stamped),
             }),
             Ok(InputSendOutcome::Reserved)
         );
@@ -958,6 +1020,15 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+
+        // The reserve path must deliver the command it was handed, stamp and
+        // all. Rebuilding a terminal keyboard event on the way through would
+        // hand it whatever generation is current at that moment -- which is the
+        // one case where the drop at dispatch is guaranteed to be wrong.
+        assert!(matches!(keyboard_rx.try_recv(), Ok(HostCommand::Restart)));
+        let reserved = keyboard_rx.try_recv().expect("reserved keyboard command");
+        assert!(matches!(reserved, HostCommand::OnKeyboardComplete { .. }));
+        assert_eq!(reserved.callback_generation(), NonZeroI64::new(stamped));
     }
 
     #[test]

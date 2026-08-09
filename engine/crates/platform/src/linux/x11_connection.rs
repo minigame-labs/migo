@@ -253,58 +253,6 @@ impl X11RenderConnection {
         self.fd
     }
 
-    #[cfg(test)]
-    pub(super) fn from_display_for_test(display: NonNull<c_void>) -> Arc<Self> {
-        #[derive(Debug)]
-        struct NoopX11Api;
-
-        impl X11Api for NoopX11Api {
-            fn display_name(&self, _display: NonNull<c_void>) -> EngineResult<CString> {
-                Ok(CString::new(":0").unwrap())
-            }
-
-            fn open_display(&self, _name: &CStr) -> EngineResult<NonNull<c_void>> {
-                Err(EngineError::new(ErrorCode::InvalidOperation))
-            }
-
-            fn close_display(&self, _display: NonNull<c_void>) {}
-
-            fn connection_fd(&self, _display: NonNull<c_void>) -> EngineResult<RawFd> {
-                Ok(0)
-            }
-
-            fn server_identity(
-                &self,
-                _display: NonNull<c_void>,
-                _display_name: &CStr,
-            ) -> EngineResult<X11ServerIdentity> {
-                Ok(X11ServerIdentity::Unix {
-                    pid: 1,
-                    uid: 1,
-                    gid: 1,
-                    display_number: Box::from(&b"0"[..]),
-                })
-            }
-
-            fn connection_is_alive(&self, _fd: RawFd) -> EngineResult<()> {
-                Ok(())
-            }
-        }
-
-        Arc::new(Self {
-            api: Arc::new(NoopX11Api),
-            display,
-            display_name: CString::new(":0").unwrap(),
-            server_identity: X11ServerIdentity::Unix {
-                pid: 1,
-                uid: 1,
-                gid: 1,
-                display_number: Box::from(&b"0"[..]),
-            },
-            fd: 0,
-        })
-    }
-
     /// Verify a later caller-owned display reaches this live render server.
     ///
     /// # Safety
@@ -471,6 +419,128 @@ fn os_error(code: ErrorCode, message: &'static str) -> EngineError {
     EngineError::new(code)
         .with_msg(message)
         .with_detail(std::io::Error::last_os_error().to_string())
+}
+
+/// A declared X11 topology with no Xlib, no server and no socket: each
+/// `Display*` the caller places reaches a named server, and a render connection
+/// is opened through the production path against it.
+///
+/// This is the only way to get a `LinuxX11Context` without a running X server,
+/// so both this crate's presenter tests and the C ABI layer's reattachment
+/// tests use it. Two ways to fabricate the same object would be two chances to
+/// fabricate one production code never builds.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct X11TestServers {
+    /// `Display*` as an address, and the X server behind it. Addresses rather
+    /// than pointers so the topology stays `Send + Sync` without an unsafe
+    /// promise about pointers nothing here dereferences.
+    servers: std::collections::HashMap<usize, u8>,
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl X11TestServers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declare that `display` reaches X server `server_id`. A display that was
+    /// never placed is unknown to this topology and fails the way Xlib fails on
+    /// a pointer from somewhere else.
+    pub fn place(&mut self, display: NonNull<c_void>, server_id: u8) -> &mut Self {
+        self.servers.insert(display.as_ptr() as usize, server_id);
+        self
+    }
+
+    /// Private render connections opened through this topology so far.
+    ///
+    /// The count is what makes "reattachment reuses the connection" falsifiable:
+    /// a reuse arm that quietly opened a second one would still return a working
+    /// context.
+    pub fn opens(&self) -> usize {
+        self.opens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Open a private render connection on `render`, resolved from `host`
+    /// exactly as `X11RenderConnection::open` resolves it from a live display.
+    pub(super) fn open_connection(
+        &self,
+        host: NonNull<c_void>,
+        render: NonNull<c_void>,
+    ) -> EngineResult<Arc<X11RenderConnection>> {
+        let api = Arc::new(TestX11Api {
+            servers: self.servers.clone(),
+            render: render.as_ptr() as usize,
+            opens: Arc::clone(&self.opens),
+        });
+        X11RenderConnection::open_with_api(host, api)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+struct TestX11Api {
+    servers: std::collections::HashMap<usize, u8>,
+    render: usize,
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestX11Api {
+    fn server_of(&self, display: NonNull<c_void>) -> EngineResult<u8> {
+        self.servers
+            .get(&(display.as_ptr() as usize))
+            .copied()
+            .ok_or_else(|| {
+                EngineError::new(ErrorCode::InvalidArgument)
+                    .with_msg("display was never placed on a test X11 server")
+                    .with_detail(format!("display={:p}", display.as_ptr()))
+            })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl X11Api for TestX11Api {
+    fn display_name(&self, display: NonNull<c_void>) -> EngineResult<CString> {
+        let server = self.server_of(display)?;
+        CString::new(format!(":{server}")).map_err(|_| {
+            EngineError::new(ErrorCode::InvalidArgument).with_msg("test display name contains NUL")
+        })
+    }
+
+    fn open_display(&self, _name: &CStr) -> EngineResult<NonNull<c_void>> {
+        self.opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        NonNull::new(self.render as *mut c_void).ok_or_else(|| {
+            EngineError::new(ErrorCode::RenderInitializeError)
+                .with_msg("test render display must be non-null")
+        })
+    }
+
+    fn close_display(&self, _display: NonNull<c_void>) {}
+
+    fn connection_fd(&self, display: NonNull<c_void>) -> EngineResult<RawFd> {
+        self.server_of(display).map(RawFd::from)
+    }
+
+    fn server_identity(
+        &self,
+        display: NonNull<c_void>,
+        _display_name: &CStr,
+    ) -> EngineResult<X11ServerIdentity> {
+        let server = self.server_of(display)?;
+        Ok(X11ServerIdentity::Unix {
+            pid: libc::pid_t::from(server),
+            uid: 1000,
+            gid: 1000,
+            display_number: server.to_string().into_bytes().into_boxed_slice(),
+        })
+    }
+
+    fn connection_is_alive(&self, _fd: RawFd) -> EngineResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

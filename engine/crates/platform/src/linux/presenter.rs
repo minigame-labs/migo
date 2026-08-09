@@ -29,6 +29,11 @@ use shared::{
 
 use super::{egl_fallback, x11_connection::X11RenderConnection};
 
+/// Re-exported so a test-support consumer needs one import path for the X11
+/// context and the topology it is opened against.
+#[cfg(any(test, feature = "test-support"))]
+pub use super::x11_connection::X11TestServers;
+
 /// System EGL shared object on glibc Linux. The unversioned `libEGL.so` symlink
 /// ships only with `-dev` packages, so the runtime `.so.1` is loaded directly.
 const LINUX_EGL_LIBRARY: &str = "libEGL.so.1";
@@ -1038,10 +1043,19 @@ impl LinuxX11Context {
         self.connection.fd_for_test()
     }
 
-    #[cfg(test)]
-    fn from_render_display_for_test(display: NonNull<c_void>) -> Self {
-        Self::from_connection(X11RenderConnection::from_display_for_test(display))
-            .expect("test X11 context")
+    /// Open a render context against a declared topology instead of a server.
+    ///
+    /// Reachable from other crates under `test-support` because the C ABI layer
+    /// owns the decision this exists to test -- whether a reattachment reuses
+    /// this connection or opens another -- and that decision is two crates from
+    /// the connection itself.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_on_test_servers(
+        servers: &X11TestServers,
+        host: NonNull<c_void>,
+        render: NonNull<c_void>,
+    ) -> EngineResult<Self> {
+        Self::from_connection(servers.open_connection(host, render)?)
     }
 }
 
@@ -1063,8 +1077,15 @@ mod tests {
 
     use super::*;
 
+    /// A context whose private render connection is exactly `display`, opened
+    /// from a separate host display on the same server -- the shape production
+    /// `open` resolves.
     fn test_x11_context(display: NonNull<c_void>) -> LinuxX11Context {
-        LinuxX11Context::from_render_display_for_test(display)
+        const TEST_SERVER: u8 = 7;
+        let host = NonNull::new(0x1usize as *mut c_void).expect("host display");
+        let mut servers = X11TestServers::new();
+        servers.place(host, TEST_SERVER).place(display, TEST_SERVER);
+        LinuxX11Context::open_on_test_servers(&servers, host, display).expect("test X11 context")
     }
 
     #[test]

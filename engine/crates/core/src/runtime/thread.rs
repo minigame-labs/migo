@@ -207,11 +207,16 @@ fn spawn_host_thread_inner(
     // Authoritative shutdown signal, independent of the normal-command budget:
     // `shutdown_host` sets this even when the budget is full (where its normal
     // Shutdown nudge is dropped) and the host loop polls it every iteration.
+    // Constructed before registration so no sender can ever be reachable
+    // without a generation to stamp with. The boundary itself moves into the
+    // Host thread; the registry keeps only a reader.
+    let restart_boundary = crate::runtime::restart_boundary::RestartBoundary::new();
     registry::register_sender(
         id,
         host_tx.clone(),
         critical_host_tx.clone(),
         Arc::clone(&surface_control),
+        restart_boundary.reader(),
     );
 
     // Clone the platform Arc so we can use it in the catch_unwind path
@@ -231,6 +236,7 @@ fn spawn_host_thread_inner(
                     platform,
                     opt,
                     Arc::clone(&surface_control),
+                    restart_boundary,
                 ) {
                     Ok(h) => h,
                     Err(e) => {

@@ -42,7 +42,7 @@ independently.
 
 | Part | Items | File |
 |------|-------|------|
-| Tooling And Verification | T.1 – T.5 | [part-tooling.md](2026-08-03-four-platform-delivery/part-tooling.md) |
+| Tooling And Verification | T.1 – T.8 | [part-tooling.md](2026-08-03-four-platform-delivery/part-tooling.md) |
 | Phase 0 — Correctness Foundation | 0.1 – 0.65 (66 items) | [part-phase-0.md](2026-08-03-four-platform-delivery/part-phase-0.md) |
 | Phase 1 — Hermetic Four-Platform Builds | 1.1 – 1.14 (27 items) | [part-phase-1.md](2026-08-03-four-platform-delivery/part-phase-1.md) |
 | Phase 2 — Native Platform Qualification | 2.1 – 2.8 | [part-phases-2-5-blocked.md](2026-08-03-four-platform-delivery/part-phases-2-5-blocked.md) |

@@ -9,7 +9,20 @@ use std::{
 };
 
 use serde_json::Value;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Whether `cmd` was produced for a runtime that is no longer the current one.
+///
+/// The only implementation of the rule, called by `handle_command_inner`; it is
+/// a free function purely so it can be driven without a live `Host`, which needs
+/// V8, a render thread and an audio thread to exist.
+///
+/// A command carrying no generation is never retired — see
+/// [`HostCommand::callback_generation`] for the two reasons it may carry none,
+/// neither of which means "stale".
+fn is_retired_callback(cmd: &HostCommand, current_generation: i64) -> bool {
+    matches!(cmd.callback_generation(), Some(produced_for) if produced_for.get() != current_generation)
+}
 
 use shared::{
     config::InitOptions,
@@ -175,6 +188,14 @@ pub(crate) struct Host {
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
     network_policy: shared::op_state::NetworkPolicy,
+
+    /// The Host's one callback-id space. Cloned into every `HostOpState`,
+    /// including each Worker's, and never rebuilt on restart.
+    callback_ids: Arc<shared::callback_id::CallbackIdAllocator>,
+
+    /// The only thing that may advance the runtime generation. Everything else
+    /// holds a `RuntimeGenerationReader`.
+    restart_boundary: crate::runtime::restart_boundary::RestartBoundary,
     render_events: RenderEventReceiver,
 
     last_game_id: Option<String>,
@@ -318,6 +339,7 @@ impl Host {
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
         surface_control: Arc<shared::surface::SurfaceControl>,
+        restart_boundary: crate::runtime::restart_boundary::RestartBoundary,
     ) -> EngineResult<Self> {
         // ---- Startup timing instrumentation ----
         let t_start = Instant::now();
@@ -467,7 +489,10 @@ impl Host {
         // `context_lost` was created above (before the render thread, which is
         // its authoritative writer).
 
+        let callback_ids = Arc::new(shared::callback_id::CallbackIdAllocator::default());
         let host_state = HostOpState {
+            callback_ids: Arc::clone(&callback_ids),
+            runtime_generation: restart_boundary.current(),
             id,
             code_dir: None,
             game_paths: None,  // Set when evaluating a module
@@ -599,6 +624,8 @@ impl Host {
 
         let host = Self {
             id,
+            callback_ids,
+            restart_boundary,
             render,
             audio,
             js: JsRuntimeSlot::new(js),
@@ -792,6 +819,29 @@ impl Host {
     }
 
     async fn handle_command_inner(&mut self, cmd: HostCommand) -> EngineResult<()> {
+        // A callback produced for a runtime that has since been replaced is
+        // dropped here, before any JavaScript runs.
+        //
+        // This is the only place it can be done once for every producer. The
+        // alternative -- each platform checking before it enqueues -- loses the
+        // race by construction: the command sits in the queue while `on_restart`
+        // runs on this same thread, so whatever was true at enqueue can stop
+        // being true before dispatch. Here the comparison and the dispatch are
+        // not separated by anything.
+        //
+        // `None` is delivered: see `callback_generation` for the two distinct
+        // reasons a command carries no generation.
+        let current_generation = self.restart_boundary.current();
+        if is_retired_callback(&cmd, current_generation) {
+            debug!(
+                "[Host {}] dropping callback from generation {:?} (current {})",
+                self.id,
+                cmd.callback_generation(),
+                current_generation
+            );
+            return Ok(());
+        }
+
         match cmd {
             HostCommand::EvaluateModule { game_id, entry } => {
                 self.on_evaluate_module(game_id, entry).await
@@ -907,12 +957,26 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnDeviceMotionChange { alpha, beta, gamma } => {
+            // The generation is read at the top of `handle_command_inner`, which
+            // is the only place that may act on it: a handler comparing it again
+            // would be a second decision point that could disagree with the one
+            // that already let this command through. Hence `_` here and below.
+            HostCommand::OnDeviceMotionChange {
+                alpha,
+                beta,
+                gamma,
+                runtime_generation: _,
+            } => {
                 self.js.dispatch_device_motion(alpha, beta, gamma);
                 Ok(())
             }
 
-            HostCommand::OnGyroscopeChange { x, y, z } => {
+            HostCommand::OnGyroscopeChange {
+                x,
+                y,
+                z,
+                runtime_generation: _,
+            } => {
                 self.js.dispatch_gyroscope(x, y, z);
                 Ok(())
             }
@@ -925,12 +989,18 @@ impl Host {
             HostCommand::OnCompassChange {
                 direction,
                 accuracy,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_compass(direction, &accuracy);
                 Ok(())
             }
 
-            HostCommand::OnAccelerometerChange { x, y, z } => {
+            HostCommand::OnAccelerometerChange {
+                x,
+                y,
+                z,
+                runtime_generation: _,
+            } => {
                 self.js.dispatch_accelerometer(x, y, z);
                 Ok(())
             }
@@ -946,6 +1016,7 @@ impl Host {
             HostCommand::RecorderEvent {
                 event_type,
                 json_payload,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_recorder_event(&event_type, &json_payload);
                 Ok(())
@@ -954,6 +1025,7 @@ impl Host {
             HostCommand::RecorderFrameData {
                 data,
                 is_last_frame,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_recorder_frame_data(&data, is_last_frame);
                 Ok(())
@@ -962,6 +1034,7 @@ impl Host {
             HostCommand::CameraEvent {
                 camera_id,
                 event_type,
+                runtime_generation: _,
                 json_payload,
             } => {
                 self.js
@@ -972,6 +1045,7 @@ impl Host {
             HostCommand::CameraFrameData {
                 camera_id,
                 data,
+                runtime_generation: _,
                 width,
                 height,
             } => {
@@ -980,22 +1054,22 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnKeyboardInput { value } => {
+            HostCommand::OnKeyboardInput { value, .. } => {
                 self.js.dispatch_keyboard_input(&value);
                 Ok(())
             }
 
-            HostCommand::OnKeyboardHeightChange { height } => {
+            HostCommand::OnKeyboardHeightChange { height, .. } => {
                 self.js.dispatch_keyboard_height_change(height);
                 Ok(())
             }
 
-            HostCommand::OnKeyboardConfirm { value } => {
+            HostCommand::OnKeyboardConfirm { value, .. } => {
                 self.js.dispatch_keyboard_confirm(&value);
                 Ok(())
             }
 
-            HostCommand::OnKeyboardComplete { value } => {
+            HostCommand::OnKeyboardComplete { value, .. } => {
                 self.js.dispatch_keyboard_complete(&value);
                 Ok(())
             }
@@ -1202,7 +1276,7 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnUserCaptureScreen => {
+            HostCommand::OnUserCaptureScreen { .. } => {
                 self.js
                     .invoke_host_hook("_internalTriggerUserCaptureScreen", HOOK_ARGS_NONE);
                 Ok(())
@@ -1225,6 +1299,7 @@ impl Host {
                 video_id,
                 event_type,
                 data,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_video_event(video_id, &event_type, &data);
                 Ok(())
@@ -1456,7 +1531,30 @@ impl Host {
         let (files_dir, cache_dir) = self.js.get_base_dirs();
         let device_services = self.platform.create_device_services(self.id);
 
+        // The replacement runtime is a new generation, and it is a *candidate*
+        // until it exists: `candidate_generation` reads without mutating, so a
+        // restart that fails to build a runtime leaves the live generation
+        // exactly where it was and nothing downstream is fenced against an
+        // isolate that never appeared. The commit is at the bottom, once the new
+        // isolate is installed.
+        let retired_generation = self.restart_boundary.current();
+        let candidate_generation = self.restart_boundary.candidate_generation()?;
+
+        // Tell the platform before the old isolate goes away, so anything it
+        // hands out per session is refused for the window in which no runtime
+        // owns it. Platforms that keep nothing outside the isolate ignore this.
+        self.platform.begin_runtime_restart(
+            self.id as i32,
+            retired_generation,
+            candidate_generation,
+        );
+
         let host_state = HostOpState {
+            // The allocator is never rebuilt -- ids outlive the isolate on
+            // purpose -- but the generation does advance, and it is what tells a
+            // retired runtime's still-queued callbacks from this one's.
+            callback_ids: Arc::clone(&self.callback_ids),
+            runtime_generation: candidate_generation,
             id: self.id,
             code_dir: None,
             game_paths: None,
@@ -1588,6 +1686,27 @@ impl Host {
 
         self.js.set(new_js);
 
+        // Publish the candidate. Every callback still queued behind this restart
+        // was produced for `retired_generation` and is dropped at dispatch from
+        // here on; anything the new isolate creates carries the new value.
+        //
+        // After `js.set` rather than before: until the isolate exists there is
+        // nothing for the new generation to name, and a commit that ran first
+        // would fence the retired runtime's callbacks against a runtime that
+        // might still fail to appear.
+        self.restart_boundary
+            .commit(retired_generation, candidate_generation)?;
+        self.platform
+            .complete_runtime_restart(self.id as i32, candidate_generation);
+
+        // There is deliberately no abort path between the two notifications:
+        // nothing between them returns early, and `HostJsRuntime::new` does not
+        // fail -- it panics, taking the thread. Adding a `?` in that stretch
+        // means adding an abort, because a platform left between begin and
+        // complete refuses every acquisition for the rest of the session. That
+        // is the fail-closed direction, which is why it is safe to leave it
+        // rather than invent an abort with no caller.
+
         // If we have a last evaluated module, reload it. Even if re-evaluation
         // fails, resume render/audio below so the session doesn't stay paused.
         let reload_result = if let (Some(game_id), Some(entry)) =
@@ -1624,5 +1743,60 @@ impl Host {
         self.reconcile_context_lost();
 
         reload_result
+    }
+}
+
+#[cfg(test)]
+mod retired_callback_tests {
+    use super::is_retired_callback;
+    use shared::HostCommand;
+    use std::num::NonZeroI64;
+
+    fn keyboard(generation: Option<i64>) -> HostCommand {
+        HostCommand::OnKeyboardComplete {
+            value: "done".to_owned(),
+            runtime_generation: generation
+                .map(|value| NonZeroI64::new(value).expect("a captured generation is never zero")),
+        }
+    }
+
+    #[test]
+    fn retired_callback_generation_is_dropped_at_host_dispatch() {
+        // The whole property in one place: the same command, the same current
+        // generation, differing only in what it was produced for.
+        assert!(is_retired_callback(&keyboard(Some(1)), 2));
+        assert!(!is_retired_callback(&keyboard(Some(2)), 2));
+    }
+
+    #[test]
+    fn a_generation_stays_retired_however_far_the_runtime_moves_on() {
+        // Not "one behind": a callback held by a slow platform across several
+        // restarts is as stale as one held across a single restart, and an
+        // off-by-one comparison would let the older one through.
+        for current in [2, 3, 10, i64::MAX] {
+            assert!(
+                is_retired_callback(&keyboard(Some(1)), current),
+                "{current}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_carries_no_generation_is_delivered() {
+        // Two distinct cases, and neither means stale: a command that is not a
+        // runtime-owned callback at all, and a producer this plan has not fenced
+        // yet. Dropping either would lose input nobody is fencing.
+        assert!(!is_retired_callback(&keyboard(None), 7));
+        assert!(!is_retired_callback(&HostCommand::OnHide, 7));
+        assert!(!is_retired_callback(
+            &HostCommand::OnKeyUp {
+                key: "a".to_owned(),
+                code: "KeyA".to_owned(),
+                timestamp_ms: 0.0,
+                modifiers: 0,
+                repeat: false,
+            },
+            7
+        ));
     }
 }

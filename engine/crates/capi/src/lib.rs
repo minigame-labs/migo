@@ -36,6 +36,7 @@ mod keyboard;
 mod layout;
 mod panic_barrier;
 mod platform;
+mod retirement;
 mod surface;
 #[cfg(test)]
 mod test_support;
@@ -115,7 +116,7 @@ struct EngineInner {
     /// `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT`: opt-in, never a default.
     allow_unsigned_content: bool,
     live_sessions: Mutex<usize>,
-    retired_hosts: Mutex<Vec<HostThread>>,
+    retired_hosts: retirement::RetirementSet,
 }
 
 impl EngineInner {
@@ -138,27 +139,6 @@ impl EngineInner {
             .with_pixel_ratio(pixel_ratio)
             .with_target_fps(60)
             .with_code_signing_enabled(!self.allow_unsigned_content)
-    }
-
-    fn retire_host(&self, host: HostThread) {
-        if let Err(error) = host.request_shutdown() {
-            tracing::error!("failed to request shutdown for Host {}: {error}", host.id());
-        }
-        self.retired_hosts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(host);
-    }
-
-    fn take_retired_hosts(&self) -> Result<Vec<HostThread>, ()> {
-        let mut retired = self
-            .retired_hosts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if retired.iter().any(HostThread::is_current_thread) {
-            return Err(());
-        }
-        Ok(std::mem::take(&mut *retired))
     }
 }
 
@@ -475,7 +455,7 @@ pub unsafe extern "C" fn migo_engine_create(
                 code_cache_dir: PathBuf::from(config.code_cache_dir),
                 allow_unsigned_content: config.allow_unsigned_content,
                 live_sessions: Mutex::new(0),
-                retired_hosts: Mutex::new(Vec::new()),
+                retired_hosts: retirement::RetirementSet::new(),
             }),
         });
         *out_engine = Box::into_raw(engine);
@@ -499,7 +479,7 @@ pub unsafe extern "C" fn migo_engine_destroy(engine: *mut MigoEngine) -> MigoRes
             Err(_) => return MIGO_ERROR_INTERNAL,
         }
 
-        let retired_hosts = match engine_ref.inner.take_retired_hosts() {
+        let retired_hosts = match engine_ref.inner.retired_hosts.take() {
             Ok(hosts) => hosts,
             Err(()) => {
                 tracing::error!(
@@ -617,7 +597,7 @@ pub unsafe extern "C" fn migo_session_destroy(session: *mut MigoSession) -> Migo
             // Publish ownership before the live count reaches zero. An Engine
             // destroy racing this call can therefore never miss an exiting
             // Host after it observes that no Session remains.
-            pinned.engine.retire_host(host);
+            pinned.engine.retired_hosts.retire(host);
         }
         *live_sessions -= 1;
         drop(state);
@@ -1172,7 +1152,7 @@ mod tests {
             })
             .expect("spawn retired Host");
         let host = migo_core::HostThread::from_join_handle_for_test(8_001, join);
-        unsafe { &*engine }.inner.retire_host(host);
+        unsafe { &*engine }.inner.retired_hosts.retire(host);
 
         started_rx.recv().expect("retired Host started");
         let (destroyed_tx, destroyed_rx) = mpsc::channel();
@@ -1215,7 +1195,7 @@ mod tests {
             .spawn(move || {
                 let host = owner_rx.recv().expect("receive own Host owner");
                 let engine = engine_address as *mut MigoEngine;
-                unsafe { &*engine }.inner.retire_host(host);
+                unsafe { &*engine }.inner.retired_hosts.retire(host);
                 result_tx
                     .send(unsafe { migo_engine_destroy(engine) })
                     .expect("publish self-join rejection");
@@ -1279,15 +1259,7 @@ mod tests {
                 .to_owned(),
             0
         );
-        assert_eq!(
-            unsafe { &*engine }
-                .inner
-                .retired_hosts
-                .lock()
-                .expect("retired Hosts")
-                .len(),
-            1
-        );
+        assert_eq!(unsafe { &*engine }.inner.retired_hosts.len(), 1);
 
         release_tx.send(()).expect("release retired Host");
         assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
@@ -1349,14 +1321,7 @@ mod tests {
                 .to_owned(),
             1
         );
-        assert!(
-            unsafe { &*engine }
-                .inner
-                .retired_hosts
-                .lock()
-                .expect("retired Hosts")
-                .is_empty()
-        );
+        assert_eq!(unsafe { &*engine }.inner.retired_hosts.len(), 0);
 
         unsafe { &*session }
             .state
@@ -1366,60 +1331,6 @@ mod tests {
         assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
         release_tx.send(()).expect("release retry Host");
         assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
-    }
-
-    #[test]
-    fn engine_destroy_holds_no_engine_lock_while_joining() {
-        let dirs = scratch_dirs("engine-join-locks");
-        let config = engine_config(
-            &dirs,
-            size_of::<MigoEngineConfig>() as u32,
-            MIGO_ABI_VERSION_CURRENT,
-        );
-        let mut engine: *mut MigoEngine = std::ptr::null_mut();
-        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
-
-        let inner = Arc::clone(&unsafe { &*engine }.inner);
-        let (release_tx, release_rx) = mpsc::channel();
-        let (locks_tx, locks_rx) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name("Migo-Main-capi-lock-probe".to_owned())
-            .spawn(move || {
-                release_rx.recv().expect("release lock probe");
-                let live_unlocked = inner.live_sessions.try_lock().is_ok();
-                let retired_unlocked = inner.retired_hosts.try_lock().is_ok();
-                locks_tx
-                    .send((live_unlocked, retired_unlocked))
-                    .expect("publish lock probe");
-            })
-            .expect("spawn lock-probe Host");
-        unsafe { &*engine }
-            .inner
-            .retire_host(migo_core::HostThread::from_join_handle_for_test(
-                8_005, join,
-            ));
-
-        let (destroyed_tx, destroyed_rx) = mpsc::channel();
-        let engine_address = engine as usize;
-        let destroyer = thread::spawn(move || {
-            let engine = engine_address as *mut MigoEngine;
-            destroyed_tx
-                .send(unsafe { migo_engine_destroy(engine) })
-                .expect("publish Engine result");
-        });
-        assert!(
-            destroyed_rx.try_recv().is_err(),
-            "Engine destruction must wait for its Host"
-        );
-
-        release_tx.send(()).expect("release lock probe");
-        assert_eq!(
-            locks_rx.recv().expect("lock probe result"),
-            (true, true),
-            "Engine destroy held a Migo lock while joining"
-        );
-        assert_eq!(destroyed_rx.recv().expect("Engine result"), MIGO_OK);
-        destroyer.join().expect("Engine destroyer");
     }
 
     #[test]

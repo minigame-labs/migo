@@ -12,11 +12,16 @@ use shared::services::{Scope, ScopeState};
 // ==================== Bluetooth Settings ====================
 
 #[op2(fast)]
-pub fn op_open_system_bluetooth_setting(state: &mut OpState) -> Result<(), JsErrorBox> {
+pub fn op_open_system_bluetooth_setting(
+    state: &mut OpState,
+    #[smi] request_id: i32,
+) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(sys) = services.system_info() {
-            return sys.open_bluetooth_settings().map_err(JsErrorBox::generic);
+            return sys
+                .open_bluetooth_settings(request_id)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic(
@@ -530,12 +535,15 @@ pub fn op_open_customer_service_conversation(
 // ==================== App Authorize Setting ====================
 
 #[op2(fast)]
-pub fn op_open_app_authorize_setting(state: &mut OpState) -> Result<(), JsErrorBox> {
+pub fn op_open_app_authorize_setting(
+    state: &mut OpState,
+    #[smi] request_id: i32,
+) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(sys) = services.system_info() {
             return sys
-                .open_app_authorize_setting()
+                .open_app_authorize_setting(request_id)
                 .map_err(JsErrorBox::generic);
         }
     }

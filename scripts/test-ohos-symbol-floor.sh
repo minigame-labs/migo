@@ -204,7 +204,21 @@ for artifact in "$@"; do
                 <(comm -13 "$FLOOR_SYMS" "$NEWER_SYMS") | head -40)"
             VCOUNT="$(comm -12 "$ARTIFACT_UNDEF" \
                 <(comm -13 "$FLOOR_SYMS" "$NEWER_SYMS") | wc -l)"
+            ADDED="$(comm -13 "$FLOOR_SYMS" "$NEWER_SYMS" | wc -l)"
+            NEWER_TOTAL="$(wc -l < "$NEWER_SYMS")"
             rm -f "$NEWER_SYMS"
+
+            # An empty or floor-identical newer sysroot makes every artifact
+            # pass: `comm -13` yields nothing, so there is nothing to import.
+            # That is indistinguishable from a real clean result unless the
+            # comparison says what it compared, so it says it -- and refuses
+            # rather than reporting a pass over an empty candidate set.
+            if [[ "$ADDED" -eq 0 ]]; then
+                err "newer sysroot $MIGO_OHOS_NEWER_SYSROOT adds no symbol over the floor"
+                err "($NEWER_TOTAL exported); a comparison with nothing to find is not evidence"
+                exit 1
+            fi
+            info "newer sysroot: $ADDED symbol(s) added after the floor, none may be imported"
 
             if [[ "$VCOUNT" -gt 0 ]]; then
                 err "$(basename "$artifact") imports $VCOUNT symbol(s) added after the floor:"

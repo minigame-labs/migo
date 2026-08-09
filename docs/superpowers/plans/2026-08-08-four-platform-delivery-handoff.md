@@ -5,10 +5,13 @@
 status convention, and every closed item's evidence, lives there. Read its
 "Status Convention" section before marking anything.
 
-**Branch:** `delivery/a12-and-verification-lanes`, 21 commits ahead of
-`origin/master`, never pushed. Do not push it and do not commit to `master`. The
-`perf/ble-notification-path` work merged as `0a53199` (#30), so nothing here
-depends on any other unpushed branch.
+**Branch, corrected 2026-08-09.** `delivery/a12-and-verification-lanes` no longer
+exists: it was squash-merged as `079e954` (#31) and is on `origin/master`. Do not
+commit to `master`; branch from it. The work after that merge is on
+`delivery/x11-and-mutation-evidence`.
+
+If a handoff tells you a branch is unpushed, check `git rev-parse` on the commit
+it names before believing it — this one had already landed.
 
 **Every shell needs this**, or every host suite fails for a reason unrelated to
 your change (see §0.2):
@@ -91,6 +94,12 @@ else.
    bash scripts/verify-change.sh --base HEAD     # clean tree: everything should PASS
    ```
 
+**Check before calling something blocked.** Two things were recorded as needing
+hardware or a download this session and neither did: `xvfb-run` is installed, so
+the `#[ignore]`d X11 round-trip runs here, and a newer OpenHarmony SDK was
+already unpacked at `~/ohos-sdk-6.1` (6.1.0.31, API 23) while three notes asked a
+human to fetch one. `command -v` and `ls ~` cost nothing next to a wrong entry.
+
 **Not portable at all:** the physical device (a Huawei Mate30 Pro), the
 `migo-api26` x86_64 emulator, and the Windows/MSVC toolchain are properties of
 the original machine. Any ledger item needing device evidence (0.65, 2.2, 2.5,
@@ -127,6 +136,16 @@ cd platforms/android && ./gradlew :library:testFullDebugUnitTest :library:testSl
 clang, the Khronos headers and the linux-gnu V8 archive that four Skia-linked
 crates need. It passes any cargo subcommand through, so `cargo-mutants` runs
 inside it too (§2).
+
+**Never read a filtered `cargo test` exit status as evidence.** It exits 0 when
+the filter matches nothing, so a typo reads exactly like a passing suite — the
+mistake this repository has made twice in one day. Use the runner instead; it
+lists first and fails on zero matches:
+
+```bash
+bash scripts/run-cargo-lib-test-filter.sh migo-shared callback_id
+bash scripts/run-cargo-lib-test-filter.sh --self-test    # proves its own parser
+```
 
 **Two lanes `verify-change.sh` does not cover, and both matter:**
 
@@ -219,37 +238,60 @@ reviews are user-triggered (§6).
   ledger entries name the file and line for each, and the tests that already assert
   the properties.
 
-### 3.2 Next, in value order
+### 3.2 Done 2026-08-09, read the ledger entry rather than redoing it
 
-1. **Item 0.4 (A3): three `capi`-layer X11 tests, no hardware needed.**
-   `capi/src/platform/linux.rs` has Wayland cases only, so nothing drives
-   `build_target` down the X11 path. Assert cold attach opens one context,
-   same-server reuse yields an equal `PlatformIdentity`, and a different server is
-   refused with `INVALID_STATE` **before any lease**.
-   `LinuxX11Context::from_render_display_for_test` is the seam. Task 2 Step 4 and
-   Task 4 Step 4 of that plan are genuinely device-blocked (live X server / xvfb).
-2. **Cheap mutants for 0.2 and 0.3**, to turn "implementation present" into "guard
-   proven". For A1: join while holding the engine lock, expect
-   `engine_destroy_holds_no_engine_lock_while_joining` to fail at its own assertion.
-   For A2: move `validate_platform_identity` after the lease, expect
-   `scripts/test-surface-attachment-contract.sh` to fail with "C ABI reattachment
-   identity is not rejected before Surface lease/enqueue".
-3. **Task T.4's pitest survivors**, starting with the permission cluster:
-   `PermissionOperationGate` and `PermissionRevocation` survive having their return
-   values inverted, and `NativeMethods.updatePermission` survives negation of its
-   whole argument guard. `TouchEventHandler`'s 19 are the largest cluster. Twelve of
-   the 20 Rust survivors are android-stub-limited and seven are mathematically
-   equivalent — **do not write tests for those**, that is writing a test that cannot
-   fail. T.4 has the classification.
-4. **The remaining phase-0 epics**: 0.7/A7 (Android capability enforcement, 30
-   protected and 8 cleanup operations), 0.8/A8, 0.9/A9, 0.10/A10, 0.11/A11, 0.13
-   HarmonyOS, 0.14/A13. Most have their own detailed plan named in the ledger entry.
-5. **Phase 1 hermetic builds** — `part-phase-1.md`, 18 open items.
+1. **Item 0.4 (A3)** — the three `capi`-layer X11 tests exist. The seam this
+   document named, `LinuxX11Context::from_render_display_for_test`, was `#[cfg(test)]`
+   and therefore invisible to `capi`; `migo-platform/test-support` and
+   `X11TestServers` replace it, and replace the old fake rather than joining it.
+2. **Items 0.2 (A1) and 0.3 (A2)** — mutants taken. A2's is textbook: only the
+   static contract sees the reordering. **A1's did not fail, and could not** — see
+   §4's new entry; the fix was to make the state unrepresentable
+   (`capi/src/retirement.rs`), not to tighten the probe.
+3. **Task T.4's permission cluster** — already killed in the previous round; this
+   document's description of it was stale. Re-measured: 5 survivors, every one a
+   mutator writing the constant that is already there. Nothing to do.
+4. **Task T.6** — a derived gate was reading Java bytecode it did not compile, so it
+   failed on a cold tree and passed on a stale one. Fixed at the gate.
+5. **Task T.8, new** — `verify-change.sh` claimed OpenHarmony has no local build.
+   It has one, it takes 13 seconds, and `crates/capi/src/platform/ohos.rs` was
+   compiled by *nothing* on this machine. There is now an `ohos compile` lane.
+   `windows` is still genuinely absent and still `NOT PROVEN`.
+
+### 3.3 Next, in value order
+
+0. **Decide what to do with `feat/capi-ads-and-permissions` before anything else
+   touches `crates/capi`.** Three commits, ~1730 insertions, **never pushed**, and
+   it implements most of item 0.11. Its merge-base is PR #21 and it already
+   conflicts in four files, two of which this session changed — every further edit
+   to `capi/src/{lib,surface,test_support}.rs` makes it more expensive. It is the
+   only genuinely unmerged work in the repository; item 0.11 has the detail. A
+   `git branch -D` loses it, because there is no remote copy.
+
+1. **The remaining phase-0 epics, sorted by what they actually need.** "Most have
+   their own detailed plan" was wrong — only A1–A4 have plan files, and A5–A14
+   mostly do not. Sorting them this way is what makes them startable:
+
+   | Item | What it needs | Why |
+   |---|---|---|
+   | 0.9/A9 | **execute, tasks 1–6 done, 7 started** | plan `2026-08-02-runtime-restart-generation-boundary.md`; §6.6 authority is *not* superseded, checked. Tasks 5 and 6 are whole. **Task 7's chokepoint has landed**: a restart now actually advances the generation (`candidate_generation` → `commit`, both previously `#[allow(dead_code)]`), and `Host::handle_command_inner` drops any command whose `callback_generation()` differs. The C ABI soft keyboard is the first fenced producer; **every Android manager still passes `None`**, which is task 7's remaining bulk (Java `RuntimeGenerationBoundary`, manager tokens, ad/permission tracking, the cleanup barrier, `GameSession.close` ordering — ~57 files). Read 0.9 before starting: it records what the mechanism guarantees and the two things it deliberately does not test |
+   | 0.13 | **execute, partly device-blocked** | the entry states four concrete deliverables (ArkTS lifecycle hooks, `OHNativeWindow` release barrier, multi-touch, restart/shutdown barriers); spec §6.2 governs. Compile-level work is now verifiable locally via the T.8 lane; behaviour needs the emulator |
+   | 0.8/A8 | **split, then audit** | five clauses in one line, one already closed as 0.12's third; the C ABI half overlaps the branch in 0.11 |
+   | 0.11/A11 | **decide** | see item 0 above |
+   | 0.10/A10 | **write the requirement first** | "Canvas recovery as one transactional resource operation" has no plan file and no acceptance line in the spec — §6 runs 6.1–6.6 and none is canvas recovery. It cannot be audited against an object that does not exist, and inventing the criterion is a design decision, not verification |
+   | 0.7/A7, 0.14/A13 | **audited 2026-08-09** | read the entries; 0.7 is substantially in place, 0.14 has measured counts |
+2. **Phase 1 hermetic builds** — `part-phase-1.md`, 18 open items, and **spot-audited
+   2026-08-09: six checked, six genuinely open**. Do not carry phase 0's expectation
+   here that an audit dissolves the item — it does not. The note at the top of that
+   file has the evidence, names **1.4** as the
+   one to think about first, because `--allow-multiple-definition` is masking
+   duplicate Skia/V8 symbols rather than decorating the link line.
 
 **Before starting any of them, check the recorded obstacle against the object it
-names.** The count of wrong ones reached fourteen this session. The reflex that
-dissolves most of them is asking *"which layer can see this property?"* rather than
-*"how do I reach this code?"*.
+names.** The count of wrong ones reached **fifteen** on 2026-08-09, and the
+fifteenth was in this document: the seam item 0.4 named was real but sat at a layer
+the crate needing it cannot see. The reflex that dissolves most of them is asking
+*"which layer can see this property?"* rather than *"how do I reach this code?"*.
 
 ## 4. Traps that cost real time here
 
@@ -279,6 +321,20 @@ dissolves most of them is asking *"which layer can see this property?"* rather t
   this branch. One regeneration round covers the whole batch and belongs
   **last**: the fingerprint includes every `runtime-v8` `.rs` file and
   `engine/Cargo.lock`, so a `cargo fmt` or one added test invalidates it again.
+
+  **This branch raised the stakes rather than only the count.** Until now the
+  staleness was `.rs` churn, which the snapshot carries but does not change the
+  behaviour of. `delivery/x11-and-mutation-evidence` edits four files that are
+  *embedded into the snapshot as source* — `base/02_async.js`, `base/04_subpackage.js`,
+  `payment/01_payment.js`, `system/13_login.js` — and they carry the A9 correlation
+  fix. So **on a device, until `scripts/gen-snapshot.sh` runs, deferred results
+  still correlate the old way**, while every host suite reports the new behaviour
+  because it evaluates the JS from source. That gap is invisible to the gate by
+  construction; it is written here because nothing else can see it.
+
+  Regeneration is also **partly device-blocked**: x86_64 can be produced here, and
+  aarch64 needs the physical device. Do not regenerate a subset and call the batch
+  done.
 - **A recorded obstacle in this ledger has been wrong eight times.** When an
   item says something is impossible, verify it against the code before believing
   it. The question that has dissolved most of them is *"which layer can see this
@@ -310,6 +366,33 @@ dissolves most of them is asking *"which layer can see this property?"* rather t
   guard passed its own mutant while the defect it existed for survived. After
   writing one, ask what it does *not* cover, and write the mutant that exploits
   that.
+
+- **A sampling probe cannot observe "held nothing during a blocking call."**
+  `engine_destroy_holds_no_engine_lock_while_joining` read `try_lock` once from the
+  thread being joined and passed **50/50** with a lock deliberately held across the
+  join: the sample had no ordering against the join and ran before the destroying
+  thread was scheduled. Spinning until the lock looked free failed too, because the
+  real code releases it and the mutant re-acquires it, so the awaited state does
+  occur. The property is structural; the fix was `capi/src/retirement.rs`, where the
+  `Mutex` is private to its own module and the defect no longer compiles. Whenever a
+  test's subject is "what was *not* happening during a blocking call", expect this.
+
+- **Prove the mutant is in the binary before believing a survivor.** `touch` and a
+  `Compiling <package>` line are necessary, not sufficient. The cheap positive
+  control is a second, obviously-fatal edit a line or two away: if *that* fails the
+  test, the function you mutated is what ran. It cost one 30-second build and it is
+  what made "this shipped guard cannot fail" safe to write down.
+
+- **A gate can read a build artifact it does not produce.** Then it fails on a cold
+  tree and *passes on a stale one*, which is the direction that matters. Found in
+  `test-android-host-api-contract.sh`; details and the comparison run are in T.6.
+
+- **`pitest` cannot run `--offline`.** Its JARs live in the `pitestRuntime`
+  configuration and are not in the offline cache, so
+  `./gradlew --offline :library:pitestFullDebug` dies in dependency resolution. Run
+  it without `--offline`; the focused form is
+  `-PpitestClasses=<glob> -PpitestTests=<TestClass>` and takes about twenty seconds.
+  Read `library/build/reports/pitest/mutations.xml`, not the HTML.
 
 ---
 

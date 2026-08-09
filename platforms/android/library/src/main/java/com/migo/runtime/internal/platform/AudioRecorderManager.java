@@ -15,6 +15,8 @@ import android.util.Log;
 
 import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.RuntimeGenerationBoundary;
+import com.migo.runtime.internal.RuntimeScoped;
 import com.migo.runtime.internal.ResourceCleanup;
 
 import org.json.JSONException;
@@ -45,7 +47,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * @hide
  */
-public final class AudioRecorderManager {
+public final class AudioRecorderManager implements RuntimeScoped {
 
     private static final String TAG = "AudioRecorderManager";
 
@@ -96,8 +98,24 @@ public final class AudioRecorderManager {
     private Runnable autoStopRunnable;
     private int frameMode = FRAME_NONE;
 
+    /**
+     * The runtime this recorder belongs to.
+     *
+     * <p>Captured once, here, and stamped on every event and frame it reports.
+     * Stopping the recorder reports, and the microphone is
+     * released by the same path, so the report has to be attributable to the
+     * runtime that started it.
+     */
+    private final RuntimeGenerationBoundary.Token token;
+
+    @Override
+    public RuntimeGenerationBoundary.Token runtimeToken() {
+        return token;
+    }
+
     public AudioRecorderManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
+        this.token = RuntimeGenerationBoundary.acquire(sessionId);
         this.activity = activity;
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
@@ -488,7 +506,8 @@ public final class AudioRecorderManager {
             srcOffset += toCopy;
 
             if (accOffset >= chunkBytes) {
-                NativeMethods.onRecorderFrameData(sessionId, accumulator.clone(), false);
+                NativeMethods.onRecorderFrameData(
+                        sessionId, token.generation(), accumulator.clone(), false);
                 accOffset = 0;
             }
         }
@@ -500,7 +519,7 @@ public final class AudioRecorderManager {
         if (accOffset > 0) {
             byte[] last = new byte[accOffset];
             System.arraycopy(accumulator, 0, last, 0, accOffset);
-            NativeMethods.onRecorderFrameData(sessionId, last, true);
+            NativeMethods.onRecorderFrameData(sessionId, token.generation(), last, true);
         }
     }
 
@@ -859,7 +878,7 @@ public final class AudioRecorderManager {
     }
 
     private void fireEvent(String eventType, String jsonPayload) {
-        NativeMethods.onRecorderEvent(sessionId, eventType, jsonPayload);
+        NativeMethods.onRecorderEvent(sessionId, token.generation(), eventType, jsonPayload);
     }
 
     private static String escapeJson(String s) {

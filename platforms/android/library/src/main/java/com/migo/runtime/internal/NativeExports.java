@@ -235,7 +235,95 @@ public final class NativeExports {
                                         + " ids");
             }
             sSessions.put(sessionId, session);
+            // Ordered after the gate's admission so the two agree on which ids
+            // are live: the gate is what rejects a reused or duplicate id, and
+            // registering a generation for one it refused would leave a session
+            // numbered here that exists nowhere else.
+            RuntimeGenerationBoundary.registerSession(sessionId);
         }
+    }
+
+    /**
+     * The runtime at {@code retired} is being replaced by {@code next}.
+     *
+     * <p>Called by the engine as it drops the old isolate. Between this and
+     * {@link #completeRuntimeRestart} nothing can be acquired for this session:
+     * there is no live runtime for a new manager to belong to.
+     *
+     * @hide
+     */
+    public static void beginRuntimeRestart(int sessionId, long retired, long next) {
+        // The boundary closes first, so nothing acquired during the teardown can
+        // be handed the generation that is leaving. A teardown that then throws
+        // leaves the session RESTARTING, which the completion reopens because it
+        // is authoritative rather than matched against a remembered candidate.
+        RuntimeGenerationBoundary.beginRestart(sessionId, retired, next);
+        destroyRuntimeScopedManagers(sessionId);
+    }
+
+    /**
+     * Tear down the per-session objects the runtime being replaced created.
+     *
+     * <p>Without this a restart leaves every listener the retired isolate
+     * registered still registered: an accelerometer still sampling, a screenshot
+     * observer still querying MediaStore, a keyboard still on screen — owned by
+     * no runtime, reporting to nothing, until the session ends. The generation
+     * fence makes those events harmless; it does not stop them costing battery
+     * and memory.
+     *
+     * <p><b>What decides whether a group can be swept is its own teardown, not
+     * whether its producer is fenced.</b> Destroying a manager can report: the
+     * keyboard's emits an {@code onKeyboardComplete}, and a camera's emits a
+     * stop. Those land on the queue while {@code on_restart} is still running on
+     * the engine thread, so they are dispatched to the runtime that replaces this
+     * one — as if it had produced them. A fenced producer stamps the retired
+     * generation and the engine drops them; an unfenced one would have this sweep
+     * inject exactly the cross-talk the fence exists to remove.
+     *
+     * <p>So a group qualifies if its teardown reports nothing, or if what it
+     * reports is fenced. Sensors and input are here on the second count.
+     * {@code NetworkMonitor} is here on the first: it unregisters a
+     * {@link android.net.ConnectivityManager} callback and says nothing, and it
+     * is not fenced *by design* — a network status is a current fact about the
+     * device, like a screen rotation, so a replacement isolate needs it as much
+     * as the retired one did. Media reports a {@code stop} as it releases the
+     * camera and the microphone, and is here because those reports are fenced
+     * now. Bluetooth still reports unfenced, so it waits for its tokens.
+     *
+     * <p>Handlers the embedder registered ({@code AdHandler}, {@code AuthHandler},
+     * the message and permission sinks) are deliberately not here: they belong to
+     * the session, not to the isolate, and the app registered them once.
+     *
+     * @param sessionId The session ID
+     */
+    private static void destroyRuntimeScopedManagers(int sessionId) {
+        ResourceCleanup.runAll(
+                () -> {
+                    if (BuildConfig.MIGO_API_SENSORS) SensorExports.destroyAll(sessionId);
+                },
+                () -> {
+                    if (BuildConfig.MIGO_API_SENSORS) NetworkExports.destroyAll(sessionId);
+                },
+                // First among all of these: a camera or a microphone held by no
+                // runtime keeps the OS privacy indicator lit and keeps every
+                // other app off the device for the rest of the session.
+                () -> {
+                    if (BuildConfig.MIGO_API_MEDIA) MediaExports.destroyAll(sessionId);
+                },
+                () -> InputExports.destroyAll(sessionId),
+                () -> InteractionUI.destroy(sessionId));
+    }
+
+    /**
+     * The runtime at {@code next} is live.
+     *
+     * <p>Every object created from here belongs to it, and every token issued
+     * before the matching {@link #beginRuntimeRestart} is now stale.
+     *
+     * @hide
+     */
+    public static void completeRuntimeRestart(int sessionId, long next) {
+        RuntimeGenerationBoundary.completeRestart(sessionId, next);
     }
 
     /**
@@ -244,6 +332,9 @@ public final class NativeExports {
      */
     public static void unregisterSession(int sessionId) {
         sSessions.remove(sessionId);
+        // Every token this session issued becomes stale rather than current by
+        // default, so anything still holding one stops reporting.
+        RuntimeGenerationBoundary.unregisterSession(sessionId);
     }
 
     /** Closes permission operations and retries any retained deferred cancellations. */
@@ -772,16 +863,16 @@ public final class NativeExports {
      *
      * @param sessionId The session ID to receive the callback
      */
-    public static void openSystemBluetoothSetting(int sessionId) {
+    public static void openSystemBluetoothSetting(int sessionId, int requestId) {
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onBluetoothSettingResult(sessionId, false);
+            NativeMethods.onBluetoothSettingResult(sessionId, requestId, false);
             return;
         }
 
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onBluetoothSettingResult(sessionId, false);
+            NativeMethods.onBluetoothSettingResult(sessionId, requestId, false);
             return;
         }
 
@@ -792,10 +883,10 @@ public final class NativeExports {
                         android.bluetooth.BluetoothAdapter adapter =
                                 android.bluetooth.BluetoothAdapter.getDefaultAdapter();
                         boolean enabled = adapter != null && adapter.isEnabled();
-                        NativeMethods.onBluetoothSettingResult(sessionId, enabled);
+                        NativeMethods.onBluetoothSettingResult(sessionId, requestId, enabled);
                     });
         } catch (Exception e) {
-            NativeMethods.onBluetoothSettingResult(sessionId, false);
+            NativeMethods.onBluetoothSettingResult(sessionId, requestId, false);
         }
     }
 
@@ -804,16 +895,16 @@ public final class NativeExports {
      *
      * @param sessionId The session ID to receive the callback
      */
-    public static void openAppAuthorizeSetting(int sessionId) {
+    public static void openAppAuthorizeSetting(int sessionId, int requestId) {
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, -1);
             return;
         }
 
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, -1);
             return;
         }
 
@@ -823,9 +914,9 @@ public final class NativeExports {
             intent.setData(uri);
             ResultProxyActivity.launch(activity, intent, APP_AUTHORIZE_SETTING_REQUEST_CODE,
                     (requestCode, resultCode, data) ->
-                            NativeMethods.onAppAuthorizeSettingResult(sessionId, 0));
+                            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, 0));
         } catch (Exception e) {
-            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, requestId, -1);
         }
     }
 
@@ -1067,7 +1158,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.showToast(activity, json);
+        InteractionUI.showToast(activity, sessionId, json);
     }
 
     /**
@@ -1080,7 +1171,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.hideToast(activity);
+        InteractionUI.hideToast(sessionId);
     }
 
     /**
@@ -1090,14 +1181,17 @@ public final class NativeExports {
      * @param json      JSON params: {title, content, showCancel, cancelText, confirmText, cancelColor, confirmColor}
      */
     public static void showModal(int sessionId, String json) {
+        // Bound before anything can fail, so a refusal still answers the call
+        // that asked rather than the oldest one waiting.
+        final int requestId = CallbackCorrelation.requestIdOf(json);
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onModalResult(sessionId, 0, 1);
+            NativeMethods.onModalResult(sessionId, requestId, 0, 1);
             return;
         }
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onModalResult(sessionId, 0, 1);
+            NativeMethods.onModalResult(sessionId, requestId, 0, 1);
             return;
         }
         InteractionUI.showModal(activity, sessionId, json);
@@ -1114,7 +1208,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.showLoading(activity, json);
+        InteractionUI.showLoading(activity, sessionId, json);
     }
 
     /**
@@ -1127,7 +1221,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.hideLoading(activity);
+        InteractionUI.hideLoading(sessionId);
     }
 
     /**
@@ -1137,14 +1231,15 @@ public final class NativeExports {
      * @param json      JSON params: {alertText, itemList, itemColor}
      */
     public static void showActionSheet(int sessionId, String json) {
+        final int requestId = CallbackCorrelation.requestIdOf(json);
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) {
-            NativeMethods.onActionSheetResult(sessionId, -1);
+            NativeMethods.onActionSheetResult(sessionId, requestId, -1);
             return;
         }
         Activity activity = context.getActivity();
         if (activity == null) {
-            NativeMethods.onActionSheetResult(sessionId, -1);
+            NativeMethods.onActionSheetResult(sessionId, requestId, -1);
             return;
         }
         InteractionUI.showActionSheet(activity, sessionId, json);
@@ -1782,20 +1877,26 @@ public final class NativeExports {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail invalid session\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "invalid session"));
             return;
         }
         Activity activity = ctx.getActivity();
         if (activity == null) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail no activity\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "no activity"));
             return;
         }
         PermissionOperationGate.Pending pending =
                 sPermissionOperations.register(sessionId, "scope.userLocation");
         if (pending == null) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "permission revoked"));
             return;
         }
         if (!sPermissionOperations.enter(pending, () ->
@@ -1804,7 +1905,9 @@ public final class NativeExports {
                         failure -> reportCleanupFailureAndScheduleTerminalClose(
                                 sessionId, "location request cleanup", failure)))) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "permission revoked"));
         }
     }
 
@@ -1820,20 +1923,26 @@ public final class NativeExports {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail invalid session\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "invalid session"));
             return;
         }
         Activity activity = ctx.getActivity();
         if (activity == null) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail no activity\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "no activity"));
             return;
         }
         PermissionOperationGate.Pending pending =
                 sPermissionOperations.register(sessionId, "scope.userLocation");
         if (pending == null) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "permission revoked"));
             return;
         }
         if (!sPermissionOperations.enter(pending, () ->
@@ -1842,7 +1951,9 @@ public final class NativeExports {
                         failure -> reportCleanupFailureAndScheduleTerminalClose(
                                 sessionId, "fuzzy location request cleanup", failure)))) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "permission revoked"));
         }
     }
 
@@ -2606,6 +2717,10 @@ public final class NativeExports {
                     if (BuildConfig.MIGO_API_MEDIA) MediaExports.destroyAll(sessionId);
                 },
                 () -> InputExports.destroyAll(sessionId),
+                // Overlays are views this session put in its Activity's decor.
+                // Left here, a session closing with a toast up holds a destroyed
+                // Activity alive through a static reference.
+                () -> InteractionUI.destroy(sessionId),
                 () -> {
                     if (BuildConfig.MIGO_API_CONNECTIVITY) BluetoothExports.destroyAll(sessionId);
                 },

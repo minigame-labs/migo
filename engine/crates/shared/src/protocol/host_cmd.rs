@@ -41,6 +41,7 @@
 //! - **System** (2): `OnMemoryWarning`, `OnUserCaptureScreen`
 
 use std::borrow::Cow;
+use std::num::NonZeroI64;
 
 use crate::{
     payload_pool::{Pooled, Recycled},
@@ -437,12 +438,30 @@ pub enum HostCommand {
     /// Sent by the platform sensor listener at the requested interval.
     /// Values follow the W3C DeviceOrientation spec:
     /// alpha = rotation around Z (0-360), beta = X (-180..180), gamma = Y (-90..90).
-    OnDeviceMotionChange { alpha: f64, beta: f64, gamma: f64 },
+    OnDeviceMotionChange {
+        /// Rotation around Z, 0-360.
+        alpha: f64,
+        /// Rotation around X, -180..180.
+        beta: f64,
+        /// Rotation around Y, -90..90.
+        gamma: f64,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
+    },
 
     /// Gyroscope sensor data (angular velocity in rad/s).
     ///
     /// Sent by the platform gyroscope listener at the requested interval.
-    OnGyroscopeChange { x: f64, y: f64, z: f64 },
+    OnGyroscopeChange {
+        /// Angular velocity around X in rad/s.
+        x: f64,
+        /// Angular velocity around Y in rad/s.
+        y: f64,
+        /// Angular velocity around Z in rad/s.
+        z: f64,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
+    },
 
     /// Device screen orientation changed (portrait/landscape).
     ///
@@ -460,6 +479,8 @@ pub enum HostCommand {
         direction: f64,
         /// Accuracy string (Android: “high”/”medium”/”low”/”no-contact”/”unreliable”).
         accuracy: Cow<'static, str>,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Accelerometer data (acceleration in m/s^2).
@@ -472,6 +493,8 @@ pub enum HostCommand {
         y: f64,
         /// Acceleration along Z axis in m/s^2.
         z: f64,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     // ---- Network Events ----
@@ -492,6 +515,8 @@ pub enum HostCommand {
         event_type: String,
         /// JSON-encoded payload (e.g., stop result with tempFilePath/duration/fileSize).
         json_payload: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Recorder frame data pushed from platform (for onFrameRecorded).
@@ -500,6 +525,8 @@ pub enum HostCommand {
         data: Vec<u8>,
         /// Whether this is the last frame before stop.
         is_last_frame: bool,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     // ---- Camera Events ----
@@ -511,6 +538,8 @@ pub enum HostCommand {
         event_type: String,
         /// JSON-encoded payload.
         json_payload: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Camera frame data pushed from platform (for onCameraFrame / listenFrameChange).
@@ -524,6 +553,8 @@ pub enum HostCommand {
         width: u32,
         /// Frame height in pixels.
         height: u32,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     // ---- Keyboard Events ----
@@ -533,6 +564,8 @@ pub enum HostCommand {
     OnKeyboardInput {
         /// Current text value of the keyboard input.
         value: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Keyboard height changed (soft keyboard shown/hidden or resized).
@@ -541,6 +574,8 @@ pub enum HostCommand {
     OnKeyboardHeightChange {
         /// Keyboard height in CSS pixels (0 when hidden).
         height: f64,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// User pressed the confirm button on the soft keyboard.
@@ -549,6 +584,8 @@ pub enum HostCommand {
     OnKeyboardConfirm {
         /// Current text value of the keyboard input.
         value: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Soft keyboard dismissed/completed.
@@ -557,6 +594,8 @@ pub enum HostCommand {
     OnKeyboardComplete {
         /// Current text value of the keyboard input.
         value: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Physical/PC keyboard key down event.
@@ -815,6 +854,8 @@ pub enum HostCommand {
         /// `{"errMsg":"..."}` for error, `{"fullScreen":true,"direction":0}` for
         /// fullscreenchange).
         data: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     // ---- System Events ----
@@ -831,7 +872,10 @@ pub enum HostCommand {
     /// User took a screenshot (system screenshot button pressed).
     ///
     /// Triggers `migo.onUserCaptureScreen` callback in the game.
-    OnUserCaptureScreen,
+    OnUserCaptureScreen {
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
+    },
 
     /// Thermal status changed (ADPF, API 29+).
     /// Level 0=none, 1=light, 2=moderate, 3=severe, 4=critical, 5=emergency, 6=shutdown.
@@ -851,11 +895,162 @@ pub enum HostCommand {
     SendToHost { json: String },
 }
 
+/// Read a generation a platform captured, rejecting anything a token cannot be.
+///
+/// Platforms that carry the generation over a boundary with no "absent" — an
+/// Android `long` across JNI, a C `int64_t` — signal *unfenced* with a
+/// non-positive value. Trusting it as a generation instead would compare a
+/// producer that captured nothing against a real one, and `0 != current` reads
+/// as retired: every event from an unfenced producer would be silently dropped.
+///
+/// One implementation because every producer needs the same answer, and there
+/// are about twenty more of them to fence.
+///
+/// The result is `NonZeroI64` so that "zero is not a generation" stops being a
+/// rule this function enforces and becomes something the type cannot express.
+/// It is also why the fence costs nothing: `Option<NonZeroI64>` is eight bytes
+/// against `Option<i64>`'s sixteen, and `HostCommand` sits exactly on the 64-byte
+/// cap its own assertion pins, with 512 of them preallocated per queue. Every one
+/// of the twenty-odd producers still to be fenced adds this field to its variant.
+pub fn captured_generation(generation: i64) -> Option<NonZeroI64> {
+    NonZeroI64::new(generation).filter(|value| value.get() > 0)
+}
+
+impl HostCommand {
+    /// The runtime generation this command was produced *for*, when its producer
+    /// captured one.
+    ///
+    /// A runtime restart replaces the JavaScript isolate but not the platform
+    /// objects around it: an Android manager, a proxy Activity, a C host's
+    /// keyboard. Those keep producing events, and an event aimed at the isolate
+    /// that has just been retired must not be delivered to the one that replaced
+    /// it. The generation is what tells them apart, and it has to be *captured
+    /// where the event was produced* — reading the current one at enqueue would
+    /// always match and prove nothing.
+    ///
+    /// `None` means this command is not subject to that check, for one of two
+    /// reasons that are deliberately not distinguished here:
+    ///
+    /// * it is not a runtime-owned callback at all — `Restart`, `UpdateSurface`,
+    ///   a touch, a physical key. Dropping a key *up* because a restart happened
+    ///   would leave content believing the key is still held, which is a worse
+    ///   failure than delivering it late;
+    /// * or its producer has not been fenced yet. Android's managers are in that
+    ///   state until this plan's task 7 gives them tokens, and `None` says so
+    ///   out loud rather than passing the current generation and pretending.
+    ///
+    /// The match is exhaustive **by construction**: there is no wildcard, so a
+    /// new command cannot be added without deciding which of the two it is.
+    pub fn callback_generation(&self) -> Option<NonZeroI64> {
+        match self {
+            Self::OnKeyboardInput {
+                runtime_generation, ..
+            }
+            | Self::OnKeyboardHeightChange {
+                runtime_generation, ..
+            }
+            | Self::OnKeyboardConfirm {
+                runtime_generation, ..
+            }
+            | Self::OnKeyboardComplete {
+                runtime_generation, ..
+            }
+            // The sensor streams and the screenshot observer: Android listeners
+            // that stay registered across a restart and keep firing. Physical
+            // orientation is deliberately *not* here -- a rotation reported after
+            // a restart is a current fact about the device, and the replacement
+            // isolate needs it as much as the retired one did.
+            | Self::OnDeviceMotionChange {
+                runtime_generation, ..
+            }
+            | Self::OnGyroscopeChange {
+                runtime_generation, ..
+            }
+            | Self::OnCompassChange {
+                runtime_generation, ..
+            }
+            | Self::OnAccelerometerChange {
+                runtime_generation, ..
+            }
+            | Self::OnUserCaptureScreen { runtime_generation }
+            // Camera, microphone and video: the managers that hold hardware.
+            // Their events and their frames both stop belonging to anything the
+            // moment the isolate that opened them is replaced, and the teardown
+            // that releases the hardware reports as it goes.
+            | Self::CameraEvent {
+                runtime_generation, ..
+            }
+            | Self::CameraFrameData {
+                runtime_generation, ..
+            }
+            | Self::RecorderEvent {
+                runtime_generation, ..
+            }
+            | Self::RecorderFrameData {
+                runtime_generation, ..
+            }
+            | Self::OnVideoStateChange {
+                runtime_generation, ..
+            } => *runtime_generation,
+
+            Self::EvaluateModule { .. }
+            | Self::EvalScript { .. }
+            | Self::InvokeHostHook { .. }
+            | Self::Restart
+            | Self::Shutdown
+            | Self::OnShow { .. }
+            | Self::OnHide
+            | Self::OnFocusChanged { .. }
+            | Self::OnAudioInterruptionBegin
+            | Self::OnAudioInterruptionEnd
+            | Self::InnerAudioEvent { .. }
+            | Self::UpdateSurface { .. }
+            | Self::SurfaceDestroyed { .. }
+            | Self::SurfaceLost { .. }
+            | Self::OnTouch(..)
+            | Self::OnDeviceOrientationChange { .. }
+            | Self::OnNetworkStatusChange { .. }
+            | Self::OnKeyDown { .. }
+            | Self::OnKeyUp { .. }
+            | Self::OnMouseDown { .. }
+            | Self::OnMouseMove { .. }
+            | Self::OnMouseUp { .. }
+            | Self::OnWheel { .. }
+            | Self::OnCompositionStart { .. }
+            | Self::OnCompositionUpdate { .. }
+            | Self::OnCompositionEnd { .. }
+            | Self::OnGamepadConnected { .. }
+            | Self::OnGamepadDisconnected { .. }
+            | Self::OnGamepadState(..)
+            | Self::OnBluetoothAdapterStateChange { .. }
+            | Self::OnBluetoothDeviceFound { .. }
+            | Self::OnBLEConnectionStateChange { .. }
+            | Self::OnBLECharacteristicValueChange(..)
+            | Self::OnBLEMTUChange { .. }
+            | Self::OnBeaconUpdate { .. }
+            | Self::OnBeaconServiceChange { .. }
+            | Self::OnMemoryWarning { .. }
+            | Self::OnThermalStatusChanged { .. }
+            | Self::SetDisplayRefreshRate { .. }
+            | Self::SendToHost { .. } => None,
+        }
+    }
+}
+
 // Guard against future regressions — if a new variant re-inflates the enum,
 // this assertion will fail at compile time.
 const _: () = assert!(
     core::mem::size_of::<HostCommand>() <= 64,
     "HostCommand grew past 64 bytes; check for unboxed large variants"
+);
+
+// The fence field is `Option<NonZeroI64>` for this: it is the same eight bytes a
+// bare `i64` would cost, so fencing a variant does not spend the headroom the
+// assertion above is down to. `Option<i64>` would be sixteen, on every one of the
+// twenty-odd producers still to be fenced.
+const _: () = assert!(
+    core::mem::size_of::<Option<NonZeroI64>>() == core::mem::size_of::<i64>(),
+    "the fence field lost its niche optimisation and now costs a word per command"
 );
 
 /// Event types for InnerAudioContext.
@@ -980,4 +1175,179 @@ pub enum TouchType {
     End = 2,
     /// Touch cancelled (interrupted by system).
     Cancel = 3,
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::{Cow, HostCommand, NonZeroI64, captured_generation};
+
+    /// A generation as a producer would have captured it.
+    fn generation(value: i64) -> Option<NonZeroI64> {
+        NonZeroI64::new(value)
+    }
+
+    #[test]
+    fn only_a_positive_value_is_a_captured_generation() {
+        assert_eq!(captured_generation(1), generation(1));
+        assert_eq!(captured_generation(i64::MAX), generation(i64::MAX));
+        // The unfenced signal, and the values a corrupted or defaulted field
+        // could hold. None of them may read as "produced for generation N",
+        // because that would drop the event instead of delivering it.
+        for unfenced in [0, -1, i64::MIN] {
+            assert_eq!(captured_generation(unfenced), None, "{unfenced}");
+        }
+    }
+
+    #[test]
+    fn the_four_soft_keyboard_commands_carry_their_generation() {
+        // Each is built in its own arm, and a stamp is exactly the sort of thing
+        // that gets added to three of four.
+        let commands = [
+            HostCommand::OnKeyboardInput {
+                value: String::new(),
+                runtime_generation: generation(5),
+            },
+            HostCommand::OnKeyboardConfirm {
+                value: String::new(),
+                runtime_generation: generation(5),
+            },
+            HostCommand::OnKeyboardComplete {
+                value: String::new(),
+                runtime_generation: generation(5),
+            },
+            HostCommand::OnKeyboardHeightChange {
+                height: 0.0,
+                runtime_generation: generation(5),
+            },
+        ];
+        for command in &commands {
+            assert_eq!(command.callback_generation(), generation(5), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn the_sensor_streams_and_the_screenshot_observer_carry_their_generation() {
+        // Five arms, each written separately, and a stamp is exactly the sort of
+        // thing that gets added to four of five.
+        let commands = [
+            HostCommand::OnDeviceMotionChange {
+                alpha: 0.0,
+                beta: 0.0,
+                gamma: 0.0,
+                runtime_generation: generation(9),
+            },
+            HostCommand::OnGyroscopeChange {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                runtime_generation: generation(9),
+            },
+            HostCommand::OnCompassChange {
+                direction: 0.0,
+                accuracy: Cow::Borrowed("high"),
+                runtime_generation: generation(9),
+            },
+            HostCommand::OnAccelerometerChange {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                runtime_generation: generation(9),
+            },
+            HostCommand::OnUserCaptureScreen {
+                runtime_generation: generation(9),
+            },
+        ];
+        for command in &commands {
+            assert_eq!(command.callback_generation(), generation(9), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn the_hardware_managers_carry_their_generation_on_events_and_on_frames() {
+        // Frames as well as events: a camera that keeps delivering into the
+        // isolate that replaced the one which opened it is the same defect at
+        // thirty times the rate.
+        let commands = [
+            HostCommand::CameraEvent {
+                camera_id: 0,
+                event_type: "stop".to_owned(),
+                json_payload: "{}".to_owned(),
+                runtime_generation: generation(4),
+            },
+            HostCommand::CameraFrameData {
+                camera_id: 0,
+                data: Vec::new(),
+                width: 1,
+                height: 1,
+                runtime_generation: generation(4),
+            },
+            HostCommand::RecorderEvent {
+                event_type: "stop".to_owned(),
+                json_payload: "{}".to_owned(),
+                runtime_generation: generation(4),
+            },
+            HostCommand::RecorderFrameData {
+                data: Vec::new(),
+                is_last_frame: true,
+                runtime_generation: generation(4),
+            },
+            HostCommand::OnVideoStateChange {
+                video_id: 0,
+                event_type: "ended".to_owned(),
+                data: "{}".to_owned(),
+                runtime_generation: generation(4),
+            },
+        ];
+        for command in &commands {
+            assert_eq!(command.callback_generation(), generation(4), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_synchronous_failure_reply_is_unfenced_and_therefore_delivered() {
+        // An export that fails before any manager exists reports with the
+        // `UNFENCED` zero the Java side stamps. It answers a call the live
+        // runtime has just made, so it cannot be stale and must never be
+        // dropped -- and zero must not be read as "produced for generation 0".
+        let reply = HostCommand::RecorderEvent {
+            event_type: "error".to_owned(),
+            json_payload: "{}".to_owned(),
+            runtime_generation: captured_generation(0),
+        };
+        assert_eq!(reply.callback_generation(), None);
+    }
+
+    #[test]
+    fn a_device_orientation_change_is_never_fenced() {
+        // The sensor manager does not produce it -- the Activity does, and a
+        // rotation is a current fact about the device. Dropping one because a
+        // restart happened would leave the replacement isolate believing the
+        // screen is the way it was two runtimes ago, with nothing to correct it.
+        // Same reasoning as a physical key going up.
+        assert_eq!(
+            HostCommand::OnDeviceOrientationChange {
+                value: Cow::Borrowed("landscape"),
+            }
+            .callback_generation(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_command_that_is_not_a_runtime_callback_reports_no_generation() {
+        // Dropping a key *up* because a restart happened leaves content
+        // believing the key is still held, so these must never be fenced.
+        assert_eq!(HostCommand::OnHide.callback_generation(), None);
+        assert_eq!(
+            HostCommand::OnKeyUp {
+                key: "a".to_owned(),
+                code: "KeyA".to_owned(),
+                timestamp_ms: 0.0,
+                modifiers: 0,
+                repeat: false,
+            }
+            .callback_generation(),
+            None
+        );
+    }
 }

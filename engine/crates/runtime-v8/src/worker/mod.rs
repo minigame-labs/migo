@@ -291,6 +291,24 @@ mod module_loader_security_tests {
 // Main-thread ops (registered in `host_v8_worker`)
 // ---------------------------------------------------------------------------
 
+/// What a Worker inherits from its parent so their asynchronous results stay
+/// distinguishable: one callback-id space, and the generation that created it.
+///
+/// A function rather than two lines inside the op, because those two lines are
+/// the whole property and an op is not reachable from a unit test. Production
+/// calls this — it is the only implementation, not a restatement beside one.
+fn inherited_correlation(
+    host: &HostOpState,
+) -> (
+    std::sync::Arc<shared::callback_id::CallbackIdAllocator>,
+    i64,
+) {
+    (
+        std::sync::Arc::clone(&host.callback_ids),
+        host.runtime_generation,
+    )
+}
+
 /// Create and spawn a worker thread. Only one worker can exist at a time.
 #[op2(async(lazy), fast)]
 async fn op_worker_create(
@@ -359,7 +377,10 @@ async fn op_worker_create(
             shared::channel::ThreadWakeup::new(),
         );
 
+        let (callback_ids, runtime_generation) = inherited_correlation(host);
         let worker_state = HostOpState {
+            callback_ids,
+            runtime_generation,
             id: host.id,
             app_cache_dir: host.app_cache_dir.clone(),
             app_files_dir: host.app_files_dir.clone(),
@@ -1251,11 +1272,30 @@ mod timer_lifecycle_tests {
         op_state::{AudioSender, NetworkPolicy},
         render_command_sender::CommandSender,
     };
+    #[test]
+    fn worker_and_parent_share_host_callback_id_space() {
+        let parent = test_host_state(Arc::new(AtomicBool::new(false)));
+        let (callback_ids, runtime_generation) = super::inherited_correlation(&parent);
+
+        assert!(
+            Arc::ptr_eq(&callback_ids, &parent.callback_ids),
+            "a Worker must inherit the space, not open its own"
+        );
+        assert_eq!(runtime_generation, parent.runtime_generation);
+        // Interleaved: a Worker-local allocator would restart at 1 and hand the
+        // platform an id the parent has already used.
+        assert_eq!(parent.callback_ids.allocate(), Ok(1));
+        assert_eq!(callback_ids.allocate(), Ok(2));
+        assert_eq!(parent.callback_ids.allocate(), Ok(3));
+    }
+
     fn test_host_state(timer_backgrounded: Arc<AtomicBool>) -> HostOpState {
         let (render_tx, _render_rx) = CommandSender::new();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         HostOpState {
+            callback_ids: std::sync::Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
             id: 1,
             app_cache_dir: PathBuf::from("/tmp/cache"),
             app_files_dir: PathBuf::from("/tmp/files"),
@@ -1618,6 +1658,8 @@ mod watchdog_worker_tests {
         let (render_tx, _render_rx) = CommandSender::new();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
         HostOpState {
+            callback_ids: std::sync::Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
             id: 1,
             app_cache_dir: PathBuf::from("/tmp/cache"),
             app_files_dir: PathBuf::from("/tmp/files"),

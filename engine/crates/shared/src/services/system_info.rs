@@ -8,14 +8,14 @@ use crate::protocol::error::ServiceError;
 /// and system-level operations like opening bluetooth/authorization settings.
 pub trait SystemInfoService: Send + Sync {
     /// Open the system Bluetooth settings page.
-    fn open_bluetooth_settings(&self) -> Result<(), ServiceError> {
+    fn open_bluetooth_settings(&self, _request_id: i32) -> Result<(), ServiceError> {
         Err(ServiceError::not_supported(
             "openSystemBluetoothSetting:fail not supported",
         ))
     }
 
     /// Open the app authorization settings page.
-    fn open_app_authorize_setting(&self) -> Result<(), ServiceError> {
+    fn open_app_authorize_setting(&self, _request_id: i32) -> Result<(), ServiceError> {
         Err(ServiceError::not_supported(
             "openAppAuthorizeSetting:fail not supported",
         ))

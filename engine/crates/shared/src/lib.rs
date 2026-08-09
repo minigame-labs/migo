@@ -40,6 +40,7 @@
 //! processing across specialized threads (main, render, audio, IO).
 
 pub mod audio_channel;
+pub mod callback_id;
 pub mod channel;
 pub mod cjs_compat;
 pub mod command_vec_pool;

@@ -182,6 +182,28 @@
   one class — twelve seconds against about eight minutes for the package — so the loop is
   a focused run per change and one full run per batch.
 
+  **The permission cluster was re-measured on 2026-08-09 and the "equivalent" verdict
+  now rests on the source lines rather than on the classification.** A focused run over
+  `PermissionOperationGate*` and `PermissionRevocation*` (93 mutations, 73 killed, 2
+  timed out, 13 uncovered) leaves **5 survivors, all on `PermissionOperationGate`, and
+  every one lands on a line that already returns that constant**:
+
+  | Survivor | Source line | Mutator |
+  |---|---|---|
+  | `register:233` | `if (session.lifecycle != Lifecycle.ACTIVE) return null;` | `NullReturnVals` |
+  | `register:235` | `if (entry == null \|\| !entry.granted) return null;` | `NullReturnVals` |
+  | `enter:252` | `return false;` | `BooleanFalseReturnVals` |
+  | `enter:255` | `return true;` | `BooleanTrueReturnVals` |
+  | `runIfGranted:271` | `if (entry == null \|\| !entry.granted) return false;` | `BooleanFalseReturnVals` |
+
+  Replacing a constant return with the same constant is the same bytecode, so no test
+  can distinguish it. `PermissionRevocation` has **no** survivors. Anything written
+  against these five would be a test that cannot fail, which is the thing this
+  project's bar forbids — so the cluster is closed, not deferred.
+  Note for a later reader: `--offline` cannot run pitest, because the
+  `org.pitest:*:1.16.1` JARs are in their own `pitestRuntime` configuration and are
+  not in the offline cache. Run this task without `--offline`.
+
 
 - [x] T.5 Split this file. At ~5,500 lines it burned context on every read and was
   a merge-conflict magnet — the single biggest obstacle to more than one agent
@@ -225,6 +247,36 @@
   not fail the run, and the exception is closed by construction: it marks
   `test-local-verification-contract.sh`, which runs *this script* against fixture
   repositories and would otherwise nest the whole gate inside itself.
+
+  **A gate in the derived list was reading a build artifact nobody produced,
+  found 2026-08-09 by a clean-tree run.** `scripts/test-android-host-api-contract.sh`
+  reads `javap` output from
+  `platforms/android/library/build/intermediates/javac/fullDebug/classes` and did
+  not compile it. In CI that was accidentally safe: the workflow step is two lines,
+  `./gradlew :library:compileFullDebugJavaWithJavac` and then the script. The
+  derived lane lifts the `bash scripts/...` line alone, so locally the gate had
+  **both** failure modes — FAIL on a cold tree for a reason unrelated to the
+  change, and, worse, **PASS against stale bytecode**.
+
+  `ci_contract_gates.py`'s `NEEDS` entry even said so: *"These compile the Java
+  half themselves before reading it"*, a comment covering two entries where only
+  `test-camera-frame-jni-contract.sh` did. The second inherited a reason that never
+  applied to it — the same shape as item 0.6's `held_button_`, where one comment
+  covered two fields.
+
+  Fixed by making the gate compile what it reads, the way the camera gate already
+  does, which also makes `verify-change.sh`'s claim that gates run "with the exact
+  command line CI uses" true for this one. Evidence, with the pre-change script
+  kept as the comparison scope:
+
+  | | Classes deleted | Public method added to `MigoRuntime`, no rebuild |
+  |---|---|---|
+  | Pre-change script | FAIL "compiled classes not found" | **PASS**, "357 entries unchanged" — the false green |
+  | After | PASS, compiles then reads | FAIL, printing the added `mutantHostApiMethod` |
+
+  Restored by `git checkout` of the Java file, which is safe here because it was
+  committed; the Rust mutants in this session were not, and were restored from
+  copies.
 
   **They run unconditionally, like the host suites.** Keying them to changed files
   would mean maintaining a file list per gate — a list to forget an entry from,
@@ -409,3 +461,62 @@
   + 2 integration and Slim 471 + 1, graphics 571 + 33 integration, io 266, audio 65,
   core Full 62 and Slim 59, capi Full 143 and Slim 143, platform Full 53 and Slim 53.
   The Qt host kit is not part of this run and was verified separately for item 0.6.
+
+- [ ] T.8 Make the OpenHarmony compile a target the verifier knows about. **T.1 for a
+  third platform, and it existed only because a comment in the verifier was believed
+  instead of checked. Implemented and pinned; neither independent review has run.**
+
+  `verify-change.sh` said, in the header above its target lanes, that "`ohos` and
+  `windows` conditional code has no local build on this machine". Half of it was
+  false. The OpenHarmony SDK is at `~/ohos-sdk` and `scripts/dev-setup-ohos.sh`
+  resolves it, `x86_64-unknown-linux-ohos` is an installed Rust target, the prebuilt
+  V8 archive for the triple is in tree, and `scripts/build-ohos-sdk.sh` has been
+  running that cargo build for months. **The compile takes 13 seconds warm.** So
+  every change touching `cfg`-conditional Linux code — including the X11 work in
+  item 0.4 — collected a permanent `NOT PROVEN` that could have been evidence.
+
+  **How invisible that lane's subject was.** `cargo`'s own dep-info says it: the
+  Android build of `migo-capi` lists `crates/capi/src/platform/{android,mod}.rs`,
+  the OpenHarmony build lists `{mod,ohos}.rs`. `ohos.rs` is not merely untested by
+  the other lanes — it is not a dependency of them, so touching it does not even
+  invalidate their fingerprints. Before this item, nothing on this machine compiled
+  that file.
+
+  **The lane calls `build-ohos-sdk.sh --compile-only x86_64` rather than restating
+  its cargo line.** The `dev-setup-ohos.sh` exports and `RUSTY_V8_ARCHIVE` are
+  exactly the kind of rule a second copy gets silently wrong: without the pins, a
+  machine with an Android NDK on `PATH` compiles the C dependencies with the NDK's
+  clang and bionic headers for a musl target. `x86_64` because the lane proves the
+  `target_env = "ohos"` view of the tree compiles, which is the same view for either
+  architecture, and it is the warm one.
+
+  `--compile-only` returns before the package contract and the API floor gate, and
+  that is load-bearing rather than a shortcut: both read `dist/migo-ohos-<arch>`,
+  which the mode does not write, so running them would gate whichever package an
+  earlier full run left behind. Writing it the other way reproduced, inside this
+  same session, the stale-artifact defect being fixed in T.6.
+
+  **Probed, not assumed**, like `android-java`: absent SDK or absent V8 archive
+  records `NOT PROVEN`, not a `FAIL` that blames the change for a machine.
+
+  **Mutation evidence.** Removing `MIGO_ERROR_UNSUPPORTED_PLATFORM` from the imports
+  of `capi/src/platform/ohos.rs`:
+
+  | Scope | Result |
+  |---|---|
+  | `bash scripts/build-ohos-sdk.sh --compile-only x86_64` | **FAIL**, `error[E0425]: cannot find value MIGO_ERROR_UNSUPPORTED_PLATFORM` |
+  | `cargo test -p migo-capi --lib` | 147 passed |
+  | `bash scripts/build-android-so.sh --compile-only arm64-v8a` | SUCCESS |
+
+  The two passing scopes did not merely tolerate the mutant, they never read the
+  file — which is the strongest form the claim can take. Restored from a copy and
+  verified by `sha256sum`.
+
+  **Still absent, and correctly so:** `windows`. Its toolchain is on the other side
+  of the WSL boundary and there is no local lane, so it stays `NOT PROVEN`.
+
+  Verified 2026-08-09 in the run recorded under item 0.4: 19 host steps, 23 contract
+  gates, `android compile` PASS and `ohos compile` **PASS** where the same change had
+  reported `NOT PROVEN` an hour earlier. `scripts/test-local-verification-contract.sh`
+  was also run directly — it is `CI ONLY` from inside the verifier because it would
+  nest, and this item changes the verifier — and reports all checks passed.

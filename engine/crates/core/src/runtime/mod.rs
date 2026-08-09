@@ -4,6 +4,7 @@ mod host;
 mod input_state;
 
 pub mod registry;
+mod restart_boundary;
 pub mod thread;
 pub mod vsync;
 

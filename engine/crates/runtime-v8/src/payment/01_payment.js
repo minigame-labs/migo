@@ -15,17 +15,15 @@ import {
 } from "ext:core/ops";
 import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
+import {
+    allocateHostCallbackId,
+    parseHostCallbackId,
+} from "ext:host_v8_base/02_async.js";
+
 const noop = function () {};
 
-let _nextRequestId = 1;
 const _pendingMidas = new Map();
 const _pendingMidasGameItem = new Map();
-
-function _nextId() {
-    var id = _nextRequestId;
-    _nextRequestId += 1;
-    return id;
-}
 
 function _parseResult(resultJson) {
     if (typeof resultJson !== 'string' || resultJson.length === 0) return {};
@@ -50,15 +48,15 @@ function checkIsSupportMidasPayment(options) {
 
 function requestMidasPayment(options) {
     var opts = (options && typeof options === 'object') ? options : {};
-    var requestId = _nextId();
     var success = typeof opts.success === 'function' ? opts.success : noop;
     var fail = typeof opts.fail === 'function' ? opts.fail : noop;
     var complete = typeof opts.complete === 'function' ? opts.complete : noop;
 
     return new Promise(function (resolve, reject) {
-        _pendingMidas.set(requestId, { success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
-
+        var requestId;
         try {
+            requestId = allocateHostCallbackId();
+            _pendingMidas.set(requestId, { success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
             op_request_midas_payment(JSON.stringify({
                 requestId: requestId,
                 mode: opts.mode || 'game',
@@ -99,11 +97,16 @@ function _settleMidas(requestId, result) {
 
 function _internalOnMidasPaymentResult(resultJson) {
     var result = _parseResult(resultJson);
-    var requestId = Number(result.requestId);
-    if (Number.isFinite(requestId)) {
-        _settleMidas(requestId, result);
+    if (result !== null && typeof result === 'object' && 'requestId' in result) {
+        var requestId = parseHostCallbackId(result.requestId);
+        // Present and not an id: discard. `Number()` alone read `true` as the
+        // id 1 and `1.5` as a lookup, and either could settle a purchase the
+        // result does not belong to.
+        if (requestId !== null) _settleMidas(requestId, result);
     } else {
-        // Fallback: settle the oldest pending request (single-flight compat)
+        // Fallback for an omitted id only. Do not delete this until task 6 of
+        // the runtime-restart plan makes every platform result echo its id --
+        // without the fallback these promises would never settle at all.
         var keys = _pendingMidas.keys();
         var first = keys.next();
         if (!first.done) {
@@ -116,15 +119,15 @@ function _internalOnMidasPaymentResult(resultJson) {
 
 function requestMidasPaymentGameItem(options) {
     var opts = (options && typeof options === 'object') ? options : {};
-    var requestId = _nextId();
     var success = typeof opts.success === 'function' ? opts.success : noop;
     var fail = typeof opts.fail === 'function' ? opts.fail : noop;
     var complete = typeof opts.complete === 'function' ? opts.complete : noop;
 
     return new Promise(function (resolve, reject) {
-        _pendingMidasGameItem.set(requestId, { success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
-
+        var requestId;
         try {
+            requestId = allocateHostCallbackId();
+            _pendingMidasGameItem.set(requestId, { success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
             op_request_midas_payment_game_item(JSON.stringify({
                 requestId: requestId,
                 signData: opts.signData || '',
@@ -160,11 +163,16 @@ function _settleMidasGameItem(requestId, result) {
 
 function _internalOnMidasPaymentGameItemResult(resultJson) {
     var result = _parseResult(resultJson);
-    var requestId = Number(result.requestId);
-    if (Number.isFinite(requestId)) {
-        _settleMidasGameItem(requestId, result);
+    if (result !== null && typeof result === 'object' && 'requestId' in result) {
+        var requestId = parseHostCallbackId(result.requestId);
+        // Present and not an id: discard. `Number()` alone read `true` as the
+        // id 1 and `1.5` as a lookup, and either could settle a purchase the
+        // result does not belong to.
+        if (requestId !== null) _settleMidasGameItem(requestId, result);
     } else {
-        // Fallback: settle the oldest pending request (single-flight compat)
+        // Fallback for an omitted id only. Do not delete this until task 6 of
+        // the runtime-restart plan makes every platform result echo its id --
+        // without the fallback these promises would never settle at all.
         var keys = _pendingMidasGameItem.keys();
         var first = keys.next();
         if (!first.done) {

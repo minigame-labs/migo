@@ -31,7 +31,9 @@ const _openBluetoothSettingApi = createDeferredApi('openBluetoothAdapterSetting'
 
 function openSystemBluetoothSetting(options = {}) {
     return _openBluetoothSettingApi.invoke(options, function (opts, requestId) {
-        op_open_system_bluetooth_setting();
+        // The id was always allocated here; the op simply dropped it, so every
+        // result came back bare and settled the oldest pending request.
+        op_open_system_bluetooth_setting(requestId);
     });
 }
 

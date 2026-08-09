@@ -91,6 +91,8 @@ mod tests {
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         HostOpState {
+            callback_ids: std::sync::Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
             id,
             app_cache_dir: cache.to_path_buf(),
             app_files_dir: files.to_path_buf(),

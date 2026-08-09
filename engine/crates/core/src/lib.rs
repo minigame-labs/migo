@@ -136,7 +136,9 @@ pub use runtime::{
     spawn_host_thread,
     spawn_host_thread_tracked,
 };
-pub use services::{DeviceServiceProvider, FrameClock, HostNotifier, PlatformServices};
+pub use services::{
+    DeviceServiceProvider, FrameClock, HostNotifier, PlatformServices, RuntimeGenerationNotifier,
+};
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
 #[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]

@@ -17,10 +17,12 @@ import android.provider.OpenableColumns;
 import android.util.Log;
 import android.webkit.MimeTypeMap;
 
+import com.migo.runtime.internal.CallbackCorrelation;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.ResultProxyActivity;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -30,6 +32,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -52,10 +55,28 @@ public class ImageApiManager {
     private final WeakReference<Activity> activityRef;
     private final Handler mainHandler;
 
-    // Pending chooseImage state
-    private int pendingChooseImageCount = 9;
-    private boolean pendingChooseImageCompress = false;
-    private Uri pendingCameraTempUri = null;
+    /**
+     * Everything one picker launch needs to answer the request that started it.
+     *
+     * <p>This used to be three mutable fields on the manager, which meant a
+     * second {@code chooseImage} overwrote the first one's state while the
+     * first picker was still open: the first request's reply then carried the
+     * second's correlation id and the second's item limit. A picker owns its
+     * own request because two of them can be open at once.
+     */
+    private static final class PickerRequest {
+        /** The runtime's correlation id, or {@link CallbackCorrelation#ABSENT}. */
+        final int requestId;
+        /** The most items {@code chooseImage} may return for this request. */
+        final int count;
+        /** Where the camera app was told to write, for a capture request. */
+        Uri cameraOutput;
+
+        PickerRequest(int requestId, int count) {
+            this.requestId = requestId;
+            this.count = count;
+        }
+    }
 
     public ImageApiManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
@@ -233,25 +254,33 @@ public class ImageApiManager {
      * Options JSON: { "src": "...", "quality": 80, "compressedWidth": 0, "compressedHeight": 0 }
      * Result delivered via NativeMethods.onCompressImageResult with { "tempFilePath": "..." }
      */
-    public void compressAsync(final int sessionId, final String optionsJson) {
+    public void compressAsync(final String optionsJson) {
+        final JSONObject opts;
+        try {
+            opts = new JSONObject(optionsJson);
+        } catch (JSONException malformed) {
+            // No id can be read out of options that do not parse, so this reply
+            // carries none and settles through the runtime's fallback.
+            NativeMethods.onCompressImageResult(sessionId, CallbackCorrelation.failure(
+                    CallbackCorrelation.ABSENT, "compressImage", malformed.getMessage()));
+            return;
+        }
+        final int requestId = CallbackCorrelation.requestIdOf(opts);
+
         new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    String resultJson = compressSync(optionsJson);
-                    NativeMethods.onCompressImageResult(sessionId, resultJson);
+                    NativeMethods.onCompressImageResult(sessionId, compressSync(opts, requestId));
                 } catch (Exception e) {
-                    String msg = e.getMessage();
-                    if (msg == null) msg = "unknown error";
                     NativeMethods.onCompressImageResult(sessionId,
-                            "{\"error\":\"" + msg.replace("\"", "\\\"") + "\"}");
+                            CallbackCorrelation.failure(requestId, "compressImage", e.getMessage()));
                 }
             }
         }, "migo-compress-image").start();
     }
 
-    private String compressSync(String optionsJson) throws Exception {
-        JSONObject opts = new JSONObject(optionsJson);
+    private String compressSync(JSONObject opts, int requestId) throws Exception {
         String src = opts.getString("src");
         int quality = opts.optInt("quality", 80);
         int targetWidth = opts.optInt("compressedWidth", 0);
@@ -261,7 +290,7 @@ public class ImageApiManager {
 
         File srcFile = new File(src);
         if (!srcFile.exists()) {
-            throw new RuntimeException("compressImage:fail file not found");
+            throw new RuntimeException("file not found");
         }
 
         // First pass: get original dimensions
@@ -272,7 +301,7 @@ public class ImageApiManager {
         int origHeight = bmOpts.outHeight;
 
         if (origWidth <= 0 || origHeight <= 0) {
-            throw new RuntimeException("compressImage:fail invalid image");
+            throw new RuntimeException("invalid image");
         }
 
         // Calculate target dimensions
@@ -297,7 +326,7 @@ public class ImageApiManager {
 
         Bitmap bitmap = BitmapFactory.decodeFile(src, bmOpts);
         if (bitmap == null) {
-            throw new RuntimeException("compressImage:fail decode failed");
+            throw new RuntimeException("decode failed");
         }
 
         // Scale to exact target if needed
@@ -323,15 +352,13 @@ public class ImageApiManager {
         try (FileOutputStream fos = new FileOutputStream(tempFile)) {
             boolean ok = bitmap.compress(format, quality, fos);
             if (!ok) {
-                throw new RuntimeException("compressImage:fail compress failed");
+                throw new RuntimeException("compress failed");
             }
         } finally {
             bitmap.recycle();
         }
 
-        JSONObject result = new JSONObject();
-        result.put("tempFilePath", tempFile.getAbsolutePath());
-        return result.toString();
+        return compressImageResultJson(requestId, tempFile.getAbsolutePath());
     }
 
     // ==================== chooseMessageFile (async) ====================
@@ -343,9 +370,10 @@ public class ImageApiManager {
     public void chooseMessageFile(String optionsJson) {
         try {
             JSONObject opts = new JSONObject(optionsJson);
-            int count = opts.optInt("count", 1);
+            final PickerRequest request =
+                    new PickerRequest(CallbackCorrelation.requestIdOf(opts), opts.optInt("count", 1));
+            int count = request.count;
             String type = opts.optString("type", "all");
-            JSONArray extensionArr = opts.optJSONArray("extension");
 
             String mimeType;
             switch (type) {
@@ -373,15 +401,16 @@ public class ImageApiManager {
                     }
                     Activity activity = getActivity();
                     if (activity == null) {
-                        sendChooseMessageFileError("chooseMessageFile:fail activity is gone");
+                        sendChooseMessageFileError(request.requestId, "activity is gone");
                         return;
                     }
                     ResultProxyActivity.launch(activity,
                             Intent.createChooser(intent, "Choose File"),
-                            REQUEST_CHOOSE_FILE, this::onActivityResult);
+                            REQUEST_CHOOSE_FILE,
+                            (code, resultCode, data) -> onChooseFileResult(request, resultCode, data));
                 } catch (Exception e) {
                     Log.e(TAG, "chooseMessageFile: failed to launch picker", e);
-                    sendChooseMessageFileError("chooseMessageFile:fail " + e.getMessage());
+                    sendChooseMessageFileError(request.requestId, e.getMessage());
                 }
             });
         } catch (Exception e) {
@@ -408,30 +437,21 @@ public class ImageApiManager {
                 hasCamera = jsonArrayContains(sourceType, "camera");
             }
 
-            JSONArray sizeType = opts.optJSONArray("sizeType");
-            pendingChooseImageCount = count;
-            pendingChooseImageCompress = sizeType != null
-                    && jsonArrayContains(sizeType, "compressed")
-                    && !jsonArrayContains(sizeType, "original");
-
-            final boolean useAlbum = hasAlbum;
-            final boolean useCamera = hasCamera;
+            final PickerRequest request =
+                    new PickerRequest(CallbackCorrelation.requestIdOf(opts), count);
+            final boolean useCameraOnly = hasCamera && !hasAlbum;
 
             mainHandler.post(() -> {
                 try {
-                    if (useAlbum && !useCamera) {
-                        // Album only
-                        launchImagePicker(count);
-                    } else if (useCamera && !useAlbum) {
-                        // Camera only
-                        launchCameraCapture();
+                    if (useCameraOnly) {
+                        launchCameraCapture(request);
                     } else {
-                        // Both: use a chooser with camera + gallery
-                        launchImagePicker(count);
+                        // Album only, or both: the system chooser covers each.
+                        launchImagePicker(request);
                     }
                 } catch (Exception e) {
                     Log.e(TAG, "chooseImage: failed to launch", e);
-                    sendChooseImageError("chooseImage:fail " + e.getMessage());
+                    sendChooseImageError(request.requestId, e.getMessage());
                 }
             });
         } catch (Exception e) {
@@ -441,47 +461,50 @@ public class ImageApiManager {
 
     // ==================== ActivityResult handling ====================
 
-    private void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (resultCode != Activity.RESULT_OK) {
-            if (requestCode == REQUEST_CHOOSE_IMAGE || requestCode == REQUEST_CAPTURE_IMAGE) {
-                sendChooseImageError("chooseImage:fail cancel");
-            } else if (requestCode == REQUEST_CHOOSE_FILE) {
-                sendChooseMessageFileError("chooseMessageFile:fail cancel");
-            }
+    private void onPickImageResult(PickerRequest request, int resultCode, Intent data) {
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            sendChooseImageError(request.requestId, "cancel");
             return;
         }
+        handleChooseImageResult(request, data);
+    }
 
-        switch (requestCode) {
-            case REQUEST_CHOOSE_IMAGE:
-                handleChooseImageResult(data);
-                break;
-            case REQUEST_CAPTURE_IMAGE:
-                handleCaptureImageResult();
-                break;
-            case REQUEST_CHOOSE_FILE:
-                handleChooseFileResult(data);
-                break;
+    private void onCaptureImageResult(PickerRequest request, int resultCode) {
+        if (resultCode != Activity.RESULT_OK) {
+            sendChooseImageError(request.requestId, "cancel");
+            return;
         }
+        handleCaptureImageResult(request);
+    }
+
+    private void onChooseFileResult(PickerRequest request, int resultCode, Intent data) {
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            sendChooseMessageFileError(request.requestId, "cancel");
+            return;
+        }
+        handleChooseFileResult(request, data);
     }
 
     /**
      * Release resources when session is destroyed.
+     *
+     * <p>Nothing to release: a picker in flight owns its own state, and the
+     * proxy Activity answers it whether or not this manager still exists.
      */
     public void destroy() {
-        pendingCameraTempUri = null;
     }
 
     // ========================================================================
     // Internal: chooseImage result handling
     // ========================================================================
 
-    private void handleChooseImageResult(Intent data) {
+    private void handleChooseImageResult(PickerRequest request, Intent data) {
         try {
             List<String> paths = new ArrayList<>();
             List<Long> sizes = new ArrayList<>();
 
             if (data.getClipData() != null) {
-                int clipCount = Math.min(data.getClipData().getItemCount(), pendingChooseImageCount);
+                int clipCount = Math.min(data.getClipData().getItemCount(), request.count);
                 for (int i = 0; i < clipCount; i++) {
                     Uri uri = data.getClipData().getItemAt(i).getUri();
                     String path = copyUriToTemp(uri, "chooseimg", ".jpg");
@@ -499,60 +522,41 @@ public class ImageApiManager {
             }
 
             if (paths.isEmpty()) {
-                sendChooseImageError("chooseImage:fail no image selected");
+                sendChooseImageError(request.requestId, "no image selected");
                 return;
             }
 
-            JSONObject result = new JSONObject();
-            JSONArray tempFilePaths = new JSONArray();
-            JSONArray tempFiles = new JSONArray();
-            for (int i = 0; i < paths.size(); i++) {
-                tempFilePaths.put(paths.get(i));
-                JSONObject f = new JSONObject();
-                f.put("path", paths.get(i));
-                f.put("size", sizes.get(i));
-                tempFiles.put(f);
-            }
-            result.put("tempFilePaths", tempFilePaths);
-            result.put("tempFiles", tempFiles);
-
-            NativeMethods.onChooseImageResult(sessionId, result.toString());
+            NativeMethods.onChooseImageResult(sessionId,
+                    chooseImageResultJson(request.requestId, paths, sizes));
         } catch (Exception e) {
             Log.e(TAG, "handleChooseImageResult error", e);
-            sendChooseImageError("chooseImage:fail " + e.getMessage());
+            sendChooseImageError(request.requestId, e.getMessage());
         }
     }
 
-    private void handleCaptureImageResult() {
+    private void handleCaptureImageResult(PickerRequest request) {
         try {
-            if (pendingCameraTempUri == null) {
-                sendChooseImageError("chooseImage:fail no capture uri");
+            Uri captured = request.cameraOutput;
+            if (captured == null) {
+                sendChooseImageError(request.requestId, "no capture uri");
                 return;
             }
 
-            String path = copyUriToTemp(pendingCameraTempUri, "capture", ".jpg");
-            pendingCameraTempUri = null;
+            String path = copyUriToTemp(captured, "capture", ".jpg");
+            request.cameraOutput = null;
 
             if (path == null) {
-                sendChooseImageError("chooseImage:fail copy failed");
+                sendChooseImageError(request.requestId, "copy failed");
                 return;
             }
 
-            JSONObject result = new JSONObject();
-            JSONArray tempFilePaths = new JSONArray();
-            JSONArray tempFiles = new JSONArray();
-            tempFilePaths.put(path);
-            JSONObject f = new JSONObject();
-            f.put("path", path);
-            f.put("size", new File(path).length());
-            tempFiles.put(f);
-            result.put("tempFilePaths", tempFilePaths);
-            result.put("tempFiles", tempFiles);
-
-            NativeMethods.onChooseImageResult(sessionId, result.toString());
+            NativeMethods.onChooseImageResult(sessionId, chooseImageResultJson(
+                    request.requestId,
+                    Collections.singletonList(path),
+                    Collections.singletonList(new File(path).length())));
         } catch (Exception e) {
             Log.e(TAG, "handleCaptureImageResult error", e);
-            sendChooseImageError("chooseImage:fail " + e.getMessage());
+            sendChooseImageError(request.requestId, e.getMessage());
         }
     }
 
@@ -560,7 +564,7 @@ public class ImageApiManager {
     // Internal: chooseMessageFile result handling
     // ========================================================================
 
-    private void handleChooseFileResult(Intent data) {
+    private void handleChooseFileResult(PickerRequest request, Intent data) {
         try {
             List<JSONObject> files = new ArrayList<>();
 
@@ -581,21 +585,15 @@ public class ImageApiManager {
             }
 
             if (files.isEmpty()) {
-                sendChooseMessageFileError("chooseMessageFile:fail no file selected");
+                sendChooseMessageFileError(request.requestId, "no file selected");
                 return;
             }
 
-            JSONObject result = new JSONObject();
-            JSONArray tempFiles = new JSONArray();
-            for (JSONObject f : files) {
-                tempFiles.put(f);
-            }
-            result.put("tempFiles", tempFiles);
-
-            NativeMethods.onChooseMessageFileResult(sessionId, result.toString());
+            NativeMethods.onChooseMessageFileResult(sessionId,
+                    chooseMessageFileResultJson(request.requestId, files));
         } catch (Exception e) {
             Log.e(TAG, "handleChooseFileResult error", e);
-            sendChooseMessageFileError("chooseMessageFile:fail " + e.getMessage());
+            sendChooseMessageFileError(request.requestId, e.getMessage());
         }
     }
 
@@ -661,32 +659,33 @@ public class ImageApiManager {
     // Intent launchers
     // ========================================================================
 
-    private void launchImagePicker(int count) {
+    private void launchImagePicker(PickerRequest request) {
         Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
         intent.setType("image/*");
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        if (count > 1) {
+        if (request.count > 1) {
             intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         }
         Activity activity = getActivity();
         if (activity == null) {
-            sendChooseImageError("chooseImage:fail activity is gone");
+            sendChooseImageError(request.requestId, "activity is gone");
             return;
         }
         ResultProxyActivity.launch(activity,
                 Intent.createChooser(intent, "Choose Image"),
-                REQUEST_CHOOSE_IMAGE, this::onActivityResult);
+                REQUEST_CHOOSE_IMAGE,
+                (code, resultCode, data) -> onPickImageResult(request, resultCode, data));
     }
 
-    private void launchCameraCapture() {
+    private void launchCameraCapture(PickerRequest request) {
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
         Activity activity = getActivity();
         if (activity == null) {
-            sendChooseImageError("chooseImage:fail activity is gone");
+            sendChooseImageError(request.requestId, "activity is gone");
             return;
         }
         if (intent.resolveActivity(activity.getPackageManager()) == null) {
-            sendChooseImageError("chooseImage:fail no camera app");
+            sendChooseImageError(request.requestId, "no camera app");
             return;
         }
 
@@ -695,19 +694,20 @@ public class ImageApiManager {
             ContentValues values = new ContentValues();
             values.put(MediaStore.Images.Media.DISPLAY_NAME, "capture_" + System.currentTimeMillis() + ".jpg");
             values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-            pendingCameraTempUri = activity.getContentResolver().insert(
+            Uri output = activity.getContentResolver().insert(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-            if (pendingCameraTempUri == null) {
-                sendChooseImageError("chooseImage:fail cannot create capture uri");
+            if (output == null) {
+                sendChooseImageError(request.requestId, "cannot create capture uri");
                 return;
             }
-            intent.putExtra(MediaStore.EXTRA_OUTPUT, pendingCameraTempUri);
+            request.cameraOutput = output;
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, output);
             intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            ResultProxyActivity.launch(activity, intent,
-                    REQUEST_CAPTURE_IMAGE, this::onActivityResult);
+            ResultProxyActivity.launch(activity, intent, REQUEST_CAPTURE_IMAGE,
+                    (code, resultCode, data) -> onCaptureImageResult(request, resultCode));
         } catch (Exception e) {
             Log.e(TAG, "launchCameraCapture error", e);
-            sendChooseImageError("chooseImage:fail " + e.getMessage());
+            sendChooseImageError(request.requestId, e.getMessage());
         }
     }
 
@@ -801,24 +801,63 @@ public class ImageApiManager {
         return inSampleSize;
     }
 
-    private void sendChooseImageError(String errMsg) {
-        try {
-            JSONObject err = new JSONObject();
-            err.put("error", errMsg);
-            NativeMethods.onChooseImageResult(sessionId, err.toString());
-        } catch (Exception e) {
-            Log.e(TAG, "sendChooseImageError failed", e);
-        }
+    private void sendChooseImageError(int requestId, String reason) {
+        NativeMethods.onChooseImageResult(sessionId,
+                CallbackCorrelation.failure(requestId, "chooseImage", reason));
     }
 
-    private void sendChooseMessageFileError(String errMsg) {
-        try {
-            JSONObject err = new JSONObject();
-            err.put("error", errMsg);
-            NativeMethods.onChooseMessageFileResult(sessionId, err.toString());
-        } catch (Exception e) {
-            Log.e(TAG, "sendChooseMessageFileError failed", e);
+    private void sendChooseMessageFileError(int requestId, String reason) {
+        NativeMethods.onChooseMessageFileResult(sessionId,
+                CallbackCorrelation.failure(requestId, "chooseMessageFile", reason));
+    }
+
+    // ========================================================================
+    // Result documents
+    //
+    // Static and free of Android types on purpose: whether a result answers the
+    // request that asked for it is a property of the JSON, so it is decided
+    // where a test can read it, not inside a picker callback.
+    // ========================================================================
+
+    /** The reply to a {@code chooseImage} request, for album and camera alike. */
+    static String chooseImageResultJson(int requestId, List<String> paths, List<Long> sizes)
+            throws JSONException {
+        JSONObject result = new JSONObject();
+        JSONArray tempFilePaths = new JSONArray();
+        JSONArray tempFiles = new JSONArray();
+        for (int i = 0; i < paths.size(); i++) {
+            tempFilePaths.put(paths.get(i));
+            JSONObject file = new JSONObject();
+            file.put("path", paths.get(i));
+            file.put("size", sizes.get(i).longValue());
+            tempFiles.put(file);
         }
+        result.put("tempFilePaths", tempFilePaths);
+        result.put("tempFiles", tempFiles);
+        CallbackCorrelation.stamp(result, requestId);
+        return result.toString();
+    }
+
+    /** The reply to a {@code chooseMessageFile} request. */
+    static String chooseMessageFileResultJson(int requestId, List<JSONObject> files)
+            throws JSONException {
+        JSONObject result = new JSONObject();
+        JSONArray tempFiles = new JSONArray();
+        for (JSONObject file : files) {
+            tempFiles.put(file);
+        }
+        result.put("tempFiles", tempFiles);
+        CallbackCorrelation.stamp(result, requestId);
+        return result.toString();
+    }
+
+    /** The reply to a {@code compressImage} request. */
+    static String compressImageResultJson(int requestId, String tempFilePath)
+            throws JSONException {
+        JSONObject result = new JSONObject();
+        result.put("tempFilePath", tempFilePath);
+        CallbackCorrelation.stamp(result, requestId);
+        return result.toString();
     }
 
     private static boolean jsonArrayContains(JSONArray arr, String value) {

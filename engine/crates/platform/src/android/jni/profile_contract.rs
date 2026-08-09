@@ -75,10 +75,10 @@ const NATIVE_CORE: &[JniMethod] = methods![
         "nativeAhbPointerFromHardwareBuffer",
         "(Landroid/hardware/HardwareBuffer;)J"
     ),
-    ("onKeyboardInput", "(ILjava/lang/String;)V"),
-    ("onKeyboardConfirm", "(ILjava/lang/String;)V"),
-    ("onKeyboardComplete", "(ILjava/lang/String;)V"),
-    ("onKeyboardHeightChange", "(ID)V"),
+    ("onKeyboardInput", "(IJLjava/lang/String;)V"),
+    ("onKeyboardConfirm", "(IJLjava/lang/String;)V"),
+    ("onKeyboardComplete", "(IJLjava/lang/String;)V"),
+    ("onKeyboardHeightChange", "(IJD)V"),
     ("onMemoryWarning", "(II)V"),
     ("onThermalStatusChanged", "(II)V"),
     ("onSubpackageProgress", "(ILjava/lang/String;)V"),
@@ -86,13 +86,13 @@ const NATIVE_CORE: &[JniMethod] = methods![
 ];
 
 const NATIVE_SENSORS: &[JniMethod] = methods![
-    ("onDeviceMotionChange", "(IDDD)V"),
-    ("onGyroscopeChange", "(IDDD)V"),
+    ("onDeviceMotionChange", "(IJDDD)V"),
+    ("onGyroscopeChange", "(IJDDD)V"),
     ("onDeviceOrientationChange", "(ILjava/lang/String;)V"),
-    ("onCompassChange", "(IDLjava/lang/String;)V"),
-    ("onAccelerometerChange", "(IDDD)V"),
+    ("onCompassChange", "(IJDLjava/lang/String;)V"),
+    ("onAccelerometerChange", "(IJDDD)V"),
     ("onNetworkStatusChange", "(IZLjava/lang/String;)V"),
-    ("onUserCaptureScreen", "(I)V"),
+    ("onUserCaptureScreen", "(IJ)V"),
     ("onLocationResult", "(ILjava/lang/String;)V"),
     ("onFuzzyLocationResult", "(ILjava/lang/String;)V"),
     ("onScanCodeResult", "(ILjava/lang/String;)V"),
@@ -103,23 +103,26 @@ const NATIVE_MEDIA: &[JniMethod] = methods![
     ("onAudioInterruptionEnd", "(I)V"),
     (
         "onRecorderEvent",
-        "(ILjava/lang/String;Ljava/lang/String;)V"
+        "(IJLjava/lang/String;Ljava/lang/String;)V"
     ),
-    ("onRecorderFrameData", "(I[BZ)V"),
-    ("onCameraEvent", "(IILjava/lang/String;Ljava/lang/String;)V"),
+    ("onRecorderFrameData", "(IJ[BZ)V"),
+    (
+        "onCameraEvent",
+        "(IJILjava/lang/String;Ljava/lang/String;)V"
+    ),
     (
         "onCameraFrameData",
-        "(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V"
+        "(IJILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V"
     ),
     ("onCompressImageResult", "(ILjava/lang/String;)V"),
     ("onChooseImageResult", "(ILjava/lang/String;)V"),
     ("onChooseMessageFileResult", "(ILjava/lang/String;)V"),
-    ("onVideoEvent", "(IILjava/lang/String;Ljava/lang/String;)V"),
+    ("onVideoEvent", "(IJILjava/lang/String;Ljava/lang/String;)V"),
 ];
 
 const NATIVE_CONNECTIVITY: &[JniMethod] = methods![
-    ("onOpenSystemBluetoothSetting", "(II)V"),
-    ("onOpenAppAuthorizeSetting", "(II)V"),
+    ("onOpenSystemBluetoothSetting", "(III)V"),
+    ("onOpenAppAuthorizeSetting", "(III)V"),
     ("onBluetoothAdapterStateChange", "(IZZ)V"),
     ("onBluetoothDeviceFound", "(ILjava/lang/String;)V"),
     ("onBeaconUpdate", "(ILjava/lang/String;)V"),
@@ -148,11 +151,17 @@ const NATIVE_COMMERCE: &[JniMethod] = methods![
 const NATIVE_SYSTEM: &[JniMethod] = methods![
     ("onAuthorizeResult", "(ILjava/lang/String;)V"),
     ("updatePermission", "(ILjava/lang/String;Z)Z"),
-    ("onModalResult", "(III)V"),
-    ("onActionSheetResult", "(II)V"),
+    ("onModalResult", "(IIII)V"),
+    ("onActionSheetResult", "(III)V"),
 ];
 
 const JAVA_CORE: &[JniMethod] = methods![
+    // Core, not an optional group: every profile restarts its runtime, and a
+    // Slim session that could not be told would leave its Java generation
+    // boundary stuck in RESTARTING -- refusing every acquisition for the rest
+    // of the session.
+    ("beginRuntimeRestart", "(IJJ)V"),
+    ("completeRuntimeRestart", "(IJ)V"),
     ("getCacheDirPath", "()Ljava/lang/String;"),
     (
         "unzipFile",
@@ -242,8 +251,8 @@ const JAVA_MEDIA: &[JniMethod] = methods![
 ];
 
 const JAVA_CONNECTIVITY: &[JniMethod] = methods![
-    ("openSystemBluetoothSetting", "(I)V"),
-    ("openAppAuthorizeSetting", "(I)V"),
+    ("openSystemBluetoothSetting", "(II)V"),
+    ("openAppAuthorizeSetting", "(II)V"),
     ("getWindowInfoBytes", "(I)[B"),
     ("getSystemSettingInfoBytes", "()[B"),
     ("getDeviceInfoJson", "()Ljava/lang/String;"),
@@ -431,7 +440,9 @@ mod tests {
         // (`permissionRequest`). Permission revocation adds +1 Java
         // (`revokePermissionResources`) for synchronous targeted teardown.
         assert_eq!(native.len(), 69, "full NativeBridge surface changed");
-        assert_eq!(java.len(), 125, "full NativeExports surface changed");
+        // Runtime-generation fencing adds +2 Java (`beginRuntimeRestart`,
+        // `completeRuntimeRestart`), both Core: every profile restarts.
+        assert_eq!(java.len(), 127, "full NativeExports surface changed");
         assert_unique(&native);
         assert_unique(&java);
     }

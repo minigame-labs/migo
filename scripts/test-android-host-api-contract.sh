@@ -30,9 +30,26 @@ UPDATE=false
 
 [[ "${1:-}" == "--update" ]] && UPDATE=true
 
+# Compiled here rather than assumed, because the alternative is not "a clear
+# error": bytecode left by an earlier build passes this gate against source that
+# no longer exists. That is a false green in the one direction that matters -- a
+# host API change reviewed as unchanged -- and it is invisible, where a missing
+# directory at least announces itself. CI happened to be safe only because it
+# runs `compileFullDebugJavaWithJavac` in the same step; the local lane derives
+# the `bash ...` line alone, so it had both failure modes.
+#
+# `--offline --no-daemon` under the verifier for the reasons
+# `test-camera-frame-jni-contract.sh` records: no reachable module repository
+# there, and a daemon outliving its build still holds the project lock.
+GRADLE_FLAGS=()
+[[ -n "${MIGO_GRADLE_VERIFIER:-}" ]] && GRADLE_FLAGS+=(--offline --no-daemon)
+( cd "$ROOT_DIR/platforms/android" && ./gradlew --quiet "${GRADLE_FLAGS[@]}" \
+    :library:compileFullDebugJavaWithJavac ) \
+    || { echo "ERROR: full debug Java compilation failed" >&2; exit 1; }
+
 if [[ ! -d "$CLASSES" ]]; then
     echo "ERROR: compiled classes not found at $CLASSES" >&2
-    echo "       run: (cd platforms/android && ./gradlew :library:compileFullDebugJavaWithJavac)" >&2
+    echo "       :library:compileFullDebugJavaWithJavac reported success but wrote nothing" >&2
     exit 1
 fi
 

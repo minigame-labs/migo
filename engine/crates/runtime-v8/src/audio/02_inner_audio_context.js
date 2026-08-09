@@ -15,10 +15,9 @@ import {
   op_audio_set_inner_audio_option,
   op_audio_get_available_audio_sources,
 } from "ext:core/ops";
-import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { allocateHostCallbackId, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ID counter for InnerAudioContext instances
-let nextInnerAudioId = 1;
 
 // Registry of all active InnerAudioContext instances (for event dispatch)
 const audioContextRegistry = new Map();
@@ -110,7 +109,12 @@ class InnerAudioContext {
   #destroyed = false;
 
   constructor() {
-    this.#id = nextInnerAudioId++;
+    // From the Host's id space rather than a module counter: the audio thread
+    // keeps a player per id across a runtime restart, so a counter restarting
+    // at 1 would let a new context drive the retired runtime's still-playing
+    // sound. Exhaustion throws out of the constructor, which is this API's
+    // only failure convention -- it returns a context rather than reporting.
+    this.#id = allocateHostCallbackId();
     op_inner_audio_create(this.#id);
     registerContext(this);
   }

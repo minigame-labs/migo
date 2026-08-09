@@ -30,7 +30,7 @@ pub(crate) fn callback_session_pin() -> Arc<MigoSession> {
             code_cache_dir: PathBuf::new(),
             allow_unsigned_content: false,
             live_sessions: Mutex::new(0),
-            retired_hosts: Mutex::new(Vec::new()),
+            retired_hosts: crate::retirement::RetirementSet::new(),
         }),
         state: Mutex::new(SessionState::default()),
         callback_gate: crate::callback_gate::CallbackGate::new(),

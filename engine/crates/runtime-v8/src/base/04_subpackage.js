@@ -1,6 +1,6 @@
 import { op_download_subpackage, op_install_subpackage, op_is_subpackage_installed, op_is_subpackage_persisted, op_get_mount_generation, op_get_subpackage_identity, op_get_sub_packages, op_get_workers_path } from "ext:core/ops";
 import { require as amdRequire } from "ext:host_v8_base/01_amdshim.js";
-import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { allocateHostCallbackId, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 const noop = () => {};
 
@@ -146,7 +146,6 @@ function _executeSubpackage(pkg) {
 
 // ---- pending task tracking ----
 
-let _nextRequestId = 1;
 const _pendingTasks = new Map();
 
 class SubpackageTask {
@@ -264,7 +263,24 @@ function _tryLocalExecute(pkg) {
 
 function _startDownload(apiName, options, pkg, executeAfter) {
     const task = new SubpackageTask();
-    const requestId = _nextRequestId++;
+
+    // Before the pending entry and before any local fast path: with no id there
+    // is nothing to register a task under, and `_settle` is keyed by it. Failure
+    // is reported the way `_settle` reports one, so an exhausted id space is not
+    // the single error in this module that throws into content.
+    let requestId;
+    try {
+        requestId = allocateHostCallbackId();
+    } catch (e) {
+        const fail = typeof options.fail === "function" ? options.fail : noop;
+        const complete = typeof options.complete === "function" ? options.complete : noop;
+        const res = { errMsg: `${apiName}:fail ${_errorText(e)}` };
+        queueMicrotask(() => {
+            fail(res);
+            complete(res);
+        });
+        return task;
+    }
 
     _pendingTasks.set(requestId, {
         task,

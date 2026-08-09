@@ -42,9 +42,18 @@ pub fn hook_args_one<T: Serialize>(value: T) -> Cow<'static, str> {
     encode_hook_args(&(value,))
 }
 
-/// Two arguments -- `_internalOnModalResult(confirm, cancel)`.
+/// Two arguments -- `_internalOnActionSheetResult(requestId, tapIndex)`.
 pub fn hook_args_two<A: Serialize, B: Serialize>(a: A, b: B) -> Cow<'static, str> {
     encode_hook_args(&(a, b))
+}
+
+/// Three arguments -- `_internalOnModalResult(requestId, confirm, cancel)`.
+pub fn hook_args_three<A: Serialize, B: Serialize, C: Serialize>(
+    a: A,
+    b: B,
+    c: C,
+) -> Cow<'static, str> {
+    encode_hook_args(&(a, b, c))
 }
 
 fn encode_hook_args<T: Serialize>(value: &T) -> Cow<'static, str> {
