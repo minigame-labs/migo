@@ -32,10 +32,11 @@
 #                          than produce one.
 #   MIGO_OHOS_MIN_API      declared floor (default 20)
 #
-# ⚠ profile-slim is used, and that is a requirement rather than a preference:
-# the full profile pulls audio -> cpal -> alsa-sys -> pkg-config, and
-# OpenHarmony has no ALSA. Its audio surface is OHAudio (libohaudio.so, present
-# in the sysroot), which the engine does not consume yet.
+# The full product profile is built, which it could not be until the engine grew an
+# OHAudio backend: the audio crate reached a device through cpal, cpal has no OHAudio
+# support, and pulling it here dragged in alsa-sys and pkg-config for a library
+# OpenHarmony does not have. src/output_ohaudio.rs replaced that, so the package now
+# links libohaudio.so and ships audio rather than omitting it.
 # =============================================================================
 set -euo pipefail
 
@@ -143,7 +144,6 @@ for ARCH in "${ARCHES[@]}"; do
             RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
             RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
                 cargo build -p migo-capi --release \
-                    --no-default-features --features profile-slim \
                     --target "$TRIPLE"
         )
     fi
@@ -208,7 +208,7 @@ add_library(migo::migo STATIC IMPORTED)
 set_target_properties(migo::migo PROPERTIES
     IMPORTED_LOCATION "\${MIGO_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "\${MIGO_INCLUDE_DIRS}"
-    INTERFACE_LINK_LIBRARIES "EGL;GLESv3;native_window;c++;m;dl;pthread")
+    INTERFACE_LINK_LIBRARIES "EGL;GLESv3;native_window;ohaudio;c++;m;dl;pthread")
 
 # Required, not tuning: skia-bindings carries a translation unit referencing
 # JPEG/PDF/pathops symbols for features this build disables. Only section
@@ -276,7 +276,7 @@ EOF
   "os": "openharmony",
   "arch": "$ARCH",
   "target_triple": "$TRIPLE",
-  "product_profile": "slim",
+  "product_profile": "full",
   "min_ohos_api": $MIN_OHOS_API,
   "build_sdk": {
     "version": "$SDK_VER",
@@ -284,14 +284,13 @@ EOF
   },
   "abi_note": "OpenHarmony userspace is musl. This archive is not interchangeable with an Android (bionic) or a glibc build.",
   "entry_points": $ENTRY_POINTS,
-  "link_libraries": ["EGL", "GLESv3", "native_window", "c++", "m", "dl", "pthread"],
+  "link_libraries": ["EGL", "GLESv3", "native_window", "ohaudio", "c++", "m", "dl", "pthread"],
   "required_link_options": ["-Wl,--gc-sections"],
   "capabilities": {
     "attachable_platform_kinds": $KINDS_JSON,
     "note": "$KINDS_NOTE"
   },
   "known_gaps": [$SURFACE_GAP
-    "audio: OHAudio (libohaudio.so) is not wired up; this package is built with profile-slim",
     "arch coverage: only x86_64 has been run on a device (API 20 emulator); aarch64 is built and gated but unverified until real HarmonyOS NEXT hardware is available",
     "multi-touch: verified single-pointer only; hdc cannot synthesise a second pointer"
   ],
@@ -339,9 +338,9 @@ has no backend compiled in, whatever the headers declare.
 
 ## What this package does not do yet
 
-Audio is absent: the package is built with \`profile-slim\` because the full
-profile requires ALSA, which OpenHarmony does not have. Its audio surface is
-OHAudio, which the engine does not consume yet.
+Audio playback goes through OHAudio (\`libohaudio.so\`), which the CMake package
+links for you. It has not been heard on a device yet: only a build and a link are
+verified here.
 
 Only \`x86_64\` has been run on a device -- an API 20 emulator. The \`aarch64\`
 package is built and gated the same way but has not run on real hardware.

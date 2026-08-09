@@ -1004,7 +1004,57 @@
   `migo-full-release-arm64-v8a.aar` beside `….aar.attestation.json`.
 - [ ] 1.7 Replace the Windows warm-target link flow with a clean Windows-native
   MSVC and ANGLE build graph.
-- [ ] 1.8 Implement HarmonyOS audio playback through OHAudio.
+- [x] 1.8 Implement HarmonyOS audio playback through OHAudio.
+
+  **Done 2026-08-10, and the OpenHarmony package now ships the full product profile
+  instead of `profile-slim`.** That substitution was the whole cost of the gap: the audio
+  crate reached a device only through cpal, cpal has no OHAudio backend, and pulling it in
+  for OpenHarmony dragged `alsa-sys` and `pkg-config` in for a library the platform does
+  not have — so the package was built slim and shipped no audio at all.
+
+  **The seam is the device half only.** `AudioSync`, the watermarks, the ring and
+  `OutputCallback`'s real-time render logic were already independent of cpal, so they stay
+  in `output.rs` and both backends use them; `output_cpal.rs` and `output_ohaudio.rs` hold
+  nothing but device setup. That matters beyond tidiness: Section 7.3's steady-state and
+  first-call allocation gates are written against `OutputCallback`, so they now cover the
+  OpenHarmony callback without being duplicated — a second copy of a real-time callback is
+  how one of them quietly stops matching its gate.
+
+  **Declared by hand against the SDK headers, ten functions and six enum constants.** The
+  callback struct is passed **by value** to `OH_AudioStreamBuilder_SetRendererCallback`, so
+  all four members are declared even though two are used: a short struct passed by value
+  reads the caller's stack as if it were the rest. `length` is a byte count and the stream
+  is `F32LE`, so a length that is not a whole number of samples is refused rather than
+  rounded — rounding would leave the tail of a device buffer undefined. The callback state
+  is a box freed **after** `OH_AudioRenderer_Release`, because the device thread reaches it
+  through `user_data` and freeing it earlier is a use-after-free on a real-time thread.
+
+  **Evidence, in the order it was obtained:**
+
+  * `migo-capi` compiles for `x86_64-unknown-linux-ohos` with **default features**, which
+    is what pulls the audio crate. That build did not exist before.
+  * All fourteen `OH_Audio*` functions appear as undefined imports in the archive and
+    **all fourteen resolve** against the sysroot's `libohaudio.so`.
+  * The staged package's own contract links an **external consumer** against it with the
+    package's link list (now including `ohaudio`) and every `migo_*` resolves — a real
+    link, not a symbol table read.
+  * The API floor is unchanged: externally undefined went 645 → 660 and floor-resolved 516
+    → 531, the same +15, so every new import is satisfied at API 18 and audio did not
+    raise `ohos_api`.
+  * The host path is untouched: `migo-audio` still passes 65 tests including both
+    allocation gates, and the slim profile still builds.
+
+  **A tooling trap worth keeping.** The first symbol check reported *no* OHAudio imports,
+  and that was a lie: Rust emits LLVM bitcode members and the SDK's `llvm-nm` 15 cannot
+  read LLVM 22, so it printed nothing for every query. The control that caught it —
+  running the same query against an artifact known to contain audio — showed zero as well,
+  because that one is stripped. Reading a tool's silence as an answer needs the tool to be
+  able to see the thing first.
+
+  **Not verified, and it needs a device:** nothing has been *heard*. Playback, latency
+  under `AUDIOSTREAM_LATENCY_MODE_FAST`, interrupt handling and route changes are all
+  emulator or hardware work, which is item 2.5's audio row. What is proven here is that
+  the code exists, compiles for its own target, and links against the platform library.
 - [x] 1.9 Add the HarmonyOS V8 component manifest binding the shipped archive to
   a source revision and GN argument set.
 

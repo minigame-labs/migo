@@ -1,26 +1,42 @@
+//! Audio output: the ring buffer, the real-time render logic, and one device backend.
+//!
+//! The device half is per platform and the render half is not, so the render half lives
+//! here and each backend uses it. Two copies of a real-time callback is how one of them
+//! silently stops matching the allocation gates at the bottom of this file -- and
+//! OpenHarmony needed a second backend only because its userspace is musl with no ALSA
+//! and cpal has no OHAudio support, not because anything about the buffering differs.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig};
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
-use ringbuf::{HeapCons, HeapProd, HeapRb};
-use shared::error::{EngineError, EngineResult, ErrorCode};
-use tracing::{error, info};
+use ringbuf::HeapCons;
+use ringbuf::traits::{Consumer, Observer};
+
+/// The device backend for this target. Selected on `target_env` rather than a feature,
+/// because which audio API exists is a property of the platform and not a choice a
+/// caller gets to make.
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+#[path = "output_ohaudio.rs"]
+mod backend;
+#[cfg(not(all(target_os = "linux", target_env = "ohos")))]
+#[path = "output_cpal.rs"]
+mod backend;
+
+pub use backend::AudioOutput;
 
 /// Ring buffer size in sample frames (per channel)
 /// 8192 frames at 48kHz = ~170ms buffer
-const RING_BUFFER_FRAMES: usize = 8192;
+pub(crate) const RING_BUFFER_FRAMES: usize = 8192;
 
 /// Low watermark - when buffer falls below this, signal to refill
 /// 2048 frames at 48kHz = ~42ms
-const LOW_WATERMARK_FRAMES: usize = 2048;
+pub(crate) const LOW_WATERMARK_FRAMES: usize = 2048;
 
 /// High watermark - the refill *target*. A refill pass fills only up to here,
 /// not to the top of the ring, so a freshly triggered sound isn't queued behind
 /// ~150ms of already-buffered audio. 4096 frames at 48kHz = ~85ms, which still
 /// leaves 2x the low-watermark margin against underruns.
-const HIGH_WATERMARK_FRAMES: usize = 4096;
+pub(crate) const HIGH_WATERMARK_FRAMES: usize = 4096;
 
 /// Lightweight signaling for callback-driven audio.
 /// Uses atomic flag instead of Condvar for lower overhead.
@@ -63,7 +79,7 @@ pub struct AudioSync {
 }
 
 impl AudioSync {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             needs_data: Arc::new(AtomicBool::new(false)),
             buffer_level: Arc::new(AtomicUsize::new(0)),
@@ -107,195 +123,6 @@ impl AudioSync {
     }
 }
 
-/// Audio output handle
-pub struct AudioOutput {
-    stream: Stream,
-    producer: HeapProd<f32>,
-    sample_rate: u32,
-    channels: u32,
-    sync: AudioSync,
-    low_watermark_samples: usize,
-    high_watermark_samples: usize,
-    stream_error: Arc<AtomicBool>,
-}
-
-impl AudioOutput {
-    /// Create a new audio output
-    pub fn new() -> EngineResult<Self> {
-        let host = cpal::default_host();
-
-        let device = host.default_output_device().ok_or_else(|| {
-            EngineError::from_detail(ErrorCode::NotFound, "No audio output device found")
-        })?;
-
-        info!("Audio output device: {:?}", device.name());
-
-        let config = device.default_output_config().map_err(|e| {
-            EngineError::from_detail(
-                ErrorCode::Internal,
-                format!("Failed to get default output config: {}", e),
-            )
-        })?;
-
-        let sample_rate = config.sample_rate().0;
-        let channels = config.channels() as u32;
-
-        info!(
-            "Audio output config: sample_rate={}, channels={}, format={:?}",
-            sample_rate,
-            channels,
-            config.sample_format()
-        );
-
-        let ring_size = RING_BUFFER_FRAMES * channels as usize;
-        let ring = HeapRb::<f32>::new(ring_size);
-        let (producer, consumer) = ring.split();
-
-        let sync = AudioSync::new();
-        let low_watermark_samples = LOW_WATERMARK_FRAMES * channels as usize;
-        let high_watermark_samples = HIGH_WATERMARK_FRAMES * channels as usize;
-        let stream_error = Arc::new(AtomicBool::new(false));
-
-        let stream = match config.sample_format() {
-            SampleFormat::F32 => build_stream_f32(
-                &device,
-                &config.into(),
-                consumer,
-                sync.clone(),
-                low_watermark_samples,
-                stream_error.clone(),
-            )?,
-            SampleFormat::I16 => build_stream_converted::<i16>(
-                &device,
-                &config.into(),
-                consumer,
-                sync.clone(),
-                low_watermark_samples,
-                stream_error.clone(),
-            )?,
-            SampleFormat::U16 => build_stream_converted::<u16>(
-                &device,
-                &config.into(),
-                consumer,
-                sync.clone(),
-                low_watermark_samples,
-                stream_error.clone(),
-            )?,
-            format => {
-                return Err(EngineError::from_detail(
-                    ErrorCode::Unsupported,
-                    format!("Unsupported sample format: {:?}", format),
-                ));
-            }
-        };
-
-        stream.play().map_err(|e| {
-            EngineError::from_detail(
-                ErrorCode::Internal,
-                format!("Failed to start audio stream: {}", e),
-            )
-        })?;
-
-        Ok(Self {
-            stream,
-            producer,
-            sample_rate,
-            channels,
-            sync,
-            low_watermark_samples,
-            high_watermark_samples,
-            stream_error,
-        })
-    }
-
-    /// Get the sample rate
-    #[inline]
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    /// Get the number of channels
-    #[inline]
-    pub fn channels(&self) -> u32 {
-        self.channels
-    }
-
-    /// Write samples to the output buffer
-    /// Returns the number of samples written
-    #[inline]
-    pub fn write(&mut self, samples: &[f32]) -> usize {
-        self.producer.push_slice(samples)
-    }
-
-    /// Get available space in the buffer (in samples)
-    #[inline]
-    pub fn available(&self) -> usize {
-        self.producer.vacant_len()
-    }
-
-    /// Currently buffered sample count, read from the producer side so it is
-    /// always fresh — unlike the callback-updated `buffer_level` hint behind
-    /// [`needs_data`](Self::needs_data). Use this to decide how much to refill.
-    #[inline]
-    pub fn buffered(&self) -> usize {
-        self.producer.occupied_len()
-    }
-
-    /// Refill target depth in samples: fill up to here, not the whole ring.
-    ///
-    /// Never below twice the largest observed device callback, so a device that
-    /// requests large blocks can always hold a full callback (otherwise every
-    /// callback would partially underrun). The fill loop's `available() >=
-    /// buffer_size` check still bounds this to the ring capacity.
-    #[inline]
-    pub fn high_watermark(&self) -> usize {
-        self.high_watermark_samples
-            .max(self.sync.max_callback().saturating_mul(2))
-    }
-
-    /// Check if buffer needs more data
-    #[inline]
-    pub fn needs_data(&self) -> bool {
-        self.sync.buffer_level() < self.low_watermark_samples
-    }
-
-    /// Get sync handle for checking callback signals
-    #[inline]
-    pub fn sync(&self) -> &AudioSync {
-        &self.sync
-    }
-
-    /// Check if the audio stream is still alive (no errors reported).
-    #[inline]
-    pub fn is_alive(&self) -> bool {
-        !self.stream_error.load(Ordering::Acquire)
-    }
-
-    /// Pause the audio stream (stops the hardware callback).
-    /// Use when the app is backgrounded or no audio is playing to save power.
-    pub fn pause_stream(&self) -> bool {
-        match self.stream.pause() {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("Failed to pause audio stream: {}", e);
-                false
-            }
-        }
-    }
-
-    /// Resume the audio stream (restarts the hardware callback).
-    pub fn resume_stream(&self) -> bool {
-        match self.stream.play() {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("Failed to resume audio stream: {}", e);
-                self.stream_error.store(true, Ordering::Release);
-                false
-            }
-        }
-    }
-}
-
 /// Samples converted per pass through the stack scratch buffer.
 ///
 /// 512 f32 is 2 KiB of stack, which every real-time audio callback thread has
@@ -309,7 +136,7 @@ const CONVERT_CHUNK_SAMPLES: usize = 512;
 ///
 /// A trait rather than three copies of the callback: the conversion is the only
 /// difference between the integer formats, and it monomorphises away.
-trait FromNormalizedF32: Copy {
+pub(crate) trait FromNormalizedF32: Copy {
     fn from_normalized(sample: f32) -> Self;
 }
 
@@ -339,15 +166,24 @@ impl FromNormalizedF32 for u16 {
 ///
 /// The type is also what removes the duplication: three near-identical callbacks
 /// differing only in the sample conversion collapse into two methods.
-struct OutputCallback {
+pub(crate) struct OutputCallback {
     consumer: HeapCons<f32>,
     sync: AudioSync,
     low_watermark: usize,
 }
 
 impl OutputCallback {
+    /// Built by a backend, which owns the consumer half of the ring.
+    pub(crate) fn new(consumer: HeapCons<f32>, sync: AudioSync, low_watermark: usize) -> Self {
+        Self {
+            consumer,
+            sync,
+            low_watermark,
+        }
+    }
+
     /// The device speaks the ring's own format: pop straight into its buffer.
-    fn render_native(&mut self, data: &mut [f32]) {
+    pub(crate) fn render_native(&mut self, data: &mut [f32]) {
         self.sync.observe_callback(data.len());
 
         let read = self.consumer.pop_slice(data);
@@ -369,7 +205,7 @@ impl OutputCallback {
     /// from the period space actually available -- so that `resize` was a
     /// `realloc` inside a real-time callback. A fixed scratch cannot be grown,
     /// so the failure mode is gone rather than made unlikely.
-    fn render_converted<T: FromNormalizedF32>(&mut self, data: &mut [T]) {
+    pub(crate) fn render_converted<T: FromNormalizedF32>(&mut self, data: &mut [T]) {
         self.sync.observe_callback(data.len());
 
         let mut scratch = [0.0f32; CONVERT_CHUNK_SAMPLES];
@@ -399,77 +235,12 @@ impl OutputCallback {
     }
 }
 
-fn build_stream_f32(
-    device: &Device,
-    config: &StreamConfig,
-    consumer: HeapCons<f32>,
-    sync: AudioSync,
-    low_watermark: usize,
-    stream_error: Arc<AtomicBool>,
-) -> EngineResult<Stream> {
-    let mut callback = OutputCallback {
-        consumer,
-        sync,
-        low_watermark,
-    };
-    build_stream(device, config, stream_error, move |data: &mut [f32]| {
-        callback.render_native(data)
-    })
-}
-
-fn build_stream_converted<T>(
-    device: &Device,
-    config: &StreamConfig,
-    consumer: HeapCons<f32>,
-    sync: AudioSync,
-    low_watermark: usize,
-    stream_error: Arc<AtomicBool>,
-) -> EngineResult<Stream>
-where
-    T: cpal::SizedSample + FromNormalizedF32 + 'static,
-{
-    let mut callback = OutputCallback {
-        consumer,
-        sync,
-        low_watermark,
-    };
-    build_stream(device, config, stream_error, move |data: &mut [T]| {
-        callback.render_converted(data)
-    })
-}
-
-fn build_stream<T, F>(
-    device: &Device,
-    config: &StreamConfig,
-    stream_error: Arc<AtomicBool>,
-    mut render: F,
-) -> EngineResult<Stream>
-where
-    T: cpal::SizedSample + 'static,
-    F: FnMut(&mut [T]) + Send + 'static,
-{
-    device
-        .build_output_stream(
-            config,
-            move |data: &mut [T], _: &cpal::OutputCallbackInfo| render(data),
-            move |err| {
-                error!("Audio output error: {}", err);
-                stream_error.store(true, Ordering::Release);
-            },
-            None,
-        )
-        .map_err(|e| {
-            EngineError::from_detail(
-                ErrorCode::Internal,
-                format!("Failed to build audio stream: {}", e),
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+    use ringbuf::traits::{Producer, Split};
+    use ringbuf::{HeapProd, HeapRb};
 
     const WARMUP: usize = 8;
     const MEASURED: usize = 64;
@@ -490,11 +261,7 @@ mod tests {
         producer.push_slice(&block);
         (
             producer,
-            OutputCallback {
-                consumer,
-                sync: AudioSync::new(),
-                low_watermark: ring_samples / 4,
-            },
+            OutputCallback::new(consumer, AudioSync::new(), ring_samples / 4),
         )
     }
 
@@ -579,11 +346,7 @@ mod tests {
 
         let (mut producer, consumer) = HeapRb::<f32>::new(samples).split();
         producer.push_slice(&source);
-        let mut callback = OutputCallback {
-            consumer,
-            sync: AudioSync::new(),
-            low_watermark: 0,
-        };
+        let mut callback = OutputCallback::new(consumer, AudioSync::new(), 0);
 
         let mut out = vec![0i16; samples];
         callback.render_converted(&mut out);
@@ -604,11 +367,7 @@ mod tests {
         let available = CONVERT_CHUNK_SAMPLES + 3;
         let (mut producer, consumer) = HeapRb::<f32>::new(available).split();
         producer.push_slice(&vec![1.0f32; available]);
-        let mut callback = OutputCallback {
-            consumer,
-            sync: AudioSync::new(),
-            low_watermark: usize::MAX,
-        };
+        let mut callback = OutputCallback::new(consumer, AudioSync::new(), usize::MAX);
 
         let mut out = vec![0xAAu16.wrapping_mul(3); available * 2];
         callback.render_converted(&mut out);
