@@ -11,6 +11,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
 
@@ -76,8 +78,11 @@ V8_MANIFEST="$V8_DIR/component-manifest.json"
     err "rebuild this platform's V8 artifact on the V8 build machine"
     exit 1
 }
-export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
-export RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING"
+# Verified against its component manifest, then used from a content-addressed path,
+# so cargo cannot reuse an rlib built from a previous archive at the same location.
+v8_materialise "$V8_DIR" "$ENGINE_DIR/target/v8-materialised" || exit 1
+export RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING"
 
 MANIFEST_TOOL="${MIGO_ARTIFACT_MANIFEST_TOOL:-}"
 if [[ -z "$MANIFEST_TOOL" ]]; then

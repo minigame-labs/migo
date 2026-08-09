@@ -486,4 +486,67 @@ if schema_pairs != rust_pairs:
 print(f"component schema and validator agree on {len(rust_pairs)} target(s)")
 PY
 
+# Every consumer of a V8 archive must take it from the verified, content-addressed
+# materialisation rather than from wherever the file happens to sit. Enumerated rather
+# than listed, the way the NDK pin is: the defect this closes is that
+# `build-android-so.sh` -- the script that produces the AAR's native library -- selected
+# its archive with an existence test while the SDK scripts beside it verified theirs, so
+# a script added later must not be able to reintroduce that quietly.
+python3 - "$ROOT" <<'PY' || fail "a shipping build consumes a V8 archive without materialising it first"
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+scripts = root / "scripts"
+if not (scripts / "lib/v8-materialise.sh").is_file():
+    sys.exit("missing scripts/lib/v8-materialise.sh")
+
+# Not "every script that mentions the variable": that predicate is too strong and would
+# fail correct code, which is the mistake the NDK pin gate already made and corrected. A
+# developer archive is explicitly allowed for a local executable -- it just cannot make a
+# provenance claim, so it must not reach a package. The discriminator is therefore what a
+# script *produces*, and each non-producer is exempted by name with a reason. A stale
+# exemption is an error, because one that no longer applies grants more than it needs to.
+EXEMPT = {
+    "dev-run-c-host.sh": "runs a local C host; may use a development archive",
+    "dev-run-player.sh": "runs the local player; may use a development archive",
+    "dev-test-host.sh": "runs host suites against the local linux-gnu archive",
+    "test-capi-platform-contract.sh": "a contract check, not a producer",
+    "gen-snapshot.sh": (
+        "produces committed V8 snapshots and is NOT verified -- a real gap, recorded "
+        "rather than silently excluded: its archive should be materialised too"
+    ),
+}
+
+consumers = {
+    path.name
+    for path in scripts.glob("*.sh")
+    # This contract is the one file allowed to name the variable freely -- it has to
+    # quote it to search for it -- the same exemption the NDK pin gate makes for itself.
+    if path.name != "test-artifact-manifest-contract.sh"
+    and re.search(r'RUSTY_V8_ARCHIVE="', path.read_text(encoding="utf-8"))
+}
+if not consumers:
+    sys.exit("found no script setting RUSTY_V8_ARCHIVE -- the enumeration is broken")
+
+stale = sorted(name for name in EXEMPT if name not in consumers)
+if stale:
+    sys.exit(f"exemptions that no longer consume a V8 archive: {stale}")
+
+offenders = []
+for name in sorted(consumers - set(EXEMPT)):
+    text = (scripts / name).read_text(encoding="utf-8")
+    values = re.findall(r'RUSTY_V8_ARCHIVE="([^"]*)"', text)
+    if any(value != "$V8_MATERIALISED_ARCHIVE" for value in values):
+        offenders.append(f"{name} -> {values}")
+    elif "v8_materialise" not in text:
+        offenders.append(f"{name} uses the materialised path but never calls v8_materialise")
+
+if offenders:
+    sys.exit("; ".join(offenders))
+print(
+    f"{len(consumers - set(EXEMPT))} shipping V8 consumer(s) materialise first, "
+    f"{len(EXEMPT)} exempted by name"
+)
+PY
+
 echo "artifact manifest contract: ok"

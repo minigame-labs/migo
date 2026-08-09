@@ -6,6 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
 TARGET="aarch64-linux-android"
@@ -32,6 +34,8 @@ ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/aarch64-linux-android-ar"
 export PATH="$SHIM_DIR:$PATH"
 
 V8_DIR="$ENGINE_DIR/third_party/rusty_v8/aarch64"
+# Verified against its component manifest, then used from a content-addressed path.
+v8_materialise "$V8_DIR" "$ENGINE_DIR/target/v8-materialised" || exit 1
 [[ -f "$V8_DIR/librusty_v8.a" ]] || { err "missing $V8_DIR/librusty_v8.a"; exit 1; }
 
 info "building capi staticlib for $TARGET"
@@ -56,8 +60,8 @@ TARGET_U="${TARGET//-/_}"
         "CC_${TARGET_U}=$NDK_CC" \
         "CXX_${TARGET_U}=${NDK_CC}++" \
         "AR_${TARGET_U}=$NDK_BIN/llvm-ar" \
-        RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
-        RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+        RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE" \
+        RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING" \
         cargo build -p migo-capi --release --target "$TARGET"
 )
 

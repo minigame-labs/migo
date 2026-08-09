@@ -43,6 +43,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
+
 info() { echo -e "\033[0;36m[ohos-sdk] $*\033[0m"; }
 err()  { echo -e "\033[0;31m[ohos-sdk] $*\033[0m" >&2; }
 ok()   { echo -e "\033[0;32m[ohos-sdk] $*\033[0m"; }
@@ -113,8 +116,14 @@ for ARCH in "${ARCHES[@]}"; do
         info "$ARCH: V8 archive absent, building it (this takes a while)"
         bash "$SCRIPT_DIR/build-v8-ohos.sh" "$ARCH"
     fi
-    [[ -f "$V8_DIR/librusty_v8.a" ]] || { err "V8 build produced no archive"; exit 1; }
-    [[ -f "$V8_DIR/src_binding.rs" ]] || { err "V8 build produced no binding"; exit 1; }
+    # Verified against its component manifest and materialised under a path that is its
+    # own hash, so cargo cannot reuse an rlib built from a previous archive: it reruns the
+    # v8 build script on a change of the *value* of RUSTY_V8_ARCHIVE, not of the file.
+    if ! v8_materialise "$V8_DIR" "$REPO_ROOT/engine/target/v8-materialised"; then
+        err "cannot use the V8 archive for $ARCH"
+        exit 1
+    fi
+    info "$ARCH: V8 materialised at ${V8_MATERIALISED_ARCHIVE#"$REPO_ROOT"/}"
 
     # Unlike V8 -- a separate multi-hour build with its own provenance record,
     # correctly reused when present -- cargo is always run. Cargo is the only
@@ -141,8 +150,8 @@ for ARCH in "${ARCHES[@]}"; do
             cd "$REPO_ROOT/engine"
             # Run from engine/ so rust-toolchain.toml applies: it is resolved
             # from the working directory, not from --manifest-path.
-            RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
-            RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+            RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE" \
+            RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING" \
                 cargo build -p migo-capi --release \
                     --target "$TRIPLE"
         )

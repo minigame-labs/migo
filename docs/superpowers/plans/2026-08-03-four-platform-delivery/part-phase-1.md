@@ -866,6 +866,60 @@
 - [ ] 1.3 Materialise V8, Skia, and ANGLE under immutable content-addressed
   paths before any Cargo or native link, covering the HarmonyOS path that
   currently builds V8 from an external checkout.
+
+  **The V8 half is done for every shipping consumer — 2026-08-10 — and it closed a defect
+  worse than the missing hermeticity.** `build-android-so.sh`, the script that produces
+  the AAR's native library, selected its archive with `[[ -f "$v8_archive" ]]` —
+  existence, not identity — so `libmigo.so` was linked against whatever bytes sat at
+  `engine/third_party/rusty_v8/<arch>/librusty_v8.a`, while the SDK scripts beside it
+  already ran `verify-v8-component` first. The shipping path was the unverified one.
+
+  `scripts/lib/v8-materialise.sh` verifies the archive **and** the binding against the
+  `component-manifest.json` beside them, then makes them available under
+  `engine/target/v8-materialised/<archive-sha256>/`. Six consumers use it:
+  `build-android-so.sh`, `build-android-sdk.sh`, `build-android-c-host.sh`,
+  `build-linux-sdk.sh`, `build-ohos-sdk.sh`, `build-ohos-host.sh`.
+
+  **A workaround was deleted rather than kept, which is the real argument for content
+  addressing.** Cargo reruns the `v8` crate's build script when the *value* of
+  `RUSTY_V8_ARCHIVE` changes, not when the file at that path is replaced, so a V8 rebuilt
+  in place left cargo reusing an rlib built from the previous archive — a defect that cost
+  a full debugging cycle over a staged `libmigo.so` still carrying an allocator shim the
+  rebuild had removed. `build-linux-sdk.sh` forced it with a sha256 stamp plus
+  `cargo clean -p v8`. Both are gone: different bytes are now a different path, so cargo's
+  own staleness rule is correct and there is nothing left to force.
+
+  Hard links, not copies — the archive is ~120 MB per architecture, and `links=2` was
+  checked. Deliberately **not** `chmod 444`: a hard link shares its inode with
+  `third_party`, so making the materialised copy read-only would make the *producer* fail
+  its next `cp`, and it would buy nothing, because the hash is re-checked on every call.
+  That check is what makes the path's claim true rather than decorative.
+
+  **Verified on all three buildable platforms**, each rebuilt through the new path:
+  Android `libmigo.so` links; the OpenHarmony package builds and its consumer link,
+  entry-point count and API floor all pass; the Linux SDK builds and stages. Fixtures
+  cover the refusals: a tampered archive is refused naming both hashes, and a target with
+  no manifest is refused rather than materialised — the same rule
+  `fetch-v8-archives.sh` states.
+
+  `test-artifact-manifest-contract.sh` enumerates the consumers so a script added later
+  cannot reintroduce a raw path; proved load-bearing by putting one back, which fails
+  naming the script. The predicate is *what a script produces*, not *whether it mentions
+  the variable* — the over-strong version of that rule is a mistake the NDK pin gate
+  already made and corrected, and a development archive is legitimate for a local
+  executable. The five non-producers are exempted by name with a reason each, and a stale
+  exemption is an error.
+
+  **Still open, and named rather than implied:**
+
+  * **Skia** is built by `skia-bindings` from source and has no committed manifest, so
+    there is nothing to content-address it against yet. That is the same
+    "no manifest, so no verification" position V8 was in before its lock existed.
+  * **ANGLE** is Windows-only and cannot be exercised here.
+  * **`gen-snapshot.sh` consumes an archive without verifying it**, and it produces
+    *committed* V8 snapshots — so a snapshot's provenance is not yet tied to a verified
+    archive. It is exempted by name in the gate with exactly that reason, so the gap is
+    recorded where someone will trip over it rather than silently excluded.
 - [ ] 1.4 Remove every `--allow-multiple-definition`, including both HarmonyOS
   target entries in `engine/.cargo/config.toml`, and resolve duplicate C++
   runtime symbols at component build boundaries.

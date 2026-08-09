@@ -67,6 +67,8 @@ V8_LIBS_DIR="$ENGINE_ROOT/third_party/rusty_v8"
 
 # shellcheck source=scripts/lib/android-ndk.sh
 source "$SCRIPT_DIR/lib/android-ndk.sh"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 
 if [[ ! -d "$ENGINE_ROOT" ]]; then
     print_error "engine directory not found at $ENGINE_ROOT"
@@ -324,18 +326,23 @@ build_platform() {
         arch="x86_64"
     fi
 
-    local v8_archive="$V8_LIBS_DIR/$arch/librusty_v8.a"
-    local v8_binding="$V8_LIBS_DIR/$arch/src_binding.rs"
+    local v8_dir="$V8_LIBS_DIR/$arch"
 
-    if [[ -f "$v8_archive" ]]; then
-        export RUSTY_V8_ARCHIVE="$v8_archive"
-        print_info "RUSTY_V8_ARCHIVE = $v8_archive"
+    # Verified and materialised under a path that is its own hash, rather than exported
+    # from wherever the archive happens to sit. This used to be `[[ -f "$v8_archive" ]]`
+    # -- existence, not identity -- so the AAR's native library was built against
+    # whatever bytes were at that path, while the SDK scripts beside it already ran
+    # verify-v8-component first. Content addressing also makes cargo's staleness rule
+    # correct: it reruns the v8 build script when the *value* of RUSTY_V8_ARCHIVE changes,
+    # not when the file does, so a rebuilt archive is a new path instead of a silent reuse.
+    if ! v8_materialise "$v8_dir" "$PROJECT_ROOT/engine/target/v8-materialised"; then
+        print_error "cannot use the V8 archive for $arch"
+        exit 1
     fi
-
-    if [[ -f "$v8_binding" ]]; then
-        export RUSTY_V8_SRC_BINDING_PATH="$v8_binding"
-        print_info "RUSTY_V8_SRC_BINDING_PATH = $v8_binding"
-    fi
+    export RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE"
+    export RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING"
+    print_info "RUSTY_V8_ARCHIVE = $RUSTY_V8_ARCHIVE"
+    print_info "RUSTY_V8_SRC_BINDING_PATH = $RUSTY_V8_SRC_BINDING_PATH"
 
     # --------------------------------------------------------
     # RUSTFLAGS (arm64 builtins)
