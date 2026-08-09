@@ -8,7 +8,7 @@ lists the git-ignored prerequisites — Android V8 archives via
 in every shell. Without them every host suite fails for a reason unrelated to your
 change. Nothing there has changed.
 
-**Branch:** `gate/runtime-generation-fence`, ten commits on top of `origin/master`
+**Branch:** `gate/runtime-generation-fence`, thirteen commits on top of `origin/master`
 (`3196c3a`), **unpushed**. Verify before believing: `git log --oneline 3196c3a..HEAD`.
 
 **The main line is Phase 1, four-platform delivery**, not further Phase 0 polish. Item
@@ -35,6 +35,8 @@ and 3). Everything below is the short form.
 | `8363da0` | `release/VERSION` is the single release version; four build systems now derive from it |
 | `b3f7684` | two shapes the version gate was passing wrongly |
 | `1b50e76` | the ledger for item 1.2 |
+| `c72a36f` | shipped artifacts stop recording when they were built (item 1.5's metadata half) |
+| `9583a8f` | the ledger for 1.5, left open |
 
 ---
 
@@ -135,6 +137,24 @@ bump is now one edit**, which was the point — nothing in that item proposed a 
 version, it stays at the `0.9.0` the AAR already shipped.
 
 That unblocks the packaging items that need a unified version (1.11, 1.12, 1.14).
+
+**Item 1.5 is half closed and the other half is not a delay.** Its metadata side is
+done: three shipped or committed artifacts recorded a wall clock — the AAR metadata
+(recording the epoch it was given and then stamping a *local* clock on the next
+line), the SBOM that `release.yml` ships, and the *committed* snapshot manifests.
+All three now honour `SOURCE_DATE_EPOCH`, and
+`scripts/test-reproducible-timestamp-contract.sh` holds the rule. Its archive side
+cannot be done yet, and finding that out is the useful part: **nothing in this
+repository creates a release archive.** The four SDK scripts populate a prefix
+directory and the only archive today is the AAR that Gradle builds. Archive
+determinism is a property of code item **1.11** has not written, and
+`scripts/lib/reproducible-timestamp.sh` exists so 1.11 has one stamp to use rather
+than inventing a third.
+
+When measuring a determinism fix, assert **both** halves: identical bytes across two
+runs under a fixed epoch, *and* different bytes under a different epoch. The first
+alone is satisfied by deleting the timestamp entirely.
+
 What remains in Phase 1, with what this machine can and cannot do:
 
 * **1.4 — remove every `--allow-multiple-definition`.** Five entries in
