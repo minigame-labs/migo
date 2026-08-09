@@ -640,17 +640,30 @@
   Java 151 tests per flavour (from 143), zero failures; Android host API v0
   unchanged at 357 entries; camera-frame JNI descriptor contract holds.
 
-  **What remains, and why the next family is a different kind of change.**
-  `InteractionUI`'s modal and action-sheet results do not travel as JSON at all —
-  `NativeMethods.onModalResult(sessionId, int, int)` is positional, and the
-  descriptors are **pinned on both sides**: `profile_contract.rs:151-152` holds
-  `("onModalResult", "(III)V")` and `("onActionSheetResult", "(II)V")`. Echoing
-  an id there means changing the JNI signature, the pin, the Rust caller, the
-  Java method and the JS reader together — which is why the plan's file list
-  names `NativeMethods`, `NativeBridge`, `registration.rs` and
-  `profile_contract.rs`. `ImageApiManager` (53 JSON sites), `VideoManager` and
-  `ResultProxyActivity` are still the JSON-shaped kind and follow the pattern
-  above.
+  **`InteractionUI` is in task 6's file list, but its half of the work cannot be
+  done from task 6 — and the reason is not the JNI signature.** Read end to end:
+  `showModal` sends **no id at all**. `ui/01_interaction.js` pushes onto a
+  `_pendingModals` **array** and `_internalOnModalResult(confirm, cancel)` calls
+  `shift()`, so the oldest pending modal is settled by construction, and the
+  `op_show_modal` payload has no `requestId` field to echo. Modal is not "a reply
+  that omits its id"; it is an API that never had one — which is exactly what
+  task **5** is named for, *ID-Less UI Results*, and why task 5's file list
+  carries `ui/01_interaction.js` and `ui/mod.rs`.
+
+  So the two tasks are coupled in the direction the plan's numbering hides:
+  **Java cannot echo an id the runtime never sent**, so task 6's `InteractionUI`
+  work depends on task 5's. The earlier note here that "6 may want to come before
+  5" holds for the families that *are* given an id and drop it; it does not hold
+  for modal and action sheet.
+
+  When it is done, the JNI signature has to widen with it —
+  `profile_contract.rs:151-152` pins `("onModalResult", "(III)V")` and
+  `("onActionSheetResult", "(II)V")` — but that pin is a help rather than a
+  hazard: a side changed alone fails the contract loudly instead of silently
+  mis-correlating.
+
+  Still task 6's own, and still the JSON-shaped kind that follows the pattern
+  above: `ImageApiManager` (53 JSON sites), `VideoManager`, `ResultProxyActivity`.
 
   **Tasks 5, 7–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
