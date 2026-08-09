@@ -385,6 +385,74 @@ EOP
 }
 replay || failures=$((failures + 1))
 
+# ---------------------------------------------------------------------------
+# The library has to answer honestly about a tree it cannot read.
+#
+# Neither case below is hypothetical. The vendored rusty_v8 checkout is owned by
+# another account on a shared workspace, and every caller spells its path with a
+# `..` component (`$PROJECT_ROOT/../rusty_v8_src`). git compares safe.directory
+# literally against the repository path it discovers, so the unnormalised value
+# never matches and the exception silently does not apply -- which is why this
+# check derives `real_tree` below through `cd .. && pwd`, and therefore could
+# never have observed what the build script hits.
+# ---------------------------------------------------------------------------
+unreadable_tree() {
+    local w rc=0 dotted
+    w="$(mktemp -d)"
+    git_q() { git -c user.email=t@t -c user.name=t -c init.defaultBranch=main "$@"; }
+
+    mkdir -p "$w/nested/tree" "$w/patches"
+    printf 'one\ntwo\nthree\n' > "$w/nested/tree/top.txt"
+    ( cd "$w/nested/tree" && git_q init -q . && git_q add -A && git_q commit -q -m base )
+    cat > "$w/patches/t-top.diff" <<'EOP'
+--- a/top.txt
++++ b/top.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+EOP
+    patch -p1 -d "$w/nested/tree" --batch --forward --fuzz=0 \
+        < "$w/patches/t-top.diff" >/dev/null
+
+    dotted="$w/nested/../nested/tree"
+    if GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+       v8_assert_tree_is_exactly_patched "$dotted" "$w/patches" 't-top.diff' \
+       >/dev/null 2>&1; then
+        pass "a checkout this user does not own is read through a path carrying .."
+    else
+        fail "a path carrying .. defeats the safe.directory exception"
+        rc=1
+    fi
+
+    # A tree git cannot read at all, against a declared patch that only *creates*
+    # a file -- the shape of 0008-ohos-toolchain.patch. With no changed paths
+    # enumerated, the replay succeeds into the scratch directory and the byte
+    # comparison has nothing to iterate, so an unobserved `git status` failure
+    # certifies a tree the library never managed to look at.
+    mkdir -p "$w/plain" "$w/create-patches"
+    printf 'not-a-checkout\n' > "$w/plain/marker.txt"
+    cat > "$w/create-patches/t-new.diff" <<'EOP'
+--- /dev/null
++++ b/created.gn
+@@ -0,0 +1 @@
++created
+EOP
+    if GIT_CEILING_DIRECTORIES="$w" \
+       v8_assert_tree_is_exactly_patched "$w/plain" "$w/create-patches" 't-new.diff' \
+       >/dev/null 2>&1; then
+        fail "a directory git cannot read is certified as HEAD plus the patches"
+        rc=1
+    else
+        pass "a tree whose git status fails is refused, not read as unchanged"
+    fi
+
+    rm -rf "$w"
+    return $rc
+}
+unreadable_tree || failures=$((failures + 1))
+
 info "the real source tree is explained by the patches the build declares"
 real_tree="${RUSTY_V8_SRC:-$(cd "$REPO_ROOT/.." && pwd)/rusty_v8_src}"
 if [[ -d "$real_tree/.git" ]]; then

@@ -97,10 +97,25 @@ v8_require_patch() {
 
 # Runs git against a checkout this user may not own. `-c` keeps that judgement to
 # the invocation instead of writing it into the user's global git config.
+#
+# The path is canonicalised first, and that is load-bearing rather than tidiness:
+# git compares `safe.directory` literally against the repository path it
+# discovers, and every caller derives this one as `$PROJECT_ROOT/../rusty_v8_src`.
+# An unnormalised value therefore never matches, the exception does not apply, and
+# every git call here fails with `dubious ownership` -- which the replay reports as
+# the tree carrying changes no patch explains.
 _v8_git() {
     local tree="$1"
     shift
-    git -c "safe.directory=$tree" -C "$tree" "$@"
+    local canonical
+    # Refused rather than defaulted: an empty `-C` runs git in the *current*
+    # directory, so a mistyped tree would report the calling repository's status
+    # as if it were the vendored checkout's.
+    canonical="$(cd "$tree" 2>/dev/null && pwd -P)" || {
+        _v8_patch_err "not a directory: $tree"
+        return 1
+    }
+    git -c "safe.directory=$canonical" -C "$canonical" "$@"
 }
 
 # Emits one tab-separated record per changed path, descending into submodules:
@@ -121,8 +136,24 @@ _v8_git() {
 # as one rather than followed.
 _v8_changed_paths() {
     local tree="$1" prefix="$2"
-    local record status path mode pinned actual
-    while IFS= read -r -d '' record; do
+    local listing record status path mode pinned actual
+    local -a records=()
+    # A failed enumeration must not read as an empty one. The status output is
+    # NUL-separated, so it cannot go through a command substitution, and a process
+    # substitution's exit code is not observable -- hence the file. Read it out and
+    # delete it before processing, so the recursion below cannot leak it.
+    listing="$(mktemp)" || {
+        _v8_patch_err "cannot create a temporary file to enumerate $tree"
+        return 1
+    }
+    if ! _v8_git "$tree" status --porcelain=v1 -z --untracked-files=all > "$listing"; then
+        rm -f "$listing"
+        _v8_patch_err "cannot read the git status of $tree"
+        return 1
+    fi
+    mapfile -d '' -t records < "$listing"
+    rm -f "$listing"
+    for record in "${records[@]}"; do
         status="${record:0:2}"
         path="${record:3}"
         mode="$(_v8_git "$tree" ls-files --stage -- "$path" 2>/dev/null \
@@ -139,7 +170,7 @@ _v8_changed_paths() {
         else
             printf '%s\t%s\t%s\t%s\n' "$status" "$prefix$path" "$tree" "$path"
         fi
-    done < <(_v8_git "$tree" status --porcelain=v1 -z --untracked-files=all)
+    done
 }
 
 # Proves that a checkout is its committed HEAD plus exactly the declared patches,
@@ -195,7 +226,11 @@ v8_assert_tree_is_exactly_patched() {
     fi
 
     local -a changed=() owners=() owner_paths=()
-    local status owner owner_path
+    local status owner owner_path records
+    # A command substitution rather than a process substitution: the enumeration
+    # can fail (a tree git cannot read), and `< <(...)` discards that, leaving the
+    # loop to see no changed paths and the proof to conclude the tree is clean.
+    records="$(_v8_changed_paths "$tree" "")" || return 1
     while IFS=$'\t' read -r status path owner owner_path; do
         [[ -n "$path" ]] || continue
         [[ -n "${accounted[$path]:-}" ]] && continue
@@ -211,7 +246,7 @@ v8_assert_tree_is_exactly_patched() {
         changed+=("$path")
         owners+=("$owner")
         owner_paths+=("$owner_path")
-    done < <(_v8_changed_paths "$tree" "")
+    done <<< "$records"
 
     local scratch
     scratch="$(mktemp -d)" || {
