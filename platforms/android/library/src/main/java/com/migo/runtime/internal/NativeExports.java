@@ -1782,20 +1782,26 @@ public final class NativeExports {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail invalid session\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "invalid session"));
             return;
         }
         Activity activity = ctx.getActivity();
         if (activity == null) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail no activity\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "no activity"));
             return;
         }
         PermissionOperationGate.Pending pending =
                 sPermissionOperations.register(sessionId, "scope.userLocation");
         if (pending == null) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "permission revoked"));
             return;
         }
         if (!sPermissionOperations.enter(pending, () ->
@@ -1804,7 +1810,9 @@ public final class NativeExports {
                         failure -> reportCleanupFailureAndScheduleTerminalClose(
                                 sessionId, "location request cleanup", failure)))) {
             NativeMethods.onLocationResult(sessionId,
-                    "{\"error\":\"getLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getLocation", "permission revoked"));
         }
     }
 
@@ -1820,20 +1828,26 @@ public final class NativeExports {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail invalid session\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "invalid session"));
             return;
         }
         Activity activity = ctx.getActivity();
         if (activity == null) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail no activity\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "no activity"));
             return;
         }
         PermissionOperationGate.Pending pending =
                 sPermissionOperations.register(sessionId, "scope.userLocation");
         if (pending == null) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "permission revoked"));
             return;
         }
         if (!sPermissionOperations.enter(pending, () ->
@@ -1842,7 +1856,9 @@ public final class NativeExports {
                         failure -> reportCleanupFailureAndScheduleTerminalClose(
                                 sessionId, "fuzzy location request cleanup", failure)))) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    "{\"error\":\"getFuzzyLocation:fail permission revoked\"}");
+                    CallbackCorrelation.failure(
+                            CallbackCorrelation.requestIdOf(optionsJson),
+                            "getFuzzyLocation", "permission revoked"));
         }
     }
 

@@ -392,6 +392,15 @@ dependencies {
     // are deliberately free of android.* precisely so they can be tested here
     // rather than on a device.
     testImplementation 'junit:junit:4.13.2'
+
+    // The real org.json, test-only. The android.jar the unit-test classpath uses
+    // is a stub whose every method throws "not mocked", so any host test over
+    // code that builds a JSON result fails on the first `put`. The alternative
+    // the platform offers -- `unitTests.returnDefaultValues = true` -- is
+    // module-wide and turns every unmocked android.* call into a silent default,
+    // which is the opposite of what a test should do. This shadows the stub for
+    // `org.json` only, and never enters the AAR.
+    testImplementation 'org.json:json:20240303'
 }
 
 // ---------------------------------------------------------------------------

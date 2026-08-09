@@ -15,6 +15,8 @@ import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.PermissionOperationGate;
 
 import org.json.JSONException;
+import com.migo.runtime.internal.CallbackCorrelation;
+
 import org.json.JSONObject;
 
 import java.util.function.Consumer;
@@ -199,6 +201,10 @@ public final class LocationProvider {
             PermissionOperationGate.Pending pending,
             Consumer<RuntimeException> cleanupFailureReporter) {
         boolean[] async = {false};
+        // Read before the parse: a malformed options string must still be
+        // answered to the request that sent it, and `requestIdOf` treats
+        // unparseable input as "no id" rather than throwing.
+        final int requestId = CallbackCorrelation.requestIdOf(optionsJson);
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String type = opts.optString("type", "wgs84");
@@ -208,14 +214,14 @@ public final class LocationProvider {
 
             if (!hasLocationPermission(context)) {
                 NativeMethods.onLocationResult(sessionId,
-                        errorJson("getLocation", "no location permission"));
+                        errorJson(requestId, "getLocation", "no location permission"));
                 return;
             }
 
             LocationManager lm = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
             if (lm == null) {
                 NativeMethods.onLocationResult(sessionId,
-                        errorJson("getLocation", "location service unavailable"));
+                        errorJson(requestId, "getLocation", "location service unavailable"));
                 return;
             }
 
@@ -229,7 +235,7 @@ public final class LocationProvider {
 
             if (!useGps && !useNetwork) {
                 NativeMethods.onLocationResult(sessionId,
-                        errorJson("getLocation", "location service disabled"));
+                        errorJson(requestId, "getLocation", "location service disabled"));
                 return;
             }
 
@@ -241,7 +247,7 @@ public final class LocationProvider {
             if (!needFresh && lastKnown != null) {
                 // Fast path: return immediately
                 NativeMethods.onLocationResult(sessionId,
-                        buildLocationResult(lastKnown, type, altitude));
+                        buildLocationResult(requestId, lastKnown, type, altitude));
                 return;
             }
 
@@ -252,17 +258,17 @@ public final class LocationProvider {
                     (location) -> {
                         if (location != null) {
                             NativeMethods.onLocationResult(sessionId,
-                                    buildLocationResult(location, type, altitude));
+                                    buildLocationResult(requestId, location, type, altitude));
                         } else {
                             NativeMethods.onLocationResult(sessionId,
-                                    errorJson("getLocation", "unable to get location"));
+                                    errorJson(requestId, "getLocation", "unable to get location"));
                         }
                     });
             async[0] = true;
 
         } catch (Exception e) {
             NativeMethods.onLocationResult(sessionId,
-                    errorJson("getLocation", e.getMessage()));
+                    errorJson(requestId, "getLocation", e.getMessage()));
         } finally {
             if (!async[0]) gate.finish(pending);
         }
@@ -284,20 +290,24 @@ public final class LocationProvider {
             PermissionOperationGate.Pending pending,
             Consumer<RuntimeException> cleanupFailureReporter) {
         boolean[] async = {false};
+        // Read before the parse: a malformed options string must still be
+        // answered to the request that sent it, and `requestIdOf` treats
+        // unparseable input as "no id" rather than throwing.
+        final int requestId = CallbackCorrelation.requestIdOf(optionsJson);
         try {
             JSONObject opts = new JSONObject(optionsJson);
             String type = opts.optString("type", "wgs84");
 
             if (!hasLocationPermission(context)) {
                 NativeMethods.onFuzzyLocationResult(sessionId,
-                        errorJson("getFuzzyLocation", "no location permission"));
+                        errorJson(requestId, "getFuzzyLocation", "no location permission"));
                 return;
             }
 
             LocationManager lm = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
             if (lm == null) {
                 NativeMethods.onFuzzyLocationResult(sessionId,
-                        errorJson("getFuzzyLocation", "location service unavailable"));
+                        errorJson(requestId, "getFuzzyLocation", "location service unavailable"));
                 return;
             }
 
@@ -306,7 +316,7 @@ public final class LocationProvider {
 
             if (!useGps && !useNetwork) {
                 NativeMethods.onFuzzyLocationResult(sessionId,
-                        errorJson("getFuzzyLocation", "location service disabled"));
+                        errorJson(requestId, "getFuzzyLocation", "location service disabled"));
                 return;
             }
 
@@ -322,7 +332,7 @@ public final class LocationProvider {
             if (lastKnown != null) {
                 // Fast path
                 NativeMethods.onFuzzyLocationResult(sessionId,
-                        buildFuzzyResult(lastKnown, type));
+                        buildFuzzyResult(requestId, lastKnown, type));
                 return;
             }
 
@@ -333,17 +343,17 @@ public final class LocationProvider {
                     (location) -> {
                         if (location != null) {
                             NativeMethods.onFuzzyLocationResult(sessionId,
-                                    buildFuzzyResult(location, type));
+                                    buildFuzzyResult(requestId, location, type));
                         } else {
                             NativeMethods.onFuzzyLocationResult(sessionId,
-                                    errorJson("getFuzzyLocation", "unable to get location"));
+                                    errorJson(requestId, "getFuzzyLocation", "unable to get location"));
                         }
                     });
             async[0] = true;
 
         } catch (Exception e) {
             NativeMethods.onFuzzyLocationResult(sessionId,
-                    errorJson("getFuzzyLocation", e.getMessage()));
+                    errorJson(requestId, "getFuzzyLocation", e.getMessage()));
         } finally {
             if (!async[0]) gate.finish(pending);
         }
@@ -453,7 +463,8 @@ public final class LocationProvider {
 
     // ==================== Result builders ====================
 
-    private static String buildLocationResult(Location location, String type, boolean includeAltitude) {
+    private static String buildLocationResult(
+            int requestId, Location location, String type, boolean includeAltitude) {
         try {
             double lat = location.getLatitude();
             double lng = location.getLongitude();
@@ -485,13 +496,14 @@ public final class LocationProvider {
                 result.put("horizontalAccuracy", location.hasAccuracy() ? location.getAccuracy() : 0);
             }
 
+            CallbackCorrelation.stamp(result, requestId);
             return result.toString();
         } catch (JSONException e) {
-            return errorJson("getLocation", e.getMessage());
+            return errorJson(requestId, "getLocation", e.getMessage());
         }
     }
 
-    private static String buildFuzzyResult(Location location, String type) {
+    private static String buildFuzzyResult(int requestId, Location location, String type) {
         try {
             double lat = location.getLatitude();
             double lng = location.getLongitude();
@@ -509,9 +521,10 @@ public final class LocationProvider {
             JSONObject result = new JSONObject();
             result.put("latitude", lat);
             result.put("longitude", lng);
+            CallbackCorrelation.stamp(result, requestId);
             return result.toString();
         } catch (JSONException e) {
-            return errorJson("getFuzzyLocation", e.getMessage());
+            return errorJson(requestId, "getFuzzyLocation", e.getMessage());
         }
     }
 
@@ -562,8 +575,8 @@ public final class LocationProvider {
                     == PackageManager.PERMISSION_GRANTED;
     }
 
-    private static String errorJson(String apiName, String reason) {
-        return "{\"error\":\"" + apiName + ":fail " + escapeJson(reason) + "\"}";
+    private static String errorJson(int requestId, String apiName, String reason) {
+        return CallbackCorrelation.failure(requestId, apiName, reason);
     }
 
     private static String escapeJson(String s) {
