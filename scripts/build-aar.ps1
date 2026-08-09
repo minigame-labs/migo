@@ -8,6 +8,7 @@ param(
     [string]$OutputDir = "dist",
     [string[]]$Architectures = @("all"),
     [switch]$SkipRustBuild = $false,
+    [switch]$UnverifiedNativeLibs = $false,
     [switch]$WorkerSnapshot = $false,
     [switch]$Help = $false
 )
@@ -21,7 +22,10 @@ if ($Help) {
     Write-Host "Usage:"
     Write-Host "  .\build-aar.ps1 [-BuildType release|debug] [-CodegenProfile z|2|3]"
     Write-Host "                    [-Architectures all|arm64-v8a,...]"
-    Write-Host "                    [-SkipRustBuild] [-WorkerSnapshot]"
+    Write-Host "                    [-SkipRustBuild] [-UnverifiedNativeLibs] [-WorkerSnapshot]"
+    Write-Host "  -UnverifiedNativeLibs  Package .so files this invocation did not build."
+    Write-Host "                    Only meaningful with -SkipRustBuild. The result is not"
+    Write-Host "                    a release artifact and must not be published."
     exit 0
 }
 
@@ -38,6 +42,17 @@ if ($BuildType -eq "debug" -and $CodegenProfile -ne "z") {
 }
 if ($WorkerSnapshot.IsPresent -and ($BuildType -ne "release" -or $ProductProfile -ne "full")) {
     throw "Worker snapshot requires a full release build"
+}
+
+# A release AAR must carry native libraries built from this source. -SkipRustBuild
+# packages whatever .so files are on disk and the validation step only checks that
+# they exist, so a release built this way ships natives from another commit with
+# nothing in the artifact saying so. The bash twin carries the full reasoning.
+if ($BuildType -eq "release" -and $SkipRustBuild -and -not $UnverifiedNativeLibs) {
+    throw "Release AARs cannot be built with -SkipRustBuild: the packaged native libraries would not be built from this source"
+}
+if ($UnverifiedNativeLibs -and -not $SkipRustBuild) {
+    throw "-UnverifiedNativeLibs is only meaningful with -SkipRustBuild"
 }
 
 $SourceDateEpoch = $env:SOURCE_DATE_EPOCH

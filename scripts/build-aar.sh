@@ -43,7 +43,10 @@ show_help() {
     echo "  arm64-v8a        Build for ARM64"
     echo "  x86_64           Build for x86_64"
     echo "  all              Build for all architectures"
-    echo "  --skip-rust      Skip Rust build step"
+    echo "  --skip-rust      Skip Rust build step (refused for release; see --unverified-native-libs)"
+    echo "  --unverified-native-libs  Package .so files this invocation did not build."
+    echo "                   Only meaningful with --skip-rust. The result is not a"
+    echo "                   release artifact and must not be published."
     echo "  --help           Show this help"
     exit 0
 }
@@ -115,6 +118,7 @@ PRODUCT_PROFILE="full"
 CODEGEN_PROFILE="z"
 WORKER_SNAPSHOT=false
 SKIP_RUST=false
+UNVERIFIED_NATIVE_LIBS=false
 ARTIFACT_MANIFEST_MODE="${MIGO_ARTIFACT_MANIFEST_MODE:-}"
 ARCHITECTURES=()
 USE_ALL_ARCH=false
@@ -124,6 +128,10 @@ while [[ $# -gt 0 ]]; do
     case "$arg" in
         --help|-h)
             show_help
+            ;;
+        --unverified-native-libs)
+            UNVERIFIED_NATIVE_LIBS=true
+            shift
             ;;
         --skip-rust)
             SKIP_RUST=true
@@ -239,6 +247,26 @@ if [[ "$ARTIFACT_MANIFEST_MODE" != "required" && "$ARTIFACT_MANIFEST_MODE" != "o
 fi
 if [[ "$BUILD_TYPE" == "release" && "$ARTIFACT_MANIFEST_MODE" != "required" ]]; then
     print_error "Release AARs require --artifact-manifest required"
+    exit 1
+fi
+# A release AAR must carry native libraries built from this source. `--skip-rust`
+# packages whatever `.so` files happen to be on disk, and `validate_native_libraries`
+# only checks that they *exist* -- so a release built this way ships natives from
+# another commit, another product profile or another codegen setting, and nothing in
+# the artifact says so. Refused here, at argument time, rather than deeper: this is a
+# property of the request, and the release workflow gets the protection without
+# needing a gate of its own.
+#
+# `--unverified-native-libs` is the way to say "I am exercising the packaging logic,
+# not producing something publishable". It exists because the worker-snapshot jniLibs
+# check can only be reached through a release build, so removing that path would
+# delete its only test rather than making anything safer.
+if [[ "$BUILD_TYPE" == "release" && "$SKIP_RUST" == true && "$UNVERIFIED_NATIVE_LIBS" != true ]]; then
+    print_error "Release AARs cannot be built with --skip-rust: the packaged native libraries would not be built from this source"
+    exit 1
+fi
+if [[ "$UNVERIFIED_NATIVE_LIBS" == true && "$SKIP_RUST" != true ]]; then
+    print_error "--unverified-native-libs is only meaningful with --skip-rust"
     exit 1
 fi
 

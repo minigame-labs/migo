@@ -155,6 +155,11 @@ mkdir -p "$TEST_TMP_ROOT/scripts" \
     "$TEST_TMP_ROOT/platforms/android/library" \
     "$TEST_TMP_ROOT/engine/jniLibs/full/arm64-v8a"
 cp "$AAR" "$TEST_TMP_ROOT/scripts/build-aar.sh"
+# The fixture needs the helper library too. Without it `build-aar.sh` dies at its
+# first `source` under `set -euo pipefail`, long before the check below, and the
+# assertion then failed on a missing file rather than on the property it names --
+# which is how this case came to be red on master while looking like a real check.
+cp -r "$ROOT/scripts/lib" "$TEST_TMP_ROOT/scripts/lib"
 printf '#!/usr/bin/env bash\nexit 99\n' \
     > "$TEST_TMP_ROOT/scripts/build-android-so.sh"
 chmod +x "$TEST_TMP_ROOT/scripts/build-android-so.sh"
@@ -163,7 +168,7 @@ chmod +x "$TEST_TMP_ROOT/scripts/build-android-so.sh"
 expect_rejection \
     "jniLibs directory not found: $TEST_TMP_ROOT/engine/jniLibs/full-worker-snapshot" \
     bash "$TEST_TMP_ROOT/scripts/build-aar.sh" \
-        --skip-rust --worker-snapshot release arm64-v8a
+        --skip-rust --unverified-native-libs --worker-snapshot release arm64-v8a
 
 expect_rejection "Worker snapshot requires a full release build" \
     bash "$ANDROID_SO" debug --worker-snapshot
