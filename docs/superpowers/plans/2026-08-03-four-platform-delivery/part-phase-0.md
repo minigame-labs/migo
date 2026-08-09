@@ -1256,6 +1256,39 @@
   Making it a lane means teaching the sync to carry an uncommitted tree, which is
   its own change.
 
+  **Overlay ownership: a process-wide slot for a per-session thing, found by
+  asking whether two games can run at once.** `InteractionUI` kept
+  `static View sToastOverlay` / `sLoadingOverlay` — one toast and one loading
+  spinner for the whole process. The second session's `showLoading` therefore
+  took back the *first* session's spinner, except that a view belongs to its own
+  Activity's decor, so the removal did nothing while the reference was dropped:
+  the first game's overlay left on screen with nothing able to remove it. It
+  leaked with one session too — nothing on the teardown path cleared those
+  fields, so a session closing with a toast up held a destroyed Activity and its
+  whole window hierarchy alive until some later session happened to call hide.
+
+  The fix separates lifetime from views: `SessionOverlays` keeps a slot per
+  session and the views live inside the removers, so the part that was wrong is
+  the part that can now be checked without an Activity. `InteractionUI` builds
+  and attaches; the registry owns what is on screen. `hideToast`/`hideLoading`
+  no longer take an `Activity` at all — the object to remove and the parent to
+  remove it from both live in the remover, so the two can no longer disagree.
+  The teardown joins `destroyAllManagers`, inline rather than posted when the
+  caller is already the main thread, so a failure is reported by the terminal
+  cleanup's aggregate instead of landing after `close()` has returned.
+
+  Two orderings are decisions, and the same one twice: **the slot is emptied
+  before its remover runs** (removing a view can call back into content, and a
+  toast shown from inside that callback must survive the teardown that provoked
+  it), and **`install` releases before it stores**. Eight cases, four mutants,
+  four killed: install-without-release by
+  `showing_again_takes_back_what_was_already_in_the_slot`, run-while-occupying by
+  `the_slot_is_empty_while_its_remover_runs`, a teardown that forgets the session
+  without detaching its views by three cases, and a teardown that reaches past
+  its own session by
+  `closing_one_session_leaves_the_other_sessions_overlays_alone`. Java 195 per
+  flavour.
+
   **The restart sweep is deliberately not here, and the interlock is the reason.**
   Today nothing tears down Android managers on a restart — `destroyAllManagers`
   has exactly one caller, `GameSession.close()` — so a retired session's sensors,

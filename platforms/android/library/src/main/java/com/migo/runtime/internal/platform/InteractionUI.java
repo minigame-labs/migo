@@ -40,16 +40,11 @@ public final class InteractionUI {
 
     private static final Handler sHandler = new Handler(Looper.getMainLooper());
 
-    // Current overlay references (for hide operations)
-    private static View sToastOverlay;
-    private static View sLoadingOverlay;
-    private static Runnable sToastDismissRunnable;
-
     private InteractionUI() {}
 
     // ==================== Toast ====================
 
-    public static void showToast(final Activity activity, final String json) {
+    public static void showToast(final Activity activity, final int sessionId, final String json) {
         sHandler.post(() -> {
             try {
                 JSONObject params = new JSONObject(json);
@@ -58,63 +53,68 @@ public final class InteractionUI {
                 int duration = params.optInt("duration", 1500);
                 boolean mask = params.optBoolean("mask", false);
 
-                hideToastInternal(activity);
-
                 View overlay = createOverlay(activity, title, icon, mask);
                 addOverlay(activity, overlay);
-                sToastOverlay = overlay;
 
-                sToastDismissRunnable = () -> hideToastInternal(activity);
-                sHandler.postDelayed(sToastDismissRunnable, duration);
+                // The auto-dismiss and the view come off together, so a hide
+                // that arrives first cannot leave a timer that later removes
+                // whatever has replaced this overlay.
+                Runnable dismiss = () -> SessionOverlays.release(
+                        sessionId, SessionOverlays.Slot.TOAST);
+                SessionOverlays.install(sessionId, SessionOverlays.Slot.TOAST, () -> {
+                    sHandler.removeCallbacks(dismiss);
+                    removeOverlay(activity, overlay);
+                });
+                sHandler.postDelayed(dismiss, duration);
             } catch (Exception e) {
                 // Silently fail
             }
         });
     }
 
-    public static void hideToast(final Activity activity) {
-        sHandler.post(() -> hideToastInternal(activity));
-    }
-
-    private static void hideToastInternal(Activity activity) {
-        if (sToastDismissRunnable != null) {
-            sHandler.removeCallbacks(sToastDismissRunnable);
-            sToastDismissRunnable = null;
-        }
-        if (sToastOverlay != null) {
-            removeOverlay(activity, sToastOverlay);
-            sToastOverlay = null;
-        }
+    public static void hideToast(final int sessionId) {
+        sHandler.post(() -> SessionOverlays.release(sessionId, SessionOverlays.Slot.TOAST));
     }
 
     // ==================== Loading ====================
 
-    public static void showLoading(final Activity activity, final String json) {
+    public static void showLoading(final Activity activity, final int sessionId,
+                                   final String json) {
         sHandler.post(() -> {
             try {
                 JSONObject params = new JSONObject(json);
                 String title = params.optString("title", "");
                 boolean mask = params.optBoolean("mask", false);
 
-                hideLoadingInternal(activity);
-
                 View overlay = createOverlay(activity, title, "loading", mask);
                 addOverlay(activity, overlay);
-                sLoadingOverlay = overlay;
+                SessionOverlays.install(sessionId, SessionOverlays.Slot.LOADING,
+                        () -> removeOverlay(activity, overlay));
             } catch (Exception e) {
                 // Silently fail
             }
         });
     }
 
-    public static void hideLoading(final Activity activity) {
-        sHandler.post(() -> hideLoadingInternal(activity));
+    public static void hideLoading(final int sessionId) {
+        sHandler.post(() -> SessionOverlays.release(sessionId, SessionOverlays.Slot.LOADING));
     }
 
-    private static void hideLoadingInternal(Activity activity) {
-        if (sLoadingOverlay != null) {
-            removeOverlay(activity, sLoadingOverlay);
-            sLoadingOverlay = null;
+    /**
+     * Take back every overlay this session still owns.
+     *
+     * <p>Part of the session's terminal cleanup: without it a session that
+     * closes with a toast on screen leaves a reference to a view of a destroyed
+     * Activity, holding the whole window hierarchy alive.
+     */
+    public static void destroy(final int sessionId) {
+        // Inline when the caller is already the main thread, which the terminal
+        // cleanup is: posting would run the teardown after `close()` had
+        // returned, outside the aggregate that reports its failures.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            SessionOverlays.releaseAll(sessionId);
+        } else {
+            sHandler.post(() -> SessionOverlays.releaseAll(sessionId));
         }
     }
 

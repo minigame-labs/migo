@@ -1100,7 +1100,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.showToast(activity, json);
+        InteractionUI.showToast(activity, sessionId, json);
     }
 
     /**
@@ -1113,7 +1113,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.hideToast(activity);
+        InteractionUI.hideToast(sessionId);
     }
 
     /**
@@ -1150,7 +1150,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.showLoading(activity, json);
+        InteractionUI.showLoading(activity, sessionId, json);
     }
 
     /**
@@ -1163,7 +1163,7 @@ public final class NativeExports {
         if (context == null) return;
         Activity activity = context.getActivity();
         if (activity == null) return;
-        InteractionUI.hideLoading(activity);
+        InteractionUI.hideLoading(sessionId);
     }
 
     /**
@@ -2659,6 +2659,10 @@ public final class NativeExports {
                     if (BuildConfig.MIGO_API_MEDIA) MediaExports.destroyAll(sessionId);
                 },
                 () -> InputExports.destroyAll(sessionId),
+                // Overlays are views this session put in its Activity's decor.
+                // Left here, a session closing with a toast up holds a destroyed
+                // Activity alive through a static reference.
+                () -> InteractionUI.destroy(sessionId),
                 () -> {
                     if (BuildConfig.MIGO_API_CONNECTIVITY) BluetoothExports.destroyAll(sessionId);
                 },
