@@ -33,14 +33,33 @@ public final class SensorExports {
                 manager::setLifecycleSuspended);
     }
 
+    /**
+     * The sensor manager belonging to the runtime that is running now.
+     *
+     * <p>Not {@code sSensorManagers.get}: the cache is keyed by session, so a
+     * restart would otherwise hand the replacement isolate the manager the
+     * retired one built — still registered with {@link android.hardware.SensorManager},
+     * still firing, and stamping a generation the engine drops at dispatch. The
+     * game would call {@code startAccelerometer} and never receive a reading.
+     */
+    private static DeviceSensorManager liveSensorManager(int sessionId) {
+        return RuntimeGenerationBoundary.liveEntry(
+                sSensorManagers, sessionId, DeviceSensorManager::destroy);
+    }
+
+    private static ScreenCaptureObserver liveCaptureObserver(int sessionId) {
+        return RuntimeGenerationBoundary.liveEntry(
+                sCaptureObservers, sessionId, ScreenCaptureObserver::destroy);
+    }
+
     private static DeviceSensorManager getOrCreateSensorManager(int sessionId) {
-        DeviceSensorManager existing = sSensorManagers.get(sessionId);
+        DeviceSensorManager existing = liveSensorManager(sessionId);
         if (existing != null) {
             syncSensorLifecycle(sessionId, existing);
             return existing;
         }
         synchronized (sSensorLock) {
-            existing = sSensorManagers.get(sessionId);
+            existing = liveSensorManager(sessionId);
             if (existing != null) {
                 syncSensorLifecycle(sessionId, existing);
                 return existing;
@@ -66,7 +85,7 @@ public final class SensorExports {
     }
 
     public static void stopDeviceMotionListening(int sessionId) {
-        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        DeviceSensorManager mgr = liveSensorManager(sessionId);
         if (mgr != null) {
             mgr.stopDeviceMotionListening();
         }
@@ -80,7 +99,7 @@ public final class SensorExports {
     }
 
     public static void stopGyroscope(int sessionId) {
-        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        DeviceSensorManager mgr = liveSensorManager(sessionId);
         if (mgr != null) {
             mgr.stopGyroscope();
         }
@@ -94,7 +113,7 @@ public final class SensorExports {
     }
 
     public static void stopCompass(int sessionId) {
-        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        DeviceSensorManager mgr = liveSensorManager(sessionId);
         if (mgr != null) {
             mgr.stopCompass();
         }
@@ -108,7 +127,7 @@ public final class SensorExports {
     }
 
     public static void stopAccelerometer(int sessionId) {
-        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        DeviceSensorManager mgr = liveSensorManager(sessionId);
         if (mgr != null) {
             mgr.stopAccelerometer();
         }
@@ -122,24 +141,24 @@ public final class SensorExports {
     }
 
     public static void suspendPowerSensitiveManagers(int sessionId) {
-        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        DeviceSensorManager mgr = liveSensorManager(sessionId);
         if (mgr != null) {
             mgr.suspendForLifecycle();
         }
     }
 
     public static void resumePowerSensitiveManagers(int sessionId) {
-        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        DeviceSensorManager mgr = liveSensorManager(sessionId);
         if (mgr != null) {
             mgr.resumeForLifecycle();
         }
     }
 
     public static void startCaptureScreen(int sessionId) {
-        ScreenCaptureObserver observer = sCaptureObservers.get(sessionId);
+        ScreenCaptureObserver observer = liveCaptureObserver(sessionId);
         if (observer == null) {
             synchronized (sCaptureLock) {
-                observer = sCaptureObservers.get(sessionId);
+                observer = liveCaptureObserver(sessionId);
                 if (observer == null) {
                     RuntimeContext ctx = RuntimeRegistry.get(sessionId);
                     if (ctx == null) return;
@@ -155,7 +174,7 @@ public final class SensorExports {
     }
 
     public static void stopCaptureScreen(int sessionId) {
-        ScreenCaptureObserver observer = sCaptureObservers.get(sessionId);
+        ScreenCaptureObserver observer = liveCaptureObserver(sessionId);
         if (observer != null) {
             observer.stop();
         }

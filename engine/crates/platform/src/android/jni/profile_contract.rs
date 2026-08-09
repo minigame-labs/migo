@@ -86,13 +86,13 @@ const NATIVE_CORE: &[JniMethod] = methods![
 ];
 
 const NATIVE_SENSORS: &[JniMethod] = methods![
-    ("onDeviceMotionChange", "(IDDD)V"),
-    ("onGyroscopeChange", "(IDDD)V"),
+    ("onDeviceMotionChange", "(IJDDD)V"),
+    ("onGyroscopeChange", "(IJDDD)V"),
     ("onDeviceOrientationChange", "(ILjava/lang/String;)V"),
-    ("onCompassChange", "(IDLjava/lang/String;)V"),
-    ("onAccelerometerChange", "(IDDD)V"),
+    ("onCompassChange", "(IJDLjava/lang/String;)V"),
+    ("onAccelerometerChange", "(IJDDD)V"),
     ("onNetworkStatusChange", "(IZLjava/lang/String;)V"),
-    ("onUserCaptureScreen", "(I)V"),
+    ("onUserCaptureScreen", "(IJ)V"),
     ("onLocationResult", "(ILjava/lang/String;)V"),
     ("onFuzzyLocationResult", "(ILjava/lang/String;)V"),
     ("onScanCodeResult", "(ILjava/lang/String;)V"),

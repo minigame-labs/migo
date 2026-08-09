@@ -628,6 +628,7 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
 mod tests {
     use shared::host_channel::InputSendOutcome;
     use shared::surface::{Surface, SurfaceControl, SurfaceRef};
+    use std::num::NonZeroI64;
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -1009,7 +1010,7 @@ mod tests {
         assert_eq!(
             keyboard_ingress.try_send_keyboard(HostCommand::OnKeyboardComplete {
                 value: "done".to_owned(),
-                runtime_generation: Some(stamped),
+                runtime_generation: NonZeroI64::new(stamped),
             }),
             Ok(InputSendOutcome::Reserved)
         );
@@ -1027,7 +1028,7 @@ mod tests {
         assert!(matches!(keyboard_rx.try_recv(), Ok(HostCommand::Restart)));
         let reserved = keyboard_rx.try_recv().expect("reserved keyboard command");
         assert!(matches!(reserved, HostCommand::OnKeyboardComplete { .. }));
-        assert_eq!(reserved.callback_generation(), Some(stamped));
+        assert_eq!(reserved.callback_generation(), NonZeroI64::new(stamped));
     }
 
     #[test]

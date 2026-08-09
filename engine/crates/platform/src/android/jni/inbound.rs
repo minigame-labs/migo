@@ -933,9 +933,19 @@ pub(crate) extern "system" fn onAudioInterruptionEnd(_env: JNIEnv, _class: JClas
     });
 }
 
-pub(crate) extern "system" fn onUserCaptureScreen(_env: JNIEnv, _class: JClass, host_id: jint) {
+pub(crate) extern "system" fn onUserCaptureScreen(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    generation: jlong,
+) {
     jni_safe!("onUserCaptureScreen", {
-        let _ = send_command_to_host(host_id, HostCommand::OnUserCaptureScreen);
+        let _ = send_command_to_host(
+            host_id,
+            HostCommand::OnUserCaptureScreen {
+                runtime_generation: captured_generation(generation),
+            },
+        );
     });
 }
 
@@ -978,6 +988,7 @@ pub(crate) extern "system" fn onDeviceMotionChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     alpha: jdouble,
     beta: jdouble,
     gamma: jdouble,
@@ -989,6 +1000,7 @@ pub(crate) extern "system" fn onDeviceMotionChange(
                 alpha: alpha as f64,
                 beta: beta as f64,
                 gamma: gamma as f64,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -998,6 +1010,7 @@ pub(crate) extern "system" fn onGyroscopeChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     x: jdouble,
     y: jdouble,
     z: jdouble,
@@ -1009,6 +1022,7 @@ pub(crate) extern "system" fn onGyroscopeChange(
                 x: x as f64,
                 y: y as f64,
                 z: z as f64,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1034,6 +1048,7 @@ pub(crate) extern "system" fn onCompassChange<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     direction: jdouble,
     accuracy: JString<'local>,
 ) {
@@ -1045,6 +1060,7 @@ pub(crate) extern "system" fn onCompassChange<'local>(
             HostCommand::OnCompassChange {
                 direction: direction as f64,
                 accuracy: acc,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1054,6 +1070,7 @@ pub(crate) extern "system" fn onAccelerometerChange(
     _env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     x: jdouble,
     y: jdouble,
     z: jdouble,
@@ -1065,6 +1082,7 @@ pub(crate) extern "system" fn onAccelerometerChange(
                 x: x as f64,
                 y: y as f64,
                 z: z as f64,
+                runtime_generation: captured_generation(generation),
             },
         );
     });

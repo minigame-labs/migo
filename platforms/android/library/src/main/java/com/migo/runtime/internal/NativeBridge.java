@@ -221,7 +221,8 @@ public final class NativeBridge {
      * @param beta      Rotation around X axis in degrees (-180 to 180)
      * @param gamma     Rotation around Y axis in degrees (-90 to 90)
      */
-    public static native void onDeviceMotionChange(int sessionId, double alpha, double beta, double gamma);
+    public static native void onDeviceMotionChange(
+            int sessionId, long generation, double alpha, double beta, double gamma);
 
     /**
      * Callback when gyroscope data is available.
@@ -231,7 +232,8 @@ public final class NativeBridge {
      * @param y         Angular velocity around Y axis in rad/s
      * @param z         Angular velocity around Z axis in rad/s
      */
-    public static native void onGyroscopeChange(int sessionId, double x, double y, double z);
+    public static native void onGyroscopeChange(
+            int sessionId, long generation, double x, double y, double z);
 
     /**
      * Callback when device screen orientation changes.
@@ -248,7 +250,8 @@ public final class NativeBridge {
      * @param direction Direction in degrees (0-360, 0 = north)
      * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable"
      */
-    public static native void onCompassChange(int sessionId, double direction, String accuracy);
+    public static native void onCompassChange(
+            int sessionId, long generation, double direction, String accuracy);
 
     /**
      * Callback when accelerometer data is available.
@@ -258,7 +261,8 @@ public final class NativeBridge {
      * @param y         Acceleration along Y axis in m/s^2
      * @param z         Acceleration along Z axis in m/s^2
      */
-    public static native void onAccelerometerChange(int sessionId, double x, double y, double z);
+    public static native void onAccelerometerChange(
+            int sessionId, long generation, double x, double y, double z);
 
     // ==================== Network Callbacks ====================
 
@@ -439,7 +443,7 @@ public final class NativeBridge {
      *
      * @param sessionId The session ID
      */
-    public static native void onUserCaptureScreen(int sessionId);
+    public static native void onUserCaptureScreen(int sessionId, long generation);
 
     // ==================== Memory Warning ====================
 

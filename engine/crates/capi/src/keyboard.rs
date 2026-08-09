@@ -7,7 +7,7 @@
 //! physical key is a discrete press of an identified key. Content reads the two
 //! through different listeners.
 
-use shared::protocol::host_cmd::HostCommand;
+use shared::protocol::host_cmd::{HostCommand, captured_generation};
 
 use crate::panic_barrier::guard;
 use crate::{MigoSession, map_ingress_result, pin_session};
@@ -43,7 +43,10 @@ fn validated_keyboard_to_command(
     event: ValidatedKeyboardEvent,
     runtime_generation: i64,
 ) -> HostCommand {
-    let runtime_generation = Some(runtime_generation);
+    // Through the same helper every other producer uses rather than a bare
+    // `Some`: a host that somehow observed a non-positive generation is
+    // unfenced, which is delivered, not retired.
+    let runtime_generation = captured_generation(runtime_generation);
     match event {
         ValidatedKeyboardEvent::Input(value) => HostCommand::OnKeyboardInput {
             value,
@@ -249,6 +252,7 @@ mod tests {
     use crate::test_support::with_session;
     use migo_capi_abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI, VersionedHeader};
     use std::mem::size_of;
+    use std::num::NonZeroI64;
 
     fn text_event(kind: u32, value: &str) -> MigoKeyboardEvent {
         MigoKeyboardEvent {
@@ -640,14 +644,14 @@ mod tests {
             let command = unsafe { to_host_command(event, 7) }.expect("well-formed");
             assert_eq!(
                 command.callback_generation(),
-                Some(7),
+                NonZeroI64::new(7),
                 "{command:?} lost its generation"
             );
         }
 
         // A second value, so a hard-coded constant cannot pass the first half.
         let command = unsafe { to_host_command(&events[0], 8) }.expect("well-formed");
-        assert_eq!(command.callback_generation(), Some(8));
+        assert_eq!(command.callback_generation(), NonZeroI64::new(8));
     }
 
     #[test]

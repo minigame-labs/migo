@@ -520,9 +520,10 @@ public final class NativeMethods {
      * @param beta      Rotation around X axis in degrees (-180 to 180)
      * @param gamma     Rotation around Y axis in degrees (-90 to 90)
      */
-    public static void onDeviceMotionChange(int sessionId, double alpha, double beta, double gamma) {
+    public static void onDeviceMotionChange(
+            int sessionId, long generation, double alpha, double beta, double gamma) {
         if (sessionId >= 0) {
-            NativeBridge.onDeviceMotionChange(sessionId, alpha, beta, gamma);
+            NativeBridge.onDeviceMotionChange(sessionId, generation, alpha, beta, gamma);
         }
     }
 
@@ -535,9 +536,10 @@ public final class NativeMethods {
      * @param y         Angular velocity around Y axis in rad/s
      * @param z         Angular velocity around Z axis in rad/s
      */
-    public static void onGyroscopeChange(int sessionId, double x, double y, double z) {
+    public static void onGyroscopeChange(
+            int sessionId, long generation, double x, double y, double z) {
         if (sessionId >= 0) {
-            NativeBridge.onGyroscopeChange(sessionId, x, y, z);
+            NativeBridge.onGyroscopeChange(sessionId, generation, x, y, z);
         }
     }
 
@@ -560,9 +562,10 @@ public final class NativeMethods {
      * @param direction Direction in degrees (0-360, 0 = north)
      * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable", or "unknow X"
      */
-    public static void onCompassChange(int sessionId, double direction, String accuracy) {
+    public static void onCompassChange(
+            int sessionId, long generation, double direction, String accuracy) {
         if (sessionId >= 0) {
-            NativeBridge.onCompassChange(sessionId, direction, accuracy);
+            NativeBridge.onCompassChange(sessionId, generation, direction, accuracy);
         }
     }
 
@@ -575,9 +578,10 @@ public final class NativeMethods {
      * @param y         Acceleration along Y axis in m/s^2
      * @param z         Acceleration along Z axis in m/s^2
      */
-    public static void onAccelerometerChange(int sessionId, double x, double y, double z) {
+    public static void onAccelerometerChange(
+            int sessionId, long generation, double x, double y, double z) {
         if (sessionId >= 0) {
-            NativeBridge.onAccelerometerChange(sessionId, x, y, z);
+            NativeBridge.onAccelerometerChange(sessionId, generation, x, y, z);
         }
     }
 
@@ -745,9 +749,9 @@ public final class NativeMethods {
      *
      * @param sessionId The session ID
      */
-    public static void onUserCaptureScreen(int sessionId) {
+    public static void onUserCaptureScreen(int sessionId, long generation) {
         if (sessionId >= 0) {
-            NativeBridge.onUserCaptureScreen(sessionId);
+            NativeBridge.onUserCaptureScreen(sessionId, generation);
         }
     }
 

@@ -1289,7 +1289,101 @@
   `closing_one_session_leaves_the_other_sessions_overlays_alone`. Java 195 per
   flavour.
 
-  **The restart sweep is deliberately not here, and the interlock is the reason.**
+  **Task 7 continued 2026-08-09 (third): the fence field shrank to eight bytes,
+  the sensor streams joined it, and the restart now releases what it fences.**
+
+  **`HostCommand` measures exactly 64 bytes, which is exactly its own cap.**
+  Measured, not assumed — the assertion beneath the enum says `<= 64` and the
+  comment above `OnTouch` says why ("up to 512 normal commands can be pending, so
+  enum size directly affects queue memory"), but nobody had written down that the
+  headroom was zero. Fencing a variant with `Option<i64>` spends sixteen bytes of
+  a budget that has none, and there are twenty-odd producers left to fence, some
+  of which carry two strings already. So the field became
+  `Option<NonZeroI64>`: **eight bytes, the same as a bare `i64`**, because the
+  niche is the `None`. Doing it now cost four variants; doing it after the
+  Bluetooth and camera producers would have cost twenty-six and a redesign of
+  whichever one hit the cap first.
+
+  It is also better than a size trick. `captured_generation` existed to reject
+  non-positive values, and its result type now makes "zero is not a generation"
+  something the type cannot express rather than a rule one function remembers to
+  enforce. A second static assertion pins the niche itself, because the day it is
+  lost nothing observable changes — every test still passes and every command
+  costs a word more.
+
+  **Five more producers are fenced**: the four sensor streams
+  (`OnDeviceMotionChange`, `OnGyroscopeChange`, `OnCompassChange`,
+  `OnAccelerometerChange`) and the screenshot observer (`OnUserCaptureScreen`,
+  which was a unit variant and is now a struct one). Both Android managers capture
+  a token in their constructor, both implement `RuntimeScoped`, and **every**
+  lookup in `SensorExports` — not just the create path — goes through
+  `liveEntry`, so a retired sensor manager is destroyed and rebuilt rather than
+  handed to the isolate that replaced its owner.
+
+  **`OnDeviceOrientationChange` is deliberately left unfenced**, and it sits one
+  line away from four that are not. It is produced by the Activity, not by the
+  sensor manager, and a rotation is a *current fact about the device*: dropping
+  one because a restart happened would leave the replacement isolate believing the
+  screen is the way it was two runtimes ago, with nothing that ever corrects it.
+  Same reasoning as a physical key going up. `a_device_orientation_change_is_never_fenced`
+  is the test, and mutant M14 is what makes it load-bearing.
+
+  **The restart now releases the groups it fences.** `beginRuntimeRestart` closes
+  the boundary and then tears down the sensors, the input managers and the
+  overlays. Until now nothing did: `destroyAllManagers` had exactly one caller,
+  `GameSession.close()`, so a restart left every listener the retired isolate
+  registered still registered — an accelerometer still sampling at 20 ms, a
+  screenshot observer still querying MediaStore — owned by no runtime and
+  reporting to nothing, until the session ended. The fence made those events
+  harmless; it never made them free.
+
+  **Only fenced groups are swept, and the criterion is their own teardown.**
+  Destroying a manager can report — the keyboard's emits an
+  `onKeyboardComplete`, a camera's emits a stop — and those land on the queue
+  while `on_restart` is still running on the engine thread, so they are dispatched
+  to the runtime that *replaces* this one, as if it had produced them. A fenced
+  producer stamps the retired generation and the engine drops them. An unfenced
+  one would have the sweep inject exactly the cross-talk the mechanism exists to
+  remove. Media, Bluetooth and Network join when they capture tokens, not before.
+  The two orderings that make it safe: the boundary closes *before* the teardown,
+  so nothing acquired during it gets the generation that is leaving; and a
+  teardown that throws leaves the session `RESTARTING`, which only reopens because
+  the completion is authoritative — the two changes in this session hold each
+  other up.
+
+  | mutant | killed by |
+  |---|---|
+  | the accelerometer stream is left in the unfenced group | `the_sensor_streams_and_the_screenshot_observer_carry_their_generation` |
+  | the screenshot observer is left in the unfenced group | the same case |
+  | device orientation is fenced along with the streams | `a_device_orientation_change_is_never_fenced` |
+  | one fenced variant reverts to a 16-byte field | the type system — no test can see this, which is why the assertion is written down |
+
+  ⚠️ **The mutation harness reported a survivor it had never made.** M14's target
+  text did not match, `mutate` failed, and the suite then ran against the
+  *unmutated* file and passed — printed as `SURVIVED`. Under §"gate measurement
+  pitfalls" this is the whole family in one line: a measurement whose failure mode
+  is indistinguishable from its negative result. The harness now aborts loudly
+  when a mutation does not apply. A second mutant in the same run was "killed" by
+  a syntax error rather than by anything meaning anything; rebuilt as a real arm
+  move, it is killed by a named test.
+
+  Verified: host suites for `shared`, `core`, `capi` and `platform` (both
+  profiles), Java 195 per flavour on both variants, `build-android-so.sh
+  --compile-only arm64-v8a`, `test-android-host-api-contract`,
+  `test-r8-profile-contract`, `test-input-trigger-producer-contract`,
+  `test-host-bridge-channel-contract`, the C ABI surface candidate, `fmt --check`
+  and `git diff --check`. The five JNI descriptors moved in the pinned table with
+  their signatures; nothing was added, so the surface counts are unchanged.
+
+  **Untested, and named rather than implied:** `DeviceSensorManager` and
+  `ScreenCaptureObserver` themselves, for the same reason as `KeyboardManager` —
+  their constructors need a `Context` and a main `Looper`, and nothing device-free
+  can build one. What is covered is every piece: the boundary, the sweep, the
+  arm each command sits in, and the pinned descriptors that fail if one side of a
+  JNI signature moves alone.
+
+  **The restart sweep for the remaining groups is deliberately not here, and the
+  interlock is the reason.**
   Today nothing tears down Android managers on a restart — `destroyAllManagers`
   has exactly one caller, `GameSession.close()` — so a retired session's sensors,
   BLE connections and camera keep running, owned by no runtime, until the session

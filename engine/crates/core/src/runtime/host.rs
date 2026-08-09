@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 /// [`HostCommand::callback_generation`] for the two reasons it may carry none,
 /// neither of which means "stale".
 fn is_retired_callback(cmd: &HostCommand, current_generation: i64) -> bool {
-    matches!(cmd.callback_generation(), Some(produced_for) if produced_for != current_generation)
+    matches!(cmd.callback_generation(), Some(produced_for) if produced_for.get() != current_generation)
 }
 
 use shared::{
@@ -957,12 +957,26 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnDeviceMotionChange { alpha, beta, gamma } => {
+            // The generation is read at the top of `handle_command_inner`, which
+            // is the only place that may act on it: a handler comparing it again
+            // would be a second decision point that could disagree with the one
+            // that already let this command through. Hence `_` here and below.
+            HostCommand::OnDeviceMotionChange {
+                alpha,
+                beta,
+                gamma,
+                runtime_generation: _,
+            } => {
                 self.js.dispatch_device_motion(alpha, beta, gamma);
                 Ok(())
             }
 
-            HostCommand::OnGyroscopeChange { x, y, z } => {
+            HostCommand::OnGyroscopeChange {
+                x,
+                y,
+                z,
+                runtime_generation: _,
+            } => {
                 self.js.dispatch_gyroscope(x, y, z);
                 Ok(())
             }
@@ -975,12 +989,18 @@ impl Host {
             HostCommand::OnCompassChange {
                 direction,
                 accuracy,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_compass(direction, &accuracy);
                 Ok(())
             }
 
-            HostCommand::OnAccelerometerChange { x, y, z } => {
+            HostCommand::OnAccelerometerChange {
+                x,
+                y,
+                z,
+                runtime_generation: _,
+            } => {
                 self.js.dispatch_accelerometer(x, y, z);
                 Ok(())
             }
@@ -1252,7 +1272,7 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnUserCaptureScreen => {
+            HostCommand::OnUserCaptureScreen { .. } => {
                 self.js
                     .invoke_host_hook("_internalTriggerUserCaptureScreen", HOOK_ARGS_NONE);
                 Ok(())
@@ -1725,11 +1745,13 @@ impl Host {
 mod retired_callback_tests {
     use super::is_retired_callback;
     use shared::HostCommand;
+    use std::num::NonZeroI64;
 
     fn keyboard(generation: Option<i64>) -> HostCommand {
         HostCommand::OnKeyboardComplete {
             value: "done".to_owned(),
-            runtime_generation: generation,
+            runtime_generation: generation
+                .map(|value| NonZeroI64::new(value).expect("a captured generation is never zero")),
         }
     }
 

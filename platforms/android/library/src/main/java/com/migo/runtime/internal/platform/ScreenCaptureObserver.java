@@ -12,6 +12,8 @@ import android.os.Looper;
 import android.provider.MediaStore;
 
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.RuntimeGenerationBoundary;
+import com.migo.runtime.internal.RuntimeScoped;
 
 /**
  * Observes screenshot events by monitoring MediaStore changes.
@@ -26,7 +28,7 @@ import com.migo.runtime.internal.NativeMethods;
  *
  * @hide
  */
-public final class ScreenCaptureObserver {
+public final class ScreenCaptureObserver implements RuntimeScoped {
 
     private static final String TAG = "ScreenCaptureObserver";
     private static final long DEBOUNCE_MS = 1000;
@@ -55,8 +57,24 @@ public final class ScreenCaptureObserver {
     private ContentObserver observer;
     private long lastNotifyTime = 0;
 
+
+    /**
+     * The runtime this observer belongs to.
+     *
+     * <p>Captured once, here, and stamped on every event it reports. A listener
+     * registered by one isolate stays registered across a restart and keeps
+     * firing; the stamp is what lets the engine tell those events from the
+     * replacement runtime's own.
+     */
+    private final RuntimeGenerationBoundary.Token token;
+
+    @Override
+    public RuntimeGenerationBoundary.Token runtimeToken() {
+        return token;
+    }
     public ScreenCaptureObserver(int sessionId, Context context) {
         this.sessionId = sessionId;
+        this.token = RuntimeGenerationBoundary.acquire(sessionId);
         this.contentResolver = context.getContentResolver();
         this.handler = new Handler(Looper.getMainLooper());
     }
@@ -128,7 +146,7 @@ public final class ScreenCaptureObserver {
 
     private void notifyCapture(long now) {
         lastNotifyTime = now;
-        NativeMethods.onUserCaptureScreen(sessionId);
+        NativeMethods.onUserCaptureScreen(sessionId, token.generation());
     }
 
     private boolean isScreenshotUri(Uri uri) {

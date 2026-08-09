@@ -253,7 +253,47 @@ public final class NativeExports {
      * @hide
      */
     public static void beginRuntimeRestart(int sessionId, long retired, long next) {
+        // The boundary closes first, so nothing acquired during the teardown can
+        // be handed the generation that is leaving. A teardown that then throws
+        // leaves the session RESTARTING, which the completion reopens because it
+        // is authoritative rather than matched against a remembered candidate.
         RuntimeGenerationBoundary.beginRestart(sessionId, retired, next);
+        destroyRuntimeScopedManagers(sessionId);
+    }
+
+    /**
+     * Tear down the per-session objects the runtime being replaced created.
+     *
+     * <p>Without this a restart leaves every listener the retired isolate
+     * registered still registered: an accelerometer still sampling, a screenshot
+     * observer still querying MediaStore, a keyboard still on screen — owned by
+     * no runtime, reporting to nothing, until the session ends. The generation
+     * fence makes those events harmless; it does not stop them costing battery
+     * and memory.
+     *
+     * <p><b>Only groups whose producers are fenced are swept, and the reason is
+     * their own teardown.</b> Destroying a manager can report: the keyboard's
+     * emits an {@code onKeyboardComplete}, and a camera's emits a stop. Those
+     * land on the queue while {@code on_restart} is still running on the engine
+     * thread, so they are dispatched to the runtime that replaces this one — as
+     * if it had produced them. A fenced producer stamps the retired generation
+     * and the engine drops them; an unfenced one would inject exactly the
+     * cross-talk this whole mechanism exists to remove. Media, Bluetooth and
+     * Network join this list when they capture tokens, not before.
+     *
+     * <p>Handlers the embedder registered ({@code AdHandler}, {@code AuthHandler},
+     * the message and permission sinks) are deliberately not here: they belong to
+     * the session, not to the isolate, and the app registered them once.
+     *
+     * @param sessionId The session ID
+     */
+    private static void destroyRuntimeScopedManagers(int sessionId) {
+        ResourceCleanup.runAll(
+                () -> {
+                    if (BuildConfig.MIGO_API_SENSORS) SensorExports.destroyAll(sessionId);
+                },
+                () -> InputExports.destroyAll(sessionId),
+                () -> InteractionUI.destroy(sessionId));
     }
 
     /**

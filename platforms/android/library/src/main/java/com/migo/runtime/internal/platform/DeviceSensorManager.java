@@ -10,6 +10,8 @@ import android.view.Surface;
 import android.view.WindowManager;
 
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.RuntimeGenerationBoundary;
+import com.migo.runtime.internal.RuntimeScoped;
 
 /**
  * Manages device sensor listeners for motion, gyroscope, and orientation.
@@ -28,7 +30,7 @@ import com.migo.runtime.internal.NativeMethods;
  *
  * @hide
  */
-public final class DeviceSensorManager {
+public final class DeviceSensorManager implements RuntimeScoped {
 
     private final int sessionId;
     private final SensorManager sensorManager;
@@ -56,8 +58,24 @@ public final class DeviceSensorManager {
         this(sessionId, context, false);
     }
 
+
+    /**
+     * The runtime this sensor listener belongs to.
+     *
+     * <p>Captured once, here, and stamped on every event it reports. A listener
+     * registered by one isolate stays registered across a restart and keeps
+     * firing; the stamp is what lets the engine tell those events from the
+     * replacement runtime's own.
+     */
+    private final RuntimeGenerationBoundary.Token token;
+
+    @Override
+    public RuntimeGenerationBoundary.Token runtimeToken() {
+        return token;
+    }
     public DeviceSensorManager(int sessionId, Context context, boolean lifecycleSuspended) {
         this.sessionId = sessionId;
+        this.token = RuntimeGenerationBoundary.acquire(sessionId);
         this.sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
         this.windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
         this.motionRequest = new LifecycleRequestState<>(lifecycleSuspended);
@@ -125,7 +143,8 @@ public final class DeviceSensorManager {
                     double beta = Math.toDegrees(orientation[1]);
                     double gamma = Math.toDegrees(orientation[2]);
 
-                    NativeMethods.onDeviceMotionChange(sessionId, alpha, beta, gamma);
+                    NativeMethods.onDeviceMotionChange(
+                            sessionId, token.generation(), alpha, beta, gamma);
                 }
             }
 
@@ -194,6 +213,7 @@ public final class DeviceSensorManager {
                     if (gyroscopeListener != this || !gyroscopeRequest.isActive()) return;
                     NativeMethods.onGyroscopeChange(
                             sessionId,
+                            token.generation(),
                             event.values[0],
                             event.values[1],
                             event.values[2]
@@ -267,7 +287,8 @@ public final class DeviceSensorManager {
                         // event.values[0] = azimuth (direction, 0-360 degrees)
                         double direction = event.values[0];
                         String accuracy = mapAccuracy(event.accuracy);
-                        NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                        NativeMethods.onCompassChange(
+                                sessionId, token.generation(), direction, accuracy);
                     }
                 }
 
@@ -312,7 +333,8 @@ public final class DeviceSensorManager {
                         double direction = Math.toDegrees(orientation[0]);
                         if (direction < 0) direction += 360.0;
                         String accuracy = mapAccuracy(currentAccuracy);
-                        NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                        NativeMethods.onCompassChange(
+                                sessionId, token.generation(), direction, accuracy);
                     }
                 }
             }
@@ -413,6 +435,7 @@ public final class DeviceSensorManager {
                     if (accelerometerListener != this || !accelerometerRequest.isActive()) return;
                     NativeMethods.onAccelerometerChange(
                             sessionId,
+                            token.generation(),
                             event.values[0],
                             event.values[1],
                             event.values[2]
