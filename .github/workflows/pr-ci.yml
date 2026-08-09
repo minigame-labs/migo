@@ -188,6 +188,15 @@ jobs:
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
 
+      # A restart replaces the isolate but not the Android objects around it, so
+      # an event a retired runtime's listener produces must carry the generation
+      # that listener captured. Re-reading the live generation at report time
+      # always matches, which is a check that cannot fail. Structural because it
+      # has to be: five of the six producer groups need a Context or a main
+      # Looper, so no host test can build one and restart a session behind it.
+      - name: Runtime generation fence contract
+        run: bash scripts/test-runtime-generation-fence-contract.sh
+
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
         # (scripts/test-linux-sdk-contract.sh) needs the Debian bullseye
