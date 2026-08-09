@@ -535,3 +535,12 @@
   passing or failing. What was weak is the *reason*: both probes failing produced the
   same generic "no local build for this target", which cannot tell a reader whether to
   install an SDK or to build an archive. The two causes are now named separately.
+
+  **Resolved on this machine — 2026-08-10.** The archive was built
+  (`x86_64-linux-ohos/librusty_v8.a`, 172,812,984 bytes) and
+  `bash scripts/build-ohos-sdk.sh --compile-only x86_64` now compiles `migo-capi` for the
+  OpenHarmony target here, with 24 `migo_*` entry points — so the lane is real rather
+  than probed-absent. The correction above stands as the reading of what "in tree" means
+  for a gitignored artifact: it is a fact about a machine, and the first run on any
+  machine costs the build rather than thirteen seconds. Item 0.32 records the bindgen
+  wall that made it two attempts.

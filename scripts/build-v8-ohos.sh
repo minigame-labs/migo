@@ -202,6 +202,31 @@ GN_ARGS+=" use_allocator_shim=false use_partition_alloc_as_malloc=false"
 
 export V8_FROM_SOURCE=1
 export GN_ARGS
+
+# bindgen cannot run here, and that is a property of the SDK rather than a
+# configuration to tune. The OpenHarmony SDK ships clang 15 (both 5.1 and 6.1 do), while
+# V8 145's vendored libc++ announces "Libc++ only supports Clang 20 and later" and uses
+# `__builtin_clzg`/`__builtin_ctzg`, added in clang 19. Measured: the C++ side builds to
+# completion and then `build.rs` panics with
+# `Unable to generate bindings: ClangDiagnostic(... '_Tp' does not refer to a value ...)`,
+# after more than an hour of compilation. So the committed binding for this triple is the
+# input, via the same `V8_PREBUILT_BINDING` hook the Android build uses.
+#
+# The binding is safe to share because it encodes V8's FFI ABI for a rusty_v8 revision,
+# not a target's calling convention: this file is byte-identical to the Android one at
+# the pinned revision, and both OpenHarmony triples are LP64. It is committed, so a
+# revision bump replaces it deliberately rather than regenerating silently against
+# whichever clang is on PATH.
+PREBUILT_BINDING="$OUT_DIR/src_binding.rs"
+if [[ ! -f "$PREBUILT_BINDING" ]]; then
+    err "no committed binding at $PREBUILT_BINDING"
+    err "the SDK's clang 15 cannot generate one: V8's vendored libc++ needs clang 20+."
+    err "commit the binding for this triple, or build with a newer OpenHarmony SDK clang."
+    exit 1
+fi
+export V8_PREBUILT_BINDING="$PREBUILT_BINDING"
+info "V8_PREBUILT_BINDING = $PREBUILT_BINDING"
+
 # Without these, build.rs downloads its own gn/ninja, a step that can stall.
 [[ -x "$RUSTY_V8_SRC/third_party/v8_correct_gn/gn" ]] && \
     export GN="$RUSTY_V8_SRC/third_party/v8_correct_gn/gn"

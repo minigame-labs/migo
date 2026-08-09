@@ -3074,6 +3074,34 @@
   Recorded rather than silenced: both halves still read `NOT PROVEN`, and the reason
   for the OpenHarmony half has moved from "no SDK" to "no V8 archive for the target".
 
+  **The OpenHarmony half is now done — 2026-08-10.** `scripts/build-v8-ohos.sh x86_64`
+  produced `engine/third_party/rusty_v8/x86_64-linux-ohos/librusty_v8.a`
+  (172,812,984 bytes) and `bash scripts/build-ohos-sdk.sh --compile-only x86_64`
+  compiles `migo-capi` for `x86_64-unknown-linux-ohos` with 24 `migo_*` entry points. So
+  this branch's `cfg(target_env = "ohos")` code has now compiled for its own target on
+  this machine, which is what Section 7.4 asks for.
+
+  **It took two attempts, and the first failure is worth keeping because it is not a
+  configuration mistake.** The C++ side built to completion — over an hour of clang++
+  under `ninja -j 16`, producing a 172 MB archive — and then `build.rs` panicked with
+  `Unable to generate bindings: ClangDiagnostic("… '_Tp' does not refer to a value …
+  use of undeclared identifier '__builtin_clzg' …")`. The cause is fixed, not tunable:
+  the OpenHarmony SDK ships clang 15 (both 5.1 and 6.1 do), while V8 145's vendored
+  libc++ announces "Libc++ only supports Clang 20 and later" and uses builtins added in
+  clang 19. `scripts/build-v8-ohos.sh` now feeds the committed binding for the triple
+  through the same `V8_PREBUILT_BINDING` hook the Android build uses, and **refuses**
+  rather than falling back to bindgen when that file is absent — bindgen cannot succeed
+  here, so silently trying would burn the hour again. The binding is shareable because
+  it encodes V8's FFI ABI for a rusty_v8 revision rather than a target's calling
+  convention: it is byte-identical to the Android one at the pinned revision, and both
+  OpenHarmony triples are LP64.
+
+  **The Windows half is unchanged and still blocked**: there is no Visual Studio on
+  `C:`, so it needs VS Build Tools on the existing host. `aarch64-unknown-linux-ohos`
+  also still needs its own archive and a Skia; only `x86_64` is proven, which is the
+  triple the verifier's lane uses because the `target_env = "ohos"` view of the tree is
+  the same for either architecture.
+
 - [x] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
   correcting `pr-ci.yml`'s stale comment for task 0.31. The new `host-engine-tests`
   job now has the system packages those crates need, so the missing coverage is one
