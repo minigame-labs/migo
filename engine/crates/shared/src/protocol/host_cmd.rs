@@ -515,6 +515,8 @@ pub enum HostCommand {
         event_type: String,
         /// JSON-encoded payload (e.g., stop result with tempFilePath/duration/fileSize).
         json_payload: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Recorder frame data pushed from platform (for onFrameRecorded).
@@ -523,6 +525,8 @@ pub enum HostCommand {
         data: Vec<u8>,
         /// Whether this is the last frame before stop.
         is_last_frame: bool,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     // ---- Camera Events ----
@@ -534,6 +538,8 @@ pub enum HostCommand {
         event_type: String,
         /// JSON-encoded payload.
         json_payload: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     /// Camera frame data pushed from platform (for onCameraFrame / listenFrameChange).
@@ -547,6 +553,8 @@ pub enum HostCommand {
         width: u32,
         /// Frame height in pixels.
         height: u32,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     // ---- Keyboard Events ----
@@ -846,6 +854,8 @@ pub enum HostCommand {
         /// `{"errMsg":"..."}` for error, `{"fullScreen":true,"direction":0}` for
         /// fullscreenchange).
         data: String,
+        /// See [`HostCommand::callback_generation`].
+        runtime_generation: Option<NonZeroI64>,
     },
 
     // ---- System Events ----
@@ -962,7 +972,26 @@ impl HostCommand {
             | Self::OnAccelerometerChange {
                 runtime_generation, ..
             }
-            | Self::OnUserCaptureScreen { runtime_generation } => *runtime_generation,
+            | Self::OnUserCaptureScreen { runtime_generation }
+            // Camera, microphone and video: the managers that hold hardware.
+            // Their events and their frames both stop belonging to anything the
+            // moment the isolate that opened them is replaced, and the teardown
+            // that releases the hardware reports as it goes.
+            | Self::CameraEvent {
+                runtime_generation, ..
+            }
+            | Self::CameraFrameData {
+                runtime_generation, ..
+            }
+            | Self::RecorderEvent {
+                runtime_generation, ..
+            }
+            | Self::RecorderFrameData {
+                runtime_generation, ..
+            }
+            | Self::OnVideoStateChange {
+                runtime_generation, ..
+            } => *runtime_generation,
 
             Self::EvaluateModule { .. }
             | Self::EvalScript { .. }
@@ -981,10 +1010,6 @@ impl HostCommand {
             | Self::OnTouch(..)
             | Self::OnDeviceOrientationChange { .. }
             | Self::OnNetworkStatusChange { .. }
-            | Self::RecorderEvent { .. }
-            | Self::RecorderFrameData { .. }
-            | Self::CameraEvent { .. }
-            | Self::CameraFrameData { .. }
             | Self::OnKeyDown { .. }
             | Self::OnKeyUp { .. }
             | Self::OnMouseDown { .. }
@@ -1004,7 +1029,6 @@ impl HostCommand {
             | Self::OnBLEMTUChange { .. }
             | Self::OnBeaconUpdate { .. }
             | Self::OnBeaconServiceChange { .. }
-            | Self::OnVideoStateChange { .. }
             | Self::OnMemoryWarning { .. }
             | Self::OnThermalStatusChanged { .. }
             | Self::SetDisplayRefreshRate { .. }
@@ -1236,6 +1260,61 @@ mod generation_tests {
         for command in &commands {
             assert_eq!(command.callback_generation(), generation(9), "{command:?}");
         }
+    }
+
+    #[test]
+    fn the_hardware_managers_carry_their_generation_on_events_and_on_frames() {
+        // Frames as well as events: a camera that keeps delivering into the
+        // isolate that replaced the one which opened it is the same defect at
+        // thirty times the rate.
+        let commands = [
+            HostCommand::CameraEvent {
+                camera_id: 0,
+                event_type: "stop".to_owned(),
+                json_payload: "{}".to_owned(),
+                runtime_generation: generation(4),
+            },
+            HostCommand::CameraFrameData {
+                camera_id: 0,
+                data: Vec::new(),
+                width: 1,
+                height: 1,
+                runtime_generation: generation(4),
+            },
+            HostCommand::RecorderEvent {
+                event_type: "stop".to_owned(),
+                json_payload: "{}".to_owned(),
+                runtime_generation: generation(4),
+            },
+            HostCommand::RecorderFrameData {
+                data: Vec::new(),
+                is_last_frame: true,
+                runtime_generation: generation(4),
+            },
+            HostCommand::OnVideoStateChange {
+                video_id: 0,
+                event_type: "ended".to_owned(),
+                data: "{}".to_owned(),
+                runtime_generation: generation(4),
+            },
+        ];
+        for command in &commands {
+            assert_eq!(command.callback_generation(), generation(4), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_synchronous_failure_reply_is_unfenced_and_therefore_delivered() {
+        // An export that fails before any manager exists reports with the
+        // `UNFENCED` zero the Java side stamps. It answers a call the live
+        // runtime has just made, so it cannot be stale and must never be
+        // dropped -- and zero must not be read as "produced for generation 0".
+        let reply = HostCommand::RecorderEvent {
+            event_type: "error".to_owned(),
+            json_payload: "{}".to_owned(),
+            runtime_generation: captured_generation(0),
+        };
+        assert_eq!(reply.callback_generation(), None);
     }
 
     #[test]

@@ -17,7 +17,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ANDROID_DIR="$REPO_ROOT/platforms/android"
 REG_RS="$REPO_ROOT/engine/crates/platform/src/android/jni/registration.rs"
 PROFILE_CONTRACT_RS="$REPO_ROOT/engine/crates/platform/src/android/jni/profile_contract.rs"
-EXPECTED='(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V'
+# The leading `IJ` is (sessionId, runtimeGeneration): a camera that keeps
+# delivering frames into the isolate that replaced the one which opened it is
+# the fence's problem at thirty frames a second, so the stamp rides the frame
+# path as well as the event path.
+EXPECTED='(IJILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V'
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 

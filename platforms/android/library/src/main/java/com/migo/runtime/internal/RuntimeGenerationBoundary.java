@@ -30,6 +30,16 @@ public final class RuntimeGenerationBoundary {
     /** The first generation of every session, matching the engine's. */
     private static final long FIRST_GENERATION = 1L;
 
+    /**
+     * What a caller stamps when it captured no generation, and never a valid one.
+     *
+     * <p>For events produced by the export itself rather than by a long-lived
+     * listener: a synchronous failure reply to a call the live runtime has just
+     * made cannot be stale, so it must never be dropped. The engine reads any
+     * non-positive value as "this producer is unfenced" and delivers it.
+     */
+    public static final long UNFENCED = 0L;
+
     private static final ConcurrentHashMap<Integer, SessionState> sSessions =
             new ConcurrentHashMap<>();
 

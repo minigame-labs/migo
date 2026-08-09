@@ -286,8 +286,9 @@ public final class NativeExports {
      * {@link android.net.ConnectivityManager} callback and says nothing, and it
      * is not fenced *by design* — a network status is a current fact about the
      * device, like a screen rotation, so a replacement isolate needs it as much
-     * as the retired one did. Media and Bluetooth report as they close and so
-     * wait for their tokens.
+     * as the retired one did. Media reports a {@code stop} as it releases the
+     * camera and the microphone, and is here because those reports are fenced
+     * now. Bluetooth still reports unfenced, so it waits for its tokens.
      *
      * <p>Handlers the embedder registered ({@code AdHandler}, {@code AuthHandler},
      * the message and permission sinks) are deliberately not here: they belong to
@@ -302,6 +303,12 @@ public final class NativeExports {
                 },
                 () -> {
                     if (BuildConfig.MIGO_API_SENSORS) NetworkExports.destroyAll(sessionId);
+                },
+                // First among all of these: a camera or a microphone held by no
+                // runtime keeps the OS privacy indicator lit and keeps every
+                // other app off the device for the rest of the session.
+                () -> {
+                    if (BuildConfig.MIGO_API_MEDIA) MediaExports.destroyAll(sessionId);
                 },
                 () -> InputExports.destroyAll(sessionId),
                 () -> InteractionUI.destroy(sessionId));

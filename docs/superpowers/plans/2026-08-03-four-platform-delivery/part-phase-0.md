@@ -1393,6 +1393,78 @@
   arm each command sits in, and the pinned descriptors that fail if one side of a
   JNI signature moves alone.
 
+  **Task 7 continued 2026-08-09 (fourth): the camera and the microphone stop
+  being held by a runtime that no longer exists.**
+
+  This was the worst thing left. `GameSession.restart()` released nothing the
+  media managers held, so after a restart the camera stayed open and the
+  microphone stayed recording — the OS privacy indicator lit, the hardware
+  unavailable to every other app — until the session ended. Not a leak in the
+  accounting sense: a device held open by no runtime, visible to the user.
+
+  Five commands join the fence — `CameraEvent`, `CameraFrameData`,
+  `RecorderEvent`, `RecorderFrameData`, `OnVideoStateChange` — **frames as well
+  as events**, because a camera still delivering into the isolate that replaced
+  the one which opened it is the same defect at thirty times the rate.
+  `CameraManager`, `AudioRecorderManager` and `VideoManager` capture tokens;
+  media joins the restart sweep, which is what actually releases the hardware.
+
+  **The eight-byte field was a prerequisite, and this is measured rather than
+  argued.** Reverting `CameraEvent` alone to `Option<i64>` fails the build with
+  the enum's own assertion: `HostCommand grew past 64 bytes`. A `u32` and two
+  `String`s leave exactly enough room for the niche-optimised field and not for
+  the other one. The change made one entry ago as headroom turned out to be the
+  thing that made this entry possible at all; had it been deferred, the media
+  fence would have arrived as "and also redesign whichever variant hit the cap
+  first".
+
+  **The camera cache is swept by hand, and the comment says why.** It is keyed by
+  `"sessionId:cameraId"` and holds a `CameraSlot`, not the manager, so
+  `liveEntry`'s `ConcurrentHashMap<Integer, T>` signature does not fit. The same
+  three steps are written out in `getCameraManager`: a camera built by a replaced
+  runtime still owns the device, and handing it over would leave the new isolate
+  with a camera whose frames the engine drops while the arbiter still records
+  this session as the owner.
+
+  **`suspendPowerSensitiveManagers` deliberately does not sweep**, and is
+  annotated so nobody makes it consistent later. It is driven by the Activity's
+  lifecycle, not by a runtime: a manager left over from a replaced runtime still
+  owns the camera, so suspending it when the app backgrounds is exactly right,
+  while destroying it as a side effect of backgrounding is not.
+
+  **`RuntimeGenerationBoundary.UNFENCED`** names the zero that an export stamps
+  when it reports a failure before any manager exists — `recorderStart` with no
+  Activity, for instance. A synchronous failure reply answers a call the live
+  runtime has just made, so it cannot be stale and must never be dropped. It had
+  been a bare `0`; a named constant is what stops the next reader from "fixing"
+  it into the current generation, which would make it droppable for the first
+  time.
+
+  **The camera-frame JNI contract earned its keep.** `test-camera-frame-jni-contract.sh`
+  pins `onCameraFrameData`'s descriptor independently of the profile table, in
+  both product flavours, and failed the moment the signature widened — exactly
+  the deliberate-edit gate it was written to be. Updated with the reason at the
+  pin.
+
+  | mutant | killed by |
+  |---|---|
+  | `CameraFrameData` left in the unfenced group | `the_hardware_managers_carry_their_generation_on_events_and_on_frames` |
+  | `RecorderEvent` left in the unfenced group | the same case |
+  | `OnVideoStateChange` left in the unfenced group | the same case |
+  | `CameraEvent` reverts to a 16-byte field | the 64-byte assertion, measured above |
+
+  Restored from a copy, `sha256sum` verified before and after. Verified: host
+  suites for `shared`/`core`/`capi`/`platform` (both profiles), Java 195 per
+  flavour, `build-android-so.sh --compile-only arm64-v8a`, the camera-frame,
+  android-host-api, r8-profile, product-profiles and input-trigger contracts,
+  `fmt --check`, `git diff --check`.
+
+  **Bluetooth is the only group left**, and it is left for a reason that is
+  written down rather than assumed: its teardown reports unfenced, and its
+  notification path is the one this repository has already tuned to zero
+  allocations. Fencing it means touching that path, which deserves its own
+  sitting.
+
   **The restart sweep for the remaining groups is deliberately not here, and the
   interlock is the reason.**
   Today nothing tears down Android managers on a restart — `destroyAllManagers`

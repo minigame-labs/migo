@@ -72,21 +72,21 @@ public final class MediaExports {
     public static void recorderStart(int sessionId, String optionsJson) {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) {
-            NativeMethods.onRecorderEvent(sessionId, "error",
+            NativeMethods.onRecorderEvent(sessionId, RuntimeGenerationBoundary.UNFENCED, "error",
                     "{\"errMsg\":\"recorderManager.start:fail no context\"}");
             return;
         }
         Activity activity = ctx.getActivity();
         if (activity == null) {
-            NativeMethods.onRecorderEvent(sessionId, "error",
+            NativeMethods.onRecorderEvent(sessionId, RuntimeGenerationBoundary.UNFENCED, "error",
                     "{\"errMsg\":\"recorderManager.start:fail no activity\"}");
             return;
         }
 
-        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        AudioRecorderManager mgr = liveRecorder(sessionId);
         if (mgr == null) {
             synchronized (sRecorderLock) {
-                mgr = sRecorderManagers.get(sessionId);
+                mgr = liveRecorder(sessionId);
                 if (mgr == null) {
                     mgr = new AudioRecorderManager(sessionId, activity);
                     sRecorderManagers.put(sessionId, mgr);
@@ -97,21 +97,21 @@ public final class MediaExports {
     }
 
     public static void recorderPause(int sessionId) {
-        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        AudioRecorderManager mgr = liveRecorder(sessionId);
         if (mgr != null) {
             mgr.pause();
         }
     }
 
     public static void recorderResume(int sessionId) {
-        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        AudioRecorderManager mgr = liveRecorder(sessionId);
         if (mgr != null) {
             mgr.resume();
         }
     }
 
     public static void recorderStop(int sessionId) {
-        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        AudioRecorderManager mgr = liveRecorder(sessionId);
         if (mgr != null) {
             mgr.stop();
         }
@@ -147,13 +147,42 @@ public final class MediaExports {
                 manager::setLifecycleSuspended);
     }
 
+    /**
+     * The recorder belonging to the runtime that is running now.
+     *
+     * <p>A retired one still holds the microphone. Reusing it would hand the
+     * replacement isolate a recorder whose events the engine drops, so the game
+     * would start recording and hear nothing back while the mic stayed busy.
+     */
+    private static AudioRecorderManager liveRecorder(int sessionId) {
+        return RuntimeGenerationBoundary.liveEntry(
+                sRecorderManagers, sessionId, AudioRecorderManager::destroy);
+    }
+
+    private static VideoManager liveVideoManager(int sessionId) {
+        return RuntimeGenerationBoundary.liveEntry(
+                sVideoManagers, sessionId, VideoManager::destroy);
+    }
+
     private static CameraManager getCameraManager(int sessionId, int cameraId) {
-        CameraSlot<CameraManager> retained =
-                sCameraManagers.get(cameraKey(sessionId, cameraId));
+        String key = cameraKey(sessionId, cameraId);
+        CameraSlot<CameraManager> retained = sCameraManagers.get(key);
         CameraManager manager = retained != null ? retained.get() : null;
-        if (manager != null) {
-            syncCameraLifecycle(sessionId, manager);
+        if (manager == null) return null;
+        // The same sweep RuntimeGenerationBoundary.liveEntry performs, written
+        // out because this cache is keyed by "sessionId:cameraId" and holds a
+        // slot rather than the manager. A camera built by a replaced runtime
+        // still owns the device: handing it over would leave the new isolate
+        // with a camera whose frames the engine drops, and the arbiter still
+        // recording this session as the owner.
+        if (!manager.runtimeToken().isCurrent()) {
+            sCameraManagers.computeIfPresent(key, (ignored, slot) -> {
+                slot.destroy();
+                return null;
+            });
+            return null;
         }
+        syncCameraLifecycle(sessionId, manager);
         return manager;
     }
 
@@ -344,13 +373,13 @@ public final class MediaExports {
     }
 
     private static VideoManager getOrCreateVideoManager(int sessionId) {
-        VideoManager existing = sVideoManagers.get(sessionId);
+        VideoManager existing = liveVideoManager(sessionId);
         if (existing != null) {
             syncVideoLifecycle(sessionId, existing);
             return existing;
         }
         synchronized (sVideoLock) {
-            existing = sVideoManagers.get(sessionId);
+            existing = liveVideoManager(sessionId);
             if (existing != null) {
                 syncVideoLifecycle(sessionId, existing);
                 return existing;
@@ -429,6 +458,16 @@ public final class MediaExports {
                 VideoManager::destroy);
     }
 
+    /**
+     * Release the hardware while the app is in the background.
+     *
+     * <p>Deliberately reads the caches directly rather than through the
+     * generation sweep the other accessors use: this is driven by the Activity's
+     * lifecycle, not by a runtime, and a manager left over from a replaced
+     * runtime still owns the camera or the microphone. Suspending it is exactly
+     * what should happen; destroying it as a side effect of the app going to
+     * the background is not.
+     */
     public static void suspendPowerSensitiveManagers(int sessionId) {
         String cameraPrefix = sessionId + ":";
         for (String key : sCameraManagers.keySet()) {

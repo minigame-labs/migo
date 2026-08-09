@@ -103,18 +103,21 @@ const NATIVE_MEDIA: &[JniMethod] = methods![
     ("onAudioInterruptionEnd", "(I)V"),
     (
         "onRecorderEvent",
-        "(ILjava/lang/String;Ljava/lang/String;)V"
+        "(IJLjava/lang/String;Ljava/lang/String;)V"
     ),
-    ("onRecorderFrameData", "(I[BZ)V"),
-    ("onCameraEvent", "(IILjava/lang/String;Ljava/lang/String;)V"),
+    ("onRecorderFrameData", "(IJ[BZ)V"),
+    (
+        "onCameraEvent",
+        "(IJILjava/lang/String;Ljava/lang/String;)V"
+    ),
     (
         "onCameraFrameData",
-        "(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V"
+        "(IJILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V"
     ),
     ("onCompressImageResult", "(ILjava/lang/String;)V"),
     ("onChooseImageResult", "(ILjava/lang/String;)V"),
     ("onChooseMessageFileResult", "(ILjava/lang/String;)V"),
-    ("onVideoEvent", "(IILjava/lang/String;Ljava/lang/String;)V"),
+    ("onVideoEvent", "(IJILjava/lang/String;Ljava/lang/String;)V"),
 ];
 
 const NATIVE_CONNECTIVITY: &[JniMethod] = methods![

@@ -1016,6 +1016,7 @@ impl Host {
             HostCommand::RecorderEvent {
                 event_type,
                 json_payload,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_recorder_event(&event_type, &json_payload);
                 Ok(())
@@ -1024,6 +1025,7 @@ impl Host {
             HostCommand::RecorderFrameData {
                 data,
                 is_last_frame,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_recorder_frame_data(&data, is_last_frame);
                 Ok(())
@@ -1032,6 +1034,7 @@ impl Host {
             HostCommand::CameraEvent {
                 camera_id,
                 event_type,
+                runtime_generation: _,
                 json_payload,
             } => {
                 self.js
@@ -1042,6 +1045,7 @@ impl Host {
             HostCommand::CameraFrameData {
                 camera_id,
                 data,
+                runtime_generation: _,
                 width,
                 height,
             } => {
@@ -1295,6 +1299,7 @@ impl Host {
                 video_id,
                 event_type,
                 data,
+                runtime_generation: _,
             } => {
                 self.js.dispatch_video_event(video_id, &event_type, &data);
                 Ok(())

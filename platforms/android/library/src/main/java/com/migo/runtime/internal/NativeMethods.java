@@ -612,9 +612,10 @@ public final class NativeMethods {
      * @param eventType   Event type: "stop", "error", "authCancel", "timeoutCallback"
      * @param jsonPayload JSON-encoded event data
      */
-    public static void onCameraEvent(int sessionId, int cameraId, String eventType, String jsonPayload) {
+    public static void onCameraEvent(
+            int sessionId, long generation, int cameraId, String eventType, String jsonPayload) {
         if (sessionId >= 0 && eventType != null) {
-            NativeBridge.onCameraEvent(sessionId, cameraId, eventType,
+            NativeBridge.onCameraEvent(sessionId, generation, cameraId, eventType,
                     jsonPayload != null ? jsonPayload : "{}");
         }
     }
@@ -637,7 +638,7 @@ public final class NativeMethods {
      * @param width     Frame width in pixels
      * @param height    Frame height in pixels
      */
-    public static void onCameraFrameData(int sessionId, int cameraId,
+    public static void onCameraFrameData(int sessionId, long generation, int cameraId,
             ByteBuffer yBuffer, int yOffset, int yLength,
             ByteBuffer uBuffer, int uOffset, int uLength,
             ByteBuffer vBuffer, int vOffset, int vLength,
@@ -649,7 +650,7 @@ public final class NativeMethods {
                 && yBuffer != null && yBuffer.isDirect()
                 && uBuffer != null && uBuffer.isDirect()
                 && vBuffer != null && vBuffer.isDirect()) {
-            NativeBridge.onCameraFrameData(sessionId, cameraId,
+            NativeBridge.onCameraFrameData(sessionId, generation, cameraId,
                     yBuffer, yOffset, yLength,
                     uBuffer, uOffset, uLength,
                     vBuffer, vOffset, vLength,
@@ -1094,9 +1095,11 @@ public final class NativeMethods {
      *                    "interruptionBegin", "interruptionEnd"
      * @param jsonPayload JSON-encoded event data
      */
-    public static void onRecorderEvent(int sessionId, String eventType, String jsonPayload) {
+    public static void onRecorderEvent(
+            int sessionId, long generation, String eventType, String jsonPayload) {
         if (sessionId >= 0 && eventType != null) {
-            NativeBridge.onRecorderEvent(sessionId, eventType, jsonPayload != null ? jsonPayload : "{}");
+            NativeBridge.onRecorderEvent(
+                    sessionId, generation, eventType, jsonPayload != null ? jsonPayload : "{}");
         }
     }
 
@@ -1108,9 +1111,10 @@ public final class NativeMethods {
      * @param frameData   Raw audio frame bytes
      * @param isLastFrame Whether this is the last frame before stop
      */
-    public static void onRecorderFrameData(int sessionId, byte[] frameData, boolean isLastFrame) {
+    public static void onRecorderFrameData(
+            int sessionId, long generation, byte[] frameData, boolean isLastFrame) {
         if (sessionId >= 0 && frameData != null) {
-            NativeBridge.onRecorderFrameData(sessionId, frameData, isLastFrame);
+            NativeBridge.onRecorderFrameData(sessionId, generation, frameData, isLastFrame);
         }
     }
 
@@ -1168,9 +1172,10 @@ public final class NativeMethods {
      *                  "progress", "fullscreenchange"
      * @param dataJson  JSON-encoded event data
      */
-    public static void onVideoEvent(int sessionId, int videoId, String eventType, String dataJson) {
+    public static void onVideoEvent(
+            int sessionId, long generation, int videoId, String eventType, String dataJson) {
         try {
-            NativeBridge.onVideoEvent(sessionId, videoId,
+            NativeBridge.onVideoEvent(sessionId, generation, videoId,
                 eventType != null ? eventType : "",
                 dataJson != null ? dataJson : "{}");
         } catch (Exception e) {

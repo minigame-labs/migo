@@ -1114,6 +1114,7 @@ pub(crate) extern "system" fn onRecorderEvent<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     event_type: JString<'local>,
     json_payload: JString<'local>,
 ) {
@@ -1131,6 +1132,7 @@ pub(crate) extern "system" fn onRecorderEvent<'local>(
             HostCommand::RecorderEvent {
                 event_type: evt,
                 json_payload: payload,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1140,6 +1142,7 @@ pub(crate) extern "system" fn onRecorderFrameData(
     env: JNIEnv,
     _class: JClass,
     host_id: jint,
+    generation: jlong,
     frame_data: jni::sys::jbyteArray,
     is_last_frame: jni::sys::jboolean,
 ) {
@@ -1159,6 +1162,7 @@ pub(crate) extern "system" fn onRecorderFrameData(
             HostCommand::RecorderFrameData {
                 data,
                 is_last_frame: is_last_frame != 0,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1170,6 +1174,7 @@ pub(crate) extern "system" fn onCameraEvent<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     camera_id: jint,
     event_type: JString<'local>,
     json_payload: JString<'local>,
@@ -1189,6 +1194,7 @@ pub(crate) extern "system" fn onCameraEvent<'local>(
                 camera_id: camera_id as u32,
                 event_type: evt,
                 json_payload: payload,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1198,6 +1204,7 @@ pub(crate) extern "system" fn onCameraFrameData<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     camera_id: jint,
     y_buf: JByteBuffer<'local>,
     y_off: jint,
@@ -1291,6 +1298,7 @@ pub(crate) extern "system" fn onCameraFrameData<'local>(
                 data: packed,
                 width: width as u32,
                 height: height as u32,
+                runtime_generation: captured_generation(generation),
             },
         );
     });
@@ -1825,6 +1833,7 @@ pub(crate) extern "system" fn onVideoEvent<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
+    generation: jlong,
     video_id: jint,
     event_type: JString<'local>,
     data_json: JString<'local>,
@@ -1844,6 +1853,7 @@ pub(crate) extern "system" fn onVideoEvent<'local>(
                 video_id: video_id as u32,
                 event_type: evt,
                 data,
+                runtime_generation: captured_generation(generation),
             },
         );
     });

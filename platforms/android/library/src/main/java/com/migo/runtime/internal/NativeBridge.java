@@ -305,7 +305,8 @@ public final class NativeBridge {
      * @param eventType   Event type string
      * @param jsonPayload JSON-encoded event data
      */
-    public static native void onRecorderEvent(int sessionId, String eventType, String jsonPayload);
+    public static native void onRecorderEvent(
+            int sessionId, long generation, String eventType, String jsonPayload);
 
     /**
      * Callback when recorder frame data is available.
@@ -314,7 +315,8 @@ public final class NativeBridge {
      * @param frameData   Raw audio frame bytes
      * @param isLastFrame Whether this is the last frame before stop
      */
-    public static native void onRecorderFrameData(int sessionId, byte[] frameData, boolean isLastFrame);
+    public static native void onRecorderFrameData(
+            int sessionId, long generation, byte[] frameData, boolean isLastFrame);
 
     // ==================== Camera Callbacks ====================
 
@@ -326,7 +328,8 @@ public final class NativeBridge {
      * @param eventType   Event type string
      * @param jsonPayload JSON-encoded event data
      */
-    public static native void onCameraEvent(int sessionId, int cameraId, String eventType, String jsonPayload);
+    public static native void onCameraEvent(
+            int sessionId, long generation, int cameraId, String eventType, String jsonPayload);
 
     /**
      * Callback when camera frame data is available.
@@ -350,7 +353,7 @@ public final class NativeBridge {
      * @param width     Frame width in pixels
      * @param height    Frame height in pixels
      */
-    public static native void onCameraFrameData(int sessionId, int cameraId,
+    public static native void onCameraFrameData(int sessionId, long generation, int cameraId,
             ByteBuffer yBuffer, int yOffset, int yLength,
             ByteBuffer uBuffer, int uOffset, int uLength,
             ByteBuffer vBuffer, int vOffset, int vLength,
@@ -677,7 +680,8 @@ public final class NativeBridge {
      * @param eventType Event type string
      * @param dataJson  JSON-encoded event data
      */
-    public static native void onVideoEvent(int sessionId, int videoId, String eventType, String dataJson);
+    public static native void onVideoEvent(
+            int sessionId, long generation, int videoId, String eventType, String dataJson);
 
     // ==================== Script Execution ====================
 
