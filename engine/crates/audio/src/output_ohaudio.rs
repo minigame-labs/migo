@@ -463,8 +463,6 @@ unsafe fn configure_and_generate(
         ));
     }
 
-    info!(
-        "OHAudio output: sample_rate={OHOS_SAMPLE_RATE}, channels={OHOS_CHANNELS}, format=F32LE"
-    );
+    info!("OHAudio output: sample_rate={OHOS_SAMPLE_RATE}, channels={OHOS_CHANNELS}, format=F32LE");
     Ok(renderer)
 }

@@ -207,7 +207,6 @@ impl AudioOutput {
     }
 }
 
-
 fn build_stream_f32(
     device: &Device,
     config: &StreamConfig,
