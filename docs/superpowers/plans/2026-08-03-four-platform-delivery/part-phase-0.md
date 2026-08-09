@@ -6212,3 +6212,85 @@
   mutator is reachable solely from a monitor-holding path. Mutation-tested:
   restoring the late field read re-fails the replacement test.
 
+- [ ] 0.68 Close the concurrent-Session holes both audits found. Asked because the
+  engine is meant to run several games at once and "some things have to be shared":
+  the answer is that this is a *deliberate* design on both sides and almost all of it
+  is right, so what is left is a short ranked list rather than a rework.
+
+  **What already proves the intent**, so that none of it is re-litigated:
+  `NativeExports.registerSession` refuses a duplicate id with "concurrently live
+  sessions must have distinct ids"; `ExclusiveDeviceArbiter` exists only to arbitrate
+  the camera and microphone *between* Sessions and keys per physical camera so two
+  Sessions on different cameras are not refused; `io/src/pools.rs` does per-host fair
+  queuing with a test named for it; `io/src/image_cache.rs` shares one decoded copy
+  between two games loading the same file and has `clear_for_session` precisely
+  because the process-wide `clear` discarded what another game was holding;
+  `capi/src/concurrent_sessions.rs`, `runtime-v8/src/tests/two_session_identity.rs`
+  and `storage_isolation.rs` are the standing evidence. `GameSession.close()` is
+  `sessionId`-scoped in nine of its ten steps, and `ExclusiveDeviceArbiter.releaseAll`
+  uses the two-argument `remove(resource, sessionId)` so it cannot drop another
+  Session's claim even under a race.
+
+  Ranked by what a second live Session actually loses:
+
+  1. **`GamePaths.cleanupTemp` is keyed by `gameId`, not `sessionId`**
+     (`GamePaths.java:184`, called from `GameSession.java:605`). Two Sessions of the
+     *same* game share `cacheDir/migo/games/{gameId}/tmp`, so the first to close
+     recursively deletes the other's live temp directory mid-write. `/user` and
+     `/cache` are shared by the same pair with no locking. This one is data loss, and
+     the fix crosses the Java/Rust path contract — the engine resolves `/tmp` for
+     content itself (`shared::vfs::game_paths`), so changing only the Java side would
+     move what is deleted without moving what is written. Both sides move together or
+     neither does.
+  2. **Three JNI exports have no `sessionId` at all** and resolve an Activity through
+     `RuntimeRegistry.getAny()` (`RuntimeRegistry.java:56`, used at
+     `NativeExports.java:588, 962, 1198`). `getSystemSettingInfoBytes` reads
+     `DisplayCompat.isLandscape(activity)` off whichever Session iteration order
+     returns first, so a portrait game can be told it is landscape because another
+     game's Activity is. The single-Session assumption is baked into the *signature*;
+     fixing it is the keyboard's shape — widen the descriptor, move the pin, thread
+     the id — and the profile contract is what will catch a half-done one.
+     `getCacheDirPath` and `getAppAuthorizationSettingJson` return app-scoped values
+     and are only latently wrong.
+  3. **The log level is one process-wide switch on both sides**
+     (`internal/util/Logger.java:17`, `platform/src/android/logging.rs:10`, written
+     per Session at `jni/inbound.rs:452`). `RuntimeConfig` carries a per-Session
+     `LogLevel` that nothing on the Java side ever applies, and the Rust side is
+     last-writer-wins: starting a second game with `logLevel=Off` silences the first
+     game that was started with `Debug`. Two halves of one defect.
+  4. **Image decode has no per-Session partition** (`io/src/image_ops.rs:83-84` `SEM`,
+     three permits, and `:160-161` `BUDGET`, 48 MB), while the sibling IO executor
+     next door does per-host fair queuing. One game's `preload_images` over a large
+     atlas set can hold every permit and the whole budget while another live game's
+     `drawImage` waits. This is the fairness hole in an otherwise fair policy, and it
+     is the one item here that is about latency rather than correctness.
+  5. **Diagnostics are attributed to the process, not the Session**:
+     `SEND_OVERFLOW`/`DROP_COUNTERS` (`shared/src/render_command_sender.rs:58,82`) are
+     summed into *each* Session's `command_drops` (`shared/src/stats.rs:399`), and
+     `IO_METRICS`/`WEBGL_ERROR_OVERFLOW` likewise. `stats.rs:380-386` already admits
+     it. A host polling Session A sees Session B's backpressure — wrong exactly when
+     backpressure is what is being investigated. Host-app visible only; the game-JS
+     path was already fixed by `stats_for_session`.
+  6. **`graphics/src/frame_capture.rs:21-22` is a last-presented-frame singleton**
+     written from *every* render thread, so with two Sessions `take()` returns
+     whichever swapped last. Contained today only because its one caller is the
+     single-Session dev player — the writer is in every build.
+  7. **`audio/src/streaming.rs:245` is one single-worker runtime for every Session's
+     streaming downloads**, so a stalled HTTP body in one game delays another's audio
+     start, and nothing drains it at Session end.
+  8. Latent, no in-tree caller, listed so they are not discovered twice:
+     `RuntimeRegistry.clear()` (`:77`) is a nuke-every-Session static with zero
+     callers; `PACKAGE_SIGNATURE_VERIFIER` (`shared/src/vfs/package.rs:1288`) is a
+     first-writer-wins trust root on a per-Session concept; `isolate_pool.rs:41` is a
+     process-global prewarmed-isolate pool whose `unsafe impl Send` is unenforced
+     across concurrent Session starts.
+
+  **Not defects, recorded so they are not "fixed":** `AudioFocusManager` deliberately
+  does not arbitrate — "Android already owns that decision… adding a second policy on
+  top would either contradict the platform or duplicate it" — so B starting audio
+  legitimately interrupts A. The `9001`/`10001` request-code collisions between
+  `ImageApiManager`, `ScanCodeManager` and `NativeExports` are harmless: every one
+  goes through `ResultProxyActivity`, where each launch owns one Activity instance and
+  is disambiguated by a never-reissued token, not by the code. `image_cache.trim` on
+  OS memory pressure evicting another Session's unpinned bytes is arguably correct,
+  since the pressure is process-wide and pins protect live aliases.
