@@ -8,8 +8,13 @@ lists the git-ignored prerequisites — Android V8 archives via
 in every shell. Without them every host suite fails for a reason unrelated to your
 change. Nothing there has changed.
 
-**Branch:** `gate/runtime-generation-fence`, seven commits on top of `origin/master`
+**Branch:** `gate/runtime-generation-fence`, ten commits on top of `origin/master`
 (`3196c3a`), **unpushed**. Verify before believing: `git log --oneline 3196c3a..HEAD`.
+
+**The main line is Phase 1, four-platform delivery**, not further Phase 0 polish. Item
+0.68's remaining entries (4 through 8) are latency and diagnostics attribution on one
+platform; Phase 1 is where the four platforms actually converge. The last piece of
+work here crossed over deliberately: item **1.2** is done.
 
 **Ledger:** `docs/superpowers/plans/2026-08-03-four-platform-delivery/part-phase-0.md`
 — item 0.9's task-7 entries (the fence gate, "fifth") and item 0.68 (entries 1, 2
@@ -27,6 +32,9 @@ and 3). Everything below is the short form.
 | `e0824e1` | `test-jni-outbound-signature-contract.sh` — every `JAVA_*` descriptor against its Java declaration |
 | `33522fb` | the ledger and this document |
 | `10c6331` | the log level is per session, in three tiers, on both sides |
+| `8363da0` | `release/VERSION` is the single release version; four build systems now derive from it |
+| `b3f7684` | two shapes the version gate was passing wrongly |
+| `1b50e76` | the ledger for item 1.2 |
 
 ---
 
@@ -115,6 +123,34 @@ Remaining, in the ledger's order:
 
 **Bluetooth remains the only unfenced Android producer group**, deliberately — §4 of
 the previous handoff has the whole design and the reason, and none of it has changed.
+
+---
+
+## 4a. Phase 1, and where item 1.2 leaves it
+
+`release/VERSION` is the repository's release version. Cargo mirrors it in
+`[workspace.package]` because a manifest cannot read a file, and
+`scripts/test-release-version-contract.sh` holds the two equal. **The `0.10.0-rc.1`
+bump is now one edit**, which was the point — nothing in that item proposed a new
+version, it stays at the `0.9.0` the AAR already shipped.
+
+That unblocks the packaging items that need a unified version (1.11, 1.12, 1.14).
+What remains in Phase 1, with what this machine can and cannot do:
+
+* **1.4 — remove every `--allow-multiple-definition`.** Five entries in
+  `engine/.cargo/config.toml` plus the Android build scripts. Resolving duplicate
+  symbols needs a real *link*, and Android and Linux can link here; the two
+  HarmonyOS entries the item names cannot, because there is no OHOS SDK on this
+  machine. Removing those two without linking would be an unverifiable claim.
+* **1.1l — Windows V8 lock `required_patches`.** The item itself records that the
+  Windows build is not runnable here.
+* **1.8/1.9/1.10/1.14 — HarmonyOS.** All need the OHOS SDK (`OHOS_SDK` is unset).
+* **1.2 is done; 1.3, 1.5, 1.6, 1.11, 1.12, 1.13** are the ones whose verifiable
+  half is largest on a Linux workstation.
+
+Item 0.68's remaining entries, if that thread is picked up again, are listed in §4
+above and item 5 there is the same shape as item 3 — a per-session setting meeting a
+process-wide resource.
 
 ---
 
