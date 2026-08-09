@@ -521,6 +521,16 @@ jobs:
       - name: Android minimum-API symbol floor
         run: bash scripts/test-android-symbol-floor.sh
 
+      # Placed here for the same reason as the floor check above: it needs the natives
+      # the step before staged under engine/jniLibs/. The AAR is the only archive this
+      # repository produces today, so it is where same-source rebuild byte equality can
+      # be held at all -- and nothing held it before. Two builds under one
+      # SOURCE_DATE_EPOCH must be identical, and a third under a different epoch must
+      # not be, because bytes that are merely stable would prove the archive ignores the
+      # clock rather than tracks it.
+      - name: Android AAR reproducibility
+        run: bash scripts/test-android-aar-reproducibility.sh
+
       - name: Analyze AAR size report
         run: |
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-debug.aar \

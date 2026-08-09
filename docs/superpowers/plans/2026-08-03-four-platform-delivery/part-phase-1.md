@@ -1046,6 +1046,17 @@
   **What remains for 1.5:** archive determinism (sorted entries, fixed mtime, no
   gzip timestamp, fixed uid/gid) on all four platforms, which is 1.11's code, and
   the Windows and HarmonyOS packaging paths cannot be run on a Linux workstation.
+
+  **Correction, 2026-08-10: the Android half of that was already true and is now
+  gated.** This entry said archive determinism "is a property of code that is not
+  written" because the AAR is the only archive that exists — but that makes the AAR the
+  one archive the property *can* be held on, and it holds: two release builds under one
+  `SOURCE_DATE_EPOCH` are byte-identical, Gradle already normalises zip entry timestamps,
+  and exactly one entry (`classes.jar`, carrying the generated `BuildInfo` stamp) tracks
+  the epoch. `scripts/test-android-aar-reproducibility.sh` holds it, and the paired
+  different-epoch build is what stops the equality from being satisfied by an archive that
+  ignores the clock. See item 1.12. The Linux, Windows and HarmonyOS archives are still
+  1.11's code.
 - [x] 1.6 Repair Android PowerShell packaging and reject release `--skip-rust`.
 
   **Done 2026-08-09.** The `--skip-rust` half landed earlier; what remained was the
@@ -1305,6 +1316,40 @@
 - [ ] 1.11 Produce deterministic Android, Linux, Windows, and HarmonyOS packages
   carrying manifests, checksums, BSL 1.1 text, notices, SBOMs, and provenance.
 - [ ] 1.12 Prove same-source rebuild byte equality for every shipping archive.
+
+  **The Android AAR now has that proof, and it is the only archive this repository
+  produces today — 2026-08-10.** The audit's finding stands as it was written ("no
+  reproducibility or determinism gate exists"): there was none anywhere in `scripts/`.
+  `scripts/test-android-aar-reproducibility.sh` is one, wired into `pr-ci.yml` beside the
+  symbol floor because both need the natives the AAR step stages.
+
+  **Measured, and the result was not assumed either way:** two release AAR builds under
+  one `SOURCE_DATE_EPOCH` are **byte-identical** at 17,391,073 bytes, and a third under a
+  different epoch **differs**. That pairing is required rather than tidy — an archive that
+  ignored the clock entirely would be stable too, and so would a build that produced
+  nothing, which is this repository's standing rule for any absence-shaped measurement.
+
+  **What the epoch actually moves is worth recording, because it makes the measurement
+  legible.** Of fifteen entries, exactly one differs between epochs: `classes.jar`, which
+  carries the generated `BuildInfo` stamp. Zip entry timestamps do **not** differ at all —
+  Gradle normalises them. So the archive tracks the epoch through exactly one entry and is
+  otherwise clock-free, which is why the equality is byte-level rather than approximate.
+
+  Falsifiable, and falsified with the defect task 1.5 actually fixed: restoring the
+  wall-clock stamp in `library/build.gradle` (`new Date()` instead of the epoch) makes the
+  gate fail and **name the entry** — `content differs: classes.jar` — rather than only
+  reporting that the archives differ. A first attempt at that mutation broke the Gradle
+  build instead of its determinism, which tested nothing; a mutant has to leave the build
+  working to reach the comparison.
+
+  **Scope stated, because it is narrower than the item:** the builds run
+  `--skip-rust --unverified-native-libs`, the documented way to exercise packaging logic,
+  so what is proved is that *packaging* the same inputs twice yields the same archive. The
+  natives are covered separately — both Android V8 archives reproduced from source under
+  task 1.1 and again under 1.1i, with their hashes recorded in component manifests the
+  build now verifies (task 1.3). **Still open:** the Linux, Windows and HarmonyOS packages,
+  which are item 1.11's code and do not exist yet, and a from-clean rebuild rather than a
+  same-checkout one.
 - [x] 1.13 Verify the Android permission contract from the built Full and Slim
   merged manifests at API 26, 28, and 31.
 
