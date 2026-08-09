@@ -744,16 +744,36 @@
   after reusing a verified prebuilt binding is indistinguishable from one sealed
   after regenerating it from source. Add the field and populate it. Until then the
   origin exists only in build logs, which are not shipped.
-- [ ] 1.1h Treat a version-only libclang gate as insufficient. Chromium's
-  `third_party/rust-toolchain/lib/libclang.so` reports clang 22 but silently emits
-  a **wrong** binding: `cppgc_Visitor` sized 1, nested enums missing their
-  `v8_String_` prefixes, 840 items instead of 870, and four compile errors
-  including a `1_usize - 8_usize` overflow. It ships no sibling `bin/clang`, so
-  build.rs's `-print-resource-dir` probe finds nothing and bindgen falls back to
-  NDK clang 12's builtin headers. A misconfigured libclang does not fail loudly,
-  it corrupts the FFI ABI, so the gate must also require a usable sibling
-  `bin/clang` and the regenerated binding must be diffed against the recorded one
-  before it is accepted.
+- [x] 1.1h Treat a version-only libclang gate as insufficient. **Done 2026-08-09**,
+  and the object the item names was checked before the fix was written:
+  `rusty_v8_src/third_party/rust-toolchain/lib/libclang.so` is a symlink chain to
+  `libclang.so.22.0.0git` and `clang_getClangVersion()` really does report
+  `clang version 22.0.0git`, so it passes any version floor — while its sibling `bin/`
+  contains `bindgen`, `cargo`, `rustc` and **no `clang`**. A misconfigured libclang does
+  not fail loudly; it corrupts the FFI ABI.
+
+  Two guards, because the two failure modes are independent. Acceptance now also
+  requires a sibling `clang` (or `clang++`) whose `-print-resource-dir` resolves to a
+  directory that exists — the exact fact whose absence makes bindgen fall back to
+  another toolchain's builtin headers. Falsifiable, and run against the real objects:
+  Chromium's `rust-toolchain/lib` is **rejected**, while NDK 23's libclang is accepted
+  with resource dir `.../lib64/clang/12.0.9` (and is then still refused by the version
+  floor, so the two checks compose rather than overlap).
+
+  And a regenerated binding is now diffed against the one the component manifest
+  records. A difference is either a real V8 ABI change or a bad libclang, and the bytes
+  alone cannot tell them apart, so the build stops instead of sealing a manifest over an
+  FFI surface nobody compared. `MIGO_V8_BINDING_CHANGE_EXPECTED=1` is how a V8 bump says
+  the difference is the point, which makes accepting a new ABI deliberate rather than
+  incidental.
+
+  **Not yet exercised end to end:** the refusal path was verified as a function against
+  both real libclang directories, not by a full build with `V8_LIBCLANG_PATH` pointed at
+  Chromium's — an OpenHarmony V8 build held the shared `rusty_v8_src` cargo target
+  directory, and two cargo builds in one target directory serialise on its lock. Run
+  `V8_LIBCLANG_PATH=$RUSTY_V8_SRC/third_party/rust-toolchain/lib
+  scripts/build-v8-android.sh aarch64` once that is free and confirm it falls back to
+  the prebuilt binding rather than regenerating.
 - [x] 1.2 Add one repository release-version source under `release/` and verify
   propagation to Cargo, Gradle, CMake, the HAR, archives, manifests, examples,
   and documentation.
