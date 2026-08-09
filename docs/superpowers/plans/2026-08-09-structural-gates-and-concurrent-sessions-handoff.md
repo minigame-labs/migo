@@ -8,12 +8,12 @@ lists the git-ignored prerequisites — Android V8 archives via
 in every shell. Without them every host suite fails for a reason unrelated to your
 change. Nothing there has changed.
 
-**Branch:** `gate/runtime-generation-fence`, four commits on top of `origin/master`
+**Branch:** `gate/runtime-generation-fence`, seven commits on top of `origin/master`
 (`3196c3a`), **unpushed**. Verify before believing: `git log --oneline 3196c3a..HEAD`.
 
 **Ledger:** `docs/superpowers/plans/2026-08-03-four-platform-delivery/part-phase-0.md`
-— item 0.9's task-7 entries (the fence gate, "fifth") and item 0.68 (items 1 and 2).
-Everything below is the short form.
+— item 0.9's task-7 entries (the fence gate, "fifth") and item 0.68 (entries 1, 2
+and 3). Everything below is the short form.
 
 ---
 
@@ -25,6 +25,8 @@ Everything below is the short form.
 | `7c67e70` | `/tmp` is per session on both sides, with a sweep of the directories no live session owns |
 | `6df2bad` | three JNI exports take the calling session's id; `RuntimeRegistry.getAny()` and `clear()` deleted |
 | `e0824e1` | `test-jni-outbound-signature-contract.sh` — every `JAVA_*` descriptor against its Java declaration |
+| `33522fb` | the ledger and this document |
+| `10c6331` | the log level is per session, in three tiers, on both sides |
 
 ---
 
@@ -87,15 +89,17 @@ compare by simple name. Only `public static` answers for a descriptor.
 
 ## 4. State of item 0.68
 
-Items 1 and 2 are closed, and item 8's `RuntimeRegistry.clear()` went with item 2.
+Items 1, 2 and 3 are closed, and item 8's `RuntimeRegistry.clear()` went with item 2.
+
+Item 3's shape is worth knowing before touching the next one, because the same
+question recurs: a setting that arrives *per session* meeting a resource that is
+*process-wide*. `shared::log_level` answers it in three tiers — the thread's session
+(exact, because a host thread can be attributed), the join over live sessions (for
+threads that cannot), and the process default. Item 5 below is the same shape and
+should probably get the same answer.
+
 Remaining, in the ledger's order:
 
-3. **The log level is one process-wide switch on both sides**
-   (`internal/util/Logger.java:17`, `platform/src/android/logging.rs:10`, written per
-   session at `jni/inbound.rs:452`). `RuntimeConfig` carries a per-session `LogLevel`
-   that the Java side never applies, and the Rust side is last-writer-wins: starting a
-   second game with `logLevel=Off` silences the first started with `Debug`. Two halves
-   of one defect, and the cheapest remaining one.
 4. **Image decode has no per-session partition** (`io/src/image_ops.rs:83-84` `SEM`,
    three permits; `:160-161` `BUDGET`, 48 MB) while the IO executor next door does
    per-host fair queuing. Latency, not correctness.
@@ -172,9 +176,14 @@ now derives 26 contract gates.
 **Windows reads NOT PROVEN without the MSVC toolchain**, and that is the honest
 answer — do not infer it from the Linux build.
 
-**Mutation harness rules, and one new one.** A mutation that fails to apply must abort
-loudly. Every `killed` line must name the test that failed. And: **an equivalent
-mutant must be discarded, not counted.** One mutation this session reported a loose
+**Mutation harness rules, and two new ones.** A mutation that fails to apply must
+abort loudly. Every `killed` line must name the test that failed. **A `TYPE SYSTEM`
+verdict is the one to distrust**: a harness written this session reported all five
+Rust mutants as caught by the compiler, because cargo prints `error: test failed`
+after a red suite and the harness matched that as a compile error. Five of five
+caught by the compiler is not credible for a `.min()` → `.max()` mutation, which is
+what prompted checking — read test failures *before* compile errors. And: **an
+equivalent mutant must be discarded, not counted.** One mutation this session reported a loose
 temp file as owned by session `0`; since `0` is not live either, the file was still
 deleted and the suite still passed. It was recorded as NOT DETECTED and replaced with
 a mutation that changes behaviour — counting it would have invented a survivor.
