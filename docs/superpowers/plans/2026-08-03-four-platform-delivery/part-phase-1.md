@@ -1100,6 +1100,30 @@
   variable is opt-in and `build-ohos-sdk.sh` does not set it — and neither
   independent review has run.
 
+  **The wiring half is done — 2026-08-10.** `build-ohos-sdk.sh` now runs the floor gate
+  as part of a package build and *discovers* the newer sysroot instead of waiting to be
+  handed one, so the post-floor comparison stops being a check nobody runs. Selection is
+  on the SDK's own declared `apiVersion`, not on its directory name, and the first draft
+  taking "the highest-sorted directory that is not the floor" was **wrong**: with the
+  floor as the newest installed SDK it hands back an *older* sysroot and reports its
+  extra symbols as post-floor, which is evidence pointing the wrong way. Three layouts
+  are checked — a newer and an older SDK present (picks the newer), the floor being the
+  newest (refuses, reports none), and only an older one beside it (refuses).
+  `MIGO_OHOS_NEWER_SYSROOT` still wins when set.
+
+  On this machine only one SDK exists, so the run says so —
+  `no second OpenHarmony SDK found, so only the floor half of the API gate runs` — rather
+  than passing silently, which is the T.8 reporting rule applied here.
+
+  Measured on the freshly staged `x86_64` package: floor exports 8,200 symbols across
+  117 libraries, `libmigo_capi.a` has 645 externally undefined of which 516 are resolved
+  by the floor, and no import postdates it. Those are the same numbers this entry
+  recorded, now reproduced locally.
+
+  **Still open:** the two-sysroot delta itself cannot be demonstrated here until a second
+  SDK is unpacked, `compatibleSdkVersion` has not been set from the proven floor, and
+  neither independent review has run.
+
   **Correction, 2026-08-09: the evidence above was not produced on this workstation
   and cannot be reproduced here yet.** `ls -d ~/ohos-sdk*` finds only `~/ohos-sdk`
   (5.1.0.107, API 18); there is no `~/ohos-sdk-6.1`, and `dist/` does not exist, so
