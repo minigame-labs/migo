@@ -211,8 +211,17 @@
   (`owner_opens_private_connection_and_closes_it_before_api_drop`) and, at the C
   ABI, only for a context the test itself opened. Task 2 Step 4's
   `native_owned_connection_round_trip` is `#[ignore]`d pending a live X server, and
-  Task 4 Step 4 runs the real C host under `xvfb-run`. Both need an X server this
-  machine does not have.
+  Task 4 Step 4 runs the real C host under `xvfb-run`.
+
+  **Correction, 2026-08-09: this machine has `xvfb-run`, so the first of those was
+  never blocked here.** Run as
+  `xvfb-run -a … test -p migo-platform --lib native_owned_connection_round_trip -- --ignored`
+  it **passes**, and it is not vacuous: with `DISPLAY` unset the same invocation
+  fails at `DISPLAY must be set by the test gate: NotPresent`. It stays `#[ignore]`d
+  because the gate does not provide a display, which is the right default — but
+  "device-blocked" was wrong, and it was written several times before anyone typed
+  `command -v xvfb-run`. Task 4 Step 4 (the real C host under `xvfb-run`) is
+  therefore also reachable here and remains genuinely unrun.
 
   **Verification, 2026-08-09** — `bash scripts/verify-change.sh --base master`,
   covering this item together with 0.2, 0.3, T.6 and T.8:

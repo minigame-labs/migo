@@ -14,13 +14,11 @@
 > | 1.4 remove every `--allow-multiple-definition` | tree-wide grep | still in `engine/.cargo/config.toml` ×5, `platforms/openharmony/.../CMakeLists.txt`, and `scripts/build-android-so.sh`, whose comment calls it required on every Android target |
 > | 1.6 release must reject `--skip-rust` | grep | `scripts/build-aar.sh` still documents and accepts it |
 > | 1.9 HarmonyOS V8 component manifest | directory listing | neither `*-linux-ohos/` has `component-manifest.json`; `x86_64-linux-gnu/` does, which is the shape to copy |
-> | 1.10 two-sysroot HarmonyOS floor | ran it | `scripts/test-ohos-symbol-floor.sh` supports the mode at `:195` but it is opt-in via `MIGO_OHOS_NEWER_SYSROOT`, and today's run printed the hint rather than the second audit |
+> | 1.10 two-sysroot HarmonyOS floor | ran it, then ran it properly | **satisfied on both architectures the same day** — the newer SDK was already installed at `~/ohos-sdk-6.1` (6.1.0.31, API 23). See the entry below |
 > | 1.12 byte-equal rebuild for every shipping archive | `ls scripts/` | no reproducibility or determinism gate exists |
 >
-> **Budget these as implementation, not as audits.** The one near-free item is
-> **1.10**: the two-sysroot support is already written, so it needs a second and
-> newer OpenHarmony SDK unpacked beside the current one and the variable set —
-> §0 of the handoff records the download recipe. **1.4 is the one to think about
+> **Budget these as implementation, not as audits.** **1.10 turned out to need
+> nothing at all** — see its entry. **1.4 is the one to think about
 > before touching**: `--allow-multiple-definition` is masking duplicate symbols
 > that Skia and V8 each contribute, so removing it is resolving those symbols per
 > platform, not deleting a flag.
@@ -703,6 +701,37 @@
   (`MIGO_OHOS_FLOOR_SYSROOT` at the floor plus `MIGO_OHOS_NEWER_SYSROOT`), set
   `compatibleSdkVersion` to the proven floor, and record any symbol that forces
   the floor higher.
+
+  **Run 2026-08-09, and it needed no installation: the newer SDK was already
+  unpacked at `~/ohos-sdk-6.1` (6.1.0.31, API 23) beside the floor at
+  `~/ohos-sdk` (5.1.0.107, API 18).** Three earlier notes in this session asked a
+  human to download it. Checking `ls ~/ohos-sdk*` before asking would have
+  answered that; the obstacle was recorded rather than verified, which is the
+  shape this ledger keeps finding and this time produced it.
+
+  ```
+  MIGO_OHOS_NEWER_SYSROOT=$HOME/ohos-sdk-6.1/native/sysroot \
+    MIGO_OHOS_TRIPLE=<triple> bash scripts/test-ohos-symbol-floor.sh \
+    dist/migo-ohos-<arch>/lib/libmigo_capi.a
+  ```
+
+  Both architectures pass with a real comparison behind them: the floor exports
+  8,200 symbols across 117 libraries, the newer sysroot 10,135 across 132, so
+  **1,935 symbols postdate the floor** and `libmigo_capi.a` imports none of them
+  (x86_64: 645 undefined, 516 floor-resolved; aarch64: 637 and 512).
+
+  **The gate was improved before it was believed.** Its two-sysroot branch printed
+  nothing on success, so "compared 1,935 candidates and found none" was
+  indistinguishable from "compared an empty set" — an absent newer sysroot with
+  the right directory name would have passed every artifact silently. It now
+  states the delta it compared and **fails closed** when that delta is zero.
+  Falsifiable: pointed at an empty directory it reports
+  `newer sysroot … adds no symbol over the floor (0 exported); a comparison with
+  nothing to find is not evidence` and exits 1.
+
+  **Still open before this can be `- [x]`:** it is not wired into any gate — the
+  variable is opt-in and `build-ohos-sdk.sh` does not set it — and neither
+  independent review has run.
 - [ ] 1.11 Produce deterministic Android, Linux, Windows, and HarmonyOS packages
   carrying manifests, checksums, BSL 1.1 text, notices, SBOMs, and provenance.
 - [ ] 1.12 Prove same-source rebuild byte equality for every shipping archive.

@@ -94,6 +94,12 @@ else.
    bash scripts/verify-change.sh --base HEAD     # clean tree: everything should PASS
    ```
 
+**Check before calling something blocked.** Two things were recorded as needing
+hardware or a download this session and neither did: `xvfb-run` is installed, so
+the `#[ignore]`d X11 round-trip runs here, and a newer OpenHarmony SDK was
+already unpacked at `~/ohos-sdk-6.1` (6.1.0.31, API 23) while three notes asked a
+human to fetch one. `command -v` and `ls ~` cost nothing next to a wrong entry.
+
 **Not portable at all:** the physical device (a Huawei Mate30 Pro), the
 `migo-api26` x86_64 emulator, and the Windows/MSVC toolchain are properties of
 the original machine. Any ledger item needing device evidence (0.65, 2.2, 2.5,
@@ -277,8 +283,7 @@ reviews are user-triggered (§6).
 2. **Phase 1 hermetic builds** — `part-phase-1.md`, 18 open items, and **spot-audited
    2026-08-09: six checked, six genuinely open**. Do not carry phase 0's expectation
    here that an audit dissolves the item — it does not. The note at the top of that
-   file has the evidence, names **1.10** as the near-free one (its two-sysroot
-   support is written; it needs a second, newer OpenHarmony SDK) and **1.4** as the
+   file has the evidence, names **1.4** as the
    one to think about first, because `--allow-multiple-definition` is masking
    duplicate Skia/V8 symbols rather than decorating the link line.
 
