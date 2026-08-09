@@ -605,7 +605,54 @@
   `android compile` and `ohos compile` PASS,
   `verified for every target this change touches`.
 
-  **Tasks 5–12 are not started, and the property is not enforced yet.** Ids and
+  **Task 6 started 2026-08-09: two of its result families now echo their id.**
+  The premise held — `requestId` appeared **zero** times in all five platform
+  Java files, while the runtime has been sending it in the request JSON all
+  along, so every reply was landing on the FIFO fallback.
+
+  `CallbackCorrelation` (`internal/CallbackCorrelation.java`) is the one place
+  that knows how an id crosses this boundary, and it carries the rule that is
+  easy to get backwards: **absent stays absent**. A request with no id must get
+  a reply with no `requestId` key, because stamping `0` makes the runtime
+  discard it as "present and not an id" — strictly worse than the fallback it
+  would otherwise have taken.
+
+  * **Location** (`getLocation`, `getFuzzyLocation`): the id threads through all
+    three result builders, and through the **eight** hard-coded failure literals
+    in `NativeExports` that fire before any parse. Bound *before* the `try`, so a
+    malformed options string still answers the request that sent it.
+  * **Scan code**: the id is held on the manager instance, because the result
+    returns through an Activity result rather than through the call that started
+    it.
+
+  **The test caught two defects in this work before it landed**, which is the
+  point of writing it first. `JSONObject.optInt` **truncates**, so
+  `{"requestId":1.5}` read back as the id `1` — and `1` is a real id, so a reply
+  would have settled whichever request held it. Same shape as the runtime's
+  `Number(true) === 1`. The parser now checks the type before the value. Second:
+  Android's unit-test `android.jar` stubs `org.json` to throw "not mocked", so
+  the first host test over JSON-building code fails on its first `put`. Fixed by
+  adding the real `org.json` as a **test-only** dependency rather than the
+  platform's `returnDefaultValues = true`, which is module-wide and turns every
+  unmocked `android.*` call into a silent default — the opposite of what a test
+  should do.
+
+  Java 151 tests per flavour (from 143), zero failures; Android host API v0
+  unchanged at 357 entries; camera-frame JNI descriptor contract holds.
+
+  **What remains, and why the next family is a different kind of change.**
+  `InteractionUI`'s modal and action-sheet results do not travel as JSON at all —
+  `NativeMethods.onModalResult(sessionId, int, int)` is positional, and the
+  descriptors are **pinned on both sides**: `profile_contract.rs:151-152` holds
+  `("onModalResult", "(III)V")` and `("onActionSheetResult", "(II)V")`. Echoing
+  an id there means changing the JNI signature, the pin, the Rust caller, the
+  Java method and the JS reader together — which is why the plan's file list
+  names `NativeMethods`, `NativeBridge`, `registration.rs` and
+  `profile_contract.rs`. `ImageApiManager` (53 JSON sites), `VideoManager` and
+  `ResultProxyActivity` are still the JSON-shaped kind and follow the pattern
+  above.
+
+  **Tasks 5, 7–12 are not started, and the property is not enforced yet.** Ids and
   generations are now carried everywhere they need to be, but nothing compares
   them before invoking JavaScript: that is Task 7's rejection and Task 10's
   unpublished candidate. Until then this is plumbing that changes no behaviour.
