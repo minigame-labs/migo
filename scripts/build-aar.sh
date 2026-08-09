@@ -75,6 +75,7 @@ OUTPUT_DIR="dist"
 
 # shellcheck source=scripts/lib/android-ndk.sh
 source "$SCRIPT_DIR/lib/android-ndk.sh"
+source "$SCRIPT_DIR/lib/reproducible-timestamp.sh"
 
 echo "========================================"
 echo "MiniGame Android AAR Builder"
@@ -525,7 +526,7 @@ collect_outputs() {
     "workerSnapshot": $WORKER_SNAPSHOT,
     "artifactManifestMode": "$ARTIFACT_MANIFEST_MODE",
     "sourceDateEpoch": $SOURCE_DATE_EPOCH_JSON,
-    "buildTime": "$(date '+%Y-%m-%d %H:%M:%S')"
+    "buildTime": "$(reproducible_timestamp)"
 }
 EOF
 

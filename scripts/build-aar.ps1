@@ -52,6 +52,32 @@ if (-not [string]::IsNullOrEmpty($SourceDateEpoch)) {
     $SourceDateEpochMetadata = $SourceDateEpoch
 }
 
+# The timestamp a shipped artifact may carry: SOURCE_DATE_EPOCH if set, else now,
+# and UTC either way. The bash twin's `scripts/lib/reproducible-timestamp.sh`
+# carries the reasoning. This wrote a *local* wall clock beside the epoch it had
+# just recorded, so the same source produced different bytes in two timezones and
+# in two minutes.
+# Self-contained on purpose: it reads the environment rather than an outer-scope
+# variable, so it does not depend on where in the script it is called from, and
+# every expression is a single line because PowerShell ends a statement at a
+# newline -- a leading-dot continuation is a C# habit that does not parse here.
+# This file cannot be run on the machine that wrote it, so it assumes as little as
+# possible.
+function Get-ReproducibleTimestamp {
+    $epoch = $env:SOURCE_DATE_EPOCH
+    if ([string]::IsNullOrEmpty($epoch)) {
+        $nowUtc = (Get-Date).ToUniversalTime()
+        return $nowUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+    [long]$seconds = 0
+    if ($epoch -notmatch '^[0-9]+$' -or -not [long]::TryParse($epoch, [ref]$seconds)) {
+        throw "SOURCE_DATE_EPOCH must be non-negative Unix seconds, got: $epoch"
+    }
+    $stamp = [DateTimeOffset]::FromUnixTimeSeconds($seconds)
+    $utc = $stamp.UtcDateTime
+    return $utc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+}
+
 $CodegenSuffix = ""
 $CargoProfile = "debug"
 if ($BuildType -eq "release") {
@@ -222,7 +248,7 @@ function Collect-Outputs {
         cargoProfile = $CargoProfile
         workerSnapshot = $WorkerSnapshot.IsPresent
         sourceDateEpoch = $SourceDateEpochMetadata
-        buildTime = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        buildTime = (Get-ReproducibleTimestamp)
     } | ConvertTo-Json | Out-File (Join-Path $outDir "version-$ProductProfile$ArtifactSuffix.json") -Encoding utf8
 
     Write-Host "✓ Outputs ready: $outDir"

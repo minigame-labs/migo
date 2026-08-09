@@ -127,6 +127,14 @@ jobs:
       - name: Release version contract
         run: bash scripts/test-release-version-contract.sh
 
+      # A release artifact that records when it was built cannot be rebuilt and
+      # compared, which is what Phase 1's same-source byte equality rests on. The
+      # AAR metadata recorded the SOURCE_DATE_EPOCH it was given and then stamped a
+      # local wall clock on the next line; the SBOM and the committed snapshot
+      # manifests did the same.
+      - name: Reproducible timestamp contract
+        run: bash scripts/test-reproducible-timestamp-contract.sh
+
       # Source-only, so it belongs here rather than in the device lane -- which
       # is the point: the failure it catches (content calling a capability on
       # the wx namespace, which does not carry it) presents on a device as a

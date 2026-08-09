@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -117,15 +118,31 @@ for package in sorted(packages, key=lambda p: (p["name"], p["version"])):
 
     components.append(component)
 
+# `SOURCE_DATE_EPOCH` if set, else now, always UTC. An SBOM is a release artifact
+# (`release.yml` writes it to the Android dist directory), so a wall clock in it
+# means two builds of one commit produce different bytes -- the property Phase 1's
+# same-source rebuild comparison is built on. Refuses a malformed value rather than
+# falling back, because a caller that set it believes it is producing something
+# reproducible.
+def sbom_timestamp():
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch is None or epoch == "":
+        when = datetime.datetime.now(datetime.timezone.utc)
+    else:
+        if not epoch.isdigit():
+            raise SystemExit(
+                f"SOURCE_DATE_EPOCH must be non-negative Unix seconds, got: {epoch}"
+            )
+        when = datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
+    return when.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 sbom = {
     "bomFormat": "CycloneDX",
     "specVersion": "1.5",
     "version": 1,
     "metadata": {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "timestamp": sbom_timestamp(),
         "component": {
             "type": "library",
             "name": "migo",
