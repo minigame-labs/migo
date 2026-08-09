@@ -27,11 +27,26 @@ public final class InputExports {
 
     // ==================== Keyboard ====================
 
+    /**
+     * The keyboard belonging to the runtime that is running now.
+     *
+     * <p>Not {@code sKeyboardManagers.get}: the cache is keyed by session, so a
+     * restart would otherwise hand the replacement isolate the manager the
+     * retired one built. That manager stamps the generation it captured, which
+     * the engine drops at dispatch — the keyboard would come up and report
+     * nothing at all. A retired one is torn down here, and the caller builds a
+     * fresh one against the live runtime.
+     */
+    private static KeyboardManager liveKeyboardManager(int sessionId) {
+        return RuntimeGenerationBoundary.liveEntry(
+                sKeyboardManagers, sessionId, KeyboardManager::destroy);
+    }
+
     private static KeyboardManager getOrCreateKeyboardManager(int sessionId) {
-        KeyboardManager existing = sKeyboardManagers.get(sessionId);
+        KeyboardManager existing = liveKeyboardManager(sessionId);
         if (existing != null) return existing;
         synchronized (sKeyboardLock) {
-            existing = sKeyboardManagers.get(sessionId);
+            existing = liveKeyboardManager(sessionId);
             if (existing != null) return existing;
             RuntimeContext ctx = RuntimeRegistry.get(sessionId);
             if (ctx == null) return null;
@@ -50,14 +65,17 @@ public final class InputExports {
     }
 
     public static void keyboardHide(int sessionId) {
-        KeyboardManager mgr = sKeyboardManagers.get(sessionId);
+        // A retired keyboard is destroyed by this lookup rather than hidden,
+        // and destroying it hides it — so the view the previous runtime put on
+        // screen still goes away, and no event comes back from it.
+        KeyboardManager mgr = liveKeyboardManager(sessionId);
         if (mgr != null) {
             mgr.hide();
         }
     }
 
     public static void keyboardUpdate(int sessionId, String value) {
-        KeyboardManager mgr = sKeyboardManagers.get(sessionId);
+        KeyboardManager mgr = liveKeyboardManager(sessionId);
         if (mgr != null) {
             mgr.updateValue(value);
         }

@@ -158,6 +158,53 @@ public final class RuntimeGenerationBoundary {
         }
     }
 
+    /**
+     * The cached object for {@code sessionId}, or {@code null} once the runtime
+     * that built it has been replaced.
+     *
+     * <p>Managers are cached per session, not per runtime, so without this the
+     * isolate that replaces a retired one is handed the same object — and that
+     * object stamps the generation it captured, which the engine drops at
+     * dispatch. The fence would then turn "events reach the wrong runtime" into
+     * "events reach nothing at all": the same feature broken in a way that looks
+     * like it was never wired up. Returning {@code null} makes the caller build
+     * one against the runtime that is actually running.
+     *
+     * <p>A retired entry is removed <em>before</em> it is destroyed, which is
+     * the opposite of {@link ResourceCleanup#destroyMatching}. That one keeps an
+     * entry whose destroy failed so the cleanup can be retried; here keeping it
+     * is precisely wrong, because the next caller would be handed it again.
+     * Removing first also means a teardown that re-enters this cache — stopping
+     * a manager notifies listeners, and a listener may ask for one — is not
+     * undone by a removal that comes after it.
+     *
+     * <p>The removal is conditional on identity, and a lost race is retried
+     * rather than reported as an absence. Two callers can read the same retired
+     * entry; the first sweeps it and its caller installs a replacement, and an
+     * unconditional removal by the second would delete that replacement and
+     * leave two managers where the cache admits one — the live object orphaned
+     * on screen and a duplicate built behind it. Looking again returns the
+     * replacement instead.
+     *
+     * @hide
+     */
+    public static <T extends RuntimeScoped> T liveEntry(
+            ConcurrentHashMap<Integer, T> cache,
+            int sessionId,
+            ResourceCleanup.DestroyAction<T> destroy) {
+        for (;;) {
+            T existing = cache.get(sessionId);
+            if (existing == null) return null;
+            if (existing.runtimeToken().isCurrent()) return existing;
+            if (cache.remove(sessionId, existing)) {
+                // Only the thread that took it out destroys it, so a teardown
+                // never runs twice on one object.
+                destroy.destroy(existing);
+                return null;
+            }
+        }
+    }
+
     private static SessionState require(int sessionId) {
         SessionState state = sSessions.get(sessionId);
         if (state == null) {

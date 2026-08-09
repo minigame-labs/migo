@@ -1157,6 +1157,98 @@
   is gone, every id-less UI result now carries one, and nothing correlates by two
   schemes at once. Task 6 is whole with it — its `InteractionUI` half was always
   task 5's work wearing task 6's number, and it landed as part of it.
+
+  **Task 7 continued 2026-08-09 (later): a fence with no sweep is worse than no
+  fence, and Windows stopped being unproven.** The entry above fenced the
+  keyboard and left a defect standing that it had itself created.
+
+  **Managers are cached per session, not per runtime.** `sKeyboardManagers` is
+  keyed by `sessionId`, so the isolate that replaces a retired one is handed the
+  object the retired one built — which now stamps the generation it captured, and
+  the engine drops that at dispatch. The fence therefore converted *"events reach
+  the wrong runtime"* into *"events reach nothing at all"*: after
+  `GameSession.restart()` the keyboard would come up, accept typing and report
+  none of it, looking exactly like a feature that was never wired up. Fencing a
+  producer and sweeping its cache are one change, not two, and every one of the
+  ~20 producers still to come has this same pair.
+
+  **`RuntimeScoped` + `RuntimeGenerationBoundary.liveEntry` is the sweep, once.**
+  A manager exposes the token it captured; the lookup returns it only while that
+  token is current, and otherwise removes it, destroys it and returns `null` so
+  the caller builds one against the runtime that is actually running. Three
+  details are decisions rather than defaults:
+
+  * **Removed before destroyed** — the opposite of
+    `ResourceCleanup.destroyMatching`, which keeps an entry whose destroy failed
+    so cleanup can be retried. Here keeping it is precisely wrong: the next
+    caller would be handed it again. Removing first also means a teardown that
+    re-enters the cache (stopping a manager notifies listeners, and a listener
+    may ask for one) is not undone by a removal that comes after it.
+  * **The removal is conditional on identity, and a lost race is retried** rather
+    than reported as an absence. Two callers can read the same retired entry; the
+    first sweeps it and its caller installs a replacement, and an unconditional
+    removal by the second would delete that replacement — leaving the live
+    manager orphaned on screen and a duplicate built behind it.
+  * **All three keyboard accessors route through it**, `keyboardHide` and
+    `keyboardUpdate` included. A retired keyboard is destroyed by the lookup, and
+    destroying it hides it — so the view the previous runtime left on screen
+    still goes away, and nothing comes back from it.
+
+  **`Token.isCurrent()` had no production caller until now.** It was built and
+  tested by the entry above and used by nothing; this is what it was for.
+
+  **Mutation evidence: four mutants, four killed.**
+
+  | mutant | killed by |
+  |---|---|
+  | `liveEntry` never sweeps a retired entry | 6 of the 8 cases, including `an_entry_is_retired_the_moment_a_restart_begins` |
+  | destroy runs before the entry leaves the cache | `the_entry_leaves_the_cache_before_it_is_destroyed` |
+  | removal is not conditional on identity | `losing_the_removal_race_returns_the_replacement_rather_than_destroying_it` |
+  | the swept entry is returned instead of `null` | `an_entry_from_a_retired_runtime_is_destroyed_removed_and_not_returned` + 2 |
+
+  Restored from a copy, `sha256sum` verified. Java 185 per flavour (from 177).
+
+  **`GameSession.restart()` is the only production sender of
+  `HostCommand::Restart`** — every other sender in the tree is a test. That is
+  what sets the priority of the rest of task 7: this is a public embedder API
+  whose sessions must survive it, not a per-frame path.
+
+  **Windows: NOT PROVEN became evidence.** This branch touches
+  `windows/platform.rs`, which made `windows compile` a required target that this
+  machine reported as having no local build — the verdict line the script's own
+  header says must never be swallowed. It was wrong in the same way the `ohos`
+  sentence had been: `platforms/windows/spike/probe-layer.sh` already runs one
+  `cargo check` per package on the real MSVC toolchain, and LLVM, VS BuildTools
+  and the Windows V8 artifacts are all present here. Synced to `105605f` and run:
+  **`migo-platform` and `migo-capi` both `EXIT=0` for `x86_64-pc-windows-msvc`**,
+  zero `error[`. What keeps it out of `verify-change.sh` is not the toolchain but
+  the scope: `require_synced_worktree` refuses a dirty tree, because the Windows
+  copy is cloned over `file://` and carries committed refs only — so a lane there
+  would report NOT PROVEN for exactly the working-tree runs the script is for.
+  Making it a lane means teaching the sync to carry an uncommitted tree, which is
+  its own change.
+
+  **The restart sweep is deliberately not here, and the interlock is the reason.**
+  Today nothing tears down Android managers on a restart — `destroyAllManagers`
+  has exactly one caller, `GameSession.close()` — so a retired session's sensors,
+  BLE connections and camera keep running, owned by no runtime, until the session
+  ends. The fix is a sweep at `beginRuntimeRestart`, and it cannot simply be
+  posted: **a sweep is only safe for caches that `liveEntry` already guards**,
+  because otherwise the replacement isolate can be handed an unfenced manager
+  that the posted sweep then destroys underneath it — the same silent-death
+  failure one layer along. Two orders work, and the choice belongs with task 10's
+  transaction rather than being made in passing: run it *synchronously* on the
+  engine thread, where no JavaScript runs between `begin` and the new isolate
+  (but then camera, BLE and recorder teardown moves off the main thread, which is
+  where `close()` drives it today), or fence every producer first and post it.
+  What is already known: `NetworkMonitor`, `ScreenCaptureObserver`, `AdpfManager`
+  and `ScanCodeManager` unregister a listener and are thread-agnostic;
+  `KeyboardManager` and `VideoManager` post to the main looper themselves;
+  `CameraManager` and `AudioRecorderManager` own hardware and want their own
+  ordering. The handler slots (`clearAdHandler`, `clearAuthHandler`,
+  `clearMessageHandler`, `clearPermissionHandler`, `clearGameLogHandler`) must
+  **not** be swept: the embedder registered those once for the session, not the
+  isolate.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.

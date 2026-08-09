@@ -21,6 +21,7 @@ import java.lang.ref.WeakReference;
 
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeGenerationBoundary;
+import com.migo.runtime.internal.RuntimeScoped;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -43,7 +44,7 @@ import org.json.JSONObject;
  *
  * @hide
  */
-public class KeyboardManager {
+public class KeyboardManager implements RuntimeScoped {
 
     private static final String TAG = "KeyboardManager";
     private static final int INPUT_BAR_HORIZONTAL_MARGIN_DP = 0;
@@ -75,6 +76,11 @@ public class KeyboardManager {
      * failure that reads as working.
      */
     private final RuntimeGenerationBoundary.Token token;
+
+    @Override
+    public RuntimeGenerationBoundary.Token runtimeToken() {
+        return token;
+    }
 
     public KeyboardManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
