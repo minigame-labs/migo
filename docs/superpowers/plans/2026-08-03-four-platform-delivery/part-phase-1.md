@@ -912,9 +912,31 @@
 
   **Still open, and named rather than implied:**
 
-  * **Skia** is built by `skia-bindings` from source and has no committed manifest, so
-    there is nothing to content-address it against yet. That is the same
-    "no manifest, so no verification" position V8 was in before its lock existed.
+  * **Skia needs no manifest, and the entry above said otherwise — corrected 2026-08-10.**
+    The claim that it is "in the same position V8 was in" is wrong, and checking the object
+    is what showed it. `skia-safe`/`skia-bindings` is pinned in `engine/Cargo.lock` at
+    `0.93.1` with checksum `2359f7e3…`, that crate **vendors Skia's entire source tree**
+    (its `skia/` directory holds Skia's own `BUILD.gn`, `AUTHORS`, …), and `pr-ci.yml:53`
+    runs `cargo fetch --locked`. So Skia's provenance is already pinned cryptographically,
+    by a stronger and simpler mechanism than V8 has — V8 needed a lock, a manifest, a
+    replay proof and content addressing precisely *because* it comes from an external
+    checkout and a prebuilt archive that sit outside cargo's integrity model. Building a
+    "Skia component manifest" would duplicate `Cargo.lock`.
+
+    Two real gaps remain, and neither is verification. First, **the shipped artifact does
+    not record which Skia is inside it**: the package metadata generators mention Skia
+    nowhere, and the manifest schema's `graphics` block carries only `backend_family` and
+    `required_api`, so an artifact cannot answer "which Skia is this?". Second,
+    `SKIA_GN_ARGS` lives in `engine/.cargo/config.toml` and is recorded in no lock or
+    manifest, while V8's GN argument set is recorded in both. Those are *recording* gaps,
+    and closing them means a field on a schema that Android, Linux and Windows share —
+    which is the shape task 1.1j reverted rather than ship half-migrated, so it belongs
+    with that item rather than being bolted on here.
+  * Skia is also built **from source** on this machine rather than downloaded: the
+    `binary-cache` feature is enabled but no prebuilt matches this feature set and target,
+    so `skia-bindings` runs ninja (`.ninja_log` in its `out/` directory proves it). Its
+    build reproducibility is therefore an open question of the same kind as 1.12's, and
+    unmeasured.
   * **ANGLE** is Windows-only and cannot be exercised here.
 
   **`gen-snapshot.sh` was the seventh consumer and is now the strictest case, not an
