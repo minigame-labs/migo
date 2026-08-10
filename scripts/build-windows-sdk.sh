@@ -129,46 +129,71 @@ PROXY_LINES=""
 [[ -n "${MIGO_WIN_PROXY:-}" ]] && PROXY_LINES="set HTTPS_PROXY=${MIGO_WIN_PROXY}
 set HTTP_PROXY=${MIGO_WIN_PROXY}"
 
+WIN_TARGET_UNIX="$(win_to_unix_path "$WIN_TARGET_DOS")"
+WIN_CARGO_HOME_UNIX="$(win_to_unix_path "$WIN_CARGO_HOME_DOS")"
+
 # The manual link needs the non-system lib search dirs cargo/rustc knows via
 # cargo:rustc-link-search but link.exe does not: skia-bindings and
 # windows-targets stage their .libs in the build output / registry, not on the
 # MSVC LIB path (which vcvars sets for the system libs). Discovered dynamically
 # -- the skia-bindings hash and windows-targets versions are build-specific and
-# must never be hardcoded. (These exist because the staticlib was already built;
-# a from-clean run builds it in the batch below, and the dirs are stable across
-# the incremental relink this discovers before.)
-WIN_TARGET_UNIX="$(win_to_unix_path "$WIN_TARGET_DOS")"
-WIN_CARGO_HOME_UNIX="$(win_to_unix_path "$WIN_CARGO_HOME_DOS")"
-_extra=()
-_skia="$(find "$WIN_TARGET_UNIX/$TRIPLE/release/build" -path '*skia-bindings-*/out/skia/skparagraph.lib' 2>/dev/null | head -1)"
-[[ -n "$_skia" ]] && _extra+=("$(wslpath -w "$(dirname "$_skia")")")
-[[ -d "$WIN_TARGET_UNIX/$TRIPLE/release/gn_out/obj" ]] && _extra+=("$(wslpath -w "$WIN_TARGET_UNIX/$TRIPLE/release/gn_out/obj")")
-while IFS= read -r _d; do _extra+=("$(wslpath -w "$_d")"); done \
-    < <(find "$WIN_CARGO_HOME_UNIX/registry" -path '*windows_x86_64_msvc-*/lib' -type d 2>/dev/null)
-EXTRA_LIB_DOS="$(IFS=';'; printf '%s' "${_extra[*]}")"
-info "extra link search dirs: ${#_extra[@]}"
+# must never be hardcoded.
+#
+# CALLED AFTER THE BUILD, NEVER BEFORE. This used to run at script top level,
+# which made the whole flow depend on a warm CARGO_TARGET_DIR: the paths it
+# scans for are *produced* by the build, so on a cold target it found nothing,
+# LIB got no skia directory, and the link died with a bare
+# `LNK1181: cannot open input file 'skparagraph.lib'` -- measured, not
+# theorised. `--print native-static-libs` emits bare library NAMES with no
+# directory component, so LIB is the only channel these directories have.
+# Returns non-zero when skia's directory is not there. That is the fail-closed
+# half: handing back a partial list lets link.exe run and fail with a bare
+# `LNK1181: cannot open input file 'skparagraph.lib'`, which reads like a
+# corrupt build rather than a search path that was never assembled. An absence
+# assertion needs to be distinguishable from an empty scan.
+discover_link_search_dirs() {
+    local _extra=() _skia _d
+    _skia="$(find "$WIN_TARGET_UNIX/$TRIPLE/release/build" -path '*skia-bindings-*/out/skia/skparagraph.lib' 2>/dev/null | head -1)"
+    [[ -n "$_skia" ]] || return 1
+    _extra+=("$(wslpath -w "$(dirname "$_skia")")")
+    [[ -d "$WIN_TARGET_UNIX/$TRIPLE/release/gn_out/obj" ]] && _extra+=("$(wslpath -w "$WIN_TARGET_UNIX/$TRIPLE/release/gn_out/obj")")
+    while IFS= read -r _d; do _extra+=("$(wslpath -w "$_d")"); done \
+        < <(find "$WIN_CARGO_HOME_UNIX/registry" -path '*windows_x86_64_msvc-*/lib' -type d 2>/dev/null)
+    (IFS=';'; printf '%s' "${_extra[*]}")
+}
 
-BATCH="$WIN_TMP_UNIX/build-sdk.bat"
-cat > "$BATCH" <<BAT
+# Every environment fact both Windows stages need. Emitted once and reused: two
+# hand-kept copies of a developer environment drift, and the failures that
+# produces (a stale INCLUDE, an NDK clang ahead of LLVM) surface far from here.
+emit_win_preamble() {
+    cat <<PRE
 @echo off
+rem An inherited variable of this name makes %errorlevel% expand to it forever.
 set "ERRORLEVEL="
 call "${VCVARS_DOS}" >nul
 rem Whitelist PATH: an Android NDK on PATH shadows clang-cl and breaks bindgen,
 rem so this is an allowlist, not the inherited PATH. LLVM stays first so
 rem skia-bindings still resolves clang-cl to it; the MSVC tools bin is added
-rem (after LLVM, so clang-cl still wins) because THIS script calls link.exe
+rem (after LLVM, so clang-cl still wins) because this script calls link.exe
 rem directly for the DLL link, and cargo building only the staticlib never
 rem invoked the linker so vcvars' own PATH addition was not missed until now.
 set "PATH=${MIGO_WIN_LLVM_DIR_DOS}\\bin;%VCToolsInstallDir%bin\\Hostx64\\x64;%USERPROFILE%\\.cargo\\bin;${WIN_TOOLS_DOS};%SystemRoot%\\system32;%SystemRoot%;%SystemRoot%\\System32\\Wbem;${WIN_EXTRA_PATH_DOS}"
-rem link.exe searches LIB for input .libs; vcvars sets it for the system libs.
-rem Prepend the skia-bindings / windows-targets / V8 dirs the manual link needs.
-set "LIB=${EXTRA_LIB_DOS};%LIB%"
 set CARGO_HOME=${WIN_CARGO_HOME_DOS}
 set CARGO_TARGET_DIR=${WIN_TARGET_DOS}
 set INCLUDE=${WIN_HEADERS_DOS};%INCLUDE%
 set RUSTY_V8_ARCHIVE=${V8_ARCHIVE_DOS}
 set RUSTY_V8_SRC_BINDING_PATH=${V8_DIR_DOS}\\src_binding.rs
 ${PROXY_LINES}
+PRE
+}
+
+# ---- Stage 1: compile the staticlib and record what it needs linked ---------
+# Split from the link deliberately. The link's search path is derived from files
+# this stage produces, so the two cannot share one batch: whatever a single batch
+# computed up front would describe the previous build, and on a cold target would
+# describe nothing at all.
+BATCH_BUILD="$WIN_TMP_UNIX/build-sdk-compile.bat"
+{ emit_win_preamble; cat <<BAT
 cd /d ${WIN_WORKTREE_DOS}\\engine || exit /b 90
 
 echo [win-sdk] building capi staticlib (release)
@@ -179,6 +204,37 @@ if not "%STEP%"=="0" exit /b %STEP%
 echo [win-sdk] capturing native-static-libs
 cargo rustc -p migo-capi --lib --release --target ${TRIPLE} --crate-type staticlib -- --print native-static-libs > "${OUT_DOS}\\native-libs.txt" 2>&1
 rem cargo prints the note to stderr; the line we need starts with "native-static-libs:".
+
+set STATICLIB=${WIN_TARGET_DOS}\\${TRIPLE}\\release\\migo_capi.lib
+if not exist "%STATICLIB%" ( echo [win-sdk] staticlib not found: %STATICLIB% & exit /b 91 )
+echo === BUILD_EXIT=0 ===
+exit /b 0
+BAT
+} > "$BATCH_BUILD"
+
+RUN_LOG="$WIN_TMP_UNIX/build-sdk.log"
+info "building on Windows (this compiles the full stack; first run is ~minutes)"
+run_windows_batch "$BATCH_BUILD" | tee "$RUN_LOG"
+BUILD_RC="${PIPESTATUS[0]}"
+[[ "$BUILD_RC" -eq 0 ]] || { echo "[win-sdk] staticlib build failed (exit $BUILD_RC) -- see $RUN_LOG" >&2; exit 1; }
+
+# ---- Now the search path exists, so discover it -----------------------------
+if ! EXTRA_LIB_DOS="$(discover_link_search_dirs)"; then
+    echo "[win-sdk] the staticlib built but skia-bindings' output directory was not found under" >&2
+    echo "[win-sdk]   $WIN_TARGET_UNIX/$TRIPLE/release/build/*skia-bindings-*/out/skia/" >&2
+    echo "[win-sdk] link.exe resolves the bare library names cargo reports through LIB alone, so" >&2
+    echo "[win-sdk] linking without that directory fails with LNK1181 rather than anything clearer." >&2
+    exit 1
+fi
+info "link search dirs discovered after the build: $(awk -F';' '{print NF}' <<<"$EXTRA_LIB_DOS")"
+
+# ---- Stage 2: link the DLL --------------------------------------------------
+BATCH_LINK="$WIN_TMP_UNIX/build-sdk-link.bat"
+{ emit_win_preamble; cat <<BAT
+rem link.exe searches LIB for input .libs; vcvars sets it for the system libs.
+rem Prepend the skia-bindings / windows-targets / V8 dirs the manual link needs.
+set "LIB=${EXTRA_LIB_DOS};%LIB%"
+cd /d ${WIN_WORKTREE_DOS}\\engine || exit /b 90
 
 set STATICLIB=${WIN_TARGET_DOS}\\${TRIPLE}\\release\\migo_capi.lib
 if not exist "%STATICLIB%" ( echo [win-sdk] staticlib not found: %STATICLIB% & exit /b 91 )
@@ -202,10 +258,12 @@ set STEP=%errorlevel%
 echo === LINK_EXIT=%STEP% ===
 exit /b %STEP%
 BAT
+} > "$BATCH_LINK"
 
-RUN_LOG="$WIN_TMP_UNIX/build-sdk.log"
-info "building on Windows (this compiles the full stack; first run is ~minutes)"
-run_windows_batch "$BATCH" | tee "$RUN_LOG"
+info "linking on Windows"
+run_windows_batch "$BATCH_LINK" | tee -a "$RUN_LOG"
+LINK_RC="${PIPESTATUS[0]}"
+[[ "$LINK_RC" -eq 0 ]] || { echo "[win-sdk] link failed (exit $LINK_RC) -- see $RUN_LOG" >&2; exit 1; }
 
 [[ -f "$OUT_UNIX/migo.dll" ]] || { echo "[win-sdk] link produced no migo.dll -- see $RUN_LOG" >&2; exit 1; }
 [[ -f "$OUT_UNIX/migo.lib" ]] || { echo "[win-sdk] link produced no import lib migo.lib" >&2; exit 1; }

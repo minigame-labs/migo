@@ -4,12 +4,209 @@
 
 - [ ] 2.1 Build Android Full and Slim AARs plus the C SDK from a clean tree for
   `arm64-v8a` and `x86_64`.
+
+  **Partial, and only the Full debug half — 2026-08-10.** `bash scripts/build-aar.sh debug
+  arm64-v8a x86_64` produces `migo-full-debug.aar` (197,932,115 bytes) with both ABIs, the
+  embedded artifact manifests verified at package time and a release attestation emitted.
+  Not done here: **Slim**, **release**, the **C SDK**, and **from a clean tree** — this ran
+  against a warm workspace. It was built to unblock 2.2, so it is evidence for that item's
+  rendering row and not for this one.
+
+  **A packaging rule this exposed, worth stating because it makes an obvious shortcut
+  unsafe.** Building a single ABI incrementally does not work once another ABI's libraries
+  are staged: `engine/jniLibs/full/` accumulates per-ABI directories, Gradle packages every
+  one it finds, and the artifact manifest indexes only what the current invocation built.
+  The gate then refuses the package by name —
+
+  ```
+  AAR manifest verification: AAR has unindexed Migo JNI entries:
+    ['jni/arm64-v8a/libc++_shared.so', 'jni/arm64-v8a/libmigo.so']
+  ```
+
+  — and **produces no AAR at all**, which is the right outcome: an archive carrying a
+  native library its own manifest does not describe is precisely what the manifest exists
+  to prevent, and the failure is louder than a package that quietly ships one. The
+  consequence for this item is that a shipping build must name every ABI it intends to
+  publish in one invocation; `build-aar.sh debug x86_64` after an `arm64-v8a` build is not
+  a smaller version of the same thing, it is a build that fails.
 - [ ] 2.2 Run Android emulator smoke tests for both ABIs and the physical
   `arm64-v8a` lifecycle, input, and surface stress suite.
+
+  **Rendering conformance passes on the physical device at this HEAD — 2026-08-10.**
+  Mate30 Pro (TAS-AN00, `arm64-v8a`, SDK 31), running an AAR built from this tree
+  (`migo-full-debug-arm64-v8a.aar`, 98,136,703 bytes, embedded artifact manifests
+  verified at package time):
+
+  ```
+  android: 33 assertions, 33 passed, 0 known-failing, 0 new, 0 fixed-but-listed
+  ```
+
+  Every assertion carries its measured pixels rather than a self-report — e.g.
+  `canvas2d/fill-rect-covers-exactly … at (20,20) want [255,0,0,255] +/-2, got
+  [255,0,0,255]` — and `expectations/android.txt` is empty of IDs, so this is a clean
+  sheet and not a suite grading itself against a list of tolerated failures. The suite's
+  own two rules make the number trustworthy: **a run producing no `DONE` line is a
+  failure, not a pass**, and **an ID listed as known-failing that passes is also a
+  failure**, so neither an unloaded bundle nor a stale exemption can be read as green.
+
+  It matters that this ran on an AAR built *after* PR #35: the bench shell was carrying a
+  1 August build, which predates the runtime generation fence, so the previous numbers
+  said nothing about the current engine.
+
+  **Both ABIs pass, against one package — 2026-08-10.** The suite was then run on the
+  `x86_64` emulator (AVD `migo-api26`, API 26, KVM-accelerated, `swiftshader_indirect`)
+  and re-run on the device, both against the *same* dual-ABI
+  `migo-full-debug.aar` (197,932,115 bytes), so the two rows are comparable rather than
+  two builds each tested once:
+
+  ```
+  emulator x86_64: 33 / 33   new_failures 0
+  device   arm64  : 33 / 33   new_failures 0
+  same assertion set: True (33 ids)
+  ```
+
+  The assertion sets are compared, not just the totals — two runs of 33 could otherwise be
+  33 *different* things. And the software rasteriser matched **exactly**, not merely within
+  tolerance (`reftest-rect-equals-path max channel delta 0 <= 1`), so the Canvas2D results
+  do not depend on Mali-specific behaviour.
+
+  **The suite cannot hold both results at once, which had to be worked around by hand.**
+  Both runners write `dist/results-android.json` and stamp `platform: "android"` regardless
+  of whether the target is an emulator or a phone, so the second run silently overwrote the
+  first. The per-assertion pixel values above survive only because each file was copied
+  aside immediately after its run. That is a real gap in the suite for a two-ABI claim —
+  the numbers here are trustworthy because of a manual step, which is not a property a
+  gate should depend on.
+
+  **This is one row of 2.2 and the item stays open.** What it covers is *rendering
+  conformance* — canvas2d basics, canvas2d readback, surface geometry — on one ABI. What
+  2.2 asks for and this does not touch:
+
+  * **lifecycle, input, and surface stress.** There is no harness for these in any
+    repository — conformance drives rendering only, and 2.2's other three words need one
+    written. Attach/detach across restart, backgrounding, surface recreation, multi-touch
+    saturation and teardown are all unmeasured here. They also cannot be a self-contained
+    bundle the way the rendering tests are: the stimulus has to come from the host (adb
+    `keyevent`, `force-stop`, rotation), so the shape is external driver + engine
+    self-reported event sequence + expected-sequence comparison, reusing the existing
+    `[conformance]`/`DONE` verdict channel rather than inventing a second one.
+
+  Calling 33/33 "the device suite passes" would be exactly the overclaim this ledger keeps
+  catching: it is the rendering suite, and it passes.
+
+  **A coverage hole found by looking at the phone, which no number here would have shown.**
+  The operator noticed the screen was black during these runs. It was, and the explanation
+  is benign — the 33 assertions finish in under a second (`Snap: 14 / FR: 14` by 0.8s),
+  `done()` stops the rAF loop (`0.0 FPS`), and the display holds the last frame; the
+  `lifecycle-probe` bundle draws nothing at all. Presentation is fine, proven separately:
+  `game-endless-runner` renders a full screen of content at **56.2 FPS** on the same
+  device and build.
+
+  The hole is what that near-miss exposes. **Every assertion in this suite reads
+  `getImageData`, which is the canvas backing store — it never passes through the
+  compositor.** So "33/33 green" and "the user sees a black screen" are not contradictory
+  states: if the presentation path broke, not one of these assertions would go red. The
+  suite proves *the engine computed the right pixels*, which is a strictly weaker claim
+  than *the pixels reached the screen*, and 2.2 needs the second one.
+
+  This is the "all green but black screen" failure mode already recorded in this project's
+  history, and the suite is structurally blind to it. The fix belongs in 2.2's remaining
+  harness: **judge from the screen, not from the canvas** — on Android `adb screencap`
+  yields the compositor's actual output, so it can be sampled per pixel the same way the
+  in-content assertions are. Sampling pixels rather than eyeballing the image is the
+  established rule here; what changes is *which* buffer is sampled.
+
+  **That gate now exists — migo-conformance `5c964ae`.** A `screen-fill` bundle paints four
+  quadrants in mutually distant colours and keeps redrawing after `done()` (rAF stops at
+  `done()`, so without that a later capture would find whatever the compositor happened to
+  retain); `runners/run-android-screen.sh` relaunches it, captures the framebuffer and
+  samples it. Measured on the device:
+
+  ```
+  PASS screen-fill/screen-top-left     at (270,936)  of 1080x2340 want [255,0,128] +/-8, got [255,0,132]
+  PASS screen-fill/screen-bottom-left  at (270,1755) of 1080x2340 want [255,200,0] +/-8, got [255,198,0]
+  SCREEN 4 assertions, 4 passed, 0 failed
+  ```
+
+  The small deviations (`198` for `200`, `132` for `128`) are themselves evidence that the
+  samples came through the display pipeline rather than back out of the canvas, which would
+  have been exact.
+
+  **Checked load-bearing against the state it exists for.** Sending `KEYCODE_HOME` after the
+  bundle reported `DONE` leaves the canvas contents correct while the screen shows something
+  else — the precise shape of "engine right, user sees nothing". All four screen assertions
+  go red, sampling the launcher wallpaper (`got [108,153,210]` where `[255,0,128]` was
+  painted), while **the 33 in-content assertions would have stayed green throughout**.
+
+  Three deliberate choices, each avoiding a way this could have become decoration:
+
+  * **the bundle announces its own expectations** (`SCREEN-EXPECT <name> <fx> <fy> <r,g,b>`)
+    from the same array it paints from, and the runner reads them out of the log. A second
+    copy of the coordinates in the runner would drift and then report a colour mismatch
+    whose real cause is a stale constant.
+  * **deployment is not duplicated** — the screen runner invokes the existing bench runner
+    for building, installing and canvas-side judging, then does only the capture. Two
+    copies of "how a bundle reaches a device" is how one stops matching the other.
+  * **four quadrants, not one flat fill.** A flat fill cannot distinguish a correct frame
+    from one drawn at the wrong scale, offset or orientation — and those are the failures
+    that actually happened here (content in the top-left ninth; content confined to the
+    bottom 55%).
+
+  `harness.js` gained `await body()` so a test body may return a promise; awaiting a
+  non-promise is a microtask, so synchronous bodies keep exactly one test per frame. Full
+  suite after all of this: **Android 39/39 and Linux 39/39**, so the new bundle costs
+  neither platform anything.
 - [ ] 2.3 Build the Linux shared and static SDK and player from a clean tree;
   validate X11, Wayland, Qt, resize, input, and teardown.
 - [ ] 2.4 Build the Windows DLL, import library, and static SDK natively with
   MSVC and ANGLE; validate Win32 resize, DPI change, input, and teardown.
+
+  **The build half is done — 2026-08-10.** `bash scripts/build-windows-sdk.sh` runs
+  end to end on a workstation carrying VS Build Tools (MSVC 14.44.35207, Windows SDK
+  10.0.22621 and 10.0.26100, LLVM at the default path). `migo-capi` compiles for
+  `x86_64-pc-windows-msvc` in 30.47s release, and the manual link produces
+  `migo.dll` (26,422,272 bytes) plus the import library `migo.lib`, staged into
+  `dist/migo-windows-x86_64` with headers, the CMake package, and the ANGLE and V8
+  runtime DLLs beside it. `scripts/test-windows-sdk-contract.sh` then passes all six
+  checks with **0 skipped**:
+
+  ```
+  PASS  package carries the DLL, import library, headers and CMake package
+  PASS  ANGLE and V8 runtime DLLs ship alongside migo.dll
+  PASS  export surface is exactly the declared migo_* set (24 entries)
+  PASS  migo.dll loads and reports it can attach a Win32 HWND
+  PASS  staged headers compile standalone under MSVC C11 (/W4 /WX)
+  PASS  import library references migo.dll
+  ```
+
+  `0 skipped` is load-bearing here: this contract is the kind that can pass by
+  finding nothing, and it states the count so an empty run and a clean run are
+  distinguishable.
+
+  **This is not most of 2.4, and the item stays open.** Three of its four clauses are
+  untouched:
+
+  * **the static SDK is not built.** `migo_capi.lib` exists only as the staticlib
+    input to the DLL link; nothing packages or verifies a static consumer. The
+    arrangement is also not free to change — `windows-v8.lock.json` records that V8
+    must be absorbed through its *import* library, because linking the static archive
+    puts V8's bundled libc++ into the same link as Skia's MSVC STL and the two define
+    `std::terminate` incompatibly. A static SDK therefore needs that collision
+    answered, not just a second `cargo build`.
+  * **resize, DPI change, input and teardown are not validated.** Nothing has been
+    driven through a live `HWND`. "`migo.dll` loads and reports it can attach a Win32
+    HWND" is a capability report, not a frame, and it must not be read as one.
+  * **it was not built from a clean tree**, which this item explicitly asks for. The
+    ordering defect that made a cold target *impossible* is fixed in 1.7 — the search path
+    is now derived after the build, and a missing one fails by name instead of as a bare
+    `LNK1181` — but the fix was verified on a warm target plus an injected failure, not by
+    an actual empty-`CARGO_TARGET_DIR` run, which means rebuilding Skia. So "the mechanism
+    no longer prevents it" is proven and "it builds from a clean tree" is still
+    NOT PROVEN. Those are different sentences and this item needs the second one.
+  * NuGet packaging remains, which the script says itself.
+
+  Neither independent review has run: no codex on this workstation, waived by the
+  operator rather than satisfied.
 - [ ] 2.5 Qualify HarmonyOS on the `x86_64` emulator: attach, content-ready,
   first frame, resize, background and foreground, surface recreation,
   multi-touch, audio playback, detach, shutdown.

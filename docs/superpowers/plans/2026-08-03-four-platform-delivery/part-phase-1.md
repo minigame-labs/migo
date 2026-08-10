@@ -1191,6 +1191,75 @@
   `migo-full-release-arm64-v8a.aar` beside `….aar.attestation.json`.
 - [ ] 1.7 Replace the Windows warm-target link flow with a clean Windows-native
   MSVC and ANGLE build graph.
+
+  **The warm-target dependency is now measured rather than suspected — 2026-08-10.**
+  `build-windows-sdk.sh` links `migo.dll` by calling `link.exe` directly, and the input
+  libraries come from two places that disagree about when they are known:
+
+  * `cargo rustc -- --print native-static-libs` supplies the library **names**, and they
+    are bare — `skparagraph.lib`, `skia.lib`, `skia-bindings.lib`, … with no directory
+    component. Verified by reading the captured `native-libs.txt`, not inferred.
+  * The **directories** therefore have to reach `link.exe` through `LIB`, and the script
+    builds that list at lines 142–148 by `find`-ing `skia-bindings-*/out/skia/` inside
+    `CARGO_TARGET_DIR` — **before** the batch that does the building runs.
+
+  So the search path is derived from a *previous* build's output. On a cold
+  `CARGO_TARGET_DIR` the `find` matches nothing, `LIB` gets no skia directory, and the
+  link fails. Confirmed directly rather than by reasoning about it: with a developer
+  environment loaded and no skia directory added to `LIB`,
+
+  ```
+  link /NOLOGO /DLL /OUT:probe.dll skparagraph.lib
+  LINK : fatal error LNK1181: cannot open input file 'skparagraph.lib'   (exit 1181)
+  ```
+
+  The script's own comment anticipated the question and answered it optimistically —
+  "these exist because the staticlib was already built … the dirs are stable across the
+  incremental relink". Stability across relinks is not the property at issue; existence
+  on the first run is, and it does not hold.
+
+  **This bounds 2.4's claim.** That item's build half passed on this machine against a
+  warm `C:\mt`, so "the Windows SDK builds" is true and "the Windows SDK builds **from a
+  clean tree**" is not established — and 2.4 asks for the second. The distinction is
+  exactly the one Phase 1 exists to remove, so it is recorded here rather than left as an
+  operational quirk.
+
+  **The ordering defect is fixed — 2026-08-10.** `build-windows-sdk.sh` is now two stages
+  with the discovery between them: stage 1 compiles the staticlib and captures
+  `native-static-libs`, then the search path is derived **from what that stage produced**,
+  then stage 2 links. The two batches share one emitted preamble rather than two
+  hand-kept copies of the developer environment, since a drifted `INCLUDE` or an NDK clang
+  ahead of LLVM fails far from its cause.
+
+  Of the two candidate fixes named above, "let the toolchain that knows
+  `cargo:rustc-link-search` do the link" was **rejected on evidence, not preference**:
+  `capi`'s `crate-type` is `["staticlib", "rlib"]` and its manifest records why a `cdylib`
+  is not there — rustc's own export map gets added and *previously widened the public
+  surface*. The hand-link with a `.def` allowlist is load-bearing, so the fix had to be
+  the ordering, not the mechanism.
+
+  **Verified, both directions.** Rebuilt after the change: `link search dirs discovered
+  after the build: 5`, `LINK_EXIT=0`, and `migo.dll` comes out at **26,422,272 bytes — byte
+  count identical to the pre-change build**, so this moved when the path is computed
+  without moving what gets linked. The contract still passes 6/6, 0 skipped.
+
+  And the new failure path was **injected rather than assumed**: hiding only
+  `skparagraph.lib` (a file cargo does not fingerprint, so stage 1 still reports
+  `BUILD_EXIT=0` — the injection reaches the discovery and nothing else) makes the script
+  exit 1 naming the directory it searched, why `LIB` is the only channel available, and
+  what the old behaviour would have been. Previously this exact state produced a bare
+  `LNK1181` from link.exe.
+
+  **Not yet done, and the item stays open.** Two things:
+
+  * **A from-clean run is still unproven.** What is proven is that the ordering defect is
+    gone and that a missing search path now fails loudly instead of obscurely. Actually
+    running it against an empty `CARGO_TARGET_DIR` means rebuilding Skia (hours) and has
+    not been done, so "builds from a clean tree" remains NOT PROVEN — for this item and
+    for 2.4.
+  * **ANGLE is still not built by any graph here**, only consumed as prebuilt DLLs staged
+    by the spike into `migo-win-spike-tmp/angle/`. This item asks for an MSVC *and ANGLE*
+    build graph, and that half is untouched.
 - [x] 1.8 Implement HarmonyOS audio playback through OHAudio.
 
   **Done 2026-08-10, and the OpenHarmony package now ships the full product profile
@@ -1307,8 +1376,54 @@
   as one-off evidence; that is deliberately not a permanent gate, since the drift to
   prevent is between the two statements rather than inside either one.
 
-  **Still open here:** `aarch64` needs its own archive (and a Skia) before it can be
-  sealed, and the Windows writer still records no patch provenance — see 1.1l.
+  **`aarch64` is now built and sealed too — 2026-08-10.** `scripts/build-v8-ohos.sh
+  aarch64` produced `librusty_v8.a` (169,410,006 bytes) and its component manifest
+  verifies: `component_id` `2a85cc638945c9a6476bde49823c457804db03876ce5ca7e9858d969b94ee00b`,
+  computed and re-verified independently by the writer and the validator.
+  `scripts/fetch-v8-archives.sh --check --all` now reports **5 archives verified**
+  including `aarch64-linux-ohos`; that target was on the fetcher's absent list with the
+  reason "only the x86_64 OpenHarmony archive has been built and sealed", which stopped
+  being true, so it is listed now. Its *download* still has no published asset, and the
+  fetcher's comment says so rather than implying one exists.
+
+  **Getting there needed four blockers cleared, and three were pre-existing defects
+  rather than work.**
+
+  1. Two declared patches would not apply: `migo-build-rs-prebuilt-binding.diff` and
+     `0003-compiler-use-custom-libcxx-for-v8.patch`. In both cases the **code was already
+     identical** and only a *comment* differed — `Clang 19+` where the tree said `20+`,
+     and two explanatory lines the patch gained later. Someone had hand-edited the shared
+     checkout. `--fuzz=0` refusing them is correct and not over-strict: the gate cannot
+     tell a comment edit from a code edit, and what it is defending is that the tree is
+     *exactly* the declared patch set. The fix was to restore the tree from `HEAD` and let
+     the patches define it, never to reword a patch to match a tree — these patches are
+     provenance inputs to the already-sealed x86_64 manifest.
+  2. `gn` was version 2315 where the lock pins 2502. Fixed by `scripts/build-gn.sh`, which
+     refused twice on the way with the exact command to fix each (no checkout; wrong
+     revision) — a gate that tells you what to run is worth more than one that just fails.
+  3. **A hermetic defect the seal caught, and it would recur on every clean tree.** GNU
+     `patch` writes a `.orig` beside any file whose hunks land at an offset, and these
+     patches routinely land at an offset. That backup is an untracked file inside the very
+     tree `assert_tree_is_exactly_patched` then proves is exactly the declared patch set,
+     so the seal failed with `undeclared change: ?? build/config/c++/c++.gni.orig`
+     immediately after a *successful* first apply. It only appears where the patch was not
+     already in effect — i.e. exactly the from-clean case this manifest exists to make
+     reproducible, which is why it had never been seen. `v8-patch-apply.sh` now passes
+     `--no-backup-if-mismatch`.
+  4. Two stale `.migo_ohos_build_*.log` files from July sat in the checkout; no script in
+     the tree writes that path any more, so they were leftovers from a superseded script
+     version, and the same proof rejected them.
+
+  **A gap this exposed, and it belongs to 1.1j.** Neither OpenHarmony manifest records
+  `gn` at all — provenance carries `build_recipe`, `build_recipe_sha256`, `licenses` and
+  `source_revision`, and nothing else. So the gn pin is a *build-time* assertion only, and
+  **an archive cannot be asked which gn produced it.** Concretely: the gn found installed
+  here was a CIPD-downloaded prebuilt 2315 dated June, while the assertion demanding 2502
+  was added in August, and the x86_64 archive was sealed in between. Whether that archive
+  was built with 2315 or 2502 **cannot be determined from the evidence**, and stating
+  either would exceed it. That is precisely the hole 1.1j names.
+
+  **Still open here:** the Windows writer still records no patch provenance — see 1.1l.
 
   **Independent review found two P1s here, and the first was a precondition nobody
   stated.** `build-v8-ohos.sh` exports `V8_PREBUILT_BINDING`, a hook that exists **only**
@@ -1340,7 +1455,7 @@
   binary) and the build asserts it before compiling; a bogus gn is refused, checked. So the
   exemption is compensated exactly as on Android, which is the honest version of the
   sentence: two paths are exempt from the *replay* and pinned by a *receipt*.
-- [ ] 1.10 Prove the HarmonyOS API floor with the two-sysroot symbol audit
+- [x] 1.10 Prove the HarmonyOS API floor with the two-sysroot symbol audit
   (`MIGO_OHOS_FLOOR_SYSROOT` at the floor plus `MIGO_OHOS_NEWER_SYSROOT`), set
   `compatibleSdkVersion` to the proven floor, and record any symbol that forces
   the floor higher.
@@ -1410,6 +1525,83 @@
   entry's own lesson — check the object before believing a claim about it — applies to
   the claim itself. Reproducing it here needs the 6.1 SDK downloaded and an
   OpenHarmony build, which is blocked behind 1.9.
+
+  **The correction above is itself wrong, and the original evidence stands — 2026-08-10.**
+  It was written on a *different* workstation. On the machine the original run was made on,
+  `ls -d ~/ohos-sdk*` finds `~/ohos-sdk` (5.1.0.107, API 18), `~/ohos-sdk-6.1` (6.1.0.31,
+  API 23, confirmed from its own `oh-uni-package.json`) and the download cache beside them,
+  and `dist/` holds both staged packages. Re-run here, the two-sysroot gate reproduces the
+  original numbers exactly:
+
+  ```
+  x86_64:  floor 8200 symbols / 117 libraries; 1935 added after the floor;
+           libmigo_capi.a 645 externally undefined, 516 floor-resolved     → exit 0
+  aarch64: same floor and same 1935-symbol delta;
+           libmigo_capi.a 637 externally undefined, 512 floor-resolved     → exit 0
+  ```
+
+  Both report `no imported symbol postdates the floor sysroot`, and both ran against a
+  **non-empty** delta, so this is the real comparison rather than the empty-set pass the
+  gate was hardened against.
+
+  **Three claims in this entry were each written as a fact about "this machine", and the
+  machine changed underneath all three.** The lesson the entry drew for itself — check the
+  object before believing a claim about it — is right, and the correction applied it
+  correctly and still reached a false conclusion, because `~/ohos-sdk-6.1` is not one
+  object: it is a different object per host. An environmental claim needs the host named in
+  it, or a later reader on another machine will overturn a true record with a true
+  observation. Neither statement was dishonest and both were verified; they were about
+  different computers.
+
+  **The selection logic now has the fixture the review asked for.** It was a python
+  heredoc inside `build-ohos-sdk.sh`, and that is *why* it had only ever been checked by
+  hand: logic embedded in a heredoc has no seam a test can reach. It is now
+  `scripts/lib/select-ohos-newer-sysroot.py` — behaviour unchanged, one dead branch
+  dropped (`best_api is None` cannot hold once the floor's API is known) — with
+  `scripts/test-ohos-newer-sysroot-selection.sh` covering eight layouts.
+
+  The fixtures are built so a **name-ordering rule and an apiVersion rule disagree**; a
+  layout where both agree would pass against either implementation and prove nothing. Two
+  cases carry that weight: the floor being the newest SDK installed, and a sibling that
+  sorts *after* the floor while declaring a *lower* API. Checked load-bearing by
+  reinstating the wrong first draft: **4 of 8 cases go red**, including both of those.
+  Restored from a copy rather than `git checkout`, since the tree carries other
+  uncommitted work. A real trap is covered too — `~/ohos-sdk-dl`, a download cache, matches
+  the `ohos-sdk*` glob on this machine and is excluded by having no `native/sysroot`.
+
+  **`compatibleSdkVersion` was deliberately NOT set to the audited floor, which is a
+  departure from this item's wording.** Both declarations say API 20 (the app package's
+  `compatibleSdkVersion`, and `MIN_OHOS_API` in `build-ohos-sdk.sh`); the audit resolves
+  against an API 18 sysroot. Setting 20 → 18 would *widen* the published support claim to
+  an API level nothing has ever executed on. The audit is a symbol-existence proof and is
+  stricter than the declared floor **on purpose** — `test-ohos-symbol-floor.sh` says so in
+  its own header, because OpenHarmony ships no per-API stubs and an older sysroot is the
+  only objective version evidence available. A symbol existing is not behaviour being
+  correct. So the honest invariant is an inequality, not an equality: the published floor
+  must be **at or above** the audited one, and lowering it needs device evidence rather
+  than a symbol table.
+
+  That invariant is now a gate rather than a paragraph:
+  `scripts/test-ohos-api-floor-declaration-contract.sh` reads all three numbers, prints
+  them, and fails on either violation. Both directions were injected:
+
+  ```
+  drift  (app 21 vs C SDK 20)  → exit 1, names both sides
+  lower  (both 17, audited 18) → exit 1, "the audit then proves nothing about [17, 18)"
+  restored                     → exit 0
+  ```
+
+  The two hand-written 20s were the real defect here: one decision written twice with
+  nothing comparing them, so raising the product floor in one place would leave the other
+  advertising support that nothing gates. Both gates are wired into `pr-ci.yml`, and the
+  local verifier derives its contract lane from that file, so the count went **29 → 31**
+  rather than the gates existing where only CI runs them.
+
+  **Still open:** neither independent review has run — this workstation has no codex and
+  the operator waived the requirement, which is not the same as passing it. The audit-floor
+  comparison also reduces to the two-declaration check on a machine with no SDK unpacked;
+  that path reports itself rather than passing silently, but it does mean CI checks less
+  than this workstation does.
 - [ ] 1.11 Produce deterministic Android, Linux, Windows, and HarmonyOS packages
   carrying manifests, checksums, BSL 1.1 text, notices, SBOMs, and provenance.
 - [ ] 1.12 Prove same-source rebuild byte equality for every shipping archive.
