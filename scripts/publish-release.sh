@@ -41,16 +41,21 @@ if [[ ! -d .git ]]; then
 fi
 
 # Step 1: Generate attestation files
+#
+# Always (re)generate, even if an attestation file already exists under this
+# name: a leftover attestation from an earlier build (e.g. one produced by
+# package-sdk.sh under a different source filename, then dragged along when
+# the artifact was renamed to match this script's naming) can be present but
+# stale, with a package_file/size/sha256 that no longer matches the actual
+# bytes being uploaded. Consumers verify the attestation against the asset
+# they downloaded, so a stale attestation here is a silent release-breaking
+# bug rather than a build-time failure -- it only surfaces downstream when
+# resolve-migo-artifact.sh rejects the mismatch. Regenerating unconditionally
+# from the file about to be uploaded is the only way to guarantee they agree.
 echo "📝 Generating attestation files..."
 cd "$ARTIFACTS_DIR"
 for file in migo-*.aar migo-*.tar.gz; do
   if [[ ! -f "$file" ]]; then
-    continue
-  fi
-
-  # Skip if attestation already exists
-  if [[ -f "${file}.attestation.json" ]]; then
-    echo "  ✓ ${file}.attestation.json (already exists)"
     continue
   fi
 
