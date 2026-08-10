@@ -7,8 +7,8 @@
 //! callback cover this one too.
 //!
 //! Declared by hand against `<ohaudio/native_audiostreambuilder.h>` and
-//! `<ohaudio/native_audiorenderer.h>` rather than generated: it is ten functions and four
-//! enum constants, and a bindgen step would put a clang and a header search path between
+//! `<ohaudio/native_audiorenderer.h>` rather than generated: it is fourteen functions and
+//! six enum constants, and a bindgen step would put a clang and a header search path between
 //! this crate and a build that already has to pin both for V8.
 
 use std::ffi::{c_int, c_void};
@@ -175,13 +175,19 @@ unsafe extern "C" fn on_write_data(
     }
     // SAFETY: `user_data` is the pointer handed to SetRendererCallback, which points at a
     // `CallbackState` box that `AudioOutput` keeps alive until after the renderer is
-    // released. OHAudio serialises its data callback, so this is the only reference.
-    let state = unsafe { &mut *user_data.cast::<CallbackState>() };
+    // released. The reference is taken to the `render` field alone, not to the whole
+    // struct: `on_error` is a *separate* callback that may run concurrently with this one,
+    // so a `&mut CallbackState` here and a `&CallbackState` there would be two overlapping
+    // references with one mutable -- undefined behaviour even though the error path only
+    // touches an atomic. Disjoint fields cannot alias, so each callback projects to the one
+    // it needs. OHAudio serialises the data callback against itself, which is what makes
+    // this `&mut` the only one.
+    let render = unsafe { &mut (*user_data.cast::<CallbackState>()).render };
     // SAFETY: the device owns `bytes` writable bytes at `buffer` for this call, and
     // `F32LE` means they are `f32`-aligned.
     let samples =
         unsafe { std::slice::from_raw_parts_mut(buffer.cast::<f32>(), bytes / size_of::<f32>()) };
-    state.render.render_native(samples);
+    render.render_native(samples);
     0
 }
 
@@ -192,9 +198,12 @@ unsafe extern "C" fn on_error(
     error: c_int,
 ) -> i32 {
     if !user_data.is_null() {
-        // SAFETY: as in `on_write_data`; only the `Arc` flag is touched, which is atomic.
-        let state = unsafe { &*user_data.cast::<CallbackState>() };
-        state.stream_error.store(true, Ordering::Release);
+        // SAFETY: the same box `on_write_data` reaches, projected to a *different* field.
+        // Taking `&CallbackState` here would overlap with that callback's `&mut`, which the
+        // device is free to run concurrently -- this callback is not the data callback and
+        // is not serialised against it.
+        let stream_error = unsafe { &(*user_data.cast::<CallbackState>()).stream_error };
+        stream_error.store(true, Ordering::Release);
     }
     error!("OHAudio renderer error: {error}");
     0

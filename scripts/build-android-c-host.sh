@@ -34,9 +34,10 @@ ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/aarch64-linux-android-ar"
 export PATH="$SHIM_DIR:$PATH"
 
 V8_DIR="$ENGINE_DIR/third_party/rusty_v8/aarch64"
-# Verified against its component manifest, then used from a content-addressed path.
+# Verified against its component manifest, then used from a content-addressed path. No
+# separate existence check below it: the materialiser refuses a missing archive by name, so
+# one here would be dead code shaped like a guard.
 v8_materialise "$V8_DIR" "$ENGINE_DIR/target/v8-materialised" || exit 1
-[[ -f "$V8_DIR/librusty_v8.a" ]] || { err "missing $V8_DIR/librusty_v8.a"; exit 1; }
 
 info "building capi staticlib for $TARGET"
 # Built from inside engine/ so engine/rust-toolchain.toml applies -- it is

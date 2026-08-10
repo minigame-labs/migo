@@ -48,6 +48,13 @@ NEEDS = {
     # compiles what it reads may be listed here.
     "scripts/test-android-host-api-contract.sh": "gradlew",
     "scripts/test-camera-frame-jni-contract.sh": "gradlew",
+    # It drives Gradle's manifest-merge tasks and reads their output, so a machine with
+    # no wrapper cannot produce the merged manifests it compares. Listed here because it
+    # exits 0 in that case: without this line the verifier printed PASS for a gate that
+    # had asserted nothing, which is the same "an empty scan is indistinguishable from a
+    # clean one" defect this repository keeps removing -- and worse here, since the whole
+    # point of the gate is that a permission set is checked rather than assumed.
+    "scripts/test-android-merged-manifest-permissions.sh": "gradlew",
 }
 
 # Gates that must not run from inside the verifier.

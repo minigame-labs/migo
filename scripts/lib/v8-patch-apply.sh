@@ -136,17 +136,38 @@ _v8_git() {
 # as one rather than followed.
 _v8_changed_paths() {
     local tree="$1" prefix="$2"
-    local listing record status path mode pinned actual
-    local -a records=()
-    # A failed enumeration must not read as an empty one. The status output is
-    # NUL-separated, so it cannot go through a command substitution, and a process
-    # substitution's exit code is not observable -- hence the file. Read it out and
-    # delete it before processing, so the recursion below cannot leak it.
+    local listing record status path pinned actual submodule
+    local -a records=() submodules=()
+    # Submodules are enumerated from the index and scanned explicitly rather than
+    # discovered from the parent's status, and the reason is not obvious:
+    # `submodule.<name>.ignore = all` (or `dirty`) makes the parent's `git status` omit
+    # the submodule entirely, so a descent triggered by the parent reporting a dirty
+    # gitlink would silently never happen and unrecorded submodule edits would pass this
+    # proof. `--ignore-submodules=all` on the parent scan below therefore says "do not
+    # tell me about submodules" precisely because each one is asked directly.
+    #
+    # `scripts/lib/v8_source_proof.py` already worked this way; this copy -- the one the
+    # *build* uses, where an unexplained edit reaches an artifact rather than a manifest --
+    # did not. Two implementations of one rule, with the guard on the copy that seals.
     listing="$(mktemp)" || {
         _v8_patch_err "cannot create a temporary file to enumerate $tree"
         return 1
     }
-    if ! _v8_git "$tree" status --porcelain=v1 -z --untracked-files=all > "$listing"; then
+    if ! _v8_git "$tree" ls-files --stage > "$listing"; then
+        rm -f "$listing"
+        _v8_patch_err "cannot read the index of $tree"
+        return 1
+    fi
+    while read -r mode _ _ path; do
+        [[ "$mode" == "160000" ]] && submodules+=("$path")
+    done < "$listing"
+
+    # A failed enumeration must not read as an empty one. The status output is
+    # NUL-separated, so it cannot go through a command substitution, and a process
+    # substitution's exit code is not observable -- hence the file. Read it out and
+    # delete it before processing, so the recursion below cannot leak it.
+    if ! _v8_git "$tree" status --porcelain=v1 -z --untracked-files=all \
+            --ignore-submodules=all > "$listing"; then
         rm -f "$listing"
         _v8_patch_err "cannot read the git status of $tree"
         return 1
@@ -156,20 +177,21 @@ _v8_changed_paths() {
     for record in "${records[@]}"; do
         status="${record:0:2}"
         path="${record:3}"
-        mode="$(_v8_git "$tree" ls-files --stage -- "$path" 2>/dev/null \
-                | awk 'NR == 1 { print $1 }')"
-        if [[ "$mode" == "160000" ]]; then
-            pinned="$(_v8_git "$tree" rev-parse "HEAD:$path" 2>/dev/null)"
-            actual="$(_v8_git "$tree/$path" rev-parse HEAD 2>/dev/null)"
-            if [[ -z "$pinned" || -z "$actual" || "$pinned" != "$actual" ]]; then
-                printf '%s\t%s\t%s\t%s\n' \
-                    "submodule-moved" "$prefix$path" "$tree" "$path"
-                continue
-            fi
-            _v8_changed_paths "$tree/$path" "$prefix$path/" || return 1
-        else
-            printf '%s\t%s\t%s\t%s\n' "$status" "$prefix$path" "$tree" "$path"
+        printf '%s\t%s\t%s\t%s\n' "$status" "$prefix$path" "$tree" "$path"
+    done
+
+    # Descending is only sound while a submodule sits at the commit its parent records.
+    # Otherwise the pristine baseline would be a foreign HEAD, and a submodule checked out
+    # elsewhere where the declared patches still apply would read as clean.
+    for submodule in "${submodules[@]}"; do
+        pinned="$(_v8_git "$tree" rev-parse "HEAD:$submodule" 2>/dev/null)"
+        actual="$(_v8_git "$tree/$submodule" rev-parse HEAD 2>/dev/null)"
+        if [[ -z "$pinned" || -z "$actual" || "$pinned" != "$actual" ]]; then
+            printf '%s\t%s\t%s\t%s\n' \
+                "submodule-moved" "$prefix$submodule" "$tree" "$submodule"
+            continue
         fi
+        _v8_changed_paths "$tree/$submodule" "$prefix$submodule/" || return 1
     done
 }
 

@@ -1,4 +1,13 @@
 {
+  "gn": {
+    "notes": "The same prefetched binary the Android build uses -- scripts/build-v8-ohos.sh exports GN=third_party/v8_correct_gn/gn -- so it carries the same pin rather than a second opinion about which gn is correct. Pinned here because this build exempts that binary and its receipt from the source replay (they are untracked files whose provenance is the receipt), and an exemption with no compensating assertion is just an unverified input: gn generates the entire build graph. gn generates the entire build graph, so it is part of the artifact's provenance. V8 14.5 needs path_exists(), added in gn 2315; skia's bundled gn 2175 is too old. The exact version pin above already refuses everything older, so there is no separate minimum. gn's version is a commit position and is unchanged by local modifications, so the revision is pinned as well. Built by scripts/build-gn.sh with the one required patch, which adds -Wno-comment to gn's existing gcc-only suppression list because header_checker.h ends an ASCII-art comment line with a backslash that only gcc reports and gn compiles with -Werror.",
+    "required_patches": [
+      "0001-suppress-gcc-multiline-comment-warning"
+    ],
+    "revision": "17b0057970fa2b07a20cbb4289ab78cf93565f35",
+    "source": "https://gn.googlesource.com/gn",
+    "version": "2502"
+  },
   "notes": "The binding is not generated on this platform and that is structural rather than a configuration choice: the SDK ships clang 15 on both the 5.1 and 6.1 lines, while V8 145's vendored libc++ announces it supports clang 20 and later and uses __builtin_clzg/__builtin_ctzg, added in clang 19. bindgen therefore fails after the whole C++ side has already built. scripts/build-v8-ohos.sh feeds the committed src_binding.rs through V8_PREBUILT_BINDING and refuses if it is missing. The binding encodes V8's FFI ABI for a rusty_v8 revision rather than a target's calling convention, so it is byte-identical to the Android one at this revision and both OpenHarmony triples are LP64.",
   "ohos_api": 18,
   "required_patches": [

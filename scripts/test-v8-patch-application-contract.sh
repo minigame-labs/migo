@@ -337,6 +337,20 @@ EOP
 
     printf 'changed\n' > "$super/sub/other.txt"
     tcheck "an edit to an untouched submodule file is refused" fail
+
+    # The same edit, with the parent configured not to mention the submodule at all.
+    # `submodule.<name>.ignore = all` makes the parent's `git status` omit it, so a descent
+    # driven by the parent reporting a dirty gitlink silently never happens and the edit
+    # seals. The fixture first asserts the bypass is real, so a pass here cannot come from
+    # the configuration having had no effect.
+    git_q -C "$super" config submodule.sub.ignore all
+    if git_q -C "$super" status --porcelain | grep -q '^ M sub$'; then
+        fail "submodule.ignore=all did not hide the dirty submodule; the case is not exercised"
+        rc=1
+    else
+        tcheck "an edit hidden by submodule.ignore=all is still refused" fail
+    fi
+    git_q -C "$super" config --unset submodule.sub.ignore
     printf 'sub-untouched\n' > "$super/sub/other.txt"
 
     printf 'top-one\nTOP-TWO\ntop-three\nsmuggled\n' > "$super/top.txt"

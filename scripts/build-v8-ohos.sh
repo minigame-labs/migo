@@ -243,6 +243,25 @@ info "V8_PREBUILT_BINDING = $PREBUILT_BINDING"
     export GN="$RUSTY_V8_SRC/third_party/v8_correct_gn/gn"
 command -v ninja >/dev/null 2>&1 && export NINJA="$(command -v ninja)"
 
+# gn generates the entire build graph, so it is an input to every byte of the archive --
+# and this build *exempts* that binary and its receipt from the source replay, because
+# they are untracked files whose provenance is the receipt rather than a patch. An
+# exemption with no compensating assertion is just an unverified input, which is why the
+# Android build asserts the same pin. Same binary, same lock block, same check.
+# shellcheck source=scripts/lib/gn-pin.sh
+source "$SCRIPT_DIR/lib/gn-pin.sh"
+gn_pin_read "$V8_BUILD_LOCK" || exit 1
+if [[ -n "${GN:-}" ]]; then
+    gn_pin_assert_binary "$GN" "$ENGINE_ROOT/third_party/gn-patches" || {
+        err "the gn this build would use is not the one $V8_BUILD_LOCK pins"
+        exit 1
+    }
+else
+    err "no prefetched gn at $RUSTY_V8_SRC/third_party/v8_correct_gn/gn"
+    err "build it with: bash scripts/build-gn.sh"
+    exit 1
+fi
+
 # Outside the vendored checkout, the way build-v8-android.sh already does it. A log
 # written into $RUSTY_V8_SRC is an untracked file no committed patch explains, so it
 # makes every provenance gate over that tree -- including the Android build's own --

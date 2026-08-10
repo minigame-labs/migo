@@ -1,6 +1,6 @@
 {
   "schema": "migo-v8-component-manifest/v1",
-  "component_id": "1f45aad8099ef7646ec561cec4d39d2db6fc1fc0a6647318da0d01c15c9f83f6",
+  "component_id": "423f32273c0f49ceb8bcfcb80d069ddb65022c69af12c919b589f9557d6fc041",
   "target": {
     "triple": "x86_64-unknown-linux-ohos",
     "os": "linux",
@@ -75,7 +75,7 @@
   "provenance": {
     "source_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
     "build_recipe": "scripts/build-v8-ohos.sh",
-    "build_recipe_sha256": "834c4278c82cf21a92c77c305ab2213493e3e27daedb1f44281d6b55e1411d78",
+    "build_recipe_sha256": "0a4e019a30ace3dfb8eb9cdf2937970e0de8ed3bc10887177052264ab09dccb9",
     "licenses": [
       "BSD-3-Clause",
       "MIT"

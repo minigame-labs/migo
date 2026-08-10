@@ -29,9 +29,16 @@ rustflags = [
   # The dynamic path matches scripts/build-android-so.sh copying
   # libc++_shared.so into jniLibs/.
   #
-  # Tolerate the handful of std::* symbols that are defined in both
-  # V8's and Skia's archives; the linker picks the first definition,
-  # which is safe because all archives use the same NDK libc++ ABI.
+  # Tolerate the duplicate std::* symbols V8 and Skia both define. The linker takes the
+  # first definition, and what that tolerates was measured by removing the flag: exactly
+  # six symbols, all ones libc++
+  # explicitly instantiates in stdexcept.cpp (std::runtime_error and std::logic_error's
+  # char-const* constructor, copy constructor and copy assignment). The two providers are
+  # *different* libc++ implementations -- Chromium's, carried inside V8's rlib, and the NDK
+  # r23 sysroot's libc++_static.a -- so the older justification here, "the same libc++ ABI",
+  # was false. Taking the first definition is safe for a narrower reason: no std exception
+  # object crosses the V8/Skia boundary, because each side throws and catches internally and
+  # the surface between them is a C ABI. See ledger item 1.4.
   "-C", "link-arg=-Wl,--allow-multiple-definition",
   
   # Use LLD linker for better optimization (if available)

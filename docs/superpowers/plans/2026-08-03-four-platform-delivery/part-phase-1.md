@@ -875,10 +875,28 @@
   already ran `verify-v8-component` first. The shipping path was the unverified one.
 
   `scripts/lib/v8-materialise.sh` verifies the archive **and** the binding against the
-  `component-manifest.json` beside them, then makes them available under
-  `engine/target/v8-materialised/<archive-sha256>/`. Six consumers use it:
+  `component-manifest.json` beside them — by hash, which is the content check and not the
+  whole of what `migo-artifact-manifest verify-v8-component` does (that also recomputes
+  `component_id` and validates the target and toolchain blocks, and the SDK scripts still
+  run it). Full parity with those scripts is therefore *not* claimed here; what is closed is
+  that the shipping path went from checking nothing to checking the bytes. Running the tool
+  from the materialiser would put a cargo build of it on the hot path, which is why it does
+  not. then makes them available under
+  `engine/target/v8-materialised/<archive-sha256>-<binding-sha256>/`. Eight consumers use it, across both languages:
   `build-android-so.sh`, `build-android-sdk.sh`, `build-android-c-host.sh`,
-  `build-linux-sdk.sh`, `build-ohos-sdk.sh`, `build-ohos-host.sh`.
+  `build-linux-sdk.sh`, `build-ohos-sdk.sh`, `build-ohos-host.sh`, `gen-snapshot.sh`, and
+  `build-android-so.ps1` through `scripts/lib/V8Materialise.psm1`.
+
+  **The PowerShell one was found by review, and the enumeration could not see it.** The gate
+  globbed `*.sh` and matched `RUSTY_V8_ARCHIVE="`, so it missed `build-android-so.ps1` --
+  which still selected its archive with `Test-Path`, on the path `build-aar.ps1` invokes, so
+  the Windows-host route to an AAR linked unverified bytes even after item 1.6 made that
+  route work -- and `build-windows-sdk.sh`, which writes `set RUSTY_V8_ARCHIVE=` into a batch
+  heredoc. A *scope* hole rather than a weak assertion, and the second of its kind here: the
+  NDK pin gate had the identical `.ps1` blind spot. The gate now matches three assignment
+  spellings and skips reads, since a looser pattern reported correct code as an offender. The
+  two materialisers are held equal by producing the **same** directory for the same inputs,
+  checked: `681aaa39…-47369bfb…` from both.
 
   **A workaround was deleted rather than kept, which is the real argument for content
   addressing.** Cargo reruns the `v8` crate's build script when the *value* of
@@ -969,9 +987,11 @@
   runtime symbols at component build boundaries.
 
   **Both HarmonyOS entries are gone, and the Android duplicate is now measured rather
-  than described — 2026-08-10.** Five occurrences remain three: `engine/.cargo/config.toml`
-  ×3 (Android), `scripts/build-android-so.sh`, `scripts/build-android-so.ps1`,
-  `scripts/gen-snapshot.sh`, and `platforms/openharmony/.../CMakeLists.txt`.
+  than described — 2026-08-10.** Seven occurrences remain five: `engine/.cargo/config.toml`
+  ×3 (the three Android targets), `scripts/build-android-so.sh`,
+  `scripts/build-android-so.ps1`, `scripts/gen-snapshot.sh`, and
+  `platforms/openharmony/.../CMakeLists.txt` — the two OpenHarmony `config.toml` entries are
+  what went.
 
   **What the linker actually says.** Removing the flag from the Android build fails with
   **exactly six** duplicate symbols, every one of them a function libc++ explicitly
@@ -989,8 +1009,12 @@
   `build-android-so.sh` and the OpenHarmony `CMakeLists.txt` — **was false**. They are two
   different libc++ implementations. Taking the first definition is safe for a narrower
   reason: no `std` exception object crosses the V8/Skia boundary, because each side throws
-  and catches internally and the surface between them is a C ABI. The comments now say
-  that instead, because the old wording made the flag look like a formality.
+  and catches internally and the surface between them is a C ABI. All four places now say that instead — and an independent review
+  caught that only `build-android-so.sh` had been corrected while `config.toml`, the
+  OpenHarmony `CMakeLists.txt` and `build-android-so.ps1` still carried the disproven claim,
+  the last of them a third and differently wrong story about the NDK's *shared* libc++. A
+  ledger sentence claiming a correction that was made in one file out of four is exactly the
+  kind of unsupported claim this ledger exists to catch.
 
   **Why the HarmonyOS entries could go, with evidence rather than a guess.** `migo-capi`
   is a `staticlib` on those targets, so rustc never invokes a linker and the `link-arg`s
@@ -1183,7 +1207,7 @@
   OpenHarmony callback without being duplicated — a second copy of a real-time callback is
   how one of them quietly stops matching its gate.
 
-  **Declared by hand against the SDK headers, ten functions and six enum constants.** The
+  **Declared by hand against the SDK headers, fourteen functions and six enum constants.** The
   callback struct is passed **by value** to `OH_AudioStreamBuilder_SetRendererCallback`, so
   all four members are declared even though two are used: a short struct passed by value
   reads the caller's stack as if it were the rest. `length` is a byte count and the stream
@@ -1303,8 +1327,19 @@
   what produced these bytes includes what was applied to it.
 
   Verified after both fixes: all five patches report `already in effect`, the archive is
-  unchanged at `b097549b…`, and the manifest reseals (`component_id` `1f45aad8…`) with **no
-  path exemptions**, so the tree is proved to be HEAD plus exactly those five.
+  unchanged at `b097549b…`, and the manifest reseals with the replay covering all five.
+
+  **A third finding corrected a claim in the paragraph above.** "No path exemptions" was
+  wrong: the build passes `--accounted third_party/v8_correct_gn/gn` and its receipt, because
+  those are untracked files whose provenance is the receipt rather than a patch. Worse, the
+  exemption had **no compensating assertion** on this platform — unlike the Android build,
+  `build-v8-ohos.sh` never called `gn_pin_assert_binary` and `ohos-v8.lock.json` had no `gn`
+  block at all, so the gn that generated the entire build graph was both unverified and
+  unrecorded while this item's headline claimed the archive is bound to a GN argument set.
+  The lock now carries the same `gn` block as Android's (it is literally the same prefetched
+  binary) and the build asserts it before compiling; a bogus gn is refused, checked. So the
+  exemption is compensated exactly as on Android, which is the honest version of the
+  sentence: two paths are exempt from the *replay* and pinned by a *receipt*.
 - [ ] 1.10 Prove the HarmonyOS API floor with the two-sysroot symbol audit
   (`MIGO_OHOS_FLOOR_SYSROOT` at the floor plus `MIGO_OHOS_NEWER_SYSROOT`), set
   `compatibleSdkVersion` to the proven floor, and record any symbol that forces
@@ -1347,9 +1382,12 @@
   on the SDK's own declared `apiVersion`, not on its directory name, and the first draft
   taking "the highest-sorted directory that is not the floor" was **wrong**: with the
   floor as the newest installed SDK it hands back an *older* sysroot and reports its
-  extra symbols as post-floor, which is evidence pointing the wrong way. Three layouts
-  are checked — a newer and an older SDK present (picks the newer), the floor being the
-  newest (refuses, reports none), and only an older one beside it (refuses).
+  extra symbols as post-floor, which is evidence pointing the wrong way. Three layouts were
+  checked by hand — a newer and an older SDK present (picks the newer), the floor being the
+  newest (refuses, reports none), and only an older one beside it (refuses) — and that was a
+  **one-off manual check, not a fixture**: an independent review pointed out that nothing
+  commits it, so the wrong first draft is reintroducible with no gate firing. Said plainly
+  rather than left reading as covered.
   `MIGO_OHOS_NEWER_SYSROOT` still wins when set.
 
   On this machine only one SDK exists, so the run says so —
@@ -1431,9 +1469,15 @@
   manifest passed it.
 
   `scripts/test-android-merged-manifest-permissions.sh` compares the merged manifests
-  exactly, in both directions, per profile, and is in `pr-ci.yml` — so
-  `verify-change.sh` derives it too (confirmed: it appears in `--plan-only`, and
-  `test-local-verification-contract.sh` passes).
+  exactly, in both directions, per profile, and is in `pr-ci.yml` — so `verify-change.sh`
+  derives it too.
+
+  **It is classified `needs:gradlew`, and a review is why.** The gate skips cleanly when no
+  wrapper is present, and it was classified `run`, so the verifier printed **PASS for a gate
+  that had asserted nothing** — an empty scan indistinguishable from a clean one, in a gate
+  whose entire point is that a permission set is checked rather than assumed. Its two
+  Gradle-dependent siblings were already listed; it now is too, so an absent toolchain reads
+  NOT PROVEN.
 
   **The policy is not restated.** It moved to
   `scripts/lib/android_permission_policy.py` and both gates import it; the older gate

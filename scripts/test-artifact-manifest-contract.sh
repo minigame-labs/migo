@@ -511,16 +511,47 @@ EXEMPT = {
     "dev-run-player.sh": "runs the local player; may use a development archive",
     "dev-test-host.sh": "runs host suites against the local linux-gnu archive",
     "test-capi-platform-contract.sh": "a contract check, not a producer",
+    "build-windows-sdk.sh": (
+        "Windows has no committed component manifest -- build-v8-windows.sh deliberately "
+        "emits none until there is a lock to verify one against -- so there is nothing to "
+        "materialise against yet, which is the same reason fetch-v8-archives.sh omits the "
+        "MSVC triple. Remove this exemption when that manifest exists."
+    ),
+    "build-snapshot.ps1": (
+        "runs migo-snapshot-gen on a Windows *host* and so uses the Windows V8 archive, "
+        "which has no committed manifest either; it also clears the variable first so an "
+        "Android archive cannot leak into a host build. Same removal condition as "
+        "build-windows-sdk.sh."
+    ),
 }
 
-consumers = {
-    path.name
-    for path in scripts.glob("*.sh")
-    # This contract is the one file allowed to name the variable freely -- it has to
-    # quote it to search for it -- the same exemption the NDK pin gate makes for itself.
-    if path.name != "test-artifact-manifest-contract.sh"
-    and re.search(r'RUSTY_V8_ARCHIVE="', path.read_text(encoding="utf-8"))
-}
+# Both spellings, because the first version of this enumeration globbed `*.sh` and matched
+# `RUSTY_V8_ARCHIVE="` -- so it could not see `build-android-so.ps1`, which set the variable
+# from a `Test-Path` check on the path that produces the AAR's native library, nor
+# `build-windows-sdk.sh`, which writes `set RUSTY_V8_ARCHIVE=` into a batch heredoc. That is
+# a *scope* hole rather than a weak assertion, and it is the second time one has been found
+# here: the NDK pin gate had the identical blind spot for `.ps1`.
+# Assignments only. A pattern loose enough to match a *read* also matches
+# `Print-Info "RUSTY_V8_ARCHIVE = ..."` and a save/restore of the variable, which reports
+# correct code as an offender -- a check that fails on correct code is worse than none.
+SETTERS = [
+    re.compile(r'(?m)^\s*(?:export\s+)?RUSTY_V8_ARCHIVE="([^"]*)"'),   # bash
+    re.compile(r'(?m)^\s*\$env:RUSTY_V8_ARCHIVE\s*=\s*(\S+)'),          # PowerShell
+    re.compile(r'(?m)^\s*set\s+RUSTY_V8_ARCHIVE=(\S+)'),               # batch heredoc
+]
+MATERIALISED = {"$V8_MATERIALISED_ARCHIVE", "$v8.Archive"}
+
+consumers = {}
+for path in sorted(list(scripts.glob("*.sh")) + list(scripts.glob("*.ps1"))):
+    # This contract is the one file allowed to name the variable freely -- it has to quote
+    # it to search for it -- the same exemption the NDK pin gate makes for itself.
+    if path.name == "test-artifact-manifest-contract.sh":
+        continue
+    text = path.read_text(encoding="utf-8")
+    values = [value.strip() for pattern in SETTERS for value in pattern.findall(text)
+              if value.strip()]
+    if values:
+        consumers[path.name] = (values, text)
 if not consumers:
     sys.exit("found no script setting RUSTY_V8_ARCHIVE -- the enumeration is broken")
 
@@ -529,18 +560,17 @@ if stale:
     sys.exit(f"exemptions that no longer consume a V8 archive: {stale}")
 
 offenders = []
-for name in sorted(consumers - set(EXEMPT)):
-    text = (scripts / name).read_text(encoding="utf-8")
-    values = re.findall(r'RUSTY_V8_ARCHIVE="([^"]*)"', text)
-    if any(value != "$V8_MATERIALISED_ARCHIVE" for value in values):
+for name in sorted(set(consumers) - set(EXEMPT)):
+    values, text = consumers[name]
+    if any(value not in MATERIALISED for value in values):
         offenders.append(f"{name} -> {values}")
-    elif "v8_materialise" not in text:
-        offenders.append(f"{name} uses the materialised path but never calls v8_materialise")
+    elif "v8_materialise" not in text and "Resolve-MigoMaterialisedV8" not in text:
+        offenders.append(f"{name} uses the materialised path but never materialises")
 
 if offenders:
     sys.exit("; ".join(offenders))
 print(
-    f"{len(consumers - set(EXEMPT))} shipping V8 consumer(s) materialise first, "
+    f"{len(set(consumers) - set(EXEMPT))} shipping V8 consumer(s) materialise first, "
     f"{len(EXEMPT)} exempted by name"
 )
 PY
