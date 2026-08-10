@@ -46,11 +46,13 @@
   * **resize, DPI change, input and teardown are not validated.** Nothing has been
     driven through a live `HWND`. "`migo.dll` loads and reports it can attach a Win32
     HWND" is a capability report, not a frame, and it must not be read as one.
-  * **it was not built from a clean tree**, which this item explicitly asks for. The run
-    used a warm `CARGO_TARGET_DIR`, and the link step derives its library search path by
-    scanning that directory *before* the build runs — so on a cold target it finds no
-    skia directory and the link fails with `LNK1181`, measured. See 1.7, where the
-    mechanism and the evidence are recorded.
+  * **it was not built from a clean tree**, which this item explicitly asks for. The
+    ordering defect that made a cold target *impossible* is fixed in 1.7 — the search path
+    is now derived after the build, and a missing one fails by name instead of as a bare
+    `LNK1181` — but the fix was verified on a warm target plus an injected failure, not by
+    an actual empty-`CARGO_TARGET_DIR` run, which means rebuilding Skia. So "the mechanism
+    no longer prevents it" is proven and "it builds from a clean tree" is still
+    NOT PROVEN. Those are different sentences and this item needs the second one.
   * NuGet packaging remains, which the script says itself.
 
   Neither independent review has run: no codex on this workstation, waived by the

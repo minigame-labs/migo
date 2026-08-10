@@ -3127,9 +3127,15 @@
   **What this does not prove.** It is a compile claim, nothing more: that these paths
   type-check and codegen for `x86_64-pc-windows-msvc`. It says nothing about whether
   the Windows presenter draws a correct frame, and it is not evidence for 1.7, whose
-  subject is replacing the warm-target link flow with a native build graph. The
-  `aarch64-unknown-linux-ohos` sentence above is also unchanged and still true: only
-  `x86_64` is proven on the OpenHarmony side.
+  subject is replacing the warm-target link flow with a native build graph.
+
+  **The `aarch64-unknown-linux-ohos` half moved but is not closed.** That triple now has
+  its own V8 archive and a sealed component manifest (1.9, 2026-08-10), so the blocker this
+  entry named — "needs its own archive" — is gone. It still needs a Skia for the triple
+  before `migo-capi` can compile for it, so on the OpenHarmony side only `x86_64` has
+  actually compiled. The `target_env = "ohos"` view of the tree is the same for either
+  architecture, which is why the verifier's lane uses `x86_64`; that makes this a gap in
+  architecture coverage rather than in cfg coverage.
 
   **Neither independent review has run on this half** — this workstation has no codex,
   and the operator waived the review requirement rather than it being satisfied. Recorded

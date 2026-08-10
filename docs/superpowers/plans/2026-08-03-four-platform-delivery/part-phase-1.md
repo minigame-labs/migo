@@ -1224,12 +1224,42 @@
   exactly the one Phase 1 exists to remove, so it is recorded here rather than left as an
   operational quirk.
 
-  **Not yet done:** the replacement itself. The minimum correct fix is to stop deriving
-  link inputs from state that predates the build — either discover the search paths
-  *after* the staticlib is produced, or stop hand-linking and let the toolchain that knows
-  `cargo:rustc-link-search` do the link. Which of those the "clean Windows-native build
-  graph" should be is this item's actual design question, and it is untouched. ANGLE is
-  also still consumed as prebuilt DLLs staged by the spike, not built by any graph here.
+  **The ordering defect is fixed — 2026-08-10.** `build-windows-sdk.sh` is now two stages
+  with the discovery between them: stage 1 compiles the staticlib and captures
+  `native-static-libs`, then the search path is derived **from what that stage produced**,
+  then stage 2 links. The two batches share one emitted preamble rather than two
+  hand-kept copies of the developer environment, since a drifted `INCLUDE` or an NDK clang
+  ahead of LLVM fails far from its cause.
+
+  Of the two candidate fixes named above, "let the toolchain that knows
+  `cargo:rustc-link-search` do the link" was **rejected on evidence, not preference**:
+  `capi`'s `crate-type` is `["staticlib", "rlib"]` and its manifest records why a `cdylib`
+  is not there — rustc's own export map gets added and *previously widened the public
+  surface*. The hand-link with a `.def` allowlist is load-bearing, so the fix had to be
+  the ordering, not the mechanism.
+
+  **Verified, both directions.** Rebuilt after the change: `link search dirs discovered
+  after the build: 5`, `LINK_EXIT=0`, and `migo.dll` comes out at **26,422,272 bytes — byte
+  count identical to the pre-change build**, so this moved when the path is computed
+  without moving what gets linked. The contract still passes 6/6, 0 skipped.
+
+  And the new failure path was **injected rather than assumed**: hiding only
+  `skparagraph.lib` (a file cargo does not fingerprint, so stage 1 still reports
+  `BUILD_EXIT=0` — the injection reaches the discovery and nothing else) makes the script
+  exit 1 naming the directory it searched, why `LIB` is the only channel available, and
+  what the old behaviour would have been. Previously this exact state produced a bare
+  `LNK1181` from link.exe.
+
+  **Not yet done, and the item stays open.** Two things:
+
+  * **A from-clean run is still unproven.** What is proven is that the ordering defect is
+    gone and that a missing search path now fails loudly instead of obscurely. Actually
+    running it against an empty `CARGO_TARGET_DIR` means rebuilding Skia (hours) and has
+    not been done, so "builds from a clean tree" remains NOT PROVEN — for this item and
+    for 2.4.
+  * **ANGLE is still not built by any graph here**, only consumed as prebuilt DLLs staged
+    by the spike into `migo-win-spike-tmp/angle/`. This item asks for an MSVC *and ANGLE*
+    build graph, and that half is untouched.
 - [x] 1.8 Implement HarmonyOS audio playback through OHAudio.
 
   **Done 2026-08-10, and the OpenHarmony package now ships the full product profile
