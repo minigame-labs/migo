@@ -10,7 +10,12 @@ import android.view.Surface;
 import android.view.View;
 
 import com.migo.runtime.callback.AdHandler;
+import com.migo.runtime.callback.NavigationHandler;
+import com.migo.runtime.callback.PaymentHandler;
 import com.migo.runtime.callback.PermissionHandler;
+import com.migo.runtime.callback.PermissionSink;
+import com.migo.runtime.callback.SettingHandler;
+import com.migo.runtime.callback.ShareHandler;
 import com.migo.runtime.callback.AuthHandler;
 import com.migo.runtime.callback.GameLogHandler;
 import com.migo.runtime.callback.GameSessionListener;
@@ -765,6 +770,81 @@ public final class GameSession implements Closeable {
         synchronized (lock) {
             if (state.get() == SessionState.DESTROYED) return;
             NativeExports.setAdHandler(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the setting handler for this session.
+     * <p>
+     * Backs {@code wx.openSetting()}, which content calls to send the user
+     * somewhere a refused permission can be changed. The standing decisions live
+     * with you — see {@link PermissionSink#setScope} — so the screen that edits
+     * them does too. With no handler installed the call fails as not supported.
+     * <p>
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host setting handler, or null to clear
+     */
+    public void setSettingHandler(SettingHandler handler) {
+        synchronized (lock) {
+            if (state.get() == SessionState.DESTROYED) return;
+            NativeExports.setSettingHandler(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the share handler for this session.
+     * <p>
+     * Bridge this to your own share surface. The runtime links no share SDK and
+     * holds no social graph — with no handler installed
+     * {@code wx.shareAppMessage()} fails as not supported rather than stalling.
+     * <p>
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host share handler, or null to clear
+     */
+    public void setShareHandler(ShareHandler handler) {
+        synchronized (lock) {
+            if (state.get() == SessionState.DESTROYED) return;
+            NativeExports.setShareHandler(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the navigation handler for this session.
+     * <p>
+     * Covers the two ways content asks to leave the game: another mini program,
+     * and your support channel. Whether either is allowed is your decision. With
+     * no handler installed both fail as not supported.
+     * <p>
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host navigation handler, or null to clear
+     */
+    public void setNavigationHandler(NavigationHandler handler) {
+        synchronized (lock) {
+            if (state.get() == SessionState.DESTROYED) return;
+            NativeExports.setNavigationHandler(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the payment handler for this session.
+     * <p>
+     * Bridge this to your billing integration. The runtime holds no merchant
+     * credentials and never decides that a purchase succeeded — with no handler
+     * installed {@code wx.checkIsSupportMidasPayment()} reports no payment
+     * channel, so well-behaved content never opens a store it cannot transact
+     * in.
+     * <p>
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host payment handler, or null to clear
+     */
+    public void setPaymentHandler(PaymentHandler handler) {
+        synchronized (lock) {
+            if (state.get() == SessionState.DESTROYED) return;
+            NativeExports.setPaymentHandler(sessionId, handler);
         }
     }
 
