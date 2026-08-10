@@ -4,8 +4,95 @@
 
 - [ ] 2.1 Build Android Full and Slim AARs plus the C SDK from a clean tree for
   `arm64-v8a` and `x86_64`.
+
+  **Partial, and only the Full debug half — 2026-08-10.** `bash scripts/build-aar.sh debug
+  arm64-v8a x86_64` produces `migo-full-debug.aar` (197,932,115 bytes) with both ABIs, the
+  embedded artifact manifests verified at package time and a release attestation emitted.
+  Not done here: **Slim**, **release**, the **C SDK**, and **from a clean tree** — this ran
+  against a warm workspace. It was built to unblock 2.2, so it is evidence for that item's
+  rendering row and not for this one.
+
+  **A packaging rule this exposed, worth stating because it makes an obvious shortcut
+  unsafe.** Building a single ABI incrementally does not work once another ABI's libraries
+  are staged: `engine/jniLibs/full/` accumulates per-ABI directories, Gradle packages every
+  one it finds, and the artifact manifest indexes only what the current invocation built.
+  The gate then refuses the package by name —
+
+  ```
+  AAR manifest verification: AAR has unindexed Migo JNI entries:
+    ['jni/arm64-v8a/libc++_shared.so', 'jni/arm64-v8a/libmigo.so']
+  ```
+
+  — and **produces no AAR at all**, which is the right outcome: an archive carrying a
+  native library its own manifest does not describe is precisely what the manifest exists
+  to prevent, and the failure is louder than a package that quietly ships one. The
+  consequence for this item is that a shipping build must name every ABI it intends to
+  publish in one invocation; `build-aar.sh debug x86_64` after an `arm64-v8a` build is not
+  a smaller version of the same thing, it is a build that fails.
 - [ ] 2.2 Run Android emulator smoke tests for both ABIs and the physical
   `arm64-v8a` lifecycle, input, and surface stress suite.
+
+  **Rendering conformance passes on the physical device at this HEAD — 2026-08-10.**
+  Mate30 Pro (TAS-AN00, `arm64-v8a`, SDK 31), running an AAR built from this tree
+  (`migo-full-debug-arm64-v8a.aar`, 98,136,703 bytes, embedded artifact manifests
+  verified at package time):
+
+  ```
+  android: 33 assertions, 33 passed, 0 known-failing, 0 new, 0 fixed-but-listed
+  ```
+
+  Every assertion carries its measured pixels rather than a self-report — e.g.
+  `canvas2d/fill-rect-covers-exactly … at (20,20) want [255,0,0,255] +/-2, got
+  [255,0,0,255]` — and `expectations/android.txt` is empty of IDs, so this is a clean
+  sheet and not a suite grading itself against a list of tolerated failures. The suite's
+  own two rules make the number trustworthy: **a run producing no `DONE` line is a
+  failure, not a pass**, and **an ID listed as known-failing that passes is also a
+  failure**, so neither an unloaded bundle nor a stale exemption can be read as green.
+
+  It matters that this ran on an AAR built *after* PR #35: the bench shell was carrying a
+  1 August build, which predates the runtime generation fence, so the previous numbers
+  said nothing about the current engine.
+
+  **Both ABIs pass, against one package — 2026-08-10.** The suite was then run on the
+  `x86_64` emulator (AVD `migo-api26`, API 26, KVM-accelerated, `swiftshader_indirect`)
+  and re-run on the device, both against the *same* dual-ABI
+  `migo-full-debug.aar` (197,932,115 bytes), so the two rows are comparable rather than
+  two builds each tested once:
+
+  ```
+  emulator x86_64: 33 / 33   new_failures 0
+  device   arm64  : 33 / 33   new_failures 0
+  same assertion set: True (33 ids)
+  ```
+
+  The assertion sets are compared, not just the totals — two runs of 33 could otherwise be
+  33 *different* things. And the software rasteriser matched **exactly**, not merely within
+  tolerance (`reftest-rect-equals-path max channel delta 0 <= 1`), so the Canvas2D results
+  do not depend on Mali-specific behaviour.
+
+  **The suite cannot hold both results at once, which had to be worked around by hand.**
+  Both runners write `dist/results-android.json` and stamp `platform: "android"` regardless
+  of whether the target is an emulator or a phone, so the second run silently overwrote the
+  first. The per-assertion pixel values above survive only because each file was copied
+  aside immediately after its run. That is a real gap in the suite for a two-ABI claim —
+  the numbers here are trustworthy because of a manual step, which is not a property a
+  gate should depend on.
+
+  **This is one row of 2.2 and the item stays open.** What it covers is *rendering
+  conformance* — canvas2d basics, canvas2d readback, surface geometry — on one ABI. What
+  2.2 asks for and this does not touch:
+
+  * **lifecycle, input, and surface stress.** There is no harness for these in any
+    repository — conformance drives rendering only, and 2.2's other three words need one
+    written. Attach/detach across restart, backgrounding, surface recreation, multi-touch
+    saturation and teardown are all unmeasured here. They also cannot be a self-contained
+    bundle the way the rendering tests are: the stimulus has to come from the host (adb
+    `keyevent`, `force-stop`, rotation), so the shape is external driver + engine
+    self-reported event sequence + expected-sequence comparison, reusing the existing
+    `[conformance]`/`DONE` verdict channel rather than inventing a second one.
+
+  Calling 33/33 "the device suite passes" would be exactly the overclaim this ledger keeps
+  catching: it is the rendering suite, and it passes.
 - [ ] 2.3 Build the Linux shared and static SDK and player from a clean tree;
   validate X11, Wayland, Qt, resize, input, and teardown.
 - [ ] 2.4 Build the Windows DLL, import library, and static SDK natively with
