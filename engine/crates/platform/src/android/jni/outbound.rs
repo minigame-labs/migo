@@ -282,7 +282,7 @@ pub fn get_window_info(host_id: i32) -> Result<WindowInfo, String> {
     )
 }
 
-pub fn get_system_settings() -> Result<SystemSettings, String> {
+pub fn get_system_settings(host_id: i32) -> Result<SystemSettings, String> {
     call_static_method(
         "getSystemSettingInfoBytes",
         ReturnType::Object,
@@ -307,7 +307,7 @@ pub fn get_system_settings() -> Result<SystemSettings, String> {
                 },
             })
         },
-        &[],
+        &[jvalue { i: host_id }],
     )
 }
 
@@ -327,7 +327,7 @@ pub fn get_device_info_json() -> Result<String, String> {
     )
 }
 
-pub fn get_app_authorization_setting_json() -> Result<String, String> {
+pub fn get_app_authorization_setting_json(host_id: i32) -> Result<String, String> {
     call_static_method(
         "getAppAuthorizationSettingJson",
         ReturnType::Object,
@@ -339,7 +339,7 @@ pub fn get_app_authorization_setting_json() -> Result<String, String> {
                 .into();
             Ok(json_str)
         },
-        &[],
+        &[jvalue { i: host_id }],
     )
 }
 

@@ -29,6 +29,7 @@ mod storage_isolation_tests {
             PathBuf::from("/tmp/host-app/files"),
             PathBuf::from("/tmp/host-app/cache"),
             game_id,
+            1,
         )
         .expect("game paths")
     }
@@ -207,6 +208,7 @@ mod storage_isolation_tests {
                     PathBuf::from("/tmp/host-app/files"),
                     PathBuf::from("/tmp/host-app/cache"),
                     hostile,
+                    1,
                 )
                 .is_err(),
                 "game id {hostile:?} was accepted; it can reach another game's storage"

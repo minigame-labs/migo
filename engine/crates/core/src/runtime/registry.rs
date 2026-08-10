@@ -393,11 +393,17 @@ pub(crate) fn register_sender(
     critical_tx: CriticalHostCommandSender,
     surface_control: Arc<SurfaceControl>,
     runtime_generation: RuntimeGenerationReader,
+    log_level: shared::config::LogLevel,
 ) -> Option<HostHandle> {
     // Resolved before the registry lock is taken. Acquiring one process-wide lock
     // while holding another is how a lock cycle starts, and these two are reached
     // from different threads at bring-up.
     let stats = shared::stats::stats_for(id);
+    // A session's log level lives exactly as long as its Host, so it is published
+    // and retired here rather than by whichever platform happened to read the
+    // configuration. The Android path used to set one process-wide level at
+    // `init`, which let a session starting with `Off` silence a live one.
+    shared::log_level::register_session(id, log_level);
     let mut map = host_senders().write();
     map.insert(
         id,
@@ -418,6 +424,10 @@ pub(crate) fn register_sender(
 /// Unregister sender for a host.
 /// Returns removed sender if existed.
 pub(crate) fn unregister_sender(id: HostId) -> Option<HostHandle> {
+    // Every path that retires a Host comes through here, which is why the level is
+    // retired here too: a session left in the registry keeps holding the join open
+    // for the rest of the process.
+    shared::log_level::unregister_session(id);
     let mut map = host_senders().write();
     map.remove(&id)
 }
@@ -677,7 +687,8 @@ mod tests {
                 tx,
                 critical_tx,
                 control,
-                crate::runtime::restart_boundary::RestartBoundary::new().reader()
+                crate::runtime::restart_boundary::RestartBoundary::new().reader(),
+                shared::config::LogLevel::Warn
             )
             .is_none()
         );
@@ -786,6 +797,7 @@ mod tests {
                 critical_tx,
                 Arc::new(SurfaceControl::new()),
                 crate::runtime::restart_boundary::RestartBoundary::new().reader(),
+                shared::config::LogLevel::Warn,
             )
             .is_none()
         );
@@ -815,6 +827,7 @@ mod tests {
                 critical_tx,
                 Arc::new(SurfaceControl::new()),
                 crate::runtime::restart_boundary::RestartBoundary::new().reader(),
+                shared::config::LogLevel::Warn,
             )
             .is_none()
         );

@@ -316,37 +316,15 @@ def inject_android_method(source: str, service: str, method_source: str) -> str:
     raise ValueError(f"Android implementation for {service} not found")
 
 
-ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
-FULL_PERMISSION_POLICY = {
-    "android.permission.CAMERA": None,
-    "android.permission.RECORD_AUDIO": None,
-    "android.permission.BLUETOOTH": "30",
-    "android.permission.BLUETOOTH_ADMIN": "30",
-    "android.permission.BLUETOOTH_CONNECT": None,
-    "android.permission.BLUETOOTH_SCAN": None,
-    "android.permission.ACCESS_COARSE_LOCATION": None,
-    "android.permission.ACCESS_FINE_LOCATION": None,
-    "android.permission.WRITE_EXTERNAL_STORAGE": "28",
-}
-
-
-def manifest_permissions(source: str) -> tuple[dict[str, str | None], list[str]]:
-    found: dict[str, str | None] = {}
-    problems: list[str] = []
-    try:
-        manifest = ET.fromstring(source)
-    except ET.ParseError as error:
-        return {}, [f"invalid Android manifest XML: {error}"]
-    for element in manifest.findall("uses-permission"):
-        name = element.get(ANDROID_NS + "name")
-        if not name:
-            problems.append("uses-permission without android:name")
-            continue
-        if name in found:
-            problems.append(f"duplicate manifest permission `{name}`")
-            continue
-        found[name] = element.get(ANDROID_NS + "maxSdkVersion")
-    return found, problems
+# The policy and the manifest parser are shared with
+# test-android-merged-manifest-permissions.sh, which holds the *merged* manifests to
+# the same table. Two copies would be two statements of one rule.
+sys.path.insert(0, str(root / "scripts/lib"))
+from android_permission_policy import (  # noqa: E402
+    ANDROID_NS,
+    FULL_PERMISSION_POLICY,
+    manifest_permissions,
+)
 
 
 def validate_permission_manifests(full: str, slim: str) -> list[str]:

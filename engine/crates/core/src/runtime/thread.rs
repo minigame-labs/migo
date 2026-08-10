@@ -211,12 +211,14 @@ fn spawn_host_thread_inner(
     // without a generation to stamp with. The boundary itself moves into the
     // Host thread; the registry keeps only a reader.
     let restart_boundary = crate::runtime::restart_boundary::RestartBoundary::new();
+    let log_level = opt.log_level();
     registry::register_sender(
         id,
         host_tx.clone(),
         critical_host_tx.clone(),
         Arc::clone(&surface_control),
         restart_boundary.reader(),
+        log_level,
     );
 
     // Clone the platform Arc so we can use it in the catch_unwind path
@@ -226,6 +228,11 @@ fn spawn_host_thread_inner(
     let spawn_result = thread::Builder::new()
         .name(format!("Migo-Main-{}", id))
         .spawn(move || {
+            // Bound before any of this session's work, so its own records are
+            // filtered by its own level rather than by the most verbose level some
+            // other live session asked for. The thread ends with the session, so
+            // there is nothing to unbind.
+            shared::log_level::bind_thread_level(log_level);
             let run = || {
                 let host = match Host::new(
                     id,

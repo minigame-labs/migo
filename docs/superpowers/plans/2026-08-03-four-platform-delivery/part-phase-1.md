@@ -196,16 +196,73 @@
   now stale rather than wrong — nothing compares a manifest's patches against the
   lock at validation time, so they still validate. Regenerating them is blocked on
   1.1f, and doing so will change each `component_id`.
-- [ ] 1.1l Wire or delete `required_patches` in the Windows V8 lock.
-  `contracts/artifact-manifest/windows-v8.lock.json` declares three
-  `required_patches` and **nothing reads them**:
-  `scripts/write-windows-v8-component-manifest.py` never references the field, and
-  `scripts/build-v8-windows.sh` names its patches as its own literals. So the
-  Windows lock states a requirement it does not enforce, which is the same
-  declared-but-unenforced shape task 1.1b just removed from Android. Give it the
-  `id`/`file` shape, have the Windows build and writer read it, or delete the field
-  rather than leave it decorative. The Windows build is not runnable on this host, so
-  this needs a machine that can run it.
+- [x] 1.1l Wire or delete `required_patches` in the Windows V8 lock. **Wired
+  2026-08-09.** The lock declared three bare id strings that nothing read, while
+  `scripts/build-v8-windows.sh:196` named its own three globs — the same
+  declared-in-two-places shape task 1.1b removed from Android, in the other direction.
+  The lock now carries the `id`/`file`/`notes` entries, and the build reads it.
+
+  **The reader is shared rather than copied.** Android had the lock parser inline; a
+  second copy in the Windows script would be the drift this item exists to remove, so
+  it moved to `v8_read_declared_patches` in `scripts/lib/v8-patch-apply.sh`, which both
+  scripts already source. Verified against both locks: four entries for Android, three
+  for Windows, and `test-v8-patch-application-contract.sh` now counts 1 patch declared
+  as a script literal (OpenHarmony's) and **7 in locks**, with all 8 still resolving to
+  exactly one file each. The dual-source guard is what makes that safe: Windows'
+  literals leaving the scripts would otherwise have narrowed the check silently, which
+  is exactly how it once went from 8 to 4.
+
+  **Not done, and it needs a Windows run:** `write-windows-v8-component-manifest.py`
+  still records no patch provenance, so a Windows manifest does not attest which patches
+  produced it the way the Android one now does. The field is no longer decorative —
+  the build enforces it — but the manifest half is open and belongs with 1.1g/1.1j.
+
+  **Doing this exposed a real defect in the shared checkout, found by the contract test
+  going red mid-session while an OpenHarmony V8 build was running.** One vendored
+  `rusty_v8_src` serves all four platforms, and `0008-ohos-toolchain.patch` *creates*
+  `build/toolchain/ohos/BUILD.gn`, which the Android declaration does not touch — so
+  building OpenHarmony made the Android replay refuse a file that **is** explained by a
+  committed patch, just not by one that build applies. The two platforms were mutually
+  exclusive on one checkout, and the earlier note under 1.1i predicted this before it
+  happened.
+
+  `--accounted-patch <glob>` answers it inside the existing mechanism: the accounted
+  paths are **derived from the patch** rather than listed, so they cannot drift from
+  what it creates, and only paths a patch *creates* may be accounted for — accounting
+  for one a foreign patch merely *modifies* would skip content verification on a file
+  this platform's own patches may also touch, so it is refused. Three fixtures: the
+  foreign-created file is refused when not accounted for, accounted for when it is, and
+  a modify-only patch cannot grant an accounting at all (checked against an otherwise
+  exactly-patched tree, so the refusal can only come from that guard).
+
+  Second defect from the same red run, and simpler: `build-v8-ohos.sh` wrote its build
+  log **into** `$RUSTY_V8_SRC`, where it is an untracked file no patch explains, so it
+  broke every provenance gate over that tree. `build-v8-android.sh` already wrote its
+  log under `$TMPDIR`; the OpenHarmony script now does the same.
+
+  **Independent review found six issues, and one was a regression this change
+  introduced.** `V8_ACCOUNTED_ARGS` is forwarded to
+  `write-v8-component-manifest.py` as well as to the shell proof, and that parser knew
+  only `--accounted` — so every Android V8 build would have died on
+  `unrecognized arguments: --accounted-patch` **after** the expensive build. Separating
+  the arrays would only have moved the failure, because the writer runs the same replay
+  proof and so needs the same accounting; `accounted_paths_from_patch` now lives in
+  `scripts/lib/v8_source_proof.py` and enforces the identical create-only rule. Verified
+  against the real tree: the option is accepted, the proof passes, and
+  `--accounted-patch 0002-install-sysroot.patch` is refused with
+  `creates no file, so it cannot account for one`.
+
+  **And the recipe hash is verified, so editing a V8 build script is not a cosmetic
+  change.** `generate-android-artifact-manifests.py` compares
+  `provenance.build_recipe_sha256` against the script's current bytes, so both committed
+  component manifests became **wrong rather than stale** the moment
+  `build-v8-android.sh` changed — every AAR build failed with
+  `V8 build recipe bytes hash mismatch`. That correction matters: the earlier judgement
+  here, borrowed from 1.1b's patch-set note, was that nothing validates such staleness.
+  Both manifests were regenerated from warm builds rather than edited, which also
+  produced a **second reproducibility data point**: `aarch64` came back at
+  `681aaa39…` and `x86_64` at `ce14223a…`, both matching their recorded hashes, with new
+  ids `3a5841af…` and `21613b7e…` recording recipe `62d717ff…`.
 - [x] 1.1c Pin and assert `gn`. The script resolved `gn` from `V8_GN_PATH`, then a
   prefetched path, then the system `PATH`, and merely **logged** the version it
   found — so a system `gn` of any revision was accepted and failed later somewhere
@@ -508,14 +565,56 @@
   invoked on every single build. It is stamp-guarded and so does not re-download,
   but it makes the Android build reach the network unconditionally. Recorded under
   task 1.1d.
-- [ ] 1.1i Verify the aarch64 archive is unchanged now that patch 0002 applies.
-  Re-run `./scripts/build-v8-android.sh aarch64` and confirm sha256
-  `681aaa39367a9aa35ab7e584ddd4b36273acbc0ccb4177648c43b9b55b7eb273`. The reasoning
-  in task 1.1e says it must be, and a same-source reproducibility data point is
-  worth having either way; if it differs, the reasoning about `sysroot.gni` or about
-  duplicate GN args is wrong and the difference must be explained before the
-  archive is trusted. The first run of this build will download the Debian arm64
-  sysroot (~100MB) that the Android target never consults.
+- [x] 1.1i Verify the aarch64 archive is unchanged now that patch 0002 applies.
+  **Re-run 2026-08-09: sha256 `681aaa39367a9aa35ab7e584ddd4b36273acbc0ccb4177648c43b9b55b7eb273`,
+  unchanged.** Task 1.1e's reasoning holds, and the run shows the mechanism rather
+  than only the conclusion: patch 0002 is in effect, so the Debian arm64 sysroot
+  **was** downloaded (`chrome-linux-sysroot/2f915d82…`), `gn gen` re-ran, and the
+  regenerated `args.gn` carries `use_sysroot = true` **twice** — the duplicate GN
+  assignment 1.1e predicted, which GN accepts. `ninja: no work to do` followed, which
+  is the actual evidence: the regenerated build graph is identical to the previous
+  one, so `sysroot.gni` testing `is_android` before `is_linux && use_sysroot` really
+  does keep an Android toolchain off the Debian sysroot. The binding is byte-identical
+  to the verified prebuilt input, and re-sealing produced a **byte-identical**
+  `component-manifest.json` (`b5299a05…`, `component_id` `ee0fb437a33fcd9c…`), which
+  independently confirms 1.1f's determinism fix on a live re-seal.
+
+  **Scope of the claim, stated because it is narrower than "the archive reproduces":**
+  this was a warm build, so no C++ was recompiled. What is proved is that applying
+  0002 does not change the build graph. From-scratch reproduction of both
+  architectures is task 1.1's evidence, not this one's.
+
+  **Running it found two defects in the gate 1.1c and 1.1d built, and the first made
+  the Android V8 build impossible on this machine.** `_v8_git` passed
+  `-c safe.directory=$tree` — but git compares that value *literally* against the
+  repository path it discovers, and every caller derives the tree as
+  `$PROJECT_ROOT/../rusty_v8_src`. The unnormalised `..` never matches, so the
+  exception did not apply, every git call failed `dubious ownership`, and the replay
+  reported **"the rusty_v8 tree carries changes the committed patches do not
+  explain"** — an accusation about the tree for what was a refusal to read it. The
+  path is now canonicalised at that single choke point, which also covers the
+  submodule descent and any caller's `RUSTY_V8_SRC`. Note the contract test could
+  never have seen this: it derives its own `real_tree` through `cd .. && pwd`, so the
+  test normalised what the build script did not.
+
+  Second, the failure was **fail-open**. `_v8_changed_paths` read `git status` through
+  a process substitution and the enumeration was read through another, so neither
+  exit status was observable and a git failure arrived as "no changed paths". With a
+  declared patch that only *creates* a file — the shape of `0008-ohos-toolchain.patch`
+  — the replay then succeeds into the scratch directory, the byte comparison has
+  nothing to iterate, and the function **certifies a tree it never managed to read**.
+  Both producers now propagate. Two mutants, each killing exactly one of the two new
+  contract cases at its own assertion: dropping the canonicalisation kills "a checkout
+  this user does not own is read through a path carrying ..", and restoring the process
+  substitution kills "a tree whose git status fails is refused, not read as unchanged".
+
+  **Recorded, not fixed: the vendored checkout can only be in one platform's declared
+  state at a time.** `build-v8-ohos.sh` applies 0008 to the same
+  `../rusty_v8_src` and never reverts it, and 0008 is not in the Android declaration,
+  so an OpenHarmony V8 build leaves the tree in a state the Android replay refuses.
+  `build-v8-ohos.sh` does not call the replay at all, so it does not notice. Either
+  each platform accounts for the others' patches or the OpenHarmony build needs its
+  own checkout; until then, run the Android build before the OpenHarmony one.
 - [x] 1.1f The component manifest can be sealed again, and what it records is now
   reproducible. Both Android manifests were regenerated and re-verified:
   `aarch64` `component_id` `ee0fb437a33fcd9c…`, `x86_64` `1c6b7b20dde62eff…`, and
@@ -669,34 +768,578 @@
   after reusing a verified prebuilt binding is indistinguishable from one sealed
   after regenerating it from source. Add the field and populate it. Until then the
   origin exists only in build logs, which are not shipped.
-- [ ] 1.1h Treat a version-only libclang gate as insufficient. Chromium's
-  `third_party/rust-toolchain/lib/libclang.so` reports clang 22 but silently emits
-  a **wrong** binding: `cppgc_Visitor` sized 1, nested enums missing their
-  `v8_String_` prefixes, 840 items instead of 870, and four compile errors
-  including a `1_usize - 8_usize` overflow. It ships no sibling `bin/clang`, so
-  build.rs's `-print-resource-dir` probe finds nothing and bindgen falls back to
-  NDK clang 12's builtin headers. A misconfigured libclang does not fail loudly,
-  it corrupts the FFI ABI, so the gate must also require a usable sibling
-  `bin/clang` and the regenerated binding must be diffed against the recorded one
-  before it is accepted.
-- [ ] 1.2 Add one repository release-version source under `release/` and verify
+- [x] 1.1h Treat a version-only libclang gate as insufficient. **Done 2026-08-09**,
+  and the object the item names was checked before the fix was written:
+  `rusty_v8_src/third_party/rust-toolchain/lib/libclang.so` is a symlink chain to
+  `libclang.so.22.0.0git` and `clang_getClangVersion()` really does report
+  `clang version 22.0.0git`, so it passes any version floor — while its sibling `bin/`
+  contains `bindgen`, `cargo`, `rustc` and **no `clang`**. A misconfigured libclang does
+  not fail loudly; it corrupts the FFI ABI.
+
+  Two guards, because the two failure modes are independent. Acceptance now also
+  requires a sibling `clang` (or `clang++`) whose `-print-resource-dir` resolves to a
+  directory that exists — the exact fact whose absence makes bindgen fall back to
+  another toolchain's builtin headers. Falsifiable, and run against the real objects:
+  Chromium's `rust-toolchain/lib` is **rejected**, while NDK 23's libclang is accepted
+  with resource dir `.../lib64/clang/12.0.9` (and is then still refused by the version
+  floor, so the two checks compose rather than overlap).
+
+  And a regenerated binding is now diffed against the one the component manifest
+  records. A difference is either a real V8 ABI change or a bad libclang, and the bytes
+  alone cannot tell them apart, so the build stops instead of sealing a manifest over an
+  FFI surface nobody compared. `MIGO_V8_BINDING_CHANGE_EXPECTED=1` is how a V8 bump says
+  the difference is the point, which makes accepting a new ABI deliberate rather than
+  incidental.
+
+  **Not yet exercised end to end:** the refusal path was verified as a function against
+  both real libclang directories, not by a full build with `V8_LIBCLANG_PATH` pointed at
+  Chromium's — an OpenHarmony V8 build held the shared `rusty_v8_src` cargo target
+  directory, and two cargo builds in one target directory serialise on its lock. Run
+  `V8_LIBCLANG_PATH=$RUSTY_V8_SRC/third_party/rust-toolchain/lib
+  scripts/build-v8-android.sh aarch64` once that is free and confirm it falls back to
+  the prebuilt binding rather than regenerating.
+- [x] 1.2 Add one repository release-version source under `release/` and verify
   propagation to Cargo, Gradle, CMake, the HAR, archives, manifests, examples,
   and documentation.
+
+  **Done 2026-08-09.** `release/VERSION` is the source; every consumer reads it and
+  `scripts/test-release-version-contract.sh` (in `pr-ci.yml`, so also in
+  `verify-change.sh`'s contract lane) is what makes that true rather than intended.
+
+  **Four build systems had four answers, and two were wrong in ways that ship.**
+  The Android AAR reported `0.9.0` while the Android C-API SDK built beside it
+  defaulted to `0.1.0` — one platform disagreeing with itself, because two scripts
+  build the two artifacts and only one had been told. The Windows SDK read a
+  version from `crates/capi/Cargo.toml` and then *discarded* it, hardcoding `0.1.1`,
+  so it announced a version no other platform had heard of. Linux and HarmonyOS
+  derived theirs from that same crate manifest, HarmonyOS with a silent `0.1.0`
+  fallback. A build that stops is recoverable; an archive labelled with a version
+  nobody chose is not, so every reader now refuses instead of defaulting.
+
+  **Plain text, and the reason is not taste.** All four toolchains must read it
+  with no dependency: bash, Python, Gradle, and CMake 3.16, which has no JSON
+  parser. A JSON source would need `jq` in bash and a parser bump in CMake.
+
+  **Cargo is the one mirror.** A manifest takes a literal, so `[workspace.package]
+  version` cannot read a file; the gate holds the two equal instead. Sixteen
+  per-crate literals collapsed into it via `version.workspace = true`, and
+  `Cargo.lock` moved 16 version lines and nothing else — checked, because CI runs
+  `cargo fetch --locked` and a stale lock fails there rather than here.
+
+  **The Windows literal's reasoning is kept, not deleted.** `0.1.0` shipped a DLL
+  that could attach no surface kind and the fix went out as `0.1.1` so those bytes
+  would not arrive under a version a consumer already held. A single forward-moving
+  source honours that; a detached per-platform literal is what lost it.
+
+  **Left independent deliberately, and checked so it cannot be folded in later:**
+  `platforms/openharmony/entry/` + `AppScope/` are a demo *application*
+  (`"type": "entry"`, `com.migo.ohoshost`, vendor `example`), not the shipped
+  library; `tests/c_host/android/` is a test application; `MIGO_ABI_VERSION_*` in
+  `include/migo/types.h` answers a different question from which release a binary
+  came from; `adapter/` is a separately publishable npm package.
+
+  **The version stays at the value already shipped in the AAR.** Nothing here
+  proposes a new one — the `0.10.0-rc.1` bump is now a single edit, which is the
+  point.
+
+  Proved end to end and by injection. `release/VERSION` set to `0.9.1-probe`
+  reached the generated `BuildInfo.java`, and was restored. The shared bash reader
+  was extracted and exercised on four inputs — normal, padded, empty, missing —
+  because three of the four SDK scripts cannot run on this machine. Ten gate
+  checks go red: the Cargo mirror drifting, a crate reintroducing its literal, the
+  workspace losing `[workspace.package]`, Gradle re-hardcoding `versionName`, a
+  packaging script re-hardcoding, the HarmonyOS fallback returning, a non-semver
+  source, stray whitespace in the source, the demo application being folded in,
+  and the source missing entirely.
+
+  **Two of those ten passed at first, and both were the gate's fault.** The marker
+  check looked for the reader's *name*, which also appears in the reader's own
+  definition, so a call site replaced by a literal left the name behind and the
+  gate stayed green; the marker is now the assignment, searched with comments
+  stripped. And the literal scan's lookbehind excluded a preceding `-`, so
+  `${MIGO_VERSION:-0.1.0}` — the exact fallback being forbidden — did not match.
+  Neither would have been found by reading the gate.
+
+  Verified: `cargo metadata` (16 members, all `0.9.0`), `cargo check --locked`,
+  Java 207 per flavour in both profiles, the android-host-api gate, and
+  `test-local-verification-contract.sh` at 27 derived gates.
 - [ ] 1.3 Materialise V8, Skia, and ANGLE under immutable content-addressed
   paths before any Cargo or native link, covering the HarmonyOS path that
   currently builds V8 from an external checkout.
+
+  **The V8 half is done for every shipping consumer — 2026-08-10 — and it closed a defect
+  worse than the missing hermeticity.** `build-android-so.sh`, the script that produces
+  the AAR's native library, selected its archive with `[[ -f "$v8_archive" ]]` —
+  existence, not identity — so `libmigo.so` was linked against whatever bytes sat at
+  `engine/third_party/rusty_v8/<arch>/librusty_v8.a`, while the SDK scripts beside it
+  already ran `verify-v8-component` first. The shipping path was the unverified one.
+
+  `scripts/lib/v8-materialise.sh` verifies the archive **and** the binding against the
+  `component-manifest.json` beside them — by hash, which is the content check and not the
+  whole of what `migo-artifact-manifest verify-v8-component` does (that also recomputes
+  `component_id` and validates the target and toolchain blocks, and the SDK scripts still
+  run it). Full parity with those scripts is therefore *not* claimed here; what is closed is
+  that the shipping path went from checking nothing to checking the bytes. Running the tool
+  from the materialiser would put a cargo build of it on the hot path, which is why it does
+  not. then makes them available under
+  `engine/target/v8-materialised/<archive-sha256>-<binding-sha256>/`. Eight consumers use it, across both languages:
+  `build-android-so.sh`, `build-android-sdk.sh`, `build-android-c-host.sh`,
+  `build-linux-sdk.sh`, `build-ohos-sdk.sh`, `build-ohos-host.sh`, `gen-snapshot.sh`, and
+  `build-android-so.ps1` through `scripts/lib/V8Materialise.psm1`.
+
+  **The PowerShell one was found by review, and the enumeration could not see it.** The gate
+  globbed `*.sh` and matched `RUSTY_V8_ARCHIVE="`, so it missed `build-android-so.ps1` --
+  which still selected its archive with `Test-Path`, on the path `build-aar.ps1` invokes, so
+  the Windows-host route to an AAR linked unverified bytes even after item 1.6 made that
+  route work -- and `build-windows-sdk.sh`, which writes `set RUSTY_V8_ARCHIVE=` into a batch
+  heredoc. A *scope* hole rather than a weak assertion, and the second of its kind here: the
+  NDK pin gate had the identical `.ps1` blind spot. The gate now matches three assignment
+  spellings and skips reads, since a looser pattern reported correct code as an offender. The
+  two materialisers are held equal by producing the **same** directory for the same inputs,
+  checked: `681aaa39…-47369bfb…` from both.
+
+  **A workaround was deleted rather than kept, which is the real argument for content
+  addressing.** Cargo reruns the `v8` crate's build script when the *value* of
+  `RUSTY_V8_ARCHIVE` changes, not when the file at that path is replaced, so a V8 rebuilt
+  in place left cargo reusing an rlib built from the previous archive — a defect that cost
+  a full debugging cycle over a staged `libmigo.so` still carrying an allocator shim the
+  rebuild had removed. `build-linux-sdk.sh` forced it with a sha256 stamp plus
+  `cargo clean -p v8`. Both are gone: different bytes are now a different path, so cargo's
+  own staleness rule is correct and there is nothing left to force.
+
+  **A review finding on the path itself:** it keyed only on the archive hash, so a
+  component whose binding changed while its archive did not would collide with the old one
+  — the stale binding there would be refused rather than replaced, and because cargo
+  watches the *value* of `RUSTY_V8_SRC_BINDING_PATH` it could go on using a `v8` crate
+  compiled against the previous binding, which is the exact defect content addressing is
+  here to remove. The directory now names **both** hashes. All four targets share one
+  binding at the pinned rusty_v8 revision, so the four paths differ only in their archive
+  half, which is what makes the collision easy to miss.
+
+  Hard links, not copies — the archive is ~120 MB per architecture, and `links=2` was
+  checked. Deliberately **not** `chmod 444`: a hard link shares its inode with
+  `third_party`, so making the materialised copy read-only would make the *producer* fail
+  its next `cp`, and it would buy nothing, because the hash is re-checked on every call.
+  That check is what makes the path's claim true rather than decorative.
+
+  **Verified on all three buildable platforms**, each rebuilt through the new path:
+  Android `libmigo.so` links; the OpenHarmony package builds and its consumer link,
+  entry-point count and API floor all pass; the Linux SDK builds and stages. Fixtures
+  cover the refusals: a tampered archive is refused naming both hashes, and a target with
+  no manifest is refused rather than materialised — the same rule
+  `fetch-v8-archives.sh` states.
+
+  `test-artifact-manifest-contract.sh` enumerates the consumers so a script added later
+  cannot reintroduce a raw path; proved load-bearing by putting one back, which fails
+  naming the script. The predicate is *what a script produces*, not *whether it mentions
+  the variable* — the over-strong version of that rule is a mistake the NDK pin gate
+  already made and corrected, and a development archive is legitimate for a local
+  executable. The five non-producers are exempted by name with a reason each, and a stale
+  exemption is an error.
+
+  **Still open, and named rather than implied:**
+
+  * **Skia needs no manifest, and the entry above said otherwise — corrected 2026-08-10.**
+    The claim that it is "in the same position V8 was in" is wrong, and checking the object
+    is what showed it. `skia-safe`/`skia-bindings` is pinned in `engine/Cargo.lock` at
+    `0.93.1` with checksum `2359f7e3…`, that crate **vendors Skia's entire source tree**
+    (its `skia/` directory holds Skia's own `BUILD.gn`, `AUTHORS`, …), and `pr-ci.yml:53`
+    runs `cargo fetch --locked`. So Skia's provenance is already pinned cryptographically,
+    by a stronger and simpler mechanism than V8 has — V8 needed a lock, a manifest, a
+    replay proof and content addressing precisely *because* it comes from an external
+    checkout and a prebuilt archive that sit outside cargo's integrity model. Building a
+    "Skia component manifest" would duplicate `Cargo.lock`.
+
+    Two real gaps remain, and neither is verification. First, **the shipped artifact does
+    not record which Skia is inside it**: the package metadata generators mention Skia
+    nowhere, and the manifest schema's `graphics` block carries only `backend_family` and
+    `required_api`, so an artifact cannot answer "which Skia is this?". Second,
+    `SKIA_GN_ARGS` lives in `engine/.cargo/config.toml` and is recorded in no lock or
+    manifest, while V8's GN argument set is recorded in both. Those are *recording* gaps,
+    and closing them means a field on a schema that Android, Linux and Windows share —
+    which is the shape task 1.1j reverted rather than ship half-migrated, so it belongs
+    with that item rather than being bolted on here.
+  * Skia is also built **from source** on this machine rather than downloaded: the
+    `binary-cache` feature is enabled but no prebuilt matches this feature set and target,
+    so `skia-bindings` runs ninja (`.ninja_log` in its `out/` directory proves it). Its
+    build reproducibility is therefore an open question of the same kind as 1.12's, and
+    unmeasured.
+  * **ANGLE** is Windows-only and cannot be exercised here.
+
+  **`gen-snapshot.sh` was the seventh consumer and is now the strictest case, not an
+  exemption.** It produces *committed* snapshots under
+  `engine/crates/runtime-v8/snapshots/` that `runtime-v8/build.rs` embeds into every
+  shipping Android `.so`, and a startup snapshot serialises a live V8 heap, so it is valid
+  only for the exact V8 that produced it — yet it checked existence plus "larger than a
+  megabyte", a heuristic for an unresolved LFS pointer that cannot tell one real archive
+  from another. The hash subsumes that heuristic, so both checks are gone in favour of the
+  materialiser, and its exemption was removed from the gate, which treats a stale exemption
+  as an error and so enforced the follow-through.
+
+  The archive is verified **before** `adb` is required, deliberately: that check is local
+  and deterministic while a device is neither, so failing on the cheap one first is what
+  makes the archive handling observable without hardware. Confirmed by running it with no
+  device attached — it prints
+  `V8 archive verified: engine/target/v8-materialised/ce14223a…/librusty_v8.a` and then
+  stops on the missing device, which is as far as this machine can go.
 - [ ] 1.4 Remove every `--allow-multiple-definition`, including both HarmonyOS
   target entries in `engine/.cargo/config.toml`, and resolve duplicate C++
   runtime symbols at component build boundaries.
+
+  **Both HarmonyOS entries are gone, and the Android duplicate is now measured rather
+  than described — 2026-08-10.** Seven occurrences remain five: `engine/.cargo/config.toml`
+  ×3 (the three Android targets), `scripts/build-android-so.sh`,
+  `scripts/build-android-so.ps1`, `scripts/gen-snapshot.sh`, and
+  `platforms/openharmony/.../CMakeLists.txt` — the two OpenHarmony `config.toml` entries are
+  what went.
+
+  **What the linker actually says.** Removing the flag from the Android build fails with
+  **exactly six** duplicate symbols, every one of them a function libc++ explicitly
+  instantiates in `stdexcept.cpp`: `std::runtime_error` and `std::logic_error`'s
+  `char const*` constructor, copy constructor and copy assignment. lld names both
+  providers, and they are not what the comments claimed:
+
+  | Provider | Origin |
+  |---|---|
+  | `stdexcept.o` in `libv8-*.rlib` | **Chromium's** libc++, carried inside V8 |
+  | `stdexcept.o` in `libc++_static.a` | the **NDK r23** sysroot's libc++ |
+
+  So "the linker picks the first definition, which is safe because both archives are built
+  against the same libc++ ABI" — the justification in `config.toml`,
+  `build-android-so.sh` and the OpenHarmony `CMakeLists.txt` — **was false**. They are two
+  different libc++ implementations. Taking the first definition is safe for a narrower
+  reason: no `std` exception object crosses the V8/Skia boundary, because each side throws
+  and catches internally and the surface between them is a C ABI. All four places now say that instead — and an independent review
+  caught that only `build-android-so.sh` had been corrected while `config.toml`, the
+  OpenHarmony `CMakeLists.txt` and `build-android-so.ps1` still carried the disproven claim,
+  the last of them a third and differently wrong story about the NDK's *shared* libc++. A
+  ledger sentence claiming a correction that was made in one file out of four is exactly the
+  kind of unsupported claim this ledger exists to catch.
+
+  **Why the HarmonyOS entries could go, with evidence rather than a guess.** `migo-capi`
+  is a `staticlib` on those targets, so rustc never invokes a linker and the `link-arg`s
+  were inert; a cargo-driven link for the triple does not work at all today, failing on
+  `unable to find library -lstdc++`; and the shipped consumption path — an OpenHarmony
+  consumer linking the staged archive through CMake — is exercised by
+  `test-ohos-sdk-contract.sh`, which passes `-Wl,--gc-sections` and nothing else and
+  succeeds. The package was rebuilt and re-gated after removal: consumer link, musl loader,
+  entry-point count and API floor all still pass.
+
+  **What is left, and it is not a flag.** One provider of those six symbols, on Android.
+  Two candidates, both of which change shipped bytes and need runtime verification this
+  machine cannot do:
+
+  * Have skia-bindings link `c++_shared` rather than `-lc++_static`. The AAR already ships
+    `libc++_shared.so` and `engine/crates/audio/Cargo.toml` states one-STL-per-process as
+    the intent, so this is the arrangement the project already believes it has.
+  * Rebuild the Android V8 with `use_custom_libcxx=false`. That is what the Cargo comment
+    claims is already true and the build log contradicts — the `use_custom_libcxx` feature
+    is on. It also costs an 85-minute build per architecture and invalidates both verified
+    archive hashes and their component manifests, and OpenHarmony cannot follow, because
+    its SDK's libc++ 15 is too old for V8 145 (see `build-v8-ohos.sh`'s recorded attempts).
+
+  Getting either wrong is a mismatched-STL crash at runtime, so neither is a change to
+  make without an emulator or a device to run afterwards.
+
+  **`platforms/openharmony/.../CMakeLists.txt` is not touched yet**, and deliberately: it
+  links `migohost` as a **shared** library, which is a different link from the static
+  consumer the contract exercises, and building it needs DevEco on the Windows side. The
+  contract's success is evidence about the archive, not about that module.
 - [ ] 1.5 Make release metadata and archives deterministic under
   `SOURCE_DATE_EPOCH` on all four platforms.
-- [ ] 1.6 Repair Android PowerShell packaging and reject release `--skip-rust`.
+
+  **Metadata half done 2026-08-09. The archive half cannot be done yet, and that is
+  a finding rather than a delay: nothing in this repository creates a release
+  archive.** The four SDK scripts populate a prefix *directory*
+  (`$PREFIX/lib/cmake/migo/...`); the only archive that exists today is the AAR,
+  which Gradle builds. Item 1.11 is what produces packages, so archive determinism
+  is a property of code that is not written. `scripts/lib/reproducible-timestamp.sh`
+  exists so 1.11 has the stamp to use rather than inventing a third one.
+
+  **Three shipped or committed artifacts recorded when they were built.** One wall
+  clock anywhere in the set defeats 1.12 for the whole release:
+
+  * `build-aar.sh` wrote `"sourceDateEpoch": <the epoch>` and then
+    `"buildTime": "<local wall clock>"` **on the next line** — the input for
+    reproducibility recorded and unused for the one field that broke it. Local, not
+    UTC, so the same source differed between two timezones as well as between two
+    minutes. `build-aar.ps1:225` did the same on Windows.
+  * `generate-sbom.sh` stamped `metadata.timestamp`, and `release.yml:376` writes
+    that SBOM into the Android dist directory, so it is a release asset.
+  * `write-snapshot-manifest.sh` stamped `generated_at` into the manifests under
+    `engine/crates/runtime-v8/snapshots/`, which are **committed** — three of them
+    currently carry distinct 2026-08-06 wall clocks. Every regeneration diffs on the
+    timestamp alone, and a tracked file that cannot be reproduced from the sources
+    it describes is not a manifest of anything. Those values will settle the next
+    time the snapshots are regenerated; nothing here rewrites them, because the
+    aarch64 round needs a device.
+
+  All three take `SOURCE_DATE_EPOCH` when set and a wall clock when not, always
+  UTC, and refuse a malformed value rather than treating it as absent — a caller
+  that set it believes it is producing something reproducible.
+
+  **Verified by measurement, not assertion.** The SBOM is byte-identical across two
+  runs a second apart under a fixed epoch (`08c878bf…`) **and changes when the
+  epoch changes** (`ff41012d…`). The second half matters more than the first: bytes
+  that are merely stable prove the timestamp was removed, not that it tracks the
+  epoch. The bash helper was exercised on four inputs — absent, fixed, zero,
+  malformed. `build-aar.ps1` is inspection-only: there is no `pwsh` here, so it was
+  written to assume as little as possible — self-contained rather than reading an
+  outer-scope variable, and one expression per line, because PowerShell ends a
+  statement at a newline and leading-dot continuation is a C# habit that does not
+  parse.
+
+  `scripts/test-reproducible-timestamp-contract.sh` holds the rule: a script under
+  `scripts/` that reads a clock must name `SOURCE_DATE_EPOCH` or be listed as
+  producing something that does not ship. The list is per file with a reason each
+  rather than a directory exclusion, and a **stale exemption is an error** — one
+  that no longer applies grants more than it needs to. Both directions were proved
+  red: a reintroduced wall clock, and an exemption left behind after its clock was
+  removed. A stopwatch and a build stamp look identical to a regular expression, so
+  which is which has to be stated by a human.
+
+  **What remains for 1.5:** archive determinism (sorted entries, fixed mtime, no
+  gzip timestamp, fixed uid/gid) on all four platforms, which is 1.11's code, and
+  the Windows and HarmonyOS packaging paths cannot be run on a Linux workstation.
+
+  **Correction, 2026-08-10: the Android half of that was already true and is now
+  gated.** This entry said archive determinism "is a property of code that is not
+  written" because the AAR is the only archive that exists — but that makes the AAR the
+  one archive the property *can* be held on, and it holds: two release builds under one
+  `SOURCE_DATE_EPOCH` are byte-identical, Gradle already normalises zip entry timestamps,
+  and exactly one entry (`classes.jar`, carrying the generated `BuildInfo` stamp) tracks
+  the epoch. `scripts/test-android-aar-reproducibility.sh` holds it, and the paired
+  different-epoch build is what stops the equality from being satisfied by an archive that
+  ignores the clock. See item 1.12. The Linux, Windows and HarmonyOS archives are still
+  1.11's code.
+- [x] 1.6 Repair Android PowerShell packaging and reject release `--skip-rust`.
+
+  **Done 2026-08-09.** The `--skip-rust` half landed earlier; what remained was the
+  PowerShell entry point, and the reason it was still broken is that it could not be
+  run: it probed only for `gradlew.bat`, so it was unrunnable under the `pwsh` that
+  exists on Linux. Both wrappers are committed, so it now selects by host — and every
+  finding below came from actually executing it.
+
+  **The serious defect was an unpinned NDK, not the packaging.** Task 1.1a pinned the
+  NDK so "an AAR can no longer be built with a different NDK than the V8 archive it
+  links"; `build-android-so.ps1` tested only that `$env:ANDROID_NDK_HOME` was
+  non-empty and used whatever it named. The NDK supplies the compiler, sysroot and
+  linker that the component manifest records, so a Windows build could link the pinned
+  V8 archive with any toolchain and be stamped as if it had not. It survived because
+  the enumeration meant to prevent exactly this globs `*.sh`
+  (`test-android-ndk-pin-contract.sh:137`) — the gate's *scope*, not its assertions.
+  `scripts/lib/AndroidNdk.psm1` is the PowerShell counterpart of
+  `scripts/lib/android-ndk.sh`: same lock field, same candidate order, selection by
+  the NDK's own `Pkg.Revision`, and a rejected override is reported as it happens
+  rather than only when nothing matches, because falling through in silence is the
+  substitution the pin exists to prevent.
+
+  The gate is behavioural rather than a grep for `Pkg.Revision`, which occurs in the
+  module's own prose and would pass over a module that had stopped reading it. The
+  discriminating case is a directory named **exactly** like the pin whose
+  `source.properties` reports `1.2.3456789`: refused. An NDK reporting the pin is
+  accepted. Mutation: replacing the resolver call with `$env:ANDROID_NDK_HOME` makes
+  the enumeration fail `build-android-so.ps1 uses ANDROID_NDK_HOME without resolving
+  it`.
+
+  **The packaging defect was that a release could not succeed at all.** The ps1 never
+  staged the verified package index and never passed
+  `-PmigoVerifiedReleasePackaging`, so `verifyMigoReleaseArtifactPackaging<Profile>`
+  refused with a message naming `scripts/build-aar.sh` — a bash script, to a Windows
+  user, after the Rust build and the Gradle clean. It now takes `-ArtifactManifest`
+  with the shell twin's policy (release means `required`, refused otherwise, at
+  argument time), stages through the **same** generator, metadata writer and Rust tool
+  rather than reimplementing what a manifest says, and verifies the produced AAR
+  against the index afterwards.
+
+  **Proved by comparison, which is what specification §7.4 asks for.** Under a fixed
+  `SOURCE_DATE_EPOCH`, a debug AAR staged through each entry point produced
+  byte-identical inputs — `package-index.json` `59b5b7b3…`, `slices/arm64-v8a.json`
+  `e7cffba7…`, `build-metadata.json` `1297b7f6…`. Then the case that was previously
+  impossible: `pwsh -File scripts/build-aar.ps1 -BuildType release …` ran
+  `:library:verifyMigoReleaseArtifactPackagingFull` and **passed** it. Staging
+  correctness needs no separate assertion, because that Gradle task is what reads the
+  staged inputs, so a script staging the wrong thing fails there.
+
+  **One bash defect found on the way, introduced with the refusal itself.**
+  `--unverified-native-libs` shifted inside its own `case` *and* at the loop tail, so
+  it silently swallowed the following argument: an explicit `arm64-v8a` disappeared
+  and the build widened to every ABI. The pre-existing gate case could not see it —
+  what it swallows there (`release`) is a valid positional and also the default — so
+  the new case passes an argument that is not (`--artifact-manifest off`), which the
+  bug turns into `Unknown argument: off`. The three argument-time refusals are now
+  asserted through both entry points; the ps1 half skips when `pwsh` is absent.
+
+  **Independent review found four more, all real, and two of them meant a PowerShell
+  release was still not the shell's package.** (a) `$IsWindows` does not exist in
+  Windows PowerShell 5.1, where it evaluates false — so on the one host this entry point
+  exists for, it would have chosen the Unix `gradlew` and an extensionless manifest tool.
+  `#Requires -Version 7.0` makes that unrepresentable instead of adding a second
+  host-detection rule to keep in agreement. (b) It never produced the external
+  `<aar>.attestation.json` sidecar, and never removed a stale one, so a successful
+  release left an attestation describing different bytes or none at all; it now runs the
+  same `attest` and `verify-attestation` steps and clears the outputs first. (c) The
+  resolver omitted Windows' documented `%LOCALAPPDATA%\Android\Sdk`, so a normal Android
+  Studio install could hold the pinned NDK and still be rejected. (d) A single-ABI build
+  wrote `migo-full-release.aar` where the shell writes
+  `migo-full-release-arm64-v8a.aar`, so the two overwrote each other under one name —
+  found here rather than by the review, and the per-ABI figure is the one a host weighs
+  against its APK budget.
+
+  Verified after the fixes: `pwsh -File scripts/build-aar.ps1 -BuildType release …`
+  completes, passes `verifyMigoReleaseArtifactPackagingFull`, and writes
+  `migo-full-release-arm64-v8a.aar` beside `….aar.attestation.json`.
 - [ ] 1.7 Replace the Windows warm-target link flow with a clean Windows-native
   MSVC and ANGLE build graph.
-- [ ] 1.8 Implement HarmonyOS audio playback through OHAudio.
-- [ ] 1.9 Add the HarmonyOS V8 component manifest binding the shipped archive to
-  a source revision and GN argument set. The current HarmonyOS package manifest
-  records this absence as a known gap.
+- [x] 1.8 Implement HarmonyOS audio playback through OHAudio.
+
+  **Done 2026-08-10, and the OpenHarmony package now ships the full product profile
+  instead of `profile-slim`.** That substitution was the whole cost of the gap: the audio
+  crate reached a device only through cpal, cpal has no OHAudio backend, and pulling it in
+  for OpenHarmony dragged `alsa-sys` and `pkg-config` in for a library the platform does
+  not have — so the package was built slim and shipped no audio at all.
+
+  **The seam is the device half only.** `AudioSync`, the watermarks, the ring and
+  `OutputCallback`'s real-time render logic were already independent of cpal, so they stay
+  in `output.rs` and both backends use them; `output_cpal.rs` and `output_ohaudio.rs` hold
+  nothing but device setup. That matters beyond tidiness: Section 7.3's steady-state and
+  first-call allocation gates are written against `OutputCallback`, so they now cover the
+  OpenHarmony callback without being duplicated — a second copy of a real-time callback is
+  how one of them quietly stops matching its gate.
+
+  **Declared by hand against the SDK headers, fourteen functions and six enum constants.** The
+  callback struct is passed **by value** to `OH_AudioStreamBuilder_SetRendererCallback`, so
+  all four members are declared even though two are used: a short struct passed by value
+  reads the caller's stack as if it were the rest. `length` is a byte count and the stream
+  is `F32LE`, so a length that is not a whole number of samples is refused rather than
+  rounded — rounding would leave the tail of a device buffer undefined. The callback state
+  is a box freed **after** `OH_AudioRenderer_Release`, because the device thread reaches it
+  through `user_data` and freeing it earlier is a use-after-free on a real-time thread.
+
+  **Evidence, in the order it was obtained:**
+
+  * `migo-capi` compiles for `x86_64-unknown-linux-ohos` with **default features**, which
+    is what pulls the audio crate. That build did not exist before.
+  * All fourteen `OH_Audio*` functions appear as undefined imports in the archive and
+    **all fourteen resolve** against the sysroot's `libohaudio.so`.
+  * The staged package's own contract links an **external consumer** against it with the
+    package's link list (now including `ohaudio`) and every `migo_*` resolves — a real
+    link, not a symbol table read.
+  * The API floor is unchanged: externally undefined went 645 → 660 and floor-resolved 516
+    → 531, the same +15, so every new import is satisfied at API 18 and audio did not
+    raise `ohos_api`.
+  * The host path is untouched: `migo-audio` still passes 65 tests including both
+    allocation gates, and the slim profile still builds.
+
+  **A tooling trap worth keeping.** The first symbol check reported *no* OHAudio imports,
+  and that was a lie: Rust emits LLVM bitcode members and the SDK's `llvm-nm` 15 cannot
+  read LLVM 22, so it printed nothing for every query. The control that caught it —
+  running the same query against an artifact known to contain audio — showed zero as well,
+  because that one is stripped. Reading a tool's silence as an answer needs the tool to be
+  able to see the thing first.
+
+  **A review finding in teardown, and it is the dangerous kind.** `Drop` freed the
+  callback-state box unconditionally after `OH_AudioRenderer_Release`, but that call can
+  fail — and if it does the renderer may still be live, so a later data or error callback
+  would dereference freed memory on a real-time thread. Release status is now checked and
+  the state is freed only when the renderer is definitely gone; an unrecoverable release
+  **leaks** it instead, with the reason logged. A bounded silent leak is the right trade
+  against a use-after-free.
+
+  **Not verified, and it needs a device:** nothing has been *heard*. Playback, latency
+  under `AUDIOSTREAM_LATENCY_MODE_FAST`, interrupt handling and route changes are all
+  emulator or hardware work, which is item 2.5's audio row. What is proven here is that
+  the code exists, compiles for its own target, and links against the platform library.
+- [x] 1.9 Add the HarmonyOS V8 component manifest binding the shipped archive to
+  a source revision and GN argument set.
+
+  **Done 2026-08-10** for `x86_64`, the architecture whose archive exists. The gap
+  `scripts/build-ohos-sdk.sh` recorded in its own package manifest — "no component
+  manifest binds this archive's embedded V8 to a source revision and GN argument set" —
+  is removed, because it is no longer true.
+
+  Four pieces, each mirroring what Android and Linux already do rather than inventing a
+  fourth arrangement: `contracts/artifact-manifest/ohos-v8.lock.json` (the single
+  declaration of revisions, patch set, SDK pin and per-arch target shapes), a
+  `("linux", "ohos")` arm in the Rust validator, `write-ohos-v8-component-manifest.py`,
+  and a seal step in `build-v8-ohos.sh`. Sealed and verified:
+  `component_id` `78fa8c66…`, and `migo-artifact-manifest verify-v8-component` passes
+  against the real 172,812,984-byte archive and its binding.
+
+  **`linux`/`ohos`, not `os = "ohos"`.** That is the pair the compiler reports
+  (`target_os = "linux"`, `target_env = "ohos"`) and the pair `capi/src/platform/mod.rs`
+  selects on, so a third spelling would be a fact about nothing. The floor is
+  `ohos_api = 18`: what V8 was *compiled against*, i.e. the SDK's own sysroot, not the
+  higher product floor `build-ohos-sdk.sh` declares to consumers — those are different
+  claims and both are now recorded where they belong.
+
+  **The writer reproduced two of 1.1f's defects before they were fixed, which is why
+  that entry's lessons were worth reading first.** `rustc --version` run from the
+  repository root reported **1.93.0** while the vendored checkout pins **1.89.0** —
+  recording a compiler that had built nothing in it — so it is now resolved with the
+  working directory inside that checkout. And `clang --version` embeds its
+  `InstalledDir`, which for this platform is Chromium's clang *inside* the vendored
+  tree, so the manifest carried an absolute machine path; it is normalised to
+  `${RUSTY_V8_SRC}`, as the GN args already were to `${OHOS_NDK_HOME}`. Verified by
+  sealing twice: byte-identical.
+
+  **The archive now verifies through the same path as every other target.**
+  `bash scripts/fetch-v8-archives.sh --check --all` reports four archives verified
+  including `x86_64-linux-ohos`, so the fetcher's own rule — "a target with no committed
+  manifest cannot be fetched, by design" — is satisfied rather than worked around.
+  `aarch64-linux-ohos` is deliberately still absent: no archive, so nothing to verify
+  against.
+
+  **It also runs the replay proof, which no OpenHarmony build had ever done**, so a
+  stray edit in the shared checkout could previously have reached this archive
+  unrecorded. Android's declared patches are accounted for by path here — the mirror
+  image of `--accounted-patch` on that side — because one checkout serves both and each
+  platform's patches touch files the other does not declare.
+
+  **A drift found on the way, and the reason it went unnoticed for so long:** the
+  committed JSON schemas are enforced by nothing. `v8-component-schema-v1.json` listed
+  Android and Linux under `target` while the Rust validator had been accepting Windows,
+  so a Windows manifest was valid to the tool and invalid to the document describing it.
+  Both are now listed, and `test-artifact-manifest-contract.sh` equates the schema's
+  target set with the validator's arms — checked load-bearing by deleting the
+  OpenHarmony entry, which fails naming `validator-only targets: [('linux', 'ohos')]`.
+  All four committed manifests were also validated against the schema with `jsonschema`
+  as one-off evidence; that is deliberately not a permanent gate, since the drift to
+  prevent is between the two statements rather than inside either one.
+
+  **Still open here:** `aarch64` needs its own archive (and a Skia) before it can be
+  sealed, and the Windows writer still records no patch provenance — see 1.1l.
+
+  **Independent review found two P1s here, and the first was a precondition nobody
+  stated.** `build-v8-ohos.sh` exports `V8_PREBUILT_BINDING`, a hook that exists **only**
+  because `migo-build-rs-prebuilt-binding.diff` adds it to `build.rs` — and the script
+  declared only `0008-ohos-toolchain.patch`. The build therefore worked here because the
+  shared checkout had already been used for Android; on a checkout where it had not,
+  pristine rusty_v8 would ignore the variable, fall through to bindgen and fail on the
+  SDK's clang 15 **after an hour of compiling**. The lock now declares every patch the
+  archive is built from, and the script reads that set instead of naming one literal.
+
+  Second, the writer exempted the *paths* Android's patches touch, so `build.rs` among
+  others went unverified while the manifest claimed a smaller patch set — arbitrary edits
+  there would have been sealed. Exempting a path skips verification; declaring a patch
+  verifies it. With all five declared the replay covers every one and the exemptions are
+  gone, which is also the more honest statement: one checkout serves four platforms, so
+  what produced these bytes includes what was applied to it.
+
+  Verified after both fixes: all five patches report `already in effect`, the archive is
+  unchanged at `b097549b…`, and the manifest reseals with the replay covering all five.
+
+  **A third finding corrected a claim in the paragraph above.** "No path exemptions" was
+  wrong: the build passes `--accounted third_party/v8_correct_gn/gn` and its receipt, because
+  those are untracked files whose provenance is the receipt rather than a patch. Worse, the
+  exemption had **no compensating assertion** on this platform — unlike the Android build,
+  `build-v8-ohos.sh` never called `gn_pin_assert_binary` and `ohos-v8.lock.json` had no `gn`
+  block at all, so the gn that generated the entire build graph was both unverified and
+  unrecorded while this item's headline claimed the archive is bound to a GN argument set.
+  The lock now carries the same `gn` block as Android's (it is literally the same prefetched
+  binary) and the build asserts it before compiling; a bogus gn is refused, checked. So the
+  exemption is compensated exactly as on Android, which is the honest version of the
+  sentence: two paths are exempt from the *replay* and pinned by a *receipt*.
 - [ ] 1.10 Prove the HarmonyOS API floor with the two-sysroot symbol audit
   (`MIGO_OHOS_FLOOR_SYSROOT` at the floor plus `MIGO_OHOS_NEWER_SYSROOT`), set
   `compatibleSdkVersion` to the proven floor, and record any symbol that forces
@@ -732,10 +1375,147 @@
   **Still open before this can be `- [x]`:** it is not wired into any gate — the
   variable is opt-in and `build-ohos-sdk.sh` does not set it — and neither
   independent review has run.
+
+  **The wiring half is done — 2026-08-10.** `build-ohos-sdk.sh` now runs the floor gate
+  as part of a package build and *discovers* the newer sysroot instead of waiting to be
+  handed one, so the post-floor comparison stops being a check nobody runs. Selection is
+  on the SDK's own declared `apiVersion`, not on its directory name, and the first draft
+  taking "the highest-sorted directory that is not the floor" was **wrong**: with the
+  floor as the newest installed SDK it hands back an *older* sysroot and reports its
+  extra symbols as post-floor, which is evidence pointing the wrong way. Three layouts were
+  checked by hand — a newer and an older SDK present (picks the newer), the floor being the
+  newest (refuses, reports none), and only an older one beside it (refuses) — and that was a
+  **one-off manual check, not a fixture**: an independent review pointed out that nothing
+  commits it, so the wrong first draft is reintroducible with no gate firing. Said plainly
+  rather than left reading as covered.
+  `MIGO_OHOS_NEWER_SYSROOT` still wins when set.
+
+  On this machine only one SDK exists, so the run says so —
+  `no second OpenHarmony SDK found, so only the floor half of the API gate runs` — rather
+  than passing silently, which is the T.8 reporting rule applied here.
+
+  Measured on the freshly staged `x86_64` package: floor exports 8,200 symbols across
+  117 libraries, `libmigo_capi.a` has 645 externally undefined of which 516 are resolved
+  by the floor, and no import postdates it. Those are the same numbers this entry
+  recorded, now reproduced locally.
+
+  **Still open:** the two-sysroot delta itself cannot be demonstrated here until a second
+  SDK is unpacked, `compatibleSdkVersion` has not been set from the proven floor, and
+  neither independent review has run.
+
+  **Correction, 2026-08-09: the evidence above was not produced on this workstation
+  and cannot be reproduced here yet.** `ls -d ~/ohos-sdk*` finds only `~/ohos-sdk`
+  (5.1.0.107, API 18); there is no `~/ohos-sdk-6.1`, and `dist/` does not exist, so
+  neither the newer sysroot nor the `libmigo_capi.a` the run measured is present. The
+  entry's own lesson — check the object before believing a claim about it — applies to
+  the claim itself. Reproducing it here needs the 6.1 SDK downloaded and an
+  OpenHarmony build, which is blocked behind 1.9.
 - [ ] 1.11 Produce deterministic Android, Linux, Windows, and HarmonyOS packages
   carrying manifests, checksums, BSL 1.1 text, notices, SBOMs, and provenance.
 - [ ] 1.12 Prove same-source rebuild byte equality for every shipping archive.
-- [ ] 1.13 Verify the Android permission contract from the built Full and Slim
+
+  **The Android AAR now has that proof, and it is the only archive this repository
+  produces today — 2026-08-10.** The audit's finding stands as it was written ("no
+  reproducibility or determinism gate exists"): there was none anywhere in `scripts/`.
+  `scripts/test-android-aar-reproducibility.sh` is one, wired into `pr-ci.yml` beside the
+  symbol floor because both need the natives the AAR step stages.
+
+  **It runs in CI but not in `verify-change.sh`, and that is a property of where it
+  lives.** The verifier derives its contract lane from `pr-ci.yml`'s `quality-gate` job
+  only, and this gate is in the Android job — the same position as
+  `test-android-symbol-floor.sh` next to it, which is also CI-only for the same reason. So
+  it is an arrangement rather than an oversight, but a local `verify-change.sh` run does
+  **not** cover it, and reading a green local verdict as covering archive reproducibility
+  would be wrong. Run it by hand after touching packaging.
+
+  **Measured, and the result was not assumed either way:** two release AAR builds under
+  one `SOURCE_DATE_EPOCH` are **byte-identical** at 17,391,073 bytes, and a third under a
+  different epoch **differs**. That pairing is required rather than tidy — an archive that
+  ignored the clock entirely would be stable too, and so would a build that produced
+  nothing, which is this repository's standing rule for any absence-shaped measurement.
+
+  **What the epoch actually moves is worth recording, because it makes the measurement
+  legible.** Of fifteen entries, exactly one differs between epochs: `classes.jar`, which
+  carries the generated `BuildInfo` stamp. Zip entry timestamps do **not** differ at all —
+  Gradle normalises them. So the archive tracks the epoch through exactly one entry and is
+  otherwise clock-free, which is why the equality is byte-level rather than approximate.
+
+  Falsifiable, and falsified with the defect task 1.5 actually fixed: restoring the
+  wall-clock stamp in `library/build.gradle` (`new Date()` instead of the epoch) makes the
+  gate fail and **name the entry** — `content differs: classes.jar` — rather than only
+  reporting that the archives differ. A first attempt at that mutation broke the Gradle
+  build instead of its determinism, which tested nothing; a mutant has to leave the build
+  working to reach the comparison.
+
+  **Scope stated, because it is narrower than the item:** the builds run
+  `--skip-rust --unverified-native-libs`, the documented way to exercise packaging logic,
+  so what is proved is that *packaging* the same inputs twice yields the same archive. The
+  natives are covered separately — both Android V8 archives reproduced from source under
+  task 1.1 and again under 1.1i, with their hashes recorded in component manifests the
+  build now verifies (task 1.3). **Still open:** the Linux, Windows and HarmonyOS packages,
+  which are item 1.11's code and do not exist yet, and a from-clean rebuild rather than a
+  same-checkout one.
+- [x] 1.13 Verify the Android permission contract from the built Full and Slim
   merged manifests at API 26, 28, and 31.
+
+  **Done 2026-08-09**, and the gap was narrower than the wording suggests, because
+  `test-permission-coverage-contract.sh` already holds the *source* manifests to a
+  policy table including each `maxSdkVersion`. Two things it does not do, both of which
+  are what "built ... merged" means: it reads
+  `library/src/{full,main}/AndroidManifest.xml` rather than what Gradle produces, so a
+  permission contributed by a dependency or a `tools:` directive is invisible to it;
+  and it iterates the policy, so it checks every expected permission is **present** and
+  never that an unexpected one is **absent**. A `READ_CONTACTS` added to the Full
+  manifest passed it.
+
+  `scripts/test-android-merged-manifest-permissions.sh` compares the merged manifests
+  exactly, in both directions, per profile, and is in `pr-ci.yml` — so `verify-change.sh`
+  derives it too.
+
+  **It is classified `needs:gradlew`, and a review is why.** The gate skips cleanly when no
+  wrapper is present, and it was classified `run`, so the verifier printed **PASS for a gate
+  that had asserted nothing** — an empty scan indistinguishable from a clean one, in a gate
+  whose entire point is that a permission set is checked rather than assumed. Its two
+  Gradle-dependent siblings were already listed; it now is too, so an absent toolchain reads
+  NOT PROVEN.
+
+  **The policy is not restated.** It moved to
+  `scripts/lib/android_permission_policy.py` and both gates import it; the older gate
+  still reports the same 30 gated / 8 cleanup / 38 sensitive ops, so the extraction
+  changed nothing it asserts. A second copy of that table is the "two implementations
+  of one rule" shape, where the tests end up over the one that never ships.
+
+  **The debug variants are used, and why that is evidence about the release artifact.**
+  `processFullReleaseManifest` depends on `verifyMigoReleaseArtifactPackaging<Profile>`,
+  which refuses unless a release build has staged verified inputs, so requesting it
+  would gate on whatever an earlier run left behind. Instead the gate asserts no
+  build-type source set declares a manifest (`src/debug`, `src/release`: neither
+  exists) *and*, whenever a release merged manifest is present, that it is identical to
+  the debug one. On this run it was: `fullDebug` and `fullRelease` merged manifests are
+  byte-identical.
+
+  **The contract, measured rather than derived by hand:**
+
+  | Profile | API 26 | API 28 | API 31 |
+  |---|---|---|---|
+  | Full | 12 | 12 | **9** |
+  | Slim | 3 | 3 | 3 |
+
+  Full loses `BLUETOOTH`, `BLUETOOTH_ADMIN` (`maxSdkVersion` 30) and
+  `WRITE_EXTERNAL_STORAGE` (28) by API 31, and API 28 still requests storage because
+  the bound is inclusive. Slim requests only `INTERNET`, `ACCESS_NETWORK_STATE` and
+  `VIBRATE` on every level, and carries no Full-only permission.
+
+  Falsifiable: `--self-test` injects `READ_CONTACTS` and both profiles reject it,
+  naming the permission.
+
+  **Two holes an independent review found, both closed.** The parser read only
+  `<uses-permission>`, so a `<uses-permission-sdk-23>` declaration — effective on every
+  device this library supports, since its floor is API 26 — would have passed both gates
+  while looking like a different element. And the debug-variant argument rested on
+  source sets alone: a `releaseImplementation` dependency brings its own manifest into
+  the merge and could add a permission to the shipped Release manifest only, so the gate
+  now also refuses any build-type-scoped dependency configuration, which forces the
+  release manifest to be compared directly if one is ever added.
 - [ ] 1.14 Package the HarmonyOS HAR reproducibly with the unified version.
 

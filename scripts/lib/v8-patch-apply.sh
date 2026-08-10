@@ -97,10 +97,25 @@ v8_require_patch() {
 
 # Runs git against a checkout this user may not own. `-c` keeps that judgement to
 # the invocation instead of writing it into the user's global git config.
+#
+# The path is canonicalised first, and that is load-bearing rather than tidiness:
+# git compares `safe.directory` literally against the repository path it
+# discovers, and every caller derives this one as `$PROJECT_ROOT/../rusty_v8_src`.
+# An unnormalised value therefore never matches, the exception does not apply, and
+# every git call here fails with `dubious ownership` -- which the replay reports as
+# the tree carrying changes no patch explains.
 _v8_git() {
     local tree="$1"
     shift
-    git -c "safe.directory=$tree" -C "$tree" "$@"
+    local canonical
+    # Refused rather than defaulted: an empty `-C` runs git in the *current*
+    # directory, so a mistyped tree would report the calling repository's status
+    # as if it were the vendored checkout's.
+    canonical="$(cd "$tree" 2>/dev/null && pwd -P)" || {
+        _v8_patch_err "not a directory: $tree"
+        return 1
+    }
+    git -c "safe.directory=$canonical" -C "$canonical" "$@"
 }
 
 # Emits one tab-separated record per changed path, descending into submodules:
@@ -121,25 +136,91 @@ _v8_git() {
 # as one rather than followed.
 _v8_changed_paths() {
     local tree="$1" prefix="$2"
-    local record status path mode pinned actual
-    while IFS= read -r -d '' record; do
+    local listing record status path pinned actual submodule
+    local -a records=() submodules=()
+    # Submodules are enumerated from the index and scanned explicitly rather than
+    # discovered from the parent's status, and the reason is not obvious:
+    # `submodule.<name>.ignore = all` (or `dirty`) makes the parent's `git status` omit
+    # the submodule entirely, so a descent triggered by the parent reporting a dirty
+    # gitlink would silently never happen and unrecorded submodule edits would pass this
+    # proof. `--ignore-submodules=all` on the parent scan below therefore says "do not
+    # tell me about submodules" precisely because each one is asked directly.
+    #
+    # `scripts/lib/v8_source_proof.py` already worked this way; this copy -- the one the
+    # *build* uses, where an unexplained edit reaches an artifact rather than a manifest --
+    # did not. Two implementations of one rule, with the guard on the copy that seals.
+    listing="$(mktemp)" || {
+        _v8_patch_err "cannot create a temporary file to enumerate $tree"
+        return 1
+    }
+    if ! _v8_git "$tree" ls-files --stage > "$listing"; then
+        rm -f "$listing"
+        _v8_patch_err "cannot read the index of $tree"
+        return 1
+    fi
+    while read -r mode _ _ path; do
+        [[ "$mode" == "160000" ]] && submodules+=("$path")
+    done < "$listing"
+
+    # A failed enumeration must not read as an empty one. The status output is
+    # NUL-separated, so it cannot go through a command substitution, and a process
+    # substitution's exit code is not observable -- hence the file. Read it out and
+    # delete it before processing, so the recursion below cannot leak it.
+    if ! _v8_git "$tree" status --porcelain=v1 -z --untracked-files=all \
+            --ignore-submodules=all > "$listing"; then
+        rm -f "$listing"
+        _v8_patch_err "cannot read the git status of $tree"
+        return 1
+    fi
+    mapfile -d '' -t records < "$listing"
+    rm -f "$listing"
+    for record in "${records[@]}"; do
         status="${record:0:2}"
         path="${record:3}"
-        mode="$(_v8_git "$tree" ls-files --stage -- "$path" 2>/dev/null \
-                | awk 'NR == 1 { print $1 }')"
-        if [[ "$mode" == "160000" ]]; then
-            pinned="$(_v8_git "$tree" rev-parse "HEAD:$path" 2>/dev/null)"
-            actual="$(_v8_git "$tree/$path" rev-parse HEAD 2>/dev/null)"
-            if [[ -z "$pinned" || -z "$actual" || "$pinned" != "$actual" ]]; then
-                printf '%s\t%s\t%s\t%s\n' \
-                    "submodule-moved" "$prefix$path" "$tree" "$path"
-                continue
-            fi
-            _v8_changed_paths "$tree/$path" "$prefix$path/" || return 1
-        else
-            printf '%s\t%s\t%s\t%s\n' "$status" "$prefix$path" "$tree" "$path"
+        printf '%s\t%s\t%s\t%s\n' "$status" "$prefix$path" "$tree" "$path"
+    done
+
+    # Descending is only sound while a submodule sits at the commit its parent records.
+    # Otherwise the pristine baseline would be a foreign HEAD, and a submodule checked out
+    # elsewhere where the declared patches still apply would read as clean.
+    for submodule in "${submodules[@]}"; do
+        pinned="$(_v8_git "$tree" rev-parse "HEAD:$submodule" 2>/dev/null)"
+        actual="$(_v8_git "$tree/$submodule" rev-parse HEAD 2>/dev/null)"
+        if [[ -z "$pinned" || -z "$actual" || "$pinned" != "$actual" ]]; then
+            printf '%s\t%s\t%s\t%s\n' \
+                "submodule-moved" "$prefix$submodule" "$tree" "$submodule"
+            continue
         fi
-    done < <(_v8_git "$tree" status --porcelain=v1 -z --untracked-files=all)
+        _v8_changed_paths "$tree/$submodule" "$prefix$submodule/" || return 1
+    done
+}
+
+# The declared patch set, read from a build lock. One reader, because a second copy
+# of "where the declaration lives" is how the declaration and the thing that applies
+# it drift -- the defect task 1.1b removed for Android by collapsing three statements
+# into one, and which the Windows lock still had in the other direction: it declared
+# three `required_patches` that nothing read, while the build named its own literals.
+#
+# Prints one entry per line. A caller must use a command substitution rather than
+# `mapfile < <(...)`: a process substitution's exit status is not what `||` observes,
+# so a parser that printed a valid prefix and then rejected a malformed entry would
+# leave a truncated declaration behind and pass a non-empty check -- the build would
+# apply fewer patches than the lock requires and only discover it at manifest time.
+v8_read_declared_patches() {
+    local lock="$1"
+    [[ -f "$lock" ]] || { _v8_patch_err "missing V8 build lock: $lock"; return 1; }
+    python3 - "$lock" <<'PY'
+import json, sys
+
+lock = json.load(open(sys.argv[1]))
+required = lock.get("required_patches")
+if not isinstance(required, list) or not required:
+    sys.exit("V8 lock declares no required_patches")
+for entry in required:
+    if not isinstance(entry, dict) or "file" not in entry:
+        sys.exit(f"required_patches entry carries no file: {entry!r}")
+    print(entry["file"])
+PY
 }
 
 # Proves that a checkout is its committed HEAD plus exactly the declared patches,
@@ -164,13 +245,43 @@ _v8_changed_paths() {
 # Exemptions are arguments rather than a variable the library reads, so an exported
 # value in a release environment cannot grant one: a caller that needs an exemption
 # has to say so at the call site.
+#
+# `--accounted-patch <glob>` is for the one case a single checkout forces: the
+# vendored tree is shared by every platform's V8 build, and OpenHarmony's
+# `0008-ohos-toolchain.patch` *creates* `build/toolchain/ohos/BUILD.gn`, which the
+# Android declaration does not touch. Without this, building OpenHarmony makes the
+# Android build refuse a file that is explained by a committed patch, just not by one
+# this build applies -- so the two platforms became mutually exclusive on one
+# checkout. The paths are derived from the patch rather than listed, so they cannot
+# drift from it, and **only paths the patch creates may be accounted for**: accounting
+# for a path a foreign patch *modifies* would skip content verification on a file this
+# platform also cares about, so that is refused rather than trusted.
 v8_assert_tree_is_exactly_patched() {
     local tree="$1" dir="$2"
     shift 2
     local -A accounted=()
-    while [[ "${1:-}" == "--accounted" ]]; do
-        [[ -n "${2:-}" ]] || { _v8_patch_err "--accounted needs a path"; return 1; }
-        accounted["$2"]=1
+    while [[ "${1:-}" == "--accounted" || "${1:-}" == "--accounted-patch" ]]; do
+        [[ -n "${2:-}" ]] || { _v8_patch_err "$1 needs a value"; return 1; }
+        if [[ "$1" == "--accounted" ]]; then
+            accounted["$2"]=1
+        else
+            local foreign target
+            foreign="$(v8_resolve_patch "$dir" "$2")" || return 1
+            local -a created=()
+            while IFS= read -r target; do
+                [[ -n "$target" ]] && created+=("$target")
+            done < <(awk '
+                /^--- / { from = $2 }
+                /^\+\+\+ / { if (from == "/dev/null") { sub("^b/", "", $2); print $2 } }
+            ' "$foreign")
+            if (( ${#created[@]} == 0 )); then
+                _v8_patch_err "$(basename "$foreign") creates no file, so it cannot account for one"
+                return 1
+            fi
+            for target in "${created[@]}"; do
+                accounted["$target"]=1
+            done
+        fi
         shift 2
     done
     local -a globs=("$@")
@@ -195,7 +306,11 @@ v8_assert_tree_is_exactly_patched() {
     fi
 
     local -a changed=() owners=() owner_paths=()
-    local status owner owner_path
+    local status owner owner_path records
+    # A command substitution rather than a process substitution: the enumeration
+    # can fail (a tree git cannot read), and `< <(...)` discards that, leaving the
+    # loop to see no changed paths and the proof to conclude the tree is clean.
+    records="$(_v8_changed_paths "$tree" "")" || return 1
     while IFS=$'\t' read -r status path owner owner_path; do
         [[ -n "$path" ]] || continue
         [[ -n "${accounted[$path]:-}" ]] && continue
@@ -211,7 +326,7 @@ v8_assert_tree_is_exactly_patched() {
         changed+=("$path")
         owners+=("$owner")
         owner_paths+=("$owner_path")
-    done < <(_v8_changed_paths "$tree" "")
+    done <<< "$records"
 
     local scratch
     scratch="$(mktemp -d)" || {

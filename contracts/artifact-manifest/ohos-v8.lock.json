@@ -1,0 +1,70 @@
+{
+  "gn": {
+    "notes": "The same prefetched binary the Android build uses -- scripts/build-v8-ohos.sh exports GN=third_party/v8_correct_gn/gn -- so it carries the same pin rather than a second opinion about which gn is correct. Pinned here because this build exempts that binary and its receipt from the source replay (they are untracked files whose provenance is the receipt), and an exemption with no compensating assertion is just an unverified input: gn generates the entire build graph. gn generates the entire build graph, so it is part of the artifact's provenance. V8 14.5 needs path_exists(), added in gn 2315; skia's bundled gn 2175 is too old. The exact version pin above already refuses everything older, so there is no separate minimum. gn's version is a commit position and is unchanged by local modifications, so the revision is pinned as well. Built by scripts/build-gn.sh with the one required patch, which adds -Wno-comment to gn's existing gcc-only suppression list because header_checker.h ends an ASCII-art comment line with a backslash that only gcc reports and gn compiles with -Werror.",
+    "required_patches": [
+      "0001-suppress-gcc-multiline-comment-warning"
+    ],
+    "revision": "17b0057970fa2b07a20cbb4289ab78cf93565f35",
+    "source": "https://gn.googlesource.com/gn",
+    "version": "2502"
+  },
+  "notes": "The binding is not generated on this platform and that is structural rather than a configuration choice: the SDK ships clang 15 on both the 5.1 and 6.1 lines, while V8 145's vendored libc++ announces it supports clang 20 and later and uses __builtin_clzg/__builtin_ctzg, added in clang 19. bindgen therefore fails after the whole C++ side has already built. scripts/build-v8-ohos.sh feeds the committed src_binding.rs through V8_PREBUILT_BINDING and refuses if it is missing. The binding encodes V8's FFI ABI for a rusty_v8 revision rather than a target's calling convention, so it is byte-identical to the Android one at this revision and both OpenHarmony triples are LP64.",
+  "ohos_api": 18,
+  "required_patches": [
+    {
+      "file": "migo-build-rs-prebuilt-binding.diff",
+      "id": "migo-prebuilt-binding",
+      "notes": "Adds the V8_PREBUILT_BINDING hook to build.rs. Declared here and not merely relied upon: pristine rusty_v8 ignores that variable, so an OpenHarmony build on a checkout that had not already been used for Android would export it, fall through to bindgen, and fail after an hour on the SDK's clang 15 -- the exact wall this platform cannot pass. It is a shared checkout, so the patch has to be part of this platform's declaration rather than a precondition nobody states."
+    },
+    {
+      "file": "0001-unset-BINDGEN_EXTRA_CLANG_ARGS-in-v8_s-bindgen.patch",
+      "id": "0001-unset-bindgen-extra-clang-args",
+      "notes": "Declared because the archive is built from a tree carrying it. One vendored checkout serves every platform, so the honest statement of what produced these bytes includes the patches applied to it -- exempting their paths from the replay instead would leave their contents unverified while the manifest claimed a smaller patch set. Inert for this platform's own bindgen, which does not run."
+    },
+    {
+      "file": "0002-install-sysroot.patch",
+      "id": "0002-use-sysroot-on-android",
+      "notes": "Declared for the same reason as 0001: applied to the shared checkout these bytes were built from."
+    },
+    {
+      "file": "0003-compiler-use-custom-libcxx-for-v8.patch",
+      "id": "0003-custom-libcxx-for-snapshot-toolchain",
+      "notes": "Declared for the same reason as 0001, and not inert here: this build's snapshot toolchain is the host clang, which is what this patch configures."
+    },
+    {
+      "file": "0008-ohos-toolchain.patch",
+      "id": "0008-ohos-toolchain",
+      "notes": "Upstream Chromium has no OpenHarmony support at all: target_os is in no whitelist and neither build/ nor buildtools/ mentions it. This patch creates build/toolchain/ohos/BUILD.gn, which is the only thing that makes a custom_toolchain for the platform expressible. It creates a file rather than modifying one, which is why the Android proof can account for it with --accounted-patch."
+    }
+  ],
+  "rusty_v8_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
+  "rusty_v8_version": "145.0.0",
+  "schema": "migo-v8-build-lock/v1",
+  "sdk": {
+    "api_version": "18",
+    "notes": "The OpenHarmony native SDK supplies the target sysroot and the musl libc this archive links against, so it is part of the artifact's identity the same way the NDK is on Android. Pinned to the SDK that produced the verified archive rather than to the newest available. ohos_api is what V8 was compiled against, which is this SDK's own API level; the product floor a consumer sees is declared separately by scripts/build-ohos-sdk.sh and is allowed to be higher.",
+    "version": "5.1.0.107"
+  },
+  "sources": {
+    "rusty_v8": "https://github.com/denoland/rusty_v8/tree/e6a88b35dd3d7f2849a0df33a71d338701c55316",
+    "v8": "https://chromium.googlesource.com/v8/v8/+/8defb67673c5483ae56258a2de01b07e947dc921"
+  },
+  "targets": {
+    "aarch64": {
+      "cpu_baseline": "armv8-a",
+      "required_cpu_features": [
+        "neon"
+      ],
+      "triple": "aarch64-unknown-linux-ohos"
+    },
+    "x86_64": {
+      "cpu_baseline": "x86-64-v1",
+      "required_cpu_features": [
+        "cmov",
+        "sse2"
+      ],
+      "triple": "x86_64-unknown-linux-ohos"
+    }
+  },
+  "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921"
+}

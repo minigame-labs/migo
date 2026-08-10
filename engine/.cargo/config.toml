@@ -29,9 +29,16 @@ rustflags = [
   # The dynamic path matches scripts/build-android-so.sh copying
   # libc++_shared.so into jniLibs/.
   #
-  # Tolerate the handful of std::* symbols that are defined in both
-  # V8's and Skia's archives; the linker picks the first definition,
-  # which is safe because all archives use the same NDK libc++ ABI.
+  # Tolerate the duplicate std::* symbols V8 and Skia both define. The linker takes the
+  # first definition, and what that tolerates was measured by removing the flag: exactly
+  # six symbols, all ones libc++
+  # explicitly instantiates in stdexcept.cpp (std::runtime_error and std::logic_error's
+  # char-const* constructor, copy constructor and copy assignment). The two providers are
+  # *different* libc++ implementations -- Chromium's, carried inside V8's rlib, and the NDK
+  # r23 sysroot's libc++_static.a -- so the older justification here, "the same libc++ ABI",
+  # was false. Taking the first definition is safe for a narrower reason: no std exception
+  # object crosses the V8/Skia boundary, because each side throws and catches internally and
+  # the surface between them is a C ABI. See ledger item 1.4.
   "-C", "link-arg=-Wl,--allow-multiple-definition",
   
   # Use LLD linker for better optimization (if available)
@@ -150,10 +157,13 @@ rustflags = [
 [target.x86_64-unknown-linux-ohos]
 linker = "x86_64-unknown-linux-ohos-clang"
 rustflags = [
-  # Skia and V8 each define a handful of the same std::* symbols; the linker
-  # takes the first definition, which is safe because both archives are built
-  # against the same libc++ ABI. Android carries this for the same reason.
-  "-C", "link-arg=-Wl,--allow-multiple-definition",
+  # No --allow-multiple-definition here, and that is measured rather than assumed:
+  # migo-capi is a staticlib on this target, so rustc never invokes a linker, and the
+  # shipped consumption path is an OpenHarmony consumer linking that archive through
+  # CMake -- which scripts/test-ohos-sdk-contract.sh does, with --gc-sections and
+  # nothing else, successfully. A cargo-driven link for this target does not work at
+  # all today (it fails on `unable to find library -lstdc++`), so a relaxation here
+  # could only silence a duplicate nobody has reached.
   # skia-bindings has a translation unit referencing JPEG/PDF/pathops symbols
   # for features Skia was built without; an executable or .so only links
   # because --gc-sections reclaims the unreferenced sections.
@@ -166,7 +176,7 @@ rustflags = [
 [target.aarch64-unknown-linux-ohos]
 linker = "aarch64-unknown-linux-ohos-clang"
 rustflags = [
-  "-C", "link-arg=-Wl,--allow-multiple-definition",
+  # See the x86_64 OpenHarmony entry for why no duplicate-definition relaxation is here.
   "-C", "link-arg=-Wl,--gc-sections",
   "-C", "link-arg=-Wl,--as-needed",
   "-C", "link-arg=-Wl,-z,relro",

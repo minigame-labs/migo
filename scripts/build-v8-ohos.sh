@@ -117,15 +117,26 @@ if [[ ! -x "$CHROMIUM_CLANG_BIN/clang++" ]]; then
 fi
 [[ -x "$CHROMIUM_CLANG_BIN/clang++" ]] || { err "Chromium clang unavailable"; exit 1; }
 
-# The toolchain definition lives in the build/ submodule, which is one of the
-# two paths the V8 provenance gate permits modifying. The patch creates the file,
-# but the path existing does not prove the content is the patch's, so
-# applied-ness is derived from the patch itself.
+# Applied-ness is derived from each patch itself rather than from a path existing, and the
+# set comes from the lock rather than from a literal here -- the same single declaration the
+# Android build reads. That matters beyond tidiness: this script exports
+# V8_PREBUILT_BINDING, a hook that exists only because
+# migo-build-rs-prebuilt-binding.diff adds it to build.rs. Naming only the OpenHarmony
+# toolchain patch here made the build silently depend on somebody having run the Android
+# build in this shared checkout first; without it, pristine rusty_v8 ignores the variable,
+# falls through to bindgen and fails on the SDK's clang 15 after an hour of compiling.
 # shellcheck source=scripts/lib/v8-patch-apply.sh
 source "$SCRIPT_DIR/lib/v8-patch-apply.sh"
-info "ensuring the OpenHarmony toolchain patch is applied"
-v8_require_patch "$RUSTY_V8_SRC" "$ENGINE_ROOT/third_party/v8-patches" \
-    '0008-ohos-toolchain.patch' || { err "OpenHarmony toolchain patch failed"; exit 1; }
+V8_BUILD_LOCK="$PROJECT_ROOT/contracts/artifact-manifest/ohos-v8.lock.json"
+V8_DECLARED_OUTPUT="$(v8_read_declared_patches "$V8_BUILD_LOCK")" \
+    || { err "cannot read the declared patch set from $V8_BUILD_LOCK"; exit 1; }
+[[ -n "$V8_DECLARED_OUTPUT" ]] || { err "the V8 lock declares no patches"; exit 1; }
+mapfile -t V8_DECLARED_PATCHES <<<"$V8_DECLARED_OUTPUT"
+info "ensuring the ${#V8_DECLARED_PATCHES[@]} declared patches are applied"
+for glob in "${V8_DECLARED_PATCHES[@]}"; do
+    v8_require_patch "$RUSTY_V8_SRC" "$ENGINE_ROOT/third_party/v8-patches" "$glob" \
+        || { err "patch failed: $glob"; exit 1; }
+done
 
 # rusty_v8 pins its own rustc (1.89.0 at the time of writing), which is not
 # migo's. A target installed for migo's toolchain is invisible here.
@@ -202,12 +213,60 @@ GN_ARGS+=" use_allocator_shim=false use_partition_alloc_as_malloc=false"
 
 export V8_FROM_SOURCE=1
 export GN_ARGS
+
+# bindgen cannot run here, and that is a property of the SDK rather than a
+# configuration to tune. The OpenHarmony SDK ships clang 15 (both 5.1 and 6.1 do), while
+# V8 145's vendored libc++ announces "Libc++ only supports Clang 20 and later" and uses
+# `__builtin_clzg`/`__builtin_ctzg`, added in clang 19. Measured: the C++ side builds to
+# completion and then `build.rs` panics with
+# `Unable to generate bindings: ClangDiagnostic(... '_Tp' does not refer to a value ...)`,
+# after more than an hour of compilation. So the committed binding for this triple is the
+# input, via the same `V8_PREBUILT_BINDING` hook the Android build uses.
+#
+# The binding is safe to share because it encodes V8's FFI ABI for a rusty_v8 revision,
+# not a target's calling convention: this file is byte-identical to the Android one at
+# the pinned revision, and both OpenHarmony triples are LP64. It is committed, so a
+# revision bump replaces it deliberately rather than regenerating silently against
+# whichever clang is on PATH.
+PREBUILT_BINDING="$OUT_DIR/src_binding.rs"
+if [[ ! -f "$PREBUILT_BINDING" ]]; then
+    err "no committed binding at $PREBUILT_BINDING"
+    err "the SDK's clang 15 cannot generate one: V8's vendored libc++ needs clang 20+."
+    err "commit the binding for this triple, or build with a newer OpenHarmony SDK clang."
+    exit 1
+fi
+export V8_PREBUILT_BINDING="$PREBUILT_BINDING"
+info "V8_PREBUILT_BINDING = $PREBUILT_BINDING"
+
 # Without these, build.rs downloads its own gn/ninja, a step that can stall.
 [[ -x "$RUSTY_V8_SRC/third_party/v8_correct_gn/gn" ]] && \
     export GN="$RUSTY_V8_SRC/third_party/v8_correct_gn/gn"
 command -v ninja >/dev/null 2>&1 && export NINJA="$(command -v ninja)"
 
-BUILD_LOG="$RUSTY_V8_SRC/.migo_ohos_build_$ARCH.log"
+# gn generates the entire build graph, so it is an input to every byte of the archive --
+# and this build *exempts* that binary and its receipt from the source replay, because
+# they are untracked files whose provenance is the receipt rather than a patch. An
+# exemption with no compensating assertion is just an unverified input, which is why the
+# Android build asserts the same pin. Same binary, same lock block, same check.
+# shellcheck source=scripts/lib/gn-pin.sh
+source "$SCRIPT_DIR/lib/gn-pin.sh"
+gn_pin_read "$V8_BUILD_LOCK" || exit 1
+if [[ -n "${GN:-}" ]]; then
+    gn_pin_assert_binary "$GN" "$ENGINE_ROOT/third_party/gn-patches" || {
+        err "the gn this build would use is not the one $V8_BUILD_LOCK pins"
+        exit 1
+    }
+else
+    err "no prefetched gn at $RUSTY_V8_SRC/third_party/v8_correct_gn/gn"
+    err "build it with: bash scripts/build-gn.sh"
+    exit 1
+fi
+
+# Outside the vendored checkout, the way build-v8-android.sh already does it. A log
+# written into $RUSTY_V8_SRC is an untracked file no committed patch explains, so it
+# makes every provenance gate over that tree -- including the Android build's own --
+# refuse it, and the tree is shared by all four platforms.
+BUILD_LOG="${TMPDIR:-/tmp}/migo-v8-ohos-build-${ARCH}.$$.log"
 info "building (log: $BUILD_LOG)"
 info "GN_ARGS = $GN_ARGS"
 if ! (cd "$RUSTY_V8_SRC" && cargo build --release --target "$RUST_TRIPLE" > "$BUILD_LOG" 2>&1); then
@@ -238,3 +297,26 @@ fi
 ok "no PartitionAlloc hijack symbols"
 
 ok "installed $OUT_DIR/librusty_v8.a ($(du -h "$OUT_DIR/librusty_v8.a" | cut -f1))"
+
+# ---- seal ------------------------------------------------------------------
+# Binds these bytes to a source revision, a GN argument set and an SDK identity.
+# Until this existed, `scripts/build-ohos-sdk.sh` recorded the absence as a known gap
+# in its own package manifest: the archive shipped with nothing saying which V8 it is.
+# The writer also runs the shared replay proof over the vendored checkout, which no
+# OpenHarmony build had ever done, so a stray edit there could reach this archive
+# unrecorded.
+V8_COMPONENT_WRITER="$SCRIPT_DIR/write-ohos-v8-component-manifest.py"
+python3 "$V8_COMPONENT_WRITER" \
+    --repo-root "$PROJECT_ROOT" \
+    --rusty-v8-src "$RUSTY_V8_SRC" \
+    --sdk-home "$OHOS_NDK_HOME" \
+    --arch "$ARCH" \
+    --gn-args "$GN_ARGS" \
+    --archive "$OUT_DIR/librusty_v8.a" \
+    --binding "$OUT_DIR/src_binding.rs" \
+    --compiler "$WRAP_DIR/$RUST_TRIPLE-clang++" \
+    --linker "$CHROMIUM_CLANG_BIN/ld.lld" \
+    --accounted 'third_party/v8_correct_gn/gn' \
+    --accounted 'third_party/v8_correct_gn/gn-receipt.json' \
+    --output "$OUT_DIR/component-manifest.json"
+ok "component manifest -> $OUT_DIR/component-manifest.json"

@@ -67,6 +67,8 @@ V8_LIBS_DIR="$ENGINE_ROOT/third_party/rusty_v8"
 
 # shellcheck source=scripts/lib/android-ndk.sh
 source "$SCRIPT_DIR/lib/android-ndk.sh"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 
 if [[ ! -d "$ENGINE_ROOT" ]]; then
     print_error "engine directory not found at $ENGINE_ROOT"
@@ -324,31 +326,50 @@ build_platform() {
         arch="x86_64"
     fi
 
-    local v8_archive="$V8_LIBS_DIR/$arch/librusty_v8.a"
-    local v8_binding="$V8_LIBS_DIR/$arch/src_binding.rs"
+    local v8_dir="$V8_LIBS_DIR/$arch"
 
-    if [[ -f "$v8_archive" ]]; then
-        export RUSTY_V8_ARCHIVE="$v8_archive"
-        print_info "RUSTY_V8_ARCHIVE = $v8_archive"
+    # Verified and materialised under a path that is its own hash, rather than exported
+    # from wherever the archive happens to sit. This used to be `[[ -f "$v8_archive" ]]`
+    # -- existence, not identity -- so the AAR's native library was built against
+    # whatever bytes were at that path, while the SDK scripts beside it already ran
+    # verify-v8-component first. Content addressing also makes cargo's staleness rule
+    # correct: it reruns the v8 build script when the *value* of RUSTY_V8_ARCHIVE changes,
+    # not when the file does, so a rebuilt archive is a new path instead of a silent reuse.
+    if ! v8_materialise "$v8_dir" "$PROJECT_ROOT/engine/target/v8-materialised"; then
+        print_error "cannot use the V8 archive for $arch"
+        exit 1
     fi
-
-    if [[ -f "$v8_binding" ]]; then
-        export RUSTY_V8_SRC_BINDING_PATH="$v8_binding"
-        print_info "RUSTY_V8_SRC_BINDING_PATH = $v8_binding"
-    fi
+    export RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE"
+    export RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING"
+    print_info "RUSTY_V8_ARCHIVE = $RUSTY_V8_ARCHIVE"
+    print_info "RUSTY_V8_SRC_BINDING_PATH = $RUSTY_V8_SRC_BINDING_PATH"
 
     # --------------------------------------------------------
     # RUSTFLAGS (arm64 builtins)
     # --------------------------------------------------------
     local orig_rustflags="${RUSTFLAGS:-}"
 
-    # --allow-multiple-definition is needed on every Android target:
-    # rusty_v8's prebuilt librusty_v8.a embeds parts of libc++, and
-    # skia-bindings emits `-lc++_static`.  Both archives define
-    # std::runtime_error / std::exception / ... → linker picks the first
-    # occurrence, which is safe (identical NDK ABI) but lld defaults to
-    # erroring.  The flag only needs to exist on the final link of
-    # libmigo.so, which happens inside the cargo invocation below.
+    # --allow-multiple-definition is needed on every Android target, and what it
+    # tolerates was measured on 2026-08-10 by removing it: the link fails with exactly
+    # six duplicate symbols, all of them ones libc++ explicitly instantiates in
+    # stdexcept.cpp -- std::runtime_error and std::logic_error's char-const* and copy
+    # constructors, and their copy assignments. lld names both providers:
+    #
+    #   V8's own stdexcept.o, from *Chromium's* libc++, inside
+    #     target/<triple>/release/deps/.../libv8-*.rlib
+    #   the NDK sysroot's libc++_static.a, at
+    #     libcxx/src/support/runtime/stdexcept_default.ipp:35 of ndk-release-r23
+    #
+    # So the justification this comment used to carry -- "identical NDK ABI" -- was
+    # wrong. These are two different libc++ implementations, and taking the first
+    # definition is safe only because no std exception object crosses the V8/Skia
+    # boundary: each side throws and catches internally, and the surface between them
+    # is a C ABI. That is a narrower claim than "same ABI", and it is why item 1.4
+    # stays open -- resolving this means one provider of those symbols, not a
+    # friendlier linker.
+    #
+    # The flag only needs to exist on the final link of libmigo.so, which happens
+    # inside the cargo invocation below.
     #
     # Do NOT add `-C embed-bitcode=no` here. The shipping [profile.release] uses
     # lto="fat", and rustc rejects `-C embed-bitcode=no` together with `-C lto`

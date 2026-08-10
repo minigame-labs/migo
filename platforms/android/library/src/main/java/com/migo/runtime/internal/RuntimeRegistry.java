@@ -47,35 +47,12 @@ public final class RuntimeRegistry {
     }
 
     /**
-     * Get any available valid context.
-     * <p>
-     * Useful for operations that don't require a specific session context.
-     *
-     * @return Any valid context, or null if none available
-     */
-    public static RuntimeContext getAny() {
-        for (RuntimeContext context : sContexts.values()) {
-            if (context.isValid()) {
-                return context;
-            }
-        }
-        return null;
-    }
-
-    /**
      * Get the number of registered contexts.
      *
      * @return Context count
      */
     public static int size() {
         return sContexts.size();
-    }
-
-    /**
-     * Clear all registered contexts.
-     */
-    public static void clear() {
-        sContexts.clear();
     }
 
     /**

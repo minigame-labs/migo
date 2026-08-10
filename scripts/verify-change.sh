@@ -529,6 +529,27 @@ target_command() {
     esac
 }
 
+# What a machine is missing, so the verdict is actionable. A lane records NOT PROVEN
+# when its toolchain is absent, which is right -- but "no local build for this target"
+# was the whole message, and for OpenHarmony two different absences produced it: no
+# SDK, which one command installs, and no V8 archive, which is a build measured in
+# hours. Those are not the same news.
+target_absence_reason() {
+    case "$1:$2" in
+        ohos:compile)
+            if [[ ! -f "$ROOT/engine/third_party/rusty_v8/x86_64-linux-ohos/librusty_v8.a" ]]; then
+                echo "no OpenHarmony V8 archive; build it with scripts/build-v8-ohos.sh x86_64"
+            else
+                echo "no OpenHarmony SDK; see scripts/dev-setup-ohos.sh"
+            fi
+            ;;
+        android-java:compile)
+            echo "no Android Gradle wrapper at platforms/android/gradlew"
+            ;;
+        *) echo "no local build for this target" ;;
+    esac
+}
+
 # Into an array first, and every target build runs with stdin closed -- the same
 # reason the contract lane above does, and the same bug found twice. Read from a
 # here-string, Gradle inherits the remaining plan as its stdin: the `android-java`
@@ -545,7 +566,10 @@ for line in "${target_plan[@]}"; do
     [[ "$keyword" == "TARGET" ]] || continue
     command="$(target_command "$platform" "$tier")"
     if [[ -z "$command" ]]; then
-        record "$platform $tier" "no local build for this target" "NOT PROVEN"
+        # Why it is absent, not just that it is. Both OpenHarmony probes used to
+        # collapse into this one sentence, so the verdict could not tell a reader
+        # whether to install an SDK or to spend hours building a V8 archive.
+        record "$platform $tier" "$(target_absence_reason "$platform" "$tier")" "NOT PROVEN"
         continue
     fi
     run_step "$platform $tier" "$command" </dev/null || true

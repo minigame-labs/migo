@@ -520,3 +520,27 @@
   reported `NOT PROVEN` an hour earlier. `scripts/test-local-verification-contract.sh`
   was also run directly — it is `CI ONLY` from inside the verifier because it would
   nest, and this item changes the verifier — and reports all checks passed.
+
+  **Correction, 2026-08-09: "the prebuilt V8 archive for the triple is in tree" is not
+  true of this workstation, so neither the `PASS` nor "13 seconds warm" reproduces
+  here.** `engine/third_party/rusty_v8/x86_64-linux-ohos/` holds only `src_binding.rs`.
+  The archive is gitignored, so being "in tree" is a fact about whichever machine built
+  it rather than about the repository, and on a fresh checkout this lane costs the hours
+  `scripts/build-v8-ohos.sh` takes before it costs thirteen seconds.
+
+  The lane's own reporting was checked before being blamed, and it is honest: the
+  planner emits `TARGET ohos compile` from the *changed sources'* cfg conditions
+  (`verification_targets.py:516`), and the archive/SDK probe runs at execution time
+  (`verify-change.sh:546`), so an unavailable toolchain records `NOT PROVEN` rather than
+  passing or failing. What was weak is the *reason*: both probes failing produced the
+  same generic "no local build for this target", which cannot tell a reader whether to
+  install an SDK or to build an archive. The two causes are now named separately.
+
+  **Resolved on this machine — 2026-08-10.** The archive was built
+  (`x86_64-linux-ohos/librusty_v8.a`, 172,812,984 bytes) and
+  `bash scripts/build-ohos-sdk.sh --compile-only x86_64` now compiles `migo-capi` for the
+  OpenHarmony target here, with 24 `migo_*` entry points — so the lane is real rather
+  than probed-absent. The correction above stands as the reading of what "in tree" means
+  for a gitignored artifact: it is a fact about a machine, and the first run on any
+  machine costs the build rather than thirteen seconds. Item 0.32 records the bindgen
+  wall that made it two attempts.

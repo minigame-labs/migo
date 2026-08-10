@@ -4,6 +4,7 @@ import java.io.File;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.function.IntPredicate;
 import java.util.regex.Pattern;
 
 /**
@@ -14,11 +15,19 @@ import java.util.regex.Pattern;
  *   <li>{@code /user} → User data (saves, preferences) - persistent</li>
  *   <li>{@code /cache} → Cache files - may be cleared by system</li>
  *   <li>{@code /code} → Game code - read only</li>
- *   <li>{@code /tmp} → Temporary files - cleared on session end</li>
+ *   <li>{@code /tmp} → Temporary files - private to one session, cleared when
+ *       that session ends</li>
  * </ul>
  * <p>
  * {@link #getCacheDir()} is the per-game cache root rather than the directory
  * {@code /cache} resolves to; see its documentation.
+ * <p>
+ * Every path here is derived the same way as
+ * {@code shared::vfs::game_paths::GamePaths} in the engine, and the two must move
+ * together. They are two computations of one layout: the engine resolves
+ * {@code /tmp} for the content that writes it, and this class is what deletes it,
+ * so a change on one side alone moves what is written without moving what is
+ * removed — or the reverse.
  *
  */
 public final class GamePaths {
@@ -55,20 +64,30 @@ public final class GamePaths {
 
     private static final String MIGO_GAMES_DIR = "migo/games";
 
+    /** Parent of the per-session temporary directories. */
+    private static final String TEMP_DIR = "tmp";
+
     private final String gameId;
     private final File userDataDir;
     private final File cacheDir;
     private final File codeDir;
+    private final File tempRoot;
     private final File tempDir;
 
     /**
-     * Create game paths from RuntimeConfig and game ID.
+     * Create game paths from RuntimeConfig, game ID and session ID.
      *
-     * @param config RuntimeConfig with base directories
-     * @param gameId Unique game identifier
+     * @param config    RuntimeConfig with base directories
+     * @param gameId    Unique game identifier
+     * @param sessionId The session these paths belong to, which is what keeps
+     *                  {@code /tmp} private to it. Two concurrently live sessions
+     *                  of the same game share {@code /user} and {@code /cache} on
+     *                  purpose — that is one game's save data — but {@code /tmp}
+     *                  lasts for a session, and sharing it made the first session
+     *                  to close delete the other's live files mid-write.
      * @throws IllegalArgumentException if gameId is invalid
      */
-    public GamePaths(RuntimeConfig config, String gameId) {
+    public GamePaths(RuntimeConfig config, String gameId, int sessionId) {
         if (!isValidGameId(gameId)) {
             throw new IllegalArgumentException(
                 "Invalid gameId: must be 1-64 lower-case alphanumeric characters, underscore or hyphen, and not a reserved device name");
@@ -83,7 +102,11 @@ public final class GamePaths {
         // Cache storage: cacheDir/migo/games/{gameId}/
         File cacheBase = new File(config.getCacheDir(), MIGO_GAMES_DIR + "/" + gameId);
         this.cacheDir = cacheBase;
-        this.tempDir = new File(cacheBase, "tmp");
+        // A directory level rather than a name suffix, so a sweep of abandoned
+        // temp directories is confined to one subtree and cannot reach the
+        // subpackage install store or the staging directories beside it.
+        this.tempRoot = new File(cacheBase, TEMP_DIR);
+        this.tempDir = new File(tempRoot, Integer.toString(sessionId));
     }
 
     /**
@@ -159,7 +182,8 @@ public final class GamePaths {
     /**
      * Get the temporary directory.
      * <p>
-     * Cleared when the session ends.
+     * Private to this session and cleared when it ends, so a second live session
+     * of the same game neither reads these files nor loses them.
      * Maps to virtual path: /tmp
      */
     public File getTempDir() {
@@ -178,12 +202,62 @@ public final class GamePaths {
     }
 
     /**
-     * Clean up temporary files.
+     * Clean up this session's temporary files.
      * Call this when the session ends.
+     * <p>
+     * Scoped to this session's directory: it used to be the whole per-game temp
+     * directory, which a second live session of the same game was still writing.
      */
     public void cleanupTemp() {
         deleteRecursive(tempDir);
         tempDir.mkdirs();
+    }
+
+    /**
+     * Remove the temp directories of sessions that are no longer live.
+     *
+     * <p>A session's temp directory is removed by its own teardown, so what is
+     * left here belongs to a session whose process died before it could run —
+     * app kills are routine on Android — or to a build that wrote {@code /tmp}
+     * before it was split per session, whose files sit directly in this
+     * directory. Neither has an owner that will ever come back for it.
+     *
+     * <p>Called before this session creates its own directory, which is also what
+     * makes it the guarantee that {@code /tmp} starts empty: this session's id is
+     * not live yet, so a directory left behind by a dead session that happened to
+     * hold the same id is swept as abandoned rather than inherited. Session ids
+     * are a per-process counter, so after a restart they are handed out again from
+     * the beginning and that collision is the common case, not a remote one.
+     *
+     * <p>{@code isLive} decides ownership rather than a timestamp or a name
+     * pattern, because only liveness distinguishes "abandoned" from "in use by
+     * someone else right now". Passing it in keeps this class free of the session
+     * registry and lets the sweep be tested without one.
+     *
+     * @param isLive whether a session id still has a live session behind it
+     */
+    void sweepAbandonedTemp(IntPredicate isLive) {
+        File[] entries = tempRoot.listFiles();
+        if (entries == null) return;
+        for (File entry : entries) {
+            Integer owner = temporaryDirectoryOwner(entry);
+            if (owner != null && isLive.test(owner)) continue;
+            deleteRecursive(entry);
+        }
+    }
+
+    /**
+     * The session id {@code entry} belongs to, or {@code null} if it belongs to no
+     * session at all — a loose file from before {@code /tmp} was split per session,
+     * or a name this class did not write.
+     */
+    private static Integer temporaryDirectoryOwner(File entry) {
+        if (!entry.isDirectory()) return null;
+        try {
+            return Integer.valueOf(entry.getName());
+        } catch (NumberFormatException notASessionDirectory) {
+            return null;
+        }
     }
 
     /**

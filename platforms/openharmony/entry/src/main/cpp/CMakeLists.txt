@@ -36,11 +36,14 @@ add_library(migohost SHARED napi_init.cpp)
 # symbols.
 #
 # --allow-multiple-definition: Skia and V8 each embed parts of a C++ runtime, so
-# std::runtime_error, std::logic_error and friends are defined more than once in
-# the archive. The linker takes the first definition, which is safe because both
-# were built against the same libc++ ABI. Android's build carries this flag for
-# exactly the same reason; the alternative -- statically linking another libc++
-# on top -- is what produced the duplicates in the first place.
+# std::runtime_error and std::logic_error are defined more than once. The linker takes the
+# first definition -- and "because both were built against the same libc++ ABI", which this
+# comment used to say, is false: on Android the same duplicates were measured as coming from
+# two *different* libc++ implementations (Chromium's inside V8, and the NDK sysroot's), and
+# OpenHarmony's arrangement is the same shape with the SDK's libc++ in that second role.
+# It is safe for a narrower reason: no std exception object crosses the V8/Skia boundary,
+# since each side throws and catches internally and the surface between them is a C ABI.
+# See ledger item 1.4, which is open on resolving it to one provider.
 target_link_options(migohost PRIVATE
     -Wl,--gc-sections
     -Wl,--allow-multiple-definition

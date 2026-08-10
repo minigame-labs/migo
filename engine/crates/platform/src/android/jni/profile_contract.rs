@@ -162,7 +162,6 @@ const JAVA_CORE: &[JniMethod] = methods![
     // of the session.
     ("beginRuntimeRestart", "(IJJ)V"),
     ("completeRuntimeRestart", "(IJ)V"),
-    ("getCacheDirPath", "()Ljava/lang/String;"),
     (
         "unzipFile",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
@@ -254,9 +253,9 @@ const JAVA_CONNECTIVITY: &[JniMethod] = methods![
     ("openSystemBluetoothSetting", "(II)V"),
     ("openAppAuthorizeSetting", "(II)V"),
     ("getWindowInfoBytes", "(I)[B"),
-    ("getSystemSettingInfoBytes", "()[B"),
+    ("getSystemSettingInfoBytes", "(I)[B"),
     ("getDeviceInfoJson", "()Ljava/lang/String;"),
-    ("getAppAuthorizationSettingJson", "()Ljava/lang/String;"),
+    ("getAppAuthorizationSettingJson", "(I)Ljava/lang/String;"),
     ("bluetoothOpenAdapter", "(ILjava/lang/String;)V"),
     ("bluetoothCloseAdapter", "(I)V"),
     ("bluetoothGetAdapterState", "(I)Ljava/lang/String;"),
@@ -442,7 +441,10 @@ mod tests {
         assert_eq!(native.len(), 69, "full NativeBridge surface changed");
         // Runtime-generation fencing adds +2 Java (`beginRuntimeRestart`,
         // `completeRuntimeRestart`), both Core: every profile restarts.
-        assert_eq!(java.len(), 127, "full NativeExports surface changed");
+        // Concurrent-session correctness removes -1 Java (`getCacheDirPath`,
+        // which nothing in the engine called and which resolved an Activity
+        // through whichever session came first).
+        assert_eq!(java.len(), 126, "full NativeExports surface changed");
         assert_unique(&native);
         assert_unique(&java);
     }

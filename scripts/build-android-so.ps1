@@ -94,10 +94,24 @@ function Check-Dependencies {
         exit 1
     }
 
-    if (-not $env:ANDROID_NDK_HOME) {
-        Print-Error "ANDROID_NDK_HOME is not set"
+    # Which NDK this is has to be asserted, not assumed: the NDK supplies the
+    # compiler, sysroot and linker that the component manifest records, so it is
+    # part of the artifact's identity. Testing only that ANDROID_NDK_HOME was
+    # non-empty let a Windows build link the pinned V8 archive with any NDK at all,
+    # which is the defect the shell path closed in task 1.1a and this path never
+    # did. The variable is no longer required either, for the same reason
+    # build-android-so.sh does not require it: the NDK is found in the standard SDK
+    # layouts, and an override is checked like any other candidate.
+    Import-Module (Join-Path $PSScriptRoot "lib/AndroidNdk.psm1") -Force
+    $ndkLock = Join-Path (Split-Path $PSScriptRoot -Parent) "contracts/artifact-manifest/android-v8.lock.json"
+    try {
+        $ndkHome = Resolve-MigoPinnedNdk -Lock $ndkLock
+    }
+    catch {
+        Print-Error $_.Exception.Message
         exit 1
     }
+    Print-Success "Pinned Android NDK: $ndkHome"
 
     Print-Success "All dependencies are ready"
 }
@@ -186,27 +200,32 @@ function Build-Platform {
     # --------------------------------------------------------
     $arch = if ($platform -eq "arm64-v8a") { "aarch64" } else { "x86_64" }
 
-    $v8Archive = Join-Path $paths.v8Libs "$arch\librusty_v8.a"
-    $v8Binding = Join-Path $paths.v8Libs "$arch\src_binding.rs"
-
-    if (Test-Path $v8Archive) {
-        $env:RUSTY_V8_ARCHIVE = $v8Archive
-        Print-Info "RUSTY_V8_ARCHIVE = $v8Archive"
-    }
-
-    if (Test-Path $v8Binding) {
-        $env:RUSTY_V8_SRC_BINDING_PATH = $v8Binding
-        Print-Info "RUSTY_V8_SRC_BINDING_PATH = $v8Binding"
-    }
+    # Verified against its component manifest and used from a path that is its own hash.
+    # This was `Test-Path` -- existence, not identity -- so the AAR this script's caller
+    # produces was linked against whatever bytes sat there, exactly as the shell path was
+    # before it grew the same check.
+    Import-Module (Join-Path $PSScriptRoot "lib/V8Materialise.psm1") -Force
+    $v8 = Resolve-MigoMaterialisedV8 `
+        -V8Dir (Join-Path $paths.v8Libs $arch) `
+        -Root (Join-Path (Split-Path $PSScriptRoot -Parent) "engine/target/v8-materialised")
+    $env:RUSTY_V8_ARCHIVE = $v8.Archive
+    Print-Info "RUSTY_V8_ARCHIVE = $($v8.Archive)"
+    $env:RUSTY_V8_SRC_BINDING_PATH = $v8.Binding
+    Print-Info "RUSTY_V8_SRC_BINDING_PATH = $($v8.Binding)"
 
     # --------------------------------------------------------
     # RUSTFLAGS (arm64 builtins)
     # --------------------------------------------------------
     $origRUSTFLAGS = $env:RUSTFLAGS
 
-    # `-Wl,--allow-multiple-definition` is needed because skia-bindings
-    # emits `-lc++_static` which redefines symbols already provided by
-    # the NDK's libc++.so.  Without this the final link fails with
+    # `-Wl,--allow-multiple-definition` is needed, and the reason this comment used to
+    # give was wrong twice over: it is not that skia-bindings redefines symbols the NDK's
+    # *shared* libc++ provides. Measured on the shell path by removing the flag: exactly six
+    # symbols, the ones libc++ explicitly instantiates in stdexcept.cpp, defined by two
+    # different static libc++ implementations -- Chromium's inside V8's rlib and the NDK
+    # sysroot's libc++_static.a. Safe only because no std exception object crosses the
+    # V8/Skia boundary. See ledger item 1.4 and the shell twin's comment.
+    # Without this the final link fails with
     # "multiple definition of std::…" on some symbols.
     $commonRustflags = "-Clink-arg=-Wl,--allow-multiple-definition"
 

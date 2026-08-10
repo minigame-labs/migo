@@ -144,9 +144,9 @@ def compact(source: str) -> str:
 
 close_body = body_after(java, "public void close()")
 attempt_args = invocation_arguments(close_body, "terminalCleanup.attempt")
-if len(attempt_args) != 5:
+if len(attempt_args) != 6:
     raise SystemExit(
-        "GameSession.close() must pass resource cleanup, native shutdown, and three "
+        "GameSession.close() must pass resource cleanup, native shutdown, and four "
         "ownership-release "
         f"actions to TerminalCleanupState.attempt(); found {len(attempt_args)} arguments"
     )
@@ -174,15 +174,23 @@ if native_shutdown != "this::shutdownNativeOnce":
     )
 
 ownership_actions = [compact(action) for action in attempt_args[2:]]
+# Exact and ordered on purpose, which is why this list is maintained rather than
+# derived: it forbids an action being silently dropped as much as one being added, and
+# the order is load-bearing -- stop resolving the session, clean the directory it owns,
+# stop its logging, and drop the native registration last. `Logger.unregisterSession`
+# arrived with per-session log levels and this list was not updated with it, so the gate
+# was red rather than wrong.
 required_ownership_actions = [
     "()->RuntimeRegistry.unregister(sessionId)",
     "paths::cleanupTemp",
+    "()->Logger.unregisterSession(sessionId)",
     "()->NativeExports.unregisterSession(sessionId)",
 ]
 if ownership_actions != required_ownership_actions:
     raise SystemExit(
         "GameSession ownership-release phase must contain registry unregister, temporary "
-        f"cleanup, and session unregister in order; found {ownership_actions}"
+        "cleanup, logger unregister, and session unregister in order; "
+        f"found {ownership_actions}"
     )
 
 compact_close = compact(close_body)

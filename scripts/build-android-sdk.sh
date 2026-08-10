@@ -11,12 +11,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
 
 ARCH="aarch64"
 PREFIX=""
-VERSION="0.1.0"
+# Filled from the release-version source below unless `--version` overrides it.
+VERSION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
@@ -25,6 +28,17 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# The repository's single release-version source, unless the caller named one.
+# No fallback default: a package labelled with a version nobody chose is worse
+# than a build that refuses, and this script's default was `0.1.0` while the AAR
+# built beside it reported something else entirely.
+if [[ -z "$VERSION" ]]; then
+    SOURCE="$REPO_ROOT/release/VERSION"
+    [[ -f "$SOURCE" ]] || { echo "[android-sdk] release version source missing: $SOURCE" >&2; exit 1; }
+    VERSION="$(tr -d '[:space:]' < "$SOURCE")"
+    [[ -n "$VERSION" ]] || { echo "[android-sdk] release version source is empty: $SOURCE" >&2; exit 1; }
+fi
 
 case "$ARCH" in
     aarch64) TARGET="aarch64-linux-android"; ABI="arm64-v8a" ;;
@@ -64,8 +78,11 @@ V8_MANIFEST="$V8_DIR/component-manifest.json"
     err "rebuild this platform's V8 artifact on the V8 build machine"
     exit 1
 }
-export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
-export RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING"
+# Verified against its component manifest, then used from a content-addressed path,
+# so cargo cannot reuse an rlib built from a previous archive at the same location.
+v8_materialise "$V8_DIR" "$ENGINE_DIR/target/v8-materialised" || exit 1
+export RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING"
 
 MANIFEST_TOOL="${MIGO_ARTIFACT_MANIFEST_TOOL:-}"
 if [[ -z "$MANIFEST_TOOL" ]]; then

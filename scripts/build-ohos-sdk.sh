@@ -32,19 +32,29 @@
 #                          than produce one.
 #   MIGO_OHOS_MIN_API      declared floor (default 20)
 #
-# ⚠ profile-slim is used, and that is a requirement rather than a preference:
-# the full profile pulls audio -> cpal -> alsa-sys -> pkg-config, and
-# OpenHarmony has no ALSA. Its audio surface is OHAudio (libohaudio.so, present
-# in the sysroot), which the engine does not consume yet.
+# The full product profile is built, which it could not be until the engine grew an
+# OHAudio backend: the audio crate reached a device through cpal, cpal has no OHAudio
+# support, and pulling it here dragged in alsa-sys and pkg-config for a library
+# OpenHarmony does not have. src/output_ohaudio.rs replaced that, so the package now
+# links libohaudio.so and ships audio rather than omitting it.
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
+
 info() { echo -e "\033[0;36m[ohos-sdk] $*\033[0m"; }
 err()  { echo -e "\033[0;31m[ohos-sdk] $*\033[0m" >&2; }
 ok()   { echo -e "\033[0;32m[ohos-sdk] $*\033[0m"; }
+warn() { echo -e "\033[0;33m[ohos-sdk] $*\033[0m" >&2; }
+
+# Resolved once. Two places need the SDK's own location -- the package manifest's SDK
+# identity and the API floor gate's search for a newer sysroot -- and a second copy of
+# the default is how the two come to disagree about which SDK the package describes.
+OHOS_SDK_HOME="${OHOS_NDK_HOME:-$HOME/ohos-sdk}"
 
 ARCHES=()
 COMPILE_ONLY=0
@@ -65,8 +75,20 @@ while [[ $# -gt 0 ]]; do
 done
 [[ ${#ARCHES[@]} -gt 0 ]] || ARCHES=(aarch64)
 
-MIGO_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$REPO_ROOT/engine/crates/capi/Cargo.toml" | head -1)"
-[[ -n "$MIGO_VERSION" ]] || MIGO_VERSION="0.1.0"
+# The repository's single release-version source. Read rather than derived from a
+# crate manifest, and with no fallback: a default here ships a package labelled
+# with a version nobody chose, which is how the Linux and HarmonyOS SDKs could
+# have been built as `0.1.0` from a tree that was not.
+read_release_version() {
+    local source="$1/release/VERSION"
+    [[ -f "$source" ]] || { echo "[sdk] release version source missing: $source" >&2; exit 1; }
+    local version
+    version="$(tr -d '[:space:]' < "$source")"
+    [[ -n "$version" ]] || { echo "[sdk] release version source is empty: $source" >&2; exit 1; }
+    printf '%s' "$version"
+}
+
+MIGO_VERSION="$(read_release_version "$REPO_ROOT")"
 
 # The API level this package declares support for. Derived from Huawei's own
 # device-share data rather than from "oldest possible": as of 2026-06 the
@@ -94,8 +116,14 @@ for ARCH in "${ARCHES[@]}"; do
         info "$ARCH: V8 archive absent, building it (this takes a while)"
         bash "$SCRIPT_DIR/build-v8-ohos.sh" "$ARCH"
     fi
-    [[ -f "$V8_DIR/librusty_v8.a" ]] || { err "V8 build produced no archive"; exit 1; }
-    [[ -f "$V8_DIR/src_binding.rs" ]] || { err "V8 build produced no binding"; exit 1; }
+    # Verified against its component manifest and materialised under a path that is its
+    # own hash, so cargo cannot reuse an rlib built from a previous archive: it reruns the
+    # v8 build script on a change of the *value* of RUSTY_V8_ARCHIVE, not of the file.
+    if ! v8_materialise "$V8_DIR" "$REPO_ROOT/engine/target/v8-materialised"; then
+        err "cannot use the V8 archive for $ARCH"
+        exit 1
+    fi
+    info "$ARCH: V8 materialised at ${V8_MATERIALISED_ARCHIVE#"$REPO_ROOT"/}"
 
     # Unlike V8 -- a separate multi-hour build with its own provenance record,
     # correctly reused when present -- cargo is always run. Cargo is the only
@@ -122,10 +150,9 @@ for ARCH in "${ARCHES[@]}"; do
             cd "$REPO_ROOT/engine"
             # Run from engine/ so rust-toolchain.toml applies: it is resolved
             # from the working directory, not from --manifest-path.
-            RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
-            RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+            RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE" \
+            RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING" \
                 cargo build -p migo-capi --release \
-                    --no-default-features --features profile-slim \
                     --target "$TRIPLE"
         )
     fi
@@ -190,7 +217,7 @@ add_library(migo::migo STATIC IMPORTED)
 set_target_properties(migo::migo PROPERTIES
     IMPORTED_LOCATION "\${MIGO_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "\${MIGO_INCLUDE_DIRS}"
-    INTERFACE_LINK_LIBRARIES "EGL;GLESv3;native_window;c++;m;dl;pthread")
+    INTERFACE_LINK_LIBRARIES "EGL;GLESv3;native_window;ohaudio;c++;m;dl;pthread")
 
 # Required, not tuning: skia-bindings carries a translation unit referencing
 # JPEG/PDF/pathops symbols for features this build disables. Only section
@@ -216,7 +243,7 @@ endif()
 EOF
 
     # ---- manifest -----------------------------------------------------------
-    SDK_PKG="${OHOS_NDK_HOME:-$HOME/ohos-sdk}/native/oh-uni-package.json"
+    SDK_PKG="$OHOS_SDK_HOME/native/oh-uni-package.json"
     SDK_API="unknown"; SDK_VER="unknown"
     if [[ -f "$SDK_PKG" ]]; then
         SDK_API="$(sed -n 's/.*"apiVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SDK_PKG" | head -1)"
@@ -258,7 +285,7 @@ EOF
   "os": "openharmony",
   "arch": "$ARCH",
   "target_triple": "$TRIPLE",
-  "product_profile": "slim",
+  "product_profile": "full",
   "min_ohos_api": $MIN_OHOS_API,
   "build_sdk": {
     "version": "$SDK_VER",
@@ -266,15 +293,13 @@ EOF
   },
   "abi_note": "OpenHarmony userspace is musl. This archive is not interchangeable with an Android (bionic) or a glibc build.",
   "entry_points": $ENTRY_POINTS,
-  "link_libraries": ["EGL", "GLESv3", "native_window", "c++", "m", "dl", "pthread"],
+  "link_libraries": ["EGL", "GLESv3", "native_window", "ohaudio", "c++", "m", "dl", "pthread"],
   "required_link_options": ["-Wl,--gc-sections"],
   "capabilities": {
     "attachable_platform_kinds": $KINDS_JSON,
     "note": "$KINDS_NOTE"
   },
   "known_gaps": [$SURFACE_GAP
-    "audio: OHAudio (libohaudio.so) is not wired up; this package is built with profile-slim",
-    "V8 provenance: no component manifest binds this archive's embedded V8 to a source revision and GN argument set, as contracts/artifact-manifest does for Android and Linux. The same item is open on Windows. Publishing these bytes should wait on it",
     "arch coverage: only x86_64 has been run on a device (API 20 emulator); aarch64 is built and gated but unverified until real HarmonyOS NEXT hardware is available",
     "multi-touch: verified single-pointer only; hdc cannot synthesise a second pointer"
   ],
@@ -322,9 +347,9 @@ has no backend compiled in, whatever the headers declare.
 
 ## What this package does not do yet
 
-Audio is absent: the package is built with \`profile-slim\` because the full
-profile requires ALSA, which OpenHarmony does not have. Its audio surface is
-OHAudio, which the engine does not consume yet.
+Audio playback goes through OHAudio (\`libohaudio.so\`), which the CMake package
+links for you. It has not been heard on a device yet: only a build and a link are
+verified here.
 
 Only \`x86_64\` has been run on a device -- an API 20 emulator. The \`aarch64\`
 package is built and gated the same way but has not run on real hardware.
@@ -362,6 +387,55 @@ done
 # there is no __INTRODUCED_IN annotation and no per-API stub library, so nothing
 # else can tell that an import postdates the declared floor.
 info "running the API floor gate"
+# The two-sysroot half was opt-in, which made it a check nobody ran: the floor
+# comparison alone answers "does this archive import anything the floor lacks", and only
+# a *newer* sysroot can answer "did any of these symbols arrive after the floor". The
+# newer SDK is discovered rather than demanded, for the reason recorded under item T.8:
+# a machine without one has to report the reduced check honestly, not fail as though the
+# change under test broke something. An explicit MIGO_OHOS_NEWER_SYSROOT still wins, so a
+# caller can point at an SDK outside these locations.
+if [[ -z "${MIGO_OHOS_NEWER_SYSROOT:-}" ]]; then
+    # Selected on the SDK's own declared apiVersion, not on its directory name, and for
+    # the same reason the NDK pin is: a directory called `ohos-sdk-6.1` is just a name.
+    # Taking the highest-sorted non-floor directory looked equivalent and is not -- if
+    # the floor happened to be the newest installed SDK, that rule would hand back an
+    # *older* sysroot and call its extra symbols "post-floor", which is evidence pointing
+    # the wrong way. A candidate must declare a higher API than the floor to qualify.
+    MIGO_OHOS_NEWER_SYSROOT="$(python3 - "$OHOS_SDK_HOME" <<'PY'
+import json, pathlib, sys
+
+floor_home = pathlib.Path(sys.argv[1])
+
+
+def api_of(home):
+    described = home / "native/oh-uni-package.json"
+    try:
+        return int(json.loads(described.read_text(encoding="utf-8"))["apiVersion"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+floor_api = api_of(floor_home)
+best_api, best = floor_api, None
+if floor_api is not None:
+    for candidate in sorted(floor_home.parent.glob("ohos-sdk*")):
+        if not (candidate / "native/sysroot").is_dir() or candidate == floor_home:
+            continue
+        api = api_of(candidate)
+        if api is not None and (best_api is None or api > best_api):
+            best_api, best = api, candidate
+if best is not None:
+    print(best / "native/sysroot")
+PY
+)" || MIGO_OHOS_NEWER_SYSROOT=""
+fi
+if [[ -n "${MIGO_OHOS_NEWER_SYSROOT:-}" ]]; then
+    info "post-floor comparison against $MIGO_OHOS_NEWER_SYSROOT"
+    export MIGO_OHOS_NEWER_SYSROOT
+else
+    warn "no second OpenHarmony SDK found, so only the floor half of the API gate runs"
+    warn "unpack a newer SDK beside $OHOS_SDK_HOME to also detect post-floor imports"
+fi
 for ARCH in "${ARCHES[@]}"; do
     # The triple must be passed: the gate defaults to x86_64, and most symbol
     # names are identical across architectures, so an aarch64 archive measured

@@ -134,15 +134,17 @@ pub struct GamePaths {
     cache_dir: PathBuf,
     /// Game-writable subtree of the cache directory (mapped to `/cache`)
     sandbox_cache_dir: PathBuf,
-    /// Temporary directory (cleared when session ends)
+    /// This session's temporary directory (cleared when the session ends)
     temp_dir: PathBuf,
 }
 
 impl GamePaths {
     /// Base subdirectory for all games.
     const GAMES_SUBDIR: &'static str = "migo/games";
+    /// Parent of the per-session temporary directories.
+    const TEMP_SUBDIR: &'static str = "tmp";
 
-    /// Create game paths from base directories and game ID.
+    /// Create game paths from base directories, game ID and session ID.
     ///
     /// # Arguments
     /// * `files_dir` - Platform's persistent files directory
@@ -154,6 +156,11 @@ impl GamePaths {
     ///   - iOS: `NSCachesDirectory`
     ///   - Desktop: `~/.cache/app/` or `%TEMP%/app/`
     /// * `game_id` - Unique game identifier
+    /// * `session_id` - The session these paths belong to, which is what keeps
+    ///   `/tmp` private to it. Two concurrently live sessions of the *same* game
+    ///   deliberately share `/user` and `/cache` — that is one game's save data —
+    ///   but `/tmp` is documented as lasting for a session, and sharing it made
+    ///   the first session to close delete the other's live files mid-write.
     ///
     /// # Returns
     /// `GamePaths` on success, `GamePathError` if game_id is invalid.
@@ -161,6 +168,7 @@ impl GamePaths {
         files_dir: impl AsRef<Path>,
         cache_dir: impl AsRef<Path>,
         game_id: &str,
+        session_id: i32,
     ) -> Result<Self, GamePathError> {
         validate_game_id(game_id)?;
 
@@ -173,7 +181,12 @@ impl GamePaths {
             user_data_dir: files_base.join("user_data"),
             cache_dir: cache_base.clone(),
             sandbox_cache_dir: cache_base.join("sandbox"),
-            temp_dir: cache_base.join("tmp"),
+            // A component rather than a suffix, so everything a sweep may remove
+            // is confined to one subtree and no cleanup can reach the install
+            // store or the staging directories that sit beside it.
+            temp_dir: cache_base
+                .join(Self::TEMP_SUBDIR)
+                .join(session_id.to_string()),
         })
     }
 
@@ -228,6 +241,10 @@ impl GamePaths {
     }
 
     /// Get the temporary directory path.
+    ///
+    /// Private to one session, not shared by every session of the game: `/tmp`
+    /// lasts for a session, and the previous shape let one session's teardown
+    /// delete another live session's files.
     pub fn temp_dir(&self) -> &Path {
         &self.temp_dir
     }
@@ -539,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_game_paths_creation() {
-        let paths = GamePaths::new("/data/files", "/data/cache", "test-game").unwrap();
+        let paths = GamePaths::new("/data/files", "/data/cache", "test-game", 7).unwrap();
 
         assert_eq!(paths.game_id(), "test-game");
         assert!(paths.code_dir().ends_with("migo/games/test-game/code"));
@@ -549,12 +566,50 @@ mod tests {
                 .ends_with("migo/games/test-game/user_data")
         );
         assert!(paths.cache_dir().ends_with("migo/games/test-game"));
-        assert!(paths.temp_dir().ends_with("migo/games/test-game/tmp"));
+        assert!(paths.temp_dir().ends_with("migo/games/test-game/tmp/7"));
+    }
+
+    /// The defect this shape exists for: two live sessions of the *same* game had
+    /// one temp directory, so the first to close deleted the other's live files.
+    #[test]
+    fn two_sessions_of_one_game_get_separate_temp_directories() {
+        let first = GamePaths::new("/data/files", "/data/cache", "test-game", 1).unwrap();
+        let second = GamePaths::new("/data/files", "/data/cache", "test-game", 2).unwrap();
+
+        assert_ne!(first.temp_dir(), second.temp_dir());
+        // Neither contains the other, so removing one recursively cannot reach the
+        // other -- distinct paths alone would still allow `tmp/1` and `tmp/1/2`.
+        assert!(!first.temp_dir().starts_with(second.temp_dir()));
+        assert!(!second.temp_dir().starts_with(first.temp_dir()));
+
+        // Everything else is per *game* on purpose: two sessions of one game are
+        // one save file, and splitting these would give the same game two.
+        assert_eq!(first.user_data_dir(), second.user_data_dir());
+        assert_eq!(first.sandbox_cache_dir(), second.sandbox_cache_dir());
+        assert_eq!(first.code_dir(), second.code_dir());
+    }
+
+    /// A sweep of abandoned temp directories walks the shared parent, so that
+    /// parent must not be the cache root: the install store and the staging
+    /// directories live there, and a game deciding which package bytes a later
+    /// session mounts is the reason `/cache` is a subdirectory in the first place.
+    #[test]
+    fn temp_directories_share_a_parent_below_the_cache_root() {
+        let paths = GamePaths::new("/data/files", "/data/cache", "test-game", 3).unwrap();
+        let temp_root = paths.temp_dir().parent().expect("temp dir has a parent");
+
+        assert_eq!(
+            temp_root,
+            PathBuf::from("/data/cache/migo/games/test-game/tmp")
+        );
+        assert_ne!(temp_root, paths.cache_dir());
+        assert!(temp_root.starts_with(paths.cache_dir()));
+        assert!(!paths.sandbox_cache_dir().starts_with(temp_root));
     }
 
     #[test]
     fn integrity_receipt_is_persistent_sibling_of_code() {
-        let paths = GamePaths::new("/data/files", "/data/cache", "test-game").unwrap();
+        let paths = GamePaths::new("/data/files", "/data/cache", "test-game", 1).unwrap();
 
         assert_eq!(
             paths.integrity_receipt_path(),
@@ -590,7 +645,7 @@ mod tests {
             "migo_game_paths_sealed_delete_{}_{nanos}",
             std::process::id()
         ));
-        let paths = GamePaths::new(root.join("files"), root.join("cache"), "sealed").unwrap();
+        let paths = GamePaths::new(root.join("files"), root.join("cache"), "sealed", 1).unwrap();
         paths.ensure_directories().unwrap();
         std::fs::create_dir_all(paths.code_dir().join("nested")).unwrap();
         std::fs::write(paths.code_dir().join("nested/game.js"), "code").unwrap();

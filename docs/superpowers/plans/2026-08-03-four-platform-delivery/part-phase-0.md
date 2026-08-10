@@ -1487,6 +1487,70 @@
   `clearMessageHandler`, `clearPermissionHandler`, `clearGameLogHandler`) must
   **not** be swept: the embedder registered those once for the session, not the
   isolate.
+
+  **Task 7 continued 2026-08-09 (fifth): the fence is checked structurally, so
+  the five groups no host test can construct are covered too.**
+
+  `scripts/test-runtime-generation-fence-contract.sh`, wired into
+  `pr-ci.yml`'s `quality-gate` (and therefore into `verify-change.sh`'s contract
+  lane, which derives that list). It was chosen over finishing Bluetooth because
+  it covers all six producer groups rather than one, and because the failure it
+  catches is invisible in review: a call site passing a re-read of the live
+  generation looks exactly like a correct one, and five of the six groups need a
+  `Context` or a main `Looper`, so nothing on a host JVM can build one and restart
+  a session behind it.
+
+  **The derivation rule this document proposed was wrong, and the gate does not
+  use it.** "Every `NATIVE_*` descriptor matching `^\(IJ` carries a generation"
+  over-selects by three of seventeen: `onVsync(IJ)V`,
+  `setDisplayRefreshRate(IJ)V` and `getConsoleLogs(IJ)Ljava/lang/String;` put a
+  *payload* long in that slot — `frame_time_nanos`, a refresh period, a log
+  cursor. A gate built on the signature would have demanded `token.generation()`
+  where a frame timestamp belongs, and the only way to satisfy it would have been
+  to break vsync. What declares the intent is the JNI handler's own parameter
+  list in `inbound.rs`: `host_id: jint, generation: jlong`. Fourteen handlers
+  declare it and all fourteen convert it with `captured_generation(generation)`.
+
+  Three engine facts are cross-checked against each other rather than one being
+  trusted — the parameter, the conversion, and the descriptor beginning `(IJ` —
+  and the descriptor set is read *backwards* as well, because `(IJ` is the whole
+  surface a generation can arrive on and every method on it must be a handler the
+  parse can see. That last check exists because `inbound.rs` generates handlers
+  from `jni_json_callback!`, and one generated that way is invisible to a text
+  parse: without it the fenced set could shrink by one silently, which is the
+  failure the gate exists to prevent.
+
+  On the Java side the receiver of `.generation()` must be a
+  **`final RuntimeGenerationBoundary.Token` field of the same file**. That is
+  stricter than "looks like a token" deliberately: a final field can only have
+  been assigned once, at construction, which is exactly the captured-at-creation
+  property, so every way of re-deriving the value at report time fails without
+  the gate enumerating them. `RuntimeGenerationBoundary.UNFENCED` is the other
+  accepted form, and it is a real answer rather than a hole — the difference
+  between it and a literal `0` is that it says so at the call site.
+
+  | injection | detected as |
+  |---|---|
+  | `1L` in place of `token.generation()` | `ScreenCaptureObserver.java:149`, neither a captured token nor UNFENCED |
+  | `RuntimeGenerationBoundary.acquire(sessionId).generation()` | not a final Token field of this file |
+  | the Token field loses its `final` | the same, at the call site that reads it |
+  | a literal inside a call wrapped across lines | `DeviceSensorManager.java:214` — whitespace normalisation reaches it |
+  | the only call site deleted | `onUserCaptureScreen` is fenced with no Java caller |
+  | wrapper forwards `0L` instead of its parameter | `NativeMethods.java:755` |
+  | wrapper drops its `generation` parameter | its second parameter must be `long generation` |
+  | handler stops calling `captured_generation` | takes a generation and never converts it |
+  | descriptor `(IJ)V` → `(II)V` | the call frame is decoded wrongly at registration |
+  | handler renamed out of the parse's view | `(IJ)V` with no visible handler |
+
+  Six vacuity guards proved the same way, in a fixture tree: a missing authority
+  file, no handler parsed, every fence removed, no descriptor parsed, the producer
+  sources deleted, the producer package removed. Each reports the reason rather
+  than passing over nothing.
+
+  Verified: the gate green on a clean tree (14 fenced callbacks, 52 handler
+  definitions, 29 call sites), `ci_contract_gates.py` deriving it into the local
+  lane as `run` with nothing unaccounted, `test-local-verification-contract.sh`
+  green at 25 derived gates, `scripts/ci/tests` 119 green.
 - [ ] 0.10 A10: Canvas recovery as one transactional resource operation.
 - [ ] 0.11 A11: permission product contract, including the public Session API
   that seeds standing host decisions before content startup.
@@ -2983,6 +3047,60 @@
   for the ohos half, and add a `windows-latest` job that builds `-p migo-capi` for
   the windows half. Until then the entry point will keep reporting both as
   `NOT PROVEN`, which is the correct reading and not noise to be silenced.
+
+  **The OpenHarmony SDK is now installed, and it was not sufficient — 2026-08-09.**
+  `~/ohos-sdk`, version 5.1.0.107 (API 18), validated by
+  `scripts/dev-setup-ohos.sh --check`: sysroots for `aarch64-linux-ohos`,
+  `arm-linux-ohos` and `x86_64-linux-ohos`, both target-prefixed clangs present, and
+  the Rust targets were already pinned in `rust-toolchain.toml`. So the unblock this
+  entry names is done.
+
+  `cargo check -p migo-capi --target aarch64-unknown-linux-ohos` now reaches a
+  **different** wall: `failed to run custom build command for v8 v145.0.0`.
+  `engine/third_party/rusty_v8/{aarch64,x86_64}-linux-ohos/` contain only
+  `src_binding.rs` and no `librusty_v8.a`, and `scripts/fetch-v8-archives.sh` knows
+  only `aarch64`, `x86_64` and `x86_64-linux-gnu` — "a target with no committed
+  manifest cannot be fetched, by design". That committed manifest is item **1.9**.
+
+  So this entry's prediction was one dependency short: the OpenHarmony half is
+  blocked behind **1.9** (or behind running `scripts/build-v8-ohos.sh` from source,
+  for which `dev-setup-ohos.sh` warns clang 15 is older than V8's vendored libc++
+  headers and that `V8_PREBUILT_BINDING` will likely be needed), and then behind a
+  Skia for `aarch64-unknown-linux-ohos`. The Windows half is unchanged in substance
+  but cheaper than "needs a Windows machine": `cmd.exe` is reachable from this WSL2
+  session, so it needs VS Build Tools on the *existing* host, not another machine.
+  There is no Visual Studio on `C:` today.
+
+  Recorded rather than silenced: both halves still read `NOT PROVEN`, and the reason
+  for the OpenHarmony half has moved from "no SDK" to "no V8 archive for the target".
+
+  **The OpenHarmony half is now done — 2026-08-10.** `scripts/build-v8-ohos.sh x86_64`
+  produced `engine/third_party/rusty_v8/x86_64-linux-ohos/librusty_v8.a`
+  (172,812,984 bytes) and `bash scripts/build-ohos-sdk.sh --compile-only x86_64`
+  compiles `migo-capi` for `x86_64-unknown-linux-ohos` with 24 `migo_*` entry points. So
+  this branch's `cfg(target_env = "ohos")` code has now compiled for its own target on
+  this machine, which is what Section 7.4 asks for.
+
+  **It took two attempts, and the first failure is worth keeping because it is not a
+  configuration mistake.** The C++ side built to completion — over an hour of clang++
+  under `ninja -j 16`, producing a 172 MB archive — and then `build.rs` panicked with
+  `Unable to generate bindings: ClangDiagnostic("… '_Tp' does not refer to a value …
+  use of undeclared identifier '__builtin_clzg' …")`. The cause is fixed, not tunable:
+  the OpenHarmony SDK ships clang 15 (both 5.1 and 6.1 do), while V8 145's vendored
+  libc++ announces "Libc++ only supports Clang 20 and later" and uses builtins added in
+  clang 19. `scripts/build-v8-ohos.sh` now feeds the committed binding for the triple
+  through the same `V8_PREBUILT_BINDING` hook the Android build uses, and **refuses**
+  rather than falling back to bindgen when that file is absent — bindgen cannot succeed
+  here, so silently trying would burn the hour again. The binding is shareable because
+  it encodes V8's FFI ABI for a rusty_v8 revision rather than a target's calling
+  convention: it is byte-identical to the Android one at the pinned revision, and both
+  OpenHarmony triples are LP64.
+
+  **The Windows half is unchanged and still blocked**: there is no Visual Studio on
+  `C:`, so it needs VS Build Tools on the existing host. `aarch64-unknown-linux-ohos`
+  also still needs its own archive and a Skia; only `x86_64` is proven, which is the
+  triple the verifier's lane uses because the `target_env = "ohos"` view of the tree is
+  the same for either architecture.
 
 - [x] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
   correcting `pr-ci.yml`'s stale comment for task 0.31. The new `host-engine-tests`
@@ -6394,6 +6512,18 @@
   the answer is that this is a *deliberate* design on both sides and almost all of it
   is right, so what is left is a short ranked list rather than a rework.
 
+  **A gate this item's own work left red, found by a full verification run on
+  2026-08-10 and fixed there.** Per-session log levels added
+  `Logger.unregisterSession` as a fourth ownership-release action in
+  `GameSession.close()`, and `test-android-owned-host-shutdown-contract.sh` still
+  required exactly three, so it failed with `found 6 arguments`. Reproduced in a clean
+  extraction of the base commit, so it predated this session's changes. The exact,
+  ordered list is deliberate rather than sloppy — it forbids an action being dropped as
+  much as one being added, and the order matters (stop resolving the session, clean the
+  directory it owns, stop its logging, drop the native registration last) — so the fix
+  was to add the fourth action, not to loosen the check. Still sensitive: removing the
+  logger entry from the expectation makes it fail again.
+
   **What already proves the intent**, so that none of it is re-litigated:
   `NativeExports.registerSession` refuses a duplicate id with "concurrently live
   sessions must have distinct ids"; `ExclusiveDeviceArbiter` exists only to arbitrate
@@ -6419,6 +6549,69 @@
      content itself (`shared::vfs::game_paths`), so changing only the Java side would
      move what is deleted without moving what is written. Both sides move together or
      neither does.
+
+     **Fixed 2026-08-09.** `/tmp` is now
+     `cacheDir/migo/games/{gameId}/tmp/{sessionId}`, derived identically by
+     `shared::vfs::game_paths::GamePaths::new` (which takes the session id and gets
+     it from `HostRuntime::host_id`, so every platform is covered by the one
+     construction site) and by the Java `GamePaths` constructor. `/user`, `/cache`
+     and `/code` stay per game, because two sessions of one title are one save file.
+
+     **A directory level rather than a name suffix**, so the sweep below walks a
+     subtree that cannot reach the subpackage install store or the staging
+     directories that sit directly under the cache root — the same reason `/cache`
+     is a subdirectory rather than the root itself.
+
+     **The sweep and the empty-at-start guarantee are one mechanism, and ordering is
+     what makes it work.** `GameSession` sweeps every `tmp/` entry no live session
+     owns *before* creating its own directory. At that moment this session is not
+     yet registered — sessions are created on the main thread
+     (`ThreadCheck.ensureMainThread`) and registered as they are created, so every
+     *other* live session already is — which means a directory left at this id by a
+     session whose process died is swept as abandoned rather than inherited. Session
+     ids are a per-process counter from 1 (`registry.rs:352`), so a reused id is the
+     common case after an app kill, not a remote one. The same pass removes the loose
+     files a build from before the split left directly in `tmp/`.
+
+     Liveness is passed in as an `IntPredicate` rather than read from
+     `RuntimeRegistry` inside `GamePaths`: it keeps a path class free of runtime
+     state and it is what makes the sweep testable without a registry. `IntPredicate`
+     rather than a new nested interface because a new type in `com.migo.runtime`
+     lands in the frozen host-API baseline, and this one has no reason to be there
+     (minSdk is 26; `java.util.function` is already used across the SDK).
+
+     **`host-api-v0.txt` moved by exactly one line**, the constructor, updated
+     deliberately.
+
+     Proved by mutation, not assertion — every kill names the test:
+
+     | mutation | killed by |
+     |---|---|
+     | temp keyed by game only, as before | `closingOneSessionLeavesTheOtherSessionsTempFiles` (+4 more) |
+     | teardown deletes the whole temp root | the same case |
+     | the sweep spares a directory no live session owns | `theSweepRemovesTemporaryDirectoriesNoLiveSessionOwns` |
+     | the sweep keeps everything no session id claims | `theSweepRemovesTemporaryFilesFromBeforeTheSplit` |
+
+     A fifth mutation was written and discarded as equivalent: reporting a loose
+     file as owned by session `0` still deletes it, since `0` is not live either.
+     It was recorded as NOT DETECTED and replaced rather than counted.
+
+     Verified: `cargo test -p migo-shared -p migo-runtime-v8 --tests` (532 + 438 +
+     integration targets green), `cargo check -p migo-core -p migo-platform -p
+     migo-capi` clean, Java 201 per flavour in both product profiles, the
+     android-host-api and runtime-generation-fence contracts green. No
+     `cfg(target_os = "android")` code is involved — `GamePaths` has one
+     construction site and it is not target-gated — so the android compile lane
+     adds nothing here.
+
+     **What is left, honestly:** a session whose process dies leaves its temp
+     directory until some later session of that game sweeps it. That is strictly
+     better than before (the shared directory was never cleaned at start either) and
+     it is inside `cacheDir`, which the OS reclaims under pressure. `clean_temp()`
+     on the Rust side still has no caller, so on desktop nothing removes a temp
+     directory at session end; that was true before this change and is item 7's
+     neighbour rather than part of this one.
+
   2. **Three JNI exports have no `sessionId` at all** and resolve an Activity through
      `RuntimeRegistry.getAny()` (`RuntimeRegistry.java:56`, used at
      `NativeExports.java:588, 962, 1198`). `getSystemSettingInfoBytes` reads
@@ -6429,12 +6622,142 @@
      the id — and the profile contract is what will catch a half-done one.
      `getCacheDirPath` and `getAppAuthorizationSettingJson` return app-scoped values
      and are only latently wrong.
+
+     **Fixed 2026-08-09, and cheaper than this entry predicted.** The session id was
+     already in scope: the Android `SystemInfo` service holds `self.host_id` and the
+     method directly above passes it to `jni::get_window_info(self.host_id)`. So the
+     descriptors widen to `(I)` and the id is threaded one line each — no trait
+     change, no other platform touched, nothing like the keyboard's shape.
+     `getAppAuthorizationSettingJson` took the id too: the value is app-scoped, but
+     which Activity answers should be a decision rather than an iteration order.
+
+     **`getCacheDirPath` is deleted rather than given an id.** No engine code calls
+     it — it was registered in `JAVA_CORE` and invoked from nowhere — and it returns
+     an app-scoped path, so threading a session into it would only make dead code
+     look deliberate. Its R8 keep roots went with it, which
+     `test-r8-profile-contract.sh` checks in both profiles, and the `java.len()` pin
+     moved 127 → 126 with the reason written at the assertion.
+
+     That left `RuntimeRegistry.getAny()` with no callers, so it is gone — it is the
+     mechanism, and leaving it invites the next export to reach for it.
+     `RuntimeRegistry.clear()` went with it, which closes the first half of item 8:
+     a nuke-every-Session static with zero callers is a footgun waiting for a
+     plausible-looking use.
+
+     **This entry's last sentence was wrong, and the correction is now a gate.**
+     "The profile contract is what will catch a half-done one" — it does not. It
+     compares method *names*. Measured: widening `getSystemSettingInfoBytes` to
+     `(I)[B` on the Rust side while leaving the Java method no-arg passes the product
+     profile contract, both R8 root checks, the Android host-API contract and
+     `javac`. Nothing would have caught it before
+     `GetStaticMethodID` failed on a device, at the moment the feature was first
+     used. `scripts/test-jni-outbound-signature-contract.sh` now decodes every
+     `JAVA_*` descriptor and compares it against the `public static` declaration in
+     `NativeExports`, for all 126 — which is `test-camera-frame-jni-contract.sh`'s
+     one-method check generalised, and it is wired into `pr-ci.yml`.
+
+     Reference types compare by simple name, because that is how the Java source
+     spells them under its imports, and a declaration that writes a type out in full
+     is reduced the same way so two spellings of one type cannot read as a mismatch.
+     Only `public static` answers for a descriptor: a private helper sharing a name
+     must not be able to. Ten checks proved it can fail — the measured half-done
+     widening, a changed return type, a swapped reference parameter, `int` where a
+     `long` is declared, an undecodable descriptor, a renamed method, a method that
+     lost `public`, and three vacuity guards in a fixture tree.
+
+     The reading both JNI gates need — masking comments and literals so structure can
+     be scanned, bracket matching, argument splitting, the descriptor tables — moved
+     to `scripts/lib/jni_source.py`, and the fence gate lost 169 duplicated lines to
+     it. A parser bug fixed in one copy and not the other is how two gates end up
+     unequal while looking alike.
+
+     Verified: `build-android-so.sh --compile-only arm64-v8a` (which is what caught
+     `jint` not being in scope in `outbound.rs` — the host lane cannot see that file),
+     `cargo test -p migo-platform --lib`, `fmt --check`, Java 201 per flavour in both
+     profiles, and the r8-profile, camera-frame-jni, android-owned-host-shutdown,
+     android-host-api, runtime-generation-fence and jni-outbound-signature gates,
+     plus `test-local-verification-contract.sh` at 26 derived gates.
   3. **The log level is one process-wide switch on both sides**
      (`internal/util/Logger.java:17`, `platform/src/android/logging.rs:10`, written
      per Session at `jni/inbound.rs:452`). `RuntimeConfig` carries a per-Session
      `LogLevel` that nothing on the Java side ever applies, and the Rust side is
      last-writer-wins: starting a second game with `logLevel=Off` silences the first
      game that was started with `Debug`. Two halves of one defect.
+
+     **Fixed 2026-08-09.** `shared::log_level` answers "which level applies to the
+     record this thread is about to emit" in three tiers, most specific first: the
+     **thread's session**, bound once at host-thread start; the **join over live
+     sessions** — the most verbose — for threads belonging to no session; and the
+     **process default** from the build type or from a C host that installs
+     diagnostics without ever creating a session.
+
+     **Why a join and not simply per-session.** A level arrives per session but the
+     sink does not: one logcat, one subscriber. A record can only be filtered by a
+     session's level if it can be attributed to that session. On the engine's host
+     thread it can, which is why that tier exists and is exact. On a shared thread —
+     the IO pool, a platform callback, the JNI caller — it cannot, and the safe
+     answer is the level of whichever session asked to see the most. Silence is the
+     answer that loses evidence, and evidence destroyed by an *unrelated* session is
+     the defect being fixed.
+
+     **The thread tier is what keeps it cheap, and the cost is documented in-tree.**
+     `log_throttle` measures `tracing` at ~300 bytes allocated per event. Without the
+     binding, a session configured `Off` would format and emit at another live
+     session's `Trace` — in its own game loop. With it, that session emits nothing
+     from its own thread. Reading the level costs a thread-local read plus, when
+     unbound, one relaxed atomic; the registry behind the join is locked only by
+     bring-up and teardown, which is the discipline the per-isolate console sink
+     already follows (`runtime-v8/src/console/mod.rs`, resolved once at bring-up for
+     exactly this reason).
+
+     **The lifetime is the Host's, so registration lives with the Host's.**
+     `register_sender` takes the level and `unregister_sender` retires it — every
+     path that retires a Host goes through that one function, so a session cannot
+     leak an entry that holds the join open for the rest of the process. That also
+     makes it platform-agnostic: one call site covers Android, Linux, Windows and
+     OHOS, and the Android-specific `logging::update_log_level(log_level)` at
+     `inbound.rs:452` is gone. A session that does not exist yet has no level to
+     speak with, which is what that line was asserting.
+
+     **The Java half had never been wired at all.** `Logger.setLogLevel` had zero
+     callers, so an embedder's configured level was ignored and every record was
+     filtered at the hardcoded `WARN`. Wiring it naively would have reproduced the
+     engine's defect here. It now registers per session and joins, and the twelve
+     level checks read one named accessor rather than the field directly — which is
+     what makes the cached value and the checks provably the same thing, and is
+     load-bearing rather than a test seam.
+
+     Java records carry one tag and no session id, so the thread tier has no
+     counterpart there and is not pretended at.
+
+     Proved by mutation, every kill naming its test:
+
+     | mutation | killed by |
+     |---|---|
+     | the join takes the least verbose level | `a_new_session_cannot_silence_an_existing_one` |
+     | registering overwrites one level for everybody | the same case |
+     | a closing session keeps holding the join open | `a_closing_session_stops_holding_the_join_open` |
+     | the thread binding is ignored on the event path | `a_thread_bound_to_a_session_uses_that_session_level` |
+     | re-registering adds a second entry | `re_registering_a_session_replaces_its_level_rather_than_adding_one` |
+     | Java: the level is the least verbose live session's | `aSecondSessionCannotSilenceALiveOne` (+3) |
+     | Java: registering assigns, as last-writer-wins did | the same case (+1) |
+     | Java: a closing session keeps holding the level open | `closingTheVerboseSessionLetsTheLevelComeBackDown` (+2) |
+     | Java: an unconfigured session is treated as most verbose | `aSessionWithNoConfiguredLevelGetsTheDefault` |
+
+     **The harness lied once, and the correction belongs here.** It first reported
+     all five Rust mutants as "killed by the type system", because cargo prints
+     `error: test failed` after a red suite and the harness matched that as a compile
+     error. Five of five caught by the compiler is not a credible result for a
+     `.min()` → `.max()` mutation, which is what prompted checking. Test failures are
+     now read before compile errors. A `TYPE SYSTEM` line that names no test is a
+     claim to distrust by default.
+
+     Verified: `cargo test -p migo-shared -p migo-runtime-v8 --tests`, `-p migo-core
+     --lib` (which is where three `register_sender` callers in `#[cfg(test)]` code
+     surfaced — the non-test build hid them), `-p migo-capi --lib`, `-p migo-platform
+     --lib`, `build-android-so.sh --compile-only arm64-v8a`, `fmt --check`, Java 207
+     per flavour in both profiles, and the r8-profile, android-host-api,
+     runtime-generation-fence and jni-outbound-signature gates.
   4. **Image decode has no per-Session partition** (`io/src/image_ops.rs:83-84` `SEM`,
      three permits, and `:160-161` `BUDGET`, 48 MB), while the sibling IO executor
      next door does per-host fair queuing. One game's `preload_images` over a large

@@ -445,4 +445,134 @@ grep -F "test-android-release-manifest-gate.sh" "$ROOT/.github/workflows/pr-ci.y
 grep -F "test-android-release-manifest-gate.sh" "$ROOT/.github/workflows/release.yml" >/dev/null || \
   fail "Android release CI does not exercise the Gradle release gate graph"
 
+# The committed JSON schema and the Rust validator are two statements of "which V8
+# component targets exist", and the unenforced one had already drifted: the schema's
+# target `oneOf` named Android and Linux while the validator had been accepting Windows,
+# so a Windows manifest was valid to the tool and invalid to the document meant to
+# describe it. Adding OpenHarmony is what surfaced that. Equated here rather than checked
+# with a JSON-schema library, because the drift is *between the two statements* and this
+# needs no dependency the CI image does not already have.
+python3 - "$ROOT" <<'PY' || fail "the component schema and the Rust validator disagree on which targets exist"
+import json, pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+contracts = root / "contracts/artifact-manifest"
+component = json.loads((contracts / "v8-component-schema-v1.json").read_text())
+defs = json.loads((contracts / "schema-v1.json").read_text())["$defs"]
+
+refs = [entry["$ref"].rsplit("/", 1)[-1] for entry in component["properties"]["target"]["oneOf"]]
+if not refs:
+    sys.exit("the component schema's target oneOf is empty")
+schema_pairs = set()
+for ref in refs:
+    definition = defs[ref]
+    for variant in definition.get("oneOf", [definition]):
+        properties = variant["properties"]
+        schema_pairs.add((properties["os"]["const"], properties["abi"]["const"]))
+
+source = (root / "tools/artifact-manifest/src/lib.rs").read_text()
+body = re.search(r"fn validate_v8_component_target.*?\n}\n", source, re.DOTALL)
+if body is None:
+    sys.exit("cannot find validate_v8_component_target in lib.rs")
+rust_pairs = set(re.findall(r'\("([a-z0-9_]+)", "([a-z0-9_]+)"\) =>', body.group(0)))
+if not rust_pairs:
+    sys.exit("extracted no target arms from validate_v8_component_target")
+
+if schema_pairs != rust_pairs:
+    sys.exit(
+        f"schema-only targets: {sorted(schema_pairs - rust_pairs)}; "
+        f"validator-only targets: {sorted(rust_pairs - schema_pairs)}"
+    )
+print(f"component schema and validator agree on {len(rust_pairs)} target(s)")
+PY
+
+# Every consumer of a V8 archive must take it from the verified, content-addressed
+# materialisation rather than from wherever the file happens to sit. Enumerated rather
+# than listed, the way the NDK pin is: the defect this closes is that
+# `build-android-so.sh` -- the script that produces the AAR's native library -- selected
+# its archive with an existence test while the SDK scripts beside it verified theirs, so
+# a script added later must not be able to reintroduce that quietly.
+python3 - "$ROOT" <<'PY' || fail "a shipping build consumes a V8 archive without materialising it first"
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+scripts = root / "scripts"
+if not (scripts / "lib/v8-materialise.sh").is_file():
+    sys.exit("missing scripts/lib/v8-materialise.sh")
+
+# Not "every script that mentions the variable": that predicate is too strong and would
+# fail correct code, which is the mistake the NDK pin gate already made and corrected. A
+# developer archive is explicitly allowed for a local executable -- it just cannot make a
+# provenance claim, so it must not reach a package. The discriminator is therefore what a
+# script *produces*, and each non-producer is exempted by name with a reason. A stale
+# exemption is an error, because one that no longer applies grants more than it needs to.
+EXEMPT = {
+    "dev-run-c-host.sh": "runs a local C host; may use a development archive",
+    "dev-run-player.sh": "runs the local player; may use a development archive",
+    "dev-test-host.sh": "runs host suites against the local linux-gnu archive",
+    "test-capi-platform-contract.sh": "a contract check, not a producer",
+    "build-windows-sdk.sh": (
+        "Windows has no committed component manifest -- build-v8-windows.sh deliberately "
+        "emits none until there is a lock to verify one against -- so there is nothing to "
+        "materialise against yet, which is the same reason fetch-v8-archives.sh omits the "
+        "MSVC triple. Remove this exemption when that manifest exists."
+    ),
+    "build-snapshot.ps1": (
+        "runs migo-snapshot-gen on a Windows *host* and so uses the Windows V8 archive, "
+        "which has no committed manifest either; it also clears the variable first so an "
+        "Android archive cannot leak into a host build. Same removal condition as "
+        "build-windows-sdk.sh."
+    ),
+}
+
+# Both spellings, because the first version of this enumeration globbed `*.sh` and matched
+# `RUSTY_V8_ARCHIVE="` -- so it could not see `build-android-so.ps1`, which set the variable
+# from a `Test-Path` check on the path that produces the AAR's native library, nor
+# `build-windows-sdk.sh`, which writes `set RUSTY_V8_ARCHIVE=` into a batch heredoc. That is
+# a *scope* hole rather than a weak assertion, and it is the second time one has been found
+# here: the NDK pin gate had the identical blind spot for `.ps1`.
+# Assignments only. A pattern loose enough to match a *read* also matches
+# `Print-Info "RUSTY_V8_ARCHIVE = ..."` and a save/restore of the variable, which reports
+# correct code as an offender -- a check that fails on correct code is worse than none.
+SETTERS = [
+    re.compile(r'(?m)^\s*(?:export\s+)?RUSTY_V8_ARCHIVE="([^"]*)"'),   # bash
+    re.compile(r'(?m)^\s*\$env:RUSTY_V8_ARCHIVE\s*=\s*(\S+)'),          # PowerShell
+    re.compile(r'(?m)^\s*set\s+RUSTY_V8_ARCHIVE=(\S+)'),               # batch heredoc
+]
+MATERIALISED = {"$V8_MATERIALISED_ARCHIVE", "$v8.Archive"}
+
+consumers = {}
+for path in sorted(list(scripts.glob("*.sh")) + list(scripts.glob("*.ps1"))):
+    # This contract is the one file allowed to name the variable freely -- it has to quote
+    # it to search for it -- the same exemption the NDK pin gate makes for itself.
+    if path.name == "test-artifact-manifest-contract.sh":
+        continue
+    text = path.read_text(encoding="utf-8")
+    values = [value.strip() for pattern in SETTERS for value in pattern.findall(text)
+              if value.strip()]
+    if values:
+        consumers[path.name] = (values, text)
+if not consumers:
+    sys.exit("found no script setting RUSTY_V8_ARCHIVE -- the enumeration is broken")
+
+stale = sorted(name for name in EXEMPT if name not in consumers)
+if stale:
+    sys.exit(f"exemptions that no longer consume a V8 archive: {stale}")
+
+offenders = []
+for name in sorted(set(consumers) - set(EXEMPT)):
+    values, text = consumers[name]
+    if any(value not in MATERIALISED for value in values):
+        offenders.append(f"{name} -> {values}")
+    elif "v8_materialise" not in text and "Resolve-MigoMaterialisedV8" not in text:
+        offenders.append(f"{name} uses the materialised path but never materialises")
+
+if offenders:
+    sys.exit("; ".join(offenders))
+print(
+    f"{len(set(consumers) - set(EXEMPT))} shipping V8 consumer(s) materialise first, "
+    f"{len(EXEMPT)} exempted by name"
+)
+PY
+
 echo "artifact manifest contract: ok"

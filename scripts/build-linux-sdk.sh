@@ -8,6 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
+
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 TARGET="x86_64-unknown-linux-gnu"
 
 PREFIX="$REPO_ROOT/dist/migo-linux-x86_64"
@@ -49,8 +52,16 @@ V8_MANIFEST="$V8_SDK_DIR/component-manifest.json"
 }
 [[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] \
     || { echo "[linux-sdk] V8 archive looks like a stub or LFS pointer" >&2; exit 1; }
-export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
-export RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING"
+# Materialised under a path that is its own hash. That is what lets the sha256 stamp
+# and the `cargo clean -p v8` below it go: cargo reruns the v8 build script when the
+# *value* of RUSTY_V8_ARCHIVE changes, so different bytes are now a different path
+# rather than a staleness the build has to detect and force.
+if ! v8_materialise "$V8_SDK_DIR" "$ENGINE_DIR/target/v8-materialised"; then
+    echo "[linux-sdk] cannot use the V8 archive at $V8_ARCHIVE" >&2
+    exit 1
+fi
+export RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING"
 
 MANIFEST_TOOL="${MIGO_ARTIFACT_MANIFEST_TOOL:-}"
 if [[ -z "$MANIFEST_TOOL" ]]; then
@@ -89,21 +100,14 @@ unset ANDROID_NDK ANDROID_NDK_HOME
 
 export RUSTFLAGS="${RUSTFLAGS:-} $RUSTFLAGS_SYSROOT_LINK"
 
-# The v8 crate bundles librusty_v8.a into its rlib at build time, and cargo only
-# reruns its build script when RUSTY_V8_ARCHIVE's *value* changes -- not when the
-# file at that path is replaced. Rebuilding V8 in place therefore leaves cargo
-# reusing an rlib containing the previous archive, silently. That cost a full
-# debugging cycle: a freshly staged libmigo.so still carried the allocator shim
-# that the V8 rebuild had just removed.
-V8_STAMP="$ENGINE_DIR/target/$TARGET/.v8-archive-sha256"
-V8_SHA="$(sha256sum "$V8_ARCHIVE" | cut -d' ' -f1)"
-mkdir -p "$(dirname "$V8_STAMP")"
-if [[ ! -f "$V8_STAMP" || "$(cat "$V8_STAMP")" != "$V8_SHA" ]]; then
-    info "V8 archive changed; forcing a rebuild of the v8 crate"
-    cargo clean --manifest-path "$ENGINE_DIR/Cargo.toml" \
-        -p v8 --release --target "$TARGET" 2>/dev/null || true
-    printf '%s' "$V8_SHA" > "$V8_STAMP"
-fi
+# No stamp file and no `cargo clean -p v8` here any more. Both existed because cargo
+# reruns the v8 build script on a change to the *value* of RUSTY_V8_ARCHIVE rather than
+# to the file at that path, so a V8 rebuilt in place left cargo reusing an rlib built
+# from the previous archive -- which cost a debugging cycle over a staged libmigo.so
+# still carrying an allocator shim the rebuild had removed. The archive is now
+# materialised at a content-addressed path, so different bytes *are* a different value
+# and cargo's own rule is correct. A workaround for a staleness that can no longer
+# happen is worse than none: it would go on clearing the crate for no reason.
 
 info "sysroot: $MIGO_SYSROOT"
 info "building capi staticlib (release, $TARGET)"
@@ -129,7 +133,20 @@ cargo rustc --manifest-path "$ENGINE_DIR/Cargo.toml" \
 grep -q 'native-static-libs:' "$LINK_NOTE" \
     || { echo "[linux-sdk] cargo did not report native-static-libs" >&2; exit 1; }
 
-VERSION="$(grep -m1 '^version' "$ENGINE_DIR/crates/capi/Cargo.toml" | cut -d'"' -f2)"
+# The repository's single release-version source. Read rather than derived from a
+# crate manifest, and with no fallback: a default here ships a package labelled
+# with a version nobody chose, which is how the Linux and HarmonyOS SDKs could
+# have been built as `0.1.0` from a tree that was not.
+read_release_version() {
+    local source="$1/release/VERSION"
+    [[ -f "$source" ]] || { echo "[sdk] release version source missing: $source" >&2; exit 1; }
+    local version
+    version="$(tr -d '[:space:]' < "$source")"
+    [[ -n "$version" ]] || { echo "[sdk] release version source is empty: $source" >&2; exit 1; }
+    printf '%s' "$version"
+}
+
+VERSION="$(read_release_version "$REPO_ROOT")"
 
 # ------------------------------------------------------------
 # libmigo.so

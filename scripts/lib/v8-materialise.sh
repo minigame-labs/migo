@@ -1,0 +1,130 @@
+# shellcheck shell=bash
+# Materialising a verified V8 archive under a content-addressed path.
+# Location: scripts/lib/v8-materialise.sh
+#
+# Two defects, one mechanism.
+#
+# **The shipping Android library was built against unverified bytes.**
+# `build-android-so.sh` selected the archive with `[[ -f "$v8_archive" ]]` -- existence,
+# not identity -- so whatever sat at `engine/third_party/rusty_v8/<arch>/librusty_v8.a`
+# went into `libmigo.so`. The SDK scripts already ran `verify-v8-component` first; the
+# script that produces the AAR's native library did not.
+#
+# **Cargo cannot see an archive replaced in place.** The `v8` crate bundles
+# `librusty_v8.a` into its rlib, and cargo reruns that build script when the *value* of
+# `RUSTY_V8_ARCHIVE` changes -- not when the file at that path does. `build-linux-sdk.sh`
+# carried a sha256 stamp plus `cargo clean -p v8` to force it, after a full debugging
+# cycle spent on a staged `libmigo.so` that still contained an allocator shim a V8 rebuild
+# had removed. A path that *contains* the hash makes that impossible instead of detected:
+# different bytes are a different path, so cargo's own staleness rule is correct, and the
+# stamp and the clean are gone rather than maintained.
+#
+# The path is not made read-only, deliberately. A hard link shares its inode with
+# `third_party`, so `chmod 444` here would make the *producer* fail its next `cp` -- and it
+# would buy nothing, because the hash is re-checked on every call, which detects an
+# in-place edit that a permission bit would only discourage.
+
+_v8_mat_err() { printf '  ✗ %s\n' "$*" >&2; }
+
+# Prints the recorded hash for a key out of a component manifest, or fails.
+_v8_mat_recorded() {
+    local manifest="$1" key="$2"
+    python3 - "$manifest" "$key" <<'PY'
+import json, sys
+
+manifest = json.load(open(sys.argv[1]))
+try:
+    print(manifest["hashes"][sys.argv[2]])
+except KeyError:
+    sys.exit(f"component manifest has no hashes.{sys.argv[2]}")
+PY
+}
+
+_v8_mat_sha256() { sha256sum "$1" | cut -d' ' -f1; }
+
+# v8_materialise <v8-dir> <materialise-root>
+#
+# Verifies `<v8-dir>`'s archive and binding against the `component-manifest.json` beside
+# them, then makes them available under `<materialise-root>/<archive-sha256>/` and sets
+# `V8_MATERIALISED_ARCHIVE` and `V8_MATERIALISED_BINDING` to those paths.
+#
+# A target with no committed manifest is refused rather than materialised: without one
+# there is nothing to say what the right bytes are, which is the same rule
+# `scripts/fetch-v8-archives.sh` states for downloading them.
+v8_materialise() {
+    local v8_dir="$1" root="$2"
+    local archive="$v8_dir/librusty_v8.a"
+    local binding="$v8_dir/src_binding.rs"
+    local manifest="$v8_dir/component-manifest.json"
+
+    local path
+    for path in "$archive" "$binding"; do
+        [[ -f "$path" ]] || { _v8_mat_err "missing V8 input: $path"; return 1; }
+    done
+    if [[ ! -f "$manifest" ]]; then
+        _v8_mat_err "no component manifest beside $archive"
+        _v8_mat_err "a target with no committed manifest cannot be verified, so it is not built against"
+        return 1
+    fi
+
+    local want_archive want_binding got_archive got_binding
+    want_archive="$(_v8_mat_recorded "$manifest" archive)" || {
+        _v8_mat_err "cannot read hashes.archive from $manifest"
+        return 1
+    }
+    want_binding="$(_v8_mat_recorded "$manifest" rust_binding)" || {
+        _v8_mat_err "cannot read hashes.rust_binding from $manifest"
+        return 1
+    }
+    got_archive="$(_v8_mat_sha256 "$archive")"
+    got_binding="$(_v8_mat_sha256 "$binding")"
+    if [[ "$got_archive" != "$want_archive" ]]; then
+        _v8_mat_err "$archive does not match its manifest"
+        _v8_mat_err "  recorded $want_archive"
+        _v8_mat_err "  actual   $got_archive"
+        return 1
+    fi
+    if [[ "$got_binding" != "$want_binding" ]]; then
+        _v8_mat_err "$binding does not match its manifest"
+        _v8_mat_err "  recorded $want_binding"
+        _v8_mat_err "  actual   $got_binding"
+        return 1
+    fi
+
+    # Keyed on *both* hashes. Keying on the archive alone collides when a binding changes
+    # while the archive does not -- two different components would map to one directory, the
+    # stale binding there would be refused rather than replaced, and because cargo watches
+    # the *value* of RUSTY_V8_SRC_BINDING_PATH it could go on using a v8 crate compiled
+    # against the previous binding. The path has to name everything it addresses.
+    local dest="$root/$got_archive-$got_binding"
+    mkdir -p "$dest" || { _v8_mat_err "cannot create $dest"; return 1; }
+
+    # Hard links rather than copies: the archive is ~120 MB per architecture, and a
+    # symlink is not usable because consumers stat the path (a `stat -c %s` LFS-pointer
+    # check reads a symlink's own size and rejects it). A copy is the fallback for the
+    # one case a link cannot serve, a different filesystem.
+    local name
+    for name in librusty_v8.a src_binding.rs; do
+        local source="$v8_dir/$name" target="$dest/$name"
+        if [[ -f "$target" ]]; then
+            # Re-checked rather than trusted: the path asserts both hashes, so a file that
+            # no longer matches the directory naming it is the one thing this mechanism must
+            # not pass on.
+            local expected="$got_archive"
+            [[ "$name" == "src_binding.rs" ]] && expected="$got_binding"
+            if [[ "$(_v8_mat_sha256 "$target")" != "$expected" ]]; then
+                _v8_mat_err "$target does not hash to the directory that names it; refusing to reuse it"
+                return 1
+            fi
+            continue
+        fi
+        ln "$source" "$target" 2>/dev/null || cp "$source" "$target" || {
+            _v8_mat_err "cannot materialise $source at $target"
+            return 1
+        }
+    done
+
+    V8_MATERIALISED_ARCHIVE="$dest/librusty_v8.a"
+    V8_MATERIALISED_BINDING="$dest/src_binding.rs"
+    export V8_MATERIALISED_ARCHIVE V8_MATERIALISED_BINDING
+}

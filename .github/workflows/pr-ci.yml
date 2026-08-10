@@ -118,6 +118,23 @@ jobs:
           python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
           bash scripts/test-release-asset-ordering-contract.sh
 
+      # A release version is a fact about a set of bytes, and it was stated
+      # independently in four build systems. They drifted: the Android AAR said
+      # 0.9.0 while the Android C-API SDK beside it defaulted to 0.1.0, the Windows
+      # SDK hardcoded 0.1.1 and discarded the version it had read, and HarmonyOS
+      # fell back to 0.1.0 in silence. A package labelled with a version nobody
+      # chose is not recallable.
+      - name: Release version contract
+        run: bash scripts/test-release-version-contract.sh
+
+      # A release artifact that records when it was built cannot be rebuilt and
+      # compared, which is what Phase 1's same-source byte equality rests on. The
+      # AAR metadata recorded the SOURCE_DATE_EPOCH it was given and then stamped a
+      # local wall clock on the next line; the SBOM and the committed snapshot
+      # manifests did the same.
+      - name: Reproducible timestamp contract
+        run: bash scripts/test-reproducible-timestamp-contract.sh
+
       # Source-only, so it belongs here rather than in the device lane -- which
       # is the point: the failure it catches (content calling a capability on
       # the wx namespace, which does not carry it) presents on a device as a
@@ -155,6 +172,15 @@ jobs:
       - name: Permission coverage contract
         run: bash scripts/test-permission-coverage-contract.sh
 
+      # The gate above holds the *source* manifests to the policy, which is a
+      # different claim from what a consumer installs: the merged manifest is what
+      # ships, a dependency or a `tools:` directive can add a permission to it, and
+      # nothing compared it until now. This holds the merged manifests to the same
+      # table -- exactly, in both directions -- and states the set each profile
+      # requests at API 26, 28 and 31.
+      - name: Android merged manifest permission contract
+        run: bash scripts/test-android-merged-manifest-permissions.sh
+
       # The host-bridge holder is reachable from content (`Symbol.for` reads the
       # global registry), and closing that is an all-or-nothing migration of
       # every call site -- one left behind evaluates against a deleted holder
@@ -187,6 +213,25 @@ jobs:
 
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
+
+      # A restart replaces the isolate but not the Android objects around it, so
+      # an event a retired runtime's listener produces must carry the generation
+      # that listener captured. Re-reading the live generation at report time
+      # always matches, which is a check that cannot fail. Structural because it
+      # has to be: five of the six producer groups need a Context or a main
+      # Looper, so no host test can build one and restart a session behind it.
+      - name: Runtime generation fence contract
+        run: bash scripts/test-runtime-generation-fence-contract.sh
+
+      # The engine resolves every outbound call on NativeExports by name *and*
+      # descriptor, and the two sides are one contract written twice: string
+      # literals in Rust, a method in Java, with nothing a compiler can tie
+      # together. A mismatch fails GetStaticMethodID on a device, at the moment the
+      # feature is first used. Measured: widening a descriptor and leaving the Java
+      # method alone passes the profile contract, both R8 root checks, the host API
+      # contract and javac -- the profile contract compares names, never shapes.
+      - name: JNI outbound signature contract
+        run: bash scripts/test-jni-outbound-signature-contract.sh
 
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
@@ -475,6 +520,16 @@ jobs:
       # (both ABIs land under engine/jniLibs/ from the step above).
       - name: Android minimum-API symbol floor
         run: bash scripts/test-android-symbol-floor.sh
+
+      # Placed here for the same reason as the floor check above: it needs the natives
+      # the step before staged under engine/jniLibs/. The AAR is the only archive this
+      # repository produces today, so it is where same-source rebuild byte equality can
+      # be held at all -- and nothing held it before. Two builds under one
+      # SOURCE_DATE_EPOCH must be identical, and a third under a different epoch must
+      # not be, because bytes that are merely stable would prove the archive ignores the
+      # clock rather than tracks it.
+      - name: Android AAR reproducibility
+        run: bash scripts/test-android-aar-reproducibility.sh
 
       - name: Analyze AAR size report
         run: |

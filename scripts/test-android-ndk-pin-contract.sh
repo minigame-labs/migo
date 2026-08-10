@@ -153,6 +153,69 @@ for f in "${ndk_users[@]}"; do
     fi
 done
 
+info "no PowerShell entry point consumes an unpinned NDK"
+# The enumeration above globs `*.sh`, and that scope -- not its assertions -- was
+# the hole: `build-android-so.ps1` took $env:ANDROID_NDK_HOME as given and checked
+# nothing, so a Windows AAR could link the pinned V8 archive with any NDK while
+# every gate reported the pin enforced. A `.ps1` is a shipped entry point too, so
+# it is enumerated on the same terms.
+mapfile -t ps_ndk_users < <(
+    grep -ln 'ANDROID_NDK_HOME' "$SCRIPT_DIR"/*.ps1 2>/dev/null)
+if (( ${#ps_ndk_users[@]} == 0 )); then
+    fail "found no PowerShell scripts using ANDROID_NDK_HOME -- the enumeration is broken"
+fi
+for f in "${ps_ndk_users[@]}"; do
+    name="$(basename "$f")"
+    if grep -q 'Resolve-MigoPinnedNdk' "$f"; then
+        pass "$name resolves the pinned NDK"
+    else
+        fail "$name uses ANDROID_NDK_HOME without resolving it"
+    fi
+done
+
+info "the PowerShell resolver decides on the same fact as the shell one"
+# One rule, two languages, and the gate has to equate them or the second copy
+# drifts into checking a directory *name* -- which is what makes a pin decorative.
+# Asserted behaviourally rather than by grepping the module for `Pkg.Revision`: that
+# string occurs in its own prose, so the grep would pass over a module that had
+# stopped reading it. The discriminating case is a directory named exactly like the
+# pin whose own source.properties reports something else, which only an
+# identity check can refuse.
+PS_LIB="$SCRIPT_DIR/lib/AndroidNdk.psm1"
+if [[ ! -f "$PS_LIB" ]]; then
+    fail "missing $PS_LIB"
+elif ! command -v pwsh >/dev/null 2>&1; then
+    info "SKIP pwsh is not installed, so the PowerShell resolver cannot be exercised"
+else
+    ps_probe="$(mktemp -d)"
+    mkdir -p "$ps_probe/sdk/ndk/$ANDROID_NDK_PIN"
+    printf 'Pkg.Revision = 1.2.3456789\n' \
+        > "$ps_probe/sdk/ndk/$ANDROID_NDK_PIN/source.properties"
+    if env -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_SDK_ROOT \
+           HOME="$ps_probe/empty" ANDROID_HOME="$ps_probe/sdk" \
+           pwsh -NoProfile -Command "
+                Import-Module '$PS_LIB' -Force
+                Resolve-MigoPinnedNdk -Lock '$LOCK'
+           " >/dev/null 2>&1; then
+        fail "the PowerShell resolver accepted a directory named $ANDROID_NDK_PIN reporting another revision"
+    else
+        pass "a directory carrying the pinned name but another revision is refused"
+    fi
+    printf 'Pkg.Revision = %s\n' "$ANDROID_NDK_PIN" \
+        > "$ps_probe/sdk/ndk/$ANDROID_NDK_PIN/source.properties"
+    if got="$(env -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_SDK_ROOT \
+                  HOME="$ps_probe/empty" ANDROID_HOME="$ps_probe/sdk" \
+                  pwsh -NoProfile -Command "
+                       Import-Module '$PS_LIB' -Force
+                       Resolve-MigoPinnedNdk -Lock '$LOCK'
+                  " 2>/dev/null)"; then
+        pass "an NDK whose own revision equals the pin is accepted ($(basename "$got"))"
+    else
+        fail "the PowerShell resolver refused an NDK reporting exactly the pinned revision"
+    fi
+    rm -rf "$ps_probe"
+fi
+
 if (( failures == 0 )); then
     echo -e "\033[0;32m$TAG all checks passed\033[0m"
 else

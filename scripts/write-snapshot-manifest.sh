@@ -26,6 +26,7 @@ ENGINE="$ROOT/engine"
 
 # shellcheck source=scripts/lib/snapshot-fingerprint.sh
 source "$ROOT/scripts/lib/snapshot-fingerprint.sh"
+source "$ROOT/scripts/lib/reproducible-timestamp.sh"
 snapshot_validate_kind_profile "$SNAPSHOT_KIND" "$PRODUCT_PROFILE" || exit 1
 snapshot_require_materialized_snapshot "$BIN" || exit 1
 JS_HASH="$(snapshot_js_hash "$ROOT")"
@@ -82,7 +83,7 @@ cat > "$MANIFEST" <<EOF
   "js_sources_sha256": "$JS_HASH",
   "deno_core_version": "$DENO_CORE_VER",
   "git_commit": "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)",
-  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "generated_at": "$(reproducible_timestamp)"
 }
 EOF
 echo "manifest -> $MANIFEST"

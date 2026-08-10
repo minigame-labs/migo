@@ -55,6 +55,7 @@ pub mod error;
 pub mod host_channel;
 pub mod image_id;
 pub mod js_escape;
+pub mod log_level;
 pub mod log_throttle;
 pub mod op_state;
 pub mod payload_pool;

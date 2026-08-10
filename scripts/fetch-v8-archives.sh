@@ -21,12 +21,15 @@
 # cannot be checked would make this a plain transport wearing a verification
 # comment. That is why x86_64-pc-windows-msvc is absent below -- see
 # scripts/build-v8-windows.sh, which deliberately does not emit a manifest until
-# a Windows lock file exists to verify one against.
+# a Windows lock file exists to verify one against. `aarch64-linux-ohos` is absent
+# for the same reason: only the x86_64 OpenHarmony archive has been built and
+# sealed, so only it has something to be verified against.
 #
 # Usage: bash scripts/fetch-v8-archives.sh [--check] [--all] [target...]
 #   --check      verify what is already present; download nothing
 #   --all        every target known to this script
-#   target...    one or more of: aarch64, x86_64, x86_64-linux-gnu
+#   target...    one or more of: aarch64, x86_64, x86_64-linux-gnu,
+#                x86_64-linux-ohos
 #
 # With no target given, the two Android targets are fetched. That is what the
 # Android build and CI need, and keeping it the default means adding a target
@@ -45,7 +48,7 @@ BASE_URL="${MIGO_V8_ARCHIVE_BASE_URL:-https://github.com/minigame-labs/migo/rele
 # Targets this script knows how to fetch and verify. The directory name doubles
 # as the asset suffix, so a release asset is always librusty_v8-<target>.a and
 # there is no second naming scheme to keep in sync.
-KNOWN_TARGETS=(aarch64 x86_64 x86_64-linux-gnu)
+KNOWN_TARGETS=(aarch64 x86_64 x86_64-linux-gnu x86_64-linux-ohos)
 DEFAULT_TARGETS=(aarch64 x86_64)
 
 info() { printf '\033[0;36m[v8-fetch] %s\033[0m\n' "$*"; }

@@ -1,6 +1,6 @@
 [package]
 name = "migo-executor-probe"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 publish = false
 description = "Occupies a shared executor with a CPU-bound step and requires a co-tenant task to run anyway. Test-only."

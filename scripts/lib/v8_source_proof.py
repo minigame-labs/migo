@@ -82,9 +82,45 @@ def patch_target_paths(patch: pathlib.Path) -> set[str]:
     return paths
 
 
+def accounted_paths_from_patch(patch_root: pathlib.Path, glob: str) -> frozenset[str]:
+    """The paths a foreign patch *creates*, for accounting them in a proof.
+
+    One vendored checkout serves every platform's V8 build, and OpenHarmony's
+    toolchain patch creates a file the Android declaration does not touch -- so
+    without this, building one platform makes the other's proof refuse a path that is
+    explained by a committed patch, just not by one that proof claims.
+
+    Only *created* paths qualify. Accounting for a path a foreign patch merely
+    modifies would skip content verification on a file this platform's own patches may
+    also touch, so a patch that creates nothing is refused rather than trusted.
+    """
+    matches = sorted(patch_root.glob(glob))
+    if len(matches) != 1:
+        raise SourceProofError(
+            f"accounted patch glob matched {len(matches)} files: {glob}"
+        )
+    patch = matches[0]
+    created: set[str] = set()
+    from_dev_null = False
+    for line in patch.read_text(encoding="utf-8").splitlines():
+        if line.startswith("--- "):
+            from_dev_null = line.removeprefix("--- ").split("\t", 1)[0].strip() == "/dev/null"
+        elif line.startswith("+++ ") and from_dev_null:
+            relative = line.removeprefix("+++ ").split("\t", 1)[0].strip()
+            relative = relative.removeprefix("b/")
+            candidate = pathlib.PurePosixPath(relative)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise SourceProofError(f"patch contains an unsafe path {relative!r}: {patch}")
+            created.add(relative)
+    if not created:
+        raise SourceProofError(
+            f"{patch.name} creates no file, so it cannot account for one"
+        )
+    return frozenset(created)
+
+
 class Change:
     """One changed path, located in whichever checkout actually owns it."""
-
     __slots__ = ("status", "path", "owner", "owner_path")
 
     def __init__(self, status: str, path: str, owner: pathlib.Path, owner_path: str):

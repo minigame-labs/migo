@@ -116,20 +116,8 @@ source "$SCRIPT_DIR/lib/v8-patch-apply.sh"
 # failed on a malformed entry would leave a truncated declaration behind and pass
 # the non-empty guard. This build would then apply fewer patches than the lock
 # requires and only find out at manifest time, after producing artifacts.
-V8_DECLARED_OUTPUT="$(
-    python3 - "$V8_BUILD_LOCK" <<'PY'
-import json, sys
-
-lock = json.load(open(sys.argv[1]))
-required = lock.get("required_patches")
-if not isinstance(required, list) or not required:
-    sys.exit("V8 lock declares no required_patches")
-for entry in required:
-    if not isinstance(entry, dict) or "file" not in entry:
-        sys.exit(f"required_patches entry carries no file: {entry!r}")
-    print(entry["file"])
-PY
-)" || { err "cannot read the declared patch set from $V8_BUILD_LOCK"; exit 1; }
+V8_DECLARED_OUTPUT="$(v8_read_declared_patches "$V8_BUILD_LOCK")" \
+    || { err "cannot read the declared patch set from $V8_BUILD_LOCK"; exit 1; }
 [[ -n "$V8_DECLARED_OUTPUT" ]] || { err "the V8 lock declares no patches"; exit 1; }
 mapfile -t V8_DECLARED_PATCHES <<<"$V8_DECLARED_OUTPUT"
 
@@ -142,6 +130,12 @@ mapfile -t V8_DECLARED_PATCHES <<<"$V8_DECLARED_OUTPUT"
 V8_ACCOUNTED_ARGS=(
     --accounted 'third_party/v8_correct_gn/gn'
     --accounted 'third_party/v8_correct_gn/gn-receipt.json'
+    # One checkout serves every platform's V8 build, and the OpenHarmony one creates
+    # a GN toolchain file this declaration does not touch. Accounted from the patch
+    # itself rather than by naming the path, so it cannot drift from what that patch
+    # creates; the library refuses to account for a path a foreign patch merely
+    # modifies, which is the case that would skip real verification.
+    --accounted-patch '0008-ohos-toolchain.patch'
 )
 
 apply_patches() {
@@ -440,6 +434,28 @@ print(match.group(1))
 PY
 }
 
+# A libclang is only usable if bindgen can find the matching builtin headers, and
+# that is a separate fact from its version. Chromium's
+# `third_party/rust-toolchain/lib/libclang.so` reports clang 22 -- it passes any
+# version floor -- and ships **no sibling `bin/clang`**, so rusty_v8's build.rs
+# `-print-resource-dir` probe finds nothing and bindgen falls back to the NDK's clang
+# 12 builtin headers. The binding it then emits is wrong rather than absent:
+# `cppgc_Visitor` sized 1, nested enums missing their `v8_String_` prefixes, 840 items
+# instead of 870, and a `1_usize - 8_usize` overflow. A misconfigured libclang does not
+# fail loudly, it corrupts the FFI ABI -- so the resource directory is required to
+# resolve, not assumed from a version number.
+libclang_resource_dir() {
+    local dir="$1" clang resource
+    for clang in "$dir/../bin/clang" "$dir/../bin/clang++"; do
+        [[ -x "$clang" ]] || continue
+        resource="$("$clang" -print-resource-dir 2>/dev/null || true)"
+        [[ -n "$resource" && -d "$resource" ]] || continue
+        printf '%s' "$resource"
+        return 0
+    done
+    return 1
+}
+
 LIBCLANG_DIR="${V8_LIBCLANG_PATH:-}"
 if [[ -z "$LIBCLANG_DIR" ]]; then
     # prefer an NDK that ships clang >= 19
@@ -463,9 +479,14 @@ if [[ -n "$LIBCLANG_DIR" && -f "$LIBCLANG_DIR/libclang.so" ]]; then
     elif (( LIBCLANG_MAJOR < LIBCLANG_MIN_MAJOR )); then
         warn "libclang at $LIBCLANG_DIR is clang $LIBCLANG_MAJOR (< $LIBCLANG_MIN_MAJOR)"
         USE_PREBUILT_BINDING=true
+    elif ! LIBCLANG_RESOURCE_DIR="$(libclang_resource_dir "$LIBCLANG_DIR")"; then
+        warn "libclang at $LIBCLANG_DIR is clang $LIBCLANG_MAJOR but has no usable sibling clang"
+        warn "bindgen would silently use another toolchain's builtin headers and emit a"
+        warn "binding that is wrong rather than missing; falling back to the verified prebuilt one"
+        USE_PREBUILT_BINDING=true
     else
         export LIBCLANG_PATH="$LIBCLANG_DIR"
-        info "LIBCLANG_PATH = $LIBCLANG_PATH (clang $LIBCLANG_MAJOR) — regenerating binding"
+        info "LIBCLANG_PATH = $LIBCLANG_PATH (clang $LIBCLANG_MAJOR, resource dir $LIBCLANG_RESOURCE_DIR) — regenerating binding"
     fi
 else
     warn "no libclang found for bindgen"
@@ -546,6 +567,32 @@ if [[ "$USE_PREBUILT_BINDING" == true ]]; then
         exit 1
     fi
     ok "produced binding is byte-identical to the verified prebuilt input"
+else
+    # Regenerated. A binding that differs from the recorded one is either a real V8
+    # ABI change or a misconfigured libclang, and the two are indistinguishable from
+    # the bytes alone -- so this stops rather than seals a manifest over an FFI surface
+    # nobody compared. Set MIGO_V8_BINDING_CHANGE_EXPECTED=1 when the difference is the
+    # point (a V8 bump), which makes accepting a new ABI a deliberate act.
+    regenerated_hash="$(sha256sum "$DEST/src_binding.rs" | awk '{print $1}')"
+    recorded_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hashes"]["rust_binding"])' \
+        "$PREBUILT_MANIFEST" 2>/dev/null || true)"
+    if [[ -z "$recorded_hash" ]]; then
+        info "no recorded binding to compare against; this build establishes it"
+    elif [[ "$regenerated_hash" == "$recorded_hash" ]]; then
+        ok "regenerated binding matches the recorded one (sha256=$regenerated_hash)"
+    elif [[ "${MIGO_V8_BINDING_CHANGE_EXPECTED:-0}" == "1" ]]; then
+        warn "regenerated binding differs from the recorded one, and that was declared expected"
+        warn "  recorded:    $recorded_hash"
+        warn "  regenerated: $regenerated_hash"
+    else
+        err "the regenerated binding differs from the one $PREBUILT_MANIFEST records"
+        err "  recorded:    $recorded_hash"
+        err "  regenerated: $regenerated_hash"
+        err "a wrong libclang corrupts the FFI ABI silently, so this is not accepted on"
+        err "trust. Diff the two, and if the change is intended, re-run with"
+        err "MIGO_V8_BINDING_CHANGE_EXPECTED=1."
+        exit 1
+    fi
 fi
 
 python3 "$V8_COMPONENT_WRITER" \

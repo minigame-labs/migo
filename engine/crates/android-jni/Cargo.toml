@@ -1,6 +1,6 @@
 [package]
 name = "migo-android-jni"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 # `libmigo.so` — the artifact Android loads via `System.loadLibrary("migo")`.

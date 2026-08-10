@@ -1,37 +1,10 @@
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use shared::config::LogLevel;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Stores the active log level as a `LevelFilter` discriminant.
-/// Updated via `update_log_level()`; read on every tracing event.
-static ACTIVE_LEVEL: AtomicU8 = AtomicU8::new(0); // 0 = OFF initially
-
 static LOG_INIT: OnceLock<()> = OnceLock::new();
-
-fn level_filter_to_u8(f: LevelFilter) -> u8 {
-    match f {
-        LevelFilter::OFF => 0,
-        LevelFilter::ERROR => 1,
-        LevelFilter::WARN => 2,
-        LevelFilter::INFO => 3,
-        LevelFilter::DEBUG => 4,
-        LevelFilter::TRACE => 5,
-    }
-}
-
-fn u8_to_level_filter(v: u8) -> LevelFilter {
-    match v {
-        0 => LevelFilter::OFF,
-        1 => LevelFilter::ERROR,
-        2 => LevelFilter::WARN,
-        3 => LevelFilter::INFO,
-        4 => LevelFilter::DEBUG,
-        _ => LevelFilter::TRACE,
-    }
-}
 
 fn log_level_to_filter(level: LogLevel) -> LevelFilter {
     match level {
@@ -44,16 +17,23 @@ fn log_level_to_filter(level: LogLevel) -> LevelFilter {
     }
 }
 
+/// The filter for the record this thread is about to emit.
+///
+/// Resolved per thread rather than from one process-wide value, because a level
+/// arrives per session and the sink does not: see `shared::log_level`, which owns
+/// the three tiers and the reason a session must not be able to silence another.
 fn load_active_filter() -> LevelFilter {
-    u8_to_level_filter(ACTIVE_LEVEL.load(Ordering::Relaxed))
+    log_level_to_filter(shared::log_level::effective_level())
 }
 
-/// Update the active log level at runtime.
+/// Set the level for threads that belong to no session.
 ///
-/// Called when a new session is created with RuntimeConfig.
+/// This is the process default, not "the current level": a session's own level is
+/// published by its Host's registration and retired with it. A C host that
+/// installs diagnostics without ever creating a session is the caller this exists
+/// for.
 pub fn update_log_level(level: LogLevel) {
-    let filter = log_level_to_filter(level);
-    ACTIVE_LEVEL.store(level_filter_to_u8(filter), Ordering::Relaxed);
+    shared::log_level::set_default_level(level);
 }
 
 /// Initialize tracing subscriber for Android (logcat).
@@ -68,11 +48,11 @@ pub fn init_logging() {
     }
 
     #[cfg(debug_assertions)]
-    let default_level = LevelFilter::DEBUG;
+    let default_level = LogLevel::Debug;
     #[cfg(not(debug_assertions))]
-    let default_level = LevelFilter::WARN;
+    let default_level = LogLevel::Warn;
 
-    ACTIVE_LEVEL.store(level_filter_to_u8(default_level), Ordering::Relaxed);
+    shared::log_level::set_default_level(default_level);
 
     // Android logcat layer.
     let android_layer =

@@ -20,6 +20,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOST_DIR="$REPO_ROOT/platforms/openharmony"
 
@@ -40,6 +42,8 @@ TRIPLE="$ARCH-unknown-linux-ohos"
 
 # ---- build the static library the host links --------------------------------
 V8_DIR="$REPO_ROOT/engine/third_party/rusty_v8/$ARCH-linux-ohos"
+# Verified against its component manifest, then used from a content-addressed path.
+v8_materialise "$V8_DIR" "$REPO_ROOT/engine/target/v8-materialised" || exit 1
 if [[ ! -f "$V8_DIR/librusty_v8.a" ]]; then
     err "missing $V8_DIR/librusty_v8.a"
     err "build it first: scripts/build-v8-ohos.sh $ARCH"
@@ -55,8 +59,8 @@ info "building migo-capi for $TRIPLE"
     cd "$REPO_ROOT/engine"
     # From engine/ so rust-toolchain.toml applies; profile-slim because the
     # full profile needs ALSA, which OpenHarmony does not have.
-    RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
-    RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+    RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE" \
+    RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING" \
         cargo build -p migo-capi --release \
             --no-default-features --features profile-slim \
             --target "$TRIPLE"

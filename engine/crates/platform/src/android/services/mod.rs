@@ -615,7 +615,7 @@ impl SystemInfoService for AndroidSystemInfo {
     }
 
     fn get_system_settings_json(&self) -> Result<String, ServiceError> {
-        let settings = jni::get_system_settings()?;
+        let settings = jni::get_system_settings(self.host_id)?;
         serde_json::to_string(&settings)
             .map_err(|e| ServiceError::system(format!("getSystemSetting:fail {}", e)))
     }
@@ -625,7 +625,7 @@ impl SystemInfoService for AndroidSystemInfo {
     }
 
     fn get_app_authorization_setting_json(&self) -> Result<String, ServiceError> {
-        Ok(jni::get_app_authorization_setting_json()?)
+        Ok(jni::get_app_authorization_setting_json(self.host_id)?)
     }
 
     fn open_setting(&self, options_json: &str) -> Result<(), ServiceError> {

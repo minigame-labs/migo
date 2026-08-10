@@ -1,14 +1,12 @@
 [package]
 name = "migo-audio"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 [lib]
 name = "audio"
 
 [dependencies]
-# Cross-platform audio output
-cpal = "0.15"
 
 # Decoders - lightweight combination
 minimp3 = "0.6"      # MP3, MIT license
@@ -28,6 +26,14 @@ futures-util = "0.3"
 # Shared
 shared = { package = "migo-shared", path = "../shared", default-features = false }
 tracing = { workspace = true }
+
+# Every platform except OpenHarmony reaches a device through cpal. OpenHarmony's
+# userspace is musl with no ALSA, and cpal has no OHAudio backend, so pulling cpal there
+# drags in alsa-sys and pkg-config for a library that does not exist on the device -- which
+# is why the OpenHarmony package had to be built with profile-slim and shipped no audio at
+# all. src/output_ohaudio.rs is the backend that replaces it.
+[target.'cfg(not(all(target_os = "linux", target_env = "ohos")))'.dependencies]
+cpal = "0.15"
 
 # Android specific: use oboe backend + shared C++ STL.
 # V8 is built with use_custom_libcxx=false (system shared STL).
