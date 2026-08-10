@@ -189,8 +189,24 @@ impl CapiWindowState {
             let width_pixels = self.width_pixels.load(Ordering::Relaxed);
             let height_pixels = self.height_pixels.load(Ordering::Relaxed);
             let pixel_ratio_bits = self.pixel_ratio_bits.load(Ordering::Relaxed);
-            let after = self.sequence.load(Ordering::Acquire);
+            // The validating load only means anything if the three reads above
+            // cannot drift past it. An acquire *load* is the wrong tool: it
+            // stops later work from being hoisted above itself, while what has
+            // to be forbidden here is the opposite direction -- an earlier
+            // relaxed load sinking below it, which would let this return a
+            // width from one update and a height from the next while the
+            // sequence still compared equal. An acquire fence is a load-load
+            // barrier over the reads that precede it, which is exactly the
+            // `smp_rmb()` in the kernel's `read_seqretry`. x86 cannot reorder
+            // two loads, so without this the tear is unobservable there and
+            // reachable only on the aarch64 targets (Android, OpenHarmony).
+            std::sync::atomic::fence(Ordering::Acquire);
+            let after = self.sequence.load(Ordering::Relaxed);
             if before == after {
+                // Unreachable by construction rather than by luck: every store
+                // to `pixel_ratio_bits` comes from an already-validated
+                // `PixelRatio`, and a `u32` store cannot tear, so whichever
+                // update this read lands on carries a valid pattern.
                 let pixel_ratio = PixelRatio::new(f32::from_bits(pixel_ratio_bits))
                     .expect("CapiWindowState stores only validated ratios");
                 return CapiWindowMetrics {
