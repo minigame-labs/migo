@@ -261,22 +261,20 @@ def main() -> int:
     patches, patch_files = declared_patches(
         lock, repo / "engine/third_party/v8-patches"
     )
-    # The same replay proof the Android and Linux writers use: materialise every
-    # declared path at HEAD, apply the declared patches, and require byte equality with
-    # the worktree. Nothing had ever held the OpenHarmony build to it, so a stray edit
-    # in the vendored checkout could have reached this archive unrecorded. Android's
-    # declared patches are accounted for by *path* here, in the mirror image of what
-    # `--accounted-patch` does on that side: one checkout serves both, and its patches
-    # touch files this declaration does not.
-    accounted = set(arguments.accounted)
-    android_lock = repo / "contracts/artifact-manifest/android-v8.lock.json"
-    if android_lock.is_file():
-        android = json.loads(android_lock.read_text(encoding="utf-8"))
-        for entry in android.get("required_patches", []):
-            for match in sorted((repo / "engine/third_party/v8-patches").glob(entry["file"])):
-                accounted |= v8_source_proof.patch_target_paths(match)
+    # The same replay proof the Android and Linux writers use: materialise every declared
+    # path at HEAD, apply the declared patches, and require byte equality with the
+    # worktree. Nothing had ever held the OpenHarmony build to it, so a stray edit in the
+    # vendored checkout could have reached this archive unrecorded.
+    #
+    # Every patch applied to the shared checkout is declared in this platform's lock, so
+    # the replay verifies all of their contents. An earlier version instead exempted the
+    # *paths* Android's patches touch, which left those files -- `build.rs` among them --
+    # unchecked while this manifest claimed a smaller patch set: arbitrary edits there
+    # would have been sealed. Exempting a path skips verification; declaring a patch
+    # verifies it, and one checkout serving four platforms means the honest statement of
+    # what produced these bytes includes what was applied to it.
     v8_source_proof.assert_tree_is_exactly_patched(
-        source, patch_files, frozenset(accounted)
+        source, patch_files, frozenset(arguments.accounted)
     )
 
     component = build_component(

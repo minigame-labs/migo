@@ -889,6 +889,15 @@
   `cargo clean -p v8`. Both are gone: different bytes are now a different path, so cargo's
   own staleness rule is correct and there is nothing left to force.
 
+  **A review finding on the path itself:** it keyed only on the archive hash, so a
+  component whose binding changed while its archive did not would collide with the old one
+  — the stale binding there would be refused rather than replaced, and because cargo
+  watches the *value* of `RUSTY_V8_SRC_BINDING_PATH` it could go on using a `v8` crate
+  compiled against the previous binding, which is the exact defect content addressing is
+  here to remove. The directory now names **both** hashes. All four targets share one
+  binding at the pinned rusty_v8 revision, so the four paths differ only in their archive
+  half, which is what makes the collision easy to miss.
+
   Hard links, not copies — the archive is ~120 MB per architecture, and `links=2` was
   checked. Deliberately **not** `chmod 444`: a hard link shares its inode with
   `third_party`, so making the materialised copy read-only would make the *producer* fail
@@ -1205,6 +1214,14 @@
   because that one is stripped. Reading a tool's silence as an answer needs the tool to be
   able to see the thing first.
 
+  **A review finding in teardown, and it is the dangerous kind.** `Drop` freed the
+  callback-state box unconditionally after `OH_AudioRenderer_Release`, but that call can
+  fail — and if it does the renderer may still be live, so a later data or error callback
+  would dereference freed memory on a real-time thread. Release status is now checked and
+  the state is freed only when the renderer is definitely gone; an unrecoverable release
+  **leaks** it instead, with the reason logged. A bounded silent leak is the right trade
+  against a use-after-free.
+
   **Not verified, and it needs a device:** nothing has been *heard*. Playback, latency
   under `AUDIOSTREAM_LATENCY_MODE_FAST`, interrupt handling and route changes are all
   emulator or hardware work, which is item 2.5's audio row. What is proven here is that
@@ -1268,6 +1285,26 @@
 
   **Still open here:** `aarch64` needs its own archive (and a Skia) before it can be
   sealed, and the Windows writer still records no patch provenance — see 1.1l.
+
+  **Independent review found two P1s here, and the first was a precondition nobody
+  stated.** `build-v8-ohos.sh` exports `V8_PREBUILT_BINDING`, a hook that exists **only**
+  because `migo-build-rs-prebuilt-binding.diff` adds it to `build.rs` — and the script
+  declared only `0008-ohos-toolchain.patch`. The build therefore worked here because the
+  shared checkout had already been used for Android; on a checkout where it had not,
+  pristine rusty_v8 would ignore the variable, fall through to bindgen and fail on the
+  SDK's clang 15 **after an hour of compiling**. The lock now declares every patch the
+  archive is built from, and the script reads that set instead of naming one literal.
+
+  Second, the writer exempted the *paths* Android's patches touch, so `build.rs` among
+  others went unverified while the manifest claimed a smaller patch set — arbitrary edits
+  there would have been sealed. Exempting a path skips verification; declaring a patch
+  verifies it. With all five declared the replay covers every one and the exemptions are
+  gone, which is also the more honest statement: one checkout serves four platforms, so
+  what produced these bytes includes what was applied to it.
+
+  Verified after both fixes: all five patches report `already in effect`, the archive is
+  unchanged at `b097549b…`, and the manifest reseals (`component_id` `1f45aad8…`) with **no
+  path exemptions**, so the tree is proved to be HEAD plus exactly those five.
 - [ ] 1.10 Prove the HarmonyOS API floor with the two-sysroot symbol audit
   (`MIGO_OHOS_FLOOR_SYSROOT` at the floor plus `MIGO_OHOS_NEWER_SYSROOT`), set
   `compatibleSdkVersion` to the proven floor, and record any symbol that forces

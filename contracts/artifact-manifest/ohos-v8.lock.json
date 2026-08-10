@@ -3,6 +3,26 @@
   "ohos_api": 18,
   "required_patches": [
     {
+      "file": "migo-build-rs-prebuilt-binding.diff",
+      "id": "migo-prebuilt-binding",
+      "notes": "Adds the V8_PREBUILT_BINDING hook to build.rs. Declared here and not merely relied upon: pristine rusty_v8 ignores that variable, so an OpenHarmony build on a checkout that had not already been used for Android would export it, fall through to bindgen, and fail after an hour on the SDK's clang 15 -- the exact wall this platform cannot pass. It is a shared checkout, so the patch has to be part of this platform's declaration rather than a precondition nobody states."
+    },
+    {
+      "file": "0001-unset-BINDGEN_EXTRA_CLANG_ARGS-in-v8_s-bindgen.patch",
+      "id": "0001-unset-bindgen-extra-clang-args",
+      "notes": "Declared because the archive is built from a tree carrying it. One vendored checkout serves every platform, so the honest statement of what produced these bytes includes the patches applied to it -- exempting their paths from the replay instead would leave their contents unverified while the manifest claimed a smaller patch set. Inert for this platform's own bindgen, which does not run."
+    },
+    {
+      "file": "0002-install-sysroot.patch",
+      "id": "0002-use-sysroot-on-android",
+      "notes": "Declared for the same reason as 0001: applied to the shared checkout these bytes were built from."
+    },
+    {
+      "file": "0003-compiler-use-custom-libcxx-for-v8.patch",
+      "id": "0003-custom-libcxx-for-snapshot-toolchain",
+      "notes": "Declared for the same reason as 0001, and not inert here: this build's snapshot toolchain is the host clang, which is what this patch configures."
+    },
+    {
       "file": "0008-ohos-toolchain.patch",
       "id": "0008-ohos-toolchain",
       "notes": "Upstream Chromium has no OpenHarmony support at all: target_os is in no whitelist and neither build/ nor buildtools/ mentions it. This patch creates build/toolchain/ohos/BUILD.gn, which is the only thing that makes a custom_toolchain for the platform expressible. It creates a file rather than modifying one, which is why the Android proof can account for it with --accounted-patch."

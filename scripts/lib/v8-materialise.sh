@@ -91,7 +91,12 @@ v8_materialise() {
         return 1
     fi
 
-    local dest="$root/$got_archive"
+    # Keyed on *both* hashes. Keying on the archive alone collides when a binding changes
+    # while the archive does not -- two different components would map to one directory, the
+    # stale binding there would be refused rather than replaced, and because cargo watches
+    # the *value* of RUSTY_V8_SRC_BINDING_PATH it could go on using a v8 crate compiled
+    # against the previous binding. The path has to name everything it addresses.
+    local dest="$root/$got_archive-$got_binding"
     mkdir -p "$dest" || { _v8_mat_err "cannot create $dest"; return 1; }
 
     # Hard links rather than copies: the archive is ~120 MB per architecture, and a
@@ -102,17 +107,13 @@ v8_materialise() {
     for name in librusty_v8.a src_binding.rs; do
         local source="$v8_dir/$name" target="$dest/$name"
         if [[ -f "$target" ]]; then
-            # Re-checked rather than trusted: the path asserts the content, so a file that
-            # no longer hashes to its own directory is the one thing this mechanism must
-            # not pass on. Only the archive names the directory, so only it can be checked
-            # against the path itself; the binding is checked against the manifest above
-            # and then against its source here.
-            if [[ "$name" == "librusty_v8.a" && "$(_v8_mat_sha256 "$target")" != "$got_archive" ]]; then
+            # Re-checked rather than trusted: the path asserts both hashes, so a file that
+            # no longer matches the directory naming it is the one thing this mechanism must
+            # not pass on.
+            local expected="$got_archive"
+            [[ "$name" == "src_binding.rs" ]] && expected="$got_binding"
+            if [[ "$(_v8_mat_sha256 "$target")" != "$expected" ]]; then
                 _v8_mat_err "$target does not hash to the directory that names it; refusing to reuse it"
-                return 1
-            fi
-            if [[ "$name" == "src_binding.rs" && "$(_v8_mat_sha256 "$target")" != "$got_binding" ]]; then
-                _v8_mat_err "$target is not the binding its manifest records; refusing to reuse it"
                 return 1
             fi
             continue

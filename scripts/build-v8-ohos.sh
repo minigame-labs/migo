@@ -117,15 +117,26 @@ if [[ ! -x "$CHROMIUM_CLANG_BIN/clang++" ]]; then
 fi
 [[ -x "$CHROMIUM_CLANG_BIN/clang++" ]] || { err "Chromium clang unavailable"; exit 1; }
 
-# The toolchain definition lives in the build/ submodule, which is one of the
-# two paths the V8 provenance gate permits modifying. The patch creates the file,
-# but the path existing does not prove the content is the patch's, so
-# applied-ness is derived from the patch itself.
+# Applied-ness is derived from each patch itself rather than from a path existing, and the
+# set comes from the lock rather than from a literal here -- the same single declaration the
+# Android build reads. That matters beyond tidiness: this script exports
+# V8_PREBUILT_BINDING, a hook that exists only because
+# migo-build-rs-prebuilt-binding.diff adds it to build.rs. Naming only the OpenHarmony
+# toolchain patch here made the build silently depend on somebody having run the Android
+# build in this shared checkout first; without it, pristine rusty_v8 ignores the variable,
+# falls through to bindgen and fails on the SDK's clang 15 after an hour of compiling.
 # shellcheck source=scripts/lib/v8-patch-apply.sh
 source "$SCRIPT_DIR/lib/v8-patch-apply.sh"
-info "ensuring the OpenHarmony toolchain patch is applied"
-v8_require_patch "$RUSTY_V8_SRC" "$ENGINE_ROOT/third_party/v8-patches" \
-    '0008-ohos-toolchain.patch' || { err "OpenHarmony toolchain patch failed"; exit 1; }
+V8_BUILD_LOCK="$PROJECT_ROOT/contracts/artifact-manifest/ohos-v8.lock.json"
+V8_DECLARED_OUTPUT="$(v8_read_declared_patches "$V8_BUILD_LOCK")" \
+    || { err "cannot read the declared patch set from $V8_BUILD_LOCK"; exit 1; }
+[[ -n "$V8_DECLARED_OUTPUT" ]] || { err "the V8 lock declares no patches"; exit 1; }
+mapfile -t V8_DECLARED_PATCHES <<<"$V8_DECLARED_OUTPUT"
+info "ensuring the ${#V8_DECLARED_PATCHES[@]} declared patches are applied"
+for glob in "${V8_DECLARED_PATCHES[@]}"; do
+    v8_require_patch "$RUSTY_V8_SRC" "$ENGINE_ROOT/third_party/v8-patches" "$glob" \
+        || { err "patch failed: $glob"; exit 1; }
+done
 
 # rusty_v8 pins its own rustc (1.89.0 at the time of writing), which is not
 # migo's. A target installed for migo's toolchain is invisible here.

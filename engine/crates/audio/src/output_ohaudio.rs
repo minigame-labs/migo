@@ -338,14 +338,28 @@ impl AudioOutput {
 
 impl Drop for AudioOutput {
     fn drop(&mut self) {
-        // Stop before release, and release before freeing the callback state: the device
-        // thread reaches that box through `user_data`, so freeing it while a renderer can
-        // still call back is a use-after-free on a real-time thread.
+        // Stop, then release, then free the callback state -- and the last step only if the
+        // release succeeded. The device thread reaches that box through `user_data`, so a
+        // renderer that is still live when the box is freed is a use-after-free on a
+        // real-time thread. `OH_AudioRenderer_Release` can fail, and freeing anyway on that
+        // path is the shape this ordering exists to prevent, so an unrecoverable release
+        // leaks the state instead. A leaked ring buffer is a bounded, silent cost; a
+        // callback into freed memory is neither.
         // SAFETY: `renderer` and `state` are owned by this handle and dropped once.
         unsafe {
-            OH_AudioRenderer_Stop(self.renderer);
-            OH_AudioRenderer_Release(self.renderer);
-            drop(Box::from_raw(self.state));
+            let stopped = OH_AudioRenderer_Stop(self.renderer);
+            if stopped != AUDIOSTREAM_SUCCESS {
+                error!("OHAudio renderer stop failed: {stopped}");
+            }
+            let released = OH_AudioRenderer_Release(self.renderer);
+            if released == AUDIOSTREAM_SUCCESS {
+                drop(Box::from_raw(self.state));
+            } else {
+                error!(
+                    "OHAudio renderer release failed: {released}; leaking its callback state, \
+                     because the renderer may still call back into it"
+                );
+            }
         }
     }
 }

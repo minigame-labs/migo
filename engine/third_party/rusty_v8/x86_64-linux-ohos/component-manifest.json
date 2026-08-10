@@ -1,6 +1,6 @@
 {
   "schema": "migo-v8-component-manifest/v1",
-  "component_id": "78fa8c665e877fa25c437463b65ebfb4f73bf48d02b9249c6fb6e3bfe3935f91",
+  "component_id": "1f45aad8099ef7646ec561cec4d39d2db6fc1fc0a6647318da0d01c15c9f83f6",
   "target": {
     "triple": "x86_64-unknown-linux-ohos",
     "os": "linux",
@@ -47,8 +47,24 @@
     ],
     "patches": [
       {
+        "id": "0001-unset-bindgen-extra-clang-args",
+        "sha256": "21a5e151cc831c8a9cda655d458fa7669f402ae1d3b96d29ade788ca20b45063"
+      },
+      {
+        "id": "0002-use-sysroot-on-android",
+        "sha256": "6d4d89570c9d48281101c51483ba262a797d221343a54d2adea05a4529816db1"
+      },
+      {
+        "id": "0003-custom-libcxx-for-snapshot-toolchain",
+        "sha256": "9c68fd6110b6a1b2549f731816defa1cf20cb204fe96d488c433dc7ec7e1f368"
+      },
+      {
         "id": "0008-ohos-toolchain",
         "sha256": "db22ae84cd9d44e85189dffe68e37316ebda107c6e0ff6771bc482cd3de16549"
+      },
+      {
+        "id": "migo-prebuilt-binding",
+        "sha256": "db9f843bb8a3d9b9c86c5ae87272a33efacd32a238a00f576d052a82a54b3389"
       }
     ]
   },
@@ -59,7 +75,7 @@
   "provenance": {
     "source_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
     "build_recipe": "scripts/build-v8-ohos.sh",
-    "build_recipe_sha256": "1ab3acae50e75c056f00fc1e437d3d44760f367bcf40ed3fd08b018c5bdecfdf",
+    "build_recipe_sha256": "834c4278c82cf21a92c77c305ab2213493e3e27daedb1f44281d6b55e1411d78",
     "licenses": [
       "BSD-3-Clause",
       "MIT"
