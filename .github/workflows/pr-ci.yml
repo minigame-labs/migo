@@ -233,6 +233,26 @@ jobs:
       - name: JNI outbound signature contract
         run: bash scripts/test-jni-outbound-signature-contract.sh
 
+      # The OpenHarmony API floor gate compares imports against a sysroot newer
+      # than the floor. Choosing the wrong one does not fail -- it produces a
+      # confident pass computed against the wrong symbol set, which is the shape
+      # that stays green for months. The selection was a heredoc inside
+      # build-ohos-sdk.sh and so had never been exercised; it is now a unit with
+      # fixtures whose layouts make a name-ordering rule and an apiVersion rule
+      # disagree, checked load-bearing by reinstating the wrong first draft (4 of
+      # 8 cases go red).
+      - name: OpenHarmony newer-sysroot selection contract
+        run: bash scripts/test-ohos-newer-sysroot-selection.sh
+
+      # The OpenHarmony floor is one decision written twice -- compatibleSdkVersion
+      # in the app package and MIN_OHOS_API in the C SDK -- so raising it in one
+      # place leaves the other advertising support nothing gates. The audited
+      # sysroot is a third, different claim: it is deliberately stricter than the
+      # published floor, so the invariant against it is an inequality. Both
+      # directions checked load-bearing by injection.
+      - name: OpenHarmony API floor declaration contract
+        run: bash scripts/test-ohos-api-floor-declaration-contract.sh
+
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
         # (scripts/test-linux-sdk-contract.sh) needs the Debian bullseye

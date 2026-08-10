@@ -10,6 +10,51 @@
   validate X11, Wayland, Qt, resize, input, and teardown.
 - [ ] 2.4 Build the Windows DLL, import library, and static SDK natively with
   MSVC and ANGLE; validate Win32 resize, DPI change, input, and teardown.
+
+  **The build half is done — 2026-08-10.** `bash scripts/build-windows-sdk.sh` runs
+  end to end on a workstation carrying VS Build Tools (MSVC 14.44.35207, Windows SDK
+  10.0.22621 and 10.0.26100, LLVM at the default path). `migo-capi` compiles for
+  `x86_64-pc-windows-msvc` in 30.47s release, and the manual link produces
+  `migo.dll` (26,422,272 bytes) plus the import library `migo.lib`, staged into
+  `dist/migo-windows-x86_64` with headers, the CMake package, and the ANGLE and V8
+  runtime DLLs beside it. `scripts/test-windows-sdk-contract.sh` then passes all six
+  checks with **0 skipped**:
+
+  ```
+  PASS  package carries the DLL, import library, headers and CMake package
+  PASS  ANGLE and V8 runtime DLLs ship alongside migo.dll
+  PASS  export surface is exactly the declared migo_* set (24 entries)
+  PASS  migo.dll loads and reports it can attach a Win32 HWND
+  PASS  staged headers compile standalone under MSVC C11 (/W4 /WX)
+  PASS  import library references migo.dll
+  ```
+
+  `0 skipped` is load-bearing here: this contract is the kind that can pass by
+  finding nothing, and it states the count so an empty run and a clean run are
+  distinguishable.
+
+  **This is not most of 2.4, and the item stays open.** Three of its four clauses are
+  untouched:
+
+  * **the static SDK is not built.** `migo_capi.lib` exists only as the staticlib
+    input to the DLL link; nothing packages or verifies a static consumer. The
+    arrangement is also not free to change — `windows-v8.lock.json` records that V8
+    must be absorbed through its *import* library, because linking the static archive
+    puts V8's bundled libc++ into the same link as Skia's MSVC STL and the two define
+    `std::terminate` incompatibly. A static SDK therefore needs that collision
+    answered, not just a second `cargo build`.
+  * **resize, DPI change, input and teardown are not validated.** Nothing has been
+    driven through a live `HWND`. "`migo.dll` loads and reports it can attach a Win32
+    HWND" is a capability report, not a frame, and it must not be read as one.
+  * **it was not built from a clean tree**, which this item explicitly asks for. The run
+    used a warm `CARGO_TARGET_DIR`, and the link step derives its library search path by
+    scanning that directory *before* the build runs — so on a cold target it finds no
+    skia directory and the link fails with `LNK1181`, measured. See 1.7, where the
+    mechanism and the evidence are recorded.
+  * NuGet packaging remains, which the script says itself.
+
+  Neither independent review has run: no codex on this workstation, waived by the
+  operator rather than satisfied.
 - [ ] 2.5 Qualify HarmonyOS on the `x86_64` emulator: attach, content-ready,
   first frame, resize, background and foreground, surface recreation,
   multi-touch, audio playback, detach, shutdown.

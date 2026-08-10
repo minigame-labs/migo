@@ -3020,7 +3020,7 @@
   the apt list and the runner image, not in the commands, which are the same ones
   that pass here.
 
-- [!] 0.32 Compile this branch's OpenHarmony and Windows conditional code for its
+- [x] 0.32 Compile this branch's OpenHarmony and Windows conditional code for its
   own target. Found by running task 0.31's entry point over the branch: it reports
   `TARGET ohos compile` for nine files and `TARGET windows compile` for five,
   including `capi/src/platform/{ohos,windows,mod,unsupported}.rs` and
@@ -3101,6 +3101,39 @@
   also still needs its own archive and a Skia; only `x86_64` is proven, which is the
   triple the verifier's lane uses because the `target_env = "ohos"` view of the tree is
   the same for either architecture.
+
+  **The Windows half is now done — 2026-08-10, on a different workstation, and that
+  qualifier is the finding.** `cargo check -p migo-platform --target
+  x86_64-pc-windows-msvc` exits 0 in 11.45s and `cargo build -p migo-capi --release`
+  for the same triple finishes in 30.47s, so all five files this entry listed under
+  `TARGET windows compile` — `capi/src/platform/{windows,mod,unsupported}.rs` and
+  `platform/src/windows/presenter.rs` among them — have now compiled for their own
+  target. Section 7.4's requirement is met for both halves, and the item is no longer
+  blocked.
+
+  **The blocking sentence above was true where it was written and false where it was
+  read, and nothing in it said which.** "There is no Visual Studio on `C:`" names an
+  object — a `C:` drive — that every machine has and no two machines share. This
+  workstation has VS Build Tools with MSVC 14.44.35207, Windows SDK 10.0.22621 and
+  10.0.26100, and LLVM at the default install path; the machine that wrote the
+  sentence had none of them. The ledger's own rule is to check the named object rather
+  than trust the record, and it has caught itself naming the *wrong* object repeatedly.
+  This is a second shape of the same failure: the right object, checked correctly, on a
+  host the reader is not on. A recorded environmental obstacle is scoped to a machine,
+  so it expires when the machine changes — the two entry points here
+  (`platforms/windows/spike/{sync-worktree,probe-layer}.sh`) had been sitting unrun and
+  working the whole time.
+
+  **What this does not prove.** It is a compile claim, nothing more: that these paths
+  type-check and codegen for `x86_64-pc-windows-msvc`. It says nothing about whether
+  the Windows presenter draws a correct frame, and it is not evidence for 1.7, whose
+  subject is replacing the warm-target link flow with a native build graph. The
+  `aarch64-unknown-linux-ohos` sentence above is also unchanged and still true: only
+  `x86_64` is proven on the OpenHarmony side.
+
+  **Neither independent review has run on this half** — this workstation has no codex,
+  and the operator waived the review requirement rather than it being satisfied. Recorded
+  because a waived gate and a passed gate must not read the same in this ledger.
 
 - [x] 0.33 Run clippy on graphics, core, capi and platform somewhere. Found while
   correcting `pr-ci.yml`'s stale comment for task 0.31. The new `host-engine-tests`

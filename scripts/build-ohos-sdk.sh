@@ -395,39 +395,14 @@ info "running the API floor gate"
 # change under test broke something. An explicit MIGO_OHOS_NEWER_SYSROOT still wins, so a
 # caller can point at an SDK outside these locations.
 if [[ -z "${MIGO_OHOS_NEWER_SYSROOT:-}" ]]; then
-    # Selected on the SDK's own declared apiVersion, not on its directory name, and for
-    # the same reason the NDK pin is: a directory called `ohos-sdk-6.1` is just a name.
-    # Taking the highest-sorted non-floor directory looked equivalent and is not -- if
-    # the floor happened to be the newest installed SDK, that rule would hand back an
-    # *older* sysroot and call its extra symbols "post-floor", which is evidence pointing
-    # the wrong way. A candidate must declare a higher API than the floor to qualify.
-    MIGO_OHOS_NEWER_SYSROOT="$(python3 - "$OHOS_SDK_HOME" <<'PY'
-import json, pathlib, sys
-
-floor_home = pathlib.Path(sys.argv[1])
-
-
-def api_of(home):
-    described = home / "native/oh-uni-package.json"
-    try:
-        return int(json.loads(described.read_text(encoding="utf-8"))["apiVersion"])
-    except (OSError, ValueError, KeyError):
-        return None
-
-
-floor_api = api_of(floor_home)
-best_api, best = floor_api, None
-if floor_api is not None:
-    for candidate in sorted(floor_home.parent.glob("ohos-sdk*")):
-        if not (candidate / "native/sysroot").is_dir() or candidate == floor_home:
-            continue
-        api = api_of(candidate)
-        if api is not None and (best_api is None or api > best_api):
-            best_api, best = api, candidate
-if best is not None:
-    print(best / "native/sysroot")
-PY
-)" || MIGO_OHOS_NEWER_SYSROOT=""
+    # The rule -- select on the SDK's own declared apiVersion, never on its directory
+    # name -- and the reasoning for it live in the selector, which is exercised by
+    # scripts/test-ohos-newer-sysroot-selection.sh. It used to be a heredoc here, and
+    # that is precisely why it could only ever be checked by hand: logic embedded in a
+    # shell heredoc has no seam a fixture can reach, so the wrong first draft stayed
+    # reintroducible with no gate firing.
+    MIGO_OHOS_NEWER_SYSROOT="$(python3 "$SCRIPT_DIR/lib/select-ohos-newer-sysroot.py" "$OHOS_SDK_HOME")" \
+        || MIGO_OHOS_NEWER_SYSROOT=""
 fi
 if [[ -n "${MIGO_OHOS_NEWER_SYSROOT:-}" ]]; then
     info "post-floor comparison against $MIGO_OHOS_NEWER_SYSROOT"
