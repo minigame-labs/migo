@@ -102,6 +102,36 @@ jobs:
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
 
+      - name: Release asset ordering contract
+        # PyYAML is not guaranteed preinstalled on the runner image, so this
+        # mirrors the ripgrep fallback above rather than assuming it's there
+        # -- but a bare `pip install` is not enough: Ubuntu 24.04 runners
+        # enforce PEP 668 (an EXTERNALLY-MANAGED marker on the system
+        # Python), and pip refuses to touch it without an explicit override.
+        # --break-system-packages is that override, deliberately scoped to
+        # this disposable CI container rather than a shared machine, and is
+        # only reached at all if `import yaml` already fails.
+        run: |
+          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
+          bash scripts/test-release-asset-ordering-contract.sh
+
+      # A release version is a fact about a set of bytes, and it was stated
+      # independently in four build systems. They drifted: the Android AAR said
+      # 0.9.0 while the Android C-API SDK beside it defaulted to 0.1.0, the Windows
+      # SDK hardcoded 0.1.1 and discarded the version it had read, and HarmonyOS
+      # fell back to 0.1.0 in silence. A package labelled with a version nobody
+      # chose is not recallable.
+      - name: Release version contract
+        run: bash scripts/test-release-version-contract.sh
+
+      # A release artifact that records when it was built cannot be rebuilt and
+      # compared, which is what Phase 1's same-source byte equality rests on. The
+      # AAR metadata recorded the SOURCE_DATE_EPOCH it was given and then stamped a
+      # local wall clock on the next line; the SBOM and the committed snapshot
+      # manifests did the same.
+      - name: Reproducible timestamp contract
+        run: bash scripts/test-reproducible-timestamp-contract.sh
+
       - name: Example content namespace contract
         run: bash scripts/test-content-namespace-contract.sh
 
@@ -134,6 +164,15 @@ jobs:
       # has to remember to update.
       - name: Permission coverage contract
         run: bash scripts/test-permission-coverage-contract.sh
+
+      # The gate above holds the *source* manifests to the policy, which is a
+      # different claim from what a consumer installs: the merged manifest is what
+      # ships, a dependency or a `tools:` directive can add a permission to it, and
+      # nothing compared it until now. This holds the merged manifests to the same
+      # table -- exactly, in both directions -- and states the set each profile
+      # requests at API 26, 28 and 31.
+      - name: Android merged manifest permission contract
+        run: bash scripts/test-android-merged-manifest-permissions.sh
 
       # The host-bridge holder is reachable from content (`Symbol.for` reads the
       # global registry), and closing that is an all-or-nothing migration of
@@ -168,6 +207,45 @@ jobs:
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
 
+      # A restart replaces the isolate but not the Android objects around it, so
+      # an event a retired runtime's listener produces must carry the generation
+      # that listener captured. Re-reading the live generation at report time
+      # always matches, which is a check that cannot fail. Structural because it
+      # has to be: five of the six producer groups need a Context or a main
+      # Looper, so no host test can build one and restart a session behind it.
+      - name: Runtime generation fence contract
+        run: bash scripts/test-runtime-generation-fence-contract.sh
+
+      # The engine resolves every outbound call on NativeExports by name *and*
+      # descriptor, and the two sides are one contract written twice: string
+      # literals in Rust, a method in Java, with nothing a compiler can tie
+      # together. A mismatch fails GetStaticMethodID on a device, at the moment the
+      # feature is first used. Measured: widening a descriptor and leaving the Java
+      # method alone passes the profile contract, both R8 root checks, the host API
+      # contract and javac -- the profile contract compares names, never shapes.
+      - name: JNI outbound signature contract
+        run: bash scripts/test-jni-outbound-signature-contract.sh
+
+      # The OpenHarmony API floor gate compares imports against a sysroot newer
+      # than the floor. Choosing the wrong one does not fail -- it produces a
+      # confident pass computed against the wrong symbol set, which is the shape
+      # that stays green for months. The selection was a heredoc inside
+      # build-ohos-sdk.sh and so had never been exercised; it is now a unit with
+      # fixtures whose layouts make a name-ordering rule and an apiVersion rule
+      # disagree, checked load-bearing by reinstating the wrong first draft (4 of
+      # 8 cases go red).
+      - name: OpenHarmony newer-sysroot selection contract
+        run: bash scripts/test-ohos-newer-sysroot-selection.sh
+
+      # The OpenHarmony floor is one decision written twice -- compatibleSdkVersion
+      # in the app package and MIN_OHOS_API in the C SDK -- so raising it in one
+      # place leaves the other advertising support nothing gates. The audited
+      # sysroot is a third, different claim: it is deliberately stricter than the
+      # published floor, so the invariant against it is an inequality. Both
+      # directions checked load-bearing by injection.
+      - name: OpenHarmony API floor declaration contract
+        run: bash scripts/test-ohos-api-floor-declaration-contract.sh
+
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
         # (scripts/test-linux-sdk-contract.sh) needs the Debian bullseye
@@ -191,23 +269,36 @@ jobs:
           cargo test --manifest-path tools/artifact-manifest/Cargo.toml --locked
           bash scripts/test-artifact-manifest-contract.sh
 
+      # An attestation is worth something only if the bytes it swears to can be
+      # arrived at independently. Until scripts/package-sdk.sh existed, every
+      # migo-sdk-*.tar.gz was a `tar` typed on a release machine: the published
+      # Linux archive records the builder's account as the owner of every entry and
+      # that machine's wall clock as every mtime, so its package_sha256 is a number
+      # only that machine could produce. This packages a synthetic prefix twice and
+      # fails if the two runs differ.
+      - name: SDK release packaging contract
+        run: bash scripts/test-sdk-package-reproducibility-contract.sh
+
       # Scope to the host-buildable crates (graphics needs skia/EGL, audio needs
       # alsa — system deps absent on this runner) and cap lints to warn against
       # the pre-existing backlog. Mirrors pr-ci.yml so the tag gate matches PR CI.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets -- --cap-lints warn
 
+      # `--tests` mirrors pr-ci.yml: `--lib` skipped the frame-boundary allocation
+      # gate (shared/tests/frame_cycle_allocation.rs) and both snapshot round-trips,
+      # so the tag gate was narrower than the PR gate on the binaries that exist
+      # because a property belongs to a binary rather than to a lib.
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
         run: |
-          # `--tests`, matching pr-ci.yml: `--lib` here skipped the frame-boundary
-          # allocation gate and both snapshot round-trips, so the tag gate was
-          # narrower than the PR gate on exactly the binaries that exist because
-          # a property belongs to a binary rather than to a lib.
           cargo test -p migo-shared -p migo-runtime-v8 --tests
           cargo test -p migo-io --lib
           cargo test -p migo-capi-abi --all-targets
+          cargo test -p migo-alloc-probe
+          cargo test -p migo-contention-probe
+          cargo test -p migo-executor-probe
         env:
           RUST_BACKTRACE: 1
 
@@ -230,6 +321,40 @@ jobs:
         run: |
           bash scripts/test-product-profiles.sh
           bash scripts/test-r8-profile-contract.sh
+
+      # The local verification entry point decides which target builds a change
+      # needs. Its own answer has to be checked: an under-reporting selector reads
+      # as "this change needs nothing", which is how three Android compile errors
+      # rode a green host loop for several sessions.
+      - name: Local verification entry point contract
+        run: bash scripts/test-local-verification-contract.sh
+
+      - name: Python script syntax check
+        run: |
+          python3 -m py_compile \
+            scripts/ci/compare_baseline.py \
+            scripts/ci/check_migo_test_suite.py \
+            scripts/gen-android-package-metadata.py \
+            scripts/gen-linux-package-metadata.py \
+            scripts/generate-android-artifact-manifests.py \
+            scripts/write-android-build-metadata.py \
+            scripts/write-linux-build-metadata.py \
+            scripts/write-linux-v8-component-manifest.py \
+            scripts/write-v8-component-manifest.py \
+            scripts/verify-android-aar-manifests.py
+
+      # When this was written, ten pr-ci quality-gate steps were absent from
+      # release.yml's quality-gate: Release asset ordering contract, Release version
+      # contract, Reproducible timestamp contract, Android merged manifest permission
+      # contract, Runtime generation fence contract, JNI outbound signature contract,
+      # OpenHarmony newer-sysroot selection contract, OpenHarmony API floor
+      # declaration contract, Local verification entry point contract, and Python
+      # script syntax check. The three release-specific gates did not run on the
+      # workflow that cuts releases. This step fails whenever that gap reopens.
+      - name: Release gate parity contract
+        run: |
+          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
+          bash scripts/test-release-gate-parity-contract.sh
 
   # ── Job 2: Linux Qt Host Kit (isolated source contract; no V8/LFS) ──
   linux-qt-host-kit:
@@ -278,9 +403,56 @@ jobs:
           npm ci
           npm test
 
-  # ── Job 4: Release AAR build ────────────────────────────────────────
+  # ── Job 4: Host engine tests — graphics, core, capi, platform, audio ─
+  # These five crates' test suites ran in no release job: the AAR build cross-
+  # compiles them and runs nothing. Mirrors pr-ci.yml's host-engine-tests job
+  # exactly (same packages, same system deps, same flags) so the tag gate is
+  # not narrower than the PR gate on the crates that need a graphics stack.
+  # NO Rust cache, same reason as the Android job: Swatinem/rust-cache prunes
+  # librusty_v8.a while keeping the fingerprint fresh, which fails the link on
+  # the second run.
+  host-engine-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - name: Install the engine's host build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ninja-build \
+            libgl-dev libegl-dev libgles-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libasound2-dev
+
+      - name: Run clippy lints (crates needing host system packages)
+        working-directory: engine
+        run: cargo clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio --all-targets -- --cap-lints warn
+
+      - name: Run Rust tests (graphics, core, capi, platform, audio)
+        working-directory: engine
+        run: |
+          cargo test -p migo-graphics --tests
+          cargo test -p migo-core --lib
+          cargo test -p migo-capi --lib
+          cargo test -p migo-platform --lib
+          cargo test -p migo-audio --lib
+        env:
+          RUST_BACKTRACE: 1
+
+  # ── Job 5: Release AAR build ────────────────────────────────────────
   release-android:
-    needs: [quality-gate, linux-qt-host-kit]
+    needs: [quality-gate, linux-qt-host-kit, host-engine-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -398,6 +570,18 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The two Android C SDK archives on v0.9.0 were produced by a `tar` typed on
+      # a release machine, which is why their attestations swear to bytes nobody
+      # receiving them can reproduce. scripts/package-sdk.sh is the reproducible
+      # path, and staging its output here rather than beside the staged prefix puts
+      # both archives under the SHA256SUMS.txt generated below.
+      - name: Package the Android C SDK for release
+        run: |
+          for abi in arm64-v8a x86_64; do
+            bash scripts/package-sdk.sh "dist/migo-android-$abi" \
+              --output-dir platforms/android/dist
+          done
+
       - name: Analyze AAR size report
         run: |
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-release.aar \
@@ -457,6 +641,10 @@ jobs:
             platforms/android/dist/migo-full-release-arm64-v8a.aar.attestation.json \
             platforms/android/dist/migo-slim-release-arm64-v8a.aar \
             platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json \
+            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz \
+            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz.attestation.json \
+            platforms/android/dist/migo-sdk-android-x86_64.tar.gz \
+            platforms/android/dist/migo-sdk-android-x86_64.tar.gz.attestation.json \
             platforms/android/dist/version.json \
             platforms/android/dist/version-full.json \
             platforms/android/dist/version-slim.json \
@@ -503,6 +691,10 @@ jobs:
             platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json
             platforms/android/dist/migo-slim-release.aar
             platforms/android/dist/migo-slim-release.aar.attestation.json
+            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz
+            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz.attestation.json
+            platforms/android/dist/migo-sdk-android-x86_64.tar.gz
+            platforms/android/dist/migo-sdk-android-x86_64.tar.gz.attestation.json
             platforms/android/dist/version.json
             platforms/android/dist/version-full.json
             platforms/android/dist/version-slim.json

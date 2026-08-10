@@ -49,38 +49,10 @@ jobs:
           echo "Device: $(adb shell getprop ro.product.model)"
           echo "Android: $(adb shell getprop ro.build.version.release)"
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          targets: aarch64-linux-android,x86_64-linux-android
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine -> target
-          cache-on-failure: true
-
-      # Build steps are optional here — if the test app is already installed
-      # on the device, you can skip the build and go directly to testing.
-      # Uncomment below if you want CI to build and install:
-      #
-      # - name: Setup Java
-      #   uses: actions/setup-java@v5
-      #   with:
-      #     distribution: temurin
-      #     java-version: "17"
-      #
-      # - name: Setup Android SDK + NDK
-      #   run: |
-      #     sdkmanager "ndk;23.2.8568313"
-      #     echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
-      #     cargo install cargo-ndk --locked
-      #
-      # - name: Build debug AAR
-      #   run: bash scripts/build-aar.sh debug
-      #
-      # - name: Install test app
-      #   run: adb install -r path/to/test-app.apk
+      # The test app must be pre-installed on the device before this workflow
+      # is dispatched. build-aar.sh and adb install are not run here because
+      # the runner's NDK and Java setup is the responsibility of the caller who
+      # prepared the device for a test session.
 
   # ── Job 2: Performance metrics ──────────────────────────────────────
   perf-test:
@@ -183,31 +155,30 @@ jobs:
         id: suite
         run: |
           SUITE_PATH="${{ github.event.inputs.test_suite_path || '../migo-test-suite' }}"
-          if [ -d "$SUITE_PATH" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "path=$SUITE_PATH" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "WARNING: migo-test-suite not found at $SUITE_PATH"
+          # A dispatched device-test run that tests nothing and reports success is
+          # the worst possible outcome: it silently grants confidence it did not earn.
+          if [ ! -d "$SUITE_PATH" ]; then
+            echo "ERROR: migo-test-suite not found at '$SUITE_PATH'" >&2
+            echo "Override with the test_suite_path input." >&2
+            exit 1
           fi
+          echo "path=$SUITE_PATH" >> "$GITHUB_OUTPUT"
 
       # The test suite must be run manually (or via its own runner script)
       # and produce a report.json. This step assumes the report already exists
       # or the suite has its own run mechanism.
       - name: Run test suite
-        if: steps.suite.outputs.available == 'true'
         run: |
           SUITE_PATH="${{ steps.suite.outputs.path }}"
           if [ -f "$SUITE_PATH/run.sh" ]; then
             bash "$SUITE_PATH/run.sh" \
               --package "${{ github.event.inputs.package || 'com.example.migo.demo' }}" \
-              --output "$SUITE_PATH/report.json" || true
+              --output "$SUITE_PATH/report.json"
           else
             echo "No run.sh found in test suite, expecting pre-existing report.json"
           fi
 
       - name: Validate test suite results
-        if: steps.suite.outputs.available == 'true'
         run: |
           SUITE_PATH="${{ steps.suite.outputs.path }}"
           if [ -f "$SUITE_PATH/report.json" ]; then
@@ -216,11 +187,12 @@ jobs:
               --summary-out reports/test-suite-summary.json \
               --gate
           else
-            echo "WARNING: no report.json found, skipping validation"
+            echo "ERROR: no report.json found after running the suite" >&2
+            exit 1
           fi
 
       - name: Upload test suite results
-        if: always() && steps.suite.outputs.available == 'true'
+        if: always()
         uses: actions/upload-artifact@v5
         with:
           name: test-suite-results
