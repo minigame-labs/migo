@@ -296,11 +296,21 @@ impl RenderSurfaceBinding {
         })
     }
 
-    /// Install the resource retained by a successful EGL recreate.
+    /// Install a lease directly, skipping staging. **Tests only.**
     ///
-    /// The candidate may have been retired after preflight. It is still
-    /// retained because EGL now references its native resource, while
-    /// `is_live()` immediately prevents presentation.
+    /// Production installs a candidate exclusively through
+    /// `SurfaceRecreateGuard::commit`, which exists only once `preflight` has
+    /// rejected a dead, older or conflicting generation. This assigns `current`
+    /// unconditionally, so reaching it from production would drop the previous
+    /// lease while EGL may still reference its native resource — a
+    /// use-after-free in the driver, which is the failure the staging
+    /// discipline exists to prevent.
+    ///
+    /// `#[cfg(test)]` rather than a comment asking callers not to use it: the
+    /// method is absent from every shipped build, so the bypass cannot acquire
+    /// a production caller later. A seam that exists only so a test can skip a
+    /// guard has no business in the guarded type's public surface.
+    #[cfg(test)]
     pub(crate) fn commit(&mut self, lease: SurfaceLease) {
         debug_assert!(self.pending.is_none());
         self.current = Some(lease);
