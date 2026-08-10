@@ -14,25 +14,73 @@
 # symbols resolved against a post-2.34 libc.
 
 _MIGO_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-MIGO_RUSTY_V8_SRC="${MIGO_RUSTY_V8_SRC:-$_MIGO_REPO_ROOT/../rusty_v8_src}"
-MIGO_SYSROOT="${MIGO_SYSROOT:-$MIGO_RUSTY_V8_SRC/build/linux/debian_bullseye_amd64-sysroot}"
-MIGO_SYSROOT_RECIPE="${MIGO_SYSROOT_RECIPE:-$(dirname "$MIGO_SYSROOT")/sysroot_scripts/sysroots.json}"
+# Both the recipe and the tree it describes live in the repository, materialised by
+# scripts/fetch-linux-sysroot.sh. They used to be resolved inside a sibling
+# ../rusty_v8_src checkout, which is what made a Linux package producible only on a
+# machine that happened to have one -- and the reason the packaging gate is
+# documented as release-machine-only.
+MIGO_SYSROOT_HOME="${MIGO_SYSROOT_HOME:-$_MIGO_REPO_ROOT/engine/third_party/linux-sysroot}"
+MIGO_SYSROOT_KEY="${MIGO_SYSROOT_KEY:-bullseye_amd64}"
+MIGO_SYSROOT_RECIPE="${MIGO_SYSROOT_RECIPE:-$MIGO_SYSROOT_HOME/sysroots.json}"
+# MIGO_SYSROOT is deliberately not defaulted here. Which directory the tarball
+# unpacks into is the recipe's answer, and repeating it would be a second pin that
+# can disagree with the one whose sha256 is the recorded sysroot identity.
 
 migo_sysroot_require() {
+    if [[ ! -f "$MIGO_SYSROOT_RECIPE" ]]; then
+        echo "[linux-sdk] Chromium sysroot recipe not found: $MIGO_SYSROOT_RECIPE" >&2
+        return 1
+    fi
+    local sysroot_dir sysroot_url
+    # One read for both answers the recipe holds about this key: where the tarball
+    # unpacks, and the URL an installed tree records in its .stamp.
+    if ! IFS=$'\t' read -r sysroot_dir sysroot_url < <(
+        python3 - "$MIGO_SYSROOT_RECIPE" "$MIGO_SYSROOT_KEY" <<'PY'
+import json
+import sys
+
+recipe, key = sys.argv[1], sys.argv[2]
+with open(recipe, encoding="utf-8") as handle:
+    entry = json.load(handle).get(key)
+if not entry:
+    sys.exit(f"no sysroot named {key} in {recipe}")
+missing = [field for field in ("SysrootDir", "URL", "Sha256Sum") if not entry.get(field)]
+if missing:
+    sys.exit(f"{key} is missing {', '.join(missing)}")
+print(entry["SysrootDir"], entry["URL"] + "/" + entry["Sha256Sum"], sep="\t")
+PY
+    ); then
+        return 1
+    fi
+    : "${MIGO_SYSROOT:=$MIGO_SYSROOT_HOME/$sysroot_dir}"
     if [[ ! -d "$MIGO_SYSROOT" ]]; then
         echo "[linux-sdk] sysroot not found: $MIGO_SYSROOT" >&2
-        echo "[linux-sdk] It ships with the Chromium/V8 checkout under" >&2
-        echo "[linux-sdk]   <rusty_v8_src>/build/linux/debian_bullseye_amd64-sysroot" >&2
-        echo "[linux-sdk] Set MIGO_SYSROOT to a Debian bullseye (glibc 2.31) sysroot." >&2
+        echo "[linux-sdk] Materialise it with: bash scripts/fetch-linux-sysroot.sh" >&2
+        return 1
+    fi
+    # The identity this recipe hashes into is written into the package manifest and
+    # is required to equal the one the V8 component recorded, so it is a claim about
+    # which sysroot the artifact was compiled against. Checking only that some
+    # libstdc++ exists would let MIGO_SYSROOT point at an unrelated Debian tree and
+    # still have the package swear it was the pinned Chromium one. The .stamp both
+    # this repo's fetch script and Chromium's own install-sysroot.py write is what
+    # ties a tree back to the pin, so an override is accepted only when it carries
+    # the one this recipe names.
+    local stamp="$MIGO_SYSROOT/.stamp"
+    if [[ ! -f "$stamp" ]]; then
+        echo "[linux-sdk] sysroot carries no .stamp, so it cannot be tied to the pin: $MIGO_SYSROOT" >&2
+        echo "[linux-sdk] Materialise it with: bash scripts/fetch-linux-sysroot.sh" >&2
+        return 1
+    fi
+    if [[ "$(cat "$stamp")" != "$sysroot_url" ]]; then
+        echo "[linux-sdk] sysroot was installed from a different pin than $MIGO_SYSROOT_RECIPE names" >&2
+        echo "[linux-sdk] recipe:    $sysroot_url" >&2
+        echo "[linux-sdk] installed: $(cat "$stamp")" >&2
         return 1
     fi
     local libstdcxx="$MIGO_SYSROOT/usr/lib/x86_64-linux-gnu/libstdc++.so.6"
     if [[ ! -f "$libstdcxx" ]]; then
         echo "[linux-sdk] sysroot is missing libstdc++: $libstdcxx" >&2
-        return 1
-    fi
-    if [[ ! -f "$MIGO_SYSROOT_RECIPE" ]]; then
-        echo "[linux-sdk] Chromium sysroot recipe not found: $MIGO_SYSROOT_RECIPE" >&2
         return 1
     fi
 }
