@@ -93,6 +93,69 @@
 
   Calling 33/33 "the device suite passes" would be exactly the overclaim this ledger keeps
   catching: it is the rendering suite, and it passes.
+
+  **A coverage hole found by looking at the phone, which no number here would have shown.**
+  The operator noticed the screen was black during these runs. It was, and the explanation
+  is benign — the 33 assertions finish in under a second (`Snap: 14 / FR: 14` by 0.8s),
+  `done()` stops the rAF loop (`0.0 FPS`), and the display holds the last frame; the
+  `lifecycle-probe` bundle draws nothing at all. Presentation is fine, proven separately:
+  `game-endless-runner` renders a full screen of content at **56.2 FPS** on the same
+  device and build.
+
+  The hole is what that near-miss exposes. **Every assertion in this suite reads
+  `getImageData`, which is the canvas backing store — it never passes through the
+  compositor.** So "33/33 green" and "the user sees a black screen" are not contradictory
+  states: if the presentation path broke, not one of these assertions would go red. The
+  suite proves *the engine computed the right pixels*, which is a strictly weaker claim
+  than *the pixels reached the screen*, and 2.2 needs the second one.
+
+  This is the "all green but black screen" failure mode already recorded in this project's
+  history, and the suite is structurally blind to it. The fix belongs in 2.2's remaining
+  harness: **judge from the screen, not from the canvas** — on Android `adb screencap`
+  yields the compositor's actual output, so it can be sampled per pixel the same way the
+  in-content assertions are. Sampling pixels rather than eyeballing the image is the
+  established rule here; what changes is *which* buffer is sampled.
+
+  **That gate now exists — migo-conformance `5c964ae`.** A `screen-fill` bundle paints four
+  quadrants in mutually distant colours and keeps redrawing after `done()` (rAF stops at
+  `done()`, so without that a later capture would find whatever the compositor happened to
+  retain); `runners/run-android-screen.sh` relaunches it, captures the framebuffer and
+  samples it. Measured on the device:
+
+  ```
+  PASS screen-fill/screen-top-left     at (270,936)  of 1080x2340 want [255,0,128] +/-8, got [255,0,132]
+  PASS screen-fill/screen-bottom-left  at (270,1755) of 1080x2340 want [255,200,0] +/-8, got [255,198,0]
+  SCREEN 4 assertions, 4 passed, 0 failed
+  ```
+
+  The small deviations (`198` for `200`, `132` for `128`) are themselves evidence that the
+  samples came through the display pipeline rather than back out of the canvas, which would
+  have been exact.
+
+  **Checked load-bearing against the state it exists for.** Sending `KEYCODE_HOME` after the
+  bundle reported `DONE` leaves the canvas contents correct while the screen shows something
+  else — the precise shape of "engine right, user sees nothing". All four screen assertions
+  go red, sampling the launcher wallpaper (`got [108,153,210]` where `[255,0,128]` was
+  painted), while **the 33 in-content assertions would have stayed green throughout**.
+
+  Three deliberate choices, each avoiding a way this could have become decoration:
+
+  * **the bundle announces its own expectations** (`SCREEN-EXPECT <name> <fx> <fy> <r,g,b>`)
+    from the same array it paints from, and the runner reads them out of the log. A second
+    copy of the coordinates in the runner would drift and then report a colour mismatch
+    whose real cause is a stale constant.
+  * **deployment is not duplicated** — the screen runner invokes the existing bench runner
+    for building, installing and canvas-side judging, then does only the capture. Two
+    copies of "how a bundle reaches a device" is how one stops matching the other.
+  * **four quadrants, not one flat fill.** A flat fill cannot distinguish a correct frame
+    from one drawn at the wrong scale, offset or orientation — and those are the failures
+    that actually happened here (content in the top-left ninth; content confined to the
+    bottom 55%).
+
+  `harness.js` gained `await body()` so a test body may return a promise; awaiting a
+  non-promise is a microtask, so synchronous bodies keep exactly one test per frame. Full
+  suite after all of this: **Android 39/39 and Linux 39/39**, so the new bundle costs
+  neither platform anything.
 - [ ] 2.3 Build the Linux shared and static SDK and player from a clean tree;
   validate X11, Wayland, Qt, resize, input, and teardown.
 - [ ] 2.4 Build the Windows DLL, import library, and static SDK natively with
