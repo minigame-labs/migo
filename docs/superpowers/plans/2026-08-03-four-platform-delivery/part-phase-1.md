@@ -1346,8 +1346,54 @@
   as one-off evidence; that is deliberately not a permanent gate, since the drift to
   prevent is between the two statements rather than inside either one.
 
-  **Still open here:** `aarch64` needs its own archive (and a Skia) before it can be
-  sealed, and the Windows writer still records no patch provenance — see 1.1l.
+  **`aarch64` is now built and sealed too — 2026-08-10.** `scripts/build-v8-ohos.sh
+  aarch64` produced `librusty_v8.a` (169,410,006 bytes) and its component manifest
+  verifies: `component_id` `2a85cc638945c9a6476bde49823c457804db03876ce5ca7e9858d969b94ee00b`,
+  computed and re-verified independently by the writer and the validator.
+  `scripts/fetch-v8-archives.sh --check --all` now reports **5 archives verified**
+  including `aarch64-linux-ohos`; that target was on the fetcher's absent list with the
+  reason "only the x86_64 OpenHarmony archive has been built and sealed", which stopped
+  being true, so it is listed now. Its *download* still has no published asset, and the
+  fetcher's comment says so rather than implying one exists.
+
+  **Getting there needed four blockers cleared, and three were pre-existing defects
+  rather than work.**
+
+  1. Two declared patches would not apply: `migo-build-rs-prebuilt-binding.diff` and
+     `0003-compiler-use-custom-libcxx-for-v8.patch`. In both cases the **code was already
+     identical** and only a *comment* differed — `Clang 19+` where the tree said `20+`,
+     and two explanatory lines the patch gained later. Someone had hand-edited the shared
+     checkout. `--fuzz=0` refusing them is correct and not over-strict: the gate cannot
+     tell a comment edit from a code edit, and what it is defending is that the tree is
+     *exactly* the declared patch set. The fix was to restore the tree from `HEAD` and let
+     the patches define it, never to reword a patch to match a tree — these patches are
+     provenance inputs to the already-sealed x86_64 manifest.
+  2. `gn` was version 2315 where the lock pins 2502. Fixed by `scripts/build-gn.sh`, which
+     refused twice on the way with the exact command to fix each (no checkout; wrong
+     revision) — a gate that tells you what to run is worth more than one that just fails.
+  3. **A hermetic defect the seal caught, and it would recur on every clean tree.** GNU
+     `patch` writes a `.orig` beside any file whose hunks land at an offset, and these
+     patches routinely land at an offset. That backup is an untracked file inside the very
+     tree `assert_tree_is_exactly_patched` then proves is exactly the declared patch set,
+     so the seal failed with `undeclared change: ?? build/config/c++/c++.gni.orig`
+     immediately after a *successful* first apply. It only appears where the patch was not
+     already in effect — i.e. exactly the from-clean case this manifest exists to make
+     reproducible, which is why it had never been seen. `v8-patch-apply.sh` now passes
+     `--no-backup-if-mismatch`.
+  4. Two stale `.migo_ohos_build_*.log` files from July sat in the checkout; no script in
+     the tree writes that path any more, so they were leftovers from a superseded script
+     version, and the same proof rejected them.
+
+  **A gap this exposed, and it belongs to 1.1j.** Neither OpenHarmony manifest records
+  `gn` at all — provenance carries `build_recipe`, `build_recipe_sha256`, `licenses` and
+  `source_revision`, and nothing else. So the gn pin is a *build-time* assertion only, and
+  **an archive cannot be asked which gn produced it.** Concretely: the gn found installed
+  here was a CIPD-downloaded prebuilt 2315 dated June, while the assertion demanding 2502
+  was added in August, and the x86_64 archive was sealed in between. Whether that archive
+  was built with 2315 or 2502 **cannot be determined from the evidence**, and stating
+  either would exceed it. That is precisely the hole 1.1j names.
+
+  **Still open here:** the Windows writer still records no patch provenance — see 1.1l.
 
   **Independent review found two P1s here, and the first was a precondition nobody
   stated.** `build-v8-ohos.sh` exports `V8_PREBUILT_BINDING`, a hook that exists **only**

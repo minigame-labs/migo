@@ -88,7 +88,16 @@ v8_require_patch() {
     # No `</dev/null`: a second redirect on the same descriptor wins, so it fed
     # patch an empty stdin -- patch then exited 0 having applied nothing.
     # `--batch` already suppresses the prompting it guarded against.
-    if ! patch -p1 -d "$tree" --batch --forward --fuzz=0 < "$pf"; then
+    # `--no-backup-if-mismatch`: GNU patch writes a `.orig` beside any file whose
+    # hunks applied with an offset, and these patches routinely apply at an offset
+    # because the revisions they target move. That backup is an untracked file
+    # inside the very tree the component manifest then proves is EXACTLY the
+    # declared patch set, so the seal fails with `undeclared change: ??
+    # build/config/c++/c++.gni.orig` -- measured, immediately after a first
+    # successful apply. The failure only appears on a tree where the patch was not
+    # already in effect, which is exactly the from-clean case the manifest exists to
+    # make reproducible, so it cannot be left to be cleaned up by hand.
+    if ! patch -p1 -d "$tree" --batch --forward --fuzz=0 --no-backup-if-mismatch < "$pf"; then
         _v8_patch_err "patch failed: $name"
         return 1
     fi
