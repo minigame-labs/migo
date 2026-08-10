@@ -40,8 +40,10 @@ use std::{any::Any, sync::Arc};
 mod attachment;
 mod control;
 mod geometry;
+mod host_window;
 
 pub use control::{SurfaceControl, SurfaceControlAttachError, SurfaceControlInstallError};
+pub use host_window::{HostWindowInfo, HostWindowMetrics, HostWindowState};
 
 pub use attachment::{
     PreparedSurfaceRelease, PublicSurfaceGeneration, SurfaceGeneration, SurfaceGenerationError,

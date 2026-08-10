@@ -23,6 +23,7 @@ use migo_core::{
     HostThread, PlatformServices, host_ingress, lease_surface_tracked, lease_surface_with_resource,
     retire_surface, send_critical_command_to_host, spawn_host_thread_tracked,
 };
+use shared::surface::{HostWindowMetrics, HostWindowState};
 use shared::{
     protocol::host_cmd::HostCommand,
     surface::{
@@ -61,7 +62,7 @@ pub struct MigoSurfaceAttachment {
     width_pixels: u32,
     height_pixels: u32,
     pixel_ratio: PixelRatio,
-    window_state: Arc<host_kit::CapiWindowState>,
+    window_state: Arc<HostWindowState>,
     lost: bool,
 }
 
@@ -221,7 +222,7 @@ pub unsafe extern "C" fn migo_session_attach_surface(
         let configuration = descriptor.configuration();
         let pixel_ratio = PixelRatio::new(configuration.scale_factor())
             .expect("the ABI validator rejects invalid scale factors");
-        let window_metrics = host_kit::CapiWindowMetrics::new(
+        let window_metrics = HostWindowMetrics::new(
             configuration.width_pixels(),
             configuration.height_pixels(),
             pixel_ratio,
@@ -349,7 +350,7 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                 }
                 None => {
                     debug_assert!(existing_window_state.is_none());
-                    let window_state = Arc::new(host_kit::CapiWindowState::new(window_metrics));
+                    let window_state = Arc::new(HostWindowState::new(window_metrics));
                     let notifier = configured_callbacks.map(|callbacks| {
                         Arc::new(callbacks::Notifier::new(
                             callbacks,
@@ -597,7 +598,7 @@ pub unsafe extern "C" fn migo_surface_update(
         // stale-sized frame with no further callback to recover from.
         let pixel_ratio =
             PixelRatio::new(configuration.scale_factor()).expect("validated Surface scale factor");
-        let previous_metrics = window_state.replace(host_kit::CapiWindowMetrics::new(
+        let previous_metrics = window_state.replace(HostWindowMetrics::new(
             configuration.width_pixels(),
             configuration.height_pixels(),
             pixel_ratio,
@@ -967,13 +968,11 @@ mod tests {
             width_pixels: 640,
             height_pixels: 480,
             pixel_ratio: PixelRatio::new(1.0).expect("valid test pixel ratio"),
-            window_state: Arc::new(host_kit::CapiWindowState::new(
-                host_kit::CapiWindowMetrics::new(
-                    640,
-                    480,
-                    PixelRatio::new(1.0).expect("valid test pixel ratio"),
-                ),
-            )),
+            window_state: Arc::new(HostWindowState::new(HostWindowMetrics::new(
+                640,
+                480,
+                PixelRatio::new(1.0).expect("valid test pixel ratio"),
+            ))),
             lost: false,
         }
     }

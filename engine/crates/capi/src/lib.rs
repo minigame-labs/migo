@@ -81,6 +81,7 @@ use migo_capi_abi::{
 };
 use migo_core::{HostThread, send_command_to_host};
 use panic_barrier::guard;
+use shared::surface::HostWindowState;
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceLossReason};
 
 // ---- Handles ----------------------------------------------------------------
@@ -220,7 +221,7 @@ struct SessionState {
     notifier: Option<Arc<callbacks::Notifier>>,
     /// Dynamic physical window metrics shared with the C HostKit. Retained by
     /// the Session so detach/reattach updates the same service object.
-    window_state: Option<Arc<host_kit::CapiWindowState>>,
+    window_state: Option<Arc<HostWindowState>>,
     /// Last visibility level set by the host.
     ///
     /// Visibility is a property of the session, not of the surface, and every

@@ -27,7 +27,6 @@ use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 #[cfg(target_os = "windows")]
 use migo_core::{HostId, host_ingress};
 use migo_core::{PlatformServices, send_command_to_host, spawn_host_thread};
-use platform::host_window::HostWindowMetrics;
 #[cfg(target_os = "linux")]
 use platform::linux::platform::LinuxPlatform as HostPlatform;
 #[cfg(target_os = "linux")]
@@ -44,6 +43,7 @@ use platform::windows::presenter::{
 };
 #[cfg(target_os = "windows")]
 use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
+use shared::surface::{HostWindowMetrics, HostWindowState, PixelRatio};
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
 #[cfg(target_os = "windows")]
@@ -204,9 +204,17 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // reason the log line above is: content laying itself out from a size the
     // window manager refused is content laying itself out wrong. The player has
     // no HiDPI notion, so one physical pixel is one CSS pixel.
-    let host_kit: Arc<dyn PlatformServices> = Arc::new(
-        HostPlatform::new().with_window(HostWindowMetrics::new(surface_w, surface_h, 1.0)),
-    );
+    // Held by the player as well as the platform: the host owns this state and
+    // republishes it whenever the window it presents into changes size, which is
+    // what lets `wx.getSystemInfoSync()` follow a resize instead of reporting
+    // the size the window had at start-up.
+    let window_state = Arc::new(HostWindowState::new(HostWindowMetrics::new(
+        surface_w,
+        surface_h,
+        PixelRatio::new(1.0).expect("1.0 is a valid pixel ratio"),
+    )));
+    let host_kit: Arc<dyn PlatformServices> =
+        Arc::new(HostPlatform::new().with_window(Arc::clone(&window_state)));
     tracing::info!("spawning host thread ({surface_w}x{surface_h} {mode})");
     let host = spawn_host_thread(surface, graphics_platform, host_kit, opt)
         .map_err(|e| format!("spawn_host_thread: {e:?}"))?;

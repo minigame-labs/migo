@@ -3,13 +3,6 @@ pub mod android;
 #[cfg(any(target_os = "android", test))]
 mod android_permission_gate;
 
-// Desktop platforms only: Android measures its own window through the JVM.
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "ohos")),
-    target_os = "windows"
-))]
-pub mod host_window;
-
 #[cfg(any(target_os = "android", test))]
 mod host_owners;
 
