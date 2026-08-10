@@ -21,8 +21,12 @@ import com.migo.runtime.callback.AdEventSink;
 import com.migo.runtime.callback.AdHandler;
 import com.migo.runtime.callback.AuthHandler;
 import com.migo.runtime.callback.GameLogHandler;
+import com.migo.runtime.callback.NavigationHandler;
+import com.migo.runtime.callback.PaymentHandler;
 import com.migo.runtime.callback.PermissionHandler;
 import com.migo.runtime.callback.PermissionSink;
+import com.migo.runtime.callback.SettingHandler;
+import com.migo.runtime.callback.ShareHandler;
 import com.migo.runtime.callback.SubpackageHandler;
 
 import com.migo.runtime.GameSession;
@@ -121,6 +125,22 @@ public final class NativeExports {
 
     /** Per-session subpackage handlers set via GameSession API. */
     private static final ConcurrentHashMap<Integer, SubpackageHandler> sSubpackageHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session setting handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, SettingHandler> sSettingHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session share handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, ShareHandler> sShareHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session navigation handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, NavigationHandler> sNavigationHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session payment handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, PaymentHandler> sPaymentHandlers =
             new ConcurrentHashMap<>();
 
     /** Per-session message handlers set via GameSession.setMessageHandler(). */
@@ -1669,24 +1689,6 @@ public final class NativeExports {
      * Extract the "requestId" field from a JSON string as a raw number string.
      * Returns null if not present or not parseable.
      */
-    private static String extractRequestId(String optionsJson) {
-        if (optionsJson == null) return null;
-        try {
-            org.json.JSONObject opts = new org.json.JSONObject(optionsJson);
-            if (opts.has("requestId")) {
-                return String.valueOf(opts.getInt("requestId"));
-            }
-        } catch (Exception e) {
-            // ignore
-        }
-        return null;
-    }
-
-    private static String buildDeferredErrorResult(String requestId, String errMsg, int errCode) {
-        String ridField = requestId != null ? "\"requestId\":" + requestId + "," : "";
-        return "{" + ridField + "\"error\":\"" + errMsg + "\",\"errCode\":" + errCode + "}";
-    }
-
     // ==================== Keyboard (delegates to InputExports) ====================
 
     public static void keyboardShow(int sessionId, String optionsJson) {
@@ -2523,110 +2525,269 @@ public final class NativeExports {
         }
     }
 
+    // ==================== Commercial host callbacks ====================
+    //
+    // Settings, share, navigation and payment. The runtime owns none of them:
+    // it has no settings screen, no social graph, no app registry and no
+    // merchant credentials, so everything below is transport -- a parsed
+    // request out to the embedder's handler, one settlement back. Registering
+    // no handler is the ordinary state of an integration in progress, and it
+    // settles as "not supported" rather than staying silent, because a pending
+    // request content is awaiting is a stalled game.
+
+    /**
+     * Set or clear the setting handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setSettingHandler(SettingHandler)}.
+     */
+    public static void setSettingHandler(int sessionId, SettingHandler handler) {
+        if (handler == null) {
+            sSettingHandlers.remove(sessionId);
+        } else {
+            sSettingHandlers.put(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the share handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setShareHandler(ShareHandler)}.
+     */
+    public static void setShareHandler(int sessionId, ShareHandler handler) {
+        if (handler == null) {
+            sShareHandlers.remove(sessionId);
+        } else {
+            sShareHandlers.put(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the navigation handler for a session.
+     *
+     * @hide Called by
+     * {@link com.migo.runtime.GameSession#setNavigationHandler(NavigationHandler)}.
+     */
+    public static void setNavigationHandler(int sessionId, NavigationHandler handler) {
+        if (handler == null) {
+            sNavigationHandlers.remove(sessionId);
+        } else {
+            sNavigationHandlers.put(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the payment handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setPaymentHandler(PaymentHandler)}.
+     */
+    public static void setPaymentHandler(int sessionId, PaymentHandler handler) {
+        if (handler == null) {
+            sPaymentHandlers.remove(sessionId);
+        } else {
+            sPaymentHandlers.put(sessionId, handler);
+        }
+    }
+
+    private static void clearSettingHandler(int sessionId) {
+        sSettingHandlers.remove(sessionId);
+    }
+
+    private static void clearShareHandler(int sessionId) {
+        sShareHandlers.remove(sessionId);
+    }
+
+    private static void clearNavigationHandler(int sessionId) {
+        sNavigationHandlers.remove(sessionId);
+    }
+
+    private static void clearPaymentHandler(int sessionId) {
+        sPaymentHandlers.remove(sessionId);
+    }
+
+    /**
+     * Claim one deferred request, so that whatever answers it answers once.
+     *
+     * <p>Answering is unconditional from here on: the handler settles it, the absence of a
+     * handler settles it, and a handler that throws settles it too. There is no path that
+     * returns without content being told something.
+     */
+    private static HostDelegation.Settlement settlement(
+            int sessionId, JSONObject options, HostDelegation.ResultChannel channel) {
+        return new HostDelegation.Settlement(
+                sessionId,
+                CallbackCorrelation.requestIdOf(options),
+                channel,
+                () -> isSessionTerminated(sessionId));
+    }
+
+    /**
+     * Hand a request to a handler, settling it if there is none or if it throws.
+     *
+     * <p>A host exception is a host bug, but content cannot be left holding a pending
+     * request because of it -- the same trade the ad bridge makes.
+     */
+    private static <H> void delegate(
+            int sessionId,
+            ConcurrentHashMap<Integer, H> handlers,
+            String api,
+            HostDelegation.Settlement settlement,
+            java.util.function.Consumer<H> invoke) {
+        H handler = handlers.get(sessionId);
+        if (handler == null) {
+            settlement.fail(-2, api + ":fail not supported");
+            return;
+        }
+        try {
+            invoke.accept(handler);
+        } catch (Exception thrown) {
+            android.util.Log.w(TAG, api + ": handler threw: " + thrown);
+            settlement.fail(-1, api + ":fail handler threw: " + thrown);
+        }
+    }
+
     // ==================== Setting ====================
 
     /**
      * Open the mini program setting page.
-     * The host should show a settings UI and call back via
-     * {@link NativeMethods#onOpenSettingResult(int, String)}.
+     * Delegates to the session's {@link SettingHandler}.
      *
      * @param sessionId   The session ID
      * @param optionsJson JSON options
      */
     public static void openSetting(int sessionId, String optionsJson) {
-        // TODO: implement with a SettingManager when ready
-        String rid = extractRequestId(optionsJson);
-        NativeMethods.onOpenSettingResult(sessionId,
-                buildDeferredErrorResult(rid, "openSetting:fail not supported", -2));
+        JSONObject options = HostDelegation.options(optionsJson);
+        HostDelegation.Settlement settlement =
+                settlement(sessionId, options, NativeMethods::onOpenSettingResult);
+        delegate(sessionId, sSettingHandlers, "openSetting", settlement,
+                handler -> handler.openSetting(HostDelegation.settingSink(settlement)));
     }
 
     // ==================== Share ====================
 
     /**
      * Trigger the native share flow.
-     * The host should show a share UI and call back via
-     * {@link NativeMethods#onShareAppMessageResult(int, String)}.
+     * Delegates to the session's {@link ShareHandler}.
      *
      * @param sessionId   The session ID
      * @param optionsJson JSON with title, imageUrl, query
      */
     public static void shareAppMessage(int sessionId, String optionsJson) {
-        // TODO: implement with a ShareManager when ready
-        String rid = extractRequestId(optionsJson);
-        NativeMethods.onShareAppMessageResult(sessionId,
-                buildDeferredErrorResult(rid, "shareAppMessage:fail not supported", -2));
+        JSONObject options = HostDelegation.options(optionsJson);
+        HostDelegation.Settlement settlement =
+                settlement(sessionId, options, NativeMethods::onShareAppMessageResult);
+        delegate(sessionId, sShareHandlers, "shareAppMessage", settlement,
+                handler -> handler.shareAppMessage(
+                        HostDelegation.shareRequest(options),
+                        HostDelegation.shareSink(settlement)));
     }
 
     // ==================== Navigate ====================
 
     /**
      * Navigate to another mini program.
-     * The host should perform navigation and call back via
-     * {@link NativeMethods#onNavigateToMiniProgramResult(int, String)}.
+     * Delegates to the session's {@link NavigationHandler}.
      *
      * @param sessionId   The session ID
      * @param optionsJson JSON with appId, path, extraData, envVersion
      */
     public static void navigateToMiniProgram(int sessionId, String optionsJson) {
-        // TODO: implement navigation when ready
-        String rid = extractRequestId(optionsJson);
-        NativeMethods.onNavigateToMiniProgramResult(sessionId,
-                buildDeferredErrorResult(rid, "navigateToMiniProgram:fail not supported", -2));
+        JSONObject options = HostDelegation.options(optionsJson);
+        HostDelegation.Settlement settlement =
+                settlement(sessionId, options, NativeMethods::onNavigateToMiniProgramResult);
+        delegate(sessionId, sNavigationHandlers, "navigateToMiniProgram", settlement,
+                handler -> handler.navigateToMiniProgram(
+                        HostDelegation.navigateRequest(options),
+                        HostDelegation.navigationSink(settlement)));
     }
 
     /**
      * Open the customer service conversation.
+     * Delegates to the session's {@link NavigationHandler}.
+     *
+     * <p>Alone among its siblings this has no result channel to settle on: the engine
+     * defines none for it, and content's call resolves off this method's return across JNI
+     * rather than off a later callback. So a refusal is reported by throwing, which is what
+     * the engine's void call converts into the {@code fail} content sees -- and why a host
+     * that cannot open the conversation must return {@code false} rather than throw its own
+     * exception, since only this frame knows the message content expects.
      *
      * @param sessionId   The session ID
      * @param optionsJson JSON with sessionFrom, showMessageCard, etc.
      */
     public static void openCustomerServiceConversation(int sessionId, String optionsJson) {
-        // TODO: implement customer service when ready
-        throw new RuntimeException("openCustomerServiceConversation:fail not supported");
+        NavigationHandler handler = sNavigationHandlers.get(sessionId);
+        boolean opened = false;
+        if (handler != null && !isSessionTerminated(sessionId)) {
+            try {
+                opened = handler.openCustomerServiceConversation(
+                        HostDelegation.customerServiceRequest(
+                                HostDelegation.options(optionsJson)));
+            } catch (Exception thrown) {
+                android.util.Log.w(TAG,
+                        "openCustomerServiceConversation: handler threw: " + thrown);
+            }
+        }
+        if (!opened) {
+            throw new UnsupportedOperationException(
+                    "openCustomerServiceConversation:fail not supported");
+        }
     }
 
     // ==================== Payment ====================
 
     /**
      * Check if the current environment supports Midas payment.
+     * Delegates to the session's {@link PaymentHandler}.
      *
      * @param sessionId   The session ID
      * @param optionsJson JSON options
      * @return JSON string: {"data":{"allow_pay":true/false}}
      */
     public static String checkIsSupportMidasPayment(int sessionId, String optionsJson) {
-        // TODO: implement real payment check when ready
-        return "{\"data\":{\"allow_pay\":false}}";
+        PaymentHandler handler = sPaymentHandlers.get(sessionId);
+        boolean allowed = false;
+        if (handler != null && !isSessionTerminated(sessionId)) {
+            try {
+                allowed = handler.isMidasPaymentSupported();
+            } catch (Exception thrown) {
+                android.util.Log.w(TAG, "checkIsSupportMidasPayment: handler threw: " + thrown);
+            }
+        }
+        return "{\"data\":{\"allow_pay\":" + allowed + "}}";
     }
 
     /**
      * Trigger Midas payment flow.
-     * The host should show payment UI and call back via
-     * {@link NativeMethods#onMidasPaymentResult(int, String)}.
+     * Delegates to the session's {@link PaymentHandler}.
      *
      * @param sessionId   The session ID
      * @param optionsJson JSON with mode, env, offerId, currencyType, etc.
      */
     public static void requestMidasPayment(int sessionId, String optionsJson) {
-        // TODO: implement with a PaymentManager when ready
-        String rid = extractRequestId(optionsJson);
-        NativeMethods.onMidasPaymentResult(sessionId,
-                buildDeferredErrorResult(rid, "requestMidasPayment:fail not supported", -2));
+        JSONObject options = HostDelegation.options(optionsJson);
+        HostDelegation.Settlement settlement =
+                settlement(sessionId, options, NativeMethods::onMidasPaymentResult);
+        delegate(sessionId, sPaymentHandlers, "requestMidasPayment", settlement,
+                handler -> handler.requestMidasPayment(
+                        HostDelegation.paymentRequest(options),
+                        HostDelegation.paymentSink(settlement)));
     }
 
     /**
      * Trigger Midas payment for game items.
-     * The host should show payment UI and call back via
-     * {@link NativeMethods#onMidasPaymentGameItemResult(int, String)}.
+     * Delegates to the session's {@link PaymentHandler}.
      *
      * @param sessionId   The session ID
      * @param optionsJson JSON with signData, paySig, signature
      */
     public static void requestMidasPaymentGameItem(int sessionId, String optionsJson) {
-        // TODO: implement with a PaymentManager when ready
-        String rid = extractRequestId(optionsJson);
-        NativeMethods.onMidasPaymentGameItemResult(sessionId,
-                buildDeferredErrorResult(rid, "requestMidasPaymentGameItem:fail not supported", -2));
+        JSONObject options = HostDelegation.options(optionsJson);
+        HostDelegation.Settlement settlement =
+                settlement(sessionId, options, NativeMethods::onMidasPaymentGameItemResult);
+        delegate(sessionId, sPaymentHandlers, "requestMidasPaymentGameItem", settlement,
+                handler -> handler.requestMidasPaymentGameItem(
+                        HostDelegation.gameItemPaymentRequest(options),
+                        HostDelegation.paymentSink(settlement)));
     }
 
     // ---- ADPF Thermal Management ----
@@ -2707,6 +2868,10 @@ public final class NativeExports {
                 () -> clearMessageHandler(sessionId),
                 () -> clearAdHandler(sessionId),
                 () -> sAdSinks.remove(sessionId),
+                () -> clearSettingHandler(sessionId),
+                () -> clearShareHandler(sessionId),
+                () -> clearNavigationHandler(sessionId),
+                () -> clearPaymentHandler(sessionId),
                 () -> clearPermissionHandler(sessionId),
                 () -> sPermissionSinks.remove(sessionId),
                 () -> unregisterErrorCallback(sessionId),

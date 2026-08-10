@@ -86,6 +86,13 @@ engine/third_party/rusty_v8/*/gn_out/
 # stray `git add -A` from committing a 190 MB library into LFS.
 engine/third_party/rusty_v8/x86_64-pc-windows-msvc/
 
+# The Debian bullseye sysroot tree scripts/fetch-linux-sysroot.sh unpacks from
+# Chromium's published tarball. sysroots.json beside it is tracked, and is the whole
+# reason the tree is reproducible anywhere: it names the tarball and its sha256, and
+# its own sha256 is the sysroot identity every Linux package manifest records.
+engine/third_party/linux-sysroot/*
+!engine/third_party/linux-sysroot/sysroots.json
+
 # Binaries built by the out-of-tree consumer examples. They are proof the
 # package works, not source; tests/c_host/build-with-pkgconfig.sh and the
 # CMake project regenerate them.

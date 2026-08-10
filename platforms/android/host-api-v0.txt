@@ -8,6 +8,10 @@
   public abstract void emitLoad(int);
   public abstract void emitLoad(int, boolean);
   public abstract void emitResize(int, int, int);
+  public abstract void fail(int, java.lang.String);
+  public abstract void fail(int, java.lang.String);
+  public abstract void fail(int, java.lang.String);
+  public abstract void fail(int, java.lang.String);
   public abstract void failRequest(int, java.lang.String);
   public abstract void login(int, com.migo.runtime.callback.AuthHandler$LoginCallback);
   public abstract void onError(com.migo.runtime.MigoException);
@@ -31,6 +35,10 @@
   public abstract void requestScope(int, java.lang.String, java.lang.String, com.migo.runtime.callback.PermissionSink);
   public abstract void resolveRequest(int, boolean);
   public abstract void setScope(java.lang.String, boolean);
+  public abstract void settleNavigated();
+  public abstract void settleOpened(java.util.Map<java.lang.String, java.lang.Boolean>);
+  public abstract void settlePaid();
+  public abstract void settleShared();
   public boolean dispatchTouchEvent(android.view.MotionEvent);
   public boolean initIcuData(java.lang.String);
   public boolean isCodeSigningEnabled();
@@ -87,7 +95,14 @@
   public com.migo.runtime.callback.AuthHandler$UserInfo userInfo;
   public com.migo.runtime.callback.AuthHandler$UserInfo();
   public com.migo.runtime.callback.AuthHandler$UserInfoResult();
+  public com.migo.runtime.callback.NavigationHandler$CustomerServiceRequest(java.lang.String, boolean, java.lang.String, java.lang.String, java.lang.String);
+  public com.migo.runtime.callback.NavigationHandler$NavigateRequest(java.lang.String, java.lang.String, java.util.Map<java.lang.String, java.lang.Object>, java.lang.String);
+  public com.migo.runtime.callback.PaymentHandler$GameItemPaymentRequest(java.lang.String, java.lang.String, java.lang.String);
+  public com.migo.runtime.callback.PaymentHandler$PaymentRequest(java.lang.String, int, java.lang.String, java.lang.String, java.lang.String, int, int, java.lang.String);
+  public com.migo.runtime.callback.ShareHandler$ShareRequest(java.lang.String, java.lang.String, java.lang.String, java.lang.String);
   public com.migo.runtime.callback.SubpackageHandler$SubpackageRequest(java.lang.String, java.lang.String);
+  public default boolean isMidasPaymentSupported();
+  public default boolean openCustomerServiceConversation(com.migo.runtime.callback.NavigationHandler$CustomerServiceRequest);
   public default void createAd(int, java.lang.String, java.lang.String, java.lang.String, com.migo.runtime.callback.AdEventSink);
   public default void destroyAd(int);
   public default void emitShowFailed(int, int, java.lang.String);
@@ -95,24 +110,53 @@
   public default void getUserInfo(boolean, java.lang.String, com.migo.runtime.callback.AuthHandler$UserInfoCallback);
   public default void hideAd(int, com.migo.runtime.callback.AdEventSink);
   public default void loadAd(int, com.migo.runtime.callback.AdEventSink);
+  public default void navigateToMiniProgram(com.migo.runtime.callback.NavigationHandler$NavigateRequest, com.migo.runtime.callback.NavigationSink);
   public default void onDestroyed();
   public default void onLoadingEnd();
   public default void onLoadingProgress(float, java.lang.String);
   public default void onLoadingStart();
   public default void onPaused();
   public default void onResumed();
+  public default void openSetting(com.migo.runtime.callback.SettingSink);
+  public default void requestMidasPayment(com.migo.runtime.callback.PaymentHandler$PaymentRequest, com.migo.runtime.callback.PaymentSink);
+  public default void requestMidasPaymentGameItem(com.migo.runtime.callback.PaymentHandler$GameItemPaymentRequest, com.migo.runtime.callback.PaymentSink);
+  public default void shareAppMessage(com.migo.runtime.callback.ShareHandler$ShareRequest, com.migo.runtime.callback.ShareSink);
   public default void showAd(int, com.migo.runtime.callback.AdEventSink);
   public default void updateAdStyle(int, java.lang.String, com.migo.runtime.callback.AdEventSink);
+  public final boolean showMessageCard;
   public final float fps;
   public final float frameTimeMs;
+  public final int buyQuantity;
   public final int commandDrops;
   public final int droppedFrames;
+  public final int env;
   public final int firstFrameMs;
   public final int inputCoalesced;
   public final int inputReliableReserveUses;
   public final int inputSaturationEvents;
+  public final int zoneId;
+  public final java.lang.String appId;
+  public final java.lang.String currencyType;
+  public final java.lang.String envVersion;
+  public final java.lang.String imageUrl;
+  public final java.lang.String imageUrlId;
+  public final java.lang.String mode;
   public final java.lang.String name;
+  public final java.lang.String offerId;
+  public final java.lang.String outTradeNo;
+  public final java.lang.String path;
+  public final java.lang.String paySig;
+  public final java.lang.String platform;
+  public final java.lang.String query;
   public final java.lang.String root;
+  public final java.lang.String sendMessageImg;
+  public final java.lang.String sendMessagePath;
+  public final java.lang.String sendMessageTitle;
+  public final java.lang.String sessionFrom;
+  public final java.lang.String signData;
+  public final java.lang.String signature;
+  public final java.lang.String title;
+  public final java.util.Map<java.lang.String, java.lang.Object> extraData;
   public float getDisplayDensity();
   public int gender;
   public int getActiveSessionCount();
@@ -261,9 +305,13 @@
   public void setGameLogHandler(com.migo.runtime.callback.GameLogHandler);
   public void setListener(com.migo.runtime.callback.GameSessionListener);
   public void setMessageHandler(com.migo.runtime.GameSession$MessageHandler);
+  public void setNavigationHandler(com.migo.runtime.callback.NavigationHandler);
   public void setOnStateChangeListener(com.migo.runtime.OnStateChangeListener);
+  public void setPaymentHandler(com.migo.runtime.callback.PaymentHandler);
   public void setPermissionHandler(com.migo.runtime.callback.PermissionHandler);
   public void setSessionCreatedListener(com.migo.runtime.MigoGameView$SessionCreatedListener);
+  public void setSettingHandler(com.migo.runtime.callback.SettingHandler);
+  public void setShareHandler(com.migo.runtime.callback.ShareHandler);
   public void setSubpackageHandler(com.migo.runtime.callback.SubpackageHandler);
   public void setUpdateInterval(int);
   public void startGame(java.lang.String);
@@ -300,6 +348,11 @@ public final class com.migo.runtime.RuntimeConfig$LogLevel extends java.lang.Enu
 public final class com.migo.runtime.SessionState extends java.lang.Enum<com.migo.runtime.SessionState> {
 public final class com.migo.runtime.callback.AuthHandler$UserInfo {
 public final class com.migo.runtime.callback.AuthHandler$UserInfoResult {
+public final class com.migo.runtime.callback.NavigationHandler$CustomerServiceRequest {
+public final class com.migo.runtime.callback.NavigationHandler$NavigateRequest {
+public final class com.migo.runtime.callback.PaymentHandler$GameItemPaymentRequest {
+public final class com.migo.runtime.callback.PaymentHandler$PaymentRequest {
+public final class com.migo.runtime.callback.ShareHandler$ShareRequest {
 public final class com.migo.runtime.callback.SubpackageHandler$SubpackageRequest {
 public interface com.migo.runtime.GameSession$MessageHandler {
 public interface com.migo.runtime.MigoGameView$SessionCreatedListener {
@@ -313,10 +366,31 @@ public interface com.migo.runtime.callback.AuthHandler$PhoneNumberCallback {
 public interface com.migo.runtime.callback.AuthHandler$UserInfoCallback {
 public interface com.migo.runtime.callback.GameLogHandler {
 public interface com.migo.runtime.callback.GameSessionListener {
+public interface com.migo.runtime.callback.NavigationHandler {
+public interface com.migo.runtime.callback.NavigationSink {
+public interface com.migo.runtime.callback.PaymentHandler {
+public interface com.migo.runtime.callback.PaymentSink {
 public interface com.migo.runtime.callback.PermissionHandler {
 public interface com.migo.runtime.callback.PermissionSink {
+public interface com.migo.runtime.callback.SettingHandler {
+public interface com.migo.runtime.callback.SettingSink {
+public interface com.migo.runtime.callback.ShareHandler {
+public interface com.migo.runtime.callback.ShareSink {
 public interface com.migo.runtime.callback.SubpackageHandler {
 public interface com.migo.runtime.callback.SubpackageHandler$DownloadCallback {
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
 }
 }
 }

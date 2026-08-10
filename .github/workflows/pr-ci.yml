@@ -276,6 +276,16 @@ jobs:
           cargo test --manifest-path tools/artifact-manifest/Cargo.toml --locked
           bash scripts/test-artifact-manifest-contract.sh
 
+      # An attestation is worth something only if the bytes it swears to can be
+      # arrived at independently. Until scripts/package-sdk.sh existed, every
+      # migo-sdk-*.tar.gz was a `tar` typed on a release machine: the published
+      # Linux archive records the builder's account as the owner of every entry and
+      # that machine's wall clock as every mtime, so its package_sha256 is a number
+      # only that machine could produce. This packages a synthetic prefix twice and
+      # fails if the two runs differ.
+      - name: SDK release packaging contract
+        run: bash scripts/test-sdk-package-reproducibility-contract.sh
+
       # Host clippy is SCOPED to the crates that build on a plain Linux host with
       # no extra system packages: shared, io, runtime-v8. graphics needs Skia's
       # EGL/GLES headers and audio needs libasound, which this fast gate does not
@@ -373,6 +383,19 @@ jobs:
             scripts/write-linux-v8-component-manifest.py \
             scripts/write-v8-component-manifest.py \
             scripts/verify-android-aar-manifests.py
+
+      # When this was written, ten pr-ci quality-gate steps were absent from
+      # release.yml's quality-gate: Release asset ordering contract, Release version
+      # contract, Reproducible timestamp contract, Android merged manifest permission
+      # contract, Runtime generation fence contract, JNI outbound signature contract,
+      # OpenHarmony newer-sysroot selection contract, OpenHarmony API floor
+      # declaration contract, Local verification entry point contract, and Python
+      # script syntax check. The three release-specific gates did not run on the
+      # workflow that cuts releases. This step fails whenever that gap reopens.
+      - name: Release gate parity contract
+        run: |
+          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
+          bash scripts/test-release-gate-parity-contract.sh
 
   # ── Job 2: Linux Qt Host Kit (isolated source contract; no V8/LFS) ──
   linux-qt-host-kit:

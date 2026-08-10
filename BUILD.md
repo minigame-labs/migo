@@ -1,9 +1,9 @@
 # Migo Build Guide
 
 How to set up a development environment and build Migo on **Linux**,
-**macOS**, and **Windows**. Covers both host-side Rust builds
-(unit tests, smoke checks) and Android cross-compilation
-(`libmigo.so`, AAR packaging).
+**macOS**, and **Windows**. Covers host-side Rust builds (unit tests,
+smoke checks), Android cross-compilation, the Linux C-API SDK,
+the Windows C-API SDK, and the OpenHarmony C-API SDK.
 
 > This file describes *how* to build the engine from source.
 
@@ -21,6 +21,10 @@ How to set up a development environment and build Migo on **Linux**,
   - [1. Host Rust tests (fast)](#1-host-rust-tests-fast)
   - [2. Android shared library (`libmigo.so`)](#2-android-shared-library-libmigoso)
   - [3. Android AAR (for app integration)](#3-android-aar-for-app-integration)
+  - [4. Linux x86_64 SDK](#4-linux-x86_64-sdk)
+  - [5. Windows x86_64 SDK](#5-windows-x86_64-sdk)
+  - [6. OpenHarmony SDK (aarch64 / x86_64)](#6-openharmony-sdk-aarch64--x86_64)
+  - [7. Release asset from a staged SDK](#7-release-asset-from-a-staged-sdk)
 - [Troubleshooting](#troubleshooting)
 - [Project invariants](#project-invariants)
 
@@ -29,18 +33,20 @@ How to set up a development environment and build Migo on **Linux**,
 ## Overview
 
 Migo is a Rust multi-crate engine (`engine/crates/`) that ships as a
-native Android library (`libmigo.so`) plus a Java SDK (`platforms/
-android/library/`). Three main outputs:
+native library and C ABI on four platforms. Main outputs:
 
 | Output | Tool | Primary use |
 |---|---|---|
 | Host binaries + unit tests | `cargo test` / `cargo build` | Develop & test on the dev machine |
-| `libmigo.so` (arm64 / x86_64) | `scripts/build-android-so.{sh,ps1}` | Drop-in replacement of the native lib |
-| AAR | `scripts/build-aar.{sh,ps1}` | Integrate as a Gradle dependency |
+| `libmigo.so` (arm64 / x86_64) | `scripts/build-android-so.{sh,ps1}` | Drop-in native lib for Android |
+| AAR | `scripts/build-aar.{sh,ps1}` | Gradle dependency for Android |
+| Linux SDK (`libmigo.so`, `libmigo.a`) | `scripts/build-linux-sdk.sh` | C-ABI consumer on Linux x86_64 |
+| Windows SDK (`migo.dll`, `migo.lib`) | `scripts/build-windows-sdk.sh` | C-ABI consumer on Windows x64 |
+| OpenHarmony SDK (`libmigo_capi.a`) | `scripts/build-ohos-sdk.sh` | C-ABI consumer on OpenHarmony |
 
-**Minimum Android API**: `26` (Android 8.0 Oreo). Locked by
-`skia-bindings 0.93` — see `scripts/build-android-so.sh` for the full
-rationale.
+**Minimum Android API**: `26` (Android 8.0 Oreo). Enforced by
+`ANDROID_API=26` in `scripts/build-android-so.sh` and
+`minSdk 26` in `platforms/android/library/build.gradle`.
 
 ---
 
@@ -221,14 +227,14 @@ No NDK needed. Runs on the dev machine in seconds.
 
 ```bash
 cd engine
-cargo test --workspace --lib --no-fail-fast
+cargo test --workspace --lib --doc
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: **499+ unit tests passing** (some environment-specific
-tests may be skipped with `--skip` — see `scripts/ci/run_smoke.sh`).
+`scripts/ci/run_smoke.sh` runs these checks (plus the Android feature
+gate) in order and is the canonical pre-merge gate.
 
 ### 2. Android shared library (`libmigo.so`)
 
@@ -302,6 +308,190 @@ Skip the Rust step if the `.so` files are already up-to-date:
 ```bash
 bash scripts/build-aar.sh release --skip-rust
 ```
+
+### 4. Linux x86_64 SDK
+
+Produces `dist/migo-linux-x86_64/` with `libmigo.so.0.9.0` (soname
+`libmigo.so.1`), `libmigo.a`, public headers, CMake package, and
+`pkg-config` `.pc`. Builds on Linux only.
+
+**Prerequisites beyond the common set**:
+
+- `lld` (e.g. `apt-get install lld`). GNU `ld` produces a malformed
+  symbol-version table for this link; only `lld` is supported. The
+  script looks for `ld.lld` on `PATH` or honours `MIGO_LLD`.
+- The Debian bullseye amd64 sysroot (enforces glibc 2.31 /
+  GLIBCXX 3.4.28 loader floor). Fetch it first:
+
+  ```bash
+  bash scripts/fetch-linux-sysroot.sh
+  ```
+
+  This materialises the sysroot at
+  `engine/third_party/linux-sysroot/` from Chromium's published
+  tarball and verifies it against the sha256 in
+  `engine/third_party/linux-sysroot/sysroots.json`. Previous builds
+  required a sibling `../rusty_v8_src` checkout; that dependency is
+  gone.
+
+- Prebuilt V8 archive for `x86_64-linux-gnu`:
+
+  ```bash
+  bash scripts/fetch-v8-archives.sh x86_64-linux-gnu
+  ```
+
+**Build**:
+
+```bash
+bash scripts/fetch-linux-sysroot.sh
+bash scripts/fetch-v8-archives.sh x86_64-linux-gnu
+bash scripts/build-linux-sdk.sh
+bash scripts/test-linux-sdk-contract.sh
+```
+
+The contract gate verifies the loader floor, export surface, soname /
+version-symlink chain, manifest consistency, declared dynamic
+dependencies, and that the staged headers compile standalone under C11
+and C++17.
+
+**Linux Qt 6 host kit** — `platforms/linux/host-kit/` ships a Qt 6
+X11 surface view and managed-session helper. Its own gate:
+
+```bash
+bash scripts/test-linux-qt-host-kit.sh
+```
+
+Requires `cmake`, `ninja`, `c++`, `rg`, and `xvfb-run` in addition to
+Qt 6 with xcb support.
+
+### 5. Windows x86_64 SDK
+
+Produces `dist/migo-windows-x86_64/` with `bin/migo.dll`,
+`lib/migo.lib` (MSVC import library), runtime DLLs (`rusty_v8.dll`,
+ANGLE), public headers, and a CMake package. Runs from WSL; the
+compile and link execute on a Windows local-disk worktree.
+
+**Requirements**:
+
+- WSL2 with the migo checkout.
+- A Windows-side worktree on a local drive (UNC paths are unusable for
+  `cargo`). Provisioned by `bash platforms/windows/spike/sync-worktree.sh`.
+- MSVC toolchain (Visual Studio 2022 or Build Tools) with
+  `VC.Tools.x86.x64`. The script locates it via `vswhere.exe`.
+- Windows V8 artifacts (`rusty_v8.dll`, `rusty_v8.dll.lib`,
+  `src_binding.rs`) in
+  `engine/third_party/rusty_v8/x86_64-pc-windows-msvc/` — not
+  produced by `fetch-v8-archives.sh` (no published asset yet).
+- ANGLE runtime DLLs (`libEGL.dll`, `libGLESv2.dll`,
+  `d3dcompiler_47.dll`).
+
+**Build** (from WSL):
+
+```bash
+bash scripts/build-windows-sdk.sh
+```
+
+The script compiles the `migo-capi` staticlib on Windows (stage 1),
+discovers the Skia / V8 link-search directories from the build output
+(stage 2), links `migo.dll` with `/OPT:REF` and a `.def` export
+allowlist derived from the headers, stages the package, and runs the
+contract gate automatically. The contract gate requires MSVC
+(`dumpbin`, `cl`) to verify the export surface and load the DLL.
+
+```bash
+bash scripts/test-windows-sdk-contract.sh
+```
+
+### 6. OpenHarmony SDK (aarch64 / x86_64)
+
+Produces `dist/migo-ohos-<arch>/` with `lib/libmigo_capi.a` (static),
+public headers, and a CMake package. Builds on Linux.
+
+**Prerequisites**:
+
+- OpenHarmony SDK (5.1.0-Release or later; ~3.2 GB). Install
+  instructions are in the header of `scripts/dev-setup-ohos.sh`.
+  Set `OHOS_NDK_HOME` to the directory containing `native/`.
+- A `rusty_v8_src` checkout at `../rusty_v8_src` relative to the
+  repo root (required by `scripts/build-v8-ohos.sh` to build the
+  OpenHarmony V8 archive from source).
+
+**Verify the SDK and print required exports**:
+
+```bash
+bash scripts/dev-setup-ohos.sh --check
+```
+
+**Build** (single command; builds V8 if absent, then packages and
+gates):
+
+```bash
+# x86_64 (emulator target):
+bash scripts/build-ohos-sdk.sh x86_64
+
+# aarch64 (device target):
+bash scripts/build-ohos-sdk.sh aarch64
+
+# Both arches:
+bash scripts/build-ohos-sdk.sh --all
+```
+
+`build-ohos-sdk.sh` runs the package contract and API floor gate
+internally. To run the contract gate against an existing staged package:
+
+```bash
+bash scripts/test-ohos-sdk-contract.sh dist/migo-ohos-x86_64
+```
+
+**Known gaps** (from `dist/migo-ohos-x86_64/share/migo/ohos-x86_64-manifest.json`):
+
+- Only x86_64 has been run on a device (an API 20 emulator). The
+  aarch64 package is built and gated but has not run on real
+  HarmonyOS NEXT hardware.
+- Multi-touch is unverified: `hdc` cannot synthesise a second pointer.
+
+OpenHarmony has no published release yet; nothing appears under
+GitHub Releases for this platform.
+
+---
+
+### 7. Release asset from a staged SDK
+
+Every `build-*-sdk.sh` above stops at a staged prefix directory. The
+asset a release publishes is one step further on:
+
+```bash
+bash scripts/package-sdk.sh dist/migo-linux-x86_64
+# -> dist/migo-sdk-linux-x86_64.tar.gz
+#    dist/migo-sdk-linux-x86_64.tar.gz.attestation.json
+```
+
+The asset name is derived from the staged prefix, so the same command
+serves Android, Linux and OpenHarmony (`dist/migo-android-arm64-v8a` →
+`migo-sdk-android-arm64-v8a.tar.gz`). `--output-dir` places the pair
+somewhere else; the Android release job points it at
+`platforms/android/dist` so `SHA256SUMS.txt` covers both files.
+**Windows is not yet packageable this way**: `build-windows-sdk.sh`
+writes no package manifest for the attestation to name, and
+`windows-sdk-0.1.1` was attested against its V8 `component-manifest.json`
+instead.
+
+The archive is **byte-identical for a given commit**: entries sorted,
+owner and group normalised to numeric `0`, permissions derived from the
+owner bits so the builder's umask cannot leak in, every mtime taken from
+`SOURCE_DATE_EPOCH`, and gzip told to store neither a timestamp nor the
+source file name. `SOURCE_DATE_EPOCH` defaults to `HEAD`'s commit time,
+so the default is already reproducible:
+
+```bash
+SOURCE_DATE_EPOCH=1700000000 bash scripts/package-sdk.sh dist/migo-linux-x86_64
+```
+
+That property is what makes the `.attestation.json` beside the archive
+worth anything — the `package_sha256` it records is a number the
+recipient can arrive at independently. It is held by
+`scripts/test-sdk-package-reproducibility-contract.sh`, which packages a
+synthetic prefix twice and compares.
 
 ---
 
@@ -387,23 +577,46 @@ network access. If behind a firewall:
 export GRADLE_OPTS='-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=7890'
 ```
 
-### Tests fail on `sync_storage_mutate_and_info_use_scheduler_worker_path`
+### `[linux-sdk] no lld found`
 
-This test is known to fail on `master` (literal `key1` is not hex-encoded);
-the failure predates the current test author. Skip with
-`--skip sync_storage_mutate_and_info_use_scheduler_worker_path`. CI's
-`run_smoke.sh` has the skip baked in.
+The Linux SDK link requires `lld`; GNU `ld` produces a malformed
+symbol-version table for this link and cannot be used. Install it:
 
-### Tests fail on `mixed_preload_batches_keep_decode_work_running_while_cached_tasks_wait`
+```bash
+sudo apt-get install lld
+```
 
-Known-flaky timing test, also pre-existing. Skip with the same
-mechanism.
+Or point the script at an existing copy:
+
+```bash
+MIGO_LLD=/path/to/ld.lld bash scripts/build-linux-sdk.sh
+```
+
+### `[linux-sdk] sysroot not found`
+
+The Debian bullseye sysroot must be materialised before the Linux SDK
+can be built:
+
+```bash
+bash scripts/fetch-linux-sysroot.sh
+```
+
+The script downloads the sysroot from Chromium's CDN and verifies its
+sha256 against `engine/third_party/linux-sysroot/sysroots.json`.
+
+### `[ohos-setup] no OpenHarmony SDK found`
+
+Set `OHOS_NDK_HOME` to the directory containing `native/`, or place
+the SDK at one of the probed locations (`~/ohos-sdk`,
+`~/.ohos-sdk`, `/opt/ohos-sdk`, `/usr/local/ohos-sdk`). See the
+header of `scripts/dev-setup-ohos.sh` for download instructions.
 
 ---
 
 ## Project invariants
 
-Things the build guarantees (verified by `scripts/ci/run_smoke.sh`):
+Things the build guarantees (verified by `scripts/ci/run_smoke.sh`
+and the per-platform contract gates):
 
 - **Android feature gate**: `zune-image` and `image` crates **never**
   appear in the Android feature graph (the platform decoder is
@@ -414,9 +627,16 @@ Things the build guarantees (verified by `scripts/ci/run_smoke.sh`):
   build.gradle`.
 - **Zero AndroidX dependencies** in `library/build.gradle` (see the
   declaration comment there).
-- **Rust `libmigo.so` size** budget: currently ~48 MB arm64 release
-  (+2.08% vs the M0 pre-refactor baseline). Significant regressions
-  should be justified in the commit.
+- **Linux loader floor**: glibc 2.31 / GLIBCXX 3.4.28, enforced by
+  the Debian bullseye sysroot and verified by
+  `scripts/test-linux-sdk-contract.sh`.
+- **C-ABI export surface**: only documented `migo_*` entry points are
+  exported from `libmigo.so` (Linux) and `migo.dll` (Windows);
+  enforced by a linker version script / `.def` file derived from the
+  headers and verified by the contract gates.
+- **Single release version**: `release/VERSION` is the sole version
+  source; all build consumers derive from it. Enforced by
+  `scripts/test-release-version-contract.sh`.
 
 If any of these change, update **this file** and the corresponding CI
 check in lock-step.
