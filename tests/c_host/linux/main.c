@@ -259,6 +259,34 @@ static void send_touch(MigoSession *session, MigoTouchType type, int x, int y,
     }
 }
 
+/*
+ * Same window, new size: the FastResize path, not a destroy/recreate, so the
+ * attachment's generation is unchanged. Widening the mismatch between this and
+ * a real destroy/recreate is the whole reason the two paths exist -- see
+ * Android's on_configure_changed, which this mirrors exactly except for the
+ * source of width/height.
+ */
+static void send_resize(MigoSurfaceAttachment *attachment, uint64_t generation,
+                        uint32_t width, uint32_t height) {
+    MigoSurfaceMetrics metrics;
+    memset(&metrics, 0, sizeof metrics);
+    metrics.struct_size = (uint32_t)sizeof metrics;
+    metrics.abi_version = MIGO_ABI_VERSION_CURRENT;
+    metrics.generation = generation;
+    metrics.width_pixels = width;
+    metrics.height_pixels = height;
+    metrics.scale_factor = SCALE_FACTOR;
+    metrics.color_space = MIGO_COLOR_SPACE_SRGB;
+    metrics.alpha_mode = MIGO_ALPHA_MODE_OPAQUE;
+    metrics.preferred_presentation_mode = MIGO_PRESENTATION_MODE_DEFAULT;
+    metrics.flags = MIGO_SURFACE_DESCRIPTOR_FLAG_NONE;
+
+    MigoResult result = migo_surface_update(attachment, &metrics);
+    if (result != MIGO_OK) {
+        fprintf(stderr, "[c-host] resize not delivered: %d\n", (int)result);
+    }
+}
+
 static void send_keyboard(MigoSession *session, MigoKeyboardEventType type,
                           const char *value, double height_css_px) {
     MigoKeyboardEvent event;
@@ -504,6 +532,11 @@ int main(int argc, char **argv) {
 
     /* ---- The host owns the event loop; Migo renders on its own thread. ---- */
     int pressed = 0;
+    /* The generation the attach above used; this window is never destroyed and
+     * recreated by this example, so every resize keeps it -- see send_resize. */
+    const uint64_t surface_generation = surface.generation;
+    int last_width = WINDOW_WIDTH;
+    int last_height = WINDOW_HEIGHT;
     for (int elapsed = 0; elapsed < seconds * 1000; elapsed += 16) {
         while (XPending(display) > 0) {
             XEvent event;
@@ -535,6 +568,17 @@ int main(int argc, char **argv) {
                     pressed = 0;
                     send_touch(session, MIGO_TOUCH_END, event.xbutton.x,
                                event.xbutton.y, (int64_t)event.xbutton.time);
+                }
+                break;
+            case ConfigureNotify:
+                /* Also fires on a plain move with the size unchanged; only a
+                 * real size change is a resize the engine needs to hear about. */
+                if (event.xconfigure.width != last_width ||
+                    event.xconfigure.height != last_height) {
+                    last_width = event.xconfigure.width;
+                    last_height = event.xconfigure.height;
+                    send_resize(attachment, surface_generation,
+                               (uint32_t)last_width, (uint32_t)last_height);
                 }
                 break;
             case LeaveNotify:
