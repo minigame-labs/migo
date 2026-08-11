@@ -86,7 +86,14 @@ fi
 # the aarch64 archive's symbols on an x86_64 host without choking on the
 # bitcode.
 if [[ -f "$STATIC_LIB" ]] && command -v nm >/dev/null 2>&1; then
+    # include/migo/platform/android.h, not just the cross-platform include/migo/*.h:
+    # it is the one platform header that declares a migo_* entry point
+    # (migo_android_init_context), and it ships in this package (see the staged
+    # tree above). Every other platform header declares only types, so widening
+    # this glob does not pull in a symbol the other SDKs' contract scripts don't
+    # already agree on.
     DECLARED="$(grep -ohE '\bmigo_[a-z0-9_]+[[:space:]]*\(' "$REPO_ROOT"/include/migo/*.h \
+            "$REPO_ROOT"/include/migo/platform/android.h \
         | tr -d '( \t' | sort -u)"
     # `|| true`: grep exits non-zero when a broken archive defines no migo_
     # symbol, which must surface as an empty set the comparison below rejects,
