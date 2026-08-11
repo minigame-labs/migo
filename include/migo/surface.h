@@ -85,6 +85,17 @@ MIGO_STATIC_ASSERT(offsetof(MigoSurfaceMetrics, scale_factor) == 24, "MigoSurfac
  * struct_size for ABI v1; the duplicate value is an intentional envelope versus
  * payload bounds/integrity cross-check. Every reserved field supplied by the
  * caller must be zero.
+ *
+ * generation numbers the host's attachments and starts at 1. Each attach must
+ * carry one strictly greater than any this Session has already accepted -- that
+ * is what lets the engine discard work naming a window the host has since
+ * replaced -- and a repeated value is refused with MIGO_ERROR_STALE_SURFACE. A
+ * refused attach consumes nothing, so a retry may offer the same value again.
+ * Any platform that destroys and recreates the window during normal operation,
+ * which Android does on every trip through the background, therefore needs a
+ * counter rather than a constant. MigoSurfaceMetrics.generation is the mirror
+ * rule: an update names the attachment it updates, so it carries that
+ * attachment's own generation rather than the next one.
  */
 typedef struct MigoSurfaceDescriptor {
     uint32_t struct_size;
