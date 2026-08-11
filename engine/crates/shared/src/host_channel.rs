@@ -96,6 +96,15 @@ impl SharedQueue {
         match lane {
             QueueLane::Normal => state.normal_len += 1,
             QueueLane::Reserved => state.reserved_len += 1,
+            // Deliberately uncounted, and so uncapped: this lane carries lifecycle
+            // and result traffic, and refusing a surface destruction or a pending
+            // result because a queue was full is a worse failure than any it could
+            // prevent. The cost is that capacity is only reserved for the counted
+            // lanes, so critical traffic outrunning the consumer can leave a later
+            // `push_back` to reallocate. That is not on the input path's own
+            // account -- input is refused at saturation rather than queued -- and
+            // capping this lane to remove the allocation would trade a bounded
+            // cost for an unbounded one.
             QueueLane::Critical => {}
         }
         state.entries.push_back(QueuedHostCommand {
