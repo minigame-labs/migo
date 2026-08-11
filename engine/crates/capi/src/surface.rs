@@ -162,9 +162,21 @@ fn consume_pending_surface_loss(
 
 fn rollback_surface_transition(session: &MigoSession) {
     let deferred_loss = {
-        // A failed pre-commit operation must always release its reservation.
-        // Recovering the data after poison is safer than permanently stranding
-        // the Session in a transition no caller can clear.
+        // A failed pre-commit operation must always release its reservation, so
+        // this reads the guard through poison rather than giving up on one.
+        //
+        // What that buys is narrower than it looks, and worth stating because the
+        // wording here used to claim otherwise: recovering the data does **not**
+        // clear the mutex's poison flag, and every other entry point takes the
+        // guard with a plain `lock()` and answers MIGO_ERROR_INTERNAL when it
+        // fails. So a Session whose lock was poisoned is finished either way; what
+        // this preserves is that the recorded state still describes what is
+        // installed, for the one reader that can see it and for anything a later
+        // change makes poison-tolerant. `Mutex::clear_poison` would make the
+        // Session usable again and is deliberately not called: poison means a
+        // thread panicked mid-mutation, and nothing here knows which of
+        // `active_attachment`, `host` and `platform_context` it had finished
+        // writing, so declaring the invariants restored would be a guess.
         let mut state = session
             .state
             .lock()
@@ -444,11 +456,12 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                     tracing::error!("migo_session_attach_surface: rollback join failed: {error}");
                 }
                 // Release the reservation like every other pre-commit failure,
-                // including this one's own sibling a few lines up. Returning
-                // without it strands the Session in `Attaching` for good, and
-                // `rollback_surface_transition` recovers the guard from poison
-                // precisely so that a poisoned lock cannot be the one failure
-                // that does so.
+                // including this one's own sibling a few lines up, so the
+                // recorded state still describes what is installed. It does not
+                // resurrect the Session: the poison flag outlives this call and
+                // every later entry point takes the guard with a plain `lock()`.
+                // See `rollback_surface_transition` for why clearing the poison
+                // would be a guess rather than a recovery.
                 rollback_surface_transition(&session);
                 return MIGO_ERROR_INTERNAL;
             };
