@@ -83,10 +83,18 @@ run_probe() {
   # counts and read as bypass, and a transition after the last frame (teardown
   # destroying a canvas) would have decided the verdict outright. Defaults to
   # false because that is where bypass starts.
+  #
+  # Keyed on the state each line names *first* -- the one it left -- because that
+  # keeps the pattern ASCII. The arrow in the engine's message is a three-byte
+  # UTF-8 character and `mawk`, which is Ubuntu's default awk, matches `.`
+  # against a single byte: a pattern spanning the arrow matches nothing there, so
+  # every probe would read as the blit path and `bypass-probe` would fail on a
+  # machine whose engine was fine. gawk matches it, which is why the first
+  # version of this ran green locally.
   local bypass
   bypass="$(awk '
-    /DrawingBuffer bypass: false . true/ { latest="true" }
-    /DrawingBuffer bypass: true . false/ { latest="false" }
+    /DrawingBuffer bypass: false/ { latest="true" }
+    /DrawingBuffer bypass: true/  { latest="false" }
     /painted [0-9]+ frames/ { at_frame=latest }
     END { print (at_frame == "" ? "false" : at_frame) }
   ' "$log")"
