@@ -1660,7 +1660,7 @@ fn validate_ohos_v8_target(target: &TargetIdentity) -> Result<(), ManifestError>
         arch => {
             return Err(ManifestError::new(format!(
                 "unsupported OpenHarmony V8 target arch: {arch}"
-            )))
+            )));
         }
     };
     require_equal(
@@ -1670,7 +1670,11 @@ fn validate_ohos_v8_target(target: &TargetIdentity) -> Result<(), ManifestError>
     )?;
     require_equal("target.os", &target.os, "linux")?;
     require_equal("target.abi", &target.abi, "ohos")?;
-    require_equal("target.cpu_baseline", &target.cpu_baseline, expected_baseline)?;
+    require_equal(
+        "target.cpu_baseline",
+        &target.cpu_baseline,
+        expected_baseline,
+    )?;
     require_sorted_unique(
         "target.required_cpu_features",
         &target.required_cpu_features,
