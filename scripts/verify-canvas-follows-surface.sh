@@ -57,22 +57,17 @@ c_ok() { echo -e "\033[0;32m[canvas-size] $*\033[0m"; }
 c_err() { echo -e "\033[0;31m[canvas-size] $*\033[0m" >&2; }
 
 PLAYER="$ENGINE_DIR/target/debug/migo-player"
-# The host V8/Skia environment belongs to the caller, as it does for the other
-# player-backed gates -- but say so here rather than letting cargo die inside the
-# v8 crate's build script with a bare "No such file or directory".
-if [[ -z "${RUSTY_V8_ARCHIVE:-}" ]]; then
-  c_err "RUSTY_V8_ARCHIVE is unset, so the player cannot be built."
-  c_err "The same environment scripts/dev-run-player.sh exports is what this needs:"
-  c_err "  V8=\$PWD/engine/third_party/rusty_v8/x86_64-linux-gnu/gn_out"
-  c_err "  export RUSTY_V8_ARCHIVE=\$V8/obj/librusty_v8.a RUSTY_V8_SRC_BINDING_PATH=\$V8/src_binding.rs"
-  c_err "  export CC=/usr/bin/clang CXX=/usr/bin/clang++ CPATH=\$HOME/.local/skia-headers LIBRARY_PATH=\$HOME/.local/lib"
-  exit 2
-fi
 # Always build, never "build if missing": a mutation run leaves a binary compiled
 # from the mutant next to a restored tree, and WSL2 preserves mtime, so an
 # if-missing gate happily scores the mutant as the fix.
+#
+# Through dev-test-host.sh rather than a bare cargo: it is where this repository
+# establishes the host V8 archive, the system clang and the Khronos headers that
+# the Skia-linked crates need, so a gate that reached for cargo directly would
+# either need its own copy of all three or refuse to run for anyone who had not
+# exported them by hand.
 c_info "building the host player"
-(cd "$ENGINE_DIR" && cargo build -p migo-player --offline)
+bash "$SCRIPT_DIR/dev-test-host.sh" build -p migo-player --offline
 
 export LD_LIBRARY_PATH="$HOME/.local/lib:/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export RUST_LOG="${RUST_LOG:-info}"
