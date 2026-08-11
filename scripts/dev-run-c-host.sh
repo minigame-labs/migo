@@ -32,8 +32,8 @@ RUN_ROOT="${MIGO_C_HOST_ROOT:-/tmp/migo-c-host}"
 # shellcheck source=scripts/lib/host-v8.sh
 source "$SCRIPT_DIR/lib/host-v8.sh"
 host_v8_resolve "$REPO_ROOT" || exit 1
-V8_ARCHIVE="${MIGO_HOST_V8_ARCHIVE:-$HOST_V8_ARCHIVE}"
-V8_BINDING="${MIGO_HOST_V8_BINDING:-$HOST_V8_BINDING}"
+V8_ARCHIVE="$HOST_V8_ARCHIVE"
+V8_BINDING="$HOST_V8_BINDING"
 bash "$SCRIPT_DIR/dev-setup-skia.sh" >/dev/null
 
 export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
