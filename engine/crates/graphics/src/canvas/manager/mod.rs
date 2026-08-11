@@ -1372,25 +1372,24 @@ impl CanvasManager {
         // avoids a black resume frame before Cocos schedules a new RAF draw.
         let (target_w, target_h) =
             self.onscreen_backing_size((physical_w, physical_h), effective_pixel_ratio);
-        let staged_drawing_buffer = self
+        let mut staged_drawing_buffer = self
             .canvases
             .get_mut(&id)
             .and_then(|entry| entry.drawing_buffer.take());
-        let drawing_buffer = if let Some(mut db) = staged_drawing_buffer {
-            // The preserved buffer keeps its GL objects, and its *size* answers
-            // the same question a fresh one does: a size the content chose is
-            // the content's, and the engine's own default describes the surface
-            // it was derived from -- this one. Keeping it unconditionally is
-            // what left a canvas nobody sized describing the surface the app
-            // was suspended on, upscaled by the blit, while `windowWidth`
-            // reported the real one.
-            //
-            // Reuse without a resize is still the common case (a resume at the
-            // same size), and that is the one that preserves the last frame and
-            // avoids a black resume frame; a surface that came back a different
-            // size has no frame worth preserving anyway.
+        // The preserved buffer keeps its GL objects, and its *size* answers the
+        // same question a fresh one does: a size the content chose is the
+        // content's, and the engine's own default describes the surface it was
+        // derived from -- this one. Keeping it unconditionally is what left a
+        // canvas nobody sized describing the surface the app was suspended on,
+        // upscaled by the blit, while `windowWidth` reported the real one.
+        //
+        // Reuse without a resize is still the common case (a resume at the same
+        // size), and that is the one that preserves the last frame and avoids a
+        // black resume frame; a surface that came back a different size has no
+        // frame worth preserving anyway.
+        if let Some(db) = staged_drawing_buffer.as_mut() {
             if (db.width, db.height) != (target_w, target_h) {
-                match drawing_buffer::resize(&self.gl, &mut db, target_w, target_h) {
+                match drawing_buffer::resize(&self.gl, db, target_w, target_h) {
                     Ok(()) => tracing::info!(
                         canvas_id = %id,
                         width = target_w,
@@ -1399,15 +1398,24 @@ impl CanvasManager {
                         surface_height = physical_h,
                         "Resized preserved DrawingBuffer to follow the recreated surface"
                     ),
-                    // Keeping the buffer at its old size leaves the canvas
-                    // describing the previous surface, which is wrong but
-                    // presentable; failing the install would drop presentation
-                    // altogether. Everything below reads the buffer's real size,
-                    // so the entry and JS still agree with the GL object.
-                    Err(error) => tracing::error!(
-                        canvas_id = %id,
-                        "preserved DrawingBuffer resize to {target_w}x{target_h} failed: {error}"
-                    ),
+                    Err(error) => {
+                        // `resize` reallocates both attachments before it checks
+                        // completeness, so a failure leaves the GL objects at the
+                        // new size while the struct still reports the old one --
+                        // and then every reader below (the entry, the viewport, JS
+                        // `canvas.width`, the blit) describes storage that is not
+                        // there. Discard it and let a fresh buffer be built at the
+                        // size that was wanted: the preserved frame is the only
+                        // loss, which is what a fresh buffer costs anyway.
+                        tracing::error!(
+                            canvas_id = %id,
+                            "preserved DrawingBuffer resize to {target_w}x{target_h} failed, \
+                             rebuilding it instead of reusing a buffer of unknown size: {error}"
+                        );
+                        if let Some(corrupted) = staged_drawing_buffer.take() {
+                            drawing_buffer::destroy(&self.gl, corrupted);
+                        }
+                    }
                 }
             } else {
                 tracing::info!(
@@ -1419,6 +1427,8 @@ impl CanvasManager {
                     "Reusing preserved DrawingBuffer for onscreen canvas"
                 );
             }
+        }
+        let drawing_buffer = if let Some(db) = staged_drawing_buffer {
             unsafe {
                 self.gl.bind_framebuffer(
                     glow::FRAMEBUFFER,
