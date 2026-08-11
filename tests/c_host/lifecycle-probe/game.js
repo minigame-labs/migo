@@ -30,9 +30,15 @@ let shows = 0;
 let framesAtHide = -1;
 let framesWhileHidden = -1;
 
+// Reported on both channels on purpose. A screenshot alone cannot distinguish
+// "the callback never arrived" from "this frame was painted before it did", and
+// reading the pixels of a *counter* was how a run of this probe was first
+// misread as a missing callback. `MIGO_CAPI_LOG=info` turns these into logcat
+// lines, which timestamps each event against the surface transitions beside it.
 wx.onHide(function () {
   hides = hides + 1;
   framesAtHide = frames;
+  console.error('[lifecycle-probe] onHide at frame ' + frames);
 });
 
 wx.onShow(function () {
@@ -42,6 +48,8 @@ wx.onShow(function () {
   if (framesAtHide >= 0) {
     framesWhileHidden = frames - framesAtHide;
   }
+  console.error('[lifecycle-probe] onShow at frame ' + frames +
+    ' painted while hidden ' + framesWhileHidden);
 });
 
 function paint() {
