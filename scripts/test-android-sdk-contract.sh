@@ -150,8 +150,9 @@ fi
 CONSUMER="$REPO_ROOT/tests/c_host/android-package-consumer"
 if [[ -x "$NDK_BIN/$ARCH-linux-android26-clang" ]] && command -v cmake >/dev/null 2>&1 \
         && [[ -f "$CONSUMER/build.sh" ]]; then
+    CONSUMER_LOG="$(mktemp)"
     if ANDROID_ABI="$ABI" MIGO_ANDROID_PREFIX="$PREFIX" \
-            bash "$CONSUMER/build.sh" >/dev/null 2>&1; then
+            bash "$CONSUMER/build.sh" >"$CONSUMER_LOG" 2>&1; then
         CONSUMER_SO="$(find "$CONSUMER/build" -name 'libconsumer.so' 2>/dev/null | head -1)"
         UNDEF="$(nm -D "$CONSUMER_SO" 2>/dev/null | grep -cE ' U migo_' || true)"
         if [[ -n "$CONSUMER_SO" && "$UNDEF" == "0" ]]; then
@@ -161,7 +162,12 @@ if [[ -x "$NDK_BIN/$ARCH-linux-android26-clang" ]] && command -v cmake >/dev/nul
         fi
     else
         fail "third-party find_package(migo) consumer failed to build against the package"
+        # Diagnostic only: this check has failed in CI while passing locally
+        # with an identical pinned NDK, so surface the swallowed cmake/build
+        # output instead of guessing at the cause.
+        sed -e 's/^/    /' "$CONSUMER_LOG"
     fi
+    rm -f "$CONSUMER_LOG"
 else
     skip "consumer link (no NDK clang, cmake, or consumer example)"
 fi
