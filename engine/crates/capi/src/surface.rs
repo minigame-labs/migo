@@ -443,6 +443,13 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                 {
                     tracing::error!("migo_session_attach_surface: rollback join failed: {error}");
                 }
+                // Release the reservation like every other pre-commit failure,
+                // including this one's own sibling a few lines up. Returning
+                // without it strands the Session in `Attaching` for good, and
+                // `rollback_surface_transition` recovers the guard from poison
+                // precisely so that a poisoned lock cannot be the one failure
+                // that does so.
+                rollback_surface_transition(&session);
                 return MIGO_ERROR_INTERNAL;
             };
             debug_assert_eq!(state.surface_transition, SurfaceTransition::Attaching);
