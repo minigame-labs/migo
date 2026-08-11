@@ -14,6 +14,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenHarmony API floor declaration gate
 - Session delivery and verification lanes (A12)
 
+### Fixed
+- A canvas the content never sized now follows a surface that was destroyed and
+  recreated at a different size, instead of keeping the size derived from the
+  previous one. Rotating while the app is in the background takes that path on
+  every Android device, and content came back to a `canvas.width`/`height`
+  describing the window it was suspended on, stretched across the new one by the
+  presentation blit while `wx.getSystemInfoSync()` reported the real extent.
+- A canvas the content *did* size with `canvas.width` is no longer moved when the
+  surface resizes. It had been rescaled in proportion to the surface, so a game
+  that picked a fixed resolution kept drawing in coordinates its own backing
+  store no longer had — into a corner of it.
+
+### Changed
+- `MigoSurfaceDescriptor.generation` now documents the rule the C ABI already
+  enforced: every attach must carry a generation strictly greater than any the
+  session has accepted, and a metrics update carries the live attachment's own.
+  A host that stamps a constant is refused with `MIGO_ERROR_STALE_SURFACE` from
+  its second attach onwards, which any platform that destroys and recreates its
+  window — Android on every trip through the background — reaches on the first
+  resume.
+
 ---
 
 ## Engine — v0.9.0 (2026-07-28)
