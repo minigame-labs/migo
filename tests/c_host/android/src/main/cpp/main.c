@@ -377,6 +377,20 @@ static void on_error(void *user_data, MigoSession *session, const MigoError *err
 /* ---- Touch ------------------------------------------------------------- */
 
 /*
+ * AMotionEvent_getPressure is calibrated per device, not normalized: Android's
+ * own docs say 1.0 is "generally considered normal" but larger values happen,
+ * and real touchscreens reach several times that. The ABI's pressure is the
+ * same [0, 1] contract as the web's Touch.force, so this host has to do the
+ * normalizing -- the same way it already divides x/y by density instead of
+ * handing over physical pixels. Mirrors TouchInputNormalizer.pressure() in
+ * the Java platform library, the one host that was already doing this.
+ */
+static float normalize_pressure(float value) {
+    if (!(value > 0.0f)) return 0.0f; /* also catches NaN and negative zero */
+    return value < 1.0f ? value : 1.0f;
+}
+
+/*
  * Every pointer is carried, which is the part the Linux example cannot test:
  * there one mouse maps to one point, so the multi-point path and the
  * per-pointer flags have never run until here.
@@ -425,7 +439,7 @@ static void forward_touch(struct host *h, AInputEvent *event) {
         /* Android reports physical pixels; the ABI takes CSS pixels. */
         points[i].x = AMotionEvent_getX(event, i) / h->density;
         points[i].y = AMotionEvent_getY(event, i) / h->density;
-        points[i].pressure = AMotionEvent_getPressure(event, i);
+        points[i].pressure = normalize_pressure(AMotionEvent_getPressure(event, i));
         if (all_changed || i == changed_index) {
             points[i].flags |= MIGO_TOUCH_FLAG_CHANGED;
             if (type == MIGO_TOUCH_END || type == MIGO_TOUCH_CANCEL) {
@@ -482,6 +496,14 @@ static int create_engine(struct host *h, const char *files_dir) {
     char code_cache_dir[512];
     snprintf(cache_dir, sizeof cache_dir, "%s/migo-cache", files_dir);
     snprintf(code_cache_dir, sizeof code_cache_dir, "%s/migo-code-cache", files_dir);
+
+    /* No JNI reaches this process on its own -- ANativeActivity_onCreate is not
+     * JNI_OnLoad. Without this, the audio backend's first output stream aborts
+     * the process instead of failing an op: see migo_android_init_context's
+     * doc comment in migo/platform/android.h. */
+    if (h->activity != NULL) {
+        migo_android_init_context(h->activity->vm, h->activity->clazz);
+    }
 
     /* Ask the library what it supports before building anything on top of it.
      * MIGO_C_ABI_HAS_RUNTIME is a preprocessor macro and describes the headers

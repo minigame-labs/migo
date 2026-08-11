@@ -68,7 +68,14 @@ typedef struct MigoTouchPoint {
     uint32_t id; /* stable across start -> move -> end for one pointer */
     float x;
     float y;
-    float pressure; /* 0.0 when the device does not report pressure */
+    /* [0.0, 1.0], the same contract as the web's Touch.force; 0.0 when the
+     * device does not report pressure. Most touch platforms calibrate
+     * pressure per device rather than normalizing it -- Android's own docs
+     * say values above 1.0 are expected -- so a host reading a native
+     * pressure API almost always has to clamp before crossing this boundary,
+     * the same way it converts physical pixels to CSS pixels for x and y. An
+     * out-of-range value here is rejected as MIGO_ERROR_INVALID_ARGUMENT. */
+    float pressure;
     MigoTouchPointFlags flags;
 } MigoTouchPoint;
 
