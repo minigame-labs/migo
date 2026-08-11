@@ -92,7 +92,16 @@ pub(crate) fn capture_default_fbo(gl: &glow::Context, width: u32, height: u32) {
     let mut buf = vec![0u8; width as usize * height as usize * 4];
     unsafe {
         // Read from the presented surface (default framebuffer), not the
-        // DrawingBuffer that the blit left bound as the read target.
+        // DrawingBuffer that the blit left bound as the read target -- and put
+        // that binding back, because this is an engine write to state the content
+        // owns. The dedup shadow still claims whatever the read target was, so a
+        // capture that walked away from FBO 0 would have the content's next
+        // `bindFramebuffer(READ_FRAMEBUFFER, sameName)` deduped against a claim
+        // the driver no longer honours, and the read would come from the window
+        // instead of the content's own framebuffer. Restoring keeps the shadow
+        // true by construction, which is what the sibling paths in
+        // `drawing_buffer` do with the texture and renderbuffer bindings.
+        let previous_read = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING) as u32;
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
         gl.read_pixels(
             0,
@@ -103,6 +112,8 @@ pub(crate) fn capture_default_fbo(gl: &glow::Context, width: u32, height: u32) {
             glow::UNSIGNED_BYTE,
             glow::PixelPackData::Slice(Some(&mut buf)),
         );
+        let restored = std::num::NonZeroU32::new(previous_read).map(glow::NativeFramebuffer);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, restored);
     }
     let mut slot = RESULT.lock().expect("frame_capture result mutex");
     // A request that arrived while this frame was being read owns the slot now:
