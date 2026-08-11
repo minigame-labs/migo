@@ -3,7 +3,7 @@ use shared::{
     protocol::render_cmd::CanvasCmd,
 };
 
-use crate::CanvasManager;
+use crate::{CanvasManager, canvas::BackingSizeOwner};
 
 pub(crate) struct CanvasHandler;
 
@@ -58,7 +58,9 @@ impl CanvasHandler {
             }
 
             CanvasCmd::ResizeCanvas { id, w, h } => {
-                let _ = cm.resize_canvas(id, w, h);
+                // Only `canvas.width`/`height` reaches here, so this is the
+                // content claiming its backing size.
+                let _ = cm.resize_canvas(id, w, h, BackingSizeOwner::Content);
             }
 
             CanvasCmd::MakeCurrent { id, resp } => {

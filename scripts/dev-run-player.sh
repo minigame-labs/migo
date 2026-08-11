@@ -28,12 +28,13 @@ SECS="${2:-8}"
 PLAYER_ARGS=("${@:3}")
 
 # ---- host V8 + Skia toolchain env (see scripts/dev-test-host.sh) ----
-V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out}"
-[[ -f "$V8_DIR/obj/librusty_v8.a" ]] || { c_err "linux-gnu V8 missing: $V8_DIR/obj/librusty_v8.a"; exit 1; }
+# shellcheck source=scripts/lib/host-v8.sh
+source "$SCRIPT_DIR/lib/host-v8.sh"
+host_v8_resolve "$REPO_ROOT" || exit 1
 bash "$SCRIPT_DIR/dev-setup-skia.sh" >/dev/null
 
-export RUSTY_V8_ARCHIVE="$V8_DIR/obj/librusty_v8.a"
-export RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs"
+export RUSTY_V8_ARCHIVE="$HOST_V8_ARCHIVE"
+export RUSTY_V8_SRC_BINDING_PATH="$HOST_V8_BINDING"
 export CC="${CC_HOST:-/usr/bin/clang}"
 export CXX="${CXX_HOST:-/usr/bin/clang++}"
 export CPATH="$HOME/.local/skia-headers${CPATH:+:$CPATH}"

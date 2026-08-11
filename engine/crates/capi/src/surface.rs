@@ -23,6 +23,7 @@ use migo_core::{
     HostThread, PlatformServices, host_ingress, lease_surface_tracked, lease_surface_with_resource,
     retire_surface, send_critical_command_to_host, spawn_host_thread_tracked,
 };
+use shared::surface::{HostWindowMetrics, HostWindowState};
 use shared::{
     protocol::host_cmd::HostCommand,
     surface::{
@@ -61,7 +62,7 @@ pub struct MigoSurfaceAttachment {
     width_pixels: u32,
     height_pixels: u32,
     pixel_ratio: PixelRatio,
-    window_state: Arc<host_kit::CapiWindowState>,
+    window_state: Arc<HostWindowState>,
     lost: bool,
 }
 
@@ -161,9 +162,21 @@ fn consume_pending_surface_loss(
 
 fn rollback_surface_transition(session: &MigoSession) {
     let deferred_loss = {
-        // A failed pre-commit operation must always release its reservation.
-        // Recovering the data after poison is safer than permanently stranding
-        // the Session in a transition no caller can clear.
+        // A failed pre-commit operation must always release its reservation, so
+        // this reads the guard through poison rather than giving up on one.
+        //
+        // What that buys is narrower than it looks, and worth stating because the
+        // wording here used to claim otherwise: recovering the data does **not**
+        // clear the mutex's poison flag, and every other entry point takes the
+        // guard with a plain `lock()` and answers MIGO_ERROR_INTERNAL when it
+        // fails. So a Session whose lock was poisoned is finished either way; what
+        // this preserves is that the recorded state still describes what is
+        // installed, for the one reader that can see it and for anything a later
+        // change makes poison-tolerant. `Mutex::clear_poison` would make the
+        // Session usable again and is deliberately not called: poison means a
+        // thread panicked mid-mutation, and nothing here knows which of
+        // `active_attachment`, `host` and `platform_context` it had finished
+        // writing, so declaring the invariants restored would be a guess.
         let mut state = session
             .state
             .lock()
@@ -221,7 +234,7 @@ pub unsafe extern "C" fn migo_session_attach_surface(
         let configuration = descriptor.configuration();
         let pixel_ratio = PixelRatio::new(configuration.scale_factor())
             .expect("the ABI validator rejects invalid scale factors");
-        let window_metrics = host_kit::CapiWindowMetrics::new(
+        let window_metrics = HostWindowMetrics::new(
             configuration.width_pixels(),
             configuration.height_pixels(),
             pixel_ratio,
@@ -349,7 +362,7 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                 }
                 None => {
                     debug_assert!(existing_window_state.is_none());
-                    let window_state = Arc::new(host_kit::CapiWindowState::new(window_metrics));
+                    let window_state = Arc::new(HostWindowState::new(window_metrics));
                     let notifier = configured_callbacks.map(|callbacks| {
                         Arc::new(callbacks::Notifier::new(
                             callbacks,
@@ -442,6 +455,14 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                 {
                     tracing::error!("migo_session_attach_surface: rollback join failed: {error}");
                 }
+                // Release the reservation like every other pre-commit failure,
+                // including this one's own sibling a few lines up, so the
+                // recorded state still describes what is installed. It does not
+                // resurrect the Session: the poison flag outlives this call and
+                // every later entry point takes the guard with a plain `lock()`.
+                // See `rollback_surface_transition` for why clearing the poison
+                // would be a guess rather than a recovery.
+                rollback_surface_transition(&session);
                 return MIGO_ERROR_INTERNAL;
             };
             debug_assert_eq!(state.surface_transition, SurfaceTransition::Attaching);
@@ -597,7 +618,7 @@ pub unsafe extern "C" fn migo_surface_update(
         // stale-sized frame with no further callback to recover from.
         let pixel_ratio =
             PixelRatio::new(configuration.scale_factor()).expect("validated Surface scale factor");
-        let previous_metrics = window_state.replace(host_kit::CapiWindowMetrics::new(
+        let previous_metrics = window_state.replace(HostWindowMetrics::new(
             configuration.width_pixels(),
             configuration.height_pixels(),
             pixel_ratio,
@@ -967,13 +988,11 @@ mod tests {
             width_pixels: 640,
             height_pixels: 480,
             pixel_ratio: PixelRatio::new(1.0).expect("valid test pixel ratio"),
-            window_state: Arc::new(host_kit::CapiWindowState::new(
-                host_kit::CapiWindowMetrics::new(
-                    640,
-                    480,
-                    PixelRatio::new(1.0).expect("valid test pixel ratio"),
-                ),
-            )),
+            window_state: Arc::new(HostWindowState::new(HostWindowMetrics::new(
+                640,
+                480,
+                PixelRatio::new(1.0).expect("valid test pixel ratio"),
+            ))),
             lost: false,
         }
     }

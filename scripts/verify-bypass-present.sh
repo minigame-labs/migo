@@ -50,8 +50,12 @@ PLAYER="$ENGINE_DIR/target/debug/migo-player"
 # Always build, never "build if missing": a mutation run leaves a binary compiled
 # from the mutant sitting next to a restored tree, and WSL2 preserves mtime, so
 # an if-missing gate happily scores the mutant as the fix.
+#
+# Through dev-test-host.sh rather than a bare cargo: it is where this repository
+# establishes the host V8 archive, the system clang and the Khronos headers the
+# Skia-linked crates need, so the gate runs for a caller who has exported nothing.
 c_info "building the host player"
-(cd "$ENGINE_DIR" && cargo build -p migo-player --offline)
+bash "$SCRIPT_DIR/dev-test-host.sh" build -p migo-player --offline
 
 export LD_LIBRARY_PATH="$HOME/.local/lib:/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export RUST_LOG="${RUST_LOG:-info}"
@@ -71,11 +75,29 @@ run_probe() {
   # Which path actually ran, from the engine's own transition log rather than
   # from the fixture's intent -- a fixture that failed to create its offscreen
   # canvas would otherwise be scored against the wrong path.
-  local bypass="false"
-  if [[ "$(grep -c "DrawingBuffer bypass: false → true" "$log" || true)" -gt \
-        "$(grep -c "DrawingBuffer bypass: true → false" "$log" || true)" ]]; then
-    bypass="true"
-  fi
+  #
+  # The reading is the last transition *before the final painted frame*, not a
+  # count of transitions across the whole log. Counting made the verdict depend
+  # on how many times the path changed rather than on what it was while the
+  # frames were drawn: a canvas destroyed mid-run left equal-and-then-unequal
+  # counts and read as bypass, and a transition after the last frame (teardown
+  # destroying a canvas) would have decided the verdict outright. Defaults to
+  # false because that is where bypass starts.
+  #
+  # Keyed on the state each line names *first* -- the one it left -- because that
+  # keeps the pattern ASCII. The arrow in the engine's message is a three-byte
+  # UTF-8 character and `mawk`, which is Ubuntu's default awk, matches `.`
+  # against a single byte: a pattern spanning the arrow matches nothing there, so
+  # every probe would read as the blit path and `bypass-probe` would fail on a
+  # machine whose engine was fine. gawk matches it, which is why the first
+  # version of this ran green locally.
+  local bypass
+  bypass="$(awk '
+    /DrawingBuffer bypass: false/ { latest="true" }
+    /DrawingBuffer bypass: true/  { latest="false" }
+    /painted [0-9]+ frames/ { at_frame=latest }
+    END { print (at_frame == "" ? "false" : at_frame) }
+  ' "$log")"
 
   local colour distinct
   read -r colour distinct <<<"$(python3 "$SCRIPT_DIR/lib/dominant_pixel.py" "$png" 2>/dev/null)"

@@ -205,6 +205,15 @@ function _submitAndSwap() {
 //   bool:     written as 0 or 1 via _u32 overlay.
 //
 // All layouts match S5 table: H=header, C=canvasId, U=u32, I=i32, F=f32, B=bool.
+//
+// The canvasId is per record and not per batch on purpose, and the four bytes buy
+// two things. Content may switch canvases inside a frame -- two contexts, twice
+// per frame, is a shape the engine supports -- so a batch-level id would need a
+// switch-canvas record anyway. And the decoder's validation pass is stateless: it
+// checks each record's arity and end against the used length and trusts no offset
+// it has not validated, which a current-canvas carried across records would end.
+// Hoisting the id looks like free savings and would trade that for a few KB per
+// frame of buffer traffic.
 
 // 1 VIEWPORT: H C I I U U (6 words)
 function encodeViewport(canvasId, x, y, width, height) {

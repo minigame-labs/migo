@@ -16,7 +16,16 @@ const gl = canvas.getContext("webgl");
 // Never drawn to, never read. Its whole job is to exist, because existing is
 // what `can_bypass_drawing_buffer` counts. The first `createCanvas` is the
 // onscreen one; every call after it allocates an offscreen pbuffer canvas.
-const _offscreen = migo.createCanvas();
+//
+// On `globalThis`, not in a module `const`: existing as a binding nothing reads
+// again is not the same as being reachable, and V8 may drop it. The canvas is
+// then garbage, the FinalizationRegistry in `03_canvas.js` destroys it, the
+// canvas count falls back to one and bypass latches — silently turning this
+// probe into a second copy of `bypass-probe`, which is the one thing it must
+// never be. Measured before this line moved: the canvas went away about two
+// seconds into a three-second run, and the gate had been reporting the wrong
+// path ever since.
+globalThis.__blitProbeSecondCanvas = migo.createCanvas();
 
 const R = 0.2;
 const G = 0.8;

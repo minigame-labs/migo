@@ -29,15 +29,11 @@ CONTENT_ID="c-host-demo"
 RUN_ROOT="${MIGO_C_HOST_ROOT:-/tmp/migo-c-host}"
 
 # ---- host V8 + Skia toolchain env (same as scripts/dev-test-host.sh) ----
-V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out}"
-V8_ARCHIVE="${MIGO_HOST_V8_ARCHIVE:-$V8_DIR/obj/librusty_v8.a}"
-V8_BINDING="${MIGO_HOST_V8_BINDING:-$V8_DIR/src_binding.rs}"
-[[ -f "$V8_ARCHIVE" ]] || { c_err "linux-gnu V8 archive missing: $V8_ARCHIVE"; exit 1; }
-[[ -f "$V8_BINDING" ]] || { c_err "linux-gnu V8 binding missing: $V8_BINDING"; exit 1; }
-[[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] || {
-    c_err "V8 archive looks like an LFS pointer: $V8_ARCHIVE"
-    exit 1
-}
+# shellcheck source=scripts/lib/host-v8.sh
+source "$SCRIPT_DIR/lib/host-v8.sh"
+host_v8_resolve "$REPO_ROOT" || exit 1
+V8_ARCHIVE="$HOST_V8_ARCHIVE"
+V8_BINDING="$HOST_V8_BINDING"
 bash "$SCRIPT_DIR/dev-setup-skia.sh" >/dev/null
 
 export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"

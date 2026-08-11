@@ -12,6 +12,8 @@ the reason these exist.
 | `android/` | A NativeActivity host. No Java at all: the manifest declares `android:hasCode="false"` and names this library's `ANativeActivity_onCreate`. |
 | `touch-probe/` | Content shared by both, for verifying that input arrives. |
 | `keyboard-probe/` | Content shared by both, for verifying the soft-keyboard round trip. |
+| `surface-recreate-probe/` | Content shared by both, for verifying that the main canvas still describes the surface after the window was destroyed and recreated at a different size. |
+| `lifecycle-probe/` | Content shared by both, for verifying that the engine stops painting while the app is away and that content is told it went away. |
 
 The Android module lives here rather than under `platforms/android/` because it
 is a *consumer* of what that tree ships, not part of the product. Gradle picks
@@ -28,12 +30,33 @@ bash tests/c_host/linux/build-with-pkgconfig.sh
 ## Android
 
 ```sh
-bash scripts/build-android-c-host.sh         # cross-compiles capi, builds the APK
+bash scripts/build-android-c-host.sh         # arm64-v8a: cross-compiles capi, builds the APK
+bash scripts/build-android-c-host.sh x86_64  # the ABI an emulator runs at usable speed
 adb install -r tests/c_host/android/build/outputs/apk/debug/*.apk
 ```
 
 Content goes where the engine resolves it, under the app's own files directory:
-`<files>/migo/games/<content-id>/code/{game.json,game.js}`.
+`<files>/migo/games/<content-id>/code/{game.json,game.js}`. The host reads
+`<files>/content-id` to decide which bundle to load, so switching probes needs no
+rebuild:
+
+```sh
+adb shell "cat game.js | run-as com.migo.chost sh -c 'cat > files/migo/games/<id>/code/game.js'"
+adb shell "echo <id> | run-as com.migo.chost sh -c 'cat > files/content-id'"
+```
+
+Backgrounding the app destroys the window and resuming creates a new one, which
+is the lifecycle no desktop has. Rotating **while backgrounded** is the version of
+it that hands the engine a window of a *different* size, rather than a resize of
+the same one — a distinction worth keeping in mind, because the two take different
+paths through the engine and only the second one destroys the surface:
+
+```sh
+adb shell input keyevent KEYCODE_HOME
+adb shell settings put system accelerometer_rotation 0
+adb shell settings put system user_rotation 1
+adb shell am start -n com.migo.chost/android.app.NativeActivity
+```
 
 ## What each platform proves that the other cannot
 

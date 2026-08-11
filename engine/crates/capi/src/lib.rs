@@ -81,6 +81,7 @@ use migo_capi_abi::{
 };
 use migo_core::{HostThread, send_command_to_host};
 use panic_barrier::guard;
+use shared::surface::HostWindowState;
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceLossReason};
 
 // ---- Handles ----------------------------------------------------------------
@@ -132,13 +133,25 @@ impl EngineInner {
     /// a location of its own, so deriving a subdirectory here would put game data
     /// somewhere the host cannot find, clear, or back up.
     fn session_init_options(&self, pixel_ratio: f32) -> InitOptions {
-        InitOptions::new()
+        let options = InitOptions::new()
             .with_files_dir(self.files_dir.clone())
             .with_cache_dir(self.cache_dir.clone())
             .with_code_cache_dir(self.code_cache_dir.clone())
             .with_pixel_ratio(pixel_ratio)
             .with_target_fps(60)
-            .with_code_signing_enabled(!self.allow_unsigned_content)
+            .with_code_signing_enabled(!self.allow_unsigned_content);
+        // The session's level, not just the process default, because a session
+        // binds its own level to its host thread and publishes it for the render
+        // thread -- deliberately, so one session cannot silence another. Setting
+        // only the process default therefore left `MIGO_CAPI_LOG` unable to raise
+        // the level for any thread that does engine work: measured on Android as
+        // two Warn records and no Info at all, from a host that had asked for
+        // Info. This is the whole of the diagnostic channel a host with no Java
+        // has, so it has to reach the threads whose behaviour is in question.
+        match dev_log_level() {
+            Some(level) => options.with_log_level(level),
+            None => options,
+        }
     }
 }
 
@@ -220,7 +233,7 @@ struct SessionState {
     notifier: Option<Arc<callbacks::Notifier>>,
     /// Dynamic physical window metrics shared with the C HostKit. Retained by
     /// the Session so detach/reattach updates the same service object.
-    window_state: Option<Arc<host_kit::CapiWindowState>>,
+    window_state: Option<Arc<HostWindowState>>,
     /// Last visibility level set by the host.
     ///
     /// Visibility is a property of the session, not of the surface, and every
@@ -903,21 +916,30 @@ pub unsafe extern "C" fn migo_session_set_focus(
 /// A library has no business hijacking the process's global logger, so this is
 /// opt-in and off by default. Hosts receive operational errors through
 /// `on_error`; this switch exists only for additional engine diagnostics.
-fn init_dev_logging() {
+/// The level `MIGO_CAPI_LOG` asks for, if a host set it.
+///
+/// Read in one place because it has two consumers that have to agree: the
+/// subscriber this process installs, and the level every session hands its own
+/// threads. An unrecognised value means Info rather than nothing, since a host
+/// that set the variable at all is asking for output.
+fn dev_log_level() -> Option<shared::config::LogLevel> {
     use shared::config::LogLevel;
+    let level = std::env::var_os("MIGO_CAPI_LOG")?;
+    Some(match level.to_string_lossy().to_lowercase().as_str() {
+        "trace" => LogLevel::Trace,
+        "debug" => LogLevel::Debug,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    })
+}
+
+fn init_dev_logging() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let Some(level) = std::env::var_os("MIGO_CAPI_LOG") else {
+        let Some(level) = dev_log_level() else {
             return;
-        };
-        let level = level.to_string_lossy().to_lowercase();
-        let level = match level.as_str() {
-            "trace" => LogLevel::Trace,
-            "debug" => LogLevel::Debug,
-            "warn" => LogLevel::Warn,
-            "error" => LogLevel::Error,
-            _ => LogLevel::Info,
         };
         crate::platform::install_dev_logging(level);
     });

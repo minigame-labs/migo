@@ -8,8 +8,8 @@
 # It wires up the three things a minimal Ubuntu / WSL2 host lacks for a migo
 # host build:
 #   1. A linux-gnu `librusty_v8.a` + `src_binding.rs` (V8 is NOT rebuilt here;
-#      point MIGO_HOST_V8_DIR at a prebuilt linux-gnu gn_out, or use the
-#      default sibling rusty_v8_src checkout).
+#      resolved by scripts/lib/host-v8.sh, which defaults to the in-repo fetch
+#      that `scripts/fetch-v8-archives.sh x86_64-linux-gnu` produces).
 #   2. The system clang/clang++ as CC/CXX (NOT the Android NDK clang, whose
 #      libc++ vs system libstdc++-13 <chrono> mismatch breaks the Skia build),
 #      and ANDROID_NDK unset so skia-bindings does not pick the NDK toolchain.
@@ -25,8 +25,10 @@
 #   scripts/dev-test-host.sh build -p migo-graphics --lib
 #
 # Env overrides:
-#   MIGO_HOST_V8_DIR  gn_out dir holding librusty_v8.a + src_binding.rs
-#                     (default: ../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out)
+#   MIGO_HOST_V8_DIR  directory holding librusty_v8.a + src_binding.rs, either
+#                     side by side (what scripts/fetch-v8-archives.sh produces)
+#                     or with the archive under obj/ (a rusty_v8 source build).
+#                     Defaults to the in-repo fetch; see scripts/lib/host-v8.sh.
 #   CC_HOST / CXX_HOST  host C/C++ compiler (default: /usr/bin/clang{,++})
 #
 # NOTE: every crate here links as an executable (test binaries, the player), so
@@ -44,14 +46,13 @@ ENGINE_DIR="$REPO_ROOT/engine"
 c_info() { echo -e "\033[0;36m[host] $*\033[0m"; }
 c_err()  { echo -e "\033[0;31m[host] $*\033[0m" >&2; }
 
-V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out}"
-V8_ARCHIVE="$V8_DIR/obj/librusty_v8.a"
-V8_BINDING="$V8_DIR/src_binding.rs"
-
-[[ -f "$V8_ARCHIVE" ]] || { c_err "linux-gnu V8 archive not found: $V8_ARCHIVE
-Set MIGO_HOST_V8_DIR to a prebuilt gn_out, or build one from rusty_v8_src."; exit 1; }
-[[ -f "$V8_BINDING" ]] || { c_err "linux-gnu V8 binding not found: $V8_BINDING"; exit 1; }
-[[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] || { c_err "V8 archive looks like an LFS pointer: $V8_ARCHIVE"; exit 1; }
+V8_ARCHIVE=""
+V8_BINDING=""
+# shellcheck source=scripts/lib/host-v8.sh
+source "$SCRIPT_DIR/lib/host-v8.sh"
+host_v8_resolve "$REPO_ROOT" || exit 1
+V8_ARCHIVE="$HOST_V8_ARCHIVE"
+V8_BINDING="$HOST_V8_BINDING"
 
 # Host Skia deps (idempotent): EGL/GL headers + .so symlinks + ninja.
 c_info "ensuring host Skia deps (scripts/dev-setup-skia.sh)"

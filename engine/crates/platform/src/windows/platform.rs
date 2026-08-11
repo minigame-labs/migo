@@ -1,9 +1,9 @@
-use crate::host_window::{HostWindowInfo, HostWindowMetrics};
 use migo_core::services::{
     CommerceServices, ConnectivityServices, DeviceServices, KeyboardService, MediaServices,
     SensorServices, SystemInfoService, SystemUtilServices,
 };
 use migo_core::{DeviceServiceProvider, FrameClock, HostNotifier};
+use shared::surface::{HostWindowInfo, HostWindowState};
 use std::sync::Arc;
 
 /// Windows platform capabilities.
@@ -18,7 +18,7 @@ pub struct WindowsPlatform {
     ///
     /// See `LinuxPlatform` — same gap, same fix, and the player drives both
     /// through the same code.
-    window: Option<HostWindowMetrics>,
+    window: Option<Arc<HostWindowState>>,
 }
 
 impl WindowsPlatform {
@@ -43,12 +43,13 @@ impl WindowsPlatform {
 
     /// Report the window the host is presenting into.
     ///
-    /// Taken at construction because a Windows host's surface does not change
-    /// size while a session runs — window resize is not wired through to a
-    /// surface lease yet. When it is, this stops being a value and has to become
-    /// something the host updates, or it will confidently report the size the
-    /// window had at start-up, which is the exact defect this exists to fix.
-    pub fn with_window(mut self, window: HostWindowMetrics) -> Self {
+    /// Shared rather than copied, because a Windows window resizes while the
+    /// session runs: the host keeps its own handle to this state and publishes
+    /// a new measurement through `HostWindowState::replace`, which every
+    /// service already handed to content reads. Taking a value here instead
+    /// would confidently report the size the window had at start-up, which is
+    /// the exact defect this exists to fix.
+    pub fn with_window(mut self, window: Arc<HostWindowState>) -> Self {
         self.window = Some(window);
         self
     }
@@ -67,7 +68,7 @@ impl Default for WindowsPlatform {
 /// `None` for a service the platform gained later would drop it silently.
 struct WindowsDeviceServices {
     host_keyboard: Option<Arc<dyn KeyboardService>>,
-    window: Option<HostWindowMetrics>,
+    window: Option<Arc<HostWindowState>>,
 }
 
 impl SensorServices for WindowsDeviceServices {}
@@ -80,7 +81,9 @@ impl SystemUtilServices for WindowsDeviceServices {
     }
 
     fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
-        Some(Arc::new(HostWindowInfo::new(self.window?)))
+        Some(Arc::new(HostWindowInfo::new(Arc::clone(
+            self.window.as_ref()?,
+        ))))
     }
 }
 
@@ -93,7 +96,7 @@ impl DeviceServiceProvider for WindowsPlatform {
         }
         Some(Arc::new(WindowsDeviceServices {
             host_keyboard: self.host_keyboard.clone(),
-            window: self.window,
+            window: self.window.clone(),
         }))
     }
 }
@@ -110,6 +113,14 @@ impl migo_core::RuntimeGenerationNotifier for WindowsPlatform {}
 mod tests {
     use super::*;
     use shared::protocol::error::ServiceError;
+    use shared::surface::HostWindowMetrics;
+    fn window(width: u32, height: u32) -> Arc<HostWindowState> {
+        Arc::new(HostWindowState::new(HostWindowMetrics::new(
+            width,
+            height,
+            shared::surface::PixelRatio::new(1.0).expect("test ratio"),
+        )))
+    }
 
     struct HostKeyboard;
     impl KeyboardService for HostKeyboard {
@@ -136,7 +147,7 @@ mod tests {
     #[test]
     fn a_host_supplied_window_is_reported_to_content() {
         let json = WindowsPlatform::new()
-            .with_window(HostWindowMetrics::new(720, 1280, 1.0))
+            .with_window(window(720, 1280))
             .create_device_services(1)
             .expect("a supplied window must produce a bundle")
             .system_info()
@@ -153,7 +164,7 @@ mod tests {
     #[test]
     fn a_window_and_a_keyboard_are_both_offered() {
         let services = WindowsPlatform::with_host_keyboard(Some(Arc::new(HostKeyboard)))
-            .with_window(HostWindowMetrics::new(720, 1280, 1.0))
+            .with_window(window(720, 1280))
             .create_device_services(1)
             .expect("bundle");
         assert!(services.keyboard().is_some(), "the keyboard was dropped");

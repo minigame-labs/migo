@@ -1,9 +1,9 @@
-use crate::host_window::{HostWindowInfo, HostWindowMetrics};
 use migo_core::services::{
     CommerceServices, ConnectivityServices, DeviceServices, KeyboardService, MediaServices,
     SensorServices, SystemInfoService, SystemUtilServices,
 };
 use migo_core::{DeviceServiceProvider, FrameClock, HostNotifier};
+use shared::surface::{HostWindowInfo, HostWindowState};
 use std::sync::Arc;
 
 pub struct LinuxPlatform {
@@ -19,7 +19,7 @@ pub struct LinuxPlatform {
     /// window, so content that lays itself out from `windowWidth`/`windowHeight`
     /// stacks everything at the origin. Nothing in the rendering path is wrong
     /// when that happens, which is why no rendering test catches it.
-    window: Option<HostWindowMetrics>,
+    window: Option<Arc<HostWindowState>>,
 }
 
 impl LinuxPlatform {
@@ -44,12 +44,13 @@ impl LinuxPlatform {
 
     /// Report the window the host is presenting into.
     ///
-    /// Taken at construction because a Linux host's surface does not change size
-    /// while a session runs -- window resize is not wired through to a surface
-    /// lease yet. When it is, this stops being a value and has to become
-    /// something the host updates, or it will confidently report the size the
-    /// window had at start-up, which is the exact defect this exists to fix.
-    pub fn with_window(mut self, window: HostWindowMetrics) -> Self {
+    /// Shared rather than copied, because a Linux window resizes while the
+    /// session runs: the host keeps its own handle to this state and publishes a
+    /// new measurement through `HostWindowState::replace`, which every service
+    /// already handed to content reads. Taking a value here instead would
+    /// confidently report the size the window had at start-up, which is the
+    /// exact defect this exists to fix.
+    pub fn with_window(mut self, window: Arc<HostWindowState>) -> Self {
         self.window = Some(window);
         self
     }
@@ -68,7 +69,7 @@ impl Default for LinuxPlatform {
 /// `None` for a service the platform gained later would drop it silently.
 struct LinuxDeviceServices {
     host_keyboard: Option<Arc<dyn KeyboardService>>,
-    window: Option<HostWindowMetrics>,
+    window: Option<Arc<HostWindowState>>,
 }
 
 impl SensorServices for LinuxDeviceServices {}
@@ -81,7 +82,9 @@ impl SystemUtilServices for LinuxDeviceServices {
     }
 
     fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
-        Some(Arc::new(HostWindowInfo::new(self.window?)))
+        Some(Arc::new(HostWindowInfo::new(Arc::clone(
+            self.window.as_ref()?,
+        ))))
     }
 }
 
@@ -95,7 +98,7 @@ impl DeviceServiceProvider for LinuxPlatform {
         }
         Some(Arc::new(LinuxDeviceServices {
             host_keyboard: self.host_keyboard.clone(),
-            window: self.window,
+            window: self.window.clone(),
         }))
     }
 }
@@ -112,6 +115,14 @@ impl migo_core::RuntimeGenerationNotifier for LinuxPlatform {}
 mod tests {
     use super::*;
     use shared::protocol::error::ServiceError;
+    use shared::surface::HostWindowMetrics;
+    fn window(width: u32, height: u32) -> Arc<HostWindowState> {
+        Arc::new(HostWindowState::new(HostWindowMetrics::new(
+            width,
+            height,
+            shared::surface::PixelRatio::new(1.0).expect("test ratio"),
+        )))
+    }
 
     struct HostKeyboard;
     impl KeyboardService for HostKeyboard {
@@ -143,7 +154,7 @@ mod tests {
     #[test]
     fn a_host_supplied_window_is_reported_to_content() {
         let json = LinuxPlatform::new()
-            .with_window(HostWindowMetrics::new(720, 1280, 1.0))
+            .with_window(window(720, 1280))
             .create_device_services(1)
             .expect("a supplied window must produce a bundle")
             .system_info()
@@ -161,7 +172,7 @@ mod tests {
     #[test]
     fn a_window_and_a_keyboard_are_both_offered() {
         let services = LinuxPlatform::with_host_keyboard(Some(Arc::new(HostKeyboard)))
-            .with_window(HostWindowMetrics::new(720, 1280, 1.0))
+            .with_window(window(720, 1280))
             .create_device_services(1)
             .expect("bundle");
         assert!(services.keyboard().is_some(), "the keyboard was dropped");

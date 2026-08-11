@@ -69,6 +69,17 @@ struct host {
     int dispatch_pipe[2]; /* [0] read, [1] write */
     /* Drives the scripted pad; see GAMEPAD_SCRIPT_FRAME. */
     unsigned frames_delivered;
+    /* The generation of the live attachment, and the high-water mark the next
+     * attach has to beat.
+     *
+     * Every attach must carry a generation strictly greater than any the Session
+     * has accepted, and Android destroys and recreates the window on every trip
+     * through the background -- so a host that stamps a constant attaches once
+     * and is then refused with MIGO_ERROR_STALE_SURFACE for the rest of the
+     * process, leaving the app with no surface after its first resume. A metrics
+     * update is the opposite rule: it names the attachment it is updating, so it
+     * carries exactly this value rather than the next one. */
+    uint64_t surface_generation;
     /* Needed for the soft keyboard: showing and hiding the system IME is an
      * activity-level operation, and this host has no Java side to ask. */
     ANativeActivity *activity;
@@ -566,11 +577,15 @@ static void attach_window(struct host *h, ANativeWindow *window) {
     /* The engine acquires its own reference; this one stays ours. */
     native.native_window = window;
 
+    /* Claimed, not committed: a refused attach does not consume a generation on
+     * the engine side, so the retry has to be able to offer this same one. */
+    uint64_t generation = h->surface_generation + 1;
+
     MigoSurfaceDescriptor surface;
     memset(&surface, 0, sizeof surface);
     surface.struct_size = (uint32_t)sizeof surface;
     surface.abi_version = MIGO_ABI_VERSION_CURRENT;
-    surface.generation = 1;
+    surface.generation = generation;
     surface.platform_kind = MIGO_PLATFORM_ANDROID_NATIVE_WINDOW;
     surface.flags = MIGO_SURFACE_DESCRIPTOR_FLAG_NONE;
     surface.width_pixels = (uint32_t)width;
@@ -588,7 +603,9 @@ static void attach_window(struct host *h, ANativeWindow *window) {
         LOGE("migo_session_attach_surface failed: %d", (int)result);
         return;
     }
-    LOGI("attached %dx%d density=%.2f", width, height, h->density);
+    h->surface_generation = generation;
+    LOGI("attached %dx%d density=%.2f generation=%llu", width, height, h->density,
+         (unsigned long long)generation);
 
     if (!h->content_loaded) {
         MigoContentDescriptor content;
@@ -673,7 +690,7 @@ static void update_surface(struct host *h, ANativeWindow *window) {
     memset(&metrics, 0, sizeof metrics);
     metrics.struct_size = (uint32_t)sizeof metrics;
     metrics.abi_version = MIGO_ABI_VERSION_CURRENT;
-    metrics.generation = 1;
+    metrics.generation = h->surface_generation;
     metrics.width_pixels = (uint32_t)ANativeWindow_getWidth(window);
     metrics.height_pixels = (uint32_t)ANativeWindow_getHeight(window);
     metrics.scale_factor = h->density;

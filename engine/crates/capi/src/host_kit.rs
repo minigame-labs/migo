@@ -12,11 +12,8 @@ use migo_core::services::{
 };
 use migo_core::{DeviceServiceProvider, FrameClock, HostNotifier};
 use shared::protocol::error::ServiceError;
-use shared::surface::{PixelRatio, SafeArea, WindowInfo};
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicU32, AtomicU64, Ordering},
-};
+use shared::surface::{HostWindowInfo, HostWindowState};
+use std::sync::{Arc, Weak};
 
 use crate::{
     MigoSession,
@@ -92,7 +89,7 @@ impl CapiHostKit {
     pub fn new(
         notifier: Option<Arc<Notifier>>,
         session: Weak<MigoSession>,
-        window: Arc<CapiWindowState>,
+        window: Arc<HostWindowState>,
     ) -> Self {
         // Offered exactly when the host installed the callbacks -- never
         // because the platform claims a keyboard. On Android the platform's own
@@ -118,94 +115,9 @@ impl CapiHostKit {
     }
 }
 
-/// One coherent physical-window snapshot supplied by a C host.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct CapiWindowMetrics {
-    width_pixels: u32,
-    height_pixels: u32,
-    pixel_ratio: PixelRatio,
-}
-
-impl CapiWindowMetrics {
-    #[inline]
-    pub(crate) const fn new(
-        width_pixels: u32,
-        height_pixels: u32,
-        pixel_ratio: PixelRatio,
-    ) -> Self {
-        Self {
-            width_pixels,
-            height_pixels,
-            pixel_ratio,
-        }
-    }
-}
-
-/// A single-writer seqlock for window metrics.
-///
-/// Surface transitions are serialized by `SessionControl`, while JS may query
-/// window information concurrently. Atomics avoid taking a platform lock from
-/// V8 and guarantee that width, height and DPR always come from one update.
-pub(crate) struct CapiWindowState {
-    sequence: AtomicU64,
-    width_pixels: AtomicU32,
-    height_pixels: AtomicU32,
-    pixel_ratio_bits: AtomicU32,
-}
-
-impl CapiWindowState {
-    pub(crate) fn new(metrics: CapiWindowMetrics) -> Self {
-        Self {
-            sequence: AtomicU64::new(0),
-            width_pixels: AtomicU32::new(metrics.width_pixels),
-            height_pixels: AtomicU32::new(metrics.height_pixels),
-            pixel_ratio_bits: AtomicU32::new(metrics.pixel_ratio.get().to_bits()),
-        }
-    }
-
-    /// Publish all fields as one logical update and return the old snapshot so
-    /// a rejected command enqueue can roll the change back.
-    pub(crate) fn replace(&self, metrics: CapiWindowMetrics) -> CapiWindowMetrics {
-        let previous = self.snapshot();
-        let prior = self.sequence.fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(prior & 1, 0, "C Surface updates must be serialized");
-        self.width_pixels
-            .store(metrics.width_pixels, Ordering::Relaxed);
-        self.height_pixels
-            .store(metrics.height_pixels, Ordering::Relaxed);
-        self.pixel_ratio_bits
-            .store(metrics.pixel_ratio.get().to_bits(), Ordering::Relaxed);
-        self.sequence.fetch_add(1, Ordering::Release);
-        previous
-    }
-
-    pub(crate) fn snapshot(&self) -> CapiWindowMetrics {
-        loop {
-            let before = self.sequence.load(Ordering::Acquire);
-            if before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let width_pixels = self.width_pixels.load(Ordering::Relaxed);
-            let height_pixels = self.height_pixels.load(Ordering::Relaxed);
-            let pixel_ratio_bits = self.pixel_ratio_bits.load(Ordering::Relaxed);
-            let after = self.sequence.load(Ordering::Acquire);
-            if before == after {
-                let pixel_ratio = PixelRatio::new(f32::from_bits(pixel_ratio_bits))
-                    .expect("CapiWindowState stores only validated ratios");
-                return CapiWindowMetrics {
-                    width_pixels,
-                    height_pixels,
-                    pixel_ratio,
-                };
-            }
-        }
-    }
-}
-
 struct CapiDeviceServices {
     keyboard: Option<Arc<dyn KeyboardService>>,
-    window: Arc<CapiWindowState>,
+    window: Arc<HostWindowState>,
 }
 
 impl SensorServices for CapiDeviceServices {}
@@ -219,39 +131,7 @@ impl SystemUtilServices for CapiDeviceServices {
     }
 
     fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
-        Some(Arc::new(CapiSystemInfo {
-            window: Arc::clone(&self.window),
-        }))
-    }
-}
-
-struct CapiSystemInfo {
-    window: Arc<CapiWindowState>,
-}
-
-impl SystemInfoService for CapiSystemInfo {
-    fn get_window_info_json(&self) -> Result<String, ServiceError> {
-        let metrics = self.window.snapshot();
-        let physical_width = metrics.width_pixels as f32;
-        let physical_height = metrics.height_pixels as f32;
-        let info = WindowInfo {
-            pixel_ratio: metrics.pixel_ratio.get(),
-            screen_width: physical_width,
-            screen_height: physical_height,
-            window_width: physical_width,
-            window_height: physical_height,
-            status_bar_height: 0.0,
-            screen_top: 0.0,
-            safe_area: SafeArea {
-                left: 0.0,
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-            },
-        }
-        .to_logical();
-        serde_json::to_string(&info)
-            .map_err(|error| ServiceError::system(format!("getWindowInfo:fail serialize: {error}")))
+        Some(Arc::new(HostWindowInfo::new(Arc::clone(&self.window))))
     }
 }
 
@@ -395,9 +275,11 @@ impl migo_core::RuntimeGenerationNotifier for CapiHostKit {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::surface::{HostWindowMetrics, PixelRatio};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-    fn window(width: u32, height: u32, ratio: f32) -> Arc<CapiWindowState> {
-        Arc::new(CapiWindowState::new(CapiWindowMetrics::new(
+    fn window(width: u32, height: u32, ratio: f32) -> Arc<HostWindowState> {
+        Arc::new(HostWindowState::new(HostWindowMetrics::new(
             width,
             height,
             PixelRatio::new(ratio).expect("valid test ratio"),
@@ -590,7 +472,7 @@ mod tests {
         assert_eq!(initial["safe_area"]["right"], 0.0);
         assert_eq!(initial["safe_area"]["bottom"], 0.0);
 
-        state.replace(CapiWindowMetrics::new(
+        state.replace(HostWindowMetrics::new(
             900,
             600,
             PixelRatio::new(1.5).expect("valid ratio"),
@@ -611,8 +493,8 @@ mod tests {
         let state = window(100, 200, 1.0);
         let writer_state = Arc::clone(&state);
         let writer = std::thread::spawn(move || {
-            let a = CapiWindowMetrics::new(100, 200, PixelRatio::new(1.0).expect("valid ratio"));
-            let b = CapiWindowMetrics::new(300, 400, PixelRatio::new(2.0).expect("valid ratio"));
+            let a = HostWindowMetrics::new(100, 200, PixelRatio::new(1.0).expect("valid ratio"));
+            let b = HostWindowMetrics::new(300, 400, PixelRatio::new(2.0).expect("valid ratio"));
             for index in 0..20_000 {
                 writer_state.replace(if index & 1 == 0 { a } else { b });
             }
@@ -622,9 +504,9 @@ mod tests {
             let metrics = state.snapshot();
             assert!(
                 metrics
-                    == CapiWindowMetrics::new(100, 200, PixelRatio::new(1.0).expect("valid ratio"),)
+                    == HostWindowMetrics::new(100, 200, PixelRatio::new(1.0).expect("valid ratio"),)
                     || metrics
-                        == CapiWindowMetrics::new(
+                        == HostWindowMetrics::new(
                             300,
                             400,
                             PixelRatio::new(2.0).expect("valid ratio"),
