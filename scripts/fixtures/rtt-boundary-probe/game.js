@@ -27,7 +27,12 @@ const gl = canvas.getContext("webgl");
 // A second canvas keeps DrawingBuffer bypass off, so a blit runs every frame and
 // the post-swap restore is on the path. It is never drawn to: unlike `rtt-probe`
 // this fixture does not need a mid-frame canvas switch.
-const _keepBypassOff = migo.createCanvas();
+//
+// On `globalThis` for the reason `blit-probe` explains: a module binding nothing
+// reads again is not reachable, and once V8 drops it the FinalizationRegistry
+// destroys the canvas, bypass latches, and this probe stops reaching the
+// post-swap restore it exists to cover.
+globalThis.__rttBoundaryKeepBypassOff = migo.createCanvas();
 
 const rtt = gl.createFramebuffer();
 const tex = gl.createTexture();
