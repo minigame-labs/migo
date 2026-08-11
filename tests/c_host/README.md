@@ -13,6 +13,7 @@ the reason these exist.
 | `touch-probe/` | Content shared by both, for verifying that input arrives. |
 | `keyboard-probe/` | Content shared by both, for verifying the soft-keyboard round trip. |
 | `surface-recreate-probe/` | Content shared by both, for verifying that the main canvas still describes the surface after the window was destroyed and recreated at a different size. |
+| `lifecycle-probe/` | Content shared by both, for verifying that the engine stops painting while the app is away and that content is told it went away. |
 
 The Android module lives here rather than under `platforms/android/` because it
 is a *consumer* of what that tree ships, not part of the product. Gradle picks
