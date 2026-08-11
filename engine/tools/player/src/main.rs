@@ -66,10 +66,19 @@ fn main() {
 
     let mut positional = Vec::new();
     let mut windowed = std::env::var_os("MIGO_PLAYER_WINDOW").is_some_and(|v| v != "0");
-    for arg in std::env::args().skip(1) {
+    let mut resize = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--window" => windowed = true,
             "--offscreen" => windowed = false,
+            "--resize" => match args.next().as_deref().and_then(parse_extent) {
+                Some(extent) => resize = Some(extent),
+                None => {
+                    tracing::error!("--resize takes WIDTHxHEIGHT, e.g. --resize 1000x700");
+                    std::process::exit(2);
+                }
+            },
             _ => positional.push(arg),
         }
     }
@@ -82,13 +91,26 @@ fn main() {
         });
     let secs: u64 = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
 
-    if let Err(err) = run(&bundle_dir, secs, windowed) {
+    if let Err(err) = run(&bundle_dir, secs, windowed, resize) {
         tracing::error!("player failed: {err}");
         std::process::exit(1);
     }
 }
 
-fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
+/// `WIDTHxHEIGHT`, rejecting a zero extent because no surface may carry one.
+fn parse_extent(text: &str) -> Option<(u32, u32)> {
+    let (width, height) = text.split_once(['x', 'X'])?;
+    let width: u32 = width.trim().parse().ok()?;
+    let height: u32 = height.trim().parse().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn run(
+    bundle_dir: &PathBuf,
+    secs: u64,
+    windowed: bool,
+    resize: Option<(u32, u32)>,
+) -> Result<(), String> {
     // ---- Scratch dirs (files / cache / code cache) ----
     let root = std::env::temp_dir().join(format!("migo-player-{}", std::process::id()));
     let files_dir = root.join("files");
@@ -244,12 +266,36 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // Let the game render for the window; the render thread keeps overwriting
     // the capture slot with the latest present, so early blank warmup frames
     // are superseded by frames containing game content.
-    #[cfg(target_os = "linux")]
-    run_for(&mut window, Duration::from_secs(secs.max(4)));
-    #[cfg(target_os = "windows")]
-    run_for(&mut window, Duration::from_secs(secs.max(4)), host_id);
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    run_for(Duration::from_secs(secs.max(4)));
+    let total = Duration::from_secs(secs.max(4));
+    match resize {
+        // Offscreen is the only mode that can resize itself: a pbuffer of the
+        // new size *is* the new surface, whereas a window's extent belongs to
+        // the window system. Splitting the run in half puts frames on both
+        // sides of the transition, so a capture proves which size was presented
+        // rather than only which size was requested.
+        Some((width, height)) if !windowed => {
+            thread::sleep(total / 2);
+            resize_offscreen(host_id, &window_state, width, height)?;
+            // Ask for a second capture: the stored frame must be one presented
+            // *after* the transition, or the PNG would prove nothing about it.
+            graphics::frame_capture::request();
+            thread::sleep(total / 2);
+        }
+        Some(_) => {
+            return Err(
+                "--resize needs --offscreen; a window's extent is the window system's to change"
+                    .to_string(),
+            );
+        }
+        None => {
+            #[cfg(target_os = "linux")]
+            run_for(&mut window, total);
+            #[cfg(target_os = "windows")]
+            run_for(&mut window, total, host_id);
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            run_for(total);
+        }
+    }
     match graphics::frame_capture::take() {
         Some(frame) => {
             write_png(&png_path, &frame)?;
@@ -269,6 +315,43 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     shutdown_before_drop(host, ())?;
     tracing::info!("player done");
+    Ok(())
+}
+
+/// Report a new offscreen surface the way an embedding host reports a resize.
+///
+/// This is the whole sequence a host owes the engine, in the order the C ABI
+/// performs it: build the new native surface, lease it against the host's live
+/// Surface generation, publish the measurement content reads, then hand the
+/// lease over. The publish happens before the command is enqueued and is rolled
+/// back if the enqueue fails, so `wx.getSystemInfoSync()` can never report a
+/// size the renderer was never told about.
+///
+/// `UpdateSurface` goes through the critical channel because a dropped resize
+/// strands the app on a stale-sized frame with nothing left to trigger another.
+fn resize_offscreen(
+    host_id: migo_core::HostId,
+    window_state: &Arc<HostWindowState>,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let pixel_ratio = PixelRatio::new(1.0).expect("1.0 is a valid pixel ratio");
+    let surface: SurfaceRef = Arc::new(OffscreenSurface::new(width, height));
+    let lease = migo_core::lease_surface(host_id, surface)
+        .map_err(|error| format!("lease resized surface: {error}"))?;
+
+    let previous = window_state.replace(HostWindowMetrics::new(width, height, pixel_ratio));
+    if let Err(error) = migo_core::send_critical_command_to_host(
+        host_id,
+        HostCommand::UpdateSurface {
+            lease,
+            pixel_ratio: Some(pixel_ratio),
+        },
+    ) {
+        window_state.replace(previous);
+        return Err(format!("UpdateSurface: {error}"));
+    }
+    tracing::info!("resized offscreen surface to {width}x{height}");
     Ok(())
 }
 
