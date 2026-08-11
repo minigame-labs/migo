@@ -13,7 +13,16 @@
             android:name="android.app.NativeActivity"
             android:configChanges="orientation|keyboardHidden|screenSize"
             android:exported="true"
-            android:screenOrientation="portrait">
+            android:screenOrientation="user">
+            <!--
+              Rotatable, like the product's own MigoGameActivity, which pins no
+              orientation either. Content declares the orientation it wants; a
+              host that pins portrait cannot see what a rotation does to the
+              surface, and rotating while backgrounded is the one lifecycle that
+              hands the engine a *different* native window rather than a resized
+              one. This example was locked to portrait, and both defects that
+              path carries went unnoticed for exactly that reason.
+            -->
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="migo_c_host" />

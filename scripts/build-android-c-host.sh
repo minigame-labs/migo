@@ -10,8 +10,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/v8-materialise.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
-TARGET="aarch64-linux-android"
-ABI="arm64-v8a"
+
+# The ABI is an argument because the only Android hardware this project can
+# always reach is an emulator, and the emulator that runs at usable speed here
+# is x86_64 (KVM). A harness that only builds for the phone ABI is a harness
+# that cannot be run.
+ABI="${1:-arm64-v8a}"
+case "$ABI" in
+arm64-v8a) TARGET="aarch64-linux-android" V8_ARCH="aarch64" ;;
+x86_64) TARGET="x86_64-linux-android" V8_ARCH="x86_64" ;;
+*) echo "usage: $0 [arm64-v8a|x86_64]" >&2; exit 2 ;;
+esac
 
 info() { echo -e "\033[0;36m[android-c-host] $*\033[0m"; }
 err() { echo -e "\033[0;31m[android-c-host] $*\033[0m" >&2; }
@@ -26,14 +35,14 @@ export ANDROID_NDK_HOME
 export ANDROID_NDK="$ANDROID_NDK_HOME"
 export PATH="$NDK_BIN:$PATH"
 
-# engine/.cargo/config.toml names aarch64-linux-android-ar without a path; the
-# NDK ships it as llvm-ar.
+# engine/.cargo/config.toml names <triple>-ar without a path; the NDK ships it
+# as llvm-ar.
 SHIM_DIR="$ENGINE_DIR/target/android-ar-shim"
 mkdir -p "$SHIM_DIR"
-ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/aarch64-linux-android-ar"
+ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/${TARGET}-ar"
 export PATH="$SHIM_DIR:$PATH"
 
-V8_DIR="$ENGINE_DIR/third_party/rusty_v8/aarch64"
+V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$V8_ARCH"
 # Verified against its component manifest, then used from a content-addressed path. No
 # separate existence check below it: the materialiser refuses a missing archive by name, so
 # one here would be dead code shaped like a guard.
@@ -73,7 +82,9 @@ info "staged $(stat -c %s "$STAGE/libmigo_capi.a") bytes at $STAGE/libmigo_capi.
 
 info "building the APK"
 cd "$REPO_ROOT/platforms/android"
-./gradlew --no-daemon :c-host-example:assembleDebug
+# The Gradle project builds only the ABIs this script staged a staticlib for;
+# CMake links it by path, so an unstaged ABI fails deep in the linker instead.
+./gradlew --no-daemon "-PmigoAbis=$ABI" :c-host-example:assembleDebug
 
 APK="$(find "$REPO_ROOT/tests/c_host/android/build/outputs/apk" -name '*.apk' | head -1)"
 [[ -n "$APK" ]] || { err "no APK produced"; exit 1; }
