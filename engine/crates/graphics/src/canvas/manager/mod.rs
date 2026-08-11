@@ -5,6 +5,7 @@ use crate::backend::gl::surface::Canvas2DContext;
 use crate::dirty_region::damage_tracker::ResolvedDamage;
 use crate::{
     BoundContext,
+    canvas::{BackingSizeOwner, engine_default_backing},
     egl_platform::{EglProvider, PreparedEglSurfaceRef},
     surface_binding::{CandidateCleanup, InstallPhase, RecreateKind, SurfaceInstallFailure},
 };
@@ -294,6 +295,28 @@ pub(crate) struct CanvasManager {
     /// `getContext('2d')` and has no idea the surface went away. So nothing
     /// else will ever ask for the rebuild.
     onscreen_2d_restore: Option<Canvas2DState>,
+
+    /// The backing-store size the content chose for the onscreen canvas with
+    /// `canvas.width`/`height`, if it has chosen one.
+    ///
+    /// `None` means the size is the engine's own, derived from the surface, and
+    /// therefore has to be re-derived whenever the surface changes; that is the
+    /// whole rule, and holding the *size* rather than a flag is what makes it
+    /// survive a full context loss, where the buffer that carried the number is
+    /// gone. See [`crate::canvas::BackingSizeOwner`] for the two halves of the
+    /// rule and where the JS one lives.
+    ///
+    /// Here rather than on the entry because it has to outlive a surface
+    /// teardown: `create_onscreen` destroys and reinserts the entry on every
+    /// recreate, so state stored there would reset itself exactly when it is
+    /// needed. Same reason [`Self::onscreen_2d_restore`] lives here, and the
+    /// onscreen canvas is the singleton id 1 this path already assumes.
+    ///
+    /// A session restart does not clear it, because nothing tells the render
+    /// thread a restart happened -- and the replacement content inherits the
+    /// installed backing size through `op_get_canvas_info` anyway, so what this
+    /// remembers still describes the buffer that is actually installed.
+    onscreen_content_backing: Option<(u32, u32)>,
 
     /// Debug one-shot: when set (via `WEBGL_lose_context.loseContext()` ->
     /// `GLCmd::DebugLoseContext`), the next `check_graphics_reset_status()`
@@ -766,6 +789,8 @@ impl CanvasManager {
             surface_unavailable: false,
             force_onscreen_recreate: false,
             onscreen_2d_restore: None,
+            // A canvas nobody has sized yet is the engine's to derive.
+            onscreen_content_backing: None,
             simulated_reset: false,
             installed_surface: None,
             pending_onscreen: None,
@@ -1078,37 +1103,22 @@ impl CanvasManager {
                         );
                         let physical_w = exp_w.max(1);
                         let physical_h = exp_h.max(1);
-                        // Preserve the game's logical-vs-physical BACKING choice
-                        // across the surface resize instead of forcing the backing
-                        // to the new physical size. Scale the DrawingBuffer by the
-                        // same ratio it had to the OLD surface: a DPR-naive game
-                        // (Pixi/Phaser/vanilla Canvas2D at resolution 1) keeps its
-                        // logical-sized backing (physical/dpi) — the swap-blit keeps
-                        // upscaling it to fill the window — while a DPR-aware game
-                        // (Cocos, backing == physical) stays physical/crisp. Forcing
-                        // physical here clobbered a logical Canvas2D game's backing:
-                        // it reads the canvas size ONCE and draws in logical
-                        // coordinates forever, so an over-sized physical backing left
-                        // all of its drawing stranded in a corner (WebGL games re-read
-                        // the canvas size each frame, so they were unaffected).
-                        // `resize_canvas` takes `Option<u32>` per-dim; pass both.
-                        let (backing_w, backing_h) = {
-                            let e = self
-                                .canvases
-                                .get(&id)
-                                .expect("entry present (checked above)");
-                            let (obw, obh) = e
-                                .drawing_buffer
-                                .as_ref()
-                                .map(|db| (db.width, db.height))
-                                .unwrap_or((e.physical_width, e.physical_height));
-                            let opw = e.physical_width.max(1) as f32;
-                            let oph = e.physical_height.max(1) as f32;
-                            (
-                                ((physical_w as f32 * obw as f32 / opw).round() as u32).max(1),
-                                ((physical_h as f32 * obh as f32 / oph).round() as u32).max(1),
-                            )
-                        };
+                        // One rule, the same one the recreate path and a fresh
+                        // install answer: a backing store the content chose is
+                        // the content's and does not move because the window
+                        // did (what a browser does, and what the JS half
+                        // already promises by refusing to adopt a new size for
+                        // such a canvas), while the engine's own default is
+                        // re-derived from the surface it is meant to describe.
+                        //
+                        // This used to scale the buffer by the ratio it had to
+                        // the OLD surface, which preserved neither: a canvas
+                        // fixed at 960x640 (Phaser `Scale.NONE`) came back as
+                        // some third size while `canvas.width` still read 960,
+                        // so the content drew in coordinates its own buffer no
+                        // longer had -- into a corner of it.
+                        let (backing_w, backing_h) = self
+                            .onscreen_backing_size((physical_w, physical_h), effective_pixel_ratio);
                         self.resize_canvas_for_surface_change(id, backing_w, backing_h)
                             .map_err(|error| {
                                 SurfaceInstallFailure::from_phase(
@@ -1360,31 +1370,55 @@ impl CanvasManager {
         // context was preserved, the DrawingBuffer GL objects are still valid
         // and should be reused.  Reusing them preserves the last frame and
         // avoids a black resume frame before Cocos schedules a new RAF draw.
+        let (target_w, target_h) =
+            self.onscreen_backing_size((physical_w, physical_h), effective_pixel_ratio);
         let staged_drawing_buffer = self
             .canvases
             .get_mut(&id)
             .and_then(|entry| entry.drawing_buffer.take());
-        let drawing_buffer = if let Some(db) = staged_drawing_buffer {
-            // Reuse the preserved DrawingBuffer AS-IS, at its own size. That
-            // size is the canvas *backing store* the game chose
-            // (canvas.width/height), which is INDEPENDENT of the EGL surface
-            // size — the swap-time blit scales db -> surface. Resizing it to
-            // the new surface here would clobber a game that picked a fixed
-            // canvas resolution (e.g. Phaser `Scale.NONE` at 960x640 on a
-            // 2340x1080 screen): its content would then render into a corner of
-            // an over-sized buffer instead of being upscaled to fill the
-            // window. The game itself drives backing-size changes through
-            // `resize_canvas` (canvas.width/height). Reusing also preserves the
-            // last frame, avoiding a black resume frame after a surface
-            // recreate (device rotation / resume).
-            tracing::info!(
-                canvas_id = %id,
-                width = db.width,
-                height = db.height,
-                surface_width = physical_w,
-                surface_height = physical_h,
-                "Reusing preserved DrawingBuffer for onscreen canvas"
-            );
+        let drawing_buffer = if let Some(mut db) = staged_drawing_buffer {
+            // The preserved buffer keeps its GL objects, and its *size* answers
+            // the same question a fresh one does: a size the content chose is
+            // the content's, and the engine's own default describes the surface
+            // it was derived from -- this one. Keeping it unconditionally is
+            // what left a canvas nobody sized describing the surface the app
+            // was suspended on, upscaled by the blit, while `windowWidth`
+            // reported the real one.
+            //
+            // Reuse without a resize is still the common case (a resume at the
+            // same size), and that is the one that preserves the last frame and
+            // avoids a black resume frame; a surface that came back a different
+            // size has no frame worth preserving anyway.
+            if (db.width, db.height) != (target_w, target_h) {
+                match drawing_buffer::resize(&self.gl, &mut db, target_w, target_h) {
+                    Ok(()) => tracing::info!(
+                        canvas_id = %id,
+                        width = target_w,
+                        height = target_h,
+                        surface_width = physical_w,
+                        surface_height = physical_h,
+                        "Resized preserved DrawingBuffer to follow the recreated surface"
+                    ),
+                    // Keeping the buffer at its old size leaves the canvas
+                    // describing the previous surface, which is wrong but
+                    // presentable; failing the install would drop presentation
+                    // altogether. Everything below reads the buffer's real size,
+                    // so the entry and JS still agree with the GL object.
+                    Err(error) => tracing::error!(
+                        canvas_id = %id,
+                        "preserved DrawingBuffer resize to {target_w}x{target_h} failed: {error}"
+                    ),
+                }
+            } else {
+                tracing::info!(
+                    canvas_id = %id,
+                    width = db.width,
+                    height = db.height,
+                    surface_width = physical_w,
+                    surface_height = physical_h,
+                    "Reusing preserved DrawingBuffer for onscreen canvas"
+                );
+            }
             unsafe {
                 self.gl.bind_framebuffer(
                     glow::FRAMEBUFFER,
@@ -1409,8 +1443,7 @@ impl CanvasManager {
         };
         // The onscreen canvas backing store == the DrawingBuffer. Track its
         // actual size in the entry so bypass evaluation (db vs surface) and JS
-        // canvas.width/height stay consistent; a fresh buffer defaults to the
-        // surface size (the default canvas fills the window).
+        // canvas.width/height stay consistent.
         let (backing_w, backing_h) = if let Some(db) = drawing_buffer {
             let (dbw, dbh) = (db.width, db.height);
             if let Some(entry) = self.canvases.get_mut(&id) {
@@ -1420,38 +1453,14 @@ impl CanvasManager {
             }
             (dbw, dbh)
         } else {
-            // Default the fresh onscreen backing store to LOGICAL (CSS) pixels
-            // (surface / devicePixelRatio), not the physical surface size, to
-            // match browser/wx canvas semantics. A DPR-naive engine (Pixi/Phaser
-            // created with resolution = 1) sizes its GL viewport to the logical
-            // window size; with a logical-sized backing it fills the buffer and
-            // the swap-time blit upscales it to the physical surface (exactly how
-            // a browser CSS-scales a logical canvas to fill the display), instead
-            // of rendering into a corner of an over-sized physical buffer. A
-            // DPR-aware engine (e.g. Cocos) that sets canvas.width = logical*dpr
-            // resizes the DrawingBuffer back to the physical size via
-            // `resize_canvas`, which re-enables the direct-to-surface bypass for
-            // crisp native-resolution rendering. Making the *default* logical also
-            // keeps it stable across the multiple surfaceChanged events fired
-            // during startup layout (each fresh buffer is logical, not physical),
-            // so a logical-sized game no longer races back to a corner.
-            let dpi = effective_pixel_ratio.get();
-            let (def_w, def_h) = if dpi > 1.0 {
-                (
-                    ((physical_w as f32 / dpi).round() as u32).max(1),
-                    ((physical_h as f32 / dpi).round() as u32).max(1),
-                )
-            } else {
-                (physical_w, physical_h)
-            };
-            match drawing_buffer::create(&self.gl, def_w, def_h) {
+            match drawing_buffer::create(&self.gl, target_w, target_h) {
                 Ok(db) => {
                     if let Some(entry) = self.canvases.get_mut(&id) {
-                        entry.info.width = def_w;
-                        entry.info.height = def_h;
+                        entry.info.width = target_w;
+                        entry.info.height = target_h;
                         entry.drawing_buffer = Some(db);
                     }
-                    (def_w, def_h)
+                    (target_w, target_h)
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1661,6 +1670,20 @@ impl CanvasManager {
         Ok(())
     }
 
+    /// The backing store the onscreen canvas must have on a surface of
+    /// `surface` physical pixels.
+    ///
+    /// The one place the ownership rule is applied, so the three installs that
+    /// have to agree — a fresh create, a same-surface resize, and a
+    /// destroy-and-recreate — cannot drift apart. That drift is the defect this
+    /// exists to remove: the recreate path kept the preserved buffer at the size
+    /// derived from the surface the app was suspended on, so a canvas the content
+    /// never sized came back from a rotation still describing a portrait window.
+    fn onscreen_backing_size(&self, surface: (u32, u32), pixel_ratio: PixelRatio) -> (u32, u32) {
+        self.onscreen_content_backing
+            .unwrap_or_else(|| engine_default_backing(surface, pixel_ratio.get()))
+    }
+
     /// Resize a canvas because the *surface* moved, not because the content
     /// asked it to.
     ///
@@ -1688,7 +1711,7 @@ impl CanvasManager {
         height: u32,
     ) -> EngineResult<()> {
         let state = self.contexts_2d.get(&id).map(|ctx| ctx.drawing_state());
-        self.resize_canvas(id, Some(width), Some(height))?;
+        self.resize_canvas(id, Some(width), Some(height), BackingSizeOwner::Engine)?;
         if let (Some(state), Some(ctx)) = (state, self.contexts_2d.get_mut(&id)) {
             ctx.adopt_drawing_state(state);
         }
@@ -2968,11 +2991,19 @@ impl CanvasManager {
     ///
     /// `w` and `h` are in **physical (buffer) pixels** — the same unit JS
     /// `canvas.width`/`canvas.height` uses.  No DPR scaling is applied.
+    ///
+    /// `owner` says who is asking, and only [`BackingSizeOwner::Content`]
+    /// promotes the onscreen canvas to a content-owned size. It is an argument
+    /// rather than something the callers remember to record separately because
+    /// every call site then has to answer it, and the surface-driven caller
+    /// answering it wrongly is precisely the bug: it would take the canvas away
+    /// from the content that owns it.
     pub(crate) fn resize_canvas(
         &mut self,
         id: CanvasId,
         w: Option<u32>,
         h: Option<u32>,
+        owner: BackingSizeOwner,
     ) -> EngineResult<()> {
         let (old_w, old_h, kind, ctx_handle, old_surf) = {
             let entry = self.canvases.get(&id).ok_or_else(|| {
@@ -2999,6 +3030,15 @@ impl CanvasManager {
 
         let new_w = w.unwrap_or(old_w);
         let new_h = h.unwrap_or(old_h);
+
+        // Recorded before the no-op return below, because assigning the size it
+        // already has still claims the canvas -- the JS setter sets its half of
+        // this on every assignment, and a canvas the two halves disagree about
+        // is one whose size the engine would move under content that thinks it
+        // owns it.
+        if owner == BackingSizeOwner::Content && matches!(kind, SurfaceKind::Window) {
+            self.onscreen_content_backing = Some((new_w, new_h));
+        }
 
         if new_w == old_w && new_h == old_h {
             return Ok(());

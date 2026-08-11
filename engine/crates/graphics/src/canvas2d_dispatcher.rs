@@ -12,9 +12,9 @@
 use shared::error::EngineResult;
 use shared::protocol::render_cmd::{Canvas2DCmd, CanvasId};
 
-use crate::CanvasManager;
 use crate::backend::gl::text::TextContext;
 use crate::damage_effect::DamageEffect;
+use crate::{CanvasManager, canvas::BackingSizeOwner};
 
 /// Renderer-side shim around a shared [`TextContext`].
 ///
@@ -84,7 +84,7 @@ impl Renderer2d {
             // browser behaviour for the pathological case where the OS
             // refuses a new pbuffer (allocation failure / oversize).
             Canvas2DCmd::ResizeCanvas { w, h } => {
-                if let Err(e) = cm.resize_canvas(canvas_id, w, h) {
+                if let Err(e) = cm.resize_canvas(canvas_id, w, h, BackingSizeOwner::Content) {
                     tracing::warn!(
                         "Canvas2DCmd::ResizeCanvas failed: canvas={:?}, w={:?}, h={:?}, err={}",
                         canvas_id,

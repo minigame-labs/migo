@@ -7,6 +7,52 @@ pub(crate) enum InstallPolicy {
     FullRecreate,
 }
 
+/// Who chose an onscreen canvas's backing-store size.
+///
+/// The engine derives a default from the surface for a canvas the content never
+/// sized, so that default has to be re-derived every time the surface changes; a
+/// size the content chose is the content's and the engine must never move it.
+/// `canvas.width = N` is what promotes a canvas to [`Self::Content`], and it is a
+/// latch -- a surface change cannot take a canvas back.
+///
+/// The JS half records the same promotion (`_sizedByContent` in
+/// `web/03_canvas.js`) to decide whether it may adopt a new size, and the two
+/// have to agree: `op_get_canvas_info` reports the backing store, so a render
+/// side that moved a content-owned buffer would leave the content drawing in
+/// coordinates its own canvas no longer has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackingSizeOwner {
+    Engine,
+    Content,
+}
+
+/// The backing store the engine gives an onscreen canvas the content has not
+/// sized, in CSS pixels.
+///
+/// Logical rather than physical: a DPR-naive engine (Pixi/Phaser created with
+/// resolution 1) sizes its GL viewport to the logical window, so a logical
+/// backing is filled and the swap-time blit upscales it to the surface — exactly
+/// how a browser CSS-scales a logical canvas to fill the display — instead of
+/// leaving it rendering into a corner of an over-sized physical buffer. A
+/// DPR-aware engine (Cocos) sets `canvas.width = logical * dpr`, which takes
+/// ownership and restores the physical, bypass-eligible size.
+///
+/// One function for one rule: a fresh install, a same-surface resize and a
+/// surface recreate all have to answer this identically, and the recreate path
+/// answering it differently is what left a rotated canvas describing the surface
+/// the app was suspended on.
+pub(crate) fn engine_default_backing(surface: (u32, u32), pixel_ratio: f32) -> (u32, u32) {
+    let (width, height) = surface;
+    if pixel_ratio > 1.0 {
+        (
+            ((width as f32 / pixel_ratio).round() as u32).max(1),
+            ((height as f32 / pixel_ratio).round() as u32).max(1),
+        )
+    } else {
+        (width.max(1), height.max(1))
+    }
+}
+
 /// Pure cold-path policy. Reuse is permitted only when backend-specific native
 /// equivalence has already been proven and no generation/force boundary
 /// requires a fresh EGLSurface.
@@ -55,7 +101,36 @@ pub(crate) fn classify_surface_install(
 mod tests {
     use crate::surface_binding::RecreateKind;
 
-    use super::{InstallPolicy, classify_surface_install};
+    use super::{InstallPolicy, classify_surface_install, engine_default_backing};
+
+    /// The engine's own default is the surface in CSS pixels.
+    ///
+    /// The rounding matters rather than being incidental: 1080/2.75 is 392.72, and
+    /// content comparing `canvas.width` against `getSystemInfoSync().windowWidth`
+    /// only ever agrees if both round the same ratio the same way.
+    #[test]
+    fn the_engine_default_backing_is_the_surface_in_css_pixels() {
+        assert_eq!(engine_default_backing((1080, 2340), 2.75), (393, 851));
+        assert_eq!(engine_default_backing((2204, 1080), 2.75), (801, 393));
+    }
+
+    /// At or below one device pixel per CSS pixel the surface *is* the default.
+    ///
+    /// Dividing anyway would inflate the buffer above the surface on a ratio below
+    /// 1, which no display asks for and every blit would then downscale.
+    #[test]
+    fn a_ratio_of_one_or_less_leaves_the_backing_at_the_surface() {
+        assert_eq!(engine_default_backing((1000, 700), 1.0), (1000, 700));
+        assert_eq!(engine_default_backing((1000, 700), 0.5), (1000, 700));
+    }
+
+    /// No canvas may be zero in either dimension: a zero-sized FBO is
+    /// incomplete, and the ratio can round a thin surface to nothing.
+    #[test]
+    fn the_default_backing_is_never_zero() {
+        assert_eq!(engine_default_backing((1, 1), 4.0), (1, 1));
+        assert_eq!(engine_default_backing((0, 0), 1.0), (1, 1));
+    }
 
     #[test]
     fn surface_install_policy_preserves_fast_paths_without_cross_generation_reuse() {
