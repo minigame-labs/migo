@@ -358,6 +358,33 @@ validate_native_libraries() {
         exit 1
     fi
 
+    # A single-ABI invocation and the universal one for the same PRODUCT_PROFILE
+    # write into this same directory (it is keyed on profile/codegen/worker, not
+    # ABI), so a stale sibling ABI directory left by an earlier invocation in
+    # this job is still sitting here -- Gradle's jniLibs.srcDirs packages
+    # whatever it finds on disk, so abiFilters narrowing the *requested* set
+    # does not retroactively strip an ABI directory nobody asked this run to
+    # remove. This is what let an arm64-v8a-only AAR still carry x86_64's
+    # libmigo.so and libc++_shared.so, unindexed because the manifest correctly
+    # only described the ABI that was actually requested.
+    local abi_dir known_abi requested wanted
+    for abi_dir in "$EXTERNAL_JNI_LIBS"/*/; do
+        [[ -d "$abi_dir" ]] || continue
+        known_abi="$(basename "$abi_dir")"
+        case "$known_abi" in
+            arm64-v8a | x86_64) ;;
+            *) continue ;;
+        esac
+        wanted=false
+        for requested in "${ARCHITECTURES[@]}"; do
+            [[ "$requested" == "$known_abi" ]] && wanted=true && break
+        done
+        if [[ "$wanted" == false ]]; then
+            print_info "Removing stale $known_abi libs from an earlier invocation: $abi_dir"
+            rm -rf "$abi_dir"
+        fi
+    done
+
     for arch in "${ARCHITECTURES[@]}"; do
         local src="$EXTERNAL_JNI_LIBS/$arch"
 
@@ -495,18 +522,7 @@ build_aar() {
         )
     fi
     gradle_abis="$(IFS=,; echo "${ARCHITECTURES[*]}")"
-    # --no-build-cache: this script runs the same "assemble<Profile><Type>"
-    # task up to four times in one job (full/slim x universal/arm64-only), each
-    # a separate ./gradlew invocation sharing one persistent build cache. The
-    # release job hit a build where the arm64-only pass's AAR still carried
-    # x86_64 .so files -- native-library packaging served from a build-cache
-    # entry keyed before -PmigoAbis narrowed, not recomputed for the new ABI
-    # set. `clean` only removes this invocation's own build/ directory; it does
-    # not touch the persistent cache a later invocation can still be served
-    # from. Forcing every task to actually re-execute is worth the time on a
-    # path whose whole job is proving what the AAR contains.
-    $gradle_cmd --no-build-cache \
-        "-PmigoAbis=$gradle_abis" \
+    $gradle_cmd "-PmigoAbis=$gradle_abis" \
         "-PmigoCodegenProfile=$CODEGEN_PROFILE" \
         "-PmigoWorkerSnapshot=$WORKER_SNAPSHOT" \
         "${verified_release_args[@]}" \
