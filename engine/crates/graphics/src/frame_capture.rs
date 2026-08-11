@@ -6,20 +6,31 @@
 //! — so the captured pixels are exactly what is about to be presented,
 //! independent of the game's internals.
 //!
-//! Performance: the render thread pays only a single relaxed atomic load per
-//! presented frame (`is_requested`); the `glReadPixels` cost is incurred once,
-//! when a capture has actually been requested.
+//! Performance: the render thread pays only a single atomic load per presented
+//! frame (`requested_seq`); the `glReadPixels` cost is incurred once, when a
+//! capture has actually been requested.
 //!
 //! This is a diagnostic/dev-tool hook (the player). It never runs unless
 //! `request()` is called, so it has no effect on shipping render behaviour.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use glow::HasContext;
 
-static REQUESTED: AtomicBool = AtomicBool::new(false);
-static RESULT: Mutex<Option<CapturedFrame>> = Mutex::new(None);
+/// Which request the render thread is capturing for; 0 means none.
+///
+/// A counter rather than a flag, because "capture the next presented frame" is a
+/// claim no earlier frame may satisfy. A resize acceptance run requests twice --
+/// once at start-up and once after the transition -- and under a flag the second
+/// request was already satisfied by the frame the first left in the slot, so a
+/// resize that never presented wrote the pre-resize picture and exited
+/// successfully. Stamping each frame with the request it answers makes that
+/// unrepresentable; clearing the slot inside `request` would only narrow it,
+/// since a capture already between its `glReadPixels` and its store still lands
+/// afterwards.
+static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+static RESULT: Mutex<Option<(u64, CapturedFrame)>> = Mutex::new(None);
 
 /// A captured frame. `rgba_bottom_up` is tightly packed RGBA8 in GL row order
 /// (bottom-up); consumers flip to top-down for PNG.
@@ -29,23 +40,29 @@ pub struct CapturedFrame {
     pub rgba_bottom_up: Vec<u8>,
 }
 
-/// Request a one-shot capture of the next presented frame. Idempotent until the
-/// render thread fulfils it.
+/// Request a one-shot capture of the next presented frame.
+///
+/// Called again before [`take`] it supersedes the earlier request: from then on
+/// only a newly presented frame can satisfy it.
 pub fn request() {
-    REQUESTED.store(true, Ordering::Release);
+    REQUEST_SEQ.fetch_add(1, Ordering::AcqRel);
 }
 
-/// Stop capturing and take the most recently captured frame. Returns the latest
-/// present seen since `request()` — so early blank/clear frames are superseded
-/// by later frames that contain game content.
+/// Stop capturing and take the most recent frame presented since the latest
+/// [`request`]. A frame that answered an earlier request is discarded rather
+/// than returned, so a run that presented nothing after its last request gets
+/// `None` instead of a stale picture.
 pub fn take() -> Option<CapturedFrame> {
-    REQUESTED.store(false, Ordering::Release);
-    RESULT.lock().expect("frame_capture result mutex").take()
+    let wanted = REQUEST_SEQ.swap(0, Ordering::AcqRel);
+    let captured = RESULT.lock().expect("frame_capture result mutex").take();
+    captured
+        .filter(|(seq, _)| *seq == wanted)
+        .map(|(_, frame)| frame)
 }
 
 #[inline]
-fn is_requested() -> bool {
-    REQUESTED.load(Ordering::Acquire)
+fn requested_seq() -> u64 {
+    REQUEST_SEQ.load(Ordering::Acquire)
 }
 
 /// Read FBO 0 into the result slot while a capture is pending, overwriting any
@@ -54,7 +71,8 @@ fn is_requested() -> bool {
 /// final blit and before `eglSwapBuffers`. On the common path (no capture
 /// requested — e.g. every shipping Android frame) it costs only one atomic load.
 pub(crate) fn capture_default_fbo(gl: &glow::Context, width: u32, height: u32) {
-    if !is_requested() || width == 0 || height == 0 {
+    let seq = requested_seq();
+    if seq == 0 || width == 0 || height == 0 {
         return;
     }
     let mut buf = vec![0u8; width as usize * height as usize * 4];
@@ -72,11 +90,20 @@ pub(crate) fn capture_default_fbo(gl: &glow::Context, width: u32, height: u32) {
             glow::PixelPackData::Slice(Some(&mut buf)),
         );
     }
-    *RESULT.lock().expect("frame_capture result mutex") = Some(CapturedFrame {
-        width,
-        height,
-        rgba_bottom_up: buf,
-    });
-    // Intentionally do NOT clear REQUESTED here: keep the latest frame until the
-    // consumer calls take(), so blank warmup frames are replaced by content.
+    let mut slot = RESULT.lock().expect("frame_capture result mutex");
+    // A request that arrived while this frame was being read owns the slot now:
+    // this frame predates it, and is exactly the stale capture `take` refuses.
+    if slot.as_ref().is_some_and(|(stored, _)| *stored > seq) {
+        return;
+    }
+    *slot = Some((
+        seq,
+        CapturedFrame {
+            width,
+            height,
+            rgba_bottom_up: buf,
+        },
+    ));
+    // Intentionally do NOT clear the request here: keep the latest frame until
+    // the consumer calls take(), so blank warmup frames are replaced by content.
 }

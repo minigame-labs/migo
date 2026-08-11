@@ -298,12 +298,31 @@ fn run(
     }
     match graphics::frame_capture::take() {
         Some(frame) => {
+            // With `--resize` the capture is the acceptance evidence, so the
+            // frame has to be one the *resized* surface presented. Writing a
+            // frame of any other extent would report a resize that never
+            // happened as a pass, which is the whole failure this run exists to
+            // detect.
+            if let Some((width, height)) = resize {
+                if (frame.width, frame.height) != (width, height) {
+                    return Err(format!(
+                        "resized to {width}x{height} but the presented frame is {}x{}",
+                        frame.width, frame.height
+                    ));
+                }
+            }
             write_png(&png_path, &frame)?;
             tracing::info!(
                 "captured {}x{} frame -> {}",
                 frame.width,
                 frame.height,
                 png_path.display()
+            );
+        }
+        None if resize.is_some() => {
+            return Err(
+                "nothing was presented after the resize, so no frame proves it took effect"
+                    .to_string(),
             );
         }
         None => tracing::warn!("frame capture: no frame was presented during the window"),
