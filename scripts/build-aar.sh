@@ -495,7 +495,18 @@ build_aar() {
         )
     fi
     gradle_abis="$(IFS=,; echo "${ARCHITECTURES[*]}")"
-    $gradle_cmd "-PmigoAbis=$gradle_abis" \
+    # --no-build-cache: this script runs the same "assemble<Profile><Type>"
+    # task up to four times in one job (full/slim x universal/arm64-only), each
+    # a separate ./gradlew invocation sharing one persistent build cache. The
+    # release job hit a build where the arm64-only pass's AAR still carried
+    # x86_64 .so files -- native-library packaging served from a build-cache
+    # entry keyed before -PmigoAbis narrowed, not recomputed for the new ABI
+    # set. `clean` only removes this invocation's own build/ directory; it does
+    # not touch the persistent cache a later invocation can still be served
+    # from. Forcing every task to actually re-execute is worth the time on a
+    # path whose whole job is proving what the AAR contains.
+    $gradle_cmd --no-build-cache \
+        "-PmigoAbis=$gradle_abis" \
         "-PmigoCodegenProfile=$CODEGEN_PROFILE" \
         "-PmigoWorkerSnapshot=$WORKER_SNAPSHOT" \
         "${verified_release_args[@]}" \
