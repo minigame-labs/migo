@@ -37,11 +37,12 @@ REQUIRED_CPU_FEATURES = ["cmov", "sse2"]
 GLIBC_FLOOR = "2.31"
 GLIBCXX_FLOOR = "3.4.28"
 
-# The Linux SDK links V8 without a startup snapshot. Stated rather than implied:
-# an absent key cannot be told apart from a forgotten one, and "no snapshot" is
-# exactly the claim a future Linux snapshot would have to stop making. The
-# validator requires the policy and the list to agree, so neither can drift.
-SNAPSHOT_POLICY = "none"
+# The Linux SDK embeds a host/full V8 startup snapshot (build.rs embeds for any
+# OS it has a committed SNAPSHOT-full-linux-x86_64.bin for, not just Android).
+# Stated rather than implied: an absent key cannot be told apart from a
+# forgotten one. The validator requires the policy and the list to agree, so
+# neither can drift.
+SNAPSHOT_POLICY = "embedded"
 
 
 def package_version(value: str) -> str:
@@ -182,7 +183,7 @@ endif()
 """
 
 
-def render_manifest(*, version, needed, v8, sysroot, build_metadata, artifacts) -> dict:
+def render_manifest(*, version, needed, v8, sysroot, build_metadata, artifacts, snapshot) -> dict:
     """The package's description of itself.
 
     Every field here is checked against reality by
@@ -211,7 +212,7 @@ def render_manifest(*, version, needed, v8, sysroot, build_metadata, artifacts) 
         "sysroot": sysroot,
         "dynamic_dependencies": sorted(needed),
         "snapshot_policy": SNAPSHOT_POLICY,
-        "snapshots": [],
+        "snapshots": [snapshot],
         "v8": v8,
         "toolchain": build_metadata["toolchain"],
         "graphics": {
@@ -220,6 +221,46 @@ def render_manifest(*, version, needed, v8, sysroot, build_metadata, artifacts) 
         },
         "provenance": build_metadata["provenance"],
         "artifacts": artifacts,
+    }
+
+
+def snapshot_identity(snapshot_bin: pathlib.Path, snapshot_manifest: pathlib.Path) -> dict:
+    triple = "x86_64-unknown-linux-gnu"
+    data = json.loads(snapshot_manifest.read_text())
+    if data.get("arch") != ARCH or data.get("target_triple") != triple:
+        raise ValueError(
+            f"snapshot manifest target {data.get('target_triple')}/{data.get('arch')} "
+            f"does not match package target {triple}/{ARCH}"
+        )
+    actual_size = snapshot_bin.stat().st_size
+    if data.get("snapshot_size") != actual_size:
+        raise ValueError(
+            f"snapshot_size mismatch: manifest={data.get('snapshot_size')}, file={actual_size}"
+        )
+    actual_hash = sha256_file(snapshot_bin)
+    if data.get("snapshot_sha256") != actual_hash:
+        raise ValueError(
+            f"snapshot_sha256 mismatch: manifest={data.get('snapshot_sha256')}, file={actual_hash}"
+        )
+    return {
+        "runtime_kind": data["snapshot_kind"],
+        "product_profile": data["profile"],
+        "target_triple": data["target_triple"],
+        "arch": data["arch"],
+        "schema": str(data["schema_version"]),
+        "generator": "migo-snapshot-gen/schema-v3",
+        "generation_cpu_policy": data["generation_cpu_policy"],
+        "normalized_parameters": data["normalized_parameters"],
+        "external_references_hash": data["external_references_sha256"],
+        "bootstrap_inputs_hash": data["bootstrap_inputs_sha256"],
+        "features": data["features"],
+        "features_hash": data["features_sha256"],
+        "rust_sources_hash": data["rust_sources_sha256"],
+        "v8_archive_hash": data["v8_archive_sha256"],
+        "bytes_size": data["snapshot_size"],
+        "bytes_hash": data["snapshot_sha256"],
+        "js_sources_hash": data["js_sources_sha256"],
+        "deno_core_version": data["deno_core_version"],
     }
 
 
@@ -265,6 +306,9 @@ def main() -> int:
     parser.add_argument("--sysroot", default="")
     parser.add_argument("--v8-component-manifest")
     parser.add_argument("--build-metadata")
+    parser.add_argument("--snapshot-bin", help="embedded snapshot .bin (for --manifest)")
+    parser.add_argument("--snapshot-manifest",
+                        help="verified snapshot manifest (for --manifest)")
     args = parser.parse_args()
 
     prefix = pathlib.Path(args.prefix)
@@ -272,6 +316,8 @@ def main() -> int:
     if args.manifest:
         if not args.v8_component_manifest or not args.build_metadata:
             parser.error("--manifest requires --v8-component-manifest and --build-metadata")
+        if not args.snapshot_bin or not args.snapshot_manifest:
+            parser.error("--manifest requires --snapshot-bin and --snapshot-manifest")
         needed = []
         if args.needed_from:
             needed = [
@@ -291,6 +337,9 @@ def main() -> int:
             sysroot=args.sysroot,
             build_metadata=_read_build_metadata(pathlib.Path(args.build_metadata)),
             artifacts=artifacts,
+            snapshot=snapshot_identity(
+                pathlib.Path(args.snapshot_bin), pathlib.Path(args.snapshot_manifest)
+            ),
         )
         out_dir = prefix / "share" / "migo"
         out_dir.mkdir(parents=True, exist_ok=True)

@@ -36,7 +36,7 @@ pathlib.Path(sys.argv[1]).write_bytes(b"s" * 100001)
 pathlib.Path(sys.argv[2]).write_bytes(b"v" * 100001)
 PY
 MIGO_V8_ARCHIVE="$TMP/librusty_v8.a" bash "$ROOT/scripts/write-snapshot-manifest.sh" \
-  full aarch64 "$TMP/snapshot.bin" host >/dev/null
+  full android aarch64 "$TMP/snapshot.bin" host >/dev/null
 python3 - "$TMP/snapshot.bin.manifest.json" <<'PY'
 import json
 import pathlib
@@ -88,7 +88,7 @@ write(root / "scripts/build-v8-android.sh", v8_recipe)
 write(root / "scripts/build-aar.sh", aar_recipe)
 
 for arch, target in targets.items():
-    component_root = root / "engine/third_party/rusty_v8" / arch
+    component_root = root / "engine/third_party/rusty_v8" / target["triple"]
     archive = f"fixture-v8-archive-{arch}".encode()
     binding = f"fixture-rust-binding-{arch}".encode()
     write(component_root / "librusty_v8.a", archive)
@@ -147,7 +147,7 @@ for arch, target in targets.items():
     write(native_root / "libc++_shared.so", f"fixture-libcxx-{arch}".encode())
 
     snapshot = f"fixture-snapshot-{arch}".encode()
-    snapshot_path = root / "engine/crates/runtime-v8/snapshots" / f"SNAPSHOT-full-{arch}.bin"
+    snapshot_path = root / "engine/crates/runtime-v8/snapshots" / f"SNAPSHOT-full-android-{arch}.bin"
     write(snapshot_path, snapshot)
     snapshot_manifest = {
         "schema_version": 3,
@@ -256,7 +256,7 @@ patch -p1 -d "$V8_SOURCE" --batch --forward --fuzz=0 \
   || fail "could not apply the fixture source patch"
 
 printf '%s\n' "untracked source input" > "$V8_SOURCE/untracked-provenance.txt"
-component_root="$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64"
+component_root="$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64-linux-android"
 if python3 "$ROOT/scripts/write-v8-component-manifest.py" \
     --repo-root "$FIXTURE_ROOT" \
     --rusty-v8-src "$V8_SOURCE" \
@@ -277,7 +277,11 @@ grep -F "untracked-provenance.txt" "$TMP/untracked.err" >/dev/null || \
 rm -f "$V8_SOURCE/untracked-provenance.txt"
 
 for arch in aarch64 x86_64; do
-  component_root="$FIXTURE_ROOT/engine/third_party/rusty_v8/$arch"
+  case "$arch" in
+    aarch64) v8_dir="aarch64-linux-android" ;;
+    x86_64)  v8_dir="x86_64-linux-android" ;;
+  esac
+  component_root="$FIXTURE_ROOT/engine/third_party/rusty_v8/$v8_dir"
   python3 "$ROOT/scripts/write-v8-component-manifest.py" \
     --repo-root "$FIXTURE_ROOT" \
     --rusty-v8-src "$V8_SOURCE" \
@@ -291,8 +295,8 @@ for arch in aarch64 x86_64; do
     --lock "$V8_LOCK" >/dev/null
 done
 
-mv "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64/component-manifest.json" \
-  "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64/component-manifest.saved"
+mv "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64-linux-android/component-manifest.json" \
+  "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64-linux-android/component-manifest.saved"
 if python3 "$GENERATOR" \
     --repo-root "$FIXTURE_ROOT" \
     --tool "$TOOL" \
@@ -307,8 +311,8 @@ if python3 "$GENERATOR" \
 fi
 grep -F "component-manifest.json" "$TMP/missing.err" >/dev/null || \
   fail "missing-component error was not actionable"
-mv "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64/component-manifest.saved" \
-  "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64/component-manifest.json"
+mv "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64-linux-android/component-manifest.saved" \
+  "$FIXTURE_ROOT/engine/third_party/rusty_v8/aarch64-linux-android/component-manifest.json"
 
 python3 "$GENERATOR" \
   --repo-root "$FIXTURE_ROOT" \

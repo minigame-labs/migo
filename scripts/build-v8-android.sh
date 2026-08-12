@@ -318,8 +318,8 @@ info "EXTRA_GN_ARGS = $EXTRA_GN_ARGS"
 # release build consume an unidentified native input, which the artifact
 # contract forbids.
 LIBCLANG_MIN_MAJOR=19
-PREBUILT_BINDING="$V8_OUT_DIR/$ARCH/src_binding.rs"
-PREBUILT_MANIFEST="$V8_OUT_DIR/$ARCH/component-manifest.json"
+PREBUILT_BINDING="$V8_OUT_DIR/$TARGET/src_binding.rs"
+PREBUILT_MANIFEST="$V8_OUT_DIR/$TARGET/component-manifest.json"
 
 # Read the rusty_v8 checkout's revision WITHOUT invoking git: that tree is
 # owned by another uid, so git refuses it ("dubious ownership") and adding
@@ -543,7 +543,7 @@ BINDING="$RUSTY_V8_SRC/target/$TARGET/release/gn_out/src_binding.rs"
 
 [[ -f "$GN_OUT" ]] || { err "librusty_v8.a not found after build"; exit 1; }
 
-DEST="$V8_OUT_DIR/$ARCH"
+DEST="$V8_OUT_DIR/$TARGET"
 mkdir -p "$DEST"
 # back up the existing (termux) archive once
 if [[ -f "$DEST/librusty_v8.a" && ! -f "$DEST/librusty_v8.a.termux-bak" ]]; then

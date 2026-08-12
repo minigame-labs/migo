@@ -18,14 +18,14 @@ name: Build V8 Snapshot
 #             so an arm64 Android emulator cannot be hardware-accelerated and
 #             this approach is not available on hosted runners. Generate the
 #             arm64 snapshot on a real arm64 device and commit/upload
-#             engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-aarch64.bin.
+#             engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-android-aarch64.bin.
 #             The exact device steps are documented in snapshot-gen/src/main.rs.
 #             (A self-hosted arm64 runner with an attached device could automate
 #             this later.)
 #
 # This workflow uploads the snapshot as an artifact. Embedding into the .so is
 # done by runtime-v8/build.rs at .so build time: it picks
-# snapshots/SNAPSHOT-<profile>-<target arch>.bin for android targets only.
+# snapshots/SNAPSHOT-<profile>-<os>-<target arch>.bin, one V8 archive per (os, arch).
 
 on:
   workflow_dispatch:
@@ -167,8 +167,8 @@ jobs:
       - name: Cross-compile snapshot-gen (x86_64-android)
         working-directory: engine
         run: |
-          export RUSTY_V8_ARCHIVE="$PWD/third_party/rusty_v8/x86_64/librusty_v8.a"
-          export RUSTY_V8_SRC_BINDING_PATH="$PWD/third_party/rusty_v8/x86_64/src_binding.rs"
+          export RUSTY_V8_ARCHIVE="$PWD/third_party/rusty_v8/x86_64-linux-android/librusty_v8.a"
+          export RUSTY_V8_SRC_BINDING_PATH="$PWD/third_party/rusty_v8/x86_64-linux-android/src_binding.rs"
           export RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition -C link-arg=-landroid"
           cargo ndk -t x86_64 --platform 26 build -p migo-snapshot-gen \
             --no-default-features --features profile-${{ inputs.product_profile }} --locked
@@ -199,17 +199,17 @@ jobs:
             adb shell chmod 755 /data/local/tmp/migo-snapshot-gen
             adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_KIND=$SNAPSHOT_KIND MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
             mkdir -p engine/crates/runtime-v8/snapshots
-            adb pull /data/local/tmp/SNAPSHOT.bin engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
+            adb pull /data/local/tmp/SNAPSHOT.bin engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-android-x86_64.bin
 
       - name: Inspect snapshot
         run: |
-          f=engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
+          f=engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-android-x86_64.bin
           ls -la "$f"
           echo "size:  $(stat -c %s "$f") bytes"
           echo "sha256:"; sha256sum "$f"
 
       - name: Write manifest
-        run: bash scripts/write-snapshot-manifest.sh ${{ inputs.product_profile }} x86_64 engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin $SNAPSHOT_KIND
+        run: bash scripts/write-snapshot-manifest.sh ${{ inputs.product_profile }} android x86_64 engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-android-x86_64.bin $SNAPSHOT_KIND
 
       # Push the regenerated snapshot to a branch and surface a one-click
       # "create PR" link in the run summary. We deliberately do NOT call
@@ -220,7 +220,7 @@ jobs:
       - name: Push regen branch + surface PR link
         run: |
           set -euo pipefail
-          bin=engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
+          bin=engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-android-x86_64.bin
           man="$bin.manifest.json"
           # `git diff` ignores untracked files, so require both artifacts to be
           # tracked before considering the first Worker generation unchanged.
@@ -243,33 +243,33 @@ jobs:
           raise SystemExit(0 if identity(sys.argv[1]) == identity(sys.argv[2]) else 1)
           PY
             then
-              echo "x86_64 snapshot bytes and identity unchanged — nothing to push."
-              echo "x86_64 snapshot bytes and identity unchanged — no regen branch pushed." >> "$GITHUB_STEP_SUMMARY"
+              echo "android x86_64 snapshot bytes and identity unchanged — nothing to push."
+              echo "android x86_64 snapshot bytes and identity unchanged — no regen branch pushed." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           fi
-          branch="bot/regen-${SNAPSHOT_KIND}-${{ inputs.product_profile }}-x86_64-snapshot"
+          branch="bot/regen-${SNAPSHOT_KIND}-${{ inputs.product_profile }}-android-x86_64-snapshot"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add "$bin" "$man"
-          git commit -m "chore(snapshot): regenerate ${SNAPSHOT_KIND} ${{ inputs.product_profile }} x86_64 snapshot"
+          git commit -m "chore(snapshot): regenerate ${SNAPSHOT_KIND} ${{ inputs.product_profile }} android x86_64 snapshot"
           git push -f origin "$branch"
           url="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.ref_name }}...${branch}?expand=1"
           {
-            echo "### x86_64 snapshot regenerated"
+            echo "### android x86_64 snapshot regenerated"
             echo ""
             echo "Pushed to \`$branch\`. Open the PR (one click): $url"
             echo ""
-            echo "> arm64 must be regenerated separately on a device — \`scripts/gen-snapshot.sh arm64 --snapshot-kind ${SNAPSHOT_KIND} --product-profile ${{ inputs.product_profile }} --device <serial>\` — and committed into the same PR."
+            echo "> arm64 must be regenerated separately on a device — \`scripts/gen-snapshot.sh arm64 --os android --snapshot-kind ${SNAPSHOT_KIND} --product-profile ${{ inputs.product_profile }} --device <serial>\` — and committed into the same PR."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Open the PR: $url"
 
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@v5
         with:
-          name: snapshot-${{ inputs.snapshot_kind }}-${{ inputs.product_profile }}-x86_64
+          name: snapshot-${{ inputs.snapshot_kind }}-${{ inputs.product_profile }}-android-x86_64
           path: |
-            engine/crates/runtime-v8/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin
-            engine/crates/runtime-v8/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin.manifest.json
+            engine/crates/runtime-v8/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-android-x86_64.bin
+            engine/crates/runtime-v8/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-android-x86_64.bin.manifest.json
           if-no-files-found: error

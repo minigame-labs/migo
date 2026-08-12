@@ -66,7 +66,7 @@ $env:RUSTY_V8_ARCHIVE = $null
 $env:RUSTY_V8_SRC_BINDING_PATH = $null
 
 # Also check if the Windows V8 archive is pre-cached
-$windowsV8Dir = Join-Path $EngineDir "third_party/rusty_v8/x86_64-windows"
+$windowsV8Dir = Join-Path $EngineDir "third_party/rusty_v8/x86_64-pc-windows-msvc"
 $windowsV8Archive = Join-Path $windowsV8Dir "librusty_v8.a"
 if (Test-Path $windowsV8Archive) {
     $env:RUSTY_V8_ARCHIVE = $windowsV8Archive

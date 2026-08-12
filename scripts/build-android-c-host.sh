@@ -17,8 +17,8 @@ ENGINE_DIR="$REPO_ROOT/engine"
 # that cannot be run.
 ABI="${1:-arm64-v8a}"
 case "$ABI" in
-arm64-v8a) TARGET="aarch64-linux-android" V8_ARCH="aarch64" ;;
-x86_64) TARGET="x86_64-linux-android" V8_ARCH="x86_64" ;;
+arm64-v8a) TARGET="aarch64-linux-android" ;;
+x86_64) TARGET="x86_64-linux-android" ;;
 *) echo "usage: $0 [arm64-v8a|x86_64]" >&2; exit 2 ;;
 esac
 
@@ -42,7 +42,7 @@ mkdir -p "$SHIM_DIR"
 ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/${TARGET}-ar"
 export PATH="$SHIM_DIR:$PATH"
 
-V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$V8_ARCH"
+V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$TARGET"
 # Verified against its component manifest, then used from a content-addressed path. No
 # separate existence check below it: the materialiser refuses a missing archive by name, so
 # one here would be dead code shaped like a guard.

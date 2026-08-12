@@ -319,14 +319,7 @@ build_platform() {
     # --------------------------------------------------------
     # Rusty V8 config
     # --------------------------------------------------------
-    local arch
-    if [[ "$platform" == "arm64-v8a" ]]; then
-        arch="aarch64"
-    else
-        arch="x86_64"
-    fi
-
-    local v8_dir="$V8_LIBS_DIR/$arch"
+    local v8_dir="$V8_LIBS_DIR/$target_triple"
 
     # Verified and materialised under a path that is its own hash, rather than exported
     # from wherever the archive happens to sit. This used to be `[[ -f "$v8_archive" ]]`
@@ -336,7 +329,7 @@ build_platform() {
     # correct: it reruns the v8 build script when the *value* of RUSTY_V8_ARCHIVE changes,
     # not when the file does, so a rebuilt archive is a new path instead of a silent reuse.
     if ! v8_materialise "$v8_dir" "$PROJECT_ROOT/engine/target/v8-materialised"; then
-        print_error "cannot use the V8 archive for $arch"
+        print_error "cannot use the V8 archive for $target_triple"
         exit 1
     fi
     export RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE"

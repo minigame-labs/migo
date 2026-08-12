@@ -53,8 +53,8 @@ require_literal "$FINGERPRINT" "snapshot_kind" \
     "shell fingerprint helpers must carry snapshot_kind"
 require_literal "$JS_RUNTIME/build_snapshot.rs" "snapshot_kind" \
     "Rust snapshot identity must carry snapshot_kind"
-require_literal "$WRITE_MANIFEST" 'SNAPSHOT_KIND="${4:-host}"' \
-    "manifest writer must default its fourth kind argument to host"
+require_literal "$WRITE_MANIFEST" 'SNAPSHOT_KIND="${5:-host}"' \
+    "manifest writer must default its trailing kind argument to host"
 for script in "$GENERATOR" "$FRESHNESS"; do
     require_literal "$script" "--snapshot-kind" \
         "$(basename "$script") lacks --snapshot-kind"
@@ -65,13 +65,13 @@ expect_rejection "invalid snapshot kind" \
     bash "$FRESHNESS" --snapshot-kind invalid
 expect_rejection "Worker snapshot requires product profile full" \
     bash "$FRESHNESS" --snapshot-kind worker --product-profile slim
-worker_arches="$(bash -c 'source "$1"; snapshot_default_arches worker aarch64' _ "$FINGERPRINT")"
+worker_arches="$(bash -c 'source "$1"; snapshot_default_arches worker android aarch64' _ "$FINGERPRINT")"
 [[ "$worker_arches" == $'aarch64\nx86_64' ]] \
     || fail "a partial Worker snapshot set must require both Android ABIs"
-host_arches="$(bash -c 'source "$1"; snapshot_default_arches host x86_64' _ "$FINGERPRINT")"
+host_arches="$(bash -c 'source "$1"; snapshot_default_arches host android x86_64' _ "$FINGERPRINT")"
 [[ "$host_arches" == $'aarch64\nx86_64' ]] \
     || fail "a partial host snapshot set must require both Android ABIs"
-empty_worker_arch_count="$(bash -c 'source "$1"; mapfile -t arches < <(snapshot_default_arches worker); printf "%s" "${#arches[@]}"' _ "$FINGERPRINT")"
+empty_worker_arch_count="$(bash -c 'source "$1"; mapfile -t arches < <(snapshot_default_arches worker android); printf "%s" "${#arches[@]}"' _ "$FINGERPRINT")"
 [[ "$empty_worker_arch_count" == "0" ]] \
     || fail "an absent default-off Worker snapshot set must remain optional"
 

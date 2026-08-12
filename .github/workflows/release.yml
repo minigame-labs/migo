@@ -34,6 +34,8 @@ jobs:
           bash scripts/check-snapshot-freshness.sh --product-profile full
           bash scripts/check-snapshot-freshness.sh --product-profile slim
           bash scripts/check-snapshot-freshness.sh --snapshot-kind worker --product-profile full
+          bash scripts/check-snapshot-freshness.sh --product-profile full --os linux
+          bash scripts/check-snapshot-freshness.sh --snapshot-kind worker --product-profile full --os linux
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -598,6 +600,14 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The manifest and freshness gates prove the snapshot *file* is valid;
+      # this is the only check that reads the compiled libmigo_capi.a to prove
+      # the bytes actually landed there, same property as the AAR check above.
+      - name: Android C SDK snapshot embedding contract
+        run: |
+          bash scripts/test-capi-snapshot-embedding-contract.sh \
+            dist/migo-android-arm64 dist/migo-android-x86_64
+
       # The two Android C SDK archives on v0.9.0 were produced by a `tar` typed on
       # a release machine, which is why their attestations swear to bytes nobody
       # receiving them can reproduce. scripts/package-sdk.sh is the reproducible
@@ -750,6 +760,12 @@ jobs:
 
       - name: Linux SDK package contract
         run: bash scripts/test-linux-sdk-contract.sh
+
+      # Same property as the Android C SDK check: the manifest and freshness
+      # gates validate the snapshot file, this reads the compiled libmigo.a /
+      # libmigo.so.<version> to prove the bytes are actually embedded.
+      - name: Linux SDK snapshot embedding contract
+        run: bash scripts/test-capi-snapshot-embedding-contract.sh dist/migo-linux-x86_64
 
       # Straight into the staging directory: package-sdk.sh derives the published name
       # from the staged prefix, so there is nothing to rename on the way.

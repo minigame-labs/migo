@@ -71,7 +71,7 @@ mkdir -p "$SHIM_DIR"
 ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/$TARGET-ar"
 export PATH="$SHIM_DIR:$PATH"
 
-V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$ARCH"
+V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$TARGET"
 V8_ARCHIVE="$V8_DIR/librusty_v8.a"
 V8_BINDING="$V8_DIR/src_binding.rs"
 [[ -f "$V8_ARCHIVE" ]] || { err "missing $V8_ARCHIVE"; exit 1; }
@@ -102,7 +102,7 @@ info "verifying V8 component bytes before linking"
 "$MANIFEST_TOOL" verify-v8-component \
     "$V8_MANIFEST" "$V8_ARCHIVE" "$V8_BINDING" >/dev/null
 
-SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-$ARCH.bin"
+SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-android-$ARCH.bin"
 SNAPSHOT_MANIFEST="$SNAPSHOT_BIN.manifest.json"
 [[ -f "$SNAPSHOT_MANIFEST" ]] || {
     err "missing snapshot identity $SNAPSHOT_MANIFEST (regenerate the snapshot)"
@@ -115,7 +115,7 @@ SNAPSHOT_MANIFEST="$SNAPSHOT_BIN.manifest.json"
 source "$SCRIPT_DIR/lib/snapshot-fingerprint.sh"
 snapshot_require_materialized_snapshot "$SNAPSHOT_BIN"
 info "verifying the target host/full snapshot before compiling"
-bash "$SCRIPT_DIR/check-snapshot-freshness.sh" --product-profile full "$ARCH"
+bash "$SCRIPT_DIR/check-snapshot-freshness.sh" --product-profile full --os android "$ARCH"
 
 BUILD_METADATA="$ENGINE_DIR/target/$TARGET/release/migo-android-build-metadata.json"
 python3 "$SCRIPT_DIR/write-android-build-metadata.py" \

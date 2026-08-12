@@ -1,27 +1,39 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Generate a V8 startup snapshot for one Android ABI (the "B method").
+# Generate a V8 startup snapshot for one (os, arch) platform.
 # =============================================================================
 #
 # V8 startup snapshots are PLATFORM-bound (OS + CPU arch): a snapshot serializes
-# a live V8 heap, so it MUST be produced by the same android-<arch> V8 the .so
-# links. We therefore cross-compile `migo-snapshot-gen` to the target ABI
-# (linking the committed android V8 archive) and RUN it on that ABI's
-# emulator/device (Deno issue #27496 approach), then pull the result into
-#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin
-# which runtime-v8/build.rs embeds (android targets only) at .so build time.
+# a live V8 heap, so it MUST be produced by the same os-<arch> V8 the shipping
+# binary links. We therefore build `migo-snapshot-gen` for the target platform
+# (linking that platform's committed V8 archive) and RUN it there — natively
+# for Linux/Windows, on an emulator/device for Android/OpenHarmony (the Deno
+# issue #27496 approach) — then write the result into
+#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<os>-<arch>.bin
+# which runtime-v8/build.rs embeds at .so/.a build time.
 #
 # Usage:
-#   scripts/gen-snapshot.sh <x86_64|arm64> [--product-profile full|slim]
+#   scripts/gen-snapshot.sh <x86_64|arm64|aarch64> [--os android|linux]
+#                           [--product-profile full|slim]
 #                           [--snapshot-kind host|worker]
 #                           [--device SERIAL] [--keep]
 #
-#   x86_64  -> run on an x86_64 Android emulator (or CI; see build-snapshot.yml)
-#   arm64   -> run on a real arm64 device (hosted CI has no arm64 KVM)
+#   --os android (default)  cross-compile and run on an emulator/real device
+#                            (arm64 needs a real device: hosted CI has no arm64
+#                            KVM; x86_64 can use a hardware-accelerated emulator)
+#   --os linux               build and run natively (x86_64 only: no arm64
+#                            Linux SDK exists in this repo)
 #
-#   --device SERIAL   adb serial to use (else: $ANDROID_SERIAL, else the only
-#                     connected device, else error).
-#   --keep            leave the pushed binary/lib on the device afterwards.
+#   --device SERIAL   adb serial to use for --os android (else: $ANDROID_SERIAL,
+#                     else the only connected device, else error).
+#   --keep            leave the pushed binary/lib on the device afterwards
+#                     (--os android only).
+#
+# --os ohos and --os windows are not implemented here yet: ohos needs an
+# hdc-reachable device/emulator bridge and windows has no V8 archive until
+# Task 2 seals one (see docs/superpowers/specs/2026-08-12-release-artifact-
+# standard-design.md). Both fail closed with a clear message rather than
+# half-working.
 #
 # Environment:
 #   ANDROID_NDK_HOME  an NDK to prefer; checked against the pin like any other
@@ -29,10 +41,10 @@
 #   ADB               adb path (default: ~/Android/Sdk/platform-tools/adb, then PATH)
 #
 # Output:
-#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin
-#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin.manifest.json
+#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<os>-<arch>.bin
+#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<os>-<arch>.bin.manifest.json
 #
-# After generating BOTH ABIs, build with embedding:
+# After generating every ABI for a platform, build with embedding, e.g.:
 #   bash scripts/build-aar.sh release arm64-v8a x86_64
 # =============================================================================
 set -euo pipefail
@@ -43,12 +55,13 @@ c_err()   { echo -e "\033[0;31m[ERR]  $*\033[0m" >&2; }
 die()     { c_err "$*"; exit 1; }
 
 # ---- args -------------------------------------------------------------------
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then sed -n '2,40p' "$0"; exit 0; fi
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then sed -n '2,45p' "$0"; exit 0; fi
 ABI="${1:-}"; shift || true
 SERIAL="${ANDROID_SERIAL:-}"
 KEEP=0
 PRODUCT_PROFILE="full"
 SNAPSHOT_KIND="host"
+OS="android"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --device) SERIAL="${2:-}"; shift 2 ;;
@@ -56,8 +69,10 @@ while [[ $# -gt 0 ]]; do
     --product-profile=*) PRODUCT_PROFILE="${1#*=}"; shift ;;
     --snapshot-kind) SNAPSHOT_KIND="${2:-}"; shift 2 ;;
     --snapshot-kind=*) SNAPSHOT_KIND="${1#*=}"; shift ;;
+    --os) OS="${2:-}"; shift 2 ;;
+    --os=*) OS="${1#*=}"; shift ;;
     --keep)   KEEP=1; shift ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
     *) die "unknown arg: $1 (try --help)" ;;
   esac
 done
@@ -74,20 +89,81 @@ if [[ "$SNAPSHOT_KIND" == "worker" && "$PRODUCT_PROFILE" != "full" ]]; then
   die "Worker snapshot requires product profile full"
 fi
 
-case "$ABI" in
-  x86_64)
-    NDK_TARGET="x86_64"; TRIPLE="x86_64-linux-android"; RUST_ARCH="x86_64"
-    V8_DIR="x86_64"; LIBCXX_TRIPLE="x86_64-linux-android"; NEEDS_BUILTINS=0 ;;
-  arm64|arm64-v8a|aarch64)
-    ABI="arm64"
-    NDK_TARGET="arm64-v8a"; TRIPLE="aarch64-linux-android"; RUST_ARCH="aarch64"
-    V8_DIR="aarch64"; LIBCXX_TRIPLE="aarch64-linux-android"; NEEDS_BUILTINS=1 ;;
-  *) die "usage: gen-snapshot.sh <x86_64|arm64> [--product-profile full|slim] [--device SERIAL] [--keep]" ;;
-esac
-
-# ---- paths / tools ----------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/engine"
+OUT_DIR="$ENGINE/crates/runtime-v8/snapshots"
+mkdir -p "$OUT_DIR"
+# shellcheck source=scripts/lib/snapshot-fingerprint.sh
+source "$ROOT/scripts/lib/snapshot-fingerprint.sh"
+snapshot_valid_os "$OS" || die "invalid --os '$OS' (expected android|linux|ohos|windows)"
+
+case "$OS" in
+  ohos)    die "generation for --os ohos is not implemented in this script yet (needs an hdc-reachable device/emulator bridge)" ;;
+  windows) die "generation for --os windows is not implemented yet: no V8 archive exists until Task 2 seals a component manifest" ;;
+esac
+
+case "$ABI" in
+  x86_64) RUST_ARCH="x86_64" ;;
+  arm64|arm64-v8a|aarch64) RUST_ARCH="aarch64" ;;
+  *) die "usage: gen-snapshot.sh <x86_64|arm64> [--os android|linux] [--product-profile full|slim] [--device SERIAL] [--keep]" ;;
+esac
+V8_DIR="$(snapshot_v8_target_dir "$OS" "$RUST_ARCH")" || die "unsupported os/arch: $OS/$RUST_ARCH"
+
+if [[ "$SNAPSHOT_KIND" == "host" ]]; then
+  OUT="$OUT_DIR/SNAPSHOT-$PRODUCT_PROFILE-$OS-$RUST_ARCH.bin"
+else
+  OUT="$OUT_DIR/SNAPSHOT-worker-$PRODUCT_PROFILE-$OS-$RUST_ARCH.bin"
+fi
+
+if [[ "$OS" == "linux" ]]; then
+  [[ "$RUST_ARCH" == "x86_64" ]] || die "no linux V8 archive exists for arch '$RUST_ARCH' (x86_64 only)"
+
+  # ---- native path: build and run in place, no device involved -------------
+  # Materialised (hash-verified against component-manifest.json) rather than
+  # scripts/lib/host-v8.sh's looser existence-based resolution: this path
+  # produces the committed, shipped snapshot, not a local dev/test run, so it
+  # is held to the same "verify before you link" rule as the Android path
+  # below (see scripts/lib/v8-materialise.sh and
+  # test-artifact-manifest-contract.sh's shipping-consumer enumeration).
+  # shellcheck source=scripts/lib/v8-materialise.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/v8-materialise.sh"
+  if ! v8_materialise "$ENGINE/third_party/rusty_v8/$V8_DIR" "$ENGINE/target/v8-materialised"; then
+    die "cannot use the linux V8 archive for $V8_DIR (run: bash scripts/fetch-v8-archives.sh x86_64-linux-gnu)"
+  fi
+  c_info "V8 archive verified: ${V8_MATERIALISED_ARCHIVE#"$ROOT"/}"
+  c_info "kind=$SNAPSHOT_KIND  profile=$PRODUCT_PROFILE  os=$OS  arch=$RUST_ARCH (native)"
+
+  ( cd "$ENGINE"
+    RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE" \
+    RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING" \
+    cargo build -p migo-snapshot-gen \
+      --no-default-features --features "profile-$PRODUCT_PROFILE" --locked )
+
+  BIN="$ENGINE/target/debug/migo-snapshot-gen"
+  [[ -f "$BIN" ]] || die "build produced no binary at $BIN"
+
+  c_info "generating snapshot natively ..."
+  MIGO_SNAPSHOT_KIND="$SNAPSHOT_KIND" MIGO_SNAPSHOT_OUT="$OUT" "$BIN"
+  [[ -s "$OUT" ]] || die "generated snapshot is empty"
+
+  bash "$ROOT/scripts/write-snapshot-manifest.sh" \
+    "$PRODUCT_PROFILE" "$OS" "$RUST_ARCH" "$OUT" "$SNAPSHOT_KIND"
+
+  c_ok "snapshot -> $OUT  ($(stat -c %s "$OUT") bytes)"
+  c_ok "manifest -> $OUT.manifest.json"
+  exit 0
+fi
+
+# ---- android path: cross-compile and run on device/emulator ----------------
+case "$RUST_ARCH" in
+  x86_64)
+    NDK_TARGET="x86_64"; TRIPLE="x86_64-linux-android"
+    LIBCXX_TRIPLE="x86_64-linux-android"; NEEDS_BUILTINS=0 ;;
+  aarch64)
+    NDK_TARGET="arm64-v8a"; TRIPLE="aarch64-linux-android"
+    LIBCXX_TRIPLE="aarch64-linux-android"; NEEDS_BUILTINS=1 ;;
+esac
+
 # shellcheck source=scripts/lib/android-ndk.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/android-ndk.sh"
 # shellcheck source=scripts/lib/v8-materialise.sh
@@ -126,7 +202,7 @@ if [[ -z "$SERIAL" ]]; then
   SERIAL="${DEVS[0]}"
 fi
 ADBD=("$ADB" -s "$SERIAL")
-c_info "kind=$SNAPSHOT_KIND  profile=$PRODUCT_PROFILE  ABI=$ABI  device=$SERIAL  NDK=$NDK"
+c_info "kind=$SNAPSHOT_KIND  profile=$PRODUCT_PROFILE  os=$OS  arch=$RUST_ARCH  device=$SERIAL  NDK=$NDK"
 
 # ---- 1. cross-compile snapshot-gen -----------------------------------------
 # RUSTFLAGS here intentionally overrides .cargo/config.toml (snapshot-gen is a
@@ -160,13 +236,6 @@ c_info "generating snapshot on device ..."
 "${ADBD[@]}" shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_KIND=$SNAPSHOT_KIND MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
 
 # ---- 3. pull + manifest -----------------------------------------------------
-OUT_DIR="$ENGINE/crates/runtime-v8/snapshots"
-mkdir -p "$OUT_DIR"
-if [[ "$SNAPSHOT_KIND" == "host" ]]; then
-  OUT="$OUT_DIR/SNAPSHOT-$PRODUCT_PROFILE-$RUST_ARCH.bin"
-else
-  OUT="$OUT_DIR/SNAPSHOT-worker-$PRODUCT_PROFILE-$RUST_ARCH.bin"
-fi
 "${ADBD[@]}" pull /data/local/tmp/SNAPSHOT.bin "$OUT" >/dev/null
 [[ -s "$OUT" ]] || die "pulled snapshot is empty"
 
@@ -175,7 +244,7 @@ fi
 # manifests — see scripts/write-snapshot-manifest.sh + check-snapshot-freshness.sh.
 MANIFEST="$OUT.manifest.json"
 bash "$ROOT/scripts/write-snapshot-manifest.sh" \
-  "$PRODUCT_PROFILE" "$RUST_ARCH" "$OUT" "$SNAPSHOT_KIND"
+  "$PRODUCT_PROFILE" "$OS" "$RUST_ARCH" "$OUT" "$SNAPSHOT_KIND"
 
 # ---- 4. cleanup -------------------------------------------------------------
 if [[ "$KEEP" -eq 0 ]]; then
