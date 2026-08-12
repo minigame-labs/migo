@@ -766,6 +766,84 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # ── OpenHarmony SDK ─────────────────────────────────────────────────────
+  # The last platform to have nothing published at all. Unblocked once the two
+  # librusty_v8-*-linux-ohos.a archives went onto the v8-archives tag: their component
+  # manifests were already committed, so the sha256 to verify a download against
+  # existed before the download did.
+  #
+  # Also the first release to carry OHOS arm64. Every release so far shipped only
+  # ohos-x86_64, which is the emulator architecture -- real HarmonyOS devices are arm64.
+  release-ohos:
+    needs: [quality-gate, host-engine-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # No `targets:` here on purpose. engine/rust-toolchain.toml already names
+      # aarch64-unknown-linux-ohos and x86_64-unknown-linux-ohos and calls itself the
+      # reproducible-build contract; restating them in the workflow would be a second
+      # list to keep in step. The build scripts run cargo from engine/, so that file
+      # applies and rustup installs what it names.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      # Two reasons, and the second one is not about space. Measured sizes: the
+      # extracted SDK is 2.9 GB, each OpenHarmony cargo target directory is 4.4 GB, and
+      # the materialised V8 archives are 683 MB -- 12.4 GB against a runner's ~14 GB of
+      # free space, before the toolchain and checkout. And the preinstalled Android SDK
+      # is an active hazard for this job specifically: build-ohos-sdk.sh warns that a
+      # machine with an Android NDK on PATH "silently compiles the C dependencies with
+      # the NDK's clang and bionic headers for a musl target". Removing it frees the
+      # space and removes that failure mode at the same time. Do not delete this step to
+      # speed up CI without reading both halves.
+      - name: Make room, and remove the Android NDK this job must not see
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+
+      # Version and sha256 come from contracts/artifact-manifest/ohos-sdk.lock.json, not
+      # from the mirror: fetching a checksum from the same server as the artifact
+      # verifies transport and nothing else.
+      - name: Install the pinned OpenHarmony SDK
+        run: bash scripts/fetch-ohos-sdk.sh
+
+      - name: Fetch and verify the OpenHarmony V8 archives
+        run: bash scripts/fetch-v8-archives.sh x86_64-linux-ohos aarch64-linux-ohos
+
+      # Self-gating: build-ohos-sdk.sh runs test-ohos-sdk-contract.sh and the symbol
+      # floor per architecture, so there is no separate contract step to add here. Both
+      # arches in one invocation because they share the SDK and the toolchain setup.
+      - name: Build and gate the OpenHarmony SDK for both architectures
+        run: bash scripts/build-ohos-sdk.sh --all
+
+      - name: Package the OpenHarmony SDKs for release
+        run: |
+          mkdir -p dist/release
+          for arch in arm64 x86_64; do
+            bash scripts/package-sdk.sh "dist/migo-ohos-$arch" --output-dir dist/release
+          done
+
+      - name: Upload the staged OpenHarmony assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-ohos
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 1
+
   # ── The only publisher ──────────────────────────────────────────────────
   # Publishing lived inside release-android, so no point in the graph saw every
   # platform's output. That is what made a whole-release checksum manifest impossible
@@ -776,7 +854,7 @@ jobs:
   #
   # Adding a platform is now additive: one job, one entry in `needs`.
   publish:
-    needs: [release-android, release-linux]
+    needs: [release-android, release-linux, release-ohos]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

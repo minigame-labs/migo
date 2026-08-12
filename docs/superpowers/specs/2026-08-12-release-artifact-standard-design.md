@@ -363,10 +363,30 @@ verifies every downloaded asset.
 Step 2 needs two artifacts published to a release tag, which requires repository write
 credentials. Neither is a code problem.
 
-| Needed | Why | Who |
-| --- | --- | --- |
-| `rusty_v8` Windows x86_64 archive (`rusty_v8.dll` + import lib) on a `v8-archives-<rev>` tag | `release-windows` must fetch a verified prebuilt V8; building V8 from source on a 4-core runner does not fit the job time limit | maintainer — needs a Windows/MSVC host and release-upload rights |
-| OpenHarmony `librusty_v8` archives (aarch64, x86_64) on a `v8-archives-<rev>` tag | same, for `release-ohos`. The archives were already built locally on 2026-08-10; only publishing is missing | maintainer — release-upload rights |
+The two are not the same size of problem, and treating them as one obscured that
+OpenHarmony is a single upload away while Windows is a chain of work.
+
+**OpenHarmony — one upload.** Both component manifests are committed
+(`engine/third_party/rusty_v8/{x86_64,aarch64}-linux-ohos/component-manifest.json`,
+sealed 2026-08-10), so the sha256 a download would be verified against already exists,
+and both archives exist on the build machine. `fetch-v8-archives.sh` says so itself:
+`--check` passes against the local archives today, while a *download* "has nowhere to
+come from until the archive is published as a release asset". Publishing
+`librusty_v8-x86_64-linux-ohos.a` and `librusty_v8-aarch64-linux-ohos.a` to the
+`v8-archives-<rev>` tag is the whole prerequisite for `release-ohos`.
+
+**Windows — four things, in order.** `x86_64-pc-windows-msvc` is deliberately absent
+from `fetch-v8-archives.sh`'s known targets because `build-v8-windows.sh` emits no
+component manifest until a Windows lock file exists to seal one against, and a target
+with no manifest "cannot be fetched, by design". So: seal a Windows lock file and
+component manifest on an MSVC host; publish the archive; author a package manifest in
+`build-windows-sdk.sh`, which writes none today so `package-sdk.sh:84-91` refuses a
+Windows prefix outright (this is why the published `migo-windows-x86_64.tar.gz` was
+hand-tarred); and pin the provenance of ANGLE's `libEGL.dll`, `libGLESv2.dll` and
+`d3dcompiler_47.dll`, which are copied from a local directory today.
+
+Only the first two of those need the maintainer. The package manifest and the ANGLE
+pinning are ordinary work that does not need a Windows machine to design.
 
 The OHOS SDK itself is *not* a blocker: it is publicly downloadable from Huawei's
 mirror, so the job can fetch it with a pinned sha256 — the same fail-closed shape
