@@ -462,15 +462,20 @@ asset a release publishes is one step further on:
 
 ```bash
 bash scripts/package-sdk.sh dist/migo-linux-x86_64
-# -> dist/migo-sdk-linux-x86_64.tar.gz
-#    dist/migo-sdk-linux-x86_64.tar.gz.attestation.json
+# -> dist/migo-0.9.1-capi-linux-x86_64.tar.gz
+#    dist/migo-0.9.1-capi-linux-x86_64.tar.gz.attestation.json
 ```
 
-The asset name is derived from the staged prefix, so the same command
-serves Android, Linux and OpenHarmony (`dist/migo-android-arm64-v8a` →
-`migo-sdk-android-arm64-v8a.tar.gz`). `--output-dir` places the pair
-somewhere else; the Android release job points it at
-`platforms/android/dist` so `SHA256SUMS.txt` covers both files.
+The asset name is derived from the staged prefix with the release version
+inserted, so the same command serves Android, Linux and OpenHarmony
+(`dist/migo-android-arm64` → `migo-0.9.1-capi-android-arm64.tar.gz`). The
+`capi` segment distinguishes these from the Android AAR, whose `.aar`
+extension already says "Android, Java/Kotlin", and the version is in the
+name because a file that has been renamed or moved off the release page is
+otherwise unidentifiable. Staged prefixes use `arm64`/`x86_64` — the public
+vocabulary — while `arm64-v8a` and `aarch64` stay where the NDK and the Rust
+target triple need them. `--output-dir` places the pair somewhere else.
+`scripts/test-release-asset-naming-contract.sh` holds the scheme.
 **Windows is not yet packageable this way**: `build-windows-sdk.sh`
 writes no package manifest for the attestation to name, and
 `windows-sdk-0.1.1` was attested against its V8 `component-manifest.json`

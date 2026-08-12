@@ -79,6 +79,8 @@ OUTPUT_DIR="dist"
 # shellcheck source=scripts/lib/android-ndk.sh
 source "$SCRIPT_DIR/lib/android-ndk.sh"
 source "$SCRIPT_DIR/lib/reproducible-timestamp.sh"
+# shellcheck source=scripts/lib/release-version.sh
+source "$SCRIPT_DIR/lib/release-version.sh"
 
 echo "========================================"
 echo "MiniGame Android AAR Builder"
@@ -548,7 +550,19 @@ collect_outputs() {
         print_error "Expected AAR not found: $aar"
         exit 1
     fi
-    local artifact_name="migo-$PRODUCT_PROFILE-$BUILD_TYPE$ARTIFACT_SUFFIX$ABI_ARTIFACT_SUFFIX.aar"
+    # The published artifact has one name. Gradle's <profile><buildType> name is an
+    # internal detail that was reaching consumers as migo-full-release.aar, telling them
+    # about a product profile they cannot choose and a build type they do not need. Only
+    # one configuration is publishable -- full, release, default codegen, no worker
+    # snapshot, both ABIs -- and it gets the canonical name; every other variant keeps a
+    # descriptive one so two builds can still never overwrite each other in dist/.
+    local artifact_name
+    if [[ "$PRODUCT_PROFILE" == "full" && "$BUILD_TYPE" == "release" \
+          && -z "$ARTIFACT_SUFFIX" && -z "$ABI_ARTIFACT_SUFFIX" ]]; then
+        artifact_name="migo-$(read_release_version "$REPO_ROOT")-android.aar"
+    else
+        artifact_name="migo-$PRODUCT_PROFILE-$BUILD_TYPE$ARTIFACT_SUFFIX$ABI_ARTIFACT_SUFFIX.aar"
+    fi
     local output_aar="$out_dir/$artifact_name"
     local version_metadata="$out_dir/version-$PRODUCT_PROFILE$ARTIFACT_SUFFIX$ABI_ARTIFACT_SUFFIX.json"
     rm -f "$output_aar" "$output_aar.attestation.json" "$version_metadata"

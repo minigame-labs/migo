@@ -186,8 +186,16 @@ DERIVES = {
         "the Windows SDK's CMake package files",
     ),
     "scripts/build-android-sdk.sh": (
-        'SOURCE="$REPO_ROOT/release/VERSION"',
+        'VERSION="$(read_release_version "$REPO_ROOT")"',
         "the Android C-API SDK's package metadata",
+    ),
+    "scripts/package-sdk.sh": (
+        'VERSION="$(read_release_version "$ROOT")"',
+        "every C-ABI SDK tarball's published filename",
+    ),
+    "scripts/build-aar.sh": (
+        'artifact_name="migo-$(read_release_version "$REPO_ROOT")-android.aar"',
+        "the published Android AAR's filename",
     ),
 }
 
@@ -250,6 +258,33 @@ for relative in sorted(DERIVES):
                 f"{relative}:{number}: `{found}` is a version literal in a file that "
                 f"should derive from release/VERSION (`{version}`): {line.strip()}"
             )
+
+# ------------------------------------------------ one definition of the reader
+
+# Every consumer above is checked for an assignment that *calls* the reader, which
+# says nothing about whether they all call the same one. Four scripts each carried a
+# byte-identical read_release_version() -- and one of them carried the logic inline
+# under a different variable name -- so a copy was free to drift from release/VERSION
+# while every check above still passed. The definition site is pinned here so a
+# reintroduced copy fails instead of looking correct.
+DEFINITION = "scripts/lib/release-version.sh"
+# scripts/test-*.sh are excluded because a gate exists to talk *about* build scripts:
+# this very check names the definition in a string literal, so an unfiltered scan
+# reports itself as a second definer. Same lesson as the comment-stripping above --
+# a mention is not a use -- reached from the other direction, by watching the check
+# fail when nothing was wrong.
+definers = sorted(
+    str(candidate.relative_to(root))
+    for candidate in root.glob("scripts/**/*.sh")
+    if not candidate.name.startswith("test-")
+    and "read_release_version() {" in candidate.read_text(encoding="utf-8", errors="replace")
+)
+if definers != [DEFINITION]:
+    errors.append(
+        f"read_release_version() must be defined only in {DEFINITION}, but is defined in "
+        f"{definers}. One rule, one implementation: a second copy can drift from "
+        "release/VERSION while every call site still looks correct"
+    )
 
 # ------------------------------------------------ what must stay independent
 

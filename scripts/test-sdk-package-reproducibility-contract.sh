@@ -2,7 +2,7 @@
 # Two packagings of one staged tree must produce identical bytes, and the archive
 # must say nothing about who built it.
 #
-# The `migo-sdk-<os>-<arch>.tar.gz` on every release so far was a `tar` typed on the
+# The `migo-sdk-<os>-<arch>.tar.gz` on every release up to v0.9.1 was a `tar` typed on the
 # release machine, and the published Linux archive shows what that costs: `xg/xg` as
 # the owner of every entry and the build machine's wall clock as every mtime. The
 # attestation beside it swears to a `package_sha256` that nobody receiving it can
@@ -20,6 +20,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The expected asset names below are the derivation under test, so they must come from
+# the same version source package-sdk.sh reads. Hardcoding one here would let the
+# contract pass against a package labelled with a version nobody chose.
+# shellcheck source=scripts/lib/release-version.sh
+source "$ROOT/scripts/lib/release-version.sh"
+RELEASE_VERSION="$(read_release_version "$ROOT")"
 PASSED=0
 
 pass() { printf '\033[0;32mPASS\033[0m  %s\n' "$*"; PASSED=$((PASSED + 1)); }
@@ -64,7 +70,7 @@ sha_of() { sha256sum "$1" | cut -d' ' -f1; }
 
 EPOCH_A=1700000000
 EPOCH_B=1800000000
-ASSET="migo-sdk-fixture-x86_64.tar.gz"
+ASSET="migo-${RELEASE_VERSION}-capi-fixture-x86_64.tar.gz"
 
 PREFIX="$WORK/dist/migo-fixture-x86_64"
 stage_prefix "$PREFIX"
@@ -106,7 +112,7 @@ find "$UMASK_A" -type d -exec chmod 775 {} +
 find "$UMASK_A" -type f -exec chmod 664 {} +
 package "$UMASK_A" "$WORK/out-mode-b" "$EPOCH_A"
 
-MODE_ASSET="migo-sdk-umask-x86_64.tar.gz"
+MODE_ASSET="migo-${RELEASE_VERSION}-capi-umask-x86_64.tar.gz"
 if [[ "$(sha_of "$WORK/out-mode-a/$MODE_ASSET")" != "$(sha_of "$WORK/out-mode-b/$MODE_ASSET")" ]]; then
     fail "the same content staged under different permissions produced different archives, so the builder's umask reaches the published bytes"
 fi

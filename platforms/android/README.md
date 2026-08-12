@@ -27,17 +27,25 @@ bash scripts/build-aar.sh --product-profile slim release
 
 ```groovy
 dependencies {
-    implementation files('libs/migo-full-release.aar')
+    implementation files('libs/migo-0.9.1-android.aar')
 }
 ```
 
-或使用 Maven 仓库：
+AAR 同时包含 `arm64-v8a` 和 `x86_64`（34 MB）。**上架的应用只带一个 ABI**：在
+`defaultConfig` 里加
 
 ```groovy
-dependencies {
-    implementation 'com.migo:runtime:1.0.0'
+android {
+    defaultConfig {
+        ndk { abiFilters 'arm64-v8a' }
+    }
 }
 ```
+
+打包进 APK 的原生库就是 17 MB；发 App Bundle 则由 Play 按设备分发，`x86_64`
+对终端用户的下载量贡献为零。
+
+Maven 仓库尚未发布，暂时只能用本地 AAR。
 
 ## 快速开始
 

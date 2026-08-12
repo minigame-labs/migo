@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# `platforms/android/dist/SHA256SUMS.txt` is a checksum manifest over
-# "everything currently in dist" (`cd platforms/android/dist && sha256sum *`).
+# `dist/release/SHA256SUMS.txt` is a checksum manifest over "everything currently
+# in the release staging directory" (`cd dist/release && sha256sum *`).
+#
+# It used to cover platforms/android/dist -- the Android job's *build output*
+# directory -- which is where its dishonesty came from rather than from the file
+# itself: that directory holds internal products the release never ships, and holds
+# nothing from the Linux, Windows or OpenHarmony packages. Pointed at the staging
+# directory instead, it covers exactly the set this job publishes.
 # It is only trustworthy if nothing writes a new file into that directory
 # after it runs -- otherwise the release publishes a file the manifest never
 # saw. That bug shipped once already: "Write version metadata" ran after
@@ -35,7 +41,7 @@
 # `python3 -c "...write..."` one-liner all sailed through as clean -- the
 # allowlist of write shapes was necessarily incomplete, and every shape
 # nobody had thought of yet was silently safe. Inverted: once a step's `run`
-# text mentions platforms/android/dist anywhere (or `cd`s into it), every
+# text mentions the staging directory anywhere (or `cd`s into it), every
 # command in that step must be affirmatively recognized as read-only, or the
 # gate fails and names the command it could not clear. Being unable to
 # classify a command is treated exactly like proof that it writes.
@@ -69,7 +75,7 @@ import sys
 import yaml
 
 workflow_path = sys.argv[1]
-DIST = "platforms/android/dist"
+DIST = "dist/release"
 
 with open(workflow_path, "r", encoding="utf-8") as fh:
     workflow = yaml.safe_load(fh)

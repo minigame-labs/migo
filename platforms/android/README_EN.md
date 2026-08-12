@@ -27,17 +27,25 @@ Add the AAR to your project:
 
 ```groovy
 dependencies {
-    implementation files('libs/migo-full-release.aar')
+    implementation files('libs/migo-0.9.1-android.aar')
 }
 ```
 
-Or if using a Maven repository:
+The AAR carries both `arm64-v8a` and `x86_64` (34 MB). **A shipped app carries one
+ABI**: add
 
 ```groovy
-dependencies {
-    implementation 'com.migo:runtime:1.0.0'
+android {
+    defaultConfig {
+        ndk { abiFilters 'arm64-v8a' }
+    }
 }
 ```
+
+and the packaged native library is 17 MB. Publish an App Bundle instead and Play
+delivers per device, so `x86_64` contributes nothing to the end-user download.
+
+There is no Maven repository yet; use the local AAR.
 
 ## Quick Start
 

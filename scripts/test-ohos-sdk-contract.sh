@@ -66,6 +66,27 @@ for f in "${REQUIRED[@]}"; do
 done
 pass "package structure complete (${#REQUIRED[@]} required paths)"
 
+# ---- 1b. the manifest states its snapshot policy ----------------------------
+# runtime-v8/build.rs embeds a V8 startup snapshot only for
+# CARGO_CFG_TARGET_OS == "android", so an OpenHarmony archive genuinely has none and
+# its consumers pay a from-source JS bootstrap on every cold start. The Android
+# package manifest says "embedded" and the Linux one says "none"; this one said
+# nothing, which reads the same as the field having been forgotten.
+#
+# The value is pinned rather than merely present-checked. If a future change teaches
+# build.rs to embed for OpenHarmony, this fails and forces the manifest to be
+# corrected in the same commit, instead of the archive silently under-claiming what
+# it contains.
+DECLARED_POLICY="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1])).get("snapshot_policy", "<missing>"))
+' "$MANIFEST")"
+if [[ "$DECLARED_POLICY" != "none" ]]; then
+    fail "manifest snapshot_policy is '$DECLARED_POLICY'; expected 'none' (build.rs embeds for android targets only)"
+    exit 1
+fi
+pass "manifest declares snapshot_policy=none, matching build.rs's android-only embedding"
+
 # ---- 2. staged bytes match the manifest -------------------------------------
 DECLARED_SHA="$(python3 -c '
 import json,sys

@@ -24,12 +24,12 @@ for arg in "$@"; do
     esac
 done
 case "$ARCH" in
-    aarch64) ABI="arm64-v8a" ;;
-    x86_64)  ABI="x86_64" ;;
+    aarch64) ABI="arm64-v8a"; PUBLIC_ARCH="arm64" ;;
+    x86_64)  ABI="x86_64";    PUBLIC_ARCH="x86_64" ;;
     *) echo "unsupported arch: $ARCH" >&2; exit 2 ;;
 esac
 
-PREFIX="${MIGO_ANDROID_PREFIX:-$REPO_ROOT/dist/migo-android-$ABI}"
+PREFIX="${MIGO_ANDROID_PREFIX:-$REPO_ROOT/dist/migo-android-$PUBLIC_ARCH}"
 STATIC_LIB="$PREFIX/lib/libmigo_capi.a"
 MANIFEST="$PREFIX/share/migo/android-$ABI-manifest.json"
 MANIFEST_TOOL="$REPO_ROOT/tools/artifact-manifest"
