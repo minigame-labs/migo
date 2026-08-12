@@ -429,6 +429,7 @@ fn write_snapshot_manifest_succeeds_without_git() {
     let output = std::process::Command::new("bash")
         .arg(&script)
         .arg("full")
+        .arg("android")
         .arg("aarch64")
         .arg(&bin)
         .arg("worker")
