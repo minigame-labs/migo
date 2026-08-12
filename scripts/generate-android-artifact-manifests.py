@@ -178,7 +178,7 @@ def validate_component(
     abi: str,
     target: dict[str, Any],
 ) -> tuple[dict[str, Any], pathlib.Path, pathlib.Path]:
-    component_root = repo_root / "engine/third_party/rusty_v8" / target["arch"]
+    component_root = repo_root / "engine/third_party/rusty_v8" / target["triple"]
     manifest_path = component_root / "component-manifest.json"
     archive_path = component_root / "librusty_v8.a"
     binding_path = component_root / "src_binding.rs"
@@ -220,7 +220,7 @@ def validate_snapshot(
     v8_archive_hash: str,
 ) -> dict[str, Any]:
     prefix = "SNAPSHOT" if kind == "host" else "SNAPSHOT-worker"
-    name = f"{prefix}-{profile}-{target['arch']}.bin"
+    name = f"{prefix}-{profile}-android-{target['arch']}.bin"
     snapshot_path = repo_root / "engine/crates/runtime-v8/snapshots" / name
     manifest_path = pathlib.Path(f"{snapshot_path}.manifest.json")
     manifest = read_json(manifest_path, f"{kind} snapshot manifest")

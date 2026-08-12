@@ -11,7 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
 TARGET="${MIGO_ANDROID_TARGET:-aarch64-linux-android}"
-ARCH_DIR="aarch64"
 
 info() { echo -e "\033[0;36m[capi-platform] $*\033[0m"; }
 err() { echo -e "\033[0;31m[capi-platform] $*\033[0m" >&2; }
@@ -31,7 +30,7 @@ trap 'rm -rf "$SHIM_DIR"' EXIT
 ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/aarch64-linux-android-ar"
 export PATH="$SHIM_DIR:$PATH"
 
-V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$ARCH_DIR"
+V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$TARGET"
 if [[ ! -f "$V8_DIR/librusty_v8.a" ]]; then
     err "missing $V8_DIR/librusty_v8.a"
     exit 1

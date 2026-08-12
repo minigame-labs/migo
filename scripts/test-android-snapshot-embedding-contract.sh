@@ -62,10 +62,11 @@ def sha256_bytes(payload: bytes) -> str:
 def snapshot_filename(entry: dict[str, object], where: str) -> str:
     """Mirror the name runtime-v8/build.rs builds for the same record.
 
-    build.rs uses SNAPSHOT-{profile}-{arch}.bin for the host heap and
-    SNAPSHOT-worker-{profile}-{arch}.bin for the worker heap. Deriving it here from
-    the slice's own fields, rather than accepting a path out of the manifest, is what
-    makes the two agree by construction.
+    This checks Android AARs specifically (jni/<abi>/libmigo.so below), so the OS
+    segment is always "android". build.rs uses SNAPSHOT-{profile}-android-{arch}.bin
+    for the host heap and SNAPSHOT-worker-{profile}-android-{arch}.bin for the worker
+    heap. Deriving it here from the slice's own fields, rather than accepting a path
+    out of the manifest, is what makes the two agree by construction.
     """
     kind = entry.get("runtime_kind")
     profile = entry.get("product_profile")
@@ -74,9 +75,9 @@ def snapshot_filename(entry: dict[str, object], where: str) -> str:
         if not isinstance(value, str) or not value:
             raise ContractError(f"{where}: snapshot record has no usable {field}")
     if kind == "host":
-        return f"SNAPSHOT-{profile}-{arch}.bin"
+        return f"SNAPSHOT-{profile}-android-{arch}.bin"
     if kind == "worker":
-        return f"SNAPSHOT-worker-{profile}-{arch}.bin"
+        return f"SNAPSHOT-worker-{profile}-android-{arch}.bin"
     raise ContractError(f"{where}: unknown snapshot runtime_kind {kind!r}")
 
 

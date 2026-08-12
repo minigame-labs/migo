@@ -19,6 +19,48 @@
 
 SNAPSHOT_SCHEMA_VERSION=3
 
+snapshot_valid_os() {
+  case "$1" in
+    android|linux|ohos|windows) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# (os, arch) -> Rust target triple, recorded in the manifest's target_triple
+# field. Mirrors the match in engine/crates/runtime-v8/build.rs exactly: both
+# must agree on which V8 archive a given (os, arch) snapshot is bound to, since
+# a snapshot serializes a live V8 heap and only loads in the exact V8 that
+# produced it.
+snapshot_target_triple() {
+  local os="$1" arch="$2"
+  case "$os-$arch" in
+    android-aarch64) echo "aarch64-linux-android" ;;
+    android-x86_64)  echo "x86_64-linux-android" ;;
+    linux-x86_64)    echo "x86_64-unknown-linux-gnu" ;;
+    ohos-aarch64)    echo "aarch64-unknown-linux-ohos" ;;
+    ohos-x86_64)     echo "x86_64-unknown-linux-ohos" ;;
+    windows-x86_64)  echo "x86_64-pc-windows-msvc" ;;
+    *) echo "unsupported os/arch combination: $os/$arch" >&2; return 1 ;;
+  esac
+}
+
+# (os, arch) -> directory name under engine/third_party/rusty_v8/ holding that
+# platform's V8 archive. Kept as its own function (rather than reusing the
+# target triple) because the directory is a repo-local shorthand, not the
+# literal triple: linux/ohos drop "unknown", android has no "unknown" to drop.
+snapshot_v8_target_dir() {
+  local os="$1" arch="$2"
+  case "$os-$arch" in
+    android-aarch64) echo "aarch64-linux-android" ;;
+    android-x86_64)  echo "x86_64-linux-android" ;;
+    linux-x86_64)    echo "x86_64-linux-gnu" ;;
+    ohos-aarch64)    echo "aarch64-linux-ohos" ;;
+    ohos-x86_64)     echo "x86_64-linux-ohos" ;;
+    windows-x86_64)  echo "x86_64-pc-windows-msvc" ;;
+    *) echo "unsupported os/arch combination: $os/$arch" >&2; return 1 ;;
+  esac
+}
+
 snapshot_validate_kind_profile() {
   local snapshot_kind="$1"
   local product_profile="$2"
@@ -35,14 +77,20 @@ snapshot_validate_kind_profile() {
   fi
 }
 
-# Each kind/profile snapshot set is a two-ABI release unit. An absent set stays
-# optional, but once either ABI exists require freshness for both so a partial
-# release candidate cannot pass a default scan.
+# Each kind/profile/OS snapshot set is a release unit spanning every arch that
+# OS ships. An absent set stays optional, but once any arch of that OS exists,
+# require freshness for the full set so a partial release candidate cannot
+# pass a default scan. Android and OpenHarmony ship two arches; Linux and
+# Windows ship x86_64 only (no arm64 Linux/Windows SDK exists).
 snapshot_default_arches() {
-  local _snapshot_kind="$1"
-  shift
+  local _snapshot_kind="$1" os="$2"
+  shift 2
   if [[ "$#" -gt 0 ]]; then
-    printf '%s\n' aarch64 x86_64
+    case "$os" in
+      android|ohos) printf '%s\n' aarch64 x86_64 ;;
+      linux|windows) printf '%s\n' x86_64 ;;
+      *) echo "unsupported os for default arch set: $os" >&2; return 1 ;;
+    esac
   fi
 }
 

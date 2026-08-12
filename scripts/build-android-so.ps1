@@ -198,15 +198,13 @@ function Build-Platform {
     # --------------------------------------------------------
     # Rusty V8 config
     # --------------------------------------------------------
-    $arch = if ($platform -eq "arm64-v8a") { "aarch64" } else { "x86_64" }
-
     # Verified against its component manifest and used from a path that is its own hash.
     # This was `Test-Path` -- existence, not identity -- so the AAR this script's caller
     # produces was linked against whatever bytes sat there, exactly as the shell path was
     # before it grew the same check.
     Import-Module (Join-Path $PSScriptRoot "lib/V8Materialise.psm1") -Force
     $v8 = Resolve-MigoMaterialisedV8 `
-        -V8Dir (Join-Path $paths.v8Libs $arch) `
+        -V8Dir (Join-Path $paths.v8Libs $targetTriple) `
         -Root (Join-Path (Split-Path $PSScriptRoot -Parent) "engine/target/v8-materialised")
     $env:RUSTY_V8_ARCHIVE = $v8.Archive
     Print-Info "RUSTY_V8_ARCHIVE = $($v8.Archive)"

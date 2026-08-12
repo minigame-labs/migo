@@ -35,8 +35,8 @@
 # Usage: bash scripts/fetch-v8-archives.sh [--check] [--all] [target...]
 #   --check      verify what is already present; download nothing
 #   --all        every target known to this script
-#   target...    one or more of: aarch64, x86_64, x86_64-linux-gnu,
-#                x86_64-linux-ohos, aarch64-linux-ohos
+#   target...    one or more of: aarch64-linux-android, x86_64-linux-android,
+#                x86_64-linux-gnu, x86_64-linux-ohos, aarch64-linux-ohos
 #
 # With no target given, the two Android targets are fetched. That is what the
 # Android build and CI need, and keeping it the default means adding a target
@@ -55,8 +55,8 @@ BASE_URL="${MIGO_V8_ARCHIVE_BASE_URL:-https://github.com/minigame-labs/migo/rele
 # Targets this script knows how to fetch and verify. The directory name doubles
 # as the asset suffix, so a release asset is always librusty_v8-<target>.a and
 # there is no second naming scheme to keep in sync.
-KNOWN_TARGETS=(aarch64 x86_64 x86_64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos)
-DEFAULT_TARGETS=(aarch64 x86_64)
+KNOWN_TARGETS=(aarch64-linux-android x86_64-linux-android x86_64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos)
+DEFAULT_TARGETS=(aarch64-linux-android x86_64-linux-android)
 
 info() { printf '\033[0;36m[v8-fetch] %s\033[0m\n' "$*"; }
 ok()   { printf '\033[0;32m[v8-fetch] %s\033[0m\n' "$*"; }
@@ -89,7 +89,7 @@ for arg in "$@"; do
 done
 (( ${#requested[@]} == 0 )) && requested=("${DEFAULT_TARGETS[@]}")
 
-# De-duplicate while preserving order, so `--all x86_64` does not fetch twice.
+# De-duplicate while preserving order, so `--all x86_64-linux-android` does not fetch twice.
 targets=()
 for t in "${requested[@]}"; do
     seen=0

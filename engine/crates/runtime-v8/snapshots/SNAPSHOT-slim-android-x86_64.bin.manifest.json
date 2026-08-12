@@ -6,16 +6,16 @@
   "target_triple": "x86_64-linux-android",
   "generation_cpu_policy": "target-baseline",
   "normalized_parameters": ["--arch=x86_64","--cpu-policy=target-baseline","--product-profile=slim","--runtime-kind=host","--warmup=none"],
-  "external_references_sha256": "b389dbf04a5ffb7c82c2764e2810669d0ef4250a72050abccf986a26fbfcd708",
-  "bootstrap_inputs_sha256": "42f9e04bf445c5d43422b38b68ff15df117e0a119a598f4ac90077edeaecf8bc",
+  "external_references_sha256": "9d5cb8a5a457669cef89e7b83d71653db06a31c084188b15124981f52272202b",
+  "bootstrap_inputs_sha256": "cb34f4df9d6c318fa731bf7836cf592bca5b6cc172e06db03769bed4a6b6b33c",
   "features": ["code-signing","profile-slim","v8-limits"],
   "features_sha256": "2cdc398a325c8559e9c623222b8dccdf72b12a7119b680c6f6f9883eff0cfb94",
-  "rust_sources_sha256": "b389dbf04a5ffb7c82c2764e2810669d0ef4250a72050abccf986a26fbfcd708",
+  "rust_sources_sha256": "9d5cb8a5a457669cef89e7b83d71653db06a31c084188b15124981f52272202b",
   "v8_archive_sha256": "ce14223a4d938011b888a3ea32ffd795ae1904d86e71989321e0cec2cfee5413",
-  "snapshot_size": 1452093,
-  "snapshot_sha256": "57a4448a36baff2f2dc5bb54e6b2d2405feaefcc6e121e867ae669ae7a5dc83b",
+  "snapshot_size": 1452013,
+  "snapshot_sha256": "d541e462273e2990d2a4e5518a8863b444aa06d5d7f50ab4bafbb8d683b91b82",
   "js_sources_sha256": "c404c8ccc3378b3057c038b65f9b7a32a8f3fd155f3dc853d8029b0ddcd57acc",
   "deno_core_version": "0.385.0",
-  "git_commit": "7af491c",
-  "generated_at": "2026-08-11T16:25:37Z"
+  "git_commit": "e637a6e",
+  "generated_at": "2026-08-12T15:24:17Z"
 }

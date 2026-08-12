@@ -126,7 +126,7 @@ grep -q -- '-PmigoCodegenProfile=' "$ROOT/scripts/build-aar.ps1" \
   || fail "build-aar.ps1 does not forward its codegen profile to Gradle"
 
 echo "[7/7] checking snapshot inputs use the same named product"
-grep -q 'SNAPSHOT-{product_profile}-{target_arch}' \
+grep -q 'SNAPSHOT-{product_profile}-{os_word}-{target_arch}' \
   "$ENGINE/crates/runtime-v8/build.rs" \
   || fail "snapshot selection is not profile-qualified"
 

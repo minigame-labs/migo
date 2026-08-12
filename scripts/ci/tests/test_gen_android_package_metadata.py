@@ -47,7 +47,7 @@ class AndroidPackageManifestTest(unittest.TestCase):
         self.assertIn('"BSL-1.1"', metadata_writer)
         self.assertIn("check-snapshot-freshness.sh", script)
         self.assertIn("snapshot_require_materialized_snapshot", script)
-        self.assertIn('--product-profile full "$ARCH"', script)
+        self.assertIn('--product-profile full --os android "$ARCH"', script)
         self.assertLess(
             script.index("check-snapshot-freshness.sh"),
             script.index("building capi staticlib"),

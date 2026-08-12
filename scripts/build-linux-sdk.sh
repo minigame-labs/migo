@@ -98,6 +98,21 @@ fi
 # The NDK must not be visible, or skia-bindings picks its toolchain over ours.
 unset ANDROID_NDK ANDROID_NDK_HOME
 
+SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-linux-x86_64.bin"
+SNAPSHOT_MANIFEST="$SNAPSHOT_BIN.manifest.json"
+[[ -f "$SNAPSHOT_MANIFEST" ]] || {
+    echo "[linux-sdk] missing snapshot identity $SNAPSHOT_MANIFEST (regenerate the snapshot)" >&2
+    exit 1
+}
+# Freshness-only CI accepts a Git LFS pointer as an artifact identity. A package
+# build cannot: runtime-v8 must embed the real bytes, and a source-JS fallback
+# must never be mislabeled as snapshot_policy=embedded in the package manifest.
+# shellcheck source=scripts/lib/snapshot-fingerprint.sh
+source "$SCRIPT_DIR/lib/snapshot-fingerprint.sh"
+snapshot_require_materialized_snapshot "$SNAPSHOT_BIN"
+info "verifying the target host/full/linux snapshot before compiling"
+bash "$SCRIPT_DIR/check-snapshot-freshness.sh" --product-profile full --os linux x86_64
+
 export RUSTFLAGS="${RUSTFLAGS:-} $RUSTFLAGS_SYSROOT_LINK"
 
 # No stamp file and no `cargo clean -p v8` here any more. Both existed because cargo
@@ -265,7 +280,8 @@ python3 "$SCRIPT_DIR/abi-floor-audit.py" needed "$SO_BUILD" > "$NEEDED_FILE"
 python3 "$SCRIPT_DIR/gen-linux-package-metadata.py" --manifest \
     --prefix "$PREFIX" --version "$VERSION" \
     --needed-from "$NEEDED_FILE" --sysroot "$MIGO_SYSROOT_IDENTITY" \
-    --v8-component-manifest "$V8_MANIFEST" --build-metadata "$BUILD_METADATA"
+    --v8-component-manifest "$V8_MANIFEST" --build-metadata "$BUILD_METADATA" \
+    --snapshot-bin "$SNAPSHOT_BIN" --snapshot-manifest "$SNAPSHOT_MANIFEST"
 
 PACKAGE_MANIFEST="$PREFIX/share/migo/linux-x86_64-manifest.json"
 info "verifying the complete staged package tree"

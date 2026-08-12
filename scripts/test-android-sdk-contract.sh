@@ -128,14 +128,14 @@ fi
 # runtime-v8 cannot take its source-JS fallback in a package claiming embedded.
 # This post-build check binds the manifest back to those exact input bytes.
 if [[ -f "$MANIFEST" ]]; then
-    SNAP="$REPO_ROOT/engine/crates/runtime-v8/snapshots/SNAPSHOT-full-$ARCH.bin"
+    SNAP="$REPO_ROOT/engine/crates/runtime-v8/snapshots/SNAPSHOT-full-android-$ARCH.bin"
     if [[ -f "$SNAP" ]]; then
         WANT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshots"][0]["bytes_hash"])' "$MANIFEST")"
         GOT="$(sha256sum "$SNAP" | cut -d" " -f1)"
         if [[ "$WANT" == "$GOT" ]]; then
             pass "manifest snapshot bytes_hash matches the freshness-gated build input"
         else
-            fail "manifest snapshot bytes_hash does not match SNAPSHOT-full-$ARCH.bin"
+            fail "manifest snapshot bytes_hash does not match SNAPSHOT-full-android-$ARCH.bin"
         fi
     else
         fail "manifest names an embedded snapshot but $SNAP is missing"
