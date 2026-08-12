@@ -49,6 +49,23 @@ for required in "$DLL" "$IMPLIB" "$HEADERS/migo.h" \
 done
 (( missing )) || pass "package carries the DLL, import library, headers and CMake package"
 
+# --- 1b. The package states what it is ---------------------------------------
+# Every other platform's build script writes a package manifest; this one did not,
+# which is why scripts/package-sdk.sh refuses a Windows prefix and why the published
+# Windows archive was a `tar` typed by hand instead of the reproducible path. The
+# attestation binds the package bytes to that file, so its absence is not cosmetic.
+# The structural checking lives in scripts/lib/windows_package_manifest.py.
+MANIFEST="$PREFIX/share/migo/windows-x86_64-manifest.json"
+if [[ ! -f "$MANIFEST" ]]; then
+    fail "missing package manifest: share/migo/windows-x86_64-manifest.json"
+elif manifest_report="$(python3 "$SCRIPT_DIR/lib/windows_package_manifest.py" "$MANIFEST" "$PREFIX")"; then
+    pass "manifest declares its runtime DLLs and artifact hashes, and they match the package"
+else
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && fail "manifest: $line"
+    done <<< "$manifest_report"
+fi
+
 # Runtime DLLs the consumer cannot supply itself: migo.dll resolves EGL through
 # ANGLE and imports V8 from rusty_v8.dll, both by name at load time. A package
 # missing one loads on a developer machine that happens to have it and fails on

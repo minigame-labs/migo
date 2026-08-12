@@ -89,14 +89,8 @@ require_synced_worktree
 # crate manifest, and with no fallback: a default here ships a package labelled
 # with a version nobody chose, which is how the Linux and HarmonyOS SDKs could
 # have been built as `0.1.0` from a tree that was not.
-read_release_version() {
-    local source="$1/release/VERSION"
-    [[ -f "$source" ]] || { echo "[sdk] release version source missing: $source" >&2; exit 1; }
-    local version
-    version="$(tr -d '[:space:]' < "$source")"
-    [[ -n "$version" ]] || { echo "[sdk] release version source is empty: $source" >&2; exit 1; }
-    printf '%s' "$version"
-}
+# shellcheck source=scripts/lib/release-version.sh
+source "$SCRIPT_DIR/lib/release-version.sh"
 
 VERSION="$(read_release_version "$REPO_ROOT")"
 
@@ -282,9 +276,26 @@ cp -r "$REPO_ROOT/include/migo" "$PREFIX/include/"
 cp "$OUT_UNIX/migo.lib" "$PREFIX/lib/migo.lib"
 cp "$OUT_UNIX/migo.dll" "$PREFIX/bin/migo.dll"
 # Runtime DLLs the process loads by name: V8 and ANGLE ship alongside migo.dll.
+#
+# libEGL and libGLESv2 are required, not best-effort. The previous form was
+# `[[ -f ... ]] && cp` for all three, which silently shipped a package with no EGL
+# at all when the ANGLE directory was incomplete -- and a missing EGL is not
+# discoverable until a consumer's process fails to create a surface on a machine
+# we cannot see. d3dcompiler_47.dll genuinely is optional: whether ANGLE needs it
+# depends on how that ANGLE was built, so it is recorded in the package manifest
+# when shipped rather than assumed either way.
 cp "$V8_DIR_UNIX/rusty_v8.dll" "$PREFIX/bin/rusty_v8.dll"
 for d in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
-    [[ -f "$ANGLE_DIR_UNIX/$d" ]] && cp "$ANGLE_DIR_UNIX/$d" "$PREFIX/bin/$d"
+    [[ -f "$ANGLE_DIR_UNIX/$d" ]] || {
+        echo "[windows-sdk] required ANGLE runtime missing: $ANGLE_DIR_UNIX/$d" >&2
+        echo "[windows-sdk] test-windows-sdk-contract.sh already requires all three, and this" >&2
+        echo "[windows-sdk] script runs it with --strict below -- so copying leniently only" >&2
+        echo "[windows-sdk] moved the failure later while leaving a package with no EGL on" >&2
+        echo "[windows-sdk] disk in between. Point MIGO_WIN_ANGLE_DIR_UNIX at a complete" >&2
+        echo "[windows-sdk] ANGLE build." >&2
+        exit 1
+    }
+    cp "$ANGLE_DIR_UNIX/$d" "$PREFIX/bin/$d"
 done
 
 # ---- CMake package -------------------------------------------------------
@@ -348,6 +359,63 @@ else()
     endif()
 endif()
 CMAKE
+
+# ---- package manifest ----------------------------------------------------
+# The one thing every other platform's package had and this one did not, which is
+# why package-sdk.sh refuses a Windows prefix outright (see its error text) and why
+# the published migo-windows-x86_64.tar.gz was a `tar` typed by hand rather than the
+# reproducible path. The attestation names a single index file; this is it.
+#
+# The runtime_dependencies list is the part with teeth. A Windows consumer must
+# redistribute these DLLs, and the process loads them by name -- so the package has
+# to say which ones it shipped, and the contract has to check that bin/ contains
+# exactly that set. Declaring it is what turns "the ANGLE directory was incomplete"
+# from a silent shipping defect into a failure here.
+info "writing the package manifest"
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# The same four names test-windows-sdk-contract.sh requires, kept in one order so
+# the manifest and the gate cannot disagree about what a consumer must ship.
+ALL_RUNTIME=(migo.dll rusty_v8.dll libEGL.dll libGLESv2.dll d3dcompiler_47.dll)
+
+RUNTIME_JSON="$(
+    first=1
+    printf '['
+    for d in "${ALL_RUNTIME[@]}"; do
+        (( first )) || printf ','
+        first=0
+        printf '\n      {"file": "bin/%s", "sha256": "%s"}' "$d" "$(sha_of "$PREFIX/bin/$d")"
+    done
+    printf '\n    ]'
+)"
+
+cat > "$PREFIX/share/migo/windows-x86_64-manifest.json" <<MANIFEST
+{
+  "schema": "migo-windows-package-manifest/v1",
+  "version": "$VERSION",
+  "product_profile": "full",
+  "build_type": "release",
+  "target": "x86_64-pc-windows-msvc",
+  "os": "windows",
+  "abi": "msvc",
+  "arch": "x86_64",
+  "snapshot_policy": "none",
+  "abi_note": "migo.dll is linked from the capi staticlib with an explicit .def export allowlist, so the export table is exactly the documented migo_* surface. V8 links against its own libc++ and therefore ships as a separate rusty_v8.dll rather than being absorbed into migo.dll.",
+  "runtime_dependencies": $RUNTIME_JSON,
+  "artifacts": {
+    "lib/migo.lib": "$(sha_of "$PREFIX/lib/migo.lib")",
+    "bin/migo.dll": "$(sha_of "$PREFIX/bin/migo.dll")"
+  },
+  "known_gaps": [
+    "v8 startup snapshot: not embedded (runtime-v8/build.rs embeds for android targets only), so a cold start parses extension JS from source instead of deserialising a V8 heap",
+    "the prebuilt V8 archive for x86_64-pc-windows-msvc is not published, so this package cannot yet be produced by CI -- see scripts/fetch-v8-archives.sh for why a target with no component manifest must not be fetchable",
+    "NuGet packaging is not implemented; the package is a CMake find_package tree"
+  ]
+}
+MANIFEST
+
+python3 -m json.tool "$PREFIX/share/migo/windows-x86_64-manifest.json" >/dev/null \
+    || { echo "[windows-sdk] the generated manifest is not valid JSON" >&2; exit 1; }
 
 info "staged:"
 find "$PREFIX" -type f | sed "s|$PREFIX|  <prefix>|" | sort

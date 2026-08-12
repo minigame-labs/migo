@@ -13,6 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/v8-materialise.sh
 source "$SCRIPT_DIR/lib/v8-materialise.sh"
+# shellcheck source=scripts/lib/release-version.sh
+source "$SCRIPT_DIR/lib/release-version.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
 
@@ -34,18 +36,20 @@ done
 # than a build that refuses, and this script's default was `0.1.0` while the AAR
 # built beside it reported something else entirely.
 if [[ -z "$VERSION" ]]; then
-    SOURCE="$REPO_ROOT/release/VERSION"
-    [[ -f "$SOURCE" ]] || { echo "[android-sdk] release version source missing: $SOURCE" >&2; exit 1; }
-    VERSION="$(tr -d '[:space:]' < "$SOURCE")"
-    [[ -n "$VERSION" ]] || { echo "[android-sdk] release version source is empty: $SOURCE" >&2; exit 1; }
+    VERSION="$(read_release_version "$REPO_ROOT")"
 fi
 
 case "$ARCH" in
-    aarch64) TARGET="aarch64-linux-android"; ABI="arm64-v8a" ;;
-    x86_64)  TARGET="x86_64-linux-android";  ABI="x86_64" ;;
+    aarch64) TARGET="aarch64-linux-android"; ABI="arm64-v8a"; PUBLIC_ARCH="arm64" ;;
+    x86_64)  TARGET="x86_64-linux-android";  ABI="x86_64";    PUBLIC_ARCH="x86_64" ;;
     *) echo "unsupported arch: $ARCH (expected aarch64 or x86_64)" >&2; exit 2 ;;
 esac
-[[ -n "$PREFIX" ]] || PREFIX="$REPO_ROOT/dist/migo-android-$ABI"
+# The staged prefix directory name becomes the published asset name -- package-sdk.sh
+# derives one from the other -- so it uses the public architecture word, not the
+# Android ABI name. ABI stays what the NDK, cargo-ndk and Gradle read, and what names
+# the in-package manifest and jniLibs layout; those are internal and Android mandates
+# arm64-v8a there.
+[[ -n "$PREFIX" ]] || PREFIX="$REPO_ROOT/dist/migo-android-$PUBLIC_ARCH"
 
 info() { echo -e "\033[0;36m[android-sdk] $*\033[0m"; }
 err() { echo -e "\033[0;31m[android-sdk] $*\033[0m" >&2; }

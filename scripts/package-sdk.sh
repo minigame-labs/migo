@@ -66,17 +66,26 @@ PREFIX_PARENT="$(dirname "$PREFIX")"
 PREFIX_NAME="$(basename "$PREFIX")"
 : "${OUTPUT_DIR:=$PREFIX_PARENT}"
 
-# The asset name is the staged prefix's own name with the product prefix replaced,
-# which is what every published asset already is (dist/migo-linux-x86_64 ->
-# migo-sdk-linux-x86_64.tar.gz). Deriving it means there is no second naming scheme
-# to keep in step with the directory the build script chose.
+# shellcheck source=scripts/lib/release-version.sh
+source "$ROOT/scripts/lib/release-version.sh"
+VERSION="$(read_release_version "$ROOT")"
+
+# The asset name is the staged prefix's own name with the product prefix replaced and
+# the release version inserted (dist/migo-linux-x86_64 ->
+# migo-0.9.1-capi-linux-x86_64.tar.gz). Deriving it means there is no second naming
+# scheme to keep in step with the directory the build script chose.
+#
+# `capi` distinguishes these from the Android AAR, whose `.aar` extension already says
+# "Android, Java/Kotlin" -- so that artifact carries no api segment while these must.
+# The version is in the name because a downloaded file that has been renamed or moved
+# off the release page is otherwise unidentifiable.
 if [[ "$PREFIX_NAME" != migo-* ]]; then
     err "staged prefix is not named migo-<os>-<arch>: $PREFIX_NAME"
     err "the published asset name is derived from it, so an unrecognised name would"
     err "produce an asset no consumer is looking for"
     exit 1
 fi
-ASSET="migo-sdk-${PREFIX_NAME#migo-}.tar.gz"
+ASSET="migo-${VERSION}-capi-${PREFIX_NAME#migo-}.tar.gz"
 
 # The index is the package manifest the platform's build script wrote. Exactly one,
 # because the attestation names a single index and a tree carrying two would make

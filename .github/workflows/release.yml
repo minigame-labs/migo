@@ -22,10 +22,18 @@ jobs:
       # Block the release if any committed profile/ABI snapshot identity is
       # stale. Regenerate all affected products (see snapshots/README.md) before
       # tagging.
+      #
+      # The worker variant needs its own call: check-snapshot-freshness.sh
+      # defaults --snapshot-kind to host, so the two profile calls below cover
+      # neither worker blob. Measured before this line existed -- with
+      # SNAPSHOT-worker-full-x86_64.bin.manifest.json perturbed, both host calls
+      # exited 0 while the worker call exited 1, so a stale worker snapshot
+      # reached a tag while the same push on a branch was red.
       - name: Check snapshot freshness
         run: |
           bash scripts/check-snapshot-freshness.sh --product-profile full
           bash scripts/check-snapshot-freshness.sh --product-profile slim
+          bash scripts/check-snapshot-freshness.sh --snapshot-kind worker --product-profile full
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -537,7 +545,6 @@ jobs:
           # it apart from the real thing.
           rm -rf platforms/android/dist
           bash scripts/build-aar.sh --product-profile full release
-          bash scripts/build-aar.sh --product-profile slim release
           # arm64-only variants. The Rust artefacts are already built, so these
           # only re-run Gradle with abiFilters -- a host shipping arm64 alone
           # should not have to carry the x86_64 payload, and quoting the
@@ -545,15 +552,36 @@ jobs:
           # Procurement asks what is inside the binary and under what licences.
           # Generated from the resolved graph, so it describes the tree that was
           # built rather than what the manifests permit.
-          bash scripts/generate-sbom.sh --out platforms/android/dist/migo-sbom.cdx.json
-          bash scripts/build-aar.sh --product-profile full release arm64-v8a
-          bash scripts/build-aar.sh --product-profile slim release arm64-v8a
+          bash scripts/generate-sbom.sh \
+            --out "platforms/android/dist/migo-$(cat release/VERSION)-sbom.cdx.json"
 
       # No release may ship a libmigo.so that cannot dlopen on the API 26 floor
       # Migo claims to support. Checks every strong import against the NDK's
       # API-26 stub libraries; see scripts/test-android-symbol-floor.sh.
       - name: Android minimum-API symbol floor
         run: bash scripts/test-android-symbol-floor.sh
+
+      # The slice manifests record which snapshot each ABI embeds, but until here
+      # nothing reads the .so. generate-android-artifact-manifests.py validates the
+      # snapshot *file* and refuses to emit a slice without it, while
+      # runtime-v8/build.rs decides embedding independently and fails safe -- every
+      # failure path warns and continues. So a slice can claim a snapshot the binary
+      # does not contain, and the result is a cold-start regression with nothing red:
+      # the artifact still runs, it just parses extension JS instead of
+      # deserialising a heap.
+      #
+      # This lives outside engine/crates/runtime-v8/ on purpose. That crate's snapshot
+      # fingerprint walks every .rs in its own directory, build.rs included, so making
+      # build.rs fail closed invalidates all six committed snapshots and regenerating
+      # the aarch64 pair needs physical arm64 hardware. Checking the artifact proves
+      # the stronger property anyway -- the bytes are there, not that the build script
+      # meant to put them there.
+      #
+      # Named explicitly rather than globbed: a glob matching zero AARs would pass.
+      - name: Android snapshot embedding contract
+        run: |
+          bash scripts/test-android-snapshot-embedding-contract.sh \
+            "platforms/android/dist/migo-$(cat release/VERSION)-android.aar"
 
       # The C ABI package is published by this release too, so it is verified
       # here rather than only by hand. Runs per ABI: the entry-point set, the
@@ -577,38 +605,78 @@ jobs:
       # both archives under the SHA256SUMS.txt generated below.
       - name: Package the Android C SDK for release
         run: |
-          for abi in arm64-v8a x86_64; do
-            bash scripts/package-sdk.sh "dist/migo-android-$abi" \
+          for arch in arm64 x86_64; do
+            bash scripts/package-sdk.sh "dist/migo-android-$arch" \
               --output-dir platforms/android/dist
           done
 
+      # Per-symbol size attribution is a diagnostic, not something a consumer
+      # downloads: it shipped as size-report-full.txt / size-report-slim.txt on every
+      # release and nothing read it. Kept as a workflow artifact so a size regression
+      # stays visible, and `|| true` stays -- an analyzer failure must not block a
+      # release.
       - name: Analyze AAR size report
         run: |
-          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-release.aar \
-            > platforms/android/dist/size-report-full.txt || true
-          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-slim-release.aar \
-            > platforms/android/dist/size-report-slim.txt || true
+          mkdir -p reports
+          python3 scripts/size_report/analyze_so.py \
+            "platforms/android/dist/migo-$(cat release/VERSION)-android.aar" \
+            > reports/size-report.txt || true
 
-      - name: Write version metadata
-        run: |
-          cat > platforms/android/dist/version.json <<VEOF
-          {
-            "tag": "${{ github.ref_name }}",
-            "sha": "${{ github.sha }}",
-            "type": "release",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          VEOF
+      - name: Upload the size report as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-report
+          path: reports/size-report.txt
+          if-no-files-found: warn
 
-      # Must stay last among the steps that write into dist: SHA256SUMS.txt
-      # is a manifest over "everything currently in dist", so anything that
-      # writes here after this step runs would ship uncovered by the
-      # checksums. If you add a step below that writes into dist, either move
-      # it above this one or accept that gap explicitly.
-      - name: Generate checksums
+      # Everything published comes from this one directory, so the asset list exists
+      # once -- as its contents -- instead of in the three hand-copied places it used
+      # to: an 18-name presence check, a 20-pattern `files:` block, and the implicit
+      # coverage of `sha256sum *`. Missing any one of them published a set nobody had
+      # agreed to, and platforms/android/dist also holds internal build products
+      # (per-variant version metadata, single-ABI AARs) that were never meant to ship.
+      #
+      # `cp` is the completeness assertion the presence check used to be: a build that
+      # silently stopped producing an artifact makes a copy fail and aborts the job.
+      # The source paths are named once, here, in the step that knows them.
+      #
+      # A literal asset list is no longer expressible at all -- the names carry
+      # release/VERSION, and hardcoding it in YAML would stand up a second version
+      # source beside the one scripts/test-release-version-contract.sh exists to
+      # protect.
+      - name: Stage the published assets
         run: |
-          cd platforms/android/dist
-          sha256sum * > SHA256SUMS.txt
+          VERSION="$(cat release/VERSION)"
+          rm -rf dist/release
+          mkdir -p dist/release
+          for asset in \
+            "migo-$VERSION-android.aar" \
+            "migo-$VERSION-android.aar.attestation.json" \
+            "migo-$VERSION-capi-android-arm64.tar.gz" \
+            "migo-$VERSION-capi-android-arm64.tar.gz.attestation.json" \
+            "migo-$VERSION-capi-android-x86_64.tar.gz" \
+            "migo-$VERSION-capi-android-x86_64.tar.gz.attestation.json" \
+            "migo-$VERSION-sbom.cdx.json" \
+          ; do
+            cp "platforms/android/dist/$asset" dist/release/
+          done
+
+      # Before the checksums, so nothing unvalidated gets a hash, and before publish,
+      # so an asset from an older naming scheme fails here instead of appearing beside
+      # the real one with no way for a consumer to tell them apart. This is what
+      # replaces the `rm -rf platforms/android/dist` precaution above.
+      # Handed to the publish job rather than published from here. A job that builds
+      # one platform cannot see the release, and until it can there is no point in the
+      # graph where a whole-release checksum manifest is even expressible -- which is
+      # exactly why SHA256SUMS.txt used to cover only this job's output while its name
+      # implied the release.
+      - name: Upload the staged Android assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-android
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Optional power baseline compare
         run: |
@@ -621,84 +689,292 @@ jobs:
             echo "skip power baseline compare: ci/metrics/current_power_metrics.json not found"
           fi
 
-      - name: Verify Android release artifacts are present
-        # A build that silently stopped producing one of these would
-        # otherwise publish a release missing an artifact without failing
-        # anything -- consumers would just find the asset absent. Named
-        # explicitly (not a glob) so a missing file fails loudly here rather
-        # than at publish time. Covers everything the job unconditionally
-        # produces; the size reports are written with `|| true` (legitimately
-        # optional) and are intentionally excluded -- they are published via
-        # a glob instead, see the publish step below.
+      # One glob over one directory, which the staging step above guarantees is
+      # populated (a missing source makes its `cp` fail) and the naming contract has
+      # already validated. That is what makes fail_on_unmatched_files usable at last:
+      # action-gh-release resolves it per pattern, so the previous 20-pattern list
+      # could not enable it -- size-report-*.txt was written with `|| true` and
+      # reports/*.json only existed when there were power metrics to compare, so a
+      # legitimately empty pattern would have failed every release. Those two are no
+      # longer published (the size report is a workflow artifact; power metrics are
+      # internal), leaving a single pattern that must match.
+
+  # ── Linux SDK ───────────────────────────────────────────────────────────
+  # Every dependency is fetchable and hash-pinned, which is what makes this the first
+  # platform to move off the release machine: the Chromium sysroot comes from
+  # fetch-linux-sysroot.sh and the V8 archive from the v8-archives release asset, both
+  # verified against committed sha256s. Windows and OpenHarmony cannot follow yet --
+  # their librusty_v8 archives are not published (probed: 404 on the tag) -- so they
+  # stay hand-built for now and are covered by their own attestation sidecars instead
+  # of by SHA256SUMS.txt.
+  release-linux:
+    needs: [quality-gate, host-engine-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      # lld is not preinstalled. build-linux-sdk.sh explains why it is load-bearing
+      # rather than a preference, and it fails with an actionable message when absent
+      # -- but failing 40 minutes into a release is worse than installing it here.
+      - name: Install the linker the SDK links with
         run: |
-          for f in \
-            platforms/android/dist/migo-full-release.aar \
-            platforms/android/dist/migo-full-release.aar.attestation.json \
-            platforms/android/dist/migo-slim-release.aar \
-            platforms/android/dist/migo-slim-release.aar.attestation.json \
-            platforms/android/dist/migo-sbom.cdx.json \
-            platforms/android/dist/migo-full-release-arm64-v8a.aar \
-            platforms/android/dist/migo-full-release-arm64-v8a.aar.attestation.json \
-            platforms/android/dist/migo-slim-release-arm64-v8a.aar \
-            platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json \
-            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz \
-            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz.attestation.json \
-            platforms/android/dist/migo-sdk-android-x86_64.tar.gz \
-            platforms/android/dist/migo-sdk-android-x86_64.tar.gz.attestation.json \
-            platforms/android/dist/version.json \
-            platforms/android/dist/version-full.json \
-            platforms/android/dist/version-slim.json \
-            platforms/android/dist/SHA256SUMS.txt \
-          ; do
-            if [ ! -f "$f" ]; then
-              echo "missing release artifact: $f" >&2
-              exit 1
-            fi
+          command -v lld >/dev/null 2>&1 || sudo apt-get install -y lld
+
+      # The sysroot the V8 archive was built against, verified by sha256. The SDK build
+      # refuses when the engine's sysroot identity and the archive's disagree, so this
+      # is not merely a convenience: fetching the wrong one is a build failure, not a
+      # silently different artifact.
+      - name: Fetch and verify the pinned Chromium sysroot
+        run: bash scripts/fetch-linux-sysroot.sh
+
+      - name: Fetch and verify the linux-gnu V8 archive
+        run: bash scripts/fetch-v8-archives.sh x86_64-linux-gnu
+
+      - name: Build the Linux SDK
+        run: bash scripts/build-linux-sdk.sh
+
+      - name: Linux SDK package contract
+        run: bash scripts/test-linux-sdk-contract.sh
+
+      # Straight into the staging directory: package-sdk.sh derives the published name
+      # from the staged prefix, so there is nothing to rename on the way.
+      - name: Package the Linux SDK for release
+        run: |
+          mkdir -p dist/release
+          bash scripts/package-sdk.sh dist/migo-linux-x86_64 --output-dir dist/release
+
+      - name: Upload the staged Linux assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-linux
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── OpenHarmony SDK ─────────────────────────────────────────────────────
+  # The last platform to have nothing published at all. Unblocked once the two
+  # librusty_v8-*-linux-ohos.a archives went onto the v8-archives tag: their component
+  # manifests were already committed, so the sha256 to verify a download against
+  # existed before the download did.
+  #
+  # Also the first release to carry OHOS arm64. Every release so far shipped only
+  # ohos-x86_64, which is the emulator architecture -- real HarmonyOS devices are arm64.
+  release-ohos:
+    needs: [quality-gate, host-engine-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # No `targets:` here on purpose. engine/rust-toolchain.toml already names
+      # aarch64-unknown-linux-ohos and x86_64-unknown-linux-ohos and calls itself the
+      # reproducible-build contract; restating them in the workflow would be a second
+      # list to keep in step. The build scripts run cargo from engine/, so that file
+      # applies and rustup installs what it names.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      # Two reasons, and the second one is not about space. Measured sizes: the
+      # extracted SDK is 2.9 GB, each OpenHarmony cargo target directory is 4.4 GB, and
+      # the materialised V8 archives are 683 MB -- 12.4 GB against a runner's ~14 GB of
+      # free space, before the toolchain and checkout. And the preinstalled Android SDK
+      # is an active hazard for this job specifically: build-ohos-sdk.sh warns that a
+      # machine with an Android NDK on PATH "silently compiles the C dependencies with
+      # the NDK's clang and bionic headers for a musl target". Removing it frees the
+      # space and removes that failure mode at the same time. Do not delete this step to
+      # speed up CI without reading both halves.
+      - name: Make room, and remove the Android NDK this job must not see
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+
+      # Version and sha256 come from contracts/artifact-manifest/ohos-sdk.lock.json, not
+      # from the mirror: fetching a checksum from the same server as the artifact
+      # verifies transport and nothing else.
+      - name: Install the pinned OpenHarmony SDK
+        run: bash scripts/fetch-ohos-sdk.sh
+
+      - name: Fetch and verify the OpenHarmony V8 archives
+        run: bash scripts/fetch-v8-archives.sh x86_64-linux-ohos aarch64-linux-ohos
+
+      # Self-gating: build-ohos-sdk.sh runs test-ohos-sdk-contract.sh and the symbol
+      # floor per architecture, so there is no separate contract step to add here. Both
+      # arches in one invocation because they share the SDK and the toolchain setup.
+      - name: Build and gate the OpenHarmony SDK for both architectures
+        run: bash scripts/build-ohos-sdk.sh --all
+
+      - name: Package the OpenHarmony SDKs for release
+        run: |
+          mkdir -p dist/release
+          for arch in arm64 x86_64; do
+            bash scripts/package-sdk.sh "dist/migo-ohos-$arch" --output-dir dist/release
           done
 
-      # fail_on_unmatched_files is deliberately left at its default (false),
-      # NOT set to true. action-gh-release resolves it per glob pattern
-      # (softprops/action-gh-release src/util.ts unmatchedPatterns(), called
-      # from src/run.ts), so a single pattern matching zero files fails the
-      # whole step regardless of whether every other pattern matched. Two of
-      # the patterns below are legitimately variable in count --
-      # size-report-*.txt is written with `|| true` (an analyzer failure must
-      # not block the release) and reports/*.json only gets a file when
-      # ci/metrics/current_power_metrics.json exists to compare against --
-      # so enabling the flag would fail every release that skipped one of
-      # them. (A two-step split that set the flag only for the guaranteed
-      # files was tried and reverted: action-gh-release's createRelease
-      # defaults to draft: true and every invocation's finalizeRelease
-      # un-drafts it, so the first step would publish and un-draft the
-      # release, and a failure in the second step -- including the
-      # immutable-release rejection its own code path anticipates,
-      # isImmutableReleaseAssetUploadFailure -- would leave an already-public
-      # release permanently missing assets. That is worse than the gap this
-      # was meant to close.) The guarantee `fail_on_unmatched_files: true`
-      # would have provided for the eight required files is instead provided
-      # by the assertion step directly above, which runs first and fails the
-      # job before this step is ever reached.
+      - name: Upload the staged OpenHarmony assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-ohos
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── The only publisher ──────────────────────────────────────────────────
+  # Publishing lived inside release-android, so no point in the graph saw every
+  # platform's output. That is what made a whole-release checksum manifest impossible
+  # and what let scripts/publish-release.sh grow into a second publisher: it pushed the
+  # tag (triggering this workflow), then created the same release and `--clobber`ed the
+  # assets the workflow had just uploaded. That script is deleted; this job is the only
+  # thing that publishes.
+  #
+  # Adding a platform is now additive: one job, one entry in `needs`.
+  publish:
+    needs: [release-android, release-linux, release-ohos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # merge-multiple puts every platform's staged assets in one directory, which is
+      # the whole point: the published asset list exists once, as this directory's
+      # contents, instead of in a pattern list that has to be kept in step with the
+      # jobs.
+      - name: Collect every platform's staged assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: dist/release
+
+      # Release-level, so it belongs here rather than in whichever platform job
+      # happened to run first.
+      - name: Write version metadata
+        run: |
+          cat > dist/release/version.json <<VEOF
+          {
+            "tag": "${{ github.ref_name }}",
+            "sha": "${{ github.sha }}",
+            "type": "release",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          VEOF
+
+      - name: Release asset naming contract
+        run: bash scripts/test-release-asset-naming-contract.sh dist/release
+
+      # Must stay last among the steps that write into dist/release: SHA256SUMS.txt is
+      # a manifest over everything currently there, so anything written afterwards
+      # ships uncovered. That bug shipped once already -- version.json was written
+      # after the checksums and went out unverified -- and
+      # scripts/test-release-asset-ordering-contract.sh is what keeps the ordering from
+      # regressing again.
+      # Generated from the staging directory rather than from a template, so the asset
+      # table cannot describe a set other than the one being uploaded.
+      # generate_release_notes on the publish step appends GitHub's commit-derived
+      # notes underneath this.
+      #
+      # Placed before the checksums, not after: the notes' table already excludes
+      # SHA256SUMS.txt, so the output is identical either way, and
+      # test-release-asset-ordering-contract.sh is deny-by-default about later steps
+      # that name the staging directory -- it cannot prove a script invocation is
+      # read-only, and it is right not to guess.
+      - name: Write the release notes
+        run: bash scripts/write-release-notes.sh dist/release "$RUNNER_TEMP/release-notes.md"
+
+      #
+      # `sha256sum *` is correct here only because the staging step recreates the
+      # directory: bash expands the glob before performing the redirection, so a
+      # SHA256SUMS.txt left over from an earlier run would be listed in its own
+      # successor while empty. The `rm -rf dist/release` above is what rules that out.
+      - name: Generate checksums
+        run: |
+          cd dist/release
+          sha256sum * > SHA256SUMS.txt
+
+      # One glob over one directory, which every platform job's upload-artifact
+      # (if-no-files-found: error) guarantees is populated and the naming contract has
+      # validated. That is what makes fail_on_unmatched_files usable at last:
+      # action-gh-release resolves it per pattern, so the previous 20-pattern list could
+      # not enable it -- size-report-*.txt was written with `|| true` and reports/*.json
+      # only existed when there were power metrics to compare, so a legitimately empty
+      # pattern would have failed every release. Neither is published now (the size
+      # report is a workflow artifact, power metrics are internal), leaving a single
+      # pattern that must match.
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v3
         with:
-          files: |
-            platforms/android/dist/migo-full-release.aar
-            platforms/android/dist/migo-full-release.aar.attestation.json
-            platforms/android/dist/migo-sbom.cdx.json
-            platforms/android/dist/migo-full-release-arm64-v8a.aar
-            platforms/android/dist/migo-full-release-arm64-v8a.aar.attestation.json
-            platforms/android/dist/migo-slim-release-arm64-v8a.aar
-            platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json
-            platforms/android/dist/migo-slim-release.aar
-            platforms/android/dist/migo-slim-release.aar.attestation.json
-            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz
-            platforms/android/dist/migo-sdk-android-arm64-v8a.tar.gz.attestation.json
-            platforms/android/dist/migo-sdk-android-x86_64.tar.gz
-            platforms/android/dist/migo-sdk-android-x86_64.tar.gz.attestation.json
-            platforms/android/dist/version.json
-            platforms/android/dist/version-full.json
-            platforms/android/dist/version-slim.json
-            platforms/android/dist/SHA256SUMS.txt
-            platforms/android/dist/size-report-*.txt
-            reports/*.json
+          files: dist/release/*
+          fail_on_unmatched_files: true
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
+
+  # ── What was actually published ─────────────────────────────────────────
+  # Separate from `publish` on purpose, and the reason is the threat model. For the
+  # assets this workflow builds, the coverage invariant holds by construction:
+  # `sha256sum *` covers everything in the staging directory, and the naming contract
+  # has already refused anything that does not belong there. The only way an
+  # unverifiable asset can appear is for someone to add one *after* the workflow ran --
+  # which nothing inside the workflow can see.
+  #
+  # So this reads the published release rather than the directory it came from. It is
+  # also what a human runs by hand after uploading the Windows and OpenHarmony packages,
+  # which is the same question at the same scope:
+  #
+  #   bash scripts/verify-release-assets.sh <tag>
+  #
+  # (An earlier revision put this inside `publish`, after the checksum step.
+  # test-release-asset-ordering-contract.sh refused it -- deny-by-default, `bash
+  # <script>` cannot be proven read-only against the staging directory -- and it was
+  # right to: the step was in the wrong place, not the gate too strict.)
+  verify-published:
+    needs: [publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Release asset coverage contract
+        run: bash scripts/verify-release-assets.sh "${{ github.ref_name }}"

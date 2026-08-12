@@ -79,14 +79,8 @@ done
 # crate manifest, and with no fallback: a default here ships a package labelled
 # with a version nobody chose, which is how the Linux and HarmonyOS SDKs could
 # have been built as `0.1.0` from a tree that was not.
-read_release_version() {
-    local source="$1/release/VERSION"
-    [[ -f "$source" ]] || { echo "[sdk] release version source missing: $source" >&2; exit 1; }
-    local version
-    version="$(tr -d '[:space:]' < "$source")"
-    [[ -n "$version" ]] || { echo "[sdk] release version source is empty: $source" >&2; exit 1; }
-    printf '%s' "$version"
-}
+# shellcheck source=scripts/lib/release-version.sh
+source "$SCRIPT_DIR/lib/release-version.sh"
 
 MIGO_VERSION="$(read_release_version "$REPO_ROOT")"
 
@@ -100,7 +94,16 @@ MIN_OHOS_API="${MIGO_OHOS_MIN_API:-20}"
 for ARCH in "${ARCHES[@]}"; do
     TRIPLE="$ARCH-unknown-linux-ohos"
     STATIC_LIB="$REPO_ROOT/engine/target/$TRIPLE/release/libmigo_capi.a"
-    PREFIX="$REPO_ROOT/dist/migo-ohos-$ARCH"
+    # The staged prefix directory name becomes the published asset name, because
+    # package-sdk.sh derives one from the other, so it uses the public architecture
+    # word. $ARCH stays the toolchain's own vocabulary and keeps naming the triple and
+    # the in-package manifest, which test-ohos-sdk-contract.sh reads to know which musl
+    # loader to expect.
+    case "$ARCH" in
+        aarch64) PUBLIC_ARCH="arm64" ;;
+        *)       PUBLIC_ARCH="$ARCH" ;;
+    esac
+    PREFIX="$REPO_ROOT/dist/migo-ohos-$PUBLIC_ARCH"
 
     # ---- build what is missing ---------------------------------------------
     # One command, no human step in the middle: that is the delivery criterion
@@ -286,6 +289,7 @@ EOF
   "arch": "$ARCH",
   "target_triple": "$TRIPLE",
   "product_profile": "full",
+  "snapshot_policy": "none",
   "min_ohos_api": $MIN_OHOS_API,
   "build_sdk": {
     "version": "$SDK_VER",
@@ -300,6 +304,7 @@ EOF
     "note": "$KINDS_NOTE"
   },
   "known_gaps": [$SURFACE_GAP
+    "v8 startup snapshot: not embedded (runtime-v8/build.rs embeds for android targets only), so a cold start parses extension JS from source instead of deserialising a V8 heap",
     "arch coverage: only x86_64 has been run on a device (API 20 emulator); aarch64 is built and gated but unverified until real HarmonyOS NEXT hardware is available",
     "multi-touch: verified single-pointer only; hdc cannot synthesise a second pointer"
   ],
@@ -378,7 +383,7 @@ fi
 
 info "running the package contract"
 for ARCH in "${ARCHES[@]}"; do
-    bash "$SCRIPT_DIR/test-ohos-sdk-contract.sh" "$REPO_ROOT/dist/migo-ohos-$ARCH"
+    bash "$SCRIPT_DIR/test-ohos-sdk-contract.sh" "$REPO_ROOT/dist/migo-ohos-$PUBLIC_ARCH"
 done
 
 # The API floor gate runs here for the same reason, and it was previously wired
@@ -418,5 +423,5 @@ for ARCH in "${ARCHES[@]}"; do
     # now rejects that mismatch rather than trusting this loop to be right.
     MIGO_OHOS_TRIPLE="$ARCH-linux-ohos" \
         bash "$SCRIPT_DIR/test-ohos-symbol-floor.sh" \
-            "$REPO_ROOT/dist/migo-ohos-$ARCH/lib/libmigo_capi.a"
+            "$REPO_ROOT/dist/migo-ohos-$PUBLIC_ARCH/lib/libmigo_capi.a"
 done

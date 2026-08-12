@@ -1,0 +1,22 @@
+{
+  "schema": "migo-ohos-sdk-lock/v1",
+  "release": "5.1.0-Release",
+  "sdk_version": "5.1.0.107",
+  "api_version": 18,
+  "mirror": "https://repo.huaweicloud.com/openharmony/os/5.1.0-Release",
+  "archive": {
+    "name": "ohos-sdk-windows_linux-public.tar.gz",
+    "size_bytes": 3428583333,
+    "sha256": "8c1f97df34812e45fa4f0e3275987b261e80622abb7c51392bb063f853451344"
+  },
+  "component": {
+    "member_glob": "ohos-sdk/linux/native-linux-x64-*.zip",
+    "notes": "Located by glob, never by path depth. The tar layout is not stable across OpenHarmony releases -- setup-ohos-sdk's installer carries per-version strip levels -- so a hardcoded depth breaks on a version bump in a way that looks like a corrupt download."
+  },
+  "notes": {
+    "why_committed": "The mirror publishes ohos-sdk-windows_linux-public.tar.gz.sha256 beside the archive, but fetching a checksum from the same server as the artifact verifies transport integrity and nothing else: whoever can change one can change both. This value is committed so every later download is checked against a hash under version control, which is the standard the rest of this repository already holds (see engine/third_party/rusty_v8/*/component-manifest.json and scripts/fetch-v8-archives.sh).",
+    "trust_on_first_use": "The hash was recorded from the mirror on 2026-08-12 and could not be recomputed independently -- the archive is 3.2 GB and no local copy of it survives the install. So this pin proves the archive has not changed since that date; it does not prove it was correct then. That is the same trust model as any lockfile, and it is stated rather than implied.",
+    "why_this_version": "5.1.0.107 (API 18) is the SDK that produced the OpenHarmony artifacts this repository publishes: both librusty_v8-*-linux-ohos.a archives and the staged package manifests record it as build_sdk. Bumping it changes the toolchain identity recorded in every OHOS artifact, so it is a deliberate act, not a convenience.",
+    "api_floor_is_separate": "This is the SDK used to build, not the API level the package claims to support. The declared floor is MIGO_OHOS_MIN_API (default 20) and is checked against a floor sysroot by scripts/test-ohos-symbol-floor.sh. The two numbers are unrelated on purpose and must not be collapsed."
+  }
+}
