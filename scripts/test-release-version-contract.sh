@@ -197,6 +197,10 @@ DERIVES = {
         'artifact_name="migo-$(read_release_version "$REPO_ROOT")-android.aar"',
         "the published Android AAR's filename",
     ),
+    "scripts/write-release-notes.sh": (
+        'VERSION="$(read_release_version "$REPO_ROOT")"',
+        "the clone command and BUILD.md link the release notes hand to a reader",
+    ),
 }
 
 

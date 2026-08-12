@@ -902,6 +902,19 @@ jobs:
       # after the checksums and went out unverified -- and
       # scripts/test-release-asset-ordering-contract.sh is what keeps the ordering from
       # regressing again.
+      # Generated from the staging directory rather than from a template, so the asset
+      # table cannot describe a set other than the one being uploaded.
+      # generate_release_notes on the publish step appends GitHub's commit-derived
+      # notes underneath this.
+      #
+      # Placed before the checksums, not after: the notes' table already excludes
+      # SHA256SUMS.txt, so the output is identical either way, and
+      # test-release-asset-ordering-contract.sh is deny-by-default about later steps
+      # that name the staging directory -- it cannot prove a script invocation is
+      # read-only, and it is right not to guess.
+      - name: Write the release notes
+        run: bash scripts/write-release-notes.sh dist/release "$RUNNER_TEMP/release-notes.md"
+
       #
       # `sha256sum *` is correct here only because the staging step recreates the
       # directory: bash expands the glob before performing the redirection, so a
@@ -926,6 +939,7 @@ jobs:
         with:
           files: dist/release/*
           fail_on_unmatched_files: true
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
 
   # ── What was actually published ─────────────────────────────────────────
