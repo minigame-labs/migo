@@ -18,6 +18,7 @@ import re
 import sys
 
 _NOTE_RE = re.compile(r"native-static-libs:\s*(?P<libs>.+)")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _PACKAGE_VERSION_RE = re.compile(
     r"^(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)\."
@@ -95,6 +96,10 @@ def package_artifacts(
 
 
 def parse_native_static_libs(text: str) -> list[str]:
+    # Defense in depth: the caller sets CARGO_TERM_COLOR=never so this note is
+    # never colored in the first place, but strip any ANSI codes anyway -- see
+    # gen-android-package-metadata.py for the reproduction that found this.
+    text = _ANSI_RE.sub("", text)
     match = _NOTE_RE.search(text)
     if not match:
         raise ValueError("no 'native-static-libs:' note found in cargo output")

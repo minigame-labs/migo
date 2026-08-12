@@ -202,6 +202,11 @@ set STEP=%errorlevel%
 if not "%STEP%"=="0" exit /b %STEP%
 
 echo [win-sdk] capturing native-static-libs
+rem CARGO_TERM_COLOR=never: this note is parsed, not read by a person. Left
+rem unset, a forced-color environment wraps the note in ANSI codes whose
+rem trailing reset glues onto the last -l token and corrupts the parsed link
+rem line. See build-android-sdk.sh for the reproduction that found this.
+set CARGO_TERM_COLOR=never
 cargo rustc -p migo-capi --lib --release --target ${TRIPLE} --crate-type staticlib -- --print native-static-libs > "${OUT_DOS}\\native-libs.txt" 2>&1
 rem cargo prints the note to stderr; the line we need starts with "native-static-libs:".
 

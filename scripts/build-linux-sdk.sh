@@ -127,7 +127,12 @@ cargo build --manifest-path "$ENGINE_DIR/Cargo.toml" \
 
 info "capturing the link line cargo uses"
 LINK_NOTE="$ENGINE_DIR/target/$TARGET/release/native-static-libs.txt"
-cargo rustc --manifest-path "$ENGINE_DIR/Cargo.toml" \
+# CARGO_TERM_COLOR=never: this note is parsed, not read by a person. Left unset,
+# CI's toolchain setup forces CARGO_TERM_COLOR=always, which wraps the note in
+# ANSI codes -- the trailing reset glues onto the last -l token with no
+# separating whitespace and corrupts the parsed link line. See build-android-sdk.sh
+# for the reproduction that found this.
+CARGO_TERM_COLOR=never cargo rustc --manifest-path "$ENGINE_DIR/Cargo.toml" \
     -p migo-capi --lib --release --target "$TARGET" --crate-type staticlib -- \
     --print native-static-libs > "$LINK_NOTE" 2>&1
 grep -q 'native-static-libs:' "$LINK_NOTE" \

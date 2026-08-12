@@ -159,12 +159,21 @@ CARGO_OUT="$ENGINE_DIR/target/$TARGET/release/migo-android-native-static-libs.tx
 # Same working directory and same compiler pins as the build above: this
 # reports the link line a consumer must reproduce, so it has to describe the
 # artifact that was actually built rather than a differently-configured one.
+#
+# CARGO_TERM_COLOR=never: this note is parsed by gen-android-package-metadata.py,
+# not read by a person. dtolnay/rust-toolchain forces CARGO_TERM_COLOR=always in
+# CI when the caller leaves it unset, which wraps the note (and the last -l token
+# on the line) in ANSI codes; the trailing reset then glues onto that last token
+# with no separating whitespace, survives the `-l` filter as a token that no
+# longer equals its clean name, and lands in migo-config.cmake corrupting the
+# next entry into one unresolvable linker argument (e.g. "-lc<ESC[0m>;log").
 (
     cd "$ENGINE_DIR"
     env \
         "CC_${TARGET_U}=$NDK_CC" \
         "CXX_${TARGET_U}=${NDK_CC}++" \
         "AR_${TARGET_U}=$NDK_BIN/llvm-ar" \
+        CARGO_TERM_COLOR=never \
         cargo rustc -p migo-capi --release --target "$TARGET" \
             -- --print native-static-libs
 ) > "$CARGO_OUT" 2>&1 \
