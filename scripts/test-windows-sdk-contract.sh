@@ -22,6 +22,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/python-cmd.sh
+source "$SCRIPT_DIR/lib/python-cmd.sh"
+# shellcheck source=scripts/lib/windows-sdk-package.sh
+source "$SCRIPT_DIR/lib/windows-sdk-package.sh"
 PREFIX="${MIGO_WINDOWS_PREFIX:-$REPO_ROOT/dist/migo-windows-x86_64}"
 STRICT=0
 [[ "${1:-}" == "--strict" ]] && STRICT=1
@@ -58,7 +62,7 @@ done
 MANIFEST="$PREFIX/share/migo/windows-x86_64-manifest.json"
 if [[ ! -f "$MANIFEST" ]]; then
     fail "missing package manifest: share/migo/windows-x86_64-manifest.json"
-elif manifest_report="$(python3 "$SCRIPT_DIR/lib/windows_package_manifest.py" "$MANIFEST" "$PREFIX")"; then
+elif manifest_report="$("$(python_cmd)" "$SCRIPT_DIR/lib/windows_package_manifest.py" "$MANIFEST" "$PREFIX")"; then
     pass "manifest declares its runtime DLLs and artifact hashes, and they match the package"
 else
     while IFS= read -r line; do
@@ -79,42 +83,93 @@ done
 (( runtime_missing )) || pass "ANGLE and V8 runtime DLLs ship alongside migo.dll"
 
 # --- 2. Toolchain-dependent checks ------------------------------------------
-find_vcvars() {
-    local vswhere="/mnt/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-    [[ -f "$vswhere" ]] || return 1
-    local root
-    root="$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-        -latest -format value -property installationPath 2>/dev/null | tr -d '\r')"
-    [[ -n "$root" ]] || return 1
-    printf '%s\\VC\\Auxiliary\\Build\\vcvars64.bat' "$root"
+# Two environments run this file: WSL (this project's dev machine, crossing
+# into a synced Windows worktree via cmd.exe -- see build-windows-sdk.sh) and
+# native Windows (CI's windows-latest runner, and any plain Windows box with
+# Git for Windows + Visual Studio Build Tools, no WSL involved -- see
+# build-windows-sdk-native.sh). `wslpath` exists only in the former, so its
+# presence is the one signal this script needs to tell them apart.
+IS_WSL=0
+command -v wslpath >/dev/null 2>&1 && IS_WSL=1
+
+to_dos() {
+    if (( IS_WSL )); then wslpath -w "$1"; else cygpath -w "$1"; fi
 }
 
-VCVARS="$(find_vcvars || true)"
-if [[ -z "$VCVARS" ]]; then
+if (( IS_WSL )); then
+    find_vcvars() {
+        local vswhere="/mnt/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+        [[ -f "$vswhere" ]] || return 1
+        local root
+        root="$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+            -latest -format value -property installationPath 2>/dev/null | tr -d '\r')"
+        [[ -n "$root" ]] || return 1
+        printf '%s\\VC\\Auxiliary\\Build\\vcvars64.bat' "$root"
+    }
+    VCVARS="$(find_vcvars || true)"
+    TOOLCHAIN_READY=0
+    [[ -n "$VCVARS" ]] && TOOLCHAIN_READY=1
+else
+    # Native: nothing to locate. The caller already loaded vcvars into this
+    # process's own PATH/INCLUDE/LIB -- the same precondition
+    # build-windows-sdk-native.sh enforces before it will link anything -- so
+    # dumpbin/cl being absent here means the caller skipped that step, not
+    # that this script should go probe for a Visual Studio install itself.
+    TOOLCHAIN_READY=0
+    { command -v dumpbin.exe >/dev/null 2>&1 && command -v cl.exe >/dev/null 2>&1; } && TOOLCHAIN_READY=1
+    (( TOOLCHAIN_READY )) && windows_sdk_ensure_msvc_link_wins
+fi
+
+if (( ! TOOLCHAIN_READY )); then
     skip "export surface (no MSVC toolchain: dumpbin unavailable)"
     skip "DLL loads with its imports resolved (no MSVC toolchain)"
     skip "staged headers compile standalone under MSVC"
 else
-    WORK="$(mktemp -d /mnt/c/Windows/Temp/migo-winsdk.XXXXXX)"
-    WORK_DOS="$(wslpath -w "$WORK")"
+    if (( IS_WSL )); then
+        WORK="$(mktemp -d /mnt/c/Windows/Temp/migo-winsdk.XXXXXX)"
+    else
+        WORK="$(mktemp -d)"
+    fi
+    WORK_DOS="$(to_dos "$WORK")"
     trap 'rm -rf "$WORK"' EXIT
 
+    # Runs one MSVC tool invocation from inside $WORK and prints its output.
+    #   run_msvc <name> -- <argv...>
+    # WSL crosses into Windows via a generated batch file + cmd.exe: composing
+    # a cmd.exe command line by quoting from bash gets mangled, and a batch
+    # file is the shape that reliably survives. Any argument containing a
+    # space (a "Program Files"-style DOS path) is quoted when the batch line
+    # is assembled, since the array form no longer arrives pre-quoted the way
+    # a hand-built string did.
+    # Natively, dumpbin/cl/the probe exe this builds are already directly
+    # callable in this process's own PATH -- vcvars is already loaded here, so
+    # there is no boundary to cross, and going through cmd.exe would be
+    # unnecessary indirection. `PATH=".:$PATH"` makes the just-built
+    # loadprobe.exe runnable as a bare name from $WORK: unlike cmd.exe, bash
+    # does not search the current directory by default.
     run_msvc() {
-        # Each invocation gets its own batch file: composing a cmd.exe command
-        # line by quoting from bash gets mangled, and a batch file is the shape
-        # that reliably survives (see CLAUDE.md on the Windows spike).
-        local body="$1" name="$2"
-        local bat="/mnt/c/Windows/Temp/migo-winsdk-$name.bat"
-        {
-            echo '@echo off'
-            echo "call \"$VCVARS\" >nul"
-            echo "$body"
-        } > "$bat"
-        # cd into the scratch directory first: cmd refuses a UNC working
-        # directory and silently falls back to C:\Windows, where cl cannot
-        # write its .obj -- reported as "Permission denied" on a path the
-        # command never mentioned.
-        ( cd /tmp && cmd.exe /c "cd /d $WORK_DOS && $(wslpath -w "$bat")" 2>/dev/null | tr -d '\r' )
+        local name="$1"; shift
+        [[ "${1:-}" == "--" ]] && shift
+        if (( IS_WSL )); then
+            local bat="/mnt/c/Windows/Temp/migo-winsdk-$name.bat" line="" a
+            for a in "$@"; do
+                if [[ "$a" == *" "* ]]; then line+="\"$a\" "; else line+="$a "; fi
+            done
+            {
+                echo '@echo off'
+                echo "call \"$VCVARS\" >nul"
+                echo "$line"
+            } > "$bat"
+            # cd into the scratch directory first: cmd refuses a UNC working
+            # directory and silently falls back to C:\Windows, where cl cannot
+            # write its .obj -- reported as "Permission denied" on a path the
+            # command never mentioned.
+            ( cd /tmp && cmd.exe /c "cd /d $WORK_DOS && $(wslpath -w "$bat")" 2>/dev/null | tr -d '\r' )
+        else
+            # 2>/dev/null to match the WSL branch above, which discards
+            # whatever the wrapped cmd.exe session sent to its own stderr.
+            ( cd "$WORK" && PATH=".:$PATH" "$@" 2>/dev/null )
+        fi
     }
 
     # --- 2a. Export surface is exactly the documented migo_* set ------------
@@ -127,7 +182,7 @@ else
     [[ -s "$DECLARED" ]] || fail "no migo_* names found in the staged headers"
 
     EXPORTED="$WORK/exported.txt"
-    run_msvc "dumpbin /EXPORTS \"$(wslpath -w "$DLL")\"" exports \
+    run_msvc exports -- dumpbin /EXPORTS "$(to_dos "$DLL")" \
         | awk '/ordinal +hint +RVA +name/{f=1;next} f && NF>=4 {print $NF}' \
         | grep -E '^migo_' | sort -u > "$EXPORTED"
 
@@ -200,7 +255,7 @@ int main(int argc, char **argv) {
 }
 PROBE
     PROBE_EXE="$WORK/loadprobe.exe"
-    BUILD_OUT="$(run_msvc "cl /nologo /Fe:loadprobe.exe loadprobe.c" build || true)"
+    BUILD_OUT="$(run_msvc build -- cl /nologo /Fe:loadprobe.exe loadprobe.c || true)"
     if [[ ! -f "$PROBE_EXE" ]]; then
         fail "could not compile the load probe with MSVC: $BUILD_OUT"
     else
@@ -211,7 +266,7 @@ PROBE
         # silently matches nothing), and the point of this check is to load the
         # DLL the way a consumer ships it: beside its ANGLE runtimes.
         cp "$PREFIX/bin/"*.dll "$WORK/"
-        LOAD_OUT="$(run_msvc "loadprobe.exe migo.dll" load || true)"
+        LOAD_OUT="$(run_msvc load -- loadprobe.exe migo.dll || true)"
         if grep -q LOAD_OK <<<"$LOAD_OUT"; then
             pass "migo.dll loads and reports it can attach a Win32 HWND"
         else
@@ -225,7 +280,7 @@ PROBE
     HDR_SRC="$WORK/hdrprobe.c"
     printf '#include <migo/migo.h>\nint main(void){return 0;}\n' > "$HDR_SRC"
     HDR_EXE="$WORK/hdrprobe.exe"
-    HDR_OUT="$(run_msvc "cl /nologo /std:c11 /W4 /WX /I\"$(wslpath -w "$PREFIX/include")\" /Fe:hdrprobe.exe hdrprobe.c" hdr || true)"
+    HDR_OUT="$(run_msvc hdr -- cl /nologo /std:c11 /W4 /WX "/I$(to_dos "$PREFIX/include")" /Fe:hdrprobe.exe hdrprobe.c || true)"
     if [[ -f "$HDR_EXE" ]]; then
         pass "staged headers compile standalone under MSVC C11 (/W4 /WX)"
     else

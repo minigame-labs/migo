@@ -79,6 +79,7 @@ command -v cygpath >/dev/null 2>&1 || {
     echo "[win-sdk-native] cygpath not found -- this script needs Git for Windows' bash" >&2
     exit 1
 }
+windows_sdk_ensure_msvc_link_wins
 
 to_dos() { cygpath -w "$1"; }
 
