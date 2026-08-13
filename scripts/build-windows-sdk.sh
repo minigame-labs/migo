@@ -73,15 +73,22 @@ TRIPLE="$WIN_TARGET_TRIPLE"                      # x86_64-pc-windows-msvc
 # the toolchain, which is the whole reason the worktree lives on C:.
 V8_DIR_UNIX="$REPO_ROOT/engine/third_party/rusty_v8/x86_64-pc-windows-msvc"
 V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$(wslpath -w "$V8_DIR_UNIX")}"
-ANGLE_DIR_UNIX="${MIGO_WIN_ANGLE_DIR_UNIX:-$WIN_TMP_UNIX/angle}"
-[[ -d "$ANGLE_DIR_UNIX" ]] || ANGLE_DIR_UNIX="$WIN_TMP_UNIX"   # spike staged them flat once
+# Default to the pinned, hash-verified location fetch-windows-angle.sh
+# populates (contracts/artifact-manifest/windows-angle.lock.json), not an
+# unpinned local directory: ANGLE ships no official binaries, so this is the
+# only copy anything downstream can say something concrete about.
+ANGLE_DIR_UNIX="${MIGO_WIN_ANGLE_DIR_UNIX:-$REPO_ROOT/engine/third_party/angle-windows}"
 
 # ---- Preconditions -------------------------------------------------------
 for f in rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
     [[ -f "$V8_DIR_UNIX/$f" ]] || { echo "[win-sdk] missing Windows V8 artifact: $V8_DIR_UNIX/$f" >&2; exit 1; }
 done
-for f in libEGL.dll libGLESv2.dll; do
-    [[ -f "$ANGLE_DIR_UNIX/$f" ]] || { echo "[win-sdk] missing ANGLE runtime DLL: $ANGLE_DIR_UNIX/$f" >&2; exit 1; }
+for f in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
+    [[ -f "$ANGLE_DIR_UNIX/$f" ]] || {
+        echo "[win-sdk] missing ANGLE runtime DLL: $ANGLE_DIR_UNIX/$f" >&2
+        echo "[win-sdk] fetch the pinned set with: bash scripts/fetch-windows-angle.sh" >&2
+        exit 1
+    }
 done
 require_synced_worktree
 
@@ -407,8 +414,8 @@ cat > "$PREFIX/share/migo/windows-x86_64-manifest.json" <<MANIFEST
     "bin/migo.dll": "$(sha_of "$PREFIX/bin/migo.dll")"
   },
   "known_gaps": [
-    "v8 startup snapshot: not embedded (runtime-v8/build.rs embeds for android targets only), so a cold start parses extension JS from source instead of deserialising a V8 heap",
-    "the prebuilt V8 archive for x86_64-pc-windows-msvc is not published, so this package cannot yet be produced by CI -- see scripts/fetch-v8-archives.sh for why a target with no component manifest must not be fetchable",
+    "v8 startup snapshot: not embedded for this platform yet (runtime-v8/build.rs embeds for android and linux, not windows -- no SNAPSHOT-full-windows-x86_64.bin has been generated), so a cold start parses extension JS from source instead of deserialising a V8 heap",
+    "this package is built with scripts/build-windows-sdk.sh by hand on a Windows-capable machine, not by CI: build-windows-sdk.sh uses wslpath/cmd.exe interop a GitHub windows-latest runner (no WSL) cannot run. The prebuilt V8 archive and ANGLE runtime it links ARE published (scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc, scripts/fetch-windows-angle.sh), so a Windows-native CI job is possible; writing one is separate work.",
     "NuGet packaging is not implemented; the package is a CMake find_package tree"
   ]
 }

@@ -97,6 +97,12 @@ engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.dll.lib
 engine/third_party/linux-sysroot/*
 !engine/third_party/linux-sysroot/sysroots.json
 
+# ANGLE + d3dcompiler_47 runtime DLLs scripts/fetch-windows-angle.sh installs,
+# pinned by contracts/artifact-manifest/windows-angle.lock.json (which is
+# tracked). No sibling file here plays sysroots.json's role because there is
+# nothing to unpack -- each DLL is fetched and hash-checked individually.
+engine/third_party/angle-windows/
+
 # Binaries built by the out-of-tree consumer examples. They are proof the
 # package works, not source; tests/c_host/build-with-pkgconfig.sh and the
 # CMake project regenerate them.

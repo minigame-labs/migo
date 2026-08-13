@@ -146,7 +146,13 @@ companion_filenames() {
     esac
 }
 companion_asset_name() {
-    echo "rusty_v8-$1-$2"
+    local target="$1" filename="$2"
+    # "rusty_v8.dll" -> "rusty_v8-<target>.dll", "rusty_v8.dll.lib" ->
+    # "rusty_v8-<target>.dll.lib": the target goes between the "rusty_v8" stem
+    # and its extension, matching the primary asset's own "rusty_v8-<target>.lib"
+    # naming rather than appending the local filename whole (which would
+    # duplicate the "rusty_v8" stem).
+    echo "${filename/rusty_v8./rusty_v8-$target.}"
 }
 
 fetch_verified() {
