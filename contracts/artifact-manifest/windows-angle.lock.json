@@ -1,0 +1,27 @@
+{
+  "schema": "migo-windows-angle-lock/v1",
+  "angle_version": "2.1.43007.0",
+  "angle_git_hash": "3988f897b8e2",
+  "build_date": "2025-11-04T22:02:20Z",
+  "arch": "x64",
+  "release": "https://github.com/minigame-labs/migo/releases/download/v8-archives-e6a88b3",
+  "files": {
+    "libEGL.dll": {
+      "size_bytes": 503936,
+      "sha256": "34f93d0c14cb4abea5e4bbd70015e6a0ba1b21e6b7a1b172c2c5c95643b877ca"
+    },
+    "libGLESv2.dll": {
+      "size_bytes": 7272104,
+      "sha256": "17bfe990238d54563e007ea8f881cac69ff97317c78e2a0e11cb522b2d38700e"
+    },
+    "d3dcompiler_47.dll": {
+      "size_bytes": 4751792,
+      "sha256": "85150f9f04c4be2417e92641fd7ba838a1d39521e0aea7d33a799a77e4d05cdf"
+    }
+  },
+  "notes": {
+    "why_self_hosted": "ANGLE (google/angle) publishes no official prebuilt Windows binaries -- confirmed by checking the project's own developer docs, which point contributors at building from source, and by the absence of any release artifact on the upstream repository. The two channels that exist (vcpkg's angle port, and DLLs extracted from a Chromium/Electron install) are both real but neither hands back a single stable, versioned, checksummed download URL the way the OpenHarmony mirror does for ohos-sdk.lock.json. Hosting our own verified copy on the same release tag that already carries the V8 archives (for the identical reason: no upstream single-file distribution) keeps the same fail-closed shape every other pinned dependency in this repository uses -- a committed hash a fetch script checks before use -- rather than trusting whichever mirror happens to be reachable at build time.",
+    "provenance_gap": "These three files were staged by earlier exploratory work on this machine (platforms/windows/spike/) before this lock file existed; their exact acquisition (which of vcpkg / a Chromium extraction / a from-source build produced them) was not recorded at the time. What is independently verifiable now: each DLL's own embedded FileVersion/ProductVersion resource reports 'ANGLE libEGL Dynamic Link Library' / 'ANGLE libGLESv2 Dynamic Link Library', version 2.1.43007 git hash 3988f897b8e2, built 2025-11-04 (readable via PowerShell `(Get-Item <file>).VersionInfo`); d3dcompiler_47.dll reports Microsoft as publisher, version 10.0.26100.4654, matching the Windows 10 SDK's redistributable of the same name. They were also exercised end to end: build-windows-sdk.sh's own contract (test-windows-sdk-contract.sh --strict) loads the linked migo.dll and confirms it can attach a live Win32 surface, which fails immediately if ANGLE cannot initialize a GL context. This is the same trust-on-first-use model ohos-sdk.lock.json states plainly: the pin proves the bytes have not changed since they were hashed, not that the untracked history before that point was clean. Rebuilding ANGLE from source and replacing this pin with a self-built, fully-provenanced archive is future work, tracked the same way the Windows V8 archive was before this session sealed it.",
+    "d3dcompiler_47_is_a_microsoft_file": "Not ANGLE's own output. It is Microsoft's HLSL compiler, redistributed from the Windows 10 SDK's Redist/D3D/x64 directory (present on any machine with the Windows 10/11 SDK installed) rather than built by this project. Pinned here anyway because build-windows-sdk.sh ships it as one unit with the two ANGLE DLLs and test-windows-sdk-contract.sh requires all three present -- see BUILD.md for why it is required rather than optional."
+  }
+}

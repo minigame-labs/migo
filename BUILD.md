@@ -378,12 +378,27 @@ compile and link execute on a Windows local-disk worktree.
   `cargo`). Provisioned by `bash platforms/windows/spike/sync-worktree.sh`.
 - MSVC toolchain (Visual Studio 2022 or Build Tools) with
   `VC.Tools.x86.x64`. The script locates it via `vswhere.exe`.
-- Windows V8 artifacts (`rusty_v8.dll`, `rusty_v8.dll.lib`,
+- Windows V8 artifacts (`rusty_v8.lib`, `rusty_v8.dll`, `rusty_v8.dll.lib`,
   `src_binding.rs`) in
-  `engine/third_party/rusty_v8/x86_64-pc-windows-msvc/` — not
-  produced by `fetch-v8-archives.sh` (no published asset yet).
-- ANGLE runtime DLLs (`libEGL.dll`, `libGLESv2.dll`,
-  `d3dcompiler_47.dll`).
+  `engine/third_party/rusty_v8/x86_64-pc-windows-msvc/`. Get them with:
+
+  ```bash
+  bash scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc
+  ```
+
+  or rebuild from source with `bash scripts/build-v8-windows.sh` (needs GN,
+  Ninja and a rusty_v8 checkout on a Windows local disk — see that script's
+  own header for the full prerequisite list; it re-seals
+  `component-manifest.json` when it finishes).
+- ANGLE runtime DLLs (`libEGL.dll`, `libGLESv2.dll`, `d3dcompiler_47.dll`),
+  pinned in `contracts/artifact-manifest/windows-angle.lock.json` (ANGLE
+  publishes no official prebuilt Windows binaries, so these are self-hosted
+  on the same release the V8 archives use — see that lock file's
+  `why_self_hosted` note). Get them with:
+
+  ```bash
+  bash scripts/fetch-windows-angle.sh
+  ```
 
 **Build** (from WSL):
 
@@ -394,12 +409,27 @@ bash scripts/build-windows-sdk.sh
 The script compiles the `migo-capi` staticlib on Windows (stage 1),
 discovers the Skia / V8 link-search directories from the build output
 (stage 2), links `migo.dll` with `/OPT:REF` and a `.def` export
-allowlist derived from the headers, stages the package, and runs the
-contract gate automatically. The contract gate requires MSVC
-(`dumpbin`, `cl`) to verify the export surface and load the DLL.
+allowlist derived from the headers, stages the package, writes the
+package manifest, and runs the contract gate automatically. The
+contract gate requires MSVC (`dumpbin`, `cl`) to verify the export
+surface and load the DLL.
 
 ```bash
 bash scripts/test-windows-sdk-contract.sh
+```
+
+**Release path (no Windows CI job exists yet)**: `build-windows-sdk.sh`
+uses `wslpath`/`cmd.exe` interop, so it cannot run on a GitHub
+`windows-latest` runner (no WSL). Until a Windows-native CI job exists,
+build and publish this package by hand on a Windows-capable machine:
+
+```bash
+bash scripts/build-windows-sdk.sh
+mkdir -p dist/release
+bash scripts/package-sdk.sh dist/migo-windows-x86_64 --output-dir dist/release
+# upload dist/release/migo-<version>-capi-windows-x86_64.tar.gz(.attestation.json)
+# to the release, then:
+bash scripts/verify-release-assets.sh <tag>
 ```
 
 ### 6. OpenHarmony SDK (aarch64 / x86_64)

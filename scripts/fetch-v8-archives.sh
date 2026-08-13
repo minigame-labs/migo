@@ -19,9 +19,7 @@
 # A target with no committed manifest cannot be fetched, by design: without one
 # there is nothing to say what a valid archive is, and downloading bytes that
 # cannot be checked would make this a plain transport wearing a verification
-# comment. That is why x86_64-pc-windows-msvc is absent below -- see
-# scripts/build-v8-windows.sh, which deliberately does not emit a manifest until
-# a Windows lock file exists to verify one against.
+# comment.
 #
 # `aarch64-linux-ohos` was absent for that same reason and no longer is: it was
 # built and sealed on 2026-08-10 (component_id 2a85cc63…), so it now has
@@ -32,11 +30,21 @@
 # report of the state rather than a gap -- the fetch fails naming the missing
 # asset instead of the target being silently unknown.
 #
+# `x86_64-pc-windows-msvc` is the same shape with one difference: the build
+# yields a DLL plus its import library, not a single .a, so it is not
+# `librusty_v8-<target>.a`. Only the primary link-time artifact (the import
+# library, hashes.archive in the component manifest -- see
+# write-windows-v8-component-manifest.py's comment on why the schema does not
+# widen to cover the DLL) is hash-verified here; the DLL is fetched alongside it
+# because a Windows build cannot link or ship without it, verified in turn when
+# scripts/build-windows-sdk.sh stages it into the package manifest.
+#
 # Usage: bash scripts/fetch-v8-archives.sh [--check] [--all] [target...]
 #   --check      verify what is already present; download nothing
 #   --all        every target known to this script
 #   target...    one or more of: aarch64-linux-android, x86_64-linux-android,
-#                x86_64-linux-gnu, x86_64-linux-ohos, aarch64-linux-ohos
+#                x86_64-linux-gnu, x86_64-linux-ohos, aarch64-linux-ohos,
+#                x86_64-pc-windows-msvc
 #
 # With no target given, the two Android targets are fetched. That is what the
 # Android build and CI need, and keeping it the default means adding a target
@@ -53,9 +61,10 @@ TAG="${MIGO_V8_ARCHIVE_TAG:-v8-archives-e6a88b3}"
 BASE_URL="${MIGO_V8_ARCHIVE_BASE_URL:-https://github.com/minigame-labs/migo/releases/download/$TAG}"
 
 # Targets this script knows how to fetch and verify. The directory name doubles
-# as the asset suffix, so a release asset is always librusty_v8-<target>.a and
-# there is no second naming scheme to keep in sync.
-KNOWN_TARGETS=(aarch64-linux-android x86_64-linux-android x86_64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos)
+# as the asset suffix for every target but Windows (see above), so a release
+# asset is otherwise always librusty_v8-<target>.a and there is no second naming
+# scheme to keep in sync.
+KNOWN_TARGETS=(aarch64-linux-android x86_64-linux-android x86_64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos x86_64-pc-windows-msvc)
 DEFAULT_TARGETS=(aarch64-linux-android x86_64-linux-android)
 
 info() { printf '\033[0;36m[v8-fetch] %s\033[0m\n' "$*"; }
@@ -107,11 +116,109 @@ with open(sys.argv[1]) as f:
 " "$1"
 }
 
+# (target) -> primary archive's local filename. Every target but Windows uses
+# the same "librusty_v8.a" name the directory-derived asset name is built from;
+# Windows' primary build product is the static rusty_v8.lib -- hashes.archive
+# in its component manifest is computed from exactly that file (see
+# write-windows-v8-component-manifest.py).
+primary_filename() {
+    case "$1" in
+        x86_64-pc-windows-msvc) echo "rusty_v8.lib" ;;
+        *) echo "librusty_v8.a" ;;
+    esac
+}
+primary_asset_name() {
+    case "$1" in
+        x86_64-pc-windows-msvc) echo "rusty_v8-$1.lib" ;;
+        *) echo "librusty_v8-$1.a" ;;
+    esac
+}
+# Windows cannot link or ship without its DLL and the import library the
+# linker resolves against it -- neither is covered by hashes.archive (a
+# deliberate schema choice: see write-windows-v8-component-manifest.py's
+# comment). They are fetched here because there is nowhere else a machine
+# without an MSVC host could get them, and verified in turn when
+# scripts/build-windows-sdk.sh stages them into the package manifest that
+# records every shipped file's hash.
+companion_filenames() {
+    case "$1" in
+        x86_64-pc-windows-msvc) printf '%s\n' rusty_v8.dll rusty_v8.dll.lib ;;
+    esac
+}
+companion_asset_name() {
+    local target="$1" filename="$2"
+    # "rusty_v8.dll" -> "rusty_v8-<target>.dll", "rusty_v8.dll.lib" ->
+    # "rusty_v8-<target>.dll.lib": the target goes between the "rusty_v8" stem
+    # and its extension, matching the primary asset's own "rusty_v8-<target>.lib"
+    # naming rather than appending the local filename whole (which would
+    # duplicate the "rusty_v8" stem).
+    echo "${filename/rusty_v8./rusty_v8-$target.}"
+}
+
+fetch_verified() {
+    local target="$1" path="$2" asset="$3" want="$4"
+    if [[ -f "$path" ]]; then
+        local have
+        have="$(sha256sum "$path" | cut -d' ' -f1)"
+        if [[ "$have" == "$want" ]]; then
+            ok "$target: $(basename "$path") already present and matches the manifest"
+            return 0
+        fi
+        # A wrong archive is worse than a missing one: it links and produces a
+        # binary whose provenance chain is a lie. Replace it, never keep it.
+        err "$target: $(basename "$path") present but does NOT match the manifest -- refetching"
+        rm -f "$path"
+    fi
+
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        err "$target: $(basename "$path") missing or mismatched (checking only, nothing downloaded)"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$path")"
+    info "$target: downloading $asset"
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$path" "$BASE_URL/$asset"; then
+        err "$target: download failed from $BASE_URL/$asset"
+        rm -f "$path"
+        return 1
+    fi
+
+    local have
+    have="$(sha256sum "$path" | cut -d' ' -f1)"
+    if [[ "$have" != "$want" ]]; then
+        err "$target: $(basename "$path") sha256 mismatch after download"
+        err "  expected $want"
+        err "  got      $have"
+        # Leaving it on disk would let a later step pick it up.
+        rm -f "$path"
+        return 1
+    fi
+    ok "$target: $(basename "$path") downloaded and verified against the manifest"
+}
+
+fetch_unverified_companion() {
+    local target="$1" path="$2" asset="$3"
+    if [[ -f "$path" ]]; then
+        ok "$target: $(basename "$path") already present"
+        return 0
+    fi
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        err "$target: $(basename "$path") missing (checking only, nothing downloaded)"
+        return 1
+    fi
+    mkdir -p "$(dirname "$path")"
+    info "$target: downloading $asset"
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$path" "$BASE_URL/$asset"; then
+        err "$target: download failed from $BASE_URL/$asset"
+        rm -f "$path"
+        return 1
+    fi
+    ok "$target: $(basename "$path") downloaded"
+}
+
 failures=0
 for target in "${targets[@]}"; do
     manifest="$V8_DIR/$target/component-manifest.json"
-    archive="$V8_DIR/$target/librusty_v8.a"
-    asset="librusty_v8-$target.a"
 
     if [[ ! -f "$manifest" ]]; then
         err "no component manifest for $target -- cannot say what a valid archive is"
@@ -123,41 +230,19 @@ for target in "${targets[@]}"; do
         failures=$((failures + 1)); continue
     fi
 
-    if [[ -f "$archive" ]]; then
-        have="$(sha256sum "$archive" | cut -d' ' -f1)"
-        if [[ "$have" == "$want" ]]; then
-            ok "$target: already present and matches the manifest"
-            continue
-        fi
-        # A wrong archive is worse than a missing one: it links and produces a
-        # binary whose provenance chain is a lie. Replace it, never keep it.
-        err "$target: present but does NOT match the manifest -- refetching"
-        rm -f "$archive"
-    fi
-
-    if [[ "$CHECK_ONLY" == "1" ]]; then
-        err "$target: missing or mismatched (checking only, nothing downloaded)"
+    primary="$V8_DIR/$target/$(primary_filename "$target")"
+    if ! fetch_verified "$target" "$primary" "$(primary_asset_name "$target")" "$want"; then
         failures=$((failures + 1)); continue
     fi
 
-    mkdir -p "$(dirname "$archive")"
-    info "$target: downloading $asset"
-    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$archive" "$BASE_URL/$asset"; then
-        err "$target: download failed from $BASE_URL/$asset"
-        rm -f "$archive"
-        failures=$((failures + 1)); continue
-    fi
-
-    have="$(sha256sum "$archive" | cut -d' ' -f1)"
-    if [[ "$have" != "$want" ]]; then
-        err "$target: sha256 mismatch after download"
-        err "  expected $want"
-        err "  got      $have"
-        # Leaving it on disk would let a later step pick it up.
-        rm -f "$archive"
-        failures=$((failures + 1)); continue
-    fi
-    ok "$target: downloaded and verified against the manifest"
+    companion_failed=0
+    while IFS= read -r companion; do
+        [[ -n "$companion" ]] || continue
+        path="$V8_DIR/$target/$companion"
+        asset="$(companion_asset_name "$target" "$companion")"
+        fetch_unverified_companion "$target" "$path" "$asset" || companion_failed=1
+    done < <(companion_filenames "$target")
+    (( companion_failed == 0 )) || failures=$((failures + 1))
 done
 
 if (( failures > 0 )); then

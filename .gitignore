@@ -81,10 +81,14 @@ engine/third_party/rusty_v8/x86_64-linux-gnu/librusty_v8.a
 engine/third_party/rusty_v8/*/gn_out/
 
 # Windows V8 build products of scripts/build-v8-windows.sh, same policy as the
-# Linux archive above (the ~190 MB .lib and its generated binding are not
-# tracked; the script reproduces them). Ignoring the whole dir also stops a
-# stray `git add -A` from committing a 190 MB library into LFS.
-engine/third_party/rusty_v8/x86_64-pc-windows-msvc/
+# Linux archive above: the ~190 MB rusty_v8.lib, the DLL and its import library
+# are build products and are not tracked. src_binding.rs is NOT one of them --
+# Windows bindgen cannot produce a correct binding (see build-v8-windows.sh's
+# comment), so the committed one is a required input the build script reuses,
+# same as the Android and Linux bindings beside it.
+engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.lib
+engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.dll
+engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.dll.lib
 
 # The Debian bullseye sysroot tree scripts/fetch-linux-sysroot.sh unpacks from
 # Chromium's published tarball. sysroots.json beside it is tracked, and is the whole
@@ -92,6 +96,12 @@ engine/third_party/rusty_v8/x86_64-pc-windows-msvc/
 # its own sha256 is the sysroot identity every Linux package manifest records.
 engine/third_party/linux-sysroot/*
 !engine/third_party/linux-sysroot/sysroots.json
+
+# ANGLE + d3dcompiler_47 runtime DLLs scripts/fetch-windows-angle.sh installs,
+# pinned by contracts/artifact-manifest/windows-angle.lock.json (which is
+# tracked). No sibling file here plays sysroots.json's role because there is
+# nothing to unpack -- each DLL is fetched and hash-checked individually.
+engine/third_party/angle-windows/
 
 # Binaries built by the out-of-tree consumer examples. They are proof the
 # package works, not source; tests/c_host/build-with-pkgconfig.sh and the
