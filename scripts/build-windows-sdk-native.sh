@@ -32,6 +32,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/windows-sdk-package.sh"
 # shellcheck source=scripts/lib/windows-native-toolchain.sh
 source "$SCRIPT_DIR/lib/windows-native-toolchain.sh"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 # shellcheck source=scripts/lib/release-version.sh
 source "$SCRIPT_DIR/lib/release-version.sh"
 
@@ -62,7 +64,7 @@ V8_DIR="$REPO_ROOT/engine/third_party/rusty_v8/$TRIPLE"
 ANGLE_DIR="${MIGO_WIN_ANGLE_DIR:-$REPO_ROOT/engine/third_party/angle-windows}"
 
 # ---- Preconditions ---------------------------------------------------------
-for f in rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
+for f in rusty_v8.lib rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
     [[ -f "$V8_DIR/$f" ]] || {
         echo "[win-sdk-native] missing Windows V8 artifact: $V8_DIR/$f" >&2
         echo "[win-sdk-native] fetch with: bash scripts/fetch-v8-archives.sh $TRIPLE" >&2
@@ -103,9 +105,17 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-C:\\mt}"
 export CARGO_TARGET_DIR
 CARGO_TARGET_DIR_UNIX="$(cygpath -u "$CARGO_TARGET_DIR")"
 
-V8_DIR_DOS="$(to_dos "$V8_DIR")"
-export RUSTY_V8_ARCHIVE="$V8_DIR_DOS\\rusty_v8.dll.lib"
-export RUSTY_V8_SRC_BINDING_PATH="$V8_DIR_DOS\\src_binding.rs"
+# Verifies rusty_v8.lib + src_binding.rs against component-manifest.json and
+# materialises all four V8 inputs (including the unhashed DLL/import-lib pair
+# -- see v8_materialise_windows's own comment) under a content-addressed path,
+# rather than linking whatever sits at $V8_DIR unverified.
+v8_materialise_windows "$V8_DIR" "$CARGO_TARGET_DIR_UNIX/v8-materialised" \
+    || { echo "[win-sdk-native] failed to materialise the Windows V8 archive" >&2; exit 1; }
+V8_MATERIALISED_DIR_UNIX="$(dirname "$V8_MATERIALISED_ARCHIVE")"
+V8_MATERIALISED_ARCHIVE_DOS="$(to_dos "$V8_MATERIALISED_ARCHIVE")"
+V8_MATERIALISED_BINDING_DOS="$(to_dos "$V8_MATERIALISED_BINDING")"
+export RUSTY_V8_ARCHIVE="$V8_MATERIALISED_ARCHIVE_DOS"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_MATERIALISED_BINDING_DOS"
 
 # ---- Generate the export allowlist (.def) from the headers ----------------
 DEF_UNIX="$(mktemp -d)/migo.def"
@@ -190,8 +200,11 @@ MSYS_NO_PATHCONV=1 link /NOLOGO /DLL "/DEF:$DEF_DOS" \
 info "linked: migo.dll ($(stat -c %s "$OUT_UNIX/migo.dll") bytes) + import lib migo.lib"
 
 # ---- Stage the package, CMake package, and manifest ------------------------
+# The materialised rusty_v8.dll, not the raw fetched copy: it was already
+# proven to sit alongside the verified rusty_v8.lib/src_binding.rs pair this
+# build linked against, in the same content-addressed directory.
 windows_sdk_stage_package "$PREFIX" "$REPO_ROOT/include/migo" \
-    "$OUT_UNIX/migo.lib" "$OUT_UNIX/migo.dll" "$V8_DIR/rusty_v8.dll" "$ANGLE_DIR"
+    "$OUT_UNIX/migo.lib" "$OUT_UNIX/migo.dll" "$V8_MATERIALISED_DIR_UNIX/rusty_v8.dll" "$ANGLE_DIR"
 windows_sdk_write_cmake_package "$PREFIX" "$VERSION"
 info "writing the package manifest"
 windows_sdk_write_manifest "$PREFIX" "$VERSION"

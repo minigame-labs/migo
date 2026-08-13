@@ -38,19 +38,22 @@
 #
 # Usage: scripts/build-windows-sdk.sh [--prefix WSL_DIR]
 #
-# Required env (same identities the spike uses):
-#   MIGO_WIN_V8_DIR   DOS path to the Windows V8 artifacts (rusty_v8.dll,
-#                     rusty_v8.lib, src_binding.rs). Defaults to the WSL-side
-#                     engine/third_party/rusty_v8/x86_64-pc-windows-msvc, which
-#                     is where build-v8-windows.sh puts them.
+# V8 inputs (rusty_v8.lib, rusty_v8.dll, rusty_v8.dll.lib, src_binding.rs) are
+# read from the WSL-side engine/third_party/rusty_v8/x86_64-pc-windows-msvc --
+# NOT the synced worktree copy, which is git-ignored (.gitignore) and so can
+# never carry them (sync-worktree.sh only clones committed refs; pointing
+# there once produced an empty path and a V8 build script panic
+# ("系统找不到指定的路径") several layers away from the cause) -- verified
+# against component-manifest.json and materialised by v8_materialise_windows
+# before the DOS path handed to the link is ever computed. There is
+# deliberately no override to point this at an arbitrary unverified location:
+# scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc is how you change what
+# gets linked.
 #
-#                     NOT the synced worktree copy: that whole directory is
-#                     git-ignored (.gitignore), so sync-worktree.sh -- which
-#                     clones -- can never carry it across. Pointing there
-#                     produced an empty path and a V8 build script panic
-#                     ("系统找不到指定的路径") several layers away from the cause.
-#   MIGO_WIN_ANGLE_DIR DOS path to the ANGLE runtime DLLs (libEGL.dll,
-#                     libGLESv2.dll, d3dcompiler_47.dll). Defaults to the spike tmp.
+# Required env (same identities the spike uses):
+#   MIGO_WIN_ANGLE_DIR_UNIX  WSL path to the ANGLE runtime DLLs (libEGL.dll,
+#                     libGLESv2.dll, d3dcompiler_47.dll). Defaults to
+#                     engine/third_party/angle-windows.
 #   MIGO_WIN_PROXY    optional http proxy for the V8 crate's build script.
 set -euo pipefail
 
@@ -59,6 +62,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$REPO_ROOT/platforms/windows/spike/lib.sh"
 # shellcheck source=scripts/lib/windows-sdk-package.sh
 source "$SCRIPT_DIR/lib/windows-sdk-package.sh"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 
 PREFIX="$REPO_ROOT/dist/migo-windows-x86_64"
 while [[ $# -gt 0 ]]; do
@@ -73,7 +78,6 @@ TRIPLE="$WIN_TARGET_TRIPLE"                      # x86_64-pc-windows-msvc
 # the synced worktree copy on a local disk -- a wslpath UNC path is unusable for
 # the toolchain, which is the whole reason the worktree lives on C:.
 V8_DIR_UNIX="$REPO_ROOT/engine/third_party/rusty_v8/x86_64-pc-windows-msvc"
-V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$(wslpath -w "$V8_DIR_UNIX")}"
 # Default to the pinned, hash-verified location fetch-windows-angle.sh
 # populates (contracts/artifact-manifest/windows-angle.lock.json), not an
 # unpinned local directory: ANGLE ships no official binaries, so this is the
@@ -81,7 +85,7 @@ V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$(wslpath -w "$V8_DIR_UNIX")}"
 ANGLE_DIR_UNIX="${MIGO_WIN_ANGLE_DIR_UNIX:-$REPO_ROOT/engine/third_party/angle-windows}"
 
 # ---- Preconditions -------------------------------------------------------
-for f in rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
+for f in rusty_v8.lib rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
     [[ -f "$V8_DIR_UNIX/$f" ]] || { echo "[win-sdk] missing Windows V8 artifact: $V8_DIR_UNIX/$f" >&2; exit 1; }
 done
 for f in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
@@ -114,7 +118,16 @@ DEF_DOS="$(wslpath -w "$DEF_UNIX")"
 # objects in this link. See the note at the top of this file: linking the static
 # archive puts V8's own libc++ into the same link as Skia's MSVC STL, and they
 # define std::terminate incompatibly.
-V8_ARCHIVE_DOS="$V8_DIR_DOS\\rusty_v8.dll.lib"
+#
+# Verifies rusty_v8.lib + src_binding.rs against component-manifest.json and
+# materialises all four V8 inputs (including the unhashed DLL/import-lib pair
+# -- see v8_materialise_windows's own comment) under a content-addressed path,
+# rather than linking whatever sits at $V8_DIR_UNIX unverified.
+v8_materialise_windows "$V8_DIR_UNIX" "$REPO_ROOT/engine/target/v8-materialised" \
+    || { echo "[win-sdk] failed to materialise the Windows V8 archive" >&2; exit 1; }
+V8_MATERIALISED_DIR_UNIX="$(dirname "$V8_MATERIALISED_ARCHIVE")"
+V8_MATERIALISED_ARCHIVE_DOS="$(wslpath -w "$V8_MATERIALISED_ARCHIVE")"
+V8_MATERIALISED_BINDING_DOS="$(wslpath -w "$V8_MATERIALISED_BINDING")"
 OUT_DOS="$WIN_TMP_UNIX/sdk-out"
 OUT_UNIX="$WIN_TMP_UNIX/sdk-out"
 mkdir -p "$OUT_UNIX"
@@ -176,8 +189,8 @@ set "PATH=${MIGO_WIN_LLVM_DIR_DOS}\\bin;%VCToolsInstallDir%bin\\Hostx64\\x64;%US
 set CARGO_HOME=${WIN_CARGO_HOME_DOS}
 set CARGO_TARGET_DIR=${WIN_TARGET_DOS}
 set INCLUDE=${WIN_HEADERS_DOS};%INCLUDE%
-set RUSTY_V8_ARCHIVE=${V8_ARCHIVE_DOS}
-set RUSTY_V8_SRC_BINDING_PATH=${V8_DIR_DOS}\\src_binding.rs
+set RUSTY_V8_ARCHIVE=${V8_MATERIALISED_ARCHIVE_DOS}
+set RUSTY_V8_SRC_BINDING_PATH=${V8_MATERIALISED_BINDING_DOS}
 ${PROXY_LINES}
 PRE
 }
@@ -252,7 +265,7 @@ link /NOLOGO /DLL /DEF:"${DEF_DOS}" ^
   /IMPLIB:"${OUT_DOS}\\migo.lib" ^
   /OPT:REF /OPT:ICF ^
   "%STATICLIB%" ^
-  "${V8_ARCHIVE_DOS}" ^
+  "${V8_MATERIALISED_ARCHIVE_DOS}" ^
   %NATIVE_LIBS%
 set STEP=%errorlevel%
 echo === LINK_EXIT=%STEP% ===
@@ -275,7 +288,7 @@ info "linked: migo.dll ($(stat -c %s "$OUT_UNIX/migo.dll") bytes) + import lib m
 # the CMake find_package(migo) tree, and windows-x86_64-manifest.json are all
 # identical regardless of which script produced the linked migo.dll.
 windows_sdk_stage_package "$PREFIX" "$REPO_ROOT/include/migo" \
-    "$OUT_UNIX/migo.lib" "$OUT_UNIX/migo.dll" "$V8_DIR_UNIX/rusty_v8.dll" "$ANGLE_DIR_UNIX"
+    "$OUT_UNIX/migo.lib" "$OUT_UNIX/migo.dll" "$V8_MATERIALISED_DIR_UNIX/rusty_v8.dll" "$ANGLE_DIR_UNIX"
 windows_sdk_write_cmake_package "$PREFIX" "$VERSION"
 info "writing the package manifest"
 windows_sdk_write_manifest "$PREFIX" "$VERSION"
