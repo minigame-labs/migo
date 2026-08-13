@@ -91,18 +91,27 @@ MIGO_VERSION="$(read_release_version "$REPO_ROOT")"
 # actually be verified -- see scripts/test-ohos-symbol-floor.sh.
 MIN_OHOS_API="${MIGO_OHOS_MIN_API:-20}"
 
+# The staged prefix directory name becomes the published asset name, because
+# package-sdk.sh derives one from the other, so it uses the public architecture
+# word. The toolchain's own vocabulary ($ARCH) keeps naming the triple and the
+# in-package manifest, which test-ohos-sdk-contract.sh reads to know which musl
+# loader to expect. A function rather than a variable set inside the build
+# loop: that variable used to leak its last iteration's value (aarch64, since
+# it runs after x86_64 in --all) into the package-contract and API-floor-gate
+# loops below, so both of those checked only the aarch64 package twice and
+# never looked at x86_64's at all -- a silent gap the floor gate's own
+# arch/triple cross-check happened to turn loud only when aarch64 ran last.
+public_ohos_arch() {
+    case "$1" in
+        aarch64) echo "arm64" ;;
+        *)       echo "$1" ;;
+    esac
+}
+
 for ARCH in "${ARCHES[@]}"; do
     TRIPLE="$ARCH-unknown-linux-ohos"
     STATIC_LIB="$REPO_ROOT/engine/target/$TRIPLE/release/libmigo_capi.a"
-    # The staged prefix directory name becomes the published asset name, because
-    # package-sdk.sh derives one from the other, so it uses the public architecture
-    # word. $ARCH stays the toolchain's own vocabulary and keeps naming the triple and
-    # the in-package manifest, which test-ohos-sdk-contract.sh reads to know which musl
-    # loader to expect.
-    case "$ARCH" in
-        aarch64) PUBLIC_ARCH="arm64" ;;
-        *)       PUBLIC_ARCH="$ARCH" ;;
-    esac
+    PUBLIC_ARCH="$(public_ohos_arch "$ARCH")"
     PREFIX="$REPO_ROOT/dist/migo-ohos-$PUBLIC_ARCH"
 
     # ---- build what is missing ---------------------------------------------
@@ -383,7 +392,7 @@ fi
 
 info "running the package contract"
 for ARCH in "${ARCHES[@]}"; do
-    bash "$SCRIPT_DIR/test-ohos-sdk-contract.sh" "$REPO_ROOT/dist/migo-ohos-$PUBLIC_ARCH"
+    bash "$SCRIPT_DIR/test-ohos-sdk-contract.sh" "$REPO_ROOT/dist/migo-ohos-$(public_ohos_arch "$ARCH")"
 done
 
 # The API floor gate runs here for the same reason, and it was previously wired
@@ -423,5 +432,5 @@ for ARCH in "${ARCHES[@]}"; do
     # now rejects that mismatch rather than trusting this loop to be right.
     MIGO_OHOS_TRIPLE="$ARCH-linux-ohos" \
         bash "$SCRIPT_DIR/test-ohos-symbol-floor.sh" \
-            "$REPO_ROOT/dist/migo-ohos-$PUBLIC_ARCH/lib/libmigo_capi.a"
+            "$REPO_ROOT/dist/migo-ohos-$(public_ohos_arch "$ARCH")/lib/libmigo_capi.a"
 done
