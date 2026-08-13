@@ -21,25 +21,6 @@ source "$MIGO_LIB_DIR/python-cmd.sh"
 
 info() { echo -e "\033[0;36m[win-sdk] $*\033[0m"; }
 
-# Git for Windows' bash ships its own `usr/bin/link.exe` -- a GNU coreutils
-# hardlink tool, unrelated to MSVC's linker of the same name -- and its
-# runtime prepends usr/bin to PATH on every invocation, ahead of whatever an
-# outer cmd.exe or CI step already set. rustc invokes the MSVC target's
-# linker by the bare name "link.exe", so whichever one PATH resolves first
-# wins; unfixed, it silently resolves to the wrong tool and every link fails
-# with a cryptic "extra operand" error instead of a missing-linker message.
-# `cl.exe` has no such collision (not a POSIX/GNU utility name), so it is the
-# reliable anchor: MSVC's real link.exe lives in the same directory, and
-# prepending that directory to PATH makes it win over Git's own copy.
-windows_sdk_ensure_msvc_link_wins() {
-    local cl_dir
-    cl_dir="$(command -v cl.exe 2>/dev/null)" || {
-        echo "[win-sdk] cl.exe not found -- vcvars was not loaded before this script ran" >&2
-        return 1
-    }
-    export PATH="$(dirname "$cl_dir"):$PATH"
-}
-
 # Generates the .def export allowlist from include/migo/*.h and writes it to
 # out_file. The public surface is exactly the documented migo_* entry points --
 # generated from the headers so it cannot drift from them the way a hand-kept

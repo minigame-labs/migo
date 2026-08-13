@@ -26,6 +26,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/python-cmd.sh"
 # shellcheck source=scripts/lib/windows-sdk-package.sh
 source "$SCRIPT_DIR/lib/windows-sdk-package.sh"
+# shellcheck source=scripts/lib/windows-native-toolchain.sh
+source "$SCRIPT_DIR/lib/windows-native-toolchain.sh"
 PREFIX="${MIGO_WINDOWS_PREFIX:-$REPO_ROOT/dist/migo-windows-x86_64}"
 STRICT=0
 [[ "${1:-}" == "--strict" ]] && STRICT=1
@@ -117,7 +119,7 @@ else
     # that this script should go probe for a Visual Studio install itself.
     TOOLCHAIN_READY=0
     { command -v dumpbin.exe >/dev/null 2>&1 && command -v cl.exe >/dev/null 2>&1; } && TOOLCHAIN_READY=1
-    (( TOOLCHAIN_READY )) && windows_sdk_ensure_msvc_link_wins
+    (( TOOLCHAIN_READY )) && windows_native_ensure_msvc_link_wins
 fi
 
 if (( ! TOOLCHAIN_READY )); then

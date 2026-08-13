@@ -30,6 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/windows-sdk-package.sh
 source "$SCRIPT_DIR/lib/windows-sdk-package.sh"
+# shellcheck source=scripts/lib/windows-native-toolchain.sh
+source "$SCRIPT_DIR/lib/windows-native-toolchain.sh"
 # shellcheck source=scripts/lib/release-version.sh
 source "$SCRIPT_DIR/lib/release-version.sh"
 
@@ -83,7 +85,7 @@ command -v cygpath >/dev/null 2>&1 || {
     echo "[win-sdk-native] cygpath not found -- this script needs Git for Windows' bash" >&2
     exit 1
 }
-windows_sdk_ensure_msvc_link_wins
+windows_native_ensure_msvc_link_wins
 
 to_dos() { cygpath -w "$1"; }
 
