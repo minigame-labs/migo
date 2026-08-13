@@ -38,15 +38,26 @@ for arg in "$@"; do
 done
 DEST="${DEST:-$ROOT/engine/third_party/angle-windows}"
 
-BASE_URL="$("$(python_cmd)" -c "import json; print(json.load(open('$LOCK'))['release'])")"
+# $LOCK is passed as sys.argv[1], not interpolated into the python source
+# string: MSYS/Git-Bash's automatic POSIX-to-DOS path conversion (relied on
+# here -- see build-windows-sdk-native.sh for where that conversion is
+# deliberately disabled instead, and why) rewrites whole argv tokens handed to
+# a native, non-MSYS python.exe, not substrings embedded inside a larger
+# string argument. A path baked into the -c source itself reaches python
+# unconverted and native Windows has no notion of a `/d/a/...` path.
+BASE_URL="$("$(python_cmd)" -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    print(json.load(f)['release'])
+" "$LOCK")"
 FILES=(libEGL.dll libGLESv2.dll d3dcompiler_47.dll)
 
 expected_sha() {
     "$(python_cmd)" -c "
 import json, sys
-with open('$LOCK') as f:
-    print(json.load(f)['files'][sys.argv[1]]['sha256'])
-" "$1"
+with open(sys.argv[1]) as f:
+    print(json.load(f)['files'][sys.argv[2]]['sha256'])
+" "$LOCK" "$1"
 }
 
 failures=0
