@@ -1,0 +1,52 @@
+{
+  "schema": "migo-v8-component-manifest/v1",
+  "component_id": "5bfd3a0beed3b34935af90a870041b3fed466091fe98e0519773ed543adbf96b",
+  "target": {
+    "triple": "x86_64-pc-windows-msvc",
+    "os": "windows",
+    "arch": "x86_64",
+    "abi": "msvc",
+    "cpu_baseline": "x86-64-v1",
+    "required_cpu_features": [
+      "cmov",
+      "sse2"
+    ],
+    "runtime_floor": {
+      "msvc_runtime": "MD (dynamic CRT)"
+    }
+  },
+  "toolchain": {
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) | binary: rustc | commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860 | commit-date: 2026-04-14 | host: x86_64-unknown-linux-gnu | release: 1.95.0 | LLVM version: 22.1.2",
+    "compiler": "MSVC 14.44.35207 (cl.exe, x64)",
+    "sdk": "Windows SDK 10.0.26100.0",
+    "linker": "MSVC link.exe 14.44.35207"
+  },
+  "runtime": {
+    "backend": "v8",
+    "rusty_v8_version": "145.0.0",
+    "rusty_v8_revision": "0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
+    "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921",
+    "normalized_gn_args": [
+      "use_allocator_shim=false",
+      "use_partition_alloc_as_malloc=false",
+      "v8_enable_i18n_support=true",
+      "v8_enable_pointer_compression=true",
+      "v8_enable_sandbox=false",
+      "v8_enable_webassembly=true"
+    ],
+    "patches": []
+  },
+  "hashes": {
+    "archive": "eb5aa4a296f530fd4af147dfbe4bdda8579d58ab1e159a479b6116c83b38f15d",
+    "rust_binding": "1b645c73eaa10989ade387fad9e47bcdecc910b1ce19867ff132991683c3c765"
+  },
+  "provenance": {
+    "source_revision": "0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
+    "build_recipe": "scripts/build-v8-windows.sh",
+    "build_recipe_sha256": "31558a0656a5794b9498c476fa6eb4b7c6a8a9df22191fc121d09a957ba62df1",
+    "licenses": [
+      "BSD-3-Clause",
+      "MIT"
+    ]
+  }
+}
