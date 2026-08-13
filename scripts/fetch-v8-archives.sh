@@ -54,6 +54,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/python-cmd.sh
+source "$SCRIPT_DIR/lib/python-cmd.sh"
 V8_DIR="$ROOT/engine/third_party/rusty_v8"
 TAG="${MIGO_V8_ARCHIVE_TAG:-v8-archives-e6a88b3}"
 # Overridable so the archives can be served from somewhere else (a mirror, or a
@@ -109,7 +111,7 @@ for t in "${requested[@]}"; do
 done
 
 expected_sha() {
-    python3 -c "
+    "$(python_cmd)" -c "
 import json, sys
 with open(sys.argv[1]) as f:
     print(json.load(f).get('hashes', {}).get('archive', ''))

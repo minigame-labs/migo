@@ -15,6 +15,10 @@
 # This file is sourced, not executed: no `set -euo pipefail` here (each caller
 # sets its own), and no side effects that run merely because a script sourced it.
 
+MIGO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/python-cmd.sh
+source "$MIGO_LIB_DIR/python-cmd.sh"
+
 info() { echo -e "\033[0;36m[win-sdk] $*\033[0m"; }
 
 # Generates the .def export allowlist from include/migo/*.h and writes it to
@@ -175,6 +179,6 @@ windows_sdk_write_manifest() {
 }
 MANIFEST
 
-    python3 -m json.tool "$prefix/share/migo/windows-x86_64-manifest.json" >/dev/null \
+    "$(python_cmd)" -m json.tool "$prefix/share/migo/windows-x86_64-manifest.json" >/dev/null \
         || { echo "[win-sdk] the generated manifest is not valid JSON" >&2; return 1; }
 }
