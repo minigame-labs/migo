@@ -146,7 +146,13 @@ else
     # there is no boundary to cross, and going through cmd.exe would be
     # unnecessary indirection. `PATH=".:$PATH"` makes the just-built
     # loadprobe.exe runnable as a bare name from $WORK: unlike cmd.exe, bash
-    # does not search the current directory by default.
+    # does not search the current directory by default. MSYS_NO_PATHCONV is
+    # scoped to just this invocation, not exported for the script: every
+    # dumpbin/cl flag here is single-slash (/EXPORTS, /nologo, /W4, ...),
+    # which MSYS's default path-conversion heuristic can mistake for a POSIX
+    # path and mangle -- but path *arguments* passed in (to_dos "$DLL", etc.)
+    # are already pre-converted DOS strings, so nothing here depends on that
+    # heuristic running either way.
     run_msvc() {
         local name="$1"; shift
         [[ "${1:-}" == "--" ]] && shift
@@ -168,7 +174,7 @@ else
         else
             # 2>/dev/null to match the WSL branch above, which discards
             # whatever the wrapped cmd.exe session sent to its own stderr.
-            ( cd "$WORK" && PATH=".:$PATH" "$@" 2>/dev/null )
+            ( cd "$WORK" && PATH=".:$PATH" MSYS_NO_PATHCONV=1 "$@" 2>/dev/null )
         fi
     }
 

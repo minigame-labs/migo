@@ -37,11 +37,15 @@ source "$SCRIPT_DIR/lib/release-version.sh"
 # path and rewrites it before exec -- which is exactly the shape of every
 # link.exe flag this script passes (/DLL, /DEF:..., /OUT:..., /OPT:REF). Unset,
 # `/OPT:REF` has been observed to arrive at link.exe as a mangled filesystem
-# path instead of a flag. This disables that rewriting for every process this
-# script spawns; every path link.exe or cargo needs is instead converted
-# explicitly, below, via `cygpath -w`, so nothing here depends on the automatic
-# behavior this turns off.
-export MSYS_NO_PATHCONV=1
+# path instead of a flag. This is disabled only for the single link.exe
+# invocation below (prefixed there, not exported here): every path link.exe
+# needs is converted explicitly via `to_dos`/cygpath regardless, so nothing
+# there depends on MSYS's automatic behavior either way. Exporting this
+# globally was tried first and reverted -- MSYS's automatic conversion is what
+# lets `python` elsewhere in this script open a manifest at a POSIX path
+# correctly; disabling it globally instead handed a native, non-MSYS
+# python.exe a literal `/c/...` path it has no notion of, and `json.tool`
+# failed to open it.
 
 TRIPLE="x86_64-pc-windows-msvc"
 PREFIX="$REPO_ROOT/dist/migo-windows-x86_64"
@@ -169,7 +173,9 @@ export LIB="$EXTRA_LIB_DOS;${LIB:-}"
 info "linking migo.dll"
 # shellcheck disable=SC2086  # NATIVE_LIBS is a cargo-reported, space-separated
 # token list and must word-split into separate link.exe arguments.
-link /NOLOGO /DLL "/DEF:$DEF_DOS" \
+# MSYS_NO_PATHCONV scoped to this one command: see the note near this
+# script's top on why it must not be exported for the whole script.
+MSYS_NO_PATHCONV=1 link /NOLOGO /DLL "/DEF:$DEF_DOS" \
     "/OUT:$OUT_DOS\\migo.dll" \
     "/IMPLIB:$OUT_DOS\\migo.lib" \
     /OPT:REF /OPT:ICF \

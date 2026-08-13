@@ -908,6 +908,23 @@ jobs:
         shell: bash
         run: command -v ninja >/dev/null 2>&1 || choco install ninja -y --no-progress
 
+      # engine/.cargo/config.toml pins CC_x86_64_pc_windows_msvc/CXX_... to
+      # clang-cl, resolved through PATH -- skia-bindings probes fixed paths for
+      # clang-cl.exe and refuses to build without it, so this is a hard
+      # prerequisite for every crate cc-rs compiles here (skia-bindings itself,
+      # and smaller C dependencies like minimp3-sys), not merely a Skia
+      # concern. windows-latest images bundle a Clang/LLVM bundled with Visual
+      # Studio, but its exact version has been observed to vary between image
+      # updates (actions/runner-images#10001, #12435) and whether vcvars alone
+      # puts it on PATH is not something this job wants to depend on silently
+      # -- so this pins a known-good copy the same defensive way as ninja
+      # above, and appends its directory to PATH for every later step.
+      - name: Install LLVM/clang-cl
+        shell: bash
+        run: |
+          command -v clang-cl >/dev/null 2>&1 || choco install llvm -y --no-progress
+          echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+
       - name: Fetch and verify the windows-msvc V8 archive
         shell: bash
         run: bash scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc
