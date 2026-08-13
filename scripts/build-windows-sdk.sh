@@ -123,7 +123,15 @@ DEF_DOS="$(wslpath -w "$DEF_UNIX")"
 # materialises all four V8 inputs (including the unhashed DLL/import-lib pair
 # -- see v8_materialise_windows's own comment) under a content-addressed path,
 # rather than linking whatever sits at $V8_DIR_UNIX unverified.
-v8_materialise_windows "$V8_DIR_UNIX" "$REPO_ROOT/engine/target/v8-materialised" \
+#
+# Materialised under $WIN_TMP_UNIX (a WSL-visible path into the Windows-local
+# scratch dir every other build output here already uses), not under
+# $REPO_ROOT/engine/target the way build-linux-sdk.sh does: link.exe refuses a
+# \\wsl.localhost\... UNC path outright (LNK1104, "cannot open file"), so the
+# materialised archive has to live on the C: drive link.exe actually reads
+# from -- the same reason DEF_UNIX and OUT_UNIX below are WIN_TMP_UNIX paths,
+# not plain repo-relative ones.
+v8_materialise_windows "$V8_DIR_UNIX" "$WIN_TMP_UNIX/v8-materialised" \
     || { echo "[win-sdk] failed to materialise the Windows V8 archive" >&2; exit 1; }
 V8_MATERIALISED_DIR_UNIX="$(dirname "$V8_MATERIALISED_ARCHIVE")"
 V8_MATERIALISED_ARCHIVE_DOS="$(wslpath -w "$V8_MATERIALISED_ARCHIVE")"
