@@ -24,12 +24,15 @@
 # would buy nothing, because the hash is re-checked on every call, which detects an
 # in-place edit that a permission bit would only discourage.
 
+# shellcheck source=scripts/lib/python-cmd.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/python-cmd.sh"
+
 _v8_mat_err() { printf '  ✗ %s\n' "$*" >&2; }
 
 # Prints the recorded hash for a key out of a component manifest, or fails.
 _v8_mat_recorded() {
     local manifest="$1" key="$2"
-    python3 - "$manifest" "$key" <<'PY'
+    "$(python_cmd)" - "$manifest" "$key" <<'PY'
 import json, sys
 
 manifest = json.load(open(sys.argv[1]))
