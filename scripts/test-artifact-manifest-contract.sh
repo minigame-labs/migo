@@ -515,17 +515,13 @@ EXEMPT = {
     "dev-run-player.sh": "runs the local player; may use a development archive",
     "dev-test-host.sh": "runs host suites against the local linux-gnu archive",
     "test-capi-platform-contract.sh": "a contract check, not a producer",
-    "build-windows-sdk.sh": (
-        "Windows has no committed component manifest -- build-v8-windows.sh deliberately "
-        "emits none until there is a lock to verify one against -- so there is nothing to "
-        "materialise against yet, which is the same reason fetch-v8-archives.sh omits the "
-        "MSVC triple. Remove this exemption when that manifest exists."
-    ),
     "build-snapshot.ps1": (
-        "runs migo-snapshot-gen on a Windows *host* and so uses the Windows V8 archive, "
-        "which has no committed manifest either; it also clears the variable first so an "
-        "Android archive cannot leak into a host build. Same removal condition as "
-        "build-windows-sdk.sh."
+        "runs migo-snapshot-gen on a Windows *host* solely to produce .bin snapshot files, "
+        "not to link or ship a component that embeds the archive -- unlike "
+        "build-windows-sdk.sh/build-windows-sdk-native.sh it has no packaging counterpart "
+        "to hold it to the materialised-path bar, and there is no PowerShell port of "
+        "v8_materialise_windows (scripts/lib/v8-materialise.sh) yet. It also clears the "
+        "variable first so an Android archive cannot leak into a host build."
     ),
 }
 
@@ -543,7 +539,7 @@ SETTERS = [
     re.compile(r'(?m)^\s*\$env:RUSTY_V8_ARCHIVE\s*=\s*(\S+)'),          # PowerShell
     re.compile(r'(?m)^\s*set\s+RUSTY_V8_ARCHIVE=(\S+)'),               # batch heredoc
 ]
-MATERIALISED = {"$V8_MATERIALISED_ARCHIVE", "$v8.Archive"}
+MATERIALISED = ("$V8_MATERIALISED_ARCHIVE", "$v8.Archive")
 
 consumers = {}
 for path in sorted(list(scripts.glob("*.sh")) + list(scripts.glob("*.ps1"))):
@@ -563,10 +559,24 @@ stale = sorted(name for name in EXEMPT if name not in consumers)
 if stale:
     sys.exit(f"exemptions that no longer consume a V8 archive: {stale}")
 
+def _unbrace(value: str) -> str:
+    # `${VAR}` and `$VAR` name the same thing; the batch-heredoc setters in this
+    # repo consistently brace their interpolations (see build-windows-sdk.sh),
+    # so the prefix check below must not care which form a script used.
+    if value.startswith("${") and value.endswith("}"):
+        return "$" + value[2:-1]
+    return value
+
 offenders = []
 for name in sorted(set(consumers) - set(EXEMPT)):
     values, text = consumers[name]
-    if any(value not in MATERIALISED for value in values):
+    # A prefix match, not equality: Windows consumers cannot assign the bare
+    # materialised value -- it is a POSIX path, and RUSTY_V8_ARCHIVE there is read
+    # by a native MSVC toolchain that has no notion of one, so it must be a
+    # derivative (`$V8_MATERIALISED_ARCHIVE_DOS`, a DOS-path conversion computed on
+    # its own line and assigned with no other text, so this prefix match cannot
+    # also accept an unrelated variable that merely happens to start the same way).
+    if any(not _unbrace(value).startswith(MATERIALISED) for value in values):
         offenders.append(f"{name} -> {values}")
     elif "v8_materialise" not in text and "Resolve-MigoMaterialisedV8" not in text:
         offenders.append(f"{name} uses the materialised path but never materialises")

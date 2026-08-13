@@ -710,13 +710,12 @@ jobs:
       # internal), leaving a single pattern that must match.
 
   # ── Linux SDK ───────────────────────────────────────────────────────────
-  # Every dependency is fetchable and hash-pinned, which is what makes this the first
+  # Every dependency is fetchable and hash-pinned, which is what made this the first
   # platform to move off the release machine: the Chromium sysroot comes from
   # fetch-linux-sysroot.sh and the V8 archive from the v8-archives release asset, both
-  # verified against committed sha256s. Windows and OpenHarmony cannot follow yet --
-  # their librusty_v8 archives are not published (probed: 404 on the tag) -- so they
-  # stay hand-built for now and are covered by their own attestation sidecars instead
-  # of by SHA256SUMS.txt.
+  # verified against committed sha256s. Windows and OpenHarmony have since followed
+  # (release-windows, release-ohos below) once their own librusty_v8 archives were
+  # published to the same tag.
   release-linux:
     needs: [quality-gate, host-engine-tests]
     runs-on: ubuntu-24.04
@@ -860,6 +859,102 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # ── Windows SDK ──────────────────────────────────────────────────────────
+  # The last platform this workflow builds by hand instead of building. Not
+  # because the build itself needed CI-only capability -- build-windows-sdk.sh
+  # has produced a correct, contract-verified package all along -- but because
+  # that script crosses a WSL/Windows boundary (wslpath, a synced
+  # /mnt/c/migo-win worktree, cmd.exe-dispatched batch files) that only exists
+  # on this project's own dual-boot dev machine. A windows-latest runner has no
+  # WSL: the checkout already sits on native NTFS, so there is no boundary for
+  # that machinery to cross. scripts/build-windows-sdk-native.sh is the other
+  # side of that split -- see scripts/lib/windows-sdk-package.sh for the
+  # packaging/manifest logic the two share, and scripts/build-windows-sdk.sh's
+  # own header comment for why WSL still gets its own entry point rather than
+  # a branch inside this one.
+  release-windows:
+    needs: [quality-gate, host-engine-tests]
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # skia-safe's binary-cache feature downloads a prebuilt skia-bindings for
+      # host targets and normally succeeds, but 404's when a given commit's
+      # prebuilt is unavailable (reproduced locally while developing this job)
+      # and falls back to compiling Skia from source via ninja. Mirrors the
+      # precedent already in this workflow: linux-qt-host-kit/host-engine-tests
+      # install ninja-build for the identical reason. Failing 40 minutes into a
+      # build with "ninja: command not found" is worse than a 10-second
+      # defensive install.
+      - name: Install ninja (Skia from-source fallback)
+        shell: bash
+        run: command -v ninja >/dev/null 2>&1 || choco install ninja -y --no-progress
+
+      # engine/.cargo/config.toml pins CC_x86_64_pc_windows_msvc/CXX_... to
+      # clang-cl, resolved through PATH -- skia-bindings probes fixed paths for
+      # clang-cl.exe and refuses to build without it, so this is a hard
+      # prerequisite for every crate cc-rs compiles here (skia-bindings itself,
+      # and smaller C dependencies like minimp3-sys), not merely a Skia
+      # concern. windows-latest images bundle a Clang/LLVM bundled with Visual
+      # Studio, but its exact version has been observed to vary between image
+      # updates (actions/runner-images#10001, #12435) and whether vcvars alone
+      # puts it on PATH is not something this job wants to depend on silently
+      # -- so this pins a known-good copy the same defensive way as ninja
+      # above, and appends its directory to PATH for every later step.
+      - name: Install LLVM/clang-cl
+        shell: bash
+        run: |
+          command -v clang-cl >/dev/null 2>&1 || choco install llvm -y --no-progress
+          echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+
+      - name: Fetch and verify the windows-msvc V8 archive
+        shell: bash
+        run: bash scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc
+
+      - name: Fetch and verify the pinned ANGLE runtime
+        shell: bash
+        run: bash scripts/fetch-windows-angle.sh
+
+      - name: Build the Windows SDK
+        shell: bash
+        run: bash scripts/build-windows-sdk-native.sh
+
+      - name: Windows SDK package contract
+        shell: bash
+        run: bash scripts/test-windows-sdk-contract.sh --strict
+
+      - name: Package the Windows SDK for release
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          bash scripts/package-sdk.sh dist/migo-windows-x86_64 --output-dir dist/release
+
+      - name: Upload the staged Windows assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 1
+
   # ── The only publisher ──────────────────────────────────────────────────
   # Publishing lived inside release-android, so no point in the graph saw every
   # platform's output. That is what made a whole-release checksum manifest impossible
@@ -870,7 +965,7 @@ jobs:
   #
   # Adding a platform is now additive: one job, one entry in `needs`.
   publish:
-    needs: [release-android, release-linux, release-ohos]
+    needs: [release-android, release-linux, release-ohos, release-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -966,9 +1061,11 @@ jobs:
   # unverifiable asset can appear is for someone to add one *after* the workflow ran --
   # which nothing inside the workflow can see.
   #
-  # So this reads the published release rather than the directory it came from. It is
-  # also what a human runs by hand after uploading the Windows and OpenHarmony packages,
-  # which is the same question at the same scope:
+  # So this reads the published release rather than the directory it came from. Every
+  # platform this workflow currently ships (android/linux/ohos/windows) is built and
+  # uploaded by this workflow, so nothing here depends on a by-hand step anymore --
+  # but the same command is still what to run after hand-uploading a platform this
+  # workflow does not build yet (Phase 2/3 arm64 targets), at the same scope:
   #
   #   bash scripts/verify-release-assets.sh <tag>
   #

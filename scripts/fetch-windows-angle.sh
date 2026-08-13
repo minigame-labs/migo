@@ -17,6 +17,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/python-cmd.sh
+source "$SCRIPT_DIR/lib/python-cmd.sh"
 LOCK="$ROOT/contracts/artifact-manifest/windows-angle.lock.json"
 
 info() { printf '\033[0;36m[win-angle] %s\033[0m\n' "$*"; }
@@ -36,11 +38,11 @@ for arg in "$@"; do
 done
 DEST="${DEST:-$ROOT/engine/third_party/angle-windows}"
 
-BASE_URL="$(python3 -c "import json; print(json.load(open('$LOCK'))['release'])")"
+BASE_URL="$("$(python_cmd)" -c "import json; print(json.load(open('$LOCK'))['release'])")"
 FILES=(libEGL.dll libGLESv2.dll d3dcompiler_47.dll)
 
 expected_sha() {
-    python3 -c "
+    "$(python_cmd)" -c "
 import json, sys
 with open('$LOCK') as f:
     print(json.load(f)['files'][sys.argv[1]]['sha256'])

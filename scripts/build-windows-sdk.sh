@@ -38,25 +38,32 @@
 #
 # Usage: scripts/build-windows-sdk.sh [--prefix WSL_DIR]
 #
-# Required env (same identities the spike uses):
-#   MIGO_WIN_V8_DIR   DOS path to the Windows V8 artifacts (rusty_v8.dll,
-#                     rusty_v8.lib, src_binding.rs). Defaults to the WSL-side
-#                     engine/third_party/rusty_v8/x86_64-pc-windows-msvc, which
-#                     is where build-v8-windows.sh puts them.
+# V8 inputs (rusty_v8.lib, rusty_v8.dll, rusty_v8.dll.lib, src_binding.rs) are
+# read from the WSL-side engine/third_party/rusty_v8/x86_64-pc-windows-msvc --
+# NOT the synced worktree copy, which is git-ignored (.gitignore) and so can
+# never carry them (sync-worktree.sh only clones committed refs; pointing
+# there once produced an empty path and a V8 build script panic
+# ("系统找不到指定的路径") several layers away from the cause) -- verified
+# against component-manifest.json and materialised by v8_materialise_windows
+# before the DOS path handed to the link is ever computed. There is
+# deliberately no override to point this at an arbitrary unverified location:
+# scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc is how you change what
+# gets linked.
 #
-#                     NOT the synced worktree copy: that whole directory is
-#                     git-ignored (.gitignore), so sync-worktree.sh -- which
-#                     clones -- can never carry it across. Pointing there
-#                     produced an empty path and a V8 build script panic
-#                     ("系统找不到指定的路径") several layers away from the cause.
-#   MIGO_WIN_ANGLE_DIR DOS path to the ANGLE runtime DLLs (libEGL.dll,
-#                     libGLESv2.dll, d3dcompiler_47.dll). Defaults to the spike tmp.
+# Required env (same identities the spike uses):
+#   MIGO_WIN_ANGLE_DIR_UNIX  WSL path to the ANGLE runtime DLLs (libEGL.dll,
+#                     libGLESv2.dll, d3dcompiler_47.dll). Defaults to
+#                     engine/third_party/angle-windows.
 #   MIGO_WIN_PROXY    optional http proxy for the V8 crate's build script.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$REPO_ROOT/platforms/windows/spike/lib.sh"
+# shellcheck source=scripts/lib/windows-sdk-package.sh
+source "$SCRIPT_DIR/lib/windows-sdk-package.sh"
+# shellcheck source=scripts/lib/v8-materialise.sh
+source "$SCRIPT_DIR/lib/v8-materialise.sh"
 
 PREFIX="$REPO_ROOT/dist/migo-windows-x86_64"
 while [[ $# -gt 0 ]]; do
@@ -65,14 +72,12 @@ while [[ $# -gt 0 ]]; do
         *) echo "[win-sdk] unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-info() { echo -e "\033[0;36m[win-sdk] $*\033[0m"; }
 
 TRIPLE="$WIN_TARGET_TRIPLE"                      # x86_64-pc-windows-msvc
 # WSL path is only for reading bytes to stage/check; the Windows link must use
 # the synced worktree copy on a local disk -- a wslpath UNC path is unusable for
 # the toolchain, which is the whole reason the worktree lives on C:.
 V8_DIR_UNIX="$REPO_ROOT/engine/third_party/rusty_v8/x86_64-pc-windows-msvc"
-V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$(wslpath -w "$V8_DIR_UNIX")}"
 # Default to the pinned, hash-verified location fetch-windows-angle.sh
 # populates (contracts/artifact-manifest/windows-angle.lock.json), not an
 # unpinned local directory: ANGLE ships no official binaries, so this is the
@@ -80,7 +85,7 @@ V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$(wslpath -w "$V8_DIR_UNIX")}"
 ANGLE_DIR_UNIX="${MIGO_WIN_ANGLE_DIR_UNIX:-$REPO_ROOT/engine/third_party/angle-windows}"
 
 # ---- Preconditions -------------------------------------------------------
-for f in rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
+for f in rusty_v8.lib rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
     [[ -f "$V8_DIR_UNIX/$f" ]] || { echo "[win-sdk] missing Windows V8 artifact: $V8_DIR_UNIX/$f" >&2; exit 1; }
 done
 for f in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
@@ -105,14 +110,7 @@ VERSION="$(read_release_version "$REPO_ROOT")"
 # Same source of truth the Linux migo.map uses -- the documented migo_* names.
 DEF_UNIX="$WIN_TMP_UNIX/migo.def"
 mkdir -p "$WIN_TMP_UNIX"
-{
-    echo "EXPORTS"
-    grep -ohE '\bmigo_[a-z0-9_]+[[:space:]]*\(' "$REPO_ROOT"/include/migo/*.h \
-        | tr -d '( \t' | sort -u | sed 's/^/    /'
-} > "$DEF_UNIX"
-DEF_COUNT=$(( $(wc -l < "$DEF_UNIX") - 1 ))
-info "generated export allowlist: $DEF_COUNT migo_* symbols"
-[[ "$DEF_COUNT" -ge 20 ]] || { echo "[win-sdk] suspiciously few exports ($DEF_COUNT); headers not found?" >&2; exit 1; }
+windows_sdk_generate_def "$REPO_ROOT/include/migo" "$DEF_UNIX"
 DEF_DOS="$(wslpath -w "$DEF_UNIX")"
 
 # ---- Build the staticlib, capture native libs, and link the DLL on Windows ----
@@ -120,7 +118,24 @@ DEF_DOS="$(wslpath -w "$DEF_UNIX")"
 # objects in this link. See the note at the top of this file: linking the static
 # archive puts V8's own libc++ into the same link as Skia's MSVC STL, and they
 # define std::terminate incompatibly.
-V8_ARCHIVE_DOS="$V8_DIR_DOS\\rusty_v8.dll.lib"
+#
+# Verifies rusty_v8.lib + src_binding.rs against component-manifest.json and
+# materialises all four V8 inputs (including the unhashed DLL/import-lib pair
+# -- see v8_materialise_windows's own comment) under a content-addressed path,
+# rather than linking whatever sits at $V8_DIR_UNIX unverified.
+#
+# Materialised under $WIN_TMP_UNIX (a WSL-visible path into the Windows-local
+# scratch dir every other build output here already uses), not under
+# $REPO_ROOT/engine/target the way build-linux-sdk.sh does: link.exe refuses a
+# \\wsl.localhost\... UNC path outright (LNK1104, "cannot open file"), so the
+# materialised archive has to live on the C: drive link.exe actually reads
+# from -- the same reason DEF_UNIX and OUT_UNIX below are WIN_TMP_UNIX paths,
+# not plain repo-relative ones.
+v8_materialise_windows "$V8_DIR_UNIX" "$WIN_TMP_UNIX/v8-materialised" \
+    || { echo "[win-sdk] failed to materialise the Windows V8 archive" >&2; exit 1; }
+V8_MATERIALISED_DIR_UNIX="$(dirname "$V8_MATERIALISED_ARCHIVE")"
+V8_MATERIALISED_ARCHIVE_DOS="$(wslpath -w "$V8_MATERIALISED_ARCHIVE")"
+V8_MATERIALISED_BINDING_DOS="$(wslpath -w "$V8_MATERIALISED_BINDING")"
 OUT_DOS="$WIN_TMP_UNIX/sdk-out"
 OUT_UNIX="$WIN_TMP_UNIX/sdk-out"
 mkdir -p "$OUT_UNIX"
@@ -182,8 +197,8 @@ set "PATH=${MIGO_WIN_LLVM_DIR_DOS}\\bin;%VCToolsInstallDir%bin\\Hostx64\\x64;%US
 set CARGO_HOME=${WIN_CARGO_HOME_DOS}
 set CARGO_TARGET_DIR=${WIN_TARGET_DOS}
 set INCLUDE=${WIN_HEADERS_DOS};%INCLUDE%
-set RUSTY_V8_ARCHIVE=${V8_ARCHIVE_DOS}
-set RUSTY_V8_SRC_BINDING_PATH=${V8_DIR_DOS}\\src_binding.rs
+set RUSTY_V8_ARCHIVE=${V8_MATERIALISED_ARCHIVE_DOS}
+set RUSTY_V8_SRC_BINDING_PATH=${V8_MATERIALISED_BINDING_DOS}
 ${PROXY_LINES}
 PRE
 }
@@ -258,7 +273,7 @@ link /NOLOGO /DLL /DEF:"${DEF_DOS}" ^
   /IMPLIB:"${OUT_DOS}\\migo.lib" ^
   /OPT:REF /OPT:ICF ^
   "%STATICLIB%" ^
-  "${V8_ARCHIVE_DOS}" ^
+  "${V8_MATERIALISED_ARCHIVE_DOS}" ^
   %NATIVE_LIBS%
 set STEP=%errorlevel%
 echo === LINK_EXIT=%STEP% ===
@@ -275,164 +290,26 @@ LINK_RC="${PIPESTATUS[0]}"
 [[ -f "$OUT_UNIX/migo.lib" ]] || { echo "[win-sdk] link produced no import lib migo.lib" >&2; exit 1; }
 info "linked: migo.dll ($(stat -c %s "$OUT_UNIX/migo.dll") bytes) + import lib migo.lib"
 
-# ---- Stage the package (WSL side) ----------------------------------------
-info "staging package at $PREFIX"
-rm -rf "$PREFIX"
-mkdir -p "$PREFIX/include" "$PREFIX/lib" "$PREFIX/bin" "$PREFIX/lib/cmake/migo" "$PREFIX/share/migo"
-cp -r "$REPO_ROOT/include/migo" "$PREFIX/include/"
-cp "$OUT_UNIX/migo.lib" "$PREFIX/lib/migo.lib"
-cp "$OUT_UNIX/migo.dll" "$PREFIX/bin/migo.dll"
-# Runtime DLLs the process loads by name: V8 and ANGLE ship alongside migo.dll.
-#
-# libEGL and libGLESv2 are required, not best-effort. The previous form was
-# `[[ -f ... ]] && cp` for all three, which silently shipped a package with no EGL
-# at all when the ANGLE directory was incomplete -- and a missing EGL is not
-# discoverable until a consumer's process fails to create a surface on a machine
-# we cannot see. d3dcompiler_47.dll genuinely is optional: whether ANGLE needs it
-# depends on how that ANGLE was built, so it is recorded in the package manifest
-# when shipped rather than assumed either way.
-cp "$V8_DIR_UNIX/rusty_v8.dll" "$PREFIX/bin/rusty_v8.dll"
-for d in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
-    [[ -f "$ANGLE_DIR_UNIX/$d" ]] || {
-        echo "[windows-sdk] required ANGLE runtime missing: $ANGLE_DIR_UNIX/$d" >&2
-        echo "[windows-sdk] test-windows-sdk-contract.sh already requires all three, and this" >&2
-        echo "[windows-sdk] script runs it with --strict below -- so copying leniently only" >&2
-        echo "[windows-sdk] moved the failure later while leaving a package with no EGL on" >&2
-        echo "[windows-sdk] disk in between. Point MIGO_WIN_ANGLE_DIR_UNIX at a complete" >&2
-        echo "[windows-sdk] ANGLE build." >&2
-        exit 1
-    }
-    cp "$ANGLE_DIR_UNIX/$d" "$PREFIX/bin/$d"
-done
-
-# ---- CMake package -------------------------------------------------------
-# A SHARED IMPORTED target: the consumer links the import lib (migo.lib) and the
-# DLL ships in bin/. The target carries three requirements so a consumer needs
-# only target_link_libraries(app migo::migo):
-#   * MIGO_USE_SHARED  -> the header's MIGO_API becomes __declspec(dllimport),
-#     which is the correct decoration for consuming a DLL.
-#   * c_std_11         -> the headers assert layout with C11 _Static_assert, and
-#     MSVC's default C dialect (C89) does not know it; the target opts the
-#     consumer into C11 rather than making every consumer remember /std:c11.
-#   * the include dir and both the .lib (IMPLIB) and .dll (LOCATION) locations.
-# The constraint that put a literal here is real and is kept: 0.1.0 was published
-# before the C ABI had a Windows platform layer -- the DLL loaded, exported
-# everything, and reported it could attach no surface kind -- and a released
-# version names a fixed set of bytes, so those bytes must never ship under a
-# version a consumer may already hold. A single forward-moving source satisfies
-# that better than a detached literal did: this stopped tracking the rest of the
-# repository entirely, so the Windows SDK announced a version no other platform
-# had heard of.
-MIGO_SDK_VERSION="$VERSION"
-cat > "$PREFIX/lib/cmake/migo/migo-config.cmake" <<'CMAKE'
-# Generated by scripts/build-windows-sdk.sh -- do not edit.
-#
-# Consume with the MSVC toolchain:
-#   cmake -S <your_app> -B <build> -DCMAKE_PREFIX_PATH=<this package prefix>
-#   find_package(migo REQUIRED)
-#   target_link_libraries(app PRIVATE migo::migo)
-# The DLLs in <prefix>/bin (migo.dll, rusty_v8.dll, ANGLE) must be on PATH at
-# runtime, or copied next to the executable.
-cmake_minimum_required(VERSION 3.16)
-
-get_filename_component(MIGO_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
-
-set(MIGO_VERSION "@MIGO_SDK_VERSION@")
-set(MIGO_INCLUDE_DIRS "${MIGO_PREFIX}/include")
-set(MIGO_IMPLIB "${MIGO_PREFIX}/lib/migo.lib")
-set(MIGO_DLL "${MIGO_PREFIX}/bin/migo.dll")
-
-add_library(migo::migo SHARED IMPORTED)
-set_target_properties(migo::migo PROPERTIES
-    IMPORTED_IMPLIB "${MIGO_IMPLIB}"
-    IMPORTED_LOCATION "${MIGO_DLL}"
-    INTERFACE_INCLUDE_DIRECTORIES "${MIGO_INCLUDE_DIRS}"
-    INTERFACE_COMPILE_DEFINITIONS "MIGO_USE_SHARED"
-    INTERFACE_COMPILE_FEATURES "c_std_11")
-
-set(migo_FOUND TRUE)
-CMAKE
-sed -i "s|@MIGO_SDK_VERSION@|$MIGO_SDK_VERSION|" "$PREFIX/lib/cmake/migo/migo-config.cmake"
-
-cat > "$PREFIX/lib/cmake/migo/migo-config-version.cmake" <<CMAKE
-# Generated by scripts/build-windows-sdk.sh -- do not edit.
-set(PACKAGE_VERSION "$MIGO_SDK_VERSION")
-if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)
-    set(PACKAGE_VERSION_COMPATIBLE FALSE)
-else()
-    set(PACKAGE_VERSION_COMPATIBLE TRUE)
-    if(PACKAGE_VERSION VERSION_EQUAL PACKAGE_FIND_VERSION)
-        set(PACKAGE_VERSION_EXACT TRUE)
-    endif()
-endif()
-CMAKE
-
-# ---- package manifest ----------------------------------------------------
-# The one thing every other platform's package had and this one did not, which is
-# why package-sdk.sh refuses a Windows prefix outright (see its error text) and why
-# the published migo-windows-x86_64.tar.gz was a `tar` typed by hand rather than the
-# reproducible path. The attestation names a single index file; this is it.
-#
-# The runtime_dependencies list is the part with teeth. A Windows consumer must
-# redistribute these DLLs, and the process loads them by name -- so the package has
-# to say which ones it shipped, and the contract has to check that bin/ contains
-# exactly that set. Declaring it is what turns "the ANGLE directory was incomplete"
-# from a silent shipping defect into a failure here.
+# ---- Stage the package, CMake package, and manifest (WSL side) -----------
+# Shared with scripts/build-windows-sdk-native.sh: see scripts/lib/windows-sdk-
+# package.sh for what lives there and why -- the export .def, the staged files,
+# the CMake find_package(migo) tree, and windows-x86_64-manifest.json are all
+# identical regardless of which script produced the linked migo.dll.
+windows_sdk_stage_package "$PREFIX" "$REPO_ROOT/include/migo" \
+    "$OUT_UNIX/migo.lib" "$OUT_UNIX/migo.dll" "$V8_MATERIALISED_DIR_UNIX/rusty_v8.dll" "$ANGLE_DIR_UNIX"
+windows_sdk_write_cmake_package "$PREFIX" "$VERSION"
 info "writing the package manifest"
-sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+windows_sdk_write_manifest "$PREFIX" "$VERSION"
 
-# The same four names test-windows-sdk-contract.sh requires, kept in one order so
-# the manifest and the gate cannot disagree about what a consumer must ship.
-ALL_RUNTIME=(migo.dll rusty_v8.dll libEGL.dll libGLESv2.dll d3dcompiler_47.dll)
-
-RUNTIME_JSON="$(
-    first=1
-    printf '['
-    for d in "${ALL_RUNTIME[@]}"; do
-        (( first )) || printf ','
-        first=0
-        printf '\n      {"file": "bin/%s", "sha256": "%s"}' "$d" "$(sha_of "$PREFIX/bin/$d")"
-    done
-    printf '\n    ]'
-)"
-
-cat > "$PREFIX/share/migo/windows-x86_64-manifest.json" <<MANIFEST
-{
-  "schema": "migo-windows-package-manifest/v1",
-  "version": "$VERSION",
-  "product_profile": "full",
-  "build_type": "release",
-  "target": "x86_64-pc-windows-msvc",
-  "os": "windows",
-  "abi": "msvc",
-  "arch": "x86_64",
-  "snapshot_policy": "none",
-  "abi_note": "migo.dll is linked from the capi staticlib with an explicit .def export allowlist, so the export table is exactly the documented migo_* surface. V8 links against its own libc++ and therefore ships as a separate rusty_v8.dll rather than being absorbed into migo.dll.",
-  "runtime_dependencies": $RUNTIME_JSON,
-  "artifacts": {
-    "lib/migo.lib": "$(sha_of "$PREFIX/lib/migo.lib")",
-    "bin/migo.dll": "$(sha_of "$PREFIX/bin/migo.dll")"
-  },
-  "known_gaps": [
-    "v8 startup snapshot: not embedded for this platform yet (runtime-v8/build.rs embeds for android and linux, not windows -- no SNAPSHOT-full-windows-x86_64.bin has been generated), so a cold start parses extension JS from source instead of deserialising a V8 heap",
-    "this package is built with scripts/build-windows-sdk.sh by hand on a Windows-capable machine, not by CI: build-windows-sdk.sh uses wslpath/cmd.exe interop a GitHub windows-latest runner (no WSL) cannot run. The prebuilt V8 archive and ANGLE runtime it links ARE published (scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc, scripts/fetch-windows-angle.sh), so a Windows-native CI job is possible; writing one is separate work.",
-    "NuGet packaging is not implemented; the package is a CMake find_package tree"
-  ]
-}
-MANIFEST
-
-python3 -m json.tool "$PREFIX/share/migo/windows-x86_64-manifest.json" >/dev/null \
-    || { echo "[windows-sdk] the generated manifest is not valid JSON" >&2; exit 1; }
-
-info "staged:"
-find "$PREFIX" -type f | sed "s|$PREFIX|  <prefix>|" | sort
-
-# No CI runner builds this package, so this gate is the only thing standing
-# between a broken link and a published SDK. Running it here rather than leaving
-# it to the operator makes producing a package that fails its own contract
-# impossible: windows-sdk-0.1.0 shipped a library that loaded, exported every
-# entry point, and could not attach a window, because the gate was a separate
-# step that answered a narrower question than "is this usable".
+# This local WSL path still has no other gate before this point, so this call is
+# the only thing standing between a broken link and a published SDK on this
+# path. Running it here rather than leaving it to the operator makes producing a
+# package that fails its own contract impossible: windows-sdk-0.1.0 shipped a
+# library that loaded, exported every entry point, and could not attach a
+# window, because the gate was a separate step that answered a narrower
+# question than "is this usable". (scripts/build-windows-sdk-native.sh, used by
+# CI, runs this same contract as its own explicit CI step instead of
+# self-invoking it, for per-step visibility in the Actions log.)
 info "verifying the staged package against the Windows SDK contract"
 MIGO_WINDOWS_PREFIX="$PREFIX" bash "$SCRIPT_DIR/test-windows-sdk-contract.sh" --strict
 

@@ -368,16 +368,28 @@ Qt 6 with xcb support.
 
 Produces `dist/migo-windows-x86_64/` with `bin/migo.dll`,
 `lib/migo.lib` (MSVC import library), runtime DLLs (`rusty_v8.dll`,
-ANGLE), public headers, and a CMake package. Runs from WSL; the
-compile and link execute on a Windows local-disk worktree.
+ANGLE), public headers, and a CMake package. Built by `release.yml`'s
+`release-windows` job on a GitHub `windows-latest` runner via
+`scripts/build-windows-sdk-native.sh` — no by-hand step for a normal
+release. Two entry points produce the identical package, for two
+different environments (see `scripts/lib/windows-sdk-package.sh` for
+what they share):
 
-**Requirements**:
+- **`scripts/build-windows-sdk-native.sh`** — runs directly on Windows:
+  CI, or any Windows box with Git for Windows and Visual Studio Build
+  Tools, no WSL involved. Assumes `link.exe`/`cl.exe` are already on
+  `PATH` (`vcvars64.bat` already ran, or `ilammy/msvc-dev-cmd` already
+  ran as a prior CI step) rather than locating Visual Studio itself.
+- **`scripts/build-windows-sdk.sh`** — this project's WSL2 dev-machine
+  path, where the toolchain lives on a native Windows disk reached by
+  crossing a WSL/Windows boundary (`wslpath`, a synced
+  `/mnt/c/migo-win` worktree, `cmd.exe`-dispatched batch files) that a
+  CI runner's checkout, already on native NTFS, does not have.
 
-- WSL2 with the migo checkout.
-- A Windows-side worktree on a local drive (UNC paths are unusable for
-  `cargo`). Provisioned by `bash platforms/windows/spike/sync-worktree.sh`.
+**Requirements** (native, e.g. CI):
+
 - MSVC toolchain (Visual Studio 2022 or Build Tools) with
-  `VC.Tools.x86.x64`. The script locates it via `vswhere.exe`.
+  `VC.Tools.x86.x64`, already on `PATH`.
 - Windows V8 artifacts (`rusty_v8.lib`, `rusty_v8.dll`, `rusty_v8.dll.lib`,
   `src_binding.rs`) in
   `engine/third_party/rusty_v8/x86_64-pc-windows-msvc/`. Get them with:
@@ -400,34 +412,42 @@ compile and link execute on a Windows local-disk worktree.
   bash scripts/fetch-windows-angle.sh
   ```
 
-**Build** (from WSL):
+**Build** (native):
+
+```bash
+bash scripts/build-windows-sdk-native.sh
+bash scripts/test-windows-sdk-contract.sh --strict
+```
+
+**Build** (WSL, this project's dev machine — additionally needs a
+Windows-side worktree on a local drive, provisioned by
+`bash platforms/windows/spike/sync-worktree.sh`; UNC paths are unusable
+for `cargo`):
 
 ```bash
 bash scripts/build-windows-sdk.sh
 ```
 
-The script compiles the `migo-capi` staticlib on Windows (stage 1),
-discovers the Skia / V8 link-search directories from the build output
-(stage 2), links `migo.dll` with `/OPT:REF` and a `.def` export
-allowlist derived from the headers, stages the package, writes the
-package manifest, and runs the contract gate automatically. The
-contract gate requires MSVC (`dumpbin`, `cl`) to verify the export
-surface and load the DLL.
+Either script compiles the `migo-capi` staticlib (stage 1), discovers
+the Skia / V8 link-search directories from the build output (stage 2),
+links `migo.dll` with `/OPT:REF` and a `.def` export allowlist derived
+from the headers, stages the package, and writes the package manifest.
+`build-windows-sdk.sh` additionally runs the contract gate itself for
+local one-command convenience; the CI job runs it as its own explicit
+step (above) so a failure shows up as its own named check. Either way
+the gate requires MSVC (`dumpbin`, `cl`) to verify the export surface
+and load the DLL.
+
+**Publishing a package this workflow does not build yet** (a future
+arm64 target — see the Windows/Linux arm64 phases in
+`docs/superpowers/specs/`): build and package by hand the same way,
+then upload manually and verify:
 
 ```bash
-bash scripts/test-windows-sdk-contract.sh
-```
-
-**Release path (no Windows CI job exists yet)**: `build-windows-sdk.sh`
-uses `wslpath`/`cmd.exe` interop, so it cannot run on a GitHub
-`windows-latest` runner (no WSL). Until a Windows-native CI job exists,
-build and publish this package by hand on a Windows-capable machine:
-
-```bash
-bash scripts/build-windows-sdk.sh
+bash scripts/build-windows-sdk-native.sh   # or build-windows-sdk.sh from WSL
 mkdir -p dist/release
 bash scripts/package-sdk.sh dist/migo-windows-x86_64 --output-dir dist/release
-# upload dist/release/migo-<version>-capi-windows-x86_64.tar.gz(.attestation.json)
+# upload dist/release/migo-<version>-capi-windows-<arch>.tar.gz(.attestation.json)
 # to the release, then:
 bash scripts/verify-release-assets.sh <tag>
 ```

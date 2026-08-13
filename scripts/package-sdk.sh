@@ -27,6 +27,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/windows-native-toolchain.sh
+source "$SCRIPT_DIR/lib/windows-native-toolchain.sh"
+# This script's own `cargo build` below (for tools/artifact-manifest) is
+# subject to the same Git-Bash/MSVC link.exe shadowing on a native Windows
+# runner as every other cargo invocation in this repo's Windows CI job --
+# guarded on cl.exe being present so this is a no-op on every other platform,
+# where it is neither needed nor safe to assume.
+command -v cl.exe >/dev/null 2>&1 && windows_native_ensure_msvc_link_wins
 
 info() { printf '\033[0;36m[package-sdk] %s\033[0m\n' "$*"; }
 ok()   { printf '\033[0;32m[package-sdk] %s\033[0m\n' "$*"; }
