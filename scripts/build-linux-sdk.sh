@@ -2,7 +2,14 @@
 # Build the Linux SDK artifacts against the pinned sysroot and stage a package
 # a non-cargo host can consume.
 #
-# Usage: scripts/build-linux-sdk.sh [--prefix DIR]
+# Usage: scripts/build-linux-sdk.sh [aarch64|x86_64] [--prefix DIR]
+#
+# aarch64 ships without an embedded V8 startup snapshot (snapshot_policy:
+# "none", the same policy Windows currently has): generating one requires
+# *running* migo-snapshot-gen natively on real AArch64 Linux hardware
+# (scripts/gen-snapshot.sh's own doc comment), which this build does not have
+# access to yet. x86_64's snapshot embedding is unaffected and stays
+# mandatory.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,23 +18,42 @@ ENGINE_DIR="$REPO_ROOT/engine"
 
 # shellcheck source=scripts/lib/v8-materialise.sh
 source "$SCRIPT_DIR/lib/v8-materialise.sh"
-TARGET="x86_64-unknown-linux-gnu"
 
-PREFIX="$REPO_ROOT/dist/migo-linux-x86_64"
+ARCH="x86_64"
+PREFIX=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        aarch64|x86_64) ARCH="$1"; shift ;;
         --prefix) PREFIX="$2"; shift 2 ;;
         *) echo "[linux-sdk] unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+# TARGET (rust triple), SYSROOT_KEY (sysroots.json key) and SNAPSHOT_POLICY
+# disagree in vocabulary the same way build-v8-linux.sh's ARCH/TARGET/
+# GN_CPU/SYSROOT_ARCH do, and are resolved the same way: from migo's own
+# aarch64/x86_64 spelling, not derived from each other.
+case "$ARCH" in
+    aarch64) TARGET="aarch64-unknown-linux-gnu"; SYSROOT_KEY="bullseye_arm64"; SNAPSHOT_POLICY="none" ;;
+    x86_64)  TARGET="x86_64-unknown-linux-gnu";  SYSROOT_KEY="bullseye_amd64"; SNAPSHOT_POLICY="embedded" ;;
+esac
+# Public-facing directory/asset name only -- "arm64", matching Android's and
+# OpenHarmony's own aarch64->arm64 word (see build-ohos-sdk.sh's
+# public_ohos_arch). Every internal identity (--arch below, the manifest's own
+# "arch" field, the Rust validator's target.arch) stays "aarch64", migo's own
+# vocabulary and the one the rust target triple actually uses; only the
+# published path/filename gets the public word.
+PUBLIC_ARCH="$ARCH"
+[[ "$ARCH" == "aarch64" ]] && PUBLIC_ARCH="arm64"
+[[ -n "$PREFIX" ]] || PREFIX="$REPO_ROOT/dist/migo-linux-$PUBLIC_ARCH"
 
 info() { echo -e "\033[0;36m[linux-sdk] $*\033[0m"; }
 
+export MIGO_SYSROOT_KEY="$SYSROOT_KEY"
 # shellcheck source=scripts/lib/linux-sysroot.sh
 source "$SCRIPT_DIR/lib/linux-sysroot.sh"
 migo_sysroot_export
 
-LINK_DIR="$ENGINE_DIR/target/sysroot-links"
+LINK_DIR="$ENGINE_DIR/target/sysroot-links-$ARCH"
 migo_sysroot_link_dir "$LINK_DIR"
 export LIBRARY_PATH="$LINK_DIR:${LIBRARY_PATH:-}"
 # -B, not just -L: the driver searches -B prefixes for libraries ahead of its
@@ -39,7 +65,7 @@ RUSTFLAGS_SYSROOT_LINK+=" -C link-arg=-B$LINK_DIR -C link-arg=-L$LINK_DIR"
 # with its verified component manifest. An arbitrary development archive may be
 # useful for a local executable, but it cannot make a reproducible support-floor
 # or provenance claim and therefore must never enter a published SDK.
-V8_SDK_DIR="$ENGINE_DIR/third_party/rusty_v8/x86_64-linux-gnu"
+V8_SDK_DIR="$ENGINE_DIR/third_party/rusty_v8/$ARCH-linux-gnu"
 V8_ARCHIVE="$V8_SDK_DIR/librusty_v8.a"
 V8_BINDING="$V8_SDK_DIR/src_binding.rs"
 V8_MANIFEST="$V8_SDK_DIR/component-manifest.json"
@@ -98,20 +124,28 @@ fi
 # The NDK must not be visible, or skia-bindings picks its toolchain over ours.
 unset ANDROID_NDK ANDROID_NDK_HOME
 
-SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-linux-x86_64.bin"
-SNAPSHOT_MANIFEST="$SNAPSHOT_BIN.manifest.json"
-[[ -f "$SNAPSHOT_MANIFEST" ]] || {
-    echo "[linux-sdk] missing snapshot identity $SNAPSHOT_MANIFEST (regenerate the snapshot)" >&2
-    exit 1
-}
-# Freshness-only CI accepts a Git LFS pointer as an artifact identity. A package
-# build cannot: runtime-v8 must embed the real bytes, and a source-JS fallback
-# must never be mislabeled as snapshot_policy=embedded in the package manifest.
-# shellcheck source=scripts/lib/snapshot-fingerprint.sh
-source "$SCRIPT_DIR/lib/snapshot-fingerprint.sh"
-snapshot_require_materialized_snapshot "$SNAPSHOT_BIN"
-info "verifying the target host/full/linux snapshot before compiling"
-bash "$SCRIPT_DIR/check-snapshot-freshness.sh" --product-profile full --os linux x86_64
+SNAPSHOT_BIN=""
+SNAPSHOT_MANIFEST=""
+if [[ "$SNAPSHOT_POLICY" == "embedded" ]]; then
+    SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-linux-$ARCH.bin"
+    SNAPSHOT_MANIFEST="$SNAPSHOT_BIN.manifest.json"
+    [[ -f "$SNAPSHOT_MANIFEST" ]] || {
+        echo "[linux-sdk] missing snapshot identity $SNAPSHOT_MANIFEST (regenerate the snapshot)" >&2
+        exit 1
+    }
+    # Freshness-only CI accepts a Git LFS pointer as an artifact identity. A package
+    # build cannot: runtime-v8 must embed the real bytes, and a source-JS fallback
+    # must never be mislabeled as snapshot_policy=embedded in the package manifest.
+    # shellcheck source=scripts/lib/snapshot-fingerprint.sh
+    source "$SCRIPT_DIR/lib/snapshot-fingerprint.sh"
+    snapshot_require_materialized_snapshot "$SNAPSHOT_BIN"
+    info "verifying the target host/full/linux snapshot before compiling"
+    bash "$SCRIPT_DIR/check-snapshot-freshness.sh" --product-profile full --os linux "$ARCH"
+else
+    info "snapshot_policy=none for $ARCH -- no SNAPSHOT-full-linux-$ARCH.bin exists yet" \
+        "(needs a run on real AArch64 Linux hardware); runtime-v8/build.rs will fail" \
+        "safe and fall back to loading JS from source"
+fi
 
 export RUSTFLAGS="${RUSTFLAGS:-} $RUSTFLAGS_SYSROOT_LINK"
 
@@ -210,19 +244,12 @@ VERSION="$(read_release_version "$REPO_ROOT")"
 # The version script cannot simply be dropped to avoid this: without it,
 # --gc-sections has nothing to collect and the link fails on the JPEG/PDF
 # wrappers described below.
-LLD_BIN="${MIGO_LLD:-$(command -v ld.lld 2>/dev/null || true)}"
-if [[ -z "$LLD_BIN" ]]; then
-    BUNDLED_LLD="$REPO_ROOT/../rusty_v8_src/target/$TARGET/release/clang/bin/ld.lld"
-    [[ -x "$BUNDLED_LLD" ]] && LLD_BIN="$BUNDLED_LLD"
-fi
-if [[ -z "$LLD_BIN" ]]; then
-    echo "[linux-sdk] no lld found. Install it (apt-get install lld) or set MIGO_LLD." >&2
-    echo "[linux-sdk] A system lld is preferred; the rusty_v8 toolchain copy is only a" >&2
-    echo "[linux-sdk] convenience for machines that do not have one." >&2
-    echo "[linux-sdk] GNU ld cannot be used here: it emits a malformed symbol-version" >&2
-    echo "[linux-sdk] table for this link and the result is unlinkable." >&2
-    exit 1
-fi
+#
+# Resolved once by migo_sysroot_lld_bin (linux-sysroot.sh), which
+# RUSTFLAGS_SYSROOT_LINK above already used for the cargo-driven links --
+# same binary here so this script never asks the two links to agree by
+# coincidence.
+LLD_BIN="$(migo_sysroot_lld_bin)" || exit 1
 
 BUILD_METADATA="$ENGINE_DIR/target/$TARGET/release/migo-linux-build-metadata.json"
 python3 "$SCRIPT_DIR/write-linux-build-metadata.py" \
@@ -230,7 +257,7 @@ python3 "$SCRIPT_DIR/write-linux-build-metadata.py" \
     --output "$BUILD_METADATA" \
     --compiler "$CXX" \
     --linker "$LLD_BIN" \
-    --sysroot-identity "$MIGO_SYSROOT_IDENTITY"
+    --sysroot "$MIGO_SYSROOT_IDENTITY"
 
 info "linking libmigo.so (linker: $LLD_BIN)"
 SO_MAP="$ENGINE_DIR/crates/capi/migo.map"
@@ -243,8 +270,22 @@ done
 NATIVE_LIBS=$(sed -n 's/.*native-static-libs: *//p' "$LINK_NOTE" | head -1)
 SO_BUILD="$ENGINE_DIR/target/$TARGET/release/libmigo.so.$VERSION"
 
+# --target is required here for exactly the reason linux-sysroot.sh's own
+# comment on RUSTFLAGS_SYSROOT_LINK gives: clang without one compiles for the
+# host's own default triple, and -B/-L only reorder candidates a
+# target-aware driver already considers -- they cannot make a target-unaware
+# one look in the right per-triple directory at all. Measured cross-compiling
+# arm64 on this x86_64 host: omitting it left clang defaulting to
+# x86_64-linux-gnu, which does not exist under the arm64-only sysroot, so it
+# found neither crt objects nor libc/libdl/libpthread/libm/librt/libutil --
+# `ld.lld: error: cannot open crti.o`, `unable to find library -ldl`, etc.
+# -B/-L $SYSROOT_LIB_DIR are added on top, not left to --target's implicit
+# multiarch guess, matching RUSTFLAGS_SYSROOT_LINK's own belt-and-suspenders
+# choice rather than relying on undocumented driver heuristics.
+SYSROOT_LIB_DIR="$MIGO_SYSROOT/usr/lib/$MIGO_SYSROOT_LIB_TRIPLET"
+
 # shellcheck disable=SC2086  # NATIVE_LIBS is a flag list and must word-split
-"$CXX" --ld-path="$LLD_BIN" -shared -o "$SO_BUILD" \
+"$CXX" --target="$MIGO_SYSROOT_LIB_TRIPLET" --ld-path="$LLD_BIN" -shared -o "$SO_BUILD" \
     -Wl,--version-script="$SO_MAP" \
     -Wl,-soname,libmigo.so.1 \
     -Wl,--no-undefined \
@@ -253,6 +294,7 @@ SO_BUILD="$ENGINE_DIR/target/$TARGET/release/libmigo.so.$VERSION"
     "$ENGINE_DIR/target/$TARGET/release/libmigo_capi.a" \
     $NATIVE_LIBS \
     -L "$LINK_DIR" -B "$LINK_DIR" \
+    -L "$SYSROOT_LIB_DIR" -B "$SYSROOT_LIB_DIR" \
     --sysroot="$MIGO_SYSROOT"
 info "linked: $SO_BUILD ($(stat -c %s "$SO_BUILD") bytes)"
 
@@ -270,20 +312,24 @@ ln -sf "libmigo.so.1" "$PREFIX/lib/libmigo.so"
 # --static, so the CMake imported target has to describe the same default or the
 # two integrations would disagree about what `migo::migo` is.
 python3 "$SCRIPT_DIR/gen-linux-package-metadata.py" \
-    --cargo-output "$LINK_NOTE" --prefix "$PREFIX" --version "$VERSION" --shared
+    --arch "$ARCH" --cargo-output "$LINK_NOTE" --prefix "$PREFIX" --version "$VERSION" --shared
 
 info "recording the artifact manifest"
 NEEDED_FILE="$ENGINE_DIR/target/$TARGET/release/dt-needed.txt"
 # Taken from libmigo.so: the manifest describes what the shipped library needs,
 # not what one particular consumer happened to link.
 python3 "$SCRIPT_DIR/abi-floor-audit.py" needed "$SO_BUILD" > "$NEEDED_FILE"
+SNAPSHOT_ARGS=()
+if [[ "$SNAPSHOT_POLICY" == "embedded" ]]; then
+    SNAPSHOT_ARGS=(--snapshot-bin "$SNAPSHOT_BIN" --snapshot-manifest "$SNAPSHOT_MANIFEST")
+fi
 python3 "$SCRIPT_DIR/gen-linux-package-metadata.py" --manifest \
-    --prefix "$PREFIX" --version "$VERSION" \
+    --arch "$ARCH" --prefix "$PREFIX" --version "$VERSION" \
     --needed-from "$NEEDED_FILE" --sysroot "$MIGO_SYSROOT_IDENTITY" \
     --v8-component-manifest "$V8_MANIFEST" --build-metadata "$BUILD_METADATA" \
-    --snapshot-bin "$SNAPSHOT_BIN" --snapshot-manifest "$SNAPSHOT_MANIFEST"
+    "${SNAPSHOT_ARGS[@]}"
 
-PACKAGE_MANIFEST="$PREFIX/share/migo/linux-x86_64-manifest.json"
+PACKAGE_MANIFEST="$PREFIX/share/migo/linux-$ARCH-manifest.json"
 info "verifying the complete staged package tree"
 "$MANIFEST_TOOL" verify-linux-package "$PACKAGE_MANIFEST" "$PREFIX" >/dev/null
 

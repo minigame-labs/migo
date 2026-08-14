@@ -396,18 +396,36 @@ pub fn validate_linux_package_manifest(
     require_equal("toolchain.sdk", &manifest.toolchain.sdk, &manifest.sysroot)?;
     validate_gles_package_graphics(&manifest.graphics)?;
     validate_migo_package_provenance(&manifest.provenance, "scripts/build-linux-sdk.sh")?;
-    require_equal("target", &manifest.target, "x86_64-unknown-linux-gnu")?;
+    // x86_64 and aarch64. Baseline/features floors match
+    // validate_linux_v8_target's, since a package and the V8 archive it ships
+    // describe the same machine (validate_package_v8_target below cross-checks
+    // the two agree, so this is the one place that also has to be right on
+    // its own).
+    let (expected_baseline, expected_features): (&str, &[&str]) = match manifest.arch.as_str() {
+        "x86_64" => ("x86-64-v1", &["cmov", "sse2"]),
+        "aarch64" => ("armv8-a", &["neon"]),
+        arch => {
+            return Err(ManifestError::new(format!(
+                "unsupported Linux GNU package arch: {arch}"
+            )));
+        }
+    };
+    require_equal(
+        "target",
+        &manifest.target,
+        &format!("{}-unknown-linux-gnu", manifest.arch),
+    )?;
     require_equal("os", &manifest.os, "linux")?;
     // "linux" is a kernel, not an ABI. Android and OpenHarmony are Linux
     // kernels with userspaces this package cannot load against.
     require_equal("abi", &manifest.abi, "gnu")?;
-    require_equal("arch", &manifest.arch, "x86_64")?;
-    require_equal("cpu_baseline", &manifest.cpu_baseline, "x86-64-v1")?;
+    require_equal("cpu_baseline", &manifest.cpu_baseline, expected_baseline)?;
     require_sorted_unique("required_cpu_features", &manifest.required_cpu_features)?;
-    if manifest.required_cpu_features != ["cmov", "sse2"] {
-        return Err(ManifestError::new(
-            "required_cpu_features for x86_64 must be [\"cmov\", \"sse2\"]",
-        ));
+    if manifest.required_cpu_features != expected_features {
+        return Err(ManifestError::new(format!(
+            "required_cpu_features for {} must be {expected_features:?}",
+            manifest.arch
+        )));
     }
     require_equal("glibc_floor", &manifest.glibc_floor, LINUX_GLIBC_FLOOR)?;
     require_equal(
@@ -487,8 +505,8 @@ pub fn verify_linux_package(
     package_root: &Path,
 ) -> Result<(), ManifestError> {
     validate_linux_package_manifest(manifest)?;
-    let manifest_path = "share/migo/linux-x86_64-manifest.json";
-    verify_packaged_manifest(package_root, manifest_path, manifest)?;
+    let manifest_path = format!("share/migo/linux-{}-manifest.json", manifest.arch);
+    verify_packaged_manifest(package_root, &manifest_path, manifest)?;
     let expected_links = BTreeMap::from([
         ("lib/libmigo.so".to_string(), "libmigo.so.1".to_string()),
         (
@@ -499,7 +517,7 @@ pub fn verify_linux_package(
     verify_package_tree(
         &manifest.artifacts,
         package_root,
-        manifest_path,
+        &manifest_path,
         &expected_links,
     )
 }
@@ -1699,20 +1717,42 @@ fn validate_ohos_v8_target(target: &TargetIdentity) -> Result<(), ManifestError>
     Ok(())
 }
 
+/// Linux GNU, x86_64 and aarch64. glibc/glibcxx floors are not per-arch:
+/// Debian ships one glibc release across every architecture a given suite
+/// supports, so both archs are built against the same bullseye-era floor
+/// (see scripts/write-linux-v8-component-manifest.py's TARGETS table for the
+/// same reasoning on the Python side that produces this).
 fn validate_linux_v8_target(target: &TargetIdentity) -> Result<(), ManifestError> {
-    require_equal("target.triple", &target.triple, "x86_64-unknown-linux-gnu")?;
+    let (expected_baseline, expected_features): (&str, &[&str]) = match target.arch.as_str() {
+        "x86_64" => ("x86-64-v1", &["cmov", "sse2"]),
+        "aarch64" => ("armv8-a", &["neon"]),
+        arch => {
+            return Err(ManifestError::new(format!(
+                "unsupported Linux GNU V8 target arch: {arch}"
+            )));
+        }
+    };
+    require_equal(
+        "target.triple",
+        &target.triple,
+        &format!("{}-unknown-linux-gnu", target.arch),
+    )?;
     require_equal("target.os", &target.os, "linux")?;
     require_equal("target.abi", &target.abi, "gnu")?;
-    require_equal("target.arch", &target.arch, "x86_64")?;
-    require_equal("target.cpu_baseline", &target.cpu_baseline, "x86-64-v1")?;
+    require_equal(
+        "target.cpu_baseline",
+        &target.cpu_baseline,
+        expected_baseline,
+    )?;
     require_sorted_unique(
         "target.required_cpu_features",
         &target.required_cpu_features,
     )?;
-    if target.required_cpu_features != ["cmov", "sse2"] {
-        return Err(ManifestError::new(
-            "target.required_cpu_features for Linux x86_64 must be [\"cmov\", \"sse2\"]",
-        ));
+    if target.required_cpu_features != expected_features {
+        return Err(ManifestError::new(format!(
+            "target.required_cpu_features for Linux {} must be {expected_features:?}",
+            target.arch
+        )));
     }
     if target.runtime_floor.len() != 2
         || target.runtime_floor.get("glibc").map(String::as_str) != Some(LINUX_GLIBC_FLOOR)

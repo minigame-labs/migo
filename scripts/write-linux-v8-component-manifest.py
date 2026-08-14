@@ -104,8 +104,44 @@ def verify_source_changes(
     return identities
 
 
+# Keyed on migo's own arch vocabulary (aarch64/x86_64), not GN's (arm64/x64)
+# or Debian's sysroot suffix (arm64/amd64) -- neither of those is derivable
+# from the other two, so scripts/build-v8-linux.sh resolves all three
+# separately and only this one is threaded through to the manifest, matching
+# every other platform's component manifest.
+#
+# cpu_baseline/required_cpu_features are a stated policy floor, not a
+# property measured out of the archive: x86_64's "x86-64-v1" names the
+# baseline the psABI itself guarantees for the 64-bit mode (cmov/sse2 are
+# mandatory *because* they are part of that baseline, not an extra
+# requirement layered on top) -- ARMv8-A is the equivalent floor for AArch64
+# Linux (there is no pre-ARMv8-A 64-bit mode to fall back to), and NEON
+# (Advanced SIMD) is mandatory in the ARMv8-A base architecture the same way
+# cmov/sse2 are mandatory in x86-64-v1, not an optional extension.
+#
+# runtime_floor (glibc/glibcxx) is NOT keyed per arch: Debian ships one glibc
+# release across every architecture a given suite supports, so the 2.31/
+# 3.4.28 floor scripts/abi-floor-audit.py enforces for x86_64 already applies
+# unchanged to the arm64 sysroot from the same bullseye release.
+TARGETS = {
+    "x86_64": {
+        "triple": "x86_64-unknown-linux-gnu",
+        "arch": "x86_64",
+        "cpu_baseline": "x86-64-v1",
+        "required_cpu_features": ["cmov", "sse2"],
+    },
+    "aarch64": {
+        "triple": "aarch64-unknown-linux-gnu",
+        "arch": "aarch64",
+        "cpu_baseline": "armv8-a",
+        "required_cpu_features": ["neon"],
+    },
+}
+
+
 def build_component(
     *,
+    arch: str,
     rusty_v8_version: str,
     rusty_v8_revision: str,
     v8_revision: str,
@@ -119,16 +155,17 @@ def build_component(
     linker: str,
     recipe_sha256: str,
 ) -> dict:
+    target = TARGETS[arch]
     return {
         "schema": "migo-v8-component-manifest/v1",
         "component_id": "",
         "target": {
-            "triple": "x86_64-unknown-linux-gnu",
+            "triple": target["triple"],
             "os": "linux",
-            "arch": "x86_64",
+            "arch": target["arch"],
             "abi": "gnu",
-            "cpu_baseline": "x86-64-v1",
-            "required_cpu_features": ["cmov", "sse2"],
+            "cpu_baseline": target["cpu_baseline"],
+            "required_cpu_features": sorted(target["required_cpu_features"]),
             "runtime_floor": {"glibc": "2.31", "glibcxx": "3.4.28"},
         },
         "toolchain": {
@@ -162,6 +199,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", required=True, type=pathlib.Path)
     parser.add_argument("--rusty-v8-src", required=True, type=pathlib.Path)
+    parser.add_argument("--arch", required=True, choices=sorted(TARGETS))
     parser.add_argument("--gn-args", required=True)
     parser.add_argument("--archive", required=True, type=pathlib.Path)
     parser.add_argument("--binding", required=True, type=pathlib.Path)
@@ -188,11 +226,13 @@ def main() -> int:
     sysroot_recipe = source / "build/linux/sysroot_scripts/sysroots.json"
     if not sysroot_recipe.is_file():
         raise RuntimeError(f"missing Chromium sysroot identity: {sysroot_recipe}")
+    sysroot_word = {"x86_64": "amd64", "aarch64": "arm64"}[arguments.arch]
     sdk = (
-        "Debian bullseye amd64 sysroot; "
+        f"Debian bullseye {sysroot_word} sysroot; "
         f"sysroots.json sha256={hash_file(sysroot_recipe)}"
     )
     component = build_component(
+        arch=arguments.arch,
         rusty_v8_version=package_version(source / "Cargo.toml"),
         rusty_v8_revision=v8_source_proof.head_revision(source, "rusty_v8 revision"),
         v8_revision=v8_source_proof.head_revision(source / "v8", "V8 revision"),

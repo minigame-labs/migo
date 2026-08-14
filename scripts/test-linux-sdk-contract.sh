@@ -7,19 +7,39 @@
 # because the consumer discovers it at load time on a machine we cannot see.
 #
 # Usage:
-#   scripts/test-linux-sdk-contract.sh            # skips shared-object checks
-#                                                 # when no libmigo.so is staged
-#   scripts/test-linux-sdk-contract.sh --strict   # any skip is a failure
+#   scripts/test-linux-sdk-contract.sh [aarch64|x86_64]            # skips
+#                                       shared-object checks when no libmigo.so
+#                                       is staged (default arch: x86_64)
+#   scripts/test-linux-sdk-contract.sh [aarch64|x86_64] --strict   # any skip
+#                                       is a failure
 #
 # --strict is the mode the C ABI v1 freeze gate runs in.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PREFIX="${MIGO_PREFIX:-$REPO_ROOT/dist/migo-linux-x86_64}"
 AUDIT="$SCRIPT_DIR/abi-floor-audit.py"
+ARCH="x86_64"
 STRICT=0
-[[ "${1:-}" == "--strict" ]] && STRICT=1
+for arg in "$@"; do
+    case "$arg" in
+        aarch64|x86_64) ARCH="$arg" ;;
+        --strict) STRICT=1 ;;
+        *) echo "usage: $0 [aarch64|x86_64] [--strict]" >&2; exit 2 ;;
+    esac
+done
+case "$ARCH" in
+    aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+    x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
+esac
+# Public-facing directory word only, matching build-linux-sdk.sh's own
+# aarch64->arm64 rendering (see its PUBLIC_ARCH comment). $ARCH keeps migo's
+# internal spelling everywhere else below -- the manifest filename included,
+# since gen-linux-package-metadata.py names it from args.arch, not the public
+# word.
+PUBLIC_ARCH="$ARCH"
+[[ "$ARCH" == "aarch64" ]] && PUBLIC_ARCH="arm64"
+PREFIX="${MIGO_PREFIX:-$REPO_ROOT/dist/migo-linux-$PUBLIC_ARCH}"
 
 FAILURES=0
 SKIPS=0
@@ -28,13 +48,13 @@ fail() { echo -e "\033[0;31mFAIL\033[0m  $*"; FAILURES=$((FAILURES + 1)); }
 skip() { echo -e "\033[0;33mSKIP\033[0m  $*"; SKIPS=$((SKIPS + 1)); }
 
 [[ -d "$PREFIX" ]] || {
-    echo "no staged package at $PREFIX; run scripts/build-linux-sdk.sh" >&2
+    echo "no staged package at $PREFIX; run scripts/build-linux-sdk.sh $ARCH" >&2
     exit 1
 }
 
-MANIFEST="$PREFIX/share/migo/linux-x86_64-manifest.json"
+MANIFEST="$PREFIX/share/migo/linux-$ARCH-manifest.json"
 SHARED_LIB="$PREFIX/lib/libmigo.so"
-FLOOR_BINARY="$REPO_ROOT/engine/target/x86_64-unknown-linux-gnu/release/migo-c-host"
+FLOOR_BINARY="$REPO_ROOT/engine/target/$TARGET/release/migo-c-host"
 
 # --- 1. Loader floor -------------------------------------------------------
 # Measured on the sysroot-built reference consumer: symbol versions bind at link

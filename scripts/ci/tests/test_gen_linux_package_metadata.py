@@ -153,13 +153,15 @@ class RenderManifestTest(unittest.TestCase):
         }
         snapshot = {"runtime_kind": "host", "bytes_hash": "c" * 64}
         manifest = gen.render_manifest(
+            arch="x86_64",
             version="1.0.0",
             needed=["libEGL.so.1", "libc.so.6"],
             v8={"schema": "migo-v8-component-manifest/v1", "component_id": "b" * 64},
             sysroot=LINUX_SYSROOT_IDENTITY,
             build_metadata=BUILD_METADATA,
             artifacts={"lib/libmigo.a": artifact},
-            snapshot=snapshot,
+            snapshot_policy="embedded",
+            snapshots=[snapshot],
         )
         self.assertEqual(manifest["schema"], "migo-linux-package-manifest/v2")
         self.assertEqual(manifest["product_profile"], "full")
@@ -180,9 +182,10 @@ class RenderManifestTest(unittest.TestCase):
 
     def test_dependencies_are_sorted_for_stable_diffs(self):
         manifest = gen.render_manifest(
+            arch="x86_64",
             version="1.0.0", needed=["libc.so.6", "libEGL.so.1"], v8={},
             sysroot="s", build_metadata=BUILD_METADATA, artifacts={},
-            snapshot={"runtime_kind": "host"})
+            snapshot_policy="embedded", snapshots=[{"runtime_kind": "host"}])
         self.assertEqual(manifest["dynamic_dependencies"], ["libEGL.so.1", "libc.so.6"])
 
     def test_artifact_identity_hashes_the_staged_regular_file(self):
