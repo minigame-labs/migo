@@ -1,15 +1,14 @@
 {
   "schema": "migo-v8-component-manifest/v1",
-  "component_id": "b05f22bef6177f4b4418f0002209453693fdb2d5675c4283db9480dc397567d1",
+  "component_id": "19f63547262b83d1bed2aba0edfd33f222bc784664e0cfb6238c3dfe570c9504",
   "target": {
-    "triple": "x86_64-pc-windows-msvc",
+    "triple": "aarch64-pc-windows-msvc",
     "os": "windows",
-    "arch": "x86_64",
+    "arch": "aarch64",
     "abi": "msvc",
-    "cpu_baseline": "x86-64-v1",
+    "cpu_baseline": "armv8-a",
     "required_cpu_features": [
-      "cmov",
-      "sse2"
+      "neon"
     ],
     "runtime_floor": {
       "msvc_runtime": "MD (dynamic CRT)"
@@ -17,7 +16,7 @@
   },
   "toolchain": {
     "rustc": "rustc 1.89.0 (29483883e 2025-08-04)\nbinary: rustc\ncommit-hash: 29483883eed69d5fb4db01964cdf2af4d86e9cb2\ncommit-date: 2025-08-04\nhost: x86_64-pc-windows-msvc\nrelease: 1.89.0\nLLVM version: 20.1.7",
-    "compiler": "MSVC 14.44.35207 (cl.exe, x64)",
+    "compiler": "MSVC 14.44.35207 (cl.exe, arm64, cross from x64 host)",
     "sdk": "Windows SDK 10.0.26100.0",
     "linker": "MSVC link.exe 14.44.35207"
   },
@@ -37,7 +36,7 @@
     "patches": []
   },
   "hashes": {
-    "archive": "0c524fabc829900116f8cde32273b6ebbc53fd5979248915e8638875a4e29292",
+    "archive": "c61efee378e3a6b1a6934690e25f2cc5945918c2e088b44d95a92372055c4828",
     "rust_binding": "1b645c73eaa10989ade387fad9e47bcdecc910b1ce19867ff132991683c3c765"
   },
   "provenance": {

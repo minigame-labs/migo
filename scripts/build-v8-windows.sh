@@ -54,19 +54,32 @@
 #   - Python: rusty_v8 resolves it via $PYTHON and otherwise calls "python3",
 #     which Windows installs do not provide.
 #
-# Output: engine/third_party/rusty_v8/x86_64-pc-windows-msvc/
+# Output: engine/third_party/rusty_v8/<target>/
 #           rusty_v8.lib + src_binding.rs
 #
 # Usage:
-#   scripts/build-v8-windows.sh            # build and install
-#   scripts/build-v8-windows.sh --check    # report readiness, build nothing
+#   scripts/build-v8-windows.sh [aarch64|x86_64]            # build and install (default x86_64)
+#   scripts/build-v8-windows.sh [aarch64|x86_64] --check    # report readiness, build nothing
 # ============================================================
 set -euo pipefail
+
+ARCH="x86_64"
+CHECK_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        aarch64|x86_64) ARCH="$arg" ;;
+        --check) CHECK_ONLY=1 ;;
+        *) echo "usage: $0 [aarch64|x86_64] [--check]" >&2; exit 2 ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_ROOT="$PROJECT_ROOT/engine"
-TARGET="x86_64-pc-windows-msvc"
+case "$ARCH" in
+    aarch64) TARGET="aarch64-pc-windows-msvc"; VS_ARM64_COMPONENT="Microsoft.VisualStudio.Component.VC.Tools.ARM64" ;;
+    x86_64)  TARGET="x86_64-pc-windows-msvc";  VS_ARM64_COMPONENT="" ;;
+esac
 OUT_DIR="$ENGINE_ROOT/third_party/rusty_v8/$TARGET"
 V8_BUILD_LOCK="$PROJECT_ROOT/contracts/artifact-manifest/windows-v8.lock.json"
 
@@ -83,6 +96,16 @@ GN_WIN="${MIGO_WIN_GN:-C:\\migo-win-spike-tmp\\bin\\gn.exe}"
 NINJA_WIN="${MIGO_WIN_NINJA:-C:\\migo-win-spike-tmp\\bin\\ninja.exe}"
 PYTHON_WIN="${MIGO_WIN_PYTHON:-}"
 PROXY="${MIGO_WIN_PROXY:-}"
+# build.rs passes NUM_JOBS straight through to ninja's -j when set (see its
+# ninja() helper). Unset, ninja and cargo both default to the logical CPU
+# count; building two toolchains at once (host x64 for build-time codegen
+# plus the arm64 target) roughly doubles peak clang-cl memory pressure over a
+# single-arch build, and at full parallelism that starved this machine's RAM
+# -- every crash was "LLVM ERROR: out of memory", not a compiler bug. Unlike
+# PROXY this is not written into the batch file unconditionally: cargo
+# already defaults NUM_JOBS sensibly for a single-toolchain build, so this
+# only overrides it when the caller has actually hit the problem.
+NUM_JOBS_WIN="${MIGO_WIN_NUM_JOBS:-}"
 
 # printf, not `echo -e`: every path here is a DOS path, and `echo -e` expands
 # backslash escapes inside the message -- "C:\v8src" prints as "C:<vtab>8src",
@@ -162,16 +185,25 @@ check_ready() {
         err "vswhere not found -- install Visual Studio Build Tools with the C++ workload"
         failures=$((failures + 1))
     else
-        VS_ROOT="$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+        # x86.x64 is required unconditionally: even the aarch64 cross-build runs
+        # host x64 tools (cl.exe host, invoked via vcvarsamd64_arm64.bat) that
+        # then emit ARM64 code. VS_ARM64_COMPONENT additionally requires the
+        # ARM64 target component so the cross tools actually exist.
+        local -a requires=(-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64)
+        [[ -n "$VS_ARM64_COMPONENT" ]] && requires+=(-requires "$VS_ARM64_COMPONENT")
+        VS_ROOT="$("$vswhere" -products '*' "${requires[@]}" \
             -latest -format value -property installationPath 2>/dev/null | tr -d '\r')"
-        [[ -n "$VS_ROOT" ]] || { err "no Visual Studio carries the MSVC x86/x64 build tools"; failures=$((failures + 1)); }
+        if [[ -z "$VS_ROOT" ]]; then
+            err "no Visual Studio carries the MSVC build tools this target needs ($ARCH)"
+            failures=$((failures + 1))
+        fi
     fi
 
     return "$failures"
 }
 
-if [[ "${1:-}" == "--check" ]]; then
-    if check_ready; then ok "ready to build"; exit 0; else err "not ready"; exit 1; fi
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    if check_ready; then ok "ready to build $TARGET"; exit 0; else err "not ready"; exit 1; fi
 fi
 check_ready || { err "prerequisites unmet; run --check for the list"; exit 1; }
 
@@ -223,6 +255,13 @@ apply_windows_patches || { err "patch stage failed"; exit 1; }
 # ------------------------------------------------------------
 BATCH_UNIX="/mnt/c/migo-win-spike-tmp/migo-build-v8-windows.bat"
 mkdir -p "$(dirname "$BATCH_UNIX")"
+# Captured from inside the batch, after it cd's into the pinned checkout, so
+# this records the toolchain rust-toolchain.toml actually selects. Querying
+# `rustc --version` from this WSL shell would instead report WSL's own Linux
+# toolchain -- a real, previously undiscovered bug: every Windows V8 manifest
+# to date (including the shipped x86_64 one) has recorded the wrong compiler.
+RUSTC_VERSION_FILE_WIN="C:\\migo-win-spike-tmp\\rustc-version-${TARGET}.txt"
+RUSTC_VERSION_FILE_UNIX="$(win_to_unix "$RUSTC_VERSION_FILE_WIN")"
 
 # rusty_v8's build.rs only adds clang's resource directory to the bindgen
 # arguments when target_os == "linux" (see its bindgen setup); on Windows it
@@ -239,6 +278,15 @@ mkdir -p "$(dirname "$BATCH_UNIX")"
 # is therefore the same artifact bindgen would produce if it parsed correctly,
 # and build-v8-linux.sh already does this for its own reason (older libclang).
 BINDING_BACKUP="$OUT_DIR/src_binding.rs"
+# The binding is arch/OS-independent (pure C++ API FFI surface, confirmed by
+# diff across every existing archive directory this session -- see
+# build-v8-linux.sh's own fallback for the same reasoning). A fresh arch's
+# output dir has no committed binding of its own yet, so fall back to the
+# x86_64 one rather than fail: bindgen still can't produce a correct one here
+# regardless of target arch.
+if [[ ! -f "$BINDING_BACKUP" && "$ARCH" != "x86_64" ]]; then
+    BINDING_BACKUP="$ENGINE_ROOT/third_party/rusty_v8/x86_64-pc-windows-msvc/src_binding.rs"
+fi
 PREBUILT_BINDING_LINE=""
 if [[ -f "$BINDING_BACKUP" ]]; then
     PREBUILT_BINDING_LINE="set \"V8_PREBUILT_BINDING=$(wslpath -w "$BINDING_BACKUP" 2>/dev/null || echo "$BINDING_BACKUP")\""
@@ -253,10 +301,27 @@ fi
 # writer. Writing them twice would let the recorded provenance drift from the
 # arguments the build actually used -- silently, since nothing compares them.
 GN_ARGS="v8_enable_webassembly=true v8_enable_pointer_compression=true v8_enable_i18n_support=true v8_enable_sandbox=false use_allocator_shim=false use_partition_alloc_as_malloc=false"
+# target_cpu is NOT added here: rusty_v8's build.rs (see its CARGO_CFG_TARGET_ARCH
+# handling) already pushes target_cpu="arm64" onto its own GN args whenever
+# the Rust target is aarch64, the same way `cargo build --target` already
+# selects the Rust side. Adding it here too would just duplicate a GN arg
+# build.rs already emits.
+
+# vcvars64.bat sets up host-x64-targeting-x64 tools; cross-compiling to arm64
+# needs the host-x64-targeting-arm64 cross tools instead, which is a
+# differently-named script in the same directory (there is no "vcvarsarm64.bat"
+# unless the *host* itself is arm64, which this machine is not).
+case "$ARCH" in
+    aarch64) VCVARS_BAT="vcvarsamd64_arm64.bat" ;;
+    x86_64)  VCVARS_BAT="vcvars64.bat" ;;
+esac
 
 PROXY_LINES=""
 [[ -n "$PROXY" ]] && PROXY_LINES="set HTTPS_PROXY=${PROXY}
 set HTTP_PROXY=${PROXY}"
+
+NUM_JOBS_LINE=""
+[[ -n "$NUM_JOBS_WIN" ]] && NUM_JOBS_LINE="set NUM_JOBS=${NUM_JOBS_WIN}"
 
 # NOTE: this heredoc is unquoted so the shell expands ${...}; it must therefore
 # contain no backticks, which the shell would run as a command substitution
@@ -265,7 +330,7 @@ cat > "$BATCH_UNIX" <<BAT
 @echo off
 rem An inherited variable of this name makes %errorlevel% expand to it forever.
 set "ERRORLEVEL="
-call "${VS_ROOT}\\VC\\Auxiliary\\Build\\vcvars64.bat" >nul
+call "${VS_ROOT}\\VC\\Auxiliary\\Build\\${VCVARS_BAT}" >nul
 
 rem A whitelist, not a reordering. An Android NDK ships its own clang-cl and
 rem clang resource directory, and the resolution inside bindgen does not consult
@@ -285,6 +350,7 @@ set "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin"
 set CARGO_HOME=${CARGO_HOME_WIN}
 set CARGO_TARGET_DIR=${V8_TARGET_DIR_WIN}
 ${PROXY_LINES}
+${NUM_JOBS_LINE}
 
 rem rusty_v8 resolves python via PYTHON and otherwise calls "python3"; Windows
 rem installs python.exe and no python3.exe.
@@ -322,6 +388,10 @@ rem changes no generated code, only whether a warning fails the build.
 set EXTRA_GN_ARGS=${GN_ARGS}
 
 cd /d ${RUSTY_V8_SRC_WIN} || exit /b 90
+rem After the cd, so rust-toolchain.toml's override is in effect -- see the
+rem RUSTC_VERSION_FILE_WIN comment above for why this is captured here rather
+rem than queried from WSL.
+rustc --version --verbose > "${RUSTC_VERSION_FILE_WIN}" 2>&1
 rem V8 is built WITH its bundled libc++ (the crate default), because it cannot
 rem be compiled against the MSVC STL: measured 2026-07-24, clang-cl crashes
 rem (frontend signal) on 32 torque-generated translation units, and before that
@@ -405,9 +475,12 @@ MSVC_VERSION="$(ls "$VS_ROOT_UNIX/VC/Tools/MSVC" 2>/dev/null | sort -V | tail -1
 [[ -n "$MSVC_VERSION" ]] || { err "cannot determine the MSVC toolset version under $VS_ROOT_UNIX"; exit 1; }
 SDK_VERSION="$(ls "/mnt/c/Program Files (x86)/Windows Kits/10/Include" 2>/dev/null | sort -V | tail -1)"
 [[ -n "$SDK_VERSION" ]] || { err "cannot determine the Windows SDK version"; exit 1; }
+RUSTC_VERSION="$(cat "$RUSTC_VERSION_FILE_UNIX" 2>/dev/null)"
+[[ -n "$RUSTC_VERSION" ]] || { err "cannot read the captured rustc version: $RUSTC_VERSION_FILE_UNIX"; exit 1; }
 info "toolchain: MSVC $MSVC_VERSION, Windows SDK $SDK_VERSION"
 
 python3 "$SCRIPT_DIR/write-windows-v8-component-manifest.py" \
+    --arch "$ARCH" \
     --repo-root "$PROJECT_ROOT" \
     --rusty-v8-src "$SRC_UNIX" \
     --gn-args "$GN_ARGS" \
@@ -418,6 +491,7 @@ python3 "$SCRIPT_DIR/write-windows-v8-component-manifest.py" \
     --output "$OUT_DIR/component-manifest.json" \
     --lock "$V8_BUILD_LOCK" \
     --msvc-version "$MSVC_VERSION" \
-    --sdk-version "$SDK_VERSION"
+    --sdk-version "$SDK_VERSION" \
+    --rustc-version "$RUSTC_VERSION"
 ok "component manifest -> $OUT_DIR/component-manifest.json"
 ok "V8 build complete for $TARGET"

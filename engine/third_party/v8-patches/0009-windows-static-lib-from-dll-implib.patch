@@ -1,0 +1,37 @@
+--- a/build.rs
++++ b/build.rs
+@@ -450,6 +450,34 @@
+     print_gn_args(&gn_out);
+   }
+   build("rusty_v8", None);
++
++  // MIGO: on Windows the "rusty_v8" GN target is a shared_library (see
++  // 0006-windows-rusty-v8-shared-library.patch), so ninja only ever produces
++  // rusty_v8.dll + rusty_v8.dll.lib in gn_out/ -- it never writes a plain
++  // rusty_v8.lib into gn_out/obj/, unlike every other platform's static
++  // archive target. print_link_flags() still emits `static=rusty_v8`
++  // unconditionally (unchanged: MSVC's linker resolves both the static and
++  // dylib `-l` kinds to the same "NAME.lib" naming convention, so the kind
++  // itself does not need to change here) -- but that means the file it
++  // searches for at {gn_out}/obj/rusty_v8.lib has to actually exist. Copying
++  // the import library into place under that name is what makes it exist.
++  // Without this, `cargo build` fails with "could not find native static
++  // library `rusty_v8`" on any environment that does not happen to carry an
++  // unrelated leftover rusty_v8.lib from before this patch existed -- which
++  // is exactly what masked this on every prior Windows build here, until a
++  // genuinely from-scratch target dir (this crate's first-ever
++  // aarch64-pc-windows-msvc build) exposed it.
++  if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
++    let dll_implib = gn_out.join("rusty_v8.dll.lib");
++    let static_lib_dest = gn_out.join("obj").join("rusty_v8.lib");
++    fs::copy(&dll_implib, &static_lib_dest).unwrap_or_else(|e| {
++      panic!(
++        "MIGO: failed to copy {} to {}: {e}",
++        dll_implib.display(),
++        static_lib_dest.display()
++      )
++    });
++  }
+ }
+ 
+ fn print_gn_args(gn_out_dir: &Path) {

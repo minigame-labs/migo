@@ -66,7 +66,7 @@ BASE_URL="${MIGO_V8_ARCHIVE_BASE_URL:-https://github.com/minigame-labs/migo/rele
 # as the asset suffix for every target but Windows (see above), so a release
 # asset is otherwise always librusty_v8-<target>.a and there is no second naming
 # scheme to keep in sync.
-KNOWN_TARGETS=(aarch64-linux-android x86_64-linux-android x86_64-linux-gnu aarch64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos x86_64-pc-windows-msvc)
+KNOWN_TARGETS=(aarch64-linux-android x86_64-linux-android x86_64-linux-gnu aarch64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos x86_64-pc-windows-msvc aarch64-pc-windows-msvc)
 DEFAULT_TARGETS=(aarch64-linux-android x86_64-linux-android)
 
 info() { printf '\033[0;36m[v8-fetch] %s\033[0m\n' "$*"; }

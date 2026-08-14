@@ -27,6 +27,11 @@
       "file": "0007-*.patch",
       "id": "0007-windows-register-host-callbacks-from-rust",
       "notes": "Registers the host callbacks from Rust. Spans five files, which is why applied-ness cannot key off any single one -- see scripts/lib/v8-patch-apply.sh."
+    },
+    {
+      "file": "0009-*.patch",
+      "id": "0009-windows-static-lib-from-dll-implib",
+      "notes": "Copies rusty_v8.dll.lib to gn_out/obj/rusty_v8.lib after the ninja build. The shared_library GN target from 0006 never produces a plain static archive, but build.rs's print_link_flags() still requests `static=rusty_v8` unconditionally (MSVC resolves both the static and dylib -l kinds to the same NAME.lib naming convention regardless, so that directive did not need to change). Discovered building aarch64-pc-windows-msvc from a genuinely clean target dir for the first time: every prior Windows build here had silently relied on a stale rusty_v8.lib left over from 2026-07-24, predating 0006's shared-library refactor -- CI never exercises this path, since release.yml only fetches the already-built archive."
     }
   ],
   "rusty_v8_revision": "0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
@@ -44,6 +49,13 @@
         "sse2"
       ],
       "triple": "x86_64-pc-windows-msvc"
+    },
+    "aarch64": {
+      "cpu_baseline": "armv8-a",
+      "required_cpu_features": [
+        "neon"
+      ],
+      "triple": "aarch64-pc-windows-msvc"
     }
   },
   "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921"
