@@ -716,6 +716,17 @@ jobs:
   # verified against committed sha256s. Windows and OpenHarmony have since followed
   # (release-windows, release-ohos below) once their own librusty_v8 archives were
   # published to the same tag.
+  #
+  # Both architectures build in this one job, cross-compiling aarch64 from this
+  # x86_64 runner, the same shape release-ohos already uses for its own two
+  # architectures (one job, one runner, per-arch script invocations) rather than
+  # a matrix with a native arm64 runner: cross-compilation is already proven
+  # here (scripts/lib/linux-sysroot.sh pins CC/CXX/RUSTFLAGS at the matching
+  # Debian sysroot regardless of host arch), so a second, unverified runner
+  # type would only add risk this platform does not need. aarch64 ships
+  # without an embedded V8 snapshot (see build-linux-sdk.sh's own header
+  # comment) -- generating one needs to run natively on real AArch64 Linux,
+  # which is a separate piece of work, not a gap in this job.
   release-linux:
     needs: [quality-gate, host-engine-tests]
     runs-on: ubuntu-24.04
@@ -735,7 +746,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
       # lld is not preinstalled. build-linux-sdk.sh explains why it is load-bearing
       # rather than a preference, and it fails with an actionable message when absent
@@ -744,34 +755,44 @@ jobs:
         run: |
           command -v lld >/dev/null 2>&1 || sudo apt-get install -y lld
 
-      # The sysroot the V8 archive was built against, verified by sha256. The SDK build
-      # refuses when the engine's sysroot identity and the archive's disagree, so this
-      # is not merely a convenience: fetching the wrong one is a build failure, not a
-      # silently different artifact.
-      - name: Fetch and verify the pinned Chromium sysroot
-        run: bash scripts/fetch-linux-sysroot.sh
+      # The sysroot each V8 archive was built against, verified by sha256. The SDK
+      # build refuses when the engine's sysroot identity and the archive's disagree,
+      # so this is not merely a convenience: fetching the wrong one is a build
+      # failure, not a silently different artifact.
+      - name: Fetch and verify the pinned Chromium sysroots
+        run: |
+          bash scripts/fetch-linux-sysroot.sh --key bullseye_amd64
+          bash scripts/fetch-linux-sysroot.sh --key bullseye_arm64
 
-      - name: Fetch and verify the linux-gnu V8 archive
-        run: bash scripts/fetch-v8-archives.sh x86_64-linux-gnu
+      - name: Fetch and verify the linux-gnu V8 archives
+        run: bash scripts/fetch-v8-archives.sh x86_64-linux-gnu aarch64-linux-gnu
 
-      - name: Build the Linux SDK
-        run: bash scripts/build-linux-sdk.sh
+      - name: Build the Linux SDK (x86_64)
+        run: bash scripts/build-linux-sdk.sh x86_64
 
-      - name: Linux SDK package contract
-        run: bash scripts/test-linux-sdk-contract.sh
+      - name: Build the Linux SDK (aarch64)
+        run: bash scripts/build-linux-sdk.sh aarch64
+
+      - name: Linux SDK package contract (x86_64)
+        run: bash scripts/test-linux-sdk-contract.sh x86_64
+
+      - name: Linux SDK package contract (aarch64)
+        run: bash scripts/test-linux-sdk-contract.sh aarch64
 
       # Same property as the Android C SDK check: the manifest and freshness
       # gates validate the snapshot file, this reads the compiled libmigo.a /
-      # libmigo.so.<version> to prove the bytes are actually embedded.
-      - name: Linux SDK snapshot embedding contract
+      # libmigo.so.<version> to prove the bytes are actually embedded. x86_64
+      # only: aarch64 has no snapshot to embed yet (snapshot_policy: "none").
+      - name: Linux SDK snapshot embedding contract (x86_64)
         run: bash scripts/test-capi-snapshot-embedding-contract.sh dist/migo-linux-x86_64
 
       # Straight into the staging directory: package-sdk.sh derives the published name
       # from the staged prefix, so there is nothing to rename on the way.
-      - name: Package the Linux SDK for release
+      - name: Package the Linux SDKs for release
         run: |
           mkdir -p dist/release
           bash scripts/package-sdk.sh dist/migo-linux-x86_64 --output-dir dist/release
+          bash scripts/package-sdk.sh dist/migo-linux-arm64 --output-dir dist/release
 
       - name: Upload the staged Linux assets
         uses: actions/upload-artifact@v4

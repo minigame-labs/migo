@@ -39,13 +39,18 @@ KEY="bullseye_amd64"
 DEST="$SYSROOT_HOME"
 CHECK_ONLY=0
 
-# The recipe advertises seven other architectures, and none of them is usable here:
-# the library path this script checks for, scripts/lib/linux-sysroot.sh's link
-# directory and scripts/build-linux-sdk.sh's target triple are all x86_64. A key
-# that downloaded a valid arm64 tarball and then failed on an x86_64 path would
-# read as a broken download rather than an unsupported request.
-SUPPORTED_KEY="bullseye_amd64"
-SYSROOT_LIB_TRIPLET="x86_64-linux-gnu"
+# The recipe advertises six other architectures beyond amd64/arm64, and none of
+# those is usable here: the library path this script checks for is derived from
+# the key itself (below), but there is no x86_64-linux-gnu.a analog to build
+# migo's own Linux SDK against for armhf/i386/mips*/ppc64el/riscv64 -- adding
+# one of those keys to this map without also teaching build-linux-sdk.sh and
+# scripts/lib/linux-sysroot.sh the new architecture would let this script
+# download a tarball that nothing downstream can use, which reads as a broken
+# download rather than an unsupported request.
+declare -A SYSROOT_LIB_TRIPLETS=(
+    [bullseye_amd64]="x86_64-linux-gnu"
+    [bullseye_arm64]="aarch64-linux-gnu"
+)
 
 info() { printf '\033[0;36m[linux-sysroot] %s\033[0m\n' "$*"; }
 ok()   { printf '\033[0;32m[linux-sysroot] %s\033[0m\n' "$*"; }
@@ -64,12 +69,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$KEY" != "$SUPPORTED_KEY" ]]; then
+if [[ -z "${SYSROOT_LIB_TRIPLETS[$KEY]:-}" ]]; then
     err "unsupported sysroot key: $KEY"
-    err "Only $SUPPORTED_KEY is usable: the engine's Linux target, its link directory"
-    err "and this script's completeness check are all $SYSROOT_LIB_TRIPLET."
+    err "Only ${!SYSROOT_LIB_TRIPLETS[*]} are usable: build-linux-sdk.sh and"
+    err "scripts/lib/linux-sysroot.sh only know those architectures."
     exit 2
 fi
+SYSROOT_LIB_TRIPLET="${SYSROOT_LIB_TRIPLETS[$KEY]}"
 
 if [[ ! -f "$RECIPE" ]]; then
     err "sysroot recipe not found: $RECIPE"

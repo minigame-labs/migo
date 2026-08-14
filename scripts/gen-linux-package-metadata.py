@@ -28,21 +28,40 @@ _PACKAGE_VERSION_RE = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 
-TARGET = "x86_64-unknown-linux-gnu"
 OS = "linux"
 ABI = "gnu"
-ARCH = "x86_64"
-CPU_BASELINE = "x86-64-v1"
-REQUIRED_CPU_FEATURES = ["cmov", "sse2"]
 GLIBC_FLOOR = "2.31"
 GLIBCXX_FLOOR = "3.4.28"
 
-# The Linux SDK embeds a host/full V8 startup snapshot (build.rs embeds for any
-# OS it has a committed SNAPSHOT-full-linux-x86_64.bin for, not just Android).
-# Stated rather than implied: an absent key cannot be told apart from a
-# forgotten one. The validator requires the policy and the list to agree, so
+# cpu_baseline/required_cpu_features are a stated policy floor, matching
+# scripts/write-linux-v8-component-manifest.py's own TARGETS table (see its
+# comment for why x86-64-v1/armv8-a are the right floors, not measured
+# values). glibc/glibcxx floors are not repeated per arch: Debian ships one
+# glibc release across every architecture a given suite supports.
+TARGETS = {
+    "x86_64": {
+        "triple": "x86_64-unknown-linux-gnu",
+        "cpu_baseline": "x86-64-v1",
+        "required_cpu_features": ["cmov", "sse2"],
+    },
+    "aarch64": {
+        "triple": "aarch64-unknown-linux-gnu",
+        "cpu_baseline": "armv8-a",
+        "required_cpu_features": ["neon"],
+    },
+}
+
+# The Linux SDK embeds a host/full V8 startup snapshot where one has been
+# generated (build.rs embeds for any OS/arch it has a committed
+# SNAPSHOT-full-linux-<arch>.bin for). x86_64 has one; aarch64 does not yet --
+# generating it requires *running* migo-snapshot-gen natively on real AArch64
+# Linux hardware (scripts/gen-snapshot.sh's own doc comment: "run it there"),
+# which is not available where this SDK is currently built. Stated rather
+# than implied: an absent key cannot be told apart from a forgotten one, so
+# this is a policy the caller states explicitly per arch rather than a
+# constant, and the validator requires the policy and the list to agree so
 # neither can drift.
-SNAPSHOT_POLICY = "embedded"
+SNAPSHOT_POLICIES = {"x86_64": "embedded", "aarch64": "none"}
 
 
 def package_version(value: str) -> str:
@@ -183,7 +202,9 @@ endif()
 """
 
 
-def render_manifest(*, version, needed, v8, sysroot, build_metadata, artifacts, snapshot) -> dict:
+def render_manifest(
+    *, arch, version, needed, v8, sysroot, build_metadata, artifacts, snapshot_policy, snapshots
+) -> dict:
     """The package's description of itself.
 
     Every field here is checked against reality by
@@ -191,28 +212,29 @@ def render_manifest(*, version, needed, v8, sysroot, build_metadata, artifacts, 
     verifies, not documentation that drifts.
     """
     version = package_version(version)
+    target = TARGETS[arch]
     return {
         "schema": "migo-linux-package-manifest/v2",
         "version": version,
         "product_profile": "full",
         "build_type": "release",
         "codegen_profile": "z",
-        "target": TARGET,
+        "target": target["triple"],
         # os/abi/arch are carried separately from the triple so a consumer can
         # reject a mismatch without parsing the triple. "linux" alone is not an
         # ABI: Android and OpenHarmony are Linux kernels too, and a package built
         # for one is not loadable on another.
         "os": OS,
         "abi": ABI,
-        "arch": ARCH,
-        "cpu_baseline": CPU_BASELINE,
-        "required_cpu_features": sorted(REQUIRED_CPU_FEATURES),
+        "arch": arch,
+        "cpu_baseline": target["cpu_baseline"],
+        "required_cpu_features": sorted(target["required_cpu_features"]),
         "glibc_floor": GLIBC_FLOOR,
         "glibcxx_floor": GLIBCXX_FLOOR,
         "sysroot": sysroot,
         "dynamic_dependencies": sorted(needed),
-        "snapshot_policy": SNAPSHOT_POLICY,
-        "snapshots": [snapshot],
+        "snapshot_policy": snapshot_policy,
+        "snapshots": snapshots,
         "v8": v8,
         "toolchain": build_metadata["toolchain"],
         "graphics": {
@@ -224,13 +246,13 @@ def render_manifest(*, version, needed, v8, sysroot, build_metadata, artifacts, 
     }
 
 
-def snapshot_identity(snapshot_bin: pathlib.Path, snapshot_manifest: pathlib.Path) -> dict:
-    triple = "x86_64-unknown-linux-gnu"
+def snapshot_identity(arch: str, snapshot_bin: pathlib.Path, snapshot_manifest: pathlib.Path) -> dict:
+    triple = TARGETS[arch]["triple"]
     data = json.loads(snapshot_manifest.read_text())
-    if data.get("arch") != ARCH or data.get("target_triple") != triple:
+    if data.get("arch") != arch or data.get("target_triple") != triple:
         raise ValueError(
             f"snapshot manifest target {data.get('target_triple')}/{data.get('arch')} "
-            f"does not match package target {triple}/{ARCH}"
+            f"does not match package target {triple}/{arch}"
         )
     actual_size = snapshot_bin.stat().st_size
     if data.get("snapshot_size") != actual_size:
@@ -295,6 +317,7 @@ def _read_build_metadata(path: pathlib.Path) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arch", required=True, choices=sorted(TARGETS))
     parser.add_argument("--prefix", required=True, help="staged package prefix")
     parser.add_argument("--version", required=True)
     parser.add_argument("--cargo-output",
@@ -316,8 +339,24 @@ def main() -> int:
     if args.manifest:
         if not args.v8_component_manifest or not args.build_metadata:
             parser.error("--manifest requires --v8-component-manifest and --build-metadata")
-        if not args.snapshot_bin or not args.snapshot_manifest:
-            parser.error("--manifest requires --snapshot-bin and --snapshot-manifest")
+        snapshot_policy = SNAPSHOT_POLICIES[args.arch]
+        snapshots: list[dict] = []
+        if snapshot_policy == "embedded":
+            if not args.snapshot_bin or not args.snapshot_manifest:
+                parser.error(
+                    f"--manifest --arch {args.arch} requires --snapshot-bin and "
+                    "--snapshot-manifest (this arch's policy is 'embedded')"
+                )
+            snapshots = [
+                snapshot_identity(
+                    args.arch, pathlib.Path(args.snapshot_bin), pathlib.Path(args.snapshot_manifest)
+                )
+            ]
+        elif args.snapshot_bin or args.snapshot_manifest:
+            parser.error(
+                f"--manifest --arch {args.arch}'s policy is 'none' (no snapshot has been "
+                "generated for this arch yet); --snapshot-bin/--snapshot-manifest must not be given"
+            )
         needed = []
         if args.needed_from:
             needed = [
@@ -325,21 +364,21 @@ def main() -> int:
                 for line in pathlib.Path(args.needed_from).read_text().splitlines()
                 if line.strip()
             ]
-        manifest_relative = "share/migo/linux-x86_64-manifest.json"
+        manifest_relative = f"share/migo/linux-{args.arch}-manifest.json"
         artifacts = package_artifacts(
             prefix,
             exclude={manifest_relative},
         )
         manifest = render_manifest(
+            arch=args.arch,
             version=args.version,
             needed=needed,
             v8=_read_v8_provenance(pathlib.Path(args.v8_component_manifest)),
             sysroot=args.sysroot,
             build_metadata=_read_build_metadata(pathlib.Path(args.build_metadata)),
             artifacts=artifacts,
-            snapshot=snapshot_identity(
-                pathlib.Path(args.snapshot_bin), pathlib.Path(args.snapshot_manifest)
-            ),
+            snapshot_policy=snapshot_policy,
+            snapshots=snapshots,
         )
         out_dir = prefix / "share" / "migo"
         out_dir.mkdir(parents=True, exist_ok=True)

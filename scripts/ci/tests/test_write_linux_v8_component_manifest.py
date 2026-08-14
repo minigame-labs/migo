@@ -162,6 +162,7 @@ class LinuxV8ComponentWriterTest(unittest.TestCase):
 
     def test_component_records_linux_floor_and_exact_v8_revisions(self):
         component = writer.build_component(
+            arch="x86_64",
             rusty_v8_version="145.0.0",
             rusty_v8_revision="a" * 40,
             v8_revision="b" * 40,
