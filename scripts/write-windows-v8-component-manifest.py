@@ -29,7 +29,20 @@ import subprocess
 import sys
 import tempfile
 
-TARGET_TRIPLE = "x86_64-pc-windows-msvc"
+TARGETS = {
+    "x86_64": {
+        "triple": "x86_64-pc-windows-msvc",
+        "cpu_baseline": "x86-64-v1",
+        "required_cpu_features": ["cmov", "sse2"],
+        "msvc_arch_label": "x64",
+    },
+    "aarch64": {
+        "triple": "aarch64-pc-windows-msvc",
+        "cpu_baseline": "armv8-a",
+        "required_cpu_features": ["neon"],
+        "msvc_arch_label": "arm64, cross from x64 host",
+    },
+}
 
 
 def run(command: list[str], label: str) -> str:
@@ -92,6 +105,7 @@ def normalized_gn_arguments(value: str) -> list[str]:
 def verify_against_lock(
     lock_path: pathlib.Path,
     *,
+    arch: str,
     rusty_v8_version: str,
     rusty_v8_revision: str,
     v8_revision: str,
@@ -118,9 +132,10 @@ def verify_against_lock(
                 f"lock has {expected!r}, build used {actual!r}"
             )
 
-    target = (lock.get("targets") or {}).get("x86_64")
-    if not isinstance(target, dict) or target.get("triple") != TARGET_TRIPLE:
-        raise RuntimeError(f"{lock_path.name} does not pin the {TARGET_TRIPLE} target")
+    expected_triple = TARGETS[arch]["triple"]
+    target = (lock.get("targets") or {}).get(arch)
+    if not isinstance(target, dict) or target.get("triple") != expected_triple:
+        raise RuntimeError(f"{lock_path.name} does not pin the {expected_triple} target")
 
     # Every argument the lock pins must appear with the same value. The build may
     # pass more (paths, target dirs); it may not contradict the lock.
@@ -151,6 +166,7 @@ def verify_against_lock(
 
 def build_component(
     *,
+    arch: str,
     rusty_v8_version: str,
     rusty_v8_revision: str,
     v8_revision: str,
@@ -163,16 +179,17 @@ def build_component(
     linker: str,
     recipe_sha256: str,
 ) -> dict:
+    target_spec = TARGETS[arch]
     return {
         "schema": "migo-v8-component-manifest/v1",
         "component_id": "",
         "target": {
-            "triple": TARGET_TRIPLE,
+            "triple": target_spec["triple"],
             "os": "windows",
-            "arch": "x86_64",
+            "arch": arch,
             "abi": "msvc",
-            "cpu_baseline": "x86-64-v1",
-            "required_cpu_features": ["cmov", "sse2"],
+            "cpu_baseline": target_spec["cpu_baseline"],
+            "required_cpu_features": target_spec["required_cpu_features"],
             # The MSVC runtime is a redistributable the host ships, not a floor
             # the loader enforces the way glibc is on Linux; the meaningful
             # constraint is which CRT this was compiled against.
@@ -218,6 +235,7 @@ def build_component(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arch", required=True, choices=sorted(TARGETS))
     parser.add_argument("--repo-root", required=True, type=pathlib.Path)
     parser.add_argument("--rusty-v8-src", required=True, type=pathlib.Path)
     parser.add_argument("--gn-args", required=True)
@@ -229,6 +247,7 @@ def main() -> int:
     parser.add_argument("--lock", required=True, type=pathlib.Path)
     parser.add_argument("--msvc-version", required=True)
     parser.add_argument("--sdk-version", required=True)
+    parser.add_argument("--rustc-version", required=True)
     parser.add_argument("--tool", type=pathlib.Path)
     arguments = parser.parse_args()
 
@@ -275,6 +294,7 @@ def main() -> int:
 
     verify_against_lock(
         arguments.lock.resolve(),
+        arch=arguments.arch,
         rusty_v8_version=rusty_v8_version,
         rusty_v8_revision=rusty_v8_revision,
         v8_revision=v8_revision,
@@ -283,14 +303,20 @@ def main() -> int:
     )
 
     component = build_component(
+        arch=arguments.arch,
         rusty_v8_version=rusty_v8_version,
         rusty_v8_revision=rusty_v8_revision,
         v8_revision=v8_revision,
         gn_args=gn_args,
         archive_sha256=hash_file(products["archive"]),
         binding_sha256=hash_file(products["binding"]),
-        rustc=run(["rustc", "--version", "--verbose"], "rustc"),
-        compiler=f"MSVC {arguments.msvc_version} (cl.exe, x64)",
+        # Passed in rather than queried here: this script runs from WSL, and
+        # `rustc --version` from there reports WSL's own Linux toolchain, not
+        # the pinned Windows one (rust-toolchain.toml) that actually built the
+        # archive. build-v8-windows.sh captures it from inside the batch file,
+        # after cd'ing into the checkout so the pin takes effect.
+        rustc=arguments.rustc_version,
+        compiler=f"MSVC {arguments.msvc_version} (cl.exe, {TARGETS[arguments.arch]['msvc_arch_label']})",
         sdk=f"Windows SDK {arguments.sdk_version}",
         linker=f"MSVC link.exe {arguments.msvc_version}",
         recipe_sha256=hash_file(repo / "scripts/build-v8-windows.sh"),

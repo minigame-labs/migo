@@ -86,9 +86,9 @@ engine/third_party/rusty_v8/*/gn_out/
 # Windows bindgen cannot produce a correct binding (see build-v8-windows.sh's
 # comment), so the committed one is a required input the build script reuses,
 # same as the Android and Linux bindings beside it.
-engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.lib
-engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.dll
-engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.dll.lib
+engine/third_party/rusty_v8/*-pc-windows-msvc/rusty_v8.lib
+engine/third_party/rusty_v8/*-pc-windows-msvc/rusty_v8.dll
+engine/third_party/rusty_v8/*-pc-windows-msvc/rusty_v8.dll.lib
 
 # The Debian bullseye sysroot tree scripts/fetch-linux-sysroot.sh unpacks from
 # Chromium's published tarball. sysroots.json beside it is tracked, and is the whole

@@ -1766,19 +1766,36 @@ fn validate_linux_v8_target(target: &TargetIdentity) -> Result<(), ManifestError
 }
 
 fn validate_windows_v8_target(target: &TargetIdentity) -> Result<(), ManifestError> {
-    require_equal("target.triple", &target.triple, "x86_64-pc-windows-msvc")?;
+    let (expected_baseline, expected_features): (&str, &[&str]) = match target.arch.as_str() {
+        "x86_64" => ("x86-64-v1", &["cmov", "sse2"]),
+        "aarch64" => ("armv8-a", &["neon"]),
+        arch => {
+            return Err(ManifestError::new(format!(
+                "unsupported Windows V8 target arch: {arch}"
+            )));
+        }
+    };
+    require_equal(
+        "target.triple",
+        &target.triple,
+        &format!("{}-pc-windows-msvc", target.arch),
+    )?;
     require_equal("target.os", &target.os, "windows")?;
     require_equal("target.abi", &target.abi, "msvc")?;
-    require_equal("target.arch", &target.arch, "x86_64")?;
-    require_equal("target.cpu_baseline", &target.cpu_baseline, "x86-64-v1")?;
+    require_equal(
+        "target.cpu_baseline",
+        &target.cpu_baseline,
+        expected_baseline,
+    )?;
     require_sorted_unique(
         "target.required_cpu_features",
         &target.required_cpu_features,
     )?;
-    if target.required_cpu_features != ["cmov", "sse2"] {
-        return Err(ManifestError::new(
-            "target.required_cpu_features for Windows x86_64 must be [\"cmov\", \"sse2\"]",
-        ));
+    if target.required_cpu_features != expected_features {
+        return Err(ManifestError::new(format!(
+            "target.required_cpu_features for Windows {} must be {expected_features:?}",
+            target.arch
+        )));
     }
     if target.runtime_floor.len() != 1
         || target.runtime_floor.get("msvc_runtime").map(String::as_str)
