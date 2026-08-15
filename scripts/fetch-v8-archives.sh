@@ -120,18 +120,22 @@ with open(sys.argv[1]) as f:
 
 # (target) -> primary archive's local filename. Every target but Windows uses
 # the same "librusty_v8.a" name the directory-derived asset name is built from;
-# Windows' primary build product is the static rusty_v8.lib -- hashes.archive
-# in its component manifest is computed from exactly that file (see
-# write-windows-v8-component-manifest.py).
+# every *-pc-windows-msvc target's primary build product is the static
+# rusty_v8.lib -- hashes.archive in its component manifest is computed from
+# exactly that file (see write-windows-v8-component-manifest.py). Matched by
+# pattern, not the one literal x86_64-pc-windows-msvc: a per-arch case arm here
+# is exactly the bug that shipped aarch64-pc-windows-msvc with Unix naming and
+# a 404 (fetch-v8-archives.sh tried librusty_v8-aarch64-pc-windows-msvc.a,
+# which was never a name this project's Windows archives used).
 primary_filename() {
     case "$1" in
-        x86_64-pc-windows-msvc) echo "rusty_v8.lib" ;;
+        *-pc-windows-msvc) echo "rusty_v8.lib" ;;
         *) echo "librusty_v8.a" ;;
     esac
 }
 primary_asset_name() {
     case "$1" in
-        x86_64-pc-windows-msvc) echo "rusty_v8-$1.lib" ;;
+        *-pc-windows-msvc) echo "rusty_v8-$1.lib" ;;
         *) echo "librusty_v8-$1.a" ;;
     esac
 }
@@ -144,7 +148,7 @@ primary_asset_name() {
 # records every shipped file's hash.
 companion_filenames() {
     case "$1" in
-        x86_64-pc-windows-msvc) printf '%s\n' rusty_v8.dll rusty_v8.dll.lib ;;
+        *-pc-windows-msvc) printf '%s\n' rusty_v8.dll rusty_v8.dll.lib ;;
     esac
 }
 companion_asset_name() {
