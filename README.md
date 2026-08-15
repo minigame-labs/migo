@@ -28,9 +28,9 @@ Reproducible benchmarks against the system WebView — same game, same device, s
 | Platform | Status | Released artifacts |
 |---|---|---|
 | **Android** (arm64-v8a, x86_64) | Released | AAR with the Java/Kotlin SDK; a C ABI package per ABI (headers, static library, CMake package) |
-| **Linux** (x86_64) | Released | Static and shared library, pkg-config and CMake packages; Qt 6 / X11 host kit in-tree |
-| **Windows** (x86_64) | Released | `migo.dll` with its import library, headers, a CMake package, and the ANGLE and V8 runtime DLLs it loads by name |
-| **OpenHarmony / HarmonyOS NEXT** (aarch64, x86_64) | Buildable and gated | A C ABI package per architecture (headers, static library, CMake package, manifest), produced and gated by one command; not on the releases page yet |
+| **Linux** (x86_64, aarch64) | Released | Static and shared library, pkg-config and CMake packages; Qt 6 / X11 host kit in-tree |
+| **Windows** (x86_64, aarch64) | Released | `migo.dll` with its import library, headers, a CMake package, and the ANGLE and V8 runtime DLLs it loads by name |
+| **OpenHarmony / HarmonyOS NEXT** (aarch64, x86_64) | Released | A C ABI package per architecture (headers, static library, CMake package, manifest) |
 | iOS, macOS | Planned | — |
 
 Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Each ships an `.attestation.json` recording the archive's name, size and sha256 — verify a download against it before use.
