@@ -51,17 +51,28 @@ source "$SCRIPT_DIR/lib/release-version.sh"
 # python.exe a literal `/c/...` path it has no notion of, and `json.tool`
 # failed to open it.
 
-TRIPLE="x86_64-pc-windows-msvc"
-PREFIX="$REPO_ROOT/dist/migo-windows-x86_64"
+ARCH="x86_64"
+PREFIX=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        aarch64|x86_64) ARCH="$1"; shift ;;
         --prefix) PREFIX="$2"; shift 2 ;;
         *) echo "[win-sdk-native] unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+# PUBLIC_ARCH names directories (dist/migo-windows-arm64, the ANGLE fetch
+# default); TRIPLE/ARCH stay the internal word everywhere else (V8's own
+# per-target directory, the manifest filename windows-sdk-package.sh writes)
+# -- same aarch64(internal)/arm64(public) split build-v8-windows.sh documents.
+case "$ARCH" in
+    aarch64) TRIPLE="aarch64-pc-windows-msvc"; PUBLIC_ARCH="arm64" ;;
+    x86_64)  TRIPLE="x86_64-pc-windows-msvc";  PUBLIC_ARCH="x86_64" ;;
+esac
+PREFIX="${PREFIX:-$REPO_ROOT/dist/migo-windows-$PUBLIC_ARCH}"
 
 V8_DIR="$REPO_ROOT/engine/third_party/rusty_v8/$TRIPLE"
 ANGLE_DIR="${MIGO_WIN_ANGLE_DIR:-$REPO_ROOT/engine/third_party/angle-windows}"
+[[ "$ARCH" == "aarch64" ]] && ANGLE_DIR="${MIGO_WIN_ANGLE_DIR:-$REPO_ROOT/engine/third_party/angle-windows-arm64}"
 
 # ---- Preconditions ---------------------------------------------------------
 for f in rusty_v8.lib rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
@@ -74,7 +85,7 @@ done
 for f in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
     [[ -f "$ANGLE_DIR/$f" ]] || {
         echo "[win-sdk-native] missing ANGLE runtime DLL: $ANGLE_DIR/$f" >&2
-        echo "[win-sdk-native] fetch with: bash scripts/fetch-windows-angle.sh" >&2
+        echo "[win-sdk-native] fetch with: bash scripts/fetch-windows-angle.sh $PUBLIC_ARCH" >&2
         exit 1
     }
 done
@@ -157,6 +168,13 @@ NATIVE_LIBS="${NATIVE_LIBS_LINE#*native-static-libs: }"
 # 'skparagraph.lib'` that reads like a corrupt build.
 discover_link_search_dirs() {
     local skia extra=() cargo_home_unix d
+    # The `windows` crate ecosystem splits its import libs into one crate per
+    # target arch (windows_x86_64_msvc, windows_aarch64_msvc, ...); this must
+    # match whichever one $TRIPLE actually pulled in, or the scan silently
+    # finds nothing on aarch64 while still finding a stale x64 one from a
+    # previous build sharing the same cargo registry cache.
+    local windows_crate_arch="x86_64"
+    [[ "$ARCH" == "aarch64" ]] && windows_crate_arch="aarch64"
     skia="$(find "$CARGO_TARGET_DIR_UNIX/$TRIPLE/release/build" \
         -path '*skia-bindings-*/out/skia/skparagraph.lib' 2>/dev/null | head -1)"
     [[ -n "$skia" ]] || return 1
@@ -165,7 +183,7 @@ discover_link_search_dirs() {
         && extra+=("$(to_dos "$CARGO_TARGET_DIR_UNIX/$TRIPLE/release/gn_out/obj")")
     cargo_home_unix="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")"
     while IFS= read -r d; do extra+=("$(to_dos "$d")"); done \
-        < <(find "$cargo_home_unix/registry" -path '*windows_x86_64_msvc-*/lib' -type d 2>/dev/null)
+        < <(find "$cargo_home_unix/registry" -path "*windows_${windows_crate_arch}_msvc-*/lib" -type d 2>/dev/null)
     (IFS=';'; printf '%s' "${extra[*]}")
 }
 
@@ -207,7 +225,7 @@ windows_sdk_stage_package "$PREFIX" "$REPO_ROOT/include/migo" \
     "$OUT_UNIX/migo.lib" "$OUT_UNIX/migo.dll" "$V8_MATERIALISED_DIR_UNIX/rusty_v8.dll" "$ANGLE_DIR"
 windows_sdk_write_cmake_package "$PREFIX" "$VERSION"
 info "writing the package manifest"
-windows_sdk_write_manifest "$PREFIX" "$VERSION"
+windows_sdk_write_manifest "$PREFIX" "$VERSION" "$ARCH" "$TRIPLE"
 
 # Deliberately does not self-invoke test-windows-sdk-contract.sh: the CI job
 # runs it as its own explicit step (see release.yml's release-windows job) so
