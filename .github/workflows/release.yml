@@ -976,6 +976,87 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Same steps as release-windows above, on a native windows-11-arm runner --
+  # unlike this project's own WSL2 dev machine (x64 host), there is no
+  # cross-compilation here at all: ilammy/msvc-dev-cmd with arch: arm64 on an
+  # actually-arm64 runner just puts native arm64 cl.exe/link.exe on PATH, the
+  # same way it puts native x64 tools on PATH for release-windows. The V8 and
+  # ANGLE archives this job fetches were themselves built by cross-compiling
+  # from an x64 dev machine (scripts/build-v8-windows.sh /
+  # scripts/build-angle-windows.sh aarch64) -- that cross-compilation
+  # complexity lives entirely in those two scripts and the machine that ran
+  # them once, not in this job, which only links against their output.
+  #
+  # skia-safe's prebuilt binary cache is unlikely to carry an
+  # aarch64-pc-windows-msvc entry (a target this rare), so the from-source
+  # Skia build via ninja that release-windows treats as a defensive fallback
+  # is the expected path here -- hence the longer timeout.
+  release-windows-arm64:
+    needs: [quality-gate, host-engine-tests]
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Install ninja (Skia from-source fallback)
+        shell: bash
+        run: command -v ninja >/dev/null 2>&1 || choco install ninja -y --no-progress
+
+      - name: Install LLVM/clang-cl
+        shell: bash
+        run: |
+          command -v clang-cl >/dev/null 2>&1 || choco install llvm -y --no-progress
+          echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+
+      - name: Fetch and verify the windows-msvc V8 archive
+        shell: bash
+        run: bash scripts/fetch-v8-archives.sh aarch64-pc-windows-msvc
+
+      - name: Fetch and verify the pinned ANGLE runtime
+        shell: bash
+        run: bash scripts/fetch-windows-angle.sh arm64
+
+      - name: Build the Windows SDK
+        shell: bash
+        run: bash scripts/build-windows-sdk-native.sh aarch64
+
+      - name: Windows SDK package contract
+        shell: bash
+        run: bash scripts/test-windows-sdk-contract.sh aarch64 --strict
+
+      - name: Package the Windows SDK for release
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          bash scripts/package-sdk.sh dist/migo-windows-arm64 --output-dir dist/release
+
+      - name: Upload the staged Windows arm64 assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows-arm64
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 1
+
   # ── The only publisher ──────────────────────────────────────────────────
   # Publishing lived inside release-android, so no point in the graph saw every
   # platform's output. That is what made a whole-release checksum manifest impossible
@@ -986,7 +1067,7 @@ jobs:
   #
   # Adding a platform is now additive: one job, one entry in `needs`.
   publish:
-    needs: [release-android, release-linux, release-ohos, release-windows]
+    needs: [release-android, release-linux, release-ohos, release-windows, release-windows-arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

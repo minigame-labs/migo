@@ -16,8 +16,8 @@
 #     DLL's imports resolve, which is answered by actually loading it.
 #
 # Usage:
-#   scripts/test-windows-sdk-contract.sh            # skips MSVC checks if absent
-#   scripts/test-windows-sdk-contract.sh --strict   # any skip is a failure
+#   scripts/test-windows-sdk-contract.sh [aarch64|x86_64] [--strict]
+#   (no arch: skips MSVC checks if absent; --strict: any skip is a failure)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,9 +28,26 @@ source "$SCRIPT_DIR/lib/python-cmd.sh"
 source "$SCRIPT_DIR/lib/windows-sdk-package.sh"
 # shellcheck source=scripts/lib/windows-native-toolchain.sh
 source "$SCRIPT_DIR/lib/windows-native-toolchain.sh"
-PREFIX="${MIGO_WINDOWS_PREFIX:-$REPO_ROOT/dist/migo-windows-x86_64}"
+
+ARCH="x86_64"
 STRICT=0
-[[ "${1:-}" == "--strict" ]] && STRICT=1
+for arg in "$@"; do
+    case "$arg" in
+        aarch64|x86_64) ARCH="$arg" ;;
+        --strict) STRICT=1 ;;
+        *) echo "usage: $0 [aarch64|x86_64] [--strict]" >&2; exit 2 ;;
+    esac
+done
+# PUBLIC_ARCH names the staged prefix directory (dist/migo-windows-arm64);
+# ARCH itself stays the internal word (aarch64) for the manifest filename and
+# its own JSON "arch" field, matching linux-$ARCH-manifest.json's convention
+# and the project-wide aarch64(internal)/arm64(public) split documented on
+# build-v8-windows.sh's public_ohos_arch()-referencing comment.
+case "$ARCH" in
+    aarch64) PUBLIC_ARCH="arm64";  TARGET="aarch64-pc-windows-msvc" ;;
+    x86_64)  PUBLIC_ARCH="x86_64"; TARGET="x86_64-pc-windows-msvc" ;;
+esac
+PREFIX="${MIGO_WINDOWS_PREFIX:-$REPO_ROOT/dist/migo-windows-$PUBLIC_ARCH}"
 
 FAILURES=0
 SKIPS=0
@@ -61,9 +78,9 @@ done
 # Windows archive was a `tar` typed by hand instead of the reproducible path. The
 # attestation binds the package bytes to that file, so its absence is not cosmetic.
 # The structural checking lives in scripts/lib/windows_package_manifest.py.
-MANIFEST="$PREFIX/share/migo/windows-x86_64-manifest.json"
+MANIFEST="$PREFIX/share/migo/windows-$ARCH-manifest.json"
 if [[ ! -f "$MANIFEST" ]]; then
-    fail "missing package manifest: share/migo/windows-x86_64-manifest.json"
+    fail "missing package manifest: share/migo/windows-$ARCH-manifest.json"
 elif manifest_report="$("$(python_cmd)" "$SCRIPT_DIR/lib/windows_package_manifest.py" "$MANIFEST" "$PREFIX")"; then
     pass "manifest declares its runtime DLLs and artifact hashes, and they match the package"
 else
@@ -102,11 +119,19 @@ if (( IS_WSL )); then
     find_vcvars() {
         local vswhere="/mnt/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
         [[ -f "$vswhere" ]] || return 1
+        # x86.x64 unconditionally: even the aarch64 probe below runs host x64
+        # cl.exe/dumpbin.exe (via vcvarsamd64_arm64.bat) to inspect and load an
+        # arm64 migo.dll -- see build-v8-windows.sh's own check_ready comment
+        # on why the host tools are required regardless of target arch.
+        local -a requires=(-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64)
+        [[ "$ARCH" == "aarch64" ]] && requires+=(-requires Microsoft.VisualStudio.Component.VC.Tools.ARM64)
         local root
-        root="$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+        root="$("$vswhere" -products '*' "${requires[@]}" \
             -latest -format value -property installationPath 2>/dev/null | tr -d '\r')"
         [[ -n "$root" ]] || return 1
-        printf '%s\\VC\\Auxiliary\\Build\\vcvars64.bat' "$root"
+        local vcvars_bat="vcvars64.bat"
+        [[ "$ARCH" == "aarch64" ]] && vcvars_bat="vcvarsamd64_arm64.bat"
+        printf '%s\\VC\\Auxiliary\\Build\\%s' "$root" "$vcvars_bat"
     }
     VCVARS="$(find_vcvars || true)"
     TOOLCHAIN_READY=0

@@ -131,14 +131,22 @@ endif()
 CMAKE
 }
 
-# Writes share/migo/windows-x86_64-manifest.json. The runtime_dependencies list
-# is the part with teeth: a Windows consumer must redistribute these DLLs, and
-# the process loads them by name, so the package has to say which ones it
-# shipped -- turning "the ANGLE directory was incomplete" from a silent
-# shipping defect into a failure windows_sdk_stage_package already raises
-# before this function is ever reached.
+# Writes share/migo/windows-<arch>-manifest.json. The runtime_dependencies
+# list is the part with teeth: a Windows consumer must redistribute these
+# DLLs, and the process loads them by name, so the package has to say which
+# ones it shipped -- turning "the ANGLE directory was incomplete" from a
+# silent shipping defect into a failure windows_sdk_stage_package already
+# raises before this function is ever reached.
+#
+# arch is migo's internal word (x86_64 / aarch64, matching target.arch
+# elsewhere in this repo's manifests); target is the full Rust triple. Kept as
+# two separate parameters rather than derived from one another because the
+# aarch64 -> arm64 word substitution is a *public*-facing convention (see
+# build-ohos-sdk.sh's public_ohos_arch() and build-v8-windows.sh's own
+# comment on the same convention) that belongs at the call site, not
+# hardcoded into this shared file.
 windows_sdk_write_manifest() {
-    local prefix="$1" version="$2"
+    local prefix="$1" version="$2" arch="${3:-x86_64}" target="${4:-x86_64-pc-windows-msvc}"
     local sha_of
     sha_of() { sha256sum "$1" | cut -d' ' -f1; }
 
@@ -155,16 +163,17 @@ windows_sdk_write_manifest() {
     done
     runtime_json="[${runtime_json}"$'\n    ]'
 
-    cat > "$prefix/share/migo/windows-x86_64-manifest.json" <<MANIFEST
+    local manifest_path="$prefix/share/migo/windows-$arch-manifest.json"
+    cat > "$manifest_path" <<MANIFEST
 {
   "schema": "migo-windows-package-manifest/v1",
   "version": "$version",
   "product_profile": "full",
   "build_type": "release",
-  "target": "x86_64-pc-windows-msvc",
+  "target": "$target",
   "os": "windows",
   "abi": "msvc",
-  "arch": "x86_64",
+  "arch": "$arch",
   "snapshot_policy": "none",
   "abi_note": "migo.dll is linked from the capi staticlib with an explicit .def export allowlist, so the export table is exactly the documented migo_* surface. V8 links against its own libc++ and therefore ships as a separate rusty_v8.dll rather than being absorbed into migo.dll.",
   "runtime_dependencies": $runtime_json,
@@ -173,12 +182,12 @@ windows_sdk_write_manifest() {
     "bin/migo.dll": "$(sha_of "$prefix/bin/migo.dll")"
   },
   "known_gaps": [
-    "v8 startup snapshot: not embedded for this platform yet (runtime-v8/build.rs embeds for android and linux, not windows -- no SNAPSHOT-full-windows-x86_64.bin has been generated), so a cold start parses extension JS from source instead of deserialising a V8 heap",
+    "v8 startup snapshot: not embedded for this platform yet (runtime-v8/build.rs embeds for android and linux, not windows -- no SNAPSHOT-full-windows-$arch.bin has been generated), so a cold start parses extension JS from source instead of deserialising a V8 heap",
     "NuGet packaging is not implemented; the package is a CMake find_package tree"
   ]
 }
 MANIFEST
 
-    "$(python_cmd)" -m json.tool "$prefix/share/migo/windows-x86_64-manifest.json" >/dev/null \
+    "$(python_cmd)" -m json.tool "$manifest_path" >/dev/null \
         || { echo "[win-sdk] the generated manifest is not valid JSON" >&2; return 1; }
 }
