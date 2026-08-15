@@ -10,9 +10,13 @@
 # trusted, download failing closed rather than silently.
 #
 # Usage:
-#   scripts/fetch-windows-angle.sh [--check] [DEST_DIR]
+#   scripts/fetch-windows-angle.sh [x64|arm64] [--check] [DEST_DIR]
+#   x64|arm64   default: x64 (every existing caller predates arm64 and
+#               passes no arch, so this default is load-bearing, not tidiness)
 #   --check     verify what is already present; download nothing
-#   DEST_DIR    default: engine/third_party/angle-windows
+#   DEST_DIR    default: engine/third_party/angle-windows (x64, unchanged --
+#               see build-angle-windows.sh's header for why arm64 does not
+#               share it), engine/third_party/angle-windows-arm64 for arm64
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,24 +31,30 @@ err()  { printf '\033[0;31m[win-angle] %s\033[0m\n' "$*" >&2; }
 
 [[ -f "$LOCK" ]] || { err "pin not found: $LOCK"; exit 1; }
 
+TARGET_ARCH="x64"
 CHECK_ONLY=0
 DEST=""
 for arg in "$@"; do
     case "$arg" in
+        x64|arm64) TARGET_ARCH="$arg" ;;
         --check) CHECK_ONLY=1 ;;
         -*) err "unknown option: $arg"; exit 2 ;;
         *) DEST="$arg" ;;
     esac
 done
-DEST="${DEST:-$ROOT/engine/third_party/angle-windows}"
+case "$TARGET_ARCH" in
+    x64)   DEST="${DEST:-$ROOT/engine/third_party/angle-windows}" ;;
+    arm64) DEST="${DEST:-$ROOT/engine/third_party/angle-windows-arm64}" ;;
+esac
 
-# $LOCK is passed as sys.argv[1], not interpolated into the python source
-# string: MSYS/Git-Bash's automatic POSIX-to-DOS path conversion (relied on
-# here -- see build-windows-sdk-native.sh for where that conversion is
-# deliberately disabled instead, and why) rewrites whole argv tokens handed to
-# a native, non-MSYS python.exe, not substrings embedded inside a larger
-# string argument. A path baked into the -c source itself reaches python
-# unconverted and native Windows has no notion of a `/d/a/...` path.
+# $LOCK and $TARGET_ARCH are passed as sys.argv, not interpolated into the
+# python source string: MSYS/Git-Bash's automatic POSIX-to-DOS path
+# conversion (relied on here -- see build-windows-sdk-native.sh for where
+# that conversion is deliberately disabled instead, and why) rewrites whole
+# argv tokens handed to a native, non-MSYS python.exe, not substrings
+# embedded inside a larger string argument. A path baked into the -c source
+# itself reaches python unconverted and native Windows has no notion of a
+# `/d/a/...` path.
 BASE_URL="$("$(python_cmd)" -c "
 import json, sys
 with open(sys.argv[1]) as f:
@@ -52,17 +62,26 @@ with open(sys.argv[1]) as f:
 " "$LOCK")"
 FILES=(libEGL.dll libGLESv2.dll d3dcompiler_47.dll)
 
+asset_name() {
+    "$(python_cmd)" -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    print(json.load(f)['targets'][sys.argv[2]]['files'][sys.argv[3]]['asset'])
+" "$LOCK" "$TARGET_ARCH" "$1"
+}
+
 expected_sha() {
     "$(python_cmd)" -c "
 import json, sys
 with open(sys.argv[1]) as f:
-    print(json.load(f)['files'][sys.argv[2]]['sha256'])
-" "$LOCK" "$1"
+    print(json.load(f)['targets'][sys.argv[2]]['files'][sys.argv[3]]['sha256'])
+" "$LOCK" "$TARGET_ARCH" "$1"
 }
 
 failures=0
 for name in "${FILES[@]}"; do
     path="$DEST/$name"
+    asset="$(asset_name "$name")"
     want="$(expected_sha "$name")"
 
     if [[ -f "$path" ]]; then
@@ -81,9 +100,9 @@ for name in "${FILES[@]}"; do
     fi
 
     mkdir -p "$DEST"
-    info "downloading $name"
-    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$path" "$BASE_URL/$name"; then
-        err "$name: download failed from $BASE_URL/$name"
+    info "downloading $name ($asset)"
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$path" "$BASE_URL/$asset"; then
+        err "$name: download failed from $BASE_URL/$asset"
         rm -f "$path"
         failures=$((failures + 1)); continue
     fi
@@ -103,4 +122,4 @@ if (( failures > 0 )); then
     err "$failures file(s) unavailable or unverified"
     exit 1
 fi
-ok "ANGLE runtime verified in $DEST"
+ok "ANGLE runtime ($TARGET_ARCH) verified in $DEST"

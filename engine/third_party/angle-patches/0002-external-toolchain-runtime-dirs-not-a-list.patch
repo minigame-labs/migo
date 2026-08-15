@@ -1,0 +1,20 @@
+diff --git a/config/win/visual_studio_version.gni b/config/win/visual_studio_version.gni
+index bd4116693..0d6eb4505 100644
+--- a/config/win/visual_studio_version.gni
++++ b/config/win/visual_studio_version.gni
+@@ -40,7 +40,14 @@ if (visual_studio_path == "") {
+          "You must set the windows_sdk_version if you set the path")
+   assert(wdk_path != "",
+          "You must set the wdk_path if you set the visual studio path")
+-  visual_studio_runtime_dirs = []
++  # A placeholder rather than "": setup_toolchain.py takes this positionally
++  # as argv[3] (<runtime dirs>), and GN's exec_script drops zero-length
++  # string arguments before the subprocess sees them, shifting every
++  # argument after it by one. windows_sdk_path is already a valid existing
++  # directory in scope here, and harmless to prepend to PATH (the only use
++  # of runtime_dirs, for pre-2017-toolset CRT redistributables this build
++  # does not need).
++  visual_studio_runtime_dirs = windows_sdk_path
+ }
+ 
+ visual_studio_version_logs = [ "windows_sdk_version=${windows_sdk_version}" ]

@@ -1,0 +1,26 @@
+diff --git a/toolchain/win/setup_toolchain.py b/toolchain/win/setup_toolchain.py
+index 5e6198768..c2039345d 100644
+--- a/toolchain/win/setup_toolchain.py
++++ b/toolchain/win/setup_toolchain.py
+@@ -21,7 +21,20 @@ sys.path.append(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+ import gn_helpers
+ 
+ SCRIPT_DIR = os.path.dirname(__file__)
+-SDK_VERSION = '10.0.28000.0'
++# MIGO: was a hardcoded '10.0.28000.0' -- a version this repo's own vendored
++# copy of the SDK never ships (confirmed: absent from every Windows SDK
++# release actually installable as of this patch, including the newest, since
++# it is Chromium's *internal*-toolchain pin, meant to be satisfied by
++# Google's hermetic SDK package rather than a public installer). That value
++# is only reachable through _LoadToolchainEnv's DEPOT_TOOLS_WIN_TOOLCHAIN=0
++# branch -- the one every external contributor takes -- where it is passed
++# straight to vcvarsall.bat as an explicit version request, which then fails
++# validation against whatever SDK is actually on disk. Reading it from an
++# env var (falling back to the same broken constant so a misconfigured
++# caller fails exactly as before) lets the build scripts that invoke this
++# one supply whatever SDK version their own probing found installed, the
++# same way they already do for MSVC_VERSION and windows_sdk_version.
++SDK_VERSION = os.environ.get('MIGO_ANGLE_WIN_SDK_VERSION', '10.0.28000.0')
+ MSVC_DIR = re.compile('^.*/VC/Tools/MSVC/[^/]+/include$')
+ WINDOWS_KITS_DIR = re.compile(r'^(.*/Windows Kits/\d+/Include/[^/]+)/.*')
+ 

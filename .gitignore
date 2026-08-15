@@ -101,7 +101,13 @@ engine/third_party/linux-sysroot/*
 # pinned by contracts/artifact-manifest/windows-angle.lock.json (which is
 # tracked). No sibling file here plays sysroots.json's role because there is
 # nothing to unpack -- each DLL is fetched and hash-checked individually.
+# angle-windows-{x64,arm64}/ (no trailing slash after the arch, unlike the
+# unsuffixed one above) are scripts/build-angle-windows.sh's own local build
+# output -- the same class of build product, gitignored for the same reason,
+# before it becomes a hash-pinned, fetchable release asset the way the
+# unsuffixed directory's contents already are.
 engine/third_party/angle-windows/
+engine/third_party/angle-windows-*/
 
 # Binaries built by the out-of-tree consumer examples. They are proof the
 # package works, not source; tests/c_host/build-with-pkgconfig.sh and the

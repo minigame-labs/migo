@@ -1,27 +1,58 @@
 {
-  "schema": "migo-windows-angle-lock/v1",
-  "angle_version": "2.1.43007.0",
-  "angle_git_hash": "3988f897b8e2",
-  "build_date": "2025-11-04T22:02:20Z",
-  "arch": "x64",
+  "schema": "migo-windows-angle-lock/v2",
   "release": "https://github.com/minigame-labs/migo/releases/download/v8-archives-e6a88b3",
-  "files": {
-    "libEGL.dll": {
-      "size_bytes": 503936,
-      "sha256": "34f93d0c14cb4abea5e4bbd70015e6a0ba1b21e6b7a1b172c2c5c95643b877ca"
+  "targets": {
+    "x64": {
+      "triple": "x86_64-pc-windows-msvc",
+      "angle_version": "2.1.43007.0",
+      "angle_git_hash": "3988f897b8e2",
+      "build_date": "2025-11-04T22:02:20Z",
+      "files": {
+        "libEGL.dll": {
+          "asset": "libEGL.dll",
+          "size_bytes": 503936,
+          "sha256": "34f93d0c14cb4abea5e4bbd70015e6a0ba1b21e6b7a1b172c2c5c95643b877ca"
+        },
+        "libGLESv2.dll": {
+          "asset": "libGLESv2.dll",
+          "size_bytes": 7272104,
+          "sha256": "17bfe990238d54563e007ea8f881cac69ff97317c78e2a0e11cb522b2d38700e"
+        },
+        "d3dcompiler_47.dll": {
+          "asset": "d3dcompiler_47.dll",
+          "size_bytes": 4751792,
+          "sha256": "85150f9f04c4be2417e92641fd7ba838a1d39521e0aea7d33a799a77e4d05cdf"
+        }
+      }
     },
-    "libGLESv2.dll": {
-      "size_bytes": 7272104,
-      "sha256": "17bfe990238d54563e007ea8f881cac69ff97317c78e2a0e11cb522b2d38700e"
-    },
-    "d3dcompiler_47.dll": {
-      "size_bytes": 4751792,
-      "sha256": "85150f9f04c4be2417e92641fd7ba838a1d39521e0aea7d33a799a77e4d05cdf"
+    "arm64": {
+      "triple": "aarch64-pc-windows-msvc",
+      "angle_git_hash": "fff51488e419",
+      "build_date": "2026-08-15T02:58:00Z",
+      "files": {
+        "libEGL.dll": {
+          "asset": "libEGL-aarch64-pc-windows-msvc.dll",
+          "size_bytes": 499712,
+          "sha256": "1c174cefd3ad59ef26152f728800614bd1523accb1dd22ce71241c33831a6893"
+        },
+        "libGLESv2.dll": {
+          "asset": "libGLESv2-aarch64-pc-windows-msvc.dll",
+          "size_bytes": 7152640,
+          "sha256": "c70e18239ac05909da3407e9536e5b4ccaaf8ed88cad8f328ad3502046b76b00"
+        },
+        "d3dcompiler_47.dll": {
+          "asset": "d3dcompiler_47-aarch64-pc-windows-msvc.dll",
+          "size_bytes": 8140672,
+          "sha256": "1e59fd5cb9c3df2c38ffef93c3d858288c39a9d7c954d8bf3a9675686a2aff7f"
+        }
+      }
     }
   },
   "notes": {
     "why_self_hosted": "ANGLE (google/angle) publishes no official prebuilt Windows binaries -- confirmed by checking the project's own developer docs, which point contributors at building from source, and by the absence of any release artifact on the upstream repository. The two channels that exist (vcpkg's angle port, and DLLs extracted from a Chromium/Electron install) are both real but neither hands back a single stable, versioned, checksummed download URL the way the OpenHarmony mirror does for ohos-sdk.lock.json. Hosting our own verified copy on the same release tag that already carries the V8 archives (for the identical reason: no upstream single-file distribution) keeps the same fail-closed shape every other pinned dependency in this repository uses -- a committed hash a fetch script checks before use -- rather than trusting whichever mirror happens to be reachable at build time.",
-    "provenance_gap": "These three files were staged by earlier exploratory work on this machine (platforms/windows/spike/) before this lock file existed; their exact acquisition (which of vcpkg / a Chromium extraction / a from-source build produced them) was not recorded at the time. What is independently verifiable now: each DLL's own embedded FileVersion/ProductVersion resource reports 'ANGLE libEGL Dynamic Link Library' / 'ANGLE libGLESv2 Dynamic Link Library', version 2.1.43007 git hash 3988f897b8e2, built 2025-11-04 (readable via PowerShell `(Get-Item <file>).VersionInfo`); d3dcompiler_47.dll reports Microsoft as publisher, version 10.0.26100.4654, matching the Windows 10 SDK's redistributable of the same name. They were also exercised end to end: build-windows-sdk.sh's own contract (test-windows-sdk-contract.sh --strict) loads the linked migo.dll and confirms it can attach a live Win32 surface, which fails immediately if ANGLE cannot initialize a GL context. This is the same trust-on-first-use model ohos-sdk.lock.json states plainly: the pin proves the bytes have not changed since they were hashed, not that the untracked history before that point was clean. Rebuilding ANGLE from source and replacing this pin with a self-built, fully-provenanced archive is future work, tracked the same way the Windows V8 archive was before this session sealed it.",
-    "d3dcompiler_47_is_a_microsoft_file": "Not ANGLE's own output. It is Microsoft's HLSL compiler, redistributed from the Windows 10 SDK's Redist/D3D/x64 directory (present on any machine with the Windows 10/11 SDK installed) rather than built by this project. Pinned here anyway because build-windows-sdk.sh ships it as one unit with the two ANGLE DLLs and test-windows-sdk-contract.sh requires all three present -- see BUILD.md for why it is required rather than optional."
+    "why_targets_and_per_target_asset_names": "Restructured from v1's single flat {arch, files} shape (x64 only) to targets/{x64,arm64} when arm64 was added, mirroring windows-v8.lock.json's own targets dict. Asset names differ by target on purpose: x64's stay the bare 'libEGL.dll' etc. it has always used (unchanged, so its existing release assets and this pin's hashes for them needed no republishing), while arm64's carry an '-aarch64-pc-windows-msvc' suffix -- both targets' files share the same three logical names, and GitHub release assets are a flat namespace with no directories, so distinguishing them by suffix is what avoids x64 and arm64 colliding on 'libEGL.dll'.",
+    "x64_provenance_gap": "The x64 files were staged by earlier exploratory work on this machine (platforms/windows/spike/) before this lock file existed; their exact acquisition (which of vcpkg / a Chromium extraction / a from-source build produced them) was not recorded at the time. What is independently verifiable: each DLL's own embedded FileVersion/ProductVersion resource reports 'ANGLE libEGL Dynamic Link Library' / 'ANGLE libGLESv2 Dynamic Link Library', version 2.1.43007 git hash 3988f897b8e2, built 2025-11-04 (readable via PowerShell `(Get-Item <file>).VersionInfo`); d3dcompiler_47.dll reports Microsoft as publisher, version 10.0.26100.4654, matching the Windows 10 SDK's redistributable of the same name. They were also exercised end to end: build-windows-sdk.sh's own contract (test-windows-sdk-contract.sh --strict) loads the linked migo.dll and confirms it can attach a live Win32 surface, which fails immediately if ANGLE cannot initialize a GL context. This is the same trust-on-first-use model ohos-sdk.lock.json states plainly: the pin proves the bytes have not changed since they were hashed, not that the untracked history before that point was clean.",
+    "arm64_provenance": "Unlike x64, arm64 has no such gap: it was built from source by scripts/build-angle-windows.sh, the first ANGLE-from-source pipeline this project has had for any Windows architecture (arm64 could not have inherited a prebuilt DLL the way x64's history predates this lock file -- none exists to inherit). angle_git_hash fff51488e419 is the ANGLE checkout's actual HEAD at build time (git rev-parse, not a build-generated version string); the three patches in engine/third_party/angle-patches/ that checkout carries are what made an external-contributor build of it possible at all -- see that script's own header for what each one fixes and why. Built with angle_enable_wgpu=false (see the script header for why), so these binaries carry ANGLE's D3D11 and native-Vulkan backends, not WebGPU passthrough.",
+    "d3dcompiler_47_is_a_microsoft_file": "Not ANGLE's own output. It is Microsoft's HLSL compiler, redistributed from the Windows 10/11 SDK's Redist/D3D/<arch> directory (present on any machine with the Windows SDK installed) rather than built by this project. Pinned here anyway because build-windows-sdk.sh ships it as one unit with the two ANGLE DLLs and test-windows-sdk-contract.sh requires all three present -- see BUILD.md for why it is required rather than optional."
   }
 }
