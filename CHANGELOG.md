@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## v0.9.3 (2026-08-15)
+
+The last platform gap closes: Android, Linux, Windows, and OpenHarmony each
+now build and publish both their x86_64 and arm64 release assets entirely in
+CI. No platform's release depends on a local or native-machine build step
+any more — release-windows-arm64 and Linux's arm64 addition are this cycle's
+own new jobs, and this is the first tag either has ever actually run under.
+
 ### Added
+- `release-linux` now builds and publishes `aarch64-unknown-linux-gnu`
+  alongside `x86_64`, cross-compiled from the same x86_64 runner
+- V8 built for `aarch64-pc-windows-msvc`
+- ANGLE built from source for Windows arm64 -- the first ANGLE-from-source
+  pipeline for any Windows arch this project has shipped
+- `release-windows-arm64`, a native `windows-11-arm` CI job producing a real
+  Windows arm64 SDK package, wired into `publish`
 - Runtime generation fencing, callback correlation, and verification lanes
 - Per-session isolate support
 - BLE notification path and audio realtime gates
@@ -15,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session delivery and verification lanes (A12)
 
 ### Fixed
+- `fetch-v8-archives.sh`'s Windows-target file naming matched the literal
+  `x86_64-pc-windows-msvc` only, so `aarch64-pc-windows-msvc` fell through to
+  a Unix-style name (`librusty_v8-aarch64-pc-windows-msvc.a`) that was never
+  published, 404-ing every fetch
+- The x86_64 V8 component manifest's recorded hash and toolchain provenance
+  described a rebuild that was never actually uploaded to the archive
+  release, so `release-windows` failed sha256 verification against the
+  archive that was actually still there
+- `engine/.cargo/config.toml` pinned `CC`/`CXX` to `clang-cl` for
+  `x86_64-pc-windows-msvc` only; `aarch64-pc-windows-msvc` had no
+  corresponding pin, so `cc-rs` fell back to probing versioned compiler names
+  (`clang-18`, ...) that don't exist on a runner with only choco's LLVM on
+  PATH, failing `ring`'s build script
 - A canvas the content never sized now follows a surface that was destroyed and
   recreated at a different size, instead of keeping the size derived from the
   previous one. Rotating while the app is in the background takes that path on
@@ -208,7 +238,8 @@ While the version is below 1.0.0:
 - MINOR version bumps may include breaking changes
 - PATCH version bumps are backward compatible
 
-[Unreleased]: https://github.com/minigame-labs/migo/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/minigame-labs/migo/compare/v0.9.3...HEAD
+[v0.9.3]: https://github.com/minigame-labs/migo/releases/tag/v0.9.3
 [v0.9.2]: https://github.com/minigame-labs/migo/releases/tag/v0.9.2
 [v0.9.0]: https://github.com/minigame-labs/migo/releases/tag/v0.9.0
 [linux-sdk-0.1.0]: https://github.com/minigame-labs/migo/releases/tag/linux-sdk-0.1.0
