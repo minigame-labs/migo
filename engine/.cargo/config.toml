@@ -256,6 +256,14 @@ CXX = "clang++-18"
 CC_x86_64_pc_windows_msvc = "clang-cl"
 CXX_x86_64_pc_windows_msvc = "clang-cl"
 
+# Same reasoning, the arm64 Windows runner: without this, cc-rs's own
+# unpinned-CC fallback probes versioned names (clang-18, clang-17, ...)
+# before trying plain clang/cc, and none of those exist on a runner that only
+# has choco's LLVM on PATH -- surfaced by `ring`'s build script during
+# release-windows-arm64's first real run ("failed to find tool clang-18").
+CC_aarch64_pc_windows_msvc = "clang-cl"
+CXX_aarch64_pc_windows_msvc = "clang-cl"
+
 # Khronos EGL/GL/GLES headers for Skia's GL EGL interface are expected in the
 # environment via CPATH.  On WSL / minimal Ubuntu hosts without root access,
 # run `scripts/dev-setup-skia.sh` once to fetch them to ~/.local/skia-headers
