@@ -35,7 +35,7 @@ Reproducible benchmarks against the system WebView — same game, same device, s
 
 Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Each ships an `.attestation.json` recording the archive's name, size and sha256 — verify a download against it before use.
 
-The C ABI in [`include/migo/`](include/migo/) is a **candidate** — it has a working runtime on Android, Linux and OpenHarmony but is not frozen. Its own README tracks what remains before it can be.
+The C ABI in [`include/migo/`](include/migo/) is a **candidate** — it has a working runtime on every platform above but is not frozen. Its own README tracks what remains before it can be.
 
 ## Quick start
 
@@ -113,7 +113,6 @@ migo/
 |---|---|
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | Host integration examples, one directory per platform |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Reproducible Migo-vs-WebView benchmarks |
-| [migo-test-suite](https://github.com/minigame-labs/migo-test-suite) | Mini-game API conformance test suite |
 
 ## License
 

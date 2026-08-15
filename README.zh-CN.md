@@ -28,15 +28,15 @@
 | 平台 | 状态 | 已发布产物 |
 |---|---|---|
 | **Android**（arm64-v8a、x86_64） | 已发布 | 含 Java/Kotlin SDK 的 AAR;按 ABI 发布的 C ABI 包(头文件、静态库、CMake 包) |
-| **Linux**（x86_64） | 已发布 | 静态库与共享库、pkg-config 与 CMake 包;Qt 6 / X11 host kit 在仓库内 |
-| **Windows**（x86_64） | 已发布 | `migo.dll` 及其导入库、头文件、CMake 包,以及它按名加载的 ANGLE 与 V8 运行时 DLL |
-| **OpenHarmony / HarmonyOS NEXT**（aarch64、x86_64） | 可构建、已门禁 | 按架构产出的 C ABI 包(头文件、静态库、CMake 包、manifest),一条命令产出并自带门禁;尚未上 releases 页面 |
+| **Linux**（x86_64、aarch64） | 已发布 | 静态库与共享库、pkg-config 与 CMake 包;Qt 6 / X11 host kit 在仓库内 |
+| **Windows**（x86_64、aarch64） | 已发布 | `migo.dll` 及其导入库、头文件、CMake 包,以及它按名加载的 ANGLE 与 V8 运行时 DLL |
+| **OpenHarmony / HarmonyOS NEXT**（aarch64、x86_64） | 已发布 | 按架构产出的 C ABI 包(头文件、静态库、CMake 包、manifest) |
 | iOS、macOS | 计划中 | — |
 
 已发布产物见 [releases 页面](https://github.com/minigame-labs/migo/releases)。每个产物都带
 `.attestation.json`,记录归档的名称、大小与 sha256 —— 使用前请对照校验。
 
-[`include/migo/`](include/migo/) 中的 C ABI 目前是 **candidate**——在 Android、Linux 与 OpenHarmony 上已有可用运行时，但尚未冻结。冻结前还剩哪些事项，以该目录下的 README 为准。
+[`include/migo/`](include/migo/) 中的 C ABI 目前是 **candidate**——在上表每个平台上都已有可用运行时，但尚未冻结。冻结前还剩哪些事项，以该目录下的 README 为准。
 
 ## 快速开始
 
@@ -114,7 +114,6 @@ migo/
 |---|---|
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | 各平台宿主集成示例，一个平台一个目录 |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Migo 与 WebView 的可复现对比测试 |
-| [migo-test-suite](https://github.com/minigame-labs/migo-test-suite) | 小游戏 API 兼容性测试套件 |
 
 ## 许可证
 
