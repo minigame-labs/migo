@@ -54,7 +54,7 @@ default-members = [
 # two are held equal by `scripts/test-release-version-contract.sh` rather than by
 # the format. Every member inherits it with `version.workspace = true`.
 [workspace.package]
-version = "0.9.3-rc.2"
+version = "0.9.3-rc.3"
 
 [workspace.dependencies]
 # Tokio runtime - avoid "full" feature, use only what's needed
