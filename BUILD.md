@@ -364,14 +364,26 @@ bash scripts/test-linux-qt-host-kit.sh
 Requires `cmake`, `ninja`, `c++`, `rg`, and `xvfb-run` in addition to
 Qt 6 with xcb support.
 
-### 5. Windows x86_64 SDK
+### 5. Windows SDK (x86_64 / arm64)
 
-Produces `dist/migo-windows-x86_64/` with `bin/migo.dll`,
+Produces `dist/migo-windows-<arch>/` with `bin/migo.dll`,
 `lib/migo.lib` (MSVC import library), runtime DLLs (`rusty_v8.dll`,
 ANGLE), public headers, and a CMake package. Built by `release.yml`'s
-`release-windows` job on a GitHub `windows-latest` runner via
-`scripts/build-windows-sdk-native.sh` — no by-hand step for a normal
-release. Two entry points produce the identical package, for two
+`release-windows` (x86_64, `windows-latest`) and `release-windows-arm64`
+(arm64, `windows-11-arm`) jobs via `scripts/build-windows-sdk-native.sh`
+— no by-hand step for a normal release. Neither job cross-compiles
+`migo.dll` itself: each runs natively on a runner of its own
+architecture, `ilammy/msvc-dev-cmd` puts that runner's native
+`cl.exe`/`link.exe` on `PATH`. The cross-compilation this SDK's inputs
+*did* need happened once, upstream: `scripts/build-v8-windows.sh` /
+`scripts/build-angle-windows.sh aarch64`, run from this project's own
+x86_64 dev machine, produced the `aarch64-pc-windows-msvc` V8 archive
+and ANGLE runtime this section's arm64 steps below fetch prebuilt.
+Building `migo.dll` for arm64 without that cross-compilation step
+having already run needs either a native arm64 Windows machine, or the
+GitHub-hosted `windows-11-arm` runner `release-windows-arm64` uses.
+
+Two entry points produce the identical package, for two
 different environments (see `scripts/lib/windows-sdk-package.sh` for
 what they share):
 
@@ -389,18 +401,20 @@ what they share):
 **Requirements** (native, e.g. CI):
 
 - MSVC toolchain (Visual Studio 2022 or Build Tools) with
-  `VC.Tools.x86.x64`, already on `PATH`.
+  `VC.Tools.x86.x64` (x86_64) or `VC.Tools.ARM64` (arm64), already on
+  `PATH`.
 - Windows V8 artifacts (`rusty_v8.lib`, `rusty_v8.dll`, `rusty_v8.dll.lib`,
   `src_binding.rs`) in
-  `engine/third_party/rusty_v8/x86_64-pc-windows-msvc/`. Get them with:
+  `engine/third_party/rusty_v8/<x86_64|aarch64>-pc-windows-msvc/`. Get them
+  with:
 
   ```bash
-  bash scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc
+  bash scripts/fetch-v8-archives.sh x86_64-pc-windows-msvc    # or aarch64-pc-windows-msvc
   ```
 
-  or rebuild from source with `bash scripts/build-v8-windows.sh` (needs GN,
-  Ninja and a rusty_v8 checkout on a Windows local disk — see that script's
-  own header for the full prerequisite list; it re-seals
+  or rebuild from source with `bash scripts/build-v8-windows.sh [aarch64]`
+  (needs GN, Ninja and a rusty_v8 checkout on a Windows local disk — see
+  that script's own header for the full prerequisite list; it re-seals
   `component-manifest.json` when it finishes).
 - ANGLE runtime DLLs (`libEGL.dll`, `libGLESv2.dll`, `d3dcompiler_47.dll`),
   pinned in `contracts/artifact-manifest/windows-angle.lock.json` (ANGLE
@@ -409,14 +423,18 @@ what they share):
   `why_self_hosted` note). Get them with:
 
   ```bash
-  bash scripts/fetch-windows-angle.sh
+  bash scripts/fetch-windows-angle.sh          # x64, the default
+  bash scripts/fetch-windows-angle.sh arm64    # or arm64
   ```
 
 **Build** (native):
 
 ```bash
-bash scripts/build-windows-sdk-native.sh
+bash scripts/build-windows-sdk-native.sh              # x86_64, the default
 bash scripts/test-windows-sdk-contract.sh --strict
+
+bash scripts/build-windows-sdk-native.sh aarch64       # or arm64
+bash scripts/test-windows-sdk-contract.sh aarch64 --strict
 ```
 
 **Build** (WSL, this project's dev machine — additionally needs a
@@ -437,20 +455,6 @@ local one-command convenience; the CI job runs it as its own explicit
 step (above) so a failure shows up as its own named check. Either way
 the gate requires MSVC (`dumpbin`, `cl`) to verify the export surface
 and load the DLL.
-
-**Publishing a package this workflow does not build yet** (a future
-arm64 target — see the Windows/Linux arm64 phases in
-`docs/superpowers/specs/`): build and package by hand the same way,
-then upload manually and verify:
-
-```bash
-bash scripts/build-windows-sdk-native.sh   # or build-windows-sdk.sh from WSL
-mkdir -p dist/release
-bash scripts/package-sdk.sh dist/migo-windows-x86_64 --output-dir dist/release
-# upload dist/release/migo-<version>-capi-windows-<arch>.tar.gz(.attestation.json)
-# to the release, then:
-bash scripts/verify-release-assets.sh <tag>
-```
 
 ### 6. OpenHarmony SDK (aarch64 / x86_64)
 
