@@ -28,6 +28,8 @@ typedef struct MigoAndroidNativeWindowDescriptor {
  * its `vm` and `clazz` fields. activity may be NULL for an audio-only
  * embedding. Calls after the first are a no-op, so a host may call this again
  * after an activity is recreated without checking whether it already has.
+ *
+ * Returns MIGO_ERROR_INVALID_ARGUMENT if vm is NULL.
  */
 MIGO_API MigoResult MIGO_CALL migo_android_init_context(void *vm, void *activity);
 

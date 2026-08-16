@@ -232,6 +232,10 @@ MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, timestamp_ms) == 40,
 /*
  * Deliver one wheel event. Callable from any thread; ordering between
  * concurrent calls is the host's to guarantee.
+ *
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached -- there is
+ * nothing to deliver to -- and MIGO_ERROR_WOULD_BLOCK when the event was not
+ * accepted.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_wheel_event(
     MigoSession *session,
@@ -385,8 +389,10 @@ MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, flags) == 44, "MigoKeyEvent.flags move
  * Deliver one key press or release. Callable from any thread; ordering between
  * concurrent calls is the host's to guarantee.
  *
- * MIGO_ERROR_WOULD_BLOCK means the event was not accepted. Key UP uses the
- * reliable reserve so it is not silently lost behind ordinary input.
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached -- there is
+ * nothing to deliver to. MIGO_ERROR_WOULD_BLOCK means the event was not
+ * accepted. Key UP uses the reliable reserve so it is not silently lost
+ * behind ordinary input.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_key_event(
     MigoSession *session,
@@ -437,8 +443,9 @@ MIGO_STATIC_ASSERT(offsetof(MigoCompositionEvent, data_utf8) == 16,
 /*
  * Deliver one composition event.
  *
- * MIGO_ERROR_WOULD_BLOCK means the event was not accepted. UPDATE is
- * coalescible; START and END use the reliable reserve.
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached -- there is
+ * nothing to deliver to. MIGO_ERROR_WOULD_BLOCK means the event was not
+ * accepted. UPDATE is coalescible; START and END use the reliable reserve.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_composition_event(
     MigoSession *session,
@@ -552,6 +559,10 @@ MIGO_STATIC_ASSERT(offsetof(MigoGamepadStateEvent, buttons) == 32,
  *
  * An emptied slot stays empty rather than shifting the pads after it: content
  * holds on to an index.
+ *
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached -- there is
+ * nothing to announce to -- and MIGO_ERROR_WOULD_BLOCK when the event was not
+ * accepted.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_set_gamepad_connected(
     MigoSession *session,
@@ -561,7 +572,8 @@ MIGO_API MigoResult MIGO_CALL migo_session_set_gamepad_connected(
 /*
  * Push one sample for a connected pad. Samples are coalesced independently by
  * gamepad index. MIGO_OK includes safe coalescing; MIGO_ERROR_WOULD_BLOCK means
- * this sample was not accepted.
+ * this sample was not accepted. Returns MIGO_ERROR_INVALID_STATE when no
+ * surface is attached -- there is nothing to deliver to.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_send_gamepad_state(
     MigoSession *session,

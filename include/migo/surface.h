@@ -174,6 +174,38 @@ MIGO_API MigoResult MIGO_CALL migo_session_attach_surface(
     const MigoSurfaceDescriptor *descriptor,
     MigoSurfaceAttachment **out_attachment);
 
+/*
+ * Report a resize or a presentation-parameter change on an already-attached
+ * Surface. Synchronous: by the time this returns, either the new metrics are
+ * committed and a resize command is enqueued to the host, or nothing changed.
+ *
+ * metrics.generation must be a monotonically increasing sequence the caller
+ * assigns per update; it lets a host that coalesces resize events on its own
+ * thread detect and discard an update that a newer one has already
+ * superseded.
+ *
+ *   MIGO_ERROR_INVALID_ARGUMENT  attachment or metrics was NULL; metrics'
+ *                                struct_size is smaller than the minimum
+ *                                versioned record; a field is out of range
+ *                                (zero width/height, non-finite scale
+ *                                factor); or metrics.generation is zero or
+ *                                newer than the attachment has ever seen
+ *   MIGO_ERROR_UNSUPPORTED_ABI   metrics.abi_version does not match this
+ *                                engine build, or struct_size claims a
+ *                                record larger than this build knows
+ *   MIGO_ERROR_INVALID_STATE     another Surface transition (attach, update,
+ *                                or detach) is already running on this
+ *                                Session, or the Session has no live host
+ *   MIGO_ERROR_STALE_SURFACE     attachment is not the Session's active
+ *                                attachment, has already been lost, or
+ *                                metrics.generation is older than an update
+ *                                already applied
+ *   MIGO_ERROR_INTERNAL          the host-side lease or dispatch failed;
+ *                                rare, and logged when it happens
+ *
+ * Callable from the thread that owns the Session; concurrent calls through
+ * the same Session are the caller's to serialize.
+ */
 MIGO_API MigoResult MIGO_CALL migo_surface_update(
     MigoSurfaceAttachment *attachment,
     const MigoSurfaceMetrics *metrics);
