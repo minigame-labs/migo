@@ -47,7 +47,7 @@ const loadFont = (path, family) => {
 //
 // The accessor below is the engine's only involvement with `wx`: it does not
 // build a `wx` object itself (that is an external adapter's job, same
-// pattern as migo-adapter's BOM/DOM layer), but if a game or adapter assigns
+// pattern as migo-web-adapter's BOM/DOM layer), but if a game or adapter assigns
 // `globalThis.wx` -- now or later, and reassigned as many times as it likes
 // -- loadFont stays in sync on whatever it points to, without this file
 // knowing anything about who set it or why.

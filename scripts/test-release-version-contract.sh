@@ -38,7 +38,7 @@
 #     release a binary came from. Folding the two would make an ABI-compatible
 #     release look like a breaking one, or worse, the reverse.
 #
-#   (The adapter packages -- migo-adapter, migo-wx-adapter -- used to live in
+#   (The adapter packages -- migo-web-adapter, migo-wx-adapter -- used to live in
 #   this repo and needed the same carve-out; they're standalone repos now, so
 #   this gate never sees their package.json at all.)
 #

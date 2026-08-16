@@ -6,7 +6,7 @@
 // ported from a mini-game platform (WeChat, a quick-game alliance member,
 // etc.) gets that platform's global from an external, platform-specific
 // adapter package instead (the same pattern the BOM/DOM adapter already
-// uses -- see minigame-labs/migo-adapter), loaded by the host or the game
+// uses -- see minigame-labs/migo-web-adapter), loaded by the host or the game
 // itself, not baked into every build whether it's wanted or not.
 // `_NON_MINIGAME_API` below is
 // kept as reference data for those adapters and for
