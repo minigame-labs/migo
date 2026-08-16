@@ -259,6 +259,20 @@ MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, on_surface_released) == 96,
                    "MigoHostCallbacks.on_surface_released moved");
 #endif
 
+/*
+ * Create an Engine from a host-owned configuration. On MIGO_OK, *out_engine
+ * is a handle the host must eventually pass to migo_engine_destroy;
+ * out_engine is set to NULL before any fallible work, so it is always
+ * well-defined to read.
+ *
+ * Returns MIGO_ERROR_INVALID_ARGUMENT if out_engine or config is NULL or a
+ * config field is malformed (a NUL string pointer, an unrecognised flag);
+ * MIGO_ERROR_UNSUPPORTED_ABI if config.abi_version does not match this
+ * engine build; or MIGO_ERROR_INTERNAL if a root directory does not exist
+ * and the filesystem refuses to create it (permissions, a read-only mount,
+ * a path component that is not a directory) -- the path string itself was
+ * well-formed, so this is not an invalid argument.
+ */
 MIGO_API MigoResult MIGO_CALL
 migo_engine_create(const MigoEngineConfig *config, MigoEngine **out_engine);
 
@@ -311,10 +325,26 @@ MIGO_API MigoResult MIGO_CALL migo_session_set_host_callbacks(
     MigoSession *session,
     const MigoHostCallbacks *callbacks);
 
+/*
+ * Move the Session between RUNNING and PAUSED. A no-op call (state already
+ * matches) returns MIGO_OK without side effects.
+ *
+ * MIGO_LIFECYCLE_CREATED is rejected with MIGO_ERROR_INVALID_STATE: it is
+ * only the state a Session starts in, and going back to it would mean
+ * unwinding an engine already running, which the ABI does not define. Any
+ * other unrecognised state value returns MIGO_ERROR_INVALID_ARGUMENT.
+ */
 MIGO_API MigoResult MIGO_CALL migo_session_set_lifecycle(
     MigoSession *session,
     MigoLifecycleState state);
 
+/*
+ * Report whether the Session's content is currently visible on screen, e.g.
+ * covered by another app or a system overlay. Distinct from lifecycle above:
+ * a Session can be RUNNING but not visible.
+ *
+ * Returns MIGO_ERROR_INVALID_ARGUMENT if visible is neither 0 nor 1.
+ */
 MIGO_API MigoResult MIGO_CALL
 migo_session_set_visibility(MigoSession *session, uint8_t visible);
 

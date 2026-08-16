@@ -152,7 +152,8 @@ First public engine release. Ships the Rust multi-crate engine with a C ABI
 - Audio decoders for MP3, OGG, and WAV formats; streaming and caching pipeline
 - Canvas 2D and WebGL rendering APIs
 - File I/O (sync and async), network fetch, and touch input
-- C ABI (`migo-capi`) with a stable, documented export surface (`migo_*`)
+- C ABI (`migo-capi`) with a documented, controlled export surface (`migo_*`) --
+  still a candidate today, not yet frozen; see `include/migo/README.md`
 - Android JNI bindings and AAR packaging (`migo-full-release.aar`,
   `migo-slim-release.aar`); Android demo project in
   [migo-examples](https://github.com/minigame-labs/migo-examples)

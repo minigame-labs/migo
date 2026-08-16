@@ -454,10 +454,16 @@ pub unsafe extern "C" fn migo_engine_create(
         };
 
         // The host owns the layout; we only make sure the roots it named exist
-        // before the engine starts writing under them.
+        // before the engine starts writing under them. The path string itself
+        // was already validated by MigoEngineConfig::parse above, so a
+        // failure here is the filesystem refusing a well-formed path --
+        // permissions, a read-only mount, a path component that is a file --
+        // not a malformed argument, hence INTERNAL rather than
+        // INVALID_ARGUMENT.
         for dir in [&config.files_dir, &config.cache_dir, &config.code_cache_dir] {
-            if std::fs::create_dir_all(dir).is_err() {
-                return MIGO_ERROR_INVALID_ARGUMENT;
+            if let Err(error) = std::fs::create_dir_all(dir) {
+                tracing::error!("migo_engine_create: cannot create {dir:?}: {error}");
+                return MIGO_ERROR_INTERNAL;
             }
         }
 
@@ -1110,6 +1116,40 @@ mod tests {
             unsafe { migo_engine_create(&config, &mut engine) },
             MIGO_ERROR_INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn engine_reports_internal_when_a_storage_root_cannot_be_created() {
+        // A regular file sitting where a path component needs to be a
+        // directory forces create_dir_all to fail deterministically (ENOTDIR)
+        // without needing filesystem-permission tricks. The path string
+        // itself is well-formed, so this must not be reported as
+        // MIGO_ERROR_INVALID_ARGUMENT -- that code means the argument was
+        // malformed, and this one was not.
+        let blocking_file = std::env::temp_dir().join(format!(
+            "migo-capi-test-blocked-root-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&blocking_file);
+        std::fs::write(&blocking_file, b"not a directory").expect("create blocking file");
+
+        let make = |name: &str| {
+            CString::new(blocking_file.join(name).to_str().expect("utf-8 path")).expect("cstring")
+        };
+        let dirs = (make("files"), make("cache"), make("code-cache"));
+        let config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { migo_engine_create(&config, &mut engine) },
+            MIGO_ERROR_INTERNAL
+        );
+        assert!(engine.is_null(), "no handle may escape a rejected call");
+
+        let _ = std::fs::remove_file(&blocking_file);
     }
 
     #[test]

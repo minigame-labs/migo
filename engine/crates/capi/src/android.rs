@@ -11,7 +11,7 @@
 //! boundary as undefined behaviour.
 
 use crate::panic_barrier::guard;
-use migo_capi_abi::{MIGO_OK, MigoResult};
+use migo_capi_abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK, MigoResult};
 
 /// Register this process's `JavaVM` and an Activity/Context `jobject` so the
 /// Android audio backend can open an output stream.
@@ -22,14 +22,23 @@ use migo_capi_abi::{MIGO_OK, MigoResult};
 /// `clazz`). `activity` may be null for an audio-only embedding.
 ///
 /// # Safety
-/// `vm` must be a valid `JavaVM*` for this process for the duration of the
-/// call. `activity`, if non-null, must be a valid `jobject`.
+/// `vm` must be null or a valid `JavaVM*` for this process for the duration
+/// of the call. `activity`, if non-null, must be a valid `jobject`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn migo_android_init_context(
     vm: *mut std::ffi::c_void,
     activity: *mut std::ffi::c_void,
 ) -> MigoResult {
     guard("migo_android_init_context", || {
+        // A null vm would still be stored by ndk-context and later
+        // dereferenced by the JNI calls the audio backend makes through it --
+        // a raw null-pointer crash far from this call site, not the
+        // catchable panic the module doc above describes for skipping this
+        // call entirely. Reject it here instead, like every other
+        // pointer-taking entry point in this crate.
+        if vm.is_null() {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        }
         unsafe { platform::android::init_context(vm, activity) };
         MIGO_OK
     })

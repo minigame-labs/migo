@@ -176,6 +176,18 @@ typedef int32_t MigoResult;
 #define MIGO_ERROR_INTERNAL ((MigoResult)-11)
 
 /*
+ * MIGO_ERROR_CANCELLED and MIGO_ERROR_OUT_OF_MEMORY are reserved: no current
+ * entry point returns either. Their numeric values are pinned by the ABI
+ * contract test like every other code here, so a future call that needs one
+ * can start returning it without a wire-format change. Rust's global
+ * allocator aborts the process on allocation failure rather than returning a
+ * fallible `Result`, which is why nothing produces MIGO_ERROR_OUT_OF_MEMORY
+ * today; MIGO_ERROR_CANCELLED is reserved for a future asynchronous entry
+ * point with something to cancel -- nothing in the current synchronous
+ * surface has an in-flight operation to cancel.
+ */
+
+/*
  * The host command queue was full, so the event was not delivered. Unlike every
  * other error here this one is transient: the same call may succeed later. It
  * exists because dropping input silently is worse than reporting it -- a lost

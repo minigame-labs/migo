@@ -647,6 +647,7 @@ const _: () = assert!(offset_of!(MigoSurfaceMetrics, header) == 0);
 const _: () = assert!(offset_of!(MigoSurfaceMetrics, scale_factor) == 24);
 const _: () = assert!(size_of::<MigoSurfaceMetrics>() == 48);
 const _: () = assert!(offset_of!(MigoAndroidNativeWindowDescriptor, header) == 0);
+const _: () = assert!(offset_of!(MigoWin32HwndDescriptor, header) == 0);
 const _: () = assert!(offset_of!(MigoX11WindowDescriptor, header) == 0);
 const _: () = assert!(offset_of!(MigoWaylandSurfaceDescriptor, header) == 0);
 
@@ -658,6 +659,10 @@ const _: () = assert!(offset_of!(MigoSurfaceDescriptor, platform_descriptor) == 
 const _: () = assert!(size_of::<MigoAndroidNativeWindowDescriptor>() == 24);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(MigoAndroidNativeWindowDescriptor, native_window) == 16);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<MigoWin32HwndDescriptor>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(offset_of!(MigoWin32HwndDescriptor, hwnd) == 16);
 // The OpenHarmony descriptor is pinned independently rather than by reference
 // to Android's. If either moves, the one that moved fails here -- which is the
 // point of asserting a layout twice.
