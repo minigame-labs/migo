@@ -448,6 +448,31 @@ jobs:
           npm ci
           npm test
 
+  # ── Job 3b: wx-compat adapter tests (pure JS, no NDK/V8) ────────────
+  # Same rationale as adapter-tests above, for the wx-shaped mini-game
+  # surface instead of the browser-shaped one. Separate job (not folded into
+  # adapter-tests) because the two adapters are independently versioned
+  # packages with their own package-lock.json.
+  wx-adapter-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: wx-adapter/package-lock.json
+      - name: wx-adapter tests
+        working-directory: wx-adapter
+        run: |
+          npm ci
+          npm test
+
   # ── Job 4: Android AAR build — the real "does the whole project compile,
   # link, and embed the profile/ABI snapshot" gate (cross-compiles graphics/audio
   # via the NDK, where skia/alsa deps are handled). ───────────────────
