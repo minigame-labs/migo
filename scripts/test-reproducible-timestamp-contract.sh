@@ -55,7 +55,6 @@ NOT_AN_ARTIFACT = {
     "scripts/ci/check_migo_test_suite.py": "a CI test-suite report read by a human, not packaged",
     "scripts/ci/compare_baseline.py": "a CI comparison report against a stored baseline",
     "scripts/ci/collect_metrics.sh": "device measurements, where elapsed wall time is the measurement",
-    "scripts/perf_compare.ps1": "an interactive comparison a developer runs, timestamping a sampling round on screen",
 }
 
 sources = sorted(
