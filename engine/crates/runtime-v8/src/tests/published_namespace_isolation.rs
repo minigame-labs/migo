@@ -5,8 +5,10 @@
 //! ops directly, so "no reachable op table" is the assumption the rest of the
 //! sandbox is built on rather than one hardening step among many.
 //!
-//! It was not holding. `97_wx_namespace.js` builds the `wx` and `migo`
-//! namespaces during bootstrap by copying property descriptors off globalThis;
+//! It was not holding. The bootstrap file (now `97_migo_namespace.js`; at the
+//! time, `97_wx_namespace.js`, before the engine stopped building a `wx`
+//! namespace itself) built the `wx` and `migo` namespaces during bootstrap by
+//! copying property descriptors off globalThis;
 //! `harden_global_scope` deletes deno_core's internals *afterwards*, because
 //! deleting them from JS breaks deno_core's snapshot restore path. A mirror
 //! built first therefore captured `Deno`, and deleting `globalThis.Deno` later
@@ -153,6 +155,10 @@ mod published_namespace_isolation_tests {
     /// Without this, a helper that silently matches nothing -- a typo in the
     /// shape check, an exception swallowed by one of the try/catch guards --
     /// would report a clean sandbox forever.
+    ///
+    /// Plants on `migo`: the only namespace the engine itself ever builds
+    /// (see 97_migo_namespace.js). This check's job is proving the search
+    /// mechanism itself works, independent of anything wx-shaped.
     #[test]
     fn the_op_table_search_finds_a_planted_one() {
         let mut rt = boot();
@@ -160,9 +166,9 @@ mod published_namespace_isolation_tests {
             .expect("helper");
         assert_js(
             &mut rt,
-            "globalThis.wx.__planted = { core: { ops: { op_a(){}, op_b(){}, op_c(){} } } }; \
+            "globalThis.migo.__planted = { core: { ops: { op_a(){}, op_b(){}, op_c(){} } } }; \
              const found = globalThis.__findOpTable(); \
-             let __ok = found.indexOf('wx.__planted.core.ops') !== -1; \
+             let __ok = found.indexOf('migo.__planted.core.ops') !== -1; \
              let __msg = 'planted op table not found; search reported: ' + found.join(', ')",
         );
     }
@@ -199,46 +205,47 @@ mod published_namespace_isolation_tests {
         );
     }
 
-    /// The mirrors must keep working: this fix removes internals, not APIs.
+    /// The mirror must keep working: this fix removes internals, not APIs.
     #[test]
-    fn the_wx_and_migo_namespaces_still_publish_content_apis() {
-        // Both halves of this are profile-dependent, and asserting the Full
-        // numbers everywhere would assert the product profile instead of the
-        // publication. Slim cfg-deletes whole capability extensions -- it
-        // published 127 wx names against Full's 300-plus when this was measured --
-        // and `getSystemInfoSync` is one of the names it removes. The floor is
-        // still well above what a collapsed namespace would report, and the API
-        // probed in both profiles is one neither can drop.
+    fn the_migo_namespace_still_publishes_content_apis() {
+        // Profile-dependent, and asserting the Full number unconditionally
+        // would assert the product profile instead of the publication. Slim
+        // cfg-deletes whole capability extensions -- it published 127 wx
+        // names against Full's 300-plus when this was measured -- and
+        // `getSystemInfoSync` is one of the names it removes. The floor is
+        // still well above what a collapsed namespace would report, and the
+        // API probed in both profiles is one neither can drop.
         #[cfg(feature = "api-connectivity")]
-        let (floor, probe) = (300, "globalThis.wx.getSystemInfoSync");
+        let (floor, probe) = (300, "globalThis.migo.getSystemInfoSync");
         #[cfg(not(feature = "api-connectivity"))]
-        let (floor, probe) = (100, "globalThis.wx.getStorageSync");
+        let (floor, probe) = (100, "globalThis.migo.getStorageSync");
 
         let mut rt = boot();
         assert_js(
             &mut rt,
             &format!(
-                "const wxNames = Object.getOwnPropertyNames(globalThis.wx || {{}}); \
-             const migoNames = Object.getOwnPropertyNames(globalThis.migo || {{}}); \
-             let __ok = wxNames.length > {floor} && migoNames.length > {floor} \
-                 && typeof globalThis.wx.createCanvas === 'function' \
+                "const migoNames = Object.getOwnPropertyNames(globalThis.migo || {{}}); \
+             let __ok = migoNames.length > {floor} \
+                 && typeof globalThis.migo.createCanvas === 'function' \
                  && typeof {probe} === 'function'; \
-             let __msg = 'wx=' + wxNames.length + ' migo=' + migoNames.length"
+             let __msg = 'migo=' + migoNames.length"
             ),
         );
     }
 
-    /// Gamepad APIs stay `migo`-only: this change must not blur that split,
-    /// which is what `_NON_WX` exists to hold.
+    /// `_NON_WX` (which capabilities are deliberately migo-only) is reference
+    /// data for an external wx-compat adapter now, not something the engine
+    /// acts on -- the engine never builds a `wx` object to keep names off of.
+    /// This just confirms migo publishes them, which is what matters at this
+    /// layer; whether an adapter correctly excludes them from its own `wx` is
+    /// that adapter's own test surface.
     #[test]
-    fn migo_only_capabilities_stay_off_the_wx_namespace() {
+    fn gamepad_capabilities_are_published_on_migo() {
         let mut rt = boot();
         assert_js(
             &mut rt,
-            "let __ok = typeof globalThis.migo.getGamepads === 'function' \
-                 && typeof globalThis.wx.getGamepads === 'undefined'; \
-             let __msg = 'migo.getGamepads=' + typeof globalThis.migo.getGamepads \
-                 + ' wx.getGamepads=' + typeof globalThis.wx.getGamepads",
+            "let __ok = typeof globalThis.migo.getGamepads === 'function'; \
+             let __msg = 'migo.getGamepads=' + typeof globalThis.migo.getGamepads",
         );
     }
 }

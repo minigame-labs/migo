@@ -5,7 +5,7 @@
 // side rebuilds its context at spec defaults, every later fill paints opaque
 // black and nothing reports an error.
 const L = (...a) => console.error("[ctxloss]", ...a);
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 const ctx = canvas.getContext("2d");
 const W = canvas.width, H = canvas.height;
 
@@ -14,7 +14,7 @@ ctx.globalAlpha = 1.0;
 
 // A separate WebGL canvas purely to reach WEBGL_lose_context. The loss tears
 // down the whole share group, so it reaches the 2D context too.
-const glCanvas = wx.createCanvas();
+const glCanvas = migo.createCanvas();
 const gl = glCanvas.getContext("webgl");
 const loseExt = gl && gl.getExtension("WEBGL_lose_context");
 L("lose-context extension:", loseExt ? "available" : "MISSING");

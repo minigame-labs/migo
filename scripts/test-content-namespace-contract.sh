@@ -1,94 +1,50 @@
 #!/usr/bin/env bash
-# Content in this repository must not call capabilities on a namespace that
-# does not carry them.
+# Content in this repository must not reference a namespace the engine does
+# not install.
 #
-# `97_wx_namespace.js` mirrors most globals onto `wx`, but deliberately keeps a
-# few off it: wx has no gamepad API, so those names live on `migo` (and reach
-# browser content as `navigator.getGamepads()` through the HTML5 adapter).
-# Calling `wx.getGamepads()` therefore throws TypeError on the first frame,
-# which aborts paint and leaves the screen black -- with no clue in the failure
-# that a namespace was the problem. That is exactly how it shipped: every probe
-# written for the gamepad and IME work called `wx.getGamepads()`, and the black
-# screen was read as a frame-driving or rendering fault on the device.
-#
-# The forbidden set is parsed out of the runtime source rather than repeated
-# here, so a capability added to `_NON_WX` later is covered without touching
-# this file.
+# The engine builds only `migo` (see `97_migo_namespace.js`) -- there is no
+# `wx` global unless a host or game explicitly loads a platform-compat
+# adapter, which none of the conformance content under tests/c_host does.
+# `wx.anything` there throws ReferenceError on first use, which aborts paint
+# and leaves the screen black -- with no clue in the failure that a missing
+# namespace was the problem. That is exactly how it shipped once: every probe
+# written for the gamepad and IME work called `wx.getGamepads()` (back when
+# gamepad specifically was migo-only even while the engine still built a `wx`
+# mirror for everything else), and the black screen was read as a
+# frame-driving or rendering fault on the device.
 #
 # Scope: the conformance content under tests/c_host. The host-integration
 # examples that used to live beside it moved to minigame-labs/migo-examples,
-# which carries its own copy of this gate reading the same `_NON_WX` set from
-# this repository -- so the rule still covers both, from two places.
+# which uses `migo.*` throughout for the same reason.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONTENT_ROOT="$ROOT_DIR/tests/c_host"
 
-python3 - "$ROOT_DIR" <<'PY'
-from __future__ import annotations
+errors=0
+scanned=0
+while IFS= read -r -d '' source_path; do
+    case "$source_path" in
+        */build/*) continue ;;
+    esac
+    scanned=$((scanned + 1))
+    # Word boundary, literal `wx.` form -- see git history for this file's
+    # note on why bracket notation and aliasing are out of scope for a static
+    # grep-shaped gate.
+    if grep -qE '\bwx\.[A-Za-z_$]' "$source_path"; then
+        relative="${source_path#"$ROOT_DIR"/}"
+        echo "ERROR: $relative references \`wx.*\`, but the engine does not install a wx global -- this will throw ReferenceError at runtime. Use migo.* instead." >&2
+        errors=1
+    fi
+done < <(find "$CONTENT_ROOT" -name "*.js" -print0)
 
-import pathlib
-import re
-import sys
+if [[ "$scanned" -eq 0 ]]; then
+    echo "ERROR: no content JS found to scan; the gate would pass vacuously" >&2
+    exit 1
+fi
 
-root = pathlib.Path(sys.argv[1]).resolve()
-errors: list[str] = []
+if [[ "$errors" -ne 0 ]]; then
+    exit 1
+fi
 
-namespace_source = root / "engine/crates/runtime-v8/src/97_wx_namespace.js"
-if not namespace_source.is_file():
-    print(f"ERROR: wx namespace source not found at {namespace_source}", file=sys.stderr)
-    sys.exit(1)
-
-text = namespace_source.read_text(encoding="utf-8")
-block = re.search(r"const _NON_WX = new Set\(\[(.*?)\]\);", text, re.S)
-if block is None:
-    # Without this the gate cannot fail, so it must not pass either.
-    print(
-        "ERROR: could not find the _NON_WX set in 97_wx_namespace.js; "
-        "this gate reads it to know which names are off the wx namespace",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-forbidden = re.findall(r'"([^"]+)"', block.group(1))
-if not forbidden:
-    print("ERROR: the _NON_WX set parsed empty; the gate would pass vacuously", file=sys.stderr)
-    sys.exit(1)
-
-content_root = root / "tests" / "c_host"
-scanned = 0
-for source_path in sorted(content_root.rglob("*.js")):
-    if "/build/" in str(source_path):
-        continue
-    scanned += 1
-    source = source_path.read_text(encoding="utf-8")
-    for name in forbidden:
-        # Word boundary, not substring: `wx.getGamepadsLater` is a different name.
-        #
-        # Deliberate limit, not an oversight: this matches only the literal
-        # `wx.<name>` form. Bracket notation (wx["getGamepads"]()), aliasing
-        # through another binding, and whitespace or a newline between the
-        # object and the property all evade it. Detecting those would mean
-        # deciding aliasing and computed property access statically, which is
-        # not possible in general; the mistake this gate exists to catch is the
-        # one as it is actually written in hand-authored content -- the literal
-        # form. Do not read this gate as proving no content can reach a
-        # non-wx capability.
-        if re.search(r"\bwx\." + re.escape(name) + r"\b", source):
-            relative = source_path.relative_to(root)
-            errors.append(
-                f"{relative} calls wx.{name}, but {name} is in _NON_WX and is "
-                f"only exposed on `migo` (browser content reaches it through "
-                f"the adapter as navigator.{name})"
-            )
-
-if scanned == 0:
-    print("ERROR: no content JS found to scan; the gate would pass vacuously", file=sys.stderr)
-    sys.exit(1)
-
-if errors:
-    for error in errors:
-        print(f"ERROR: {error}", file=sys.stderr)
-    sys.exit(1)
-
-print(f"OK: {scanned} content sources use no wx-namespaced capability that wx does not carry")
-PY
+echo "OK: $scanned content sources reference no undefined wx namespace"

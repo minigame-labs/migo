@@ -8,7 +8,7 @@
 // engine logs need MIGO_CAPI_LOG set before the engine is created, and a pixel
 // needs nothing at all. The value is drawn as text as well, which proves the
 // whole string crossed the boundary rather than merely that some event fired.
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 const ctx = canvas.getContext('2d');
 
 const IDLE = '#c00000';      // red     -- nothing requested yet
@@ -30,7 +30,7 @@ function requestKeyboard() {
   state = 'waiting';
   colour = WAITING;
   console.error('[kbprobe] showKeyboard');
-  wx.showKeyboard({
+  migo.showKeyboard({
     defaultValue: 'seed',
     maxLength: 140,
     multiple: false,
@@ -71,9 +71,9 @@ function paint() {
 }
 paint();
 
-wx.onTouchStart(requestKeyboard);
+migo.onTouchStart(requestKeyboard);
 
-wx.onKeyboardInput(function (res) {
+migo.onKeyboardInput(function (res) {
   inputs++;
   value = res.value;
   state = 'input';
@@ -81,45 +81,45 @@ wx.onKeyboardInput(function (res) {
   console.error('[kbprobe] input #' + inputs + ' value=' + value);
   // Content correcting the value it was handed is the third verb, and the only
   // thing that exercises it. A real game does this to enforce its own rules.
-  wx.updateKeyboard({ value: value });
+  migo.updateKeyboard({ value: value });
 });
 
-wx.onKeyboardConfirm(function (res) {
+migo.onKeyboardConfirm(function (res) {
   value = res.value;
   state = 'confirm';
   colour = CONFIRM;
   console.error('[kbprobe] confirm value=' + value);
   // Confirm is where a game is done with the field, so this is where hide
   // belongs -- and it is what proves the hide verb reaches the host.
-  wx.hideKeyboard();
+  migo.hideKeyboard();
 });
 
-wx.onKeyboardComplete(function (res) {
+migo.onKeyboardComplete(function (res) {
   value = res.value;
   state = 'complete';
   colour = COMPLETE;
   console.error('[kbprobe] complete value=' + value);
 });
 
-wx.onCompositionStart(function (res) {
+migo.onCompositionStart(function (res) {
   compositions++;
   preedit = res.data;
   console.error('[kbprobe] compositionstart data=[' + res.data + ']');
 });
 
-wx.onCompositionUpdate(function (res) {
+migo.onCompositionUpdate(function (res) {
   preedit = res.data;
   console.error('[kbprobe] compositionupdate data=[' + res.data + ']');
 });
 
-wx.onCompositionEnd(function (res) {
+migo.onCompositionEnd(function (res) {
   // Cleared on end: the committed text arrives as a keyboard input value, and
   // content that kept drawing the preedit would show it twice.
   preedit = '';
   console.error('[kbprobe] compositionend data=[' + res.data + ']');
 });
 
-wx.onKeyboardHeightChange(function (res) {
+migo.onKeyboardHeightChange(function (res) {
   keyboardHeight = res.height;
   console.error('[kbprobe] height=' + keyboardHeight);
 });

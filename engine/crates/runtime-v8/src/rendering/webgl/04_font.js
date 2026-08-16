@@ -40,9 +40,17 @@ const loadFont = (path, family) => {
     return name;
 };
 
-// wx.loadFont is a first-class WeChat API.  Some game bootstraps assign
-// `globalThis.wx` after the runtime globals are installed; keep this generic
-// alias in sync without knowing anything about the engine/adapter consuming it.
+// wx.loadFont is a first-class WeChat API. `globalThis.loadFont` is set
+// unconditionally: `migo.loadFont` picks it up automatically through
+// 97_migo_namespace.js's ordinary namespace mirroring, without this
+// function's help.
+//
+// The accessor below is the engine's only involvement with `wx`: it does not
+// build a `wx` object itself (that is an external adapter's job, same
+// pattern as `adapter/`'s BOM/DOM layer), but if a game or adapter assigns
+// `globalThis.wx` -- now or later, and reassigned as many times as it likes
+// -- loadFont stays in sync on whatever it points to, without this file
+// knowing anything about who set it or why.
 function _installWxLoadFontAlias() {
     try {
         globalThis.loadFont = loadFont;

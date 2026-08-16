@@ -294,7 +294,7 @@ fn run(runtime: &mut JsRuntime, source: &'static str) {
 fn denied_camera_can_release_but_cannot_acquire_or_use() {
     let bundle = Bundle::new(true);
     let mut runtime = boot(bundle.clone());
-    run(&mut runtime, "globalThis.__camera = wx.createCamera({});");
+    run(&mut runtime, "globalThis.__camera = migo.createCamera({});");
     bundle.camera.protected_calls.store(0, Ordering::SeqCst);
     bundle.permissions.0.store(false, Ordering::SeqCst);
 
@@ -319,7 +319,7 @@ fn denied_recorder_can_stop_but_not_start_pause_or_resume() {
     let mut runtime = boot(bundle.clone());
     run(
         &mut runtime,
-        "globalThis.__recorder = wx.getRecorderManager(); __recorder.start();",
+        "globalThis.__recorder = migo.getRecorderManager(); __recorder.start();",
     );
     bundle.recorder.protected_calls.store(0, Ordering::SeqCst);
     bundle.permissions.0.store(false, Ordering::SeqCst);
@@ -339,20 +339,20 @@ fn denied_recorder_can_stop_but_not_start_pause_or_resume() {
 fn denied_bluetooth_can_close_and_stop_but_not_acquire_query_or_write() {
     let bundle = Bundle::new(true);
     let mut runtime = boot(bundle.clone());
-    run(&mut runtime, "wx.openBluetoothAdapter({ fail() {} });");
+    run(&mut runtime, "migo.openBluetoothAdapter({ fail() {} });");
     bundle.bluetooth.protected_calls.store(0, Ordering::SeqCst);
     bundle.permissions.0.store(false, Ordering::SeqCst);
     run(
         &mut runtime,
-        "wx.closeBluetoothAdapter({ fail() {} }); \
-         wx.stopBluetoothDevicesDiscovery({ fail() {} }); \
-         wx.closeBLEConnection({ deviceId: 'device', fail() {} }); \
-         wx.stopBeaconDiscovery({ fail() {} }); \
-         wx.openBluetoothAdapter({ fail() {} }); \
-         wx.getBluetoothAdapterState({ fail() {} }); \
-         wx.startBluetoothDevicesDiscovery({ fail() {} }); \
-         wx.createBLEConnection({ deviceId: 'device', fail() {} }); \
-         wx.writeBLECharacteristicValue({ deviceId: 'device', value: '00', fail() {} });",
+        "migo.closeBluetoothAdapter({ fail() {} }); \
+         migo.stopBluetoothDevicesDiscovery({ fail() {} }); \
+         migo.closeBLEConnection({ deviceId: 'device', fail() {} }); \
+         migo.stopBeaconDiscovery({ fail() {} }); \
+         migo.openBluetoothAdapter({ fail() {} }); \
+         migo.getBluetoothAdapterState({ fail() {} }); \
+         migo.startBluetoothDevicesDiscovery({ fail() {} }); \
+         migo.createBLEConnection({ deviceId: 'device', fail() {} }); \
+         migo.writeBLECharacteristicValue({ deviceId: 'device', value: '00', fail() {} });",
     );
 
     assert_eq!(bundle.bluetooth.cleanup_calls.load(Ordering::SeqCst), 4);
@@ -365,9 +365,9 @@ fn album_write_and_shared_user_info_op_require_their_scopes() {
     let mut denied_runtime = boot(denied.clone());
     run(
         &mut denied_runtime,
-        "wx.saveImageToPhotosAlbum({ filePath: '/tmp/image.png', fail() {} }); \
-         wx.getUserInfo({ fail() {} }); \
-         wx.getUserProfile({ desc: 'profile', fail() {} }).catch(() => {});",
+        "migo.saveImageToPhotosAlbum({ filePath: '/tmp/image.png', fail() {} }); \
+         migo.getUserInfo({ fail() {} }); \
+         migo.getUserProfile({ desc: 'profile', fail() {} }).catch(() => {});",
     );
     assert_eq!(denied.image_api.0.load(Ordering::SeqCst), 0);
     assert_eq!(denied.auth.0.load(Ordering::SeqCst), 0);
@@ -376,9 +376,9 @@ fn album_write_and_shared_user_info_op_require_their_scopes() {
     let mut granted_runtime = boot(granted.clone());
     run(
         &mut granted_runtime,
-        "wx.saveImageToPhotosAlbum({ filePath: '/tmp/image.png', fail() {} }); \
-         wx.getUserInfo({ fail() {} }); \
-         wx.getUserProfile({ desc: 'profile', fail() {} }).catch(() => {});",
+        "migo.saveImageToPhotosAlbum({ filePath: '/tmp/image.png', fail() {} }); \
+         migo.getUserInfo({ fail() {} }); \
+         migo.getUserProfile({ desc: 'profile', fail() {} }).catch(() => {});",
     );
     assert_eq!(granted.image_api.0.load(Ordering::SeqCst), 1);
     assert_eq!(granted.auth.0.load(Ordering::SeqCst), 2);

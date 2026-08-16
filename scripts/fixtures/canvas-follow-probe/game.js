@@ -11,7 +11,7 @@
 // loop still running -- the same always-green shape a paired liveness reading
 // exists to refuse. Painting the settled state grey means green can only come
 // from a frame painted after the surface moved.
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 const ctx = canvas.getContext('2d');
 
 const WAITING = '#808080'; // grey  -- the surface has not changed yet
@@ -21,7 +21,7 @@ const STALE = '#cc3333';   // red   -- canvas still describes the old one
 let initial = null;
 
 function paint() {
-  const info = wx.getSystemInfoSync();
+  const info = migo.getSystemInfoSync();
   // Integers on both sides: the backing store is a whole number of pixels while
   // `windowWidth` carries the exact surface/ratio, so 1080/2.75 would never
   // compare equal to anything the engine can allocate.

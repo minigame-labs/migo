@@ -17,7 +17,7 @@
 // happened. `frames` is the paired liveness reading: a green frame from an
 // engine that stopped painting would be indistinguishable from a correct one
 // without it.
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 const ctx = canvas.getContext('2d');
 
 const FOLLOWS = '#00a000';   // green -- canvas matches the window it draws into
@@ -29,8 +29,8 @@ let lastReport = 0;
 
 // Optional on purpose: a Slim build has no window-info service, and the canvas
 // must follow its surface there too.
-if (typeof wx.onWindowResize === 'function') {
-  wx.onWindowResize(function (event) {
+if (typeof migo.onWindowResize === 'function') {
+  migo.onWindowResize(function (event) {
     resizeEvents++;
     console.error('[srprobe] onWindowResize ' + event.windowWidth + 'x' + event.windowHeight +
       ' canvas=' + canvas.width + 'x' + canvas.height);
@@ -39,7 +39,7 @@ if (typeof wx.onWindowResize === 'function') {
 
 function paint() {
   frames++;
-  const info = wx.getSystemInfoSync();
+  const info = migo.getSystemInfoSync();
   // Both are CSS pixels, but only one of them is an integer: the backing store
   // is a whole number of pixels (the surface divided by the device pixel ratio,
   // rounded), while `windowWidth` carries the exact ratio. Comparing them

@@ -7,7 +7,7 @@
 // gesture is held is evidence of the pointer count that reached JS. That matters
 // because a host has no other way to see it: engine logs need MIGO_CAPI_LOG to
 // be set before the engine is created, and a pixel needs nothing at all.
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 const ctx = canvas.getContext('2d');
 
 const IDLE = '#c00000';       // red    -- untouched since launch
@@ -46,11 +46,11 @@ function onDown(e) {
   console.error('[touchprobe] start events=' + events + ' ' + describe(e));
 }
 
-wx.onTouchStart(onDown);
+migo.onTouchStart(onDown);
 // A second finger landing on an existing gesture arrives as a move, not a start,
 // so the colour would never reach the multi-pointer value without this.
-wx.onTouchMove(onDown);
-wx.onTouchEnd(function (e) {
+migo.onTouchMove(onDown);
+migo.onTouchEnd(function (e) {
   const remaining = ((e && e.touches) || []).length;
   colour = remaining > 0 ? BY_COUNT[Math.min(remaining, BY_COUNT.length - 1)] : RELEASED;
   console.error('[touchprobe] end ' + describe(e));

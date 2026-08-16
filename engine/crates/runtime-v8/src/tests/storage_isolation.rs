@@ -4,14 +4,15 @@
 //! third-party titles, one after another in the same process. Storage was
 //! anchored to the host app's files directory while code, cache and user data
 //! were already per game, so every title in a catalogue shared one SQLite file.
-//! Three consequences, all reachable through ordinary wx APIs:
+//! Three consequences, all reachable through ordinary storage APIs:
 //!
 //! - one game could read another's saves by guessing keys;
-//! - `wx.clearStorage()` -- a normal call for a game resetting itself -- wiped
-//!   the whole catalogue;
+//! - `migo.clearStorage()` -- a normal call for a game resetting itself --
+//!   wiped the whole catalogue;
 //! - the 10 MB quota was a shared pool a single game could exhaust.
 //!
-//! It also disagreed with wx, where each mini-game has its own 10 MB.
+//! It also disagreed with the mini-game platforms this engine is compatible
+//! with, where each game has its own 10 MB.
 //!
 //! These tests pin the isolation at the path level, where the bug was, rather
 //! than by writing through the ops: the ops route through the IO scheduler and

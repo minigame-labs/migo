@@ -19,8 +19,8 @@ licence activation. Nothing is sent anywhere on start-up, on error, or on a
 timer.
 
 - **No engine-initiated requests.** Every outbound request originates in a
-  content API call — `wx.request`, `wx.downloadFile`, `wx.uploadFile`,
-  `wx.connectSocket`, audio streaming, remote image loading. They live in
+  content API call — `migo.request`, `migo.downloadFile`, `migo.uploadFile`,
+  `migo.connectSocket`, audio streaming, remote image loading. They live in
   `engine/crates/runtime-v8/src/network/` and
   `engine/crates/audio/src/streaming.rs`.
 - **Errors go to you, not to us.** A panic, an ANR, a V8 heap limit or an
@@ -43,7 +43,7 @@ not decide any of them.
 |---|---|
 | Network | Per-app domain allowlist and HTTPS enforcement, applied to fetch, download, upload, WebSocket, TCP, UDP, remote images and audio streaming — **including redirect targets**, so `allowed.com -> 302 -> blocked.com` is refused. `runtime-v8/src/network/gate.rs` |
 | Filesystem | Each game is confined to its own directories; `..`, absolute paths and symlinked archive entries are rejected. `runtime-v8/src/file/fs.rs`, `io/src/zip_extract.rs` |
-| Key-value storage | Per game, not per app: one title cannot read another's data, and `wx.clearStorage()` cannot clear another's. 10 MB total, 1 MB per value, enforced inside the SQLite transaction. `runtime-v8/src/storage/mod.rs` |
+| Key-value storage | Per game, not per app: one title cannot read another's data, and `migo.clearStorage()` cannot clear another's. 10 MB total, 1 MB per value, enforced inside the SQLite transaction. `runtime-v8/src/storage/mod.rs` |
 | Camera, microphone, location, Bluetooth | Denied unless your `PermissionHandler` grants the scope. With no handler installed, all are denied. `runtime-v8/src/permission.rs` |
 | Advertising | No ad SDK is linked. Whether an incentivised video was watched is decided by your ad SDK and passed through; the runtime cannot report a completed view on its own. `shared/src/services/ad.rs` |
 | Payment, login | Transport only. Eligibility, settlement and risk control stay with you. |

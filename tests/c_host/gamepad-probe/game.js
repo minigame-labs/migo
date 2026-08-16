@@ -1,15 +1,17 @@
 // Gamepad probe: renders what migo.getGamepads() reports, as pixels.
 //
-// The name is `migo.`, not `wx.`: wx has no gamepad API, so 97_wx_namespace.js
-// keeps these names off the wx namespace deliberately. Content that runs
-// through the HTML5 adapter sees them as navigator.getGamepads(); content like
-// this probe, which runs directly on the runtime, calls them on `migo`.
+// Called on `migo`: no mini-game platform this engine is compatible with has
+// a gamepad API, so 97_migo_namespace.js documents these as beyond the
+// common surface (see `_NON_MINIGAME_API`).
+// Content that runs through the HTML5 adapter sees them as
+// navigator.getGamepads(); content like this probe, which runs directly on
+// the runtime, calls them on `migo`.
 //
 // The JS Gamepad implementation has no unit tests -- it is state held in JS and
 // driven from native -- so this content is where it is actually exercised. The
 // colour encodes how far the round trip got, and the text carries the values,
 // so a screenshot is evidence rather than a log line that could be stale.
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 const ctx = canvas.getContext('2d');
 
 const NONE = '#c00000';       // red     -- no pad has connected
