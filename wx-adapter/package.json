@@ -1,0 +1,25 @@
+{
+  "name": "@minigame-labs/migo-wx-adapter",
+  "version": "0.1.0",
+  "description": "Publishes globalThis.wx aliased to the migo runtime's migo.* capabilities, so unmodified WeChat-mini-game-shaped content runs on migo.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build-bundle.mjs",
+    "pretest": "npm run build",
+    "test": "node tests/adapter.test.mjs && node tests/bundle.test.mjs",
+    "prepack": "npm run build"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}
