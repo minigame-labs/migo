@@ -5,16 +5,17 @@
 //! ops directly, so "no reachable op table" is the assumption the rest of the
 //! sandbox is built on rather than one hardening step among many.
 //!
-//! It was not holding. The bootstrap file (now `97_migo_namespace.js`; at the
-//! time, `97_wx_namespace.js`, before the engine stopped building a `wx`
-//! namespace itself) built the `wx` and `migo` namespaces during bootstrap by
-//! copying property descriptors off globalThis;
-//! `harden_global_scope` deletes deno_core's internals *afterwards*, because
-//! deleting them from JS breaks deno_core's snapshot restore path. A mirror
-//! built first therefore captured `Deno`, and deleting `globalThis.Deno` later
-//! did nothing to the copy -- leaving `wx.Deno.core.ops` with 616 invocable
-//! ops, including file and network ops. `__bootstrap` escaped only because its
-//! name starts with an underscore, which the mirror filter happens to skip.
+//! It was not holding. The bootstrap file (`97_migo_namespace.js`; before the
+//! engine stopped building a second, platform-compat namespace of its own, it
+//! built that namespace alongside `migo` during bootstrap) built its
+//! namespaces during bootstrap by copying property descriptors off
+//! globalThis; `harden_global_scope` deletes deno_core's internals
+//! *afterwards*, because deleting them from JS breaks deno_core's snapshot
+//! restore path. A mirror built first therefore captured `Deno`, and deleting
+//! `globalThis.Deno` later did nothing to the copy -- leaving the mirrored
+//! namespace's `.Deno.core.ops` with 616 invocable ops, including file and
+//! network ops. `__bootstrap` escaped only because its name starts with an
+//! underscore, which the mirror filter happens to skip.
 //!
 //! These tests search the published namespaces for an op table **by shape**,
 //! not by name. A future internal that leaks the same way fails here even if
@@ -91,7 +92,7 @@ mod published_namespace_isolation_tests {
 
     /// Walks every published namespace looking for the op table's shape.
     ///
-    /// Deliberately shape-based. Asserting `wx.Deno === undefined` would pass
+    /// Deliberately shape-based. Asserting `migo.Deno === undefined` would pass
     /// the day someone exposes the same object under a different name, and
     /// that is exactly how this bug survived: the exclusion list was correct
     /// for the names on it.
@@ -99,7 +100,6 @@ mod published_namespace_isolation_tests {
         globalThis.__findOpTable = function () {
             const roots = [
                 ['globalThis', globalThis],
-                ['wx', globalThis.wx],
                 ['migo', globalThis.migo],
                 ['GameGlobal', globalThis.GameGlobal],
             ];
@@ -158,7 +158,8 @@ mod published_namespace_isolation_tests {
     ///
     /// Plants on `migo`: the only namespace the engine itself ever builds
     /// (see 97_migo_namespace.js). This check's job is proving the search
-    /// mechanism itself works, independent of anything wx-shaped.
+    /// mechanism itself works, independent of any platform-compat namespace
+    /// an external adapter might add.
     #[test]
     fn the_op_table_search_finds_a_planted_one() {
         let mut rt = boot();
@@ -178,13 +179,12 @@ mod published_namespace_isolation_tests {
     /// The shape test above is the durable one; this one names `Deno` so a
     /// regression reads as what it is instead of as an anonymous shape hit.
     #[test]
-    fn deno_is_absent_from_the_global_and_from_both_mirrors() {
+    fn deno_is_absent_from_the_global_and_from_the_migo_mirror() {
         let mut rt = boot();
         assert_js(
             &mut rt,
             "const where = []; \
              if (typeof globalThis.Deno !== 'undefined') where.push('globalThis'); \
-             if (globalThis.wx && typeof globalThis.wx.Deno !== 'undefined') where.push('wx'); \
              if (globalThis.migo && typeof globalThis.migo.Deno !== 'undefined') where.push('migo'); \
              let __ok = where.length === 0; \
              let __msg = 'Deno still reachable on: ' + where.join(', ')",
@@ -192,13 +192,12 @@ mod published_namespace_isolation_tests {
     }
 
     #[test]
-    fn bootstrap_is_absent_from_the_global_and_from_both_mirrors() {
+    fn bootstrap_is_absent_from_the_global_and_from_the_migo_mirror() {
         let mut rt = boot();
         assert_js(
             &mut rt,
             "const where = []; \
              if (typeof globalThis.__bootstrap !== 'undefined') where.push('globalThis'); \
-             if (globalThis.wx && typeof globalThis.wx.__bootstrap !== 'undefined') where.push('wx'); \
              if (globalThis.migo && typeof globalThis.migo.__bootstrap !== 'undefined') where.push('migo'); \
              let __ok = where.length === 0; \
              let __msg = '__bootstrap still reachable on: ' + where.join(', ')",
@@ -210,7 +209,7 @@ mod published_namespace_isolation_tests {
     fn the_migo_namespace_still_publishes_content_apis() {
         // Profile-dependent, and asserting the Full number unconditionally
         // would assert the product profile instead of the publication. Slim
-        // cfg-deletes whole capability extensions -- it published 127 wx
+        // cfg-deletes whole capability extensions -- it published 127
         // names against Full's 300-plus when this was measured -- and
         // `getSystemInfoSync` is one of the names it removes. The floor is
         // still well above what a collapsed namespace would report, and the
@@ -233,12 +232,13 @@ mod published_namespace_isolation_tests {
         );
     }
 
-    /// `_NON_WX` (which capabilities are deliberately migo-only) is reference
-    /// data for an external wx-compat adapter now, not something the engine
-    /// acts on -- the engine never builds a `wx` object to keep names off of.
-    /// This just confirms migo publishes them, which is what matters at this
-    /// layer; whether an adapter correctly excludes them from its own `wx` is
-    /// that adapter's own test surface.
+    /// `_NON_MINIGAME_API` (which capabilities are deliberately migo-only) is
+    /// reference data for an external platform-compat adapter now, not
+    /// something the engine acts on -- the engine never builds a second
+    /// namespace to keep names off of. This just confirms migo publishes
+    /// them, which is what matters at this layer; whether an adapter
+    /// correctly excludes them from its own namespace is that adapter's own
+    /// test surface.
     #[test]
     fn gamepad_capabilities_are_published_on_migo() {
         let mut rt = boot();

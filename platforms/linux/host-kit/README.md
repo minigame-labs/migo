@@ -36,7 +36,7 @@ mini-game input model migo mirrors requires the host to own a text field and
 report its whole current value. A desktop host has a physical keyboard whose
 input already reaches content as key and composition events, so claiming the
 capability and not maintaining a field would be worse than not having it --
-content's `migo.showKeyboard` (or the same call made through a wx-compat
+content's `migo.showKeyboard` (or the same call made through a platform-compat
 adapter) correctly reports failure instead.
 
 Teardown is the C ABI's three steps and cannot be shortened: `close()` begins

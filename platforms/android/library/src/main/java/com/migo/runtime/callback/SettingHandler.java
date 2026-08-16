@@ -11,7 +11,7 @@ package com.migo.runtime.callback;
  * them has to be yours too.
  *
  * <h2>Without a handler</h2>
- * {@code wx.openSetting()} fails with {@code openSetting:fail not supported} and
+ * {@code migo.openSetting()} fails with {@code openSetting:fail not supported} and
  * code {@code -2}. It settles rather than staying silent, because content that
  * was denied a scope is meant to be sent here -- a stalled {@code openSetting()}
  * is a game with no way back.
@@ -33,7 +33,7 @@ public interface SettingHandler {
     /**
      * Show the permission-management UI for this game.
      * <p>
-     * Backs {@code wx.openSetting()}. Content typically calls it after a
+     * Backs {@code migo.openSetting()}. Content typically calls it after a
      * refusal, so the expectation is a screen the user can change a decision on,
      * not a read-only report.
      *

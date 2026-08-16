@@ -20,9 +20,10 @@ globalThis.global = globalThis;
 
 // BOM (window.innerWidth, window.screen, devicePixelRatio, document, navigator,
 // location, ...) and DOM are intentionally NOT exposed by the runtime, matching
-// wx Android's GameGlobal: it ships only `wx.*` + standard JS, with no BOM/DOM.
-// Games that need browser-style globals must layer a weapp-style adapter on top
-// (driving them from `migo.getWindowInfo()` / `migo.getSystemInfoSync()` etc.).
+// the common mini-game platform's GameGlobal: it ships only the platform
+// namespace + standard JS, with no BOM/DOM. Games that need browser-style
+// globals must layer an adapter on top (driving them from
+// `migo.getWindowInfo()` / `migo.getSystemInfoSync()` etc.).
 //
 // Engine compatibility shims (e.g. Cocos Creator's `_CCSettings` orientation
 // hook) likewise belong in the adapter, not in the runtime.

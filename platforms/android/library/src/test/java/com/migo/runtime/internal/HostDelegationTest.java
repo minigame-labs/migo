@@ -242,9 +242,9 @@ public final class HostDelegationTest {
     }
 
     /**
-     * The wx defaults for the fields content left out, which are not all empty: a request
+     * The platform defaults for the fields content left out, which are not all empty: a request
      * parsed as {@code zoneId = 0} or {@code currencyType = ""} is a different order from
-     * the one wx would have sent.
+     * the one the platform would have sent.
      */
     @Test
     public void anOrderWithNothingSetCarriesTheWxDefaults() {
@@ -385,7 +385,7 @@ public final class HostDelegationTest {
     /**
      * {@code openSetting} is the only one of these with a success payload the engine
      * consumes: {@code createDeferredApi} copies every non-{@code requestId} key onto what
-     * content receives, and {@code wx.openSetting()} is documented to answer
+     * content receives, and {@code migo.openSetting()} is documented to answer
      * {@code res.authSetting}. The other three carry no fields, so their success is the
      * absence of an error.
      */

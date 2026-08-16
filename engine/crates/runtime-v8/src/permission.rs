@@ -84,22 +84,22 @@ pub(crate) const PERMISSION_CLEANUP_OPS: &[(&str, Scope)] = &[
 
 /// Refuse an operation unless the host has granted its scope.
 ///
-/// The error text follows wx's `auth deny` convention, so content that already
-/// branches on it behaves the same way it does on wx.
+/// The error text follows the common mini-game platform's `auth deny`
+/// convention, so content that already branches on it behaves the same way.
 pub(crate) fn require_scope(state: &OpState, scope: Scope) -> Result<(), JsErrorBox> {
     if scope_state(state, scope) == ScopeState::Granted {
         return Ok(());
     }
     Err(JsErrorBox::generic(format!(
         "auth deny: {} is not granted",
-        scope.as_wx_str()
+        scope.as_minigame_str()
     )))
 }
 
 /// The host's current decision for one scope.
 ///
 /// `Unknown` when no host permission service is installed: nobody has been
-/// asked, which is not the same as having been refused. `wx.getSetting()`
+/// asked, which is not the same as having been refused. `migo.getSetting()`
 /// reports the difference and content uses it to decide between prompting and
 /// sending the user to `openSetting`.
 pub(crate) fn scope_state(state: &OpState, scope: Scope) -> ScopeState {
@@ -190,7 +190,7 @@ mod tests {
             assert!(
                 require_scope(&state, *scope).is_err(),
                 "{} was allowed with no host to grant it",
-                scope.as_wx_str()
+                scope.as_minigame_str()
             );
             assert_eq!(scope_state(&state, *scope), ScopeState::Unknown);
         }
@@ -218,9 +218,9 @@ mod tests {
         }
     }
 
-    /// The message is what content matches on; wx says `auth deny`.
+    /// The message is what content matches on; the convention says `auth deny`.
     #[test]
-    fn the_refusal_names_the_scope_in_wx_form() {
+    fn the_refusal_names_the_scope_in_minigame_form() {
         let state = state_with(None);
         let message = require_scope(&state, Scope::Camera)
             .unwrap_err()

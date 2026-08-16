@@ -209,7 +209,7 @@ function _internalTriggerOnHide() {
 
 // Focus is independent of visibility: a desktop window can lose keyboard
 // focus while remaining visible and rendering. Core retains the level and a
-// single profile callback. An HTML5 prelude maps this to focus/blur; wx leaves
+// single profile callback. An HTML5 prelude maps this to focus/blur; the common mini-game platform leaves
 // the adapter unset because it has no matching public API.
 let _focused = false;
 let _focusAdapter = null;

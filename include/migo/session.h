@@ -203,7 +203,7 @@ MIGO_STATIC_ASSERT(offsetof(MigoKeyboardShowOptions, default_value_utf8) == 24,
  * Install all three or none: a host that can show a keyboard but not hide it
  * strands it on screen with no event that corrects the state, so installing a
  * subset returns MIGO_ERROR_INVALID_ARGUMENT. A host that installs none simply
- * has no keyboard capability, and content's wx.showKeyboard reports failure.
+ * has no keyboard capability, and content's migo.showKeyboard reports failure.
  *
  * value_utf8 in the update callback is the whole current text -- content
  * correcting the value -- length-delimited and borrowed for the call.

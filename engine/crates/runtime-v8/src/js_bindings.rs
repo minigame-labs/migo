@@ -994,7 +994,7 @@ impl JsBindings {
     /// Dispatch one mouse button or motion event (PC platform).
     ///
     /// The three share a body because they differ only in which listener group
-    /// receives them; the argument list is the wx callback shape
+    /// receives them; the argument list follows the common mini-game callback shape
     /// `{x, y, button, timeStamp}`, and `x`/`y` are CSS pixels, the same
     /// logical space touch uses. A host that sends physical pixels here
     /// produces content that renders correctly and clicks in the wrong place.

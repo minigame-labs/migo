@@ -256,7 +256,7 @@ private slots:
         QVERIFY((touches[2].points[0].flags & MIGO_TOUCH_FLAG_REMOVED) != 0);
     }
 
-    /// Hover must not be delivered: wx content has no hover concept, and a free
+    /// Hover must not be delivered: mini-game content has no hover concept, and a free
     /// motion stream is events no game reads.
     void motion_without_a_button_reaches_the_mouse_stream_but_not_touch() {
         if (!require_xcb("xcb-only test", __FILE__, __LINE__)) return;

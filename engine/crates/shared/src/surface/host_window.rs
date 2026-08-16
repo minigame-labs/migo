@@ -2,7 +2,7 @@
 //! reports it to content.
 //!
 //! Two implementations of this rule existed. The C ABI carried a seqlock so a
-//! host could re-attach a resized surface and have `wx.getSystemInfoSync()`
+//! host could re-attach a resized surface and have `migo.getSystemInfoSync()`
 //! follow it; the desktop platforms carried a construction-time snapshot that
 //! could never be updated, with a comment saying so. Both serialised the same
 //! `WindowInfo`, field for field, so the only real difference was that one

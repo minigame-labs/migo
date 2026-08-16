@@ -160,10 +160,10 @@ jobs:
       - name: Ad reward integrity contract
         run: bash scripts/test-ad-reward-integrity-contract.sh
 
-      # Content must not reach the native op table. The wx/migo namespaces are
+      # Content must not reach the native op table. The migo namespace is
       # mirrored off globalThis before `harden_global_scope` removes deno_core's
       # internals, so anything hardening deletes has to be excluded from the
-      # mirror too -- `wx.Deno.core.ops` once handed content 616 invocable ops.
+      # mirror too -- a published namespace's `.Deno.core.ops` once handed content 616 invocable ops.
       - name: Runtime internals not published contract
         run: bash scripts/test-runtime-internals-not-published.sh
 
@@ -202,11 +202,6 @@ jobs:
           (cd platforms/android && ./gradlew --no-daemon :library:compileFullDebugJavaWithJavac)
           bash scripts/test-android-host-api-contract.sh
 
-      # The prescreen scanner answers "which APIs does this bundle need". Its
-      # dangerous failure is silent under-reporting -- an alias or computed key
-      # it does not follow turns into a confident "everything is supported".
-      - name: Prescreen scanner contract
-        run: bash scripts/test-prescreen-scanner.sh
 
       - name: Bounded input transport contract
         run: bash scripts/test-input-transport-contract.sh

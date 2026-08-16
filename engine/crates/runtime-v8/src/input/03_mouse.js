@@ -1,6 +1,6 @@
 // Mouse and Wheel event listeners (PC-only)
 //
-// These are part of the wx surface: wx mini-games run on PC WeChat, where the
+// These are part of the common mini-game surface: mini-games run on PC clients of that platform, where the
 // mouse is the primary input. A host delivers them through the C ABI's pointer
 // and wheel entry points; the engine never synthesizes them from touch, nor
 // touch from them. Which streams a host sends is its own decision -- an Android
@@ -40,7 +40,7 @@ function offMouseMove(listener) {
     _mouseMove.off(listener);
 }
 
-// wx's onMouseMove carries movementX/movementY, the offset from the previous
+// The common mini-game platform's onMouseMove carries movementX/movementY, the offset from the previous
 // move. It is derived here rather than in each host: every host already sends
 // consecutive positions, so computing it once keeps Android, Linux and Windows
 // from arriving at three different answers, and there is no pointer lock in this

@@ -6,8 +6,9 @@
 # event. When the trigger has no caller anywhere in the engine, the listener is
 # still advertised and still accepts a callback -- it simply never runs. Content
 # registering it sees nothing happen, on every platform, with no error: the same
-# failure shape as the `wx.getGamepads()` bug, where a black
-# screen was read for days as a rendering fault.
+# failure shape as the `getGamepads()` bug, where content called it through a
+# namespace that did not actually mirror the capability, and a black screen
+# was read for days as a rendering fault.
 #
 # Both producer channels count, and checking only the first misreports the second:
 #
@@ -20,9 +21,10 @@
 # here, so a trigger added later is covered without touching this file.
 #
 # Scope is the input modules. A dead trigger elsewhere can have a different and
-# legitimate cause -- `_internalTriggerAddToFavorites` is a wx API that is declared
-# because wx declares it and is waiting on host support -- and deleting those to
-# satisfy a gate would shrink wx compatibility rather than fix anything.
+# legitimate cause -- `_internalTriggerAddToFavorites` is a mini-game API that
+# is declared because the common mini-game surface declares it and is waiting
+# on host support -- and deleting those to satisfy a gate would shrink
+# mini-game compatibility rather than fix anything.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

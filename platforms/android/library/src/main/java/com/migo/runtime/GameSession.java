@@ -722,7 +722,7 @@ public final class GameSession implements Closeable {
     /**
      * Set or clear the auth handler for this session.
      * <p>
-     * This handler backs JS-side {@code wx.login()} and {@code wx.checkSession()}.
+     * This handler backs JS-side {@code migo.login()} and {@code migo.checkSession()}.
      * Call this before {@link #startGame(String)} for best compatibility.
      *
      * @param handler host auth handler, or null to clear
@@ -750,7 +750,7 @@ public final class GameSession implements Closeable {
      * Set or clear the permission handler for this session.
      * <p>
      * You decide what the game may do. With no handler installed every scope is
-     * denied: {@code wx.getSetting()} reports nothing granted and capability
+     * denied: {@code migo.getSetting()} reports nothing granted and capability
      * calls fail with {@code auth deny}. That is deliberate — your app may hold
      * the camera permission for its own features, and without this a game would
      * reach it under your grant with nobody asked about that game.
@@ -776,7 +776,7 @@ public final class GameSession implements Closeable {
     /**
      * Set or clear the setting handler for this session.
      * <p>
-     * Backs {@code wx.openSetting()}, which content calls to send the user
+     * Backs {@code migo.openSetting()}, which content calls to send the user
      * somewhere a refused permission can be changed. The standing decisions live
      * with you — see {@link PermissionSink#setScope} — so the screen that edits
      * them does too. With no handler installed the call fails as not supported.
@@ -797,7 +797,7 @@ public final class GameSession implements Closeable {
      * <p>
      * Bridge this to your own share surface. The runtime links no share SDK and
      * holds no social graph — with no handler installed
-     * {@code wx.shareAppMessage()} fails as not supported rather than stalling.
+     * {@code migo.shareAppMessage()} fails as not supported rather than stalling.
      * <p>
      * Call this before {@link #startGame(String)} for best compatibility.
      *
@@ -833,7 +833,7 @@ public final class GameSession implements Closeable {
      * <p>
      * Bridge this to your billing integration. The runtime holds no merchant
      * credentials and never decides that a purchase succeeded — with no handler
-     * installed {@code wx.checkIsSupportMidasPayment()} reports no payment
+     * installed {@code migo.checkIsSupportMidasPayment()} reports no payment
      * channel, so well-behaved content never opens a store it cannot transact
      * in.
      * <p>

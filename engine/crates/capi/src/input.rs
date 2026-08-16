@@ -124,8 +124,9 @@ pub unsafe extern "C" fn migo_session_send_touch(
 /// Deliver one mouse button or motion event to the session's content.
 ///
 /// Separate from `migo_session_send_touch` on purpose. A host chooses which
-/// streams its content needs: wx content written for a phone listens for touch,
-/// wx content written for PC WeChat listens for the mouse, and a desktop host
+/// streams its content needs: mini-game content written for a phone listens
+/// for touch, content written for a PC mini-game platform listens for the
+/// mouse, and a desktop host
 /// serving phone-first content may send both. The engine synthesizes neither
 /// from the other, because only the host knows which its content expects.
 ///

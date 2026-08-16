@@ -50,7 +50,7 @@ own new jobs, and this is the first tag either has ever actually run under.
   previous one. Rotating while the app is in the background takes that path on
   every Android device, and content came back to a `canvas.width`/`height`
   describing the window it was suspended on, stretched across the new one by the
-  presentation blit while `wx.getSystemInfoSync()` reported the real extent.
+  presentation blit while `migo.getSystemInfoSync()` reported the real extent.
 - A canvas the content *did* size with `canvas.width` is no longer moved when the
   surface resizes. It had been rescaled in proportion to the surface, so a game
   that picked a fixed resolution kept drawing in coordinates its own backing

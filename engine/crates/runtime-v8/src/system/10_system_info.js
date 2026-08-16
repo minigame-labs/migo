@@ -11,7 +11,7 @@ function getSystemInfoSync() {
         brand: '',
         model: 'unknown',
         pixelRatio: 1,
-        // Alias of pixelRatio. WeChat's getSystemInfoSync returns BOTH
+        // Alias of pixelRatio. The common mini-game platform's getSystemInfoSync returns BOTH
         // `pixelRatio` and `devicePixelRatio`; browser-style engines
         // (Cocos/Laya/...) read `devicePixelRatio` to size the canvas
         // backing store (`canvas.width = screenWidth * devicePixelRatio`).

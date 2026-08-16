@@ -52,7 +52,7 @@ impl std::error::Error for GamePathError {}
 /// # Why lower case only
 ///
 /// The id becomes one path component per game, and that component is the
-/// storage isolation boundary: separate saves, separate `wx.clearStorage()`,
+/// storage isolation boundary: separate saves, separate `migo.clearStorage()`,
 /// separate quota, separate `/code`. NTFS and the default APFS volume compare
 /// path components case-insensitively, so `PuzzleQuest` and `puzzlequest` are
 /// two games on Linux and Android and one directory on Windows. Restricting the

@@ -187,7 +187,7 @@ const WindowGlobalScope = {
     _internalTriggerMouseUp: core.propNonEnumerable(mouseApi._internalTriggerMouseUp),
     _internalTriggerWheel: core.propNonEnumerable(mouseApi._internalTriggerWheel),
 
-    // Gamepad transport for the HTML5 content adapter. wx has no gamepad API,
+    // Gamepad transport for the HTML5 content adapter. Mainstream mini-game platforms have no gamepad API,
     // so 97_migo_namespace.js exposes these names on `migo` only; the adapter
     // maps them to navigator.getGamepads() and Window connection events.
     getGamepads: core.propNonEnumerable(gamepadApi.getGamepads),

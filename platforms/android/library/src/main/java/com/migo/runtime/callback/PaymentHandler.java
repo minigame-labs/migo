@@ -12,7 +12,7 @@ package com.migo.runtime.callback;
  *
  * <h2>Without a handler</h2>
  * {@link #isMidasPaymentSupported} reports {@code false}, so
- * {@code wx.checkIsSupportMidasPayment()} answers
+ * {@code migo.checkIsSupportMidasPayment()} answers
  * {@code {allow_pay: false}} and well-behaved content never opens a store it
  * cannot transact in. Content that asks anyway fails with
  * {@code requestMidasPayment:fail not supported} and code {@code -2}.
@@ -37,7 +37,7 @@ public interface PaymentHandler {
     /**
      * Whether this device and user can transact at all.
      * <p>
-     * Backs {@code wx.checkIsSupportMidasPayment()}, which content calls before
+     * Backs {@code migo.checkIsSupportMidasPayment()}, which content calls before
      * showing a store. It is the answer to "is there a payment channel here",
      * not "will this particular purchase go through".
      *
@@ -74,15 +74,15 @@ public interface PaymentHandler {
 
     /** What content asked to charge for. */
     final class PaymentRequest {
-        /** wx payment mode, {@code "game"} unless content chose otherwise. */
+        /** platform payment mode, {@code "game"} unless content chose otherwise. */
         public final String mode;
-        /** wx environment selector: {@code 0} for production, {@code 1} for sandbox. */
+        /** platform environment selector: {@code 0} for production, {@code 1} for sandbox. */
         public final int env;
         /** The publisher's offer id, as content supplied it. */
         public final String offerId;
         /** ISO currency code, {@code "CNY"} unless content chose otherwise. */
         public final String currencyType;
-        /** wx platform selector, empty when content set none. */
+        /** platform selector, empty when content set none. */
         public final String platform;
         /** How much game currency to buy; {@code 0} when content set none. */
         public final int buyQuantity;

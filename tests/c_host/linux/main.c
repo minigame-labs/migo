@@ -230,7 +230,7 @@ static int detach_and_await_release(MigoSurfaceAttachment *attachment) {
 static const float SCALE_FACTOR = 1.0f;
 
 /* Maps one X11 pointer position onto a single-point touch event (id 0), which
- * is what wx content listens for; there is no separate mouse event model. */
+ * is what mini-game content listens for; there is no separate mouse event model. */
 static void send_touch(MigoSession *session, MigoTouchType type, int x, int y,
                        int64_t timestamp_ms) {
     int removed = (type == MIGO_TOUCH_END || type == MIGO_TOUCH_CANCEL);
@@ -556,7 +556,7 @@ int main(int argc, char **argv) {
                 }
                 break;
             case MotionNotify:
-                /* Only while a button is down: wx content has no hover concept,
+                /* Only while a button is down: mini-game content has no hover concept,
                  * so free motion would be a stream of events no game reads. */
                 if (pressed) {
                     send_touch(session, MIGO_TOUCH_MOVE, event.xmotion.x,

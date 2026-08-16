@@ -7,7 +7,7 @@
 //!
 //! Three modules are gated on the feature that ships the API they drive. Slim
 //! `cfg`-deletes whole capability extensions, so those tests would fail against a
-//! `wx` namespace that correctly does not have the function -- which is what they
+//! `migo` namespace that correctly does not have the function -- which is what they
 //! did, silently, for as long as nothing ran a Slim host suite. A gate here is a
 //! statement that the profile does not ship the API; it is not a statement that
 //! the test is optional.

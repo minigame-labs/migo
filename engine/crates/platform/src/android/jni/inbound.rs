@@ -1381,12 +1381,12 @@ pub(crate) extern "system" fn updatePermission<'local>(
             Ok(s) => s.into(),
             Err(_) => return JNI_FALSE,
         };
-        let Some(scope) = shared::services::Scope::from_wx_str(&scope) else {
+        let Some(scope) = shared::services::Scope::from_minigame_str(&scope) else {
             tracing::warn!(host_id, "ignoring unknown permission scope");
             return JNI_FALSE;
         };
         match crate::android::services::update_permission(host_id, scope, granted != 0, || {
-            crate::android::jni::permission_revoke_resources(host_id, scope.as_wx_str())
+            crate::android::jni::permission_revoke_resources(host_id, scope.as_minigame_str())
         }) {
             Ok(()) => JNI_TRUE,
             Err(crate::android_permission_gate::UpdateError::Closed) => {
@@ -1396,7 +1396,7 @@ pub(crate) extern "system" fn updatePermission<'local>(
             Err(crate::android_permission_gate::UpdateError::Cleanup(error)) => {
                 tracing::error!(
                     host_id,
-                    scope = scope.as_wx_str(),
+                    scope = scope.as_minigame_str(),
                     %error,
                     "permission revocation cleanup failed"
                 );

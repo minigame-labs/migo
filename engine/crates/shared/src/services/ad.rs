@@ -55,7 +55,7 @@ pub trait AdService: Send + Sync {
     /// - `adType`: string, one of `banner`, `custom`, `grid`, `interstitial`,
     ///   `rewardedVideo`, `gameBanner`, `gameIcon`, `gamePortal`
     /// - `adUnitId`: string, the publisher's ad slot id
-    /// - `options`: object, the remaining wx-style creation options
+    /// - `options`: object, the remaining platform-style creation options
     ///   (`adIntervals`, `style`, `adTheme`, `gridCount`, `count`, `multiton`)
     ///
     /// Events delivered via the ad event channel.

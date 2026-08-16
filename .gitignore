@@ -138,7 +138,6 @@ GEMINI.md
 .superpowers/
 docs/
 platforms/windows/SPIKE-REPORT.md
-tools/wx-api-diff/
 
 # Local-only operational notes (`*.local.md`). Same policy as the working
 # notes above: they are for the maintainer's machine, not for consumers.
@@ -147,3 +146,12 @@ tools/wx-api-diff/
 # OpenHarmony host build inputs staged by scripts/build-ohos-host.sh
 platforms/openharmony/entry/src/main/cpp/libs/
 platforms/openharmony/entry/src/main/cpp/migo-include/
+
+# Internal-only tooling that analyzes or compares against a specific named
+# third party's product, rather than anything migo itself publishes. Kept for
+# internal use, not published -- scripts/dump-api-surface.sh (this build's own
+# `migo` surface) stays public since it carries no third-party knowledge.
+scripts/prescreen-game.sh
+scripts/test-prescreen-scanner.sh
+tools/api-surface/fixture/
+scripts/perf_compare.ps1

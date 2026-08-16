@@ -47,10 +47,10 @@ private slots:
     /// The soft keyboard is not claimed, and not claimed in part.
     ///
     /// The three callbacks install together or not at all. This wrapper cannot
-    /// honour them -- wx's model needs the host to own a text field and report
+    /// honour them -- the common mini-game platform's model needs the host to own a text field and report
     /// its whole current value, and a desktop host has a physical keyboard
     /// whose input already reaches content as key and composition events. So
-    /// content's `wx.showKeyboard` correctly reports failure rather than
+    /// content's `migo.showKeyboard` correctly reports failure rather than
     /// opening a keyboard that reports nothing back.
     void the_soft_keyboard_capability_is_declined_whole() {
         QWidget container;

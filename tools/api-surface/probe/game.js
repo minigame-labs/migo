@@ -4,7 +4,7 @@
 // sees -- after the snapshot, after namespace construction, after hardening.
 // That is the point: parsing `99_global_scope*.js` would report what the
 // sources intend, and the two have already disagreed once (`Deno` was mirrored
-// onto `wx` despite hardening deleting it from globalThis).
+// onto a published namespace despite hardening deleting it from globalThis).
 function names(o) {
   try {
     return Object.getOwnPropertyNames(o).sort();
@@ -15,7 +15,6 @@ function names(o) {
 
 const dump = {
   global: names(globalThis),
-  wx: (typeof wx === "object" && wx) ? names(wx) : null,
   migo: (typeof migo === "object" && migo) ? names(migo) : null,
 };
 

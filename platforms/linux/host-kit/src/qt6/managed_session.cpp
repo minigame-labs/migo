@@ -156,12 +156,12 @@ MigoManagedSession::MigoManagedSession(MigoEngine &engine, QWidget &parent, QObj
     callbacks.on_request_frame = &Impl::onRequestFrame;
     // The three soft-keyboard callbacks are deliberately absent, and absent
     // together: installing a subset is refused, and installing all three would
-    // claim a capability this wrapper cannot honour. wx's soft keyboard
+    // claim a capability this wrapper cannot honour. The common mini-game platform's soft keyboard
     // requires the host to own a text field and report its whole current value;
     // a desktop host has a physical keyboard, and content already receives key
     // events and IME composition directly through the view. Claiming the
     // capability and then not maintaining a field would be worse than not
-    // having it -- content's wx.showKeyboard correctly reports failure instead.
+    // having it -- content's migo.showKeyboard correctly reports failure instead.
 
     const MigoResult installed = migo_session_set_host_callbacks(impl_->session, &callbacks);
     if (installed != MIGO_OK) {

@@ -8,7 +8,7 @@
 //! Usage:
 //!   migo-player [GAME_BUNDLE_DIR] [SECONDS] [--window]
 //!
-//! GAME_BUNDLE_DIR must contain `game.json` + `game.js` (a wx-style minigame
+//! GAME_BUNDLE_DIR must contain `game.json` + `game.js` (a mini-game-shaped
 //! bundle). Defaults to the sibling migo-bench bunnymark bundle.
 //!
 //! `--window` (or `MIGO_PLAYER_WINDOW=1`) exercises the onscreen X11 presenter.
@@ -220,7 +220,7 @@ fn run(
     // real extent made the line disagree with the pixels captured from it.
     let (surface_w, surface_h) = surface.size();
 
-    // Tell the platform what content should see from `wx.getSystemInfoSync()`.
+    // Tell the platform what content should see from `migo.getSystemInfoSync()`.
     //
     // Read from the surface rather than the requested constants for the same
     // reason the log line above is: content laying itself out from a size the
@@ -228,7 +228,7 @@ fn run(
     // no HiDPI notion, so one physical pixel is one CSS pixel.
     // Held by the player as well as the platform: the host owns this state and
     // republishes it whenever the window it presents into changes size, which is
-    // what lets `wx.getSystemInfoSync()` follow a resize instead of reporting
+    // what lets `migo.getSystemInfoSync()` follow a resize instead of reporting
     // the size the window had at start-up.
     let window_state = Arc::new(HostWindowState::new(HostWindowMetrics::new(
         surface_w,
@@ -343,7 +343,7 @@ fn run(
 /// performs it: build the new native surface, lease it against the host's live
 /// Surface generation, publish the measurement content reads, then hand the
 /// lease over. The publish happens before the command is enqueued and is rolled
-/// back if the enqueue fails, so `wx.getSystemInfoSync()` can never report a
+/// back if the enqueue fails, so `migo.getSystemInfoSync()` can never report a
 /// size the renderer was never told about.
 ///
 /// `UpdateSurface` goes through the critical channel because a dropped resize
@@ -450,10 +450,10 @@ fn run_for(window: &mut Option<Win32Window>, total: Duration, host_id: HostId) {
 ///
 /// Deliberately the same shape the Qt X11 view uses on Linux: a desktop host
 /// sends the mouse stream, and also maps the mouse to a single finger so that
-/// touch-only content -- which is nearly all wx content -- responds at all.
+/// touch-only content -- which is nearly all mini-game content -- responds at all.
 ///
 /// One physical click therefore reaches BOTH `onMouseDown` and `onTouchStart`.
-/// That matches Linux, but content listening on both (rare in wx, common in
+/// That matches Linux, but content listening on both (rare on mini-game platforms, common in
 /// HTML5) acts on one press twice. The web platform avoids this by firing
 /// compatibility mouse events only after a touch sequence ends and letting
 /// `preventDefault` suppress them; this runtime has no such suppression, and

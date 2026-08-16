@@ -35,7 +35,7 @@ fn permission_jni_call<T>(
             if let Some(scope) = scope {
                 Err(ServiceError {
                     code: ServiceErrorCode::PermissionDenied,
-                    message: format!("auth deny: {} is not granted", scope.as_wx_str()),
+                    message: format!("auth deny: {} is not granted", scope.as_minigame_str()),
                 })
             } else {
                 Err(ServiceError::system("Android session is closing"))

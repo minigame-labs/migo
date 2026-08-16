@@ -10,7 +10,7 @@ package com.migo.runtime.callback;
  * SDK and holds no social graph.
  *
  * <h2>Without a handler</h2>
- * {@code wx.shareAppMessage()} fails with
+ * {@code migo.shareAppMessage()} fails with
  * {@code shareAppMessage:fail not supported} and code {@code -2}. It settles
  * rather than staying silent: content commonly awaits the share before resuming,
  * so a dropped request is a paused game.
@@ -21,7 +21,7 @@ package com.migo.runtime.callback;
  *       the {@link ShareSink} it is given.</li>
  *   <li>Calls arrive on the runtime's host thread. Do not block: present your
  *       share surface and return. The sink is safe to use from any thread.</li>
- *   <li>The game already had its say: {@code wx.onShareAppMessage} listeners ran
+ *   <li>The game already had its say: {@code migo.onShareAppMessage} listeners ran
  *       before this call and their overrides are folded into the request. Treat
  *       what arrives as the final content, not a default to re-derive.</li>
  * </ul>
@@ -29,7 +29,7 @@ package com.migo.runtime.callback;
 public interface ShareHandler {
 
     /**
-     * Present the share flow for one {@code wx.shareAppMessage()} call.
+     * Present the share flow for one {@code migo.shareAppMessage()} call.
      *
      * @param request what content asked to share
      * @param sink    channel to settle this request on
@@ -46,12 +46,12 @@ public interface ShareHandler {
         public final String imageUrl;
         /**
          * Query string the launched game should receive, empty when content set
-         * none. wx spells it {@code a=1&b=2}, without a leading {@code ?}.
+         * none. The common mini-game platform spells it {@code a=1&b=2}, without a leading {@code ?}.
          */
         public final String query;
         /**
-         * wx-platform image id, empty when content set none. Meaningful only to
-         * a host that resolves ids against WeChat; ignore it otherwise.
+         * platform image id, empty when content set none. Meaningful only to
+         * a host that resolves ids against that platform; ignore it otherwise.
          */
         public final String imageUrlId;
 

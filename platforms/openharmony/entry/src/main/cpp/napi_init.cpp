@@ -169,7 +169,7 @@ void attach_surface(OH_NativeXComponent *component, void *window) {
         content.content_id_utf8 = g_host.content_id.c_str();
         /* Not optional: the engine rejects a null entry with
          * MIGO_ERROR_INVALID_ARGUMENT. Both the Android and the Linux host name
-         * game.js here, and wx content always has one. */
+         * game.js here, and mini-game content always has one. */
         content.entry_utf8 = "game.js";
 
         rc = migo_session_load_content(g_host.session, &content);
@@ -235,7 +235,7 @@ void OnSurfaceDestroyedCB(OH_NativeXComponent *component, void *window) {
  *   - Coordinates cross the ABI in CSS pixels, while OpenHarmony reports
  *     physical ones. Skipping the division renders correctly and puts every
  *     touch in the wrong place.
- *   - The event type belongs to the whole event; per-point types exist but a wx
+ *   - The event type belongs to the whole event; per-point types exist but a mini-game
  *     content model expects one phase per delivery, which is what the engine's
  *     MIGO_TOUCH_* values encode.
  */

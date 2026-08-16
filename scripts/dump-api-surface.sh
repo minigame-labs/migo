@@ -4,12 +4,13 @@
 # Runs `tools/api-surface/probe` as ordinary mini-game content through the Linux
 # player and captures what it sees. The runtime is the authority here, not the
 # sources: reading `99_global_scope*.js` reports what registration *intends*,
-# and the two have already disagreed -- `Deno` was mirrored onto `wx` even
-# though hardening deletes it from globalThis, which is how a reachable op table
-# survived. A probe sees the post-snapshot, post-hardening truth.
+# and the two have already disagreed -- `Deno` was once mirrored onto a
+# published namespace even though hardening deletes it from globalThis, which
+# is how a reachable op table survived. A probe sees the post-snapshot,
+# post-hardening truth.
 #
 # Output: JSON on stdout, or to --out.
-#   {"global":[...], "wx":[...], "migo":[...]}
+#   {"global":[...], "migo":[...]}
 #
 # Usage:
 #   bash scripts/dump-api-surface.sh [--out FILE] [--secs N]
@@ -65,7 +66,7 @@ import json
 import sys
 
 data = json.loads(sys.argv[1])
-for key in ("global", "wx", "migo"):
+for key in ("global", "migo"):
     if not data.get(key):
         print(f"surface is missing or empty for `{key}`", file=sys.stderr)
         raise SystemExit(1)

@@ -18,12 +18,12 @@ import org.junit.Test;
  * What content is owed when no advert can be shown.
  *
  * <p>The runtime installs an ad service on every full-profile Android session,
- * so {@code wx.createRewardedVideoAd()} takes the hosted path whether or not the
+ * so {@code migo.createRewardedVideoAd()} takes the hosted path whether or not the
  * embedder ever registered an {@link AdHandler}. That makes "hosted, but there is
  * no handler" the ordinary state of an integration in progress, and it used to be
  * the state in which {@code hide()}, {@code updateStyle()} and {@code destroy()}
  * dropped the request without a word, while {@code show()} reported an error and
- * no close -- leaving a rewarded-video flow that follows the wx idiom
+ * no close -- leaving a rewarded-video flow that follows the common mini-game platform's idiom
  * ({@code onClose} decides the payout) waiting forever.
  *
  * <p>{@code NativeExports} itself cannot be loaded here: it holds
@@ -87,7 +87,7 @@ public final class AdSettlementTest {
                 Arrays.asList("error:7:-1:showAd:fail no ad handler", "close:7:false"));
         expected.put(NativeExports.AdOp.HIDE, Arrays.asList("hide:7"));
         // Nothing is owed for these two, and that is a decision, not an omission:
-        // wx has no callback for a style write, and release is terminal.
+        // the common mini-game platform has no callback for a style write, and release is terminal.
         expected.put(NativeExports.AdOp.UPDATE_STYLE, Arrays.<String>asList());
         expected.put(NativeExports.AdOp.DESTROY, Arrays.<String>asList());
         return expected;

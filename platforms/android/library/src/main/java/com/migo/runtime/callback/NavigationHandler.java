@@ -17,9 +17,9 @@ import java.util.Map;
  * answer the same product question about where a player is allowed to go.
  *
  * <h2>Without a handler</h2>
- * {@code wx.navigateToMiniProgram()} fails with
+ * {@code migo.navigateToMiniProgram()} fails with
  * {@code navigateToMiniProgram:fail not supported} and code {@code -2}, and
- * {@code wx.openCustomerServiceConversation()} fails with
+ * {@code migo.openCustomerServiceConversation()} fails with
  * {@code openCustomerServiceConversation:fail not supported}.
  *
  * <h2>Contract</h2>

@@ -26,8 +26,8 @@ use crate::{
 };
 use migo_capi_abi::MIGO_ERROR_INTERNAL;
 
-/// wx's default when content does not ask for one.
-const WX_DEFAULT_MAX_LENGTH: u32 = 140;
+/// The common mini-game platform's default when content does not ask for one.
+const MINIGAME_DEFAULT_MAX_LENGTH: u32 = 140;
 
 /// Translate the engine's internal options JSON into the owned form the C
 /// struct is built from.
@@ -58,13 +58,13 @@ fn show_options_from_json(options_json: &str) -> ShowOptions {
             .get("maxLength")
             .and_then(|value| value.as_u64())
             .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(WX_DEFAULT_MAX_LENGTH),
+            .unwrap_or(MINIGAME_DEFAULT_MAX_LENGTH),
         confirm_type: match parsed.get("confirmType").and_then(|value| value.as_str()) {
             Some("next") => MIGO_KEYBOARD_CONFIRM_NEXT,
             Some("search") => MIGO_KEYBOARD_CONFIRM_SEARCH,
             Some("go") => MIGO_KEYBOARD_CONFIRM_GO,
             Some("send") => MIGO_KEYBOARD_CONFIRM_SEND,
-            // "done" and anything unrecognised alike: wx's default.
+            // "done" and anything unrecognised alike: the platform's default.
             _ => MIGO_KEYBOARD_CONFIRM_DONE,
         },
         keyboard_type: match parsed.get("keyboardType").and_then(|value| value.as_str()) {
@@ -135,7 +135,7 @@ impl SystemUtilServices for CapiDeviceServices {
     }
 }
 
-/// Content's `wx.showKeyboard` and friends, routed to the host's callbacks.
+/// Content's `migo.showKeyboard` and friends, routed to the host's callbacks.
 ///
 /// Every call returns once the host's dispatcher has taken the task, not once
 /// the host has acted: the ABI is asynchronous and cannot promise more. A
@@ -290,7 +290,7 @@ mod tests {
         crate::test_support::callback_session_pin()
     }
 
-    /// Every wx field must survive the trip into the C struct. A field dropped
+    /// Every field must survive the trip into the C struct. A field dropped
     /// here is a keyboard that opens with the wrong type, or that loses the
     /// text content seeded into it, with nothing in the log to say so.
     /// The capability is offered exactly when the host installed the
@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn every_wx_option_is_translated() {
+    fn every_option_is_translated() {
         let options = show_options_from_json(
             r#"{"defaultValue":"seed","maxLength":140,"multiple":true,
                 "confirmHold":true,"confirmType":"search","keyboardType":"number"}"#,
@@ -413,13 +413,13 @@ mod tests {
         assert_eq!(options.keyboard_type, MIGO_KEYBOARD_TYPE_NUMBER);
     }
 
-    /// wx's own defaults, so content that passes nothing gets the keyboard it
+    /// The common mini-game platform's own defaults, so content that passes nothing gets the keyboard it
     /// would get on the platform this API was cloned from.
     #[test]
-    fn absent_fields_fall_back_to_the_wx_defaults() {
+    fn absent_fields_fall_back_to_the_platform_defaults() {
         let options = show_options_from_json("{}");
         assert_eq!(options.default_value, "");
-        assert_eq!(options.max_length, WX_DEFAULT_MAX_LENGTH);
+        assert_eq!(options.max_length, MINIGAME_DEFAULT_MAX_LENGTH);
         assert_eq!(options.flags, MIGO_KEYBOARD_FLAG_NONE);
         assert_eq!(options.confirm_type, MIGO_KEYBOARD_CONFIRM_DONE);
         assert_eq!(options.keyboard_type, MIGO_KEYBOARD_TYPE_TEXT);
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn malformed_json_yields_the_defaults_rather_than_failing() {
         let options = show_options_from_json("this is not json");
-        assert_eq!(options.max_length, WX_DEFAULT_MAX_LENGTH);
+        assert_eq!(options.max_length, MINIGAME_DEFAULT_MAX_LENGTH);
         assert_eq!(options.keyboard_type, MIGO_KEYBOARD_TYPE_TEXT);
     }
 
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn an_out_of_range_max_length_falls_back_to_the_default() {
         let options = show_options_from_json(r#"{"maxLength":99999999999}"#);
-        assert_eq!(options.max_length, WX_DEFAULT_MAX_LENGTH);
+        assert_eq!(options.max_length, MINIGAME_DEFAULT_MAX_LENGTH);
     }
 
     #[test]

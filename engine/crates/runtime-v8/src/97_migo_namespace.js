@@ -3,7 +3,7 @@
 // Earlier revisions of this file also built a mini-game-platform-compatible
 // mirror unconditionally (later, behind a Cargo feature). Neither is here
 // anymore: `migo` is the engine's only default global, full stop. Content
-// ported from a mini-game platform (WeChat, a quick-game alliance member,
+// ported from a mini-game platform (a mainstream mini-game client, a quick-game alliance member,
 // etc.) gets that platform's global from an external, platform-specific
 // adapter package instead (the same pattern the BOM/DOM adapter already
 // uses -- see minigame-labs/migo-web-adapter), loaded by the host or the game
@@ -102,7 +102,7 @@ const _NON_API = new Set([
 ]);
 
 // Browser content capabilities implemented by the native runtime and surfaced
-// by the HTML5 adapter. No mini-game platform (WeChat, a quick-game alliance
+// by the HTML5 adapter. No mini-game platform (a mainstream mini-game client, a quick-game alliance
 // member, etc.) has a corresponding public name for these -- kept here as
 // reference data for any platform-compat adapter and for
 // scripts/test-content-namespace-contract.sh, neither of which this file
@@ -117,12 +117,12 @@ function _shouldMirrorApi(key) {
     if (_JS_BUILTINS.has(key)) return false;
     if (_NON_API.has(key)) return false;
     // Exclude any underscore-prefixed name. Two classes:
-    //   - V8 / engine internals exposed on globalThis (e.g. wx's __wxConfig,
+    //   - V8 / engine internals exposed on globalThis (e.g. a mini-game platform's own config global,
     //     __WAGameSubContextEndTime__).
     //   - migo's _internal* event-pump hooks intended only for the host's
     //     evaluateJavaScript channel.
-    // The real wx.* namespace has zero underscore-prefixed APIs (verified
-    // against wx-android.json), so this rule is the right alignment.
+    // The common mini-game namespace has zero underscore-prefixed APIs (verified
+    // against a real device capture), so this rule is the right alignment.
     if (key.charCodeAt(0) === 95 /* '_' */) return false;
     return true;
 }
@@ -149,7 +149,7 @@ function _copyApiNamespace(excluded) {
 function installApiNamespaces() {
     const migo = _copyApiNamespace(new Set());
 
-    // Enumerable to match the wx-shaped content model, where the namespace
+    // Enumerable to match the common mini-game content model, where the namespace
     // appears in Object.getOwnPropertyNames(GameGlobal).
     ObjectDefineProperty(globalThis, "migo", {
         value: migo, writable: true, enumerable: true, configurable: true,

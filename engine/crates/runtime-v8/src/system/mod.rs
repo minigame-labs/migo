@@ -411,9 +411,9 @@ pub fn op_get_beacons(state: &mut OpState) -> Result<String, JsErrorBox> {
 
 // ==================== Permission (getSetting / authorize) ====================
 
-/// Report the host's decision for every wx scope.
+/// Report the host's decision for every scope.
 ///
-/// Backs `wx.getSetting()`. Returns the wx-shaped map, e.g.
+/// Backs `migo.getSetting()`. Returns the platform-shaped map, e.g.
 /// `{"scope.camera":true,"scope.record":false}`.
 ///
 /// Only `Granted` becomes `true`. `Unknown` reports `false` because content
@@ -433,7 +433,7 @@ pub fn op_get_auth_setting(state: &mut OpState) -> String {
         }
         let granted = crate::permission::scope_state(state, *scope) == ScopeState::Granted;
         out.push('"');
-        out.push_str(scope.as_wx_str());
+        out.push_str(scope.as_minigame_str());
         out.push_str("\":");
         out.push_str(if granted { "true" } else { "false" });
     }
@@ -443,11 +443,11 @@ pub fn op_get_auth_setting(state: &mut OpState) -> String {
 
 /// Ask the host to decide a scope, prompting the user if it sees fit.
 ///
-/// Backs `wx.authorize()`. Mode C: the reply arrives on the permission-result
+/// Backs `migo.authorize()`. Mode C: the reply arrives on the permission-result
 /// channel, because there may be a human in the loop.
 ///
 /// Fails when no host permission service is installed rather than reporting
-/// success. `wx.authorize()` exists to obtain consent; returning success with
+/// success. `migo.authorize()` exists to obtain consent; returning success with
 /// nobody asked is the defect this replaces.
 #[op2(fast)]
 pub fn op_authorize(state: &mut OpState, #[string] request_json: String) -> Result<(), JsErrorBox> {

@@ -937,7 +937,7 @@ public final class NativeMethods {
     // ==================== Permission Callbacks ====================
 
     /**
-     * Settle one pending {@code wx.authorize()}.
+     * Settle one pending {@code migo.authorize()}.
      *
      * @param sessionId The session ID
      * @param resultJson JSON: {"requestId":N,"granted":true} or {"requestId":N,"error":"..."}
@@ -955,7 +955,7 @@ public final class NativeMethods {
      * JavaScript: state content could reach is state content could rewrite.
      *
      * @param sessionId The session ID
-     * @param scope     wx scope name, e.g. "scope.camera"
+     * @param scope     platform scope name, e.g. "scope.camera"
      * @param granted   whether the game may use it
      */
     public static boolean updatePermission(int sessionId, String scope, boolean granted) {

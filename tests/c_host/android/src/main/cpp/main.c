@@ -221,7 +221,7 @@ static void on_exit_requested(void *user_data, MigoSession *session) {
  * callbacks that install together.
  *
  * Show and hide drive the real system IME through the NDK's activity API, so
- * content's wx.showKeyboard genuinely raises the keyboard on the device.
+ * content's migo.showKeyboard genuinely raises the keyboard on the device.
  *
  * The text is scripted rather than read back from the IME: recovering Unicode
  * text from a NativeActivity means going through KeyEvent.getUnicodeChar over

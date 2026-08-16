@@ -301,7 +301,7 @@ else:
     if len(entry_points) < 6:
         failures.append(
             f"{sink_java.relative_to(root)}: found {len(entry_points)} ad entry "
-            "point(s), expected at least the six wx ad commands; this check "
+            "point(s), expected at least the six mini-game ad commands; this check "
             "stopped matching them and would pass vacuously"
         )
 
