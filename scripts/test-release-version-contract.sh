@@ -37,8 +37,10 @@
 #     moves when the ABI changes shape, which is a different question from which
 #     release a binary came from. Folding the two would make an ABI-compatible
 #     release look like a breaking one, or worse, the reverse.
-#   * `adapter/package.json` is a separately publishable npm package layered on the
-#     JS API surface, with its own consumers and cadence.
+#
+#   (The adapter packages -- migo-web-adapter, migo-wx-adapter -- used to live in
+#   this repo and needed the same carve-out; they're standalone repos now, so
+#   this gate never sees their package.json at all.)
 #
 # The release version only ever moves forward, and that constraint predates this
 # gate: `0.1.0` shipped a Windows DLL that could attach no surface kind, and the

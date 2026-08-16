@@ -7,10 +7,12 @@
 
 **A WebView replacement built for games.** Embed Migo in your app to run HTML5 and mini-game content natively — no browser, no DOM, no CSS, no compositor. Faster startup, lower memory, and a runtime version you pin yourself instead of one that drifts across OEMs and OS updates.
 
-Two adapter profiles let existing games run with zero or minimal changes:
+`migo.*` is the one native capability surface this engine ever installs — nothing else, at any scale. This repository stays that: a pure runtime, no adapter code mixed in. Everything else existing content expects is an independent, composable adapter, published as its own package:
 
-- **Cross-engine HTML5 / Canvas2D / WebGL** — Cocos, Egret, Pixi and vanilla Canvas games run unmodified; the adapter supplies a browser-style BOM/DOM.
-- **Mini-game platform style** — content ported from a mini-game platform (WeChat, a quick-game alliance member, etc.) runs through a platform-specific compat adapter that maps its global onto `migo.*`. The engine itself installs only `migo`; each platform's shape is an opt-in adapter, not something baked into every build.
+- **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** — a browser-style BOM/DOM surface (`window`, `document`, `Image`, `XMLHttpRequest`, ...) for engines built assuming a browser environment (Cocos, Egret, Laya, Pixi, raw Canvas/WebGL).
+- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** — publishes `globalThis.wx`, aliased to `migo.*`, for content written against a WeChat-mini-game-shaped global (unmodified WeChat mini-game source, or a similarly-shaped mini-game platform).
+
+The two touch disjoint globals and compose freely — pick zero, one, or both, matched to what your content actually needs. A future platform (a quick-game-alliance member, etc.) is the same recipe again: a new adapter package, no engine changes.
 
 ## Why Migo
 
@@ -90,7 +92,6 @@ migo/
 │   │   └── android-jni/    # JNI entry points (libmigo.so)
 │   ├── tools/              # snapshot-gen, headless player, C host example
 │   └── Cargo.toml
-├── adapter/                # HTML5 -> mini-game API adapter (JavaScript)
 ├── include/migo/           # public C headers
 ├── platforms/
 │   ├── android/            # Android SDK (AAR)
@@ -113,6 +114,8 @@ migo/
 |---|---|
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | Host integration examples, one directory per platform |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Reproducible Migo-vs-WebView benchmarks |
+| [migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter) | Browser-style BOM/DOM compat adapter |
+| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | wx-shaped mini-game compat adapter |
 
 ## License
 
