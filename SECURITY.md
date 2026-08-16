@@ -1,5 +1,7 @@
 # Security Policy
 
+[English](SECURITY.md) | [中文](SECURITY.zh-CN.md)
+
 ## Reporting a Vulnerability
 
 We take the security of **Migo** seriously. If you believe you have found a security vulnerability, please report it responsibly.

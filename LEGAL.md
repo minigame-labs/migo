@@ -1,5 +1,8 @@
 # Legal Notice
 
+> This document is the authoritative English version. It is not translated,
+> to avoid the legal risk of a translation drifting from the source text.
+
 This document clarifies the legal and licensing position of the Migo runtime.
 
 ## License

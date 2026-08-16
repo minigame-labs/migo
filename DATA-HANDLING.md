@@ -1,5 +1,8 @@
 # Data handling
 
+> This document is the authoritative English version. It is not translated,
+> to avoid the legal risk of a translation drifting from the source text.
+
 What this runtime does with data, for the security review that precedes
 embedding it.
 

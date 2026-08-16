@@ -31,12 +31,13 @@ They are two types rather than one type with a flag, because what differs is who
 is responsible for an asynchronous teardown, and a boolean cannot answer that.
 
 `MigoManagedSession` deliberately declines the soft-keyboard capability, and
-declines it whole: the three callbacks install together or not at all, and wx's
-model requires the host to own a text field and report its whole current value.
-A desktop host has a physical keyboard whose input already reaches content as
-key and composition events, so claiming the capability and not maintaining a
-field would be worse than not having it -- content's `wx.showKeyboard` correctly
-reports failure instead.
+declines it whole: the three callbacks install together or not at all, and the
+mini-game input model migo mirrors requires the host to own a text field and
+report its whole current value. A desktop host has a physical keyboard whose
+input already reaches content as key and composition events, so claiming the
+capability and not maintaining a field would be worse than not having it --
+content's `migo.showKeyboard` (or the same call made through a wx-compat
+adapter) correctly reports failure instead.
 
 Teardown is the C ABI's three steps and cannot be shortened: `close()` begins
 the detach and returns immediately, the view's release observer reports
@@ -55,12 +56,12 @@ state or entering Migo.
   same ratio the view reports as `scale_factor` at attach. Multiplying by it
   here -- the conversion that looks missing -- puts every tap in the wrong place
   on a HiDPI screen.
-- **A mouse drives both streams by default.** wx content written for a phone
-  listens for touch; wx content written for PC WeChat listens for the mouse.
+- **A mouse drives both streams by default.** Mini-game content written for a phone
+  listens for touch; content written for a PC mini-game platform listens for the mouse.
   Neither is synthesized from the other by the engine, so the view sends both
   and `setPointerDelivery()` narrows it. Content that listens for both would
-  otherwise act on one press twice. Hover reaches the mouse stream only: wx
-  content on a phone has no hover concept.
+  otherwise act on one press twice. Hover reaches the mouse stream only:
+  mini-game content on a phone has no hover concept.
 - **`code` comes from the hardware scan code, `key` from the layout.** The key
   that produces "a" on a French keyboard is still `KeyQ`, so WASD movement works
   for every layout. A key this build cannot name is reported as
@@ -88,7 +89,7 @@ later:
   and inventing an "up" for a key the user may still be holding is its own wrong
   answer. Unlike a press or a preedit, the engine makes no promise about held
   keys across a focus change.
-- **Hover as touch.** wx content has no hover concept; a free motion stream
+- **Hover as touch.** mini-game content has no hover concept; a free motion stream
   would be events no game reads.
 
 The public Migo C ABI is still marked `MIGO_C_ABI_CANDIDATE`. Treat this Host
