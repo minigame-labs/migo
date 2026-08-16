@@ -7,10 +7,12 @@
 
 **为游戏而生的 WebView 替代方案。** 把 Migo 嵌进你的 App，就能原生运行 HTML5 与小游戏内容——没有浏览器、DOM、CSS 与合成层。启动更快、内存更低，运行时版本由你自己钉死，不随 OEM 与系统版本漂移。
 
-两套适配层让现有游戏零改动或极小改动即可运行：
+`migo.*` 是这个引擎唯一安装的原生能力面——不多不少，任何规模都一样。这个仓库就保持这一点：一个纯粹的运行时，不掺任何适配层代码。现有内容期望的其他一切，都是独立发布、可组合的适配层包：
 
-- **跨引擎 HTML5 / Canvas2D / WebGL** —— Cocos、Egret、Pixi 与原生 Canvas 游戏无需修改；适配层提供浏览器风格的 BOM/DOM。
-- **小游戏平台风格** —— 从某个小游戏平台(微信、快游戏联盟成员等)移植的内容,通过对应平台的适配层运行,该适配层把平台自己的全局对象映射到 `migo.*`。引擎本身只安装 `migo`;每个平台的形态都是可选适配层,而不是每次构建都内置的东西。
+- **[migo-adapter](https://github.com/minigame-labs/migo-adapter)** —— 浏览器风格的 BOM/DOM 层(`window`、`document`、`Image`、`XMLHttpRequest` 等)，给假设自己跑在浏览器环境里的引擎用(Cocos、Egret、Laya、Pixi、原生 Canvas/WebGL)。
+- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** —— 发布 `globalThis.wx`，映射到 `migo.*`，给按微信小游戏全局对象写的内容用(未经改动的微信小游戏源码，或形态类似的小游戏平台)。
+
+这两层各自只碰互不重叠的全局对象，可以自由组合——按内容实际需要，选零个、一个或两个都要。以后再来一个平台(比如快游戏联盟成员)，还是同一个配方:加一个新的适配层包，引擎不用改。
 
 ## 为什么用 Migo
 
@@ -91,7 +93,6 @@ migo/
 │   │   └── android-jni/    # JNI 入口（libmigo.so）
 │   ├── tools/              # 快照生成、headless player、C 宿主示例
 │   └── Cargo.toml
-├── adapter/                # HTML5 -> 小游戏 API 适配层（JavaScript）
 ├── include/migo/           # 公开 C 头文件
 ├── platforms/
 │   ├── android/            # Android SDK（AAR）
@@ -114,6 +115,8 @@ migo/
 |---|---|
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | 各平台宿主集成示例，一个平台一个目录 |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Migo 与 WebView 的可复现对比测试 |
+| [migo-adapter](https://github.com/minigame-labs/migo-adapter) | 浏览器风格 BOM/DOM 兼容适配层 |
+| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | 微信小游戏形态兼容适配层 |
 
 ## 许可证
 
