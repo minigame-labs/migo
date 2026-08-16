@@ -117,7 +117,10 @@ impl Scope {
     /// arbitrary string to `migo.authorize`, and treating an unrecognised scope
     /// as any known one would grant the wrong capability.
     pub fn from_minigame_str(name: &str) -> Option<Scope> {
-        Scope::ALL.iter().copied().find(|s| s.as_minigame_str() == name)
+        Scope::ALL
+            .iter()
+            .copied()
+            .find(|s| s.as_minigame_str() == name)
     }
 }
 
@@ -244,7 +247,11 @@ mod tests {
             "camera",
             "SCOPE.CAMERA",
         ] {
-            assert_eq!(Scope::from_minigame_str(name), None, "{name:?} was accepted");
+            assert_eq!(
+                Scope::from_minigame_str(name),
+                None,
+                "{name:?} was accepted"
+            );
         }
     }
 
