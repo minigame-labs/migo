@@ -141,19 +141,20 @@ impl Drop for Canvas2DGlScopeGuard {
             if !self.gl_shadow.is_null() {
                 let shadow = unsafe { &mut *self.gl_shadow };
                 shadow.invalidate_after_external_gl_use();
-                // `active_texture`, `unpack_alignment`,
-                // `pack_alignment`, `unpack_pbo`, `pack_pbo` are
-                // back to the snapshot values — reflect that in
-                // the shadow so the *next* setter for these five
-                // doesn't trigger a redundant raw GL call.
+                // `active_texture` is back to the snapshot value —
+                // reflect that in the shadow so the *next*
+                // `activeTexture` call for it doesn't trigger a
+                // redundant raw GL call. `unpack_alignment` /
+                // `pack_alignment` need no equivalent: they dedup
+                // through the generic `pixel_store_i32` map, which
+                // `invalidate_after_external_gl_use` above already
+                // cleared, so the next `pixelStorei` re-issues
+                // regardless of pname. The PIXEL_(UN)PACK_BUFFER
+                // binding does NOT live in CanvasGLState at all —
+                // WebGL 2 code that manipulates it goes through the
+                // raw handler directly. We only re-synthesise the
+                // state that the shadow actually tracks.
                 shadow.active_texture_unit = Some(state.active_texture as u32);
-                shadow.unpack_alignment = Some(state.unpack_alignment);
-                shadow.pack_alignment = Some(state.pack_alignment);
-                // The PIXEL_(UN)PACK_BUFFER binding does NOT live
-                // in CanvasGLState at all — WebGL 2 code that
-                // manipulates it goes through the raw handler
-                // directly.  We only re-synthesise the state that
-                // the shadow actually tracks.
             }
         }
     }

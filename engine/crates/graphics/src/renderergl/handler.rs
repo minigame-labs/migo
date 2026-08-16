@@ -4,7 +4,6 @@ use shared::{
     protocol::render_cmd::{CanvasId, GLCmd, ShaderType},
 };
 use smallvec::SmallVec;
-use tracing::trace;
 
 #[cfg(test)]
 use crate::CanvasGLState;
@@ -525,22 +524,15 @@ impl RendererGL {
                 } else {
                     None
                 };
-                // State deduplication — skip GL call if already bound.
-                // Updated AFTER validation so invalid binds never pollute state.
-                let buf_key = buffer.unwrap_or(0);
-                let state = cm.gl_state.entry(canvas_id).or_default();
-                if target == glow::ARRAY_BUFFER {
-                    if state.bound_array_buffer == Some(Some(buf_key)) {
-                        return Ok(DamageEffect::NoDamage);
-                    }
-                    state.bound_array_buffer = Some(Some(buf_key));
-                } else if target == glow::ELEMENT_ARRAY_BUFFER {
-                    if state.bound_element_array_buffer == Some(Some(buf_key)) {
-                        return Ok(DamageEffect::NoDamage);
-                    }
-                    state.bound_element_array_buffer = Some(Some(buf_key));
+                // State deduplication — skip GL call if already bound. Updated
+                // AFTER validation so invalid binds never pollute state.
+                // Covers every WebGL2 buffer target (UNIFORM_BUFFER,
+                // PIXEL_UNPACK_BUFFER, COPY_READ_BUFFER, ...), not just the
+                // two GLES2-era ones a prior inline version tracked.
+                if st::update_bind_buffer(cm.gl_state.entry(canvas_id).or_default(), target, buffer)
+                {
+                    unsafe { gl.bind_buffer(target, native) };
                 }
-                unsafe { gl.bind_buffer(target, native) };
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1233,16 +1225,14 @@ impl RendererGL {
                 };
                 // Per-unit state deduplication for TEXTURE_2D.
                 // Updated AFTER validation so invalid binds never pollute state.
-                if target == glow::TEXTURE_2D {
-                    let tex_key = texture.unwrap_or(0);
-                    let state = cm.gl_state.entry(canvas_id).or_default();
-                    let unit = state.active_texture_unit.unwrap_or(glow::TEXTURE0);
-                    if state.bound_texture_2d.get(&unit) == Some(&Some(tex_key)) {
-                        return Ok(DamageEffect::NoDamage);
-                    }
-                    state.bound_texture_2d.insert(unit, Some(tex_key));
+                if target != glow::TEXTURE_2D
+                    || st::update_bind_texture_2d(
+                        cm.gl_state.entry(canvas_id).or_default(),
+                        texture,
+                    )
+                {
+                    unsafe { gl.bind_texture(target, native) };
                 }
-                unsafe { gl.bind_texture(target, native) };
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1692,7 +1682,9 @@ impl RendererGL {
                 a,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.blend_color(r, g, b, a) };
+                if st::update_blend_color(cm.gl_state.entry(canvas_id).or_default(), r, g, b, a) {
+                    unsafe { gl.blend_color(r, g, b, a) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1878,7 +1870,13 @@ impl RendererGL {
                 units,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.polygon_offset(factor, units) };
+                if st::update_polygon_offset(
+                    cm.gl_state.entry(canvas_id).or_default(),
+                    factor,
+                    units,
+                ) {
+                    unsafe { gl.polygon_offset(factor, units) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 

@@ -17,10 +17,7 @@ use std::collections::HashMap;
 
 use skia_safe::{
     AlphaType, ColorType, Image as SkImage,
-    gpu::{
-        self, Mipmapped, SurfaceOrigin, backend_textures,
-        gl::{self as sk_gl, TextureInfo},
-    },
+    gpu::{self, Mipmapped, SurfaceOrigin, backend_textures, gl::TextureInfo},
 };
 
 /// Metadata we retain for every uploaded image.  Kept deliberately minimal;

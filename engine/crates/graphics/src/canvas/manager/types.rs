@@ -182,8 +182,6 @@ pub(crate) struct CanvasGLState {
     pub front_face: Option<u32>,
     pub line_width: Option<f32>,
     pub polygon_offset: Option<(f32, f32)>,
-    pub unpack_alignment: Option<i32>,
-    pub pack_alignment: Option<i32>,
     /// Currently bound VAO (`None` = default vao 0).
     pub bound_vao: Option<u32>,
     /// Per-program uniform value cache.  Keys are `glGetUniformLocation`
@@ -328,8 +326,6 @@ impl Default for CanvasGLState {
             front_face: None,
             line_width: None,
             polygon_offset: None,
-            unpack_alignment: None,
-            pack_alignment: None,
             bound_vao: None,
             uniform_cache: HashMap::new(),
             bound_framebuffer: HashMap::new(),
@@ -429,8 +425,6 @@ impl CanvasGLState {
         self.front_face = None;
         self.line_width = None;
         self.polygon_offset = None;
-        self.unpack_alignment = None;
-        self.pack_alignment = None;
         self.bound_vao = None;
         // `uniform_cache` intentionally survives: uniforms are scoped
         // to a program, not to the shared GL context.  Skia's

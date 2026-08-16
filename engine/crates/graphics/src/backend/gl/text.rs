@@ -111,6 +111,11 @@ pub struct TextContext {
     /// them, not two.  Capped at the same 256-entry size: each entry
     /// holds one `TextBlob` (RCHandle, a few hundred bytes) plus
     /// `TextMetrics` (7 floats).  ~100 KB steady-state upper bound.
+    ///
+    /// The paint fast path that would read this is disabled pending
+    /// golden verification (see `try_fast_path_paint`), so nothing
+    /// reads it back through a live code path yet.
+    #[allow(dead_code)]
     shape_cache: core::cell::RefCell<lru::LruCache<TextMeasureKey, ShapedText>>,
     /// Warn once per unresolved family chain so misconfigured hosts
     /// get a clear signal instead of silent "paint nothing".
@@ -146,6 +151,11 @@ pub struct RegisteredFont {
 /// metrics dedup but re-enters the paragraph pipeline for painting
 /// because the text requires complex shaping (mixed scripts, BiDi,
 /// line-height propagation, font-fallback per glyph).
+// The paint fast path that reads `blob` is disabled pending golden
+// verification (see `try_fast_path_paint`), so today's measureText-only
+// callers never populate/read either field through a live code path the
+// compiler can see. Kept, not deleted: this is the fast path's data shape.
+#[allow(dead_code)]
 #[derive(Clone)]
 struct ShapedText {
     metrics: TextMetrics,
@@ -323,6 +333,10 @@ impl TextContext {
     /// Returns `None` when the first-tier family isn't registered,
     /// in which case the caller falls back to SkParagraph (which
     /// walks the full fallback chain).
+    ///
+    /// Unused today: its only caller, `obtain_shaped_text`, is itself
+    /// unreachable while `try_fast_path_paint` is disabled.
+    #[allow(dead_code)]
     fn resolve_primary_typeface(&self, attrs: &TextAttrs) -> Option<Typeface> {
         let style = self.font_style(attrs);
         // Try the head of the family list first, then the fallback.
@@ -706,6 +720,11 @@ impl TextContext {
     /// Look up (or populate) the shape-cache entry for
     /// `(text, attrs)`.  Returns `None` when no typeface can be
     /// resolved — callers treat this as "fall back to paragraph".
+    ///
+    /// Unused today: its only intended caller, the SkTextBlob fast
+    /// path, is disabled pending golden verification (see
+    /// `try_fast_path_paint`).
+    #[allow(dead_code)]
     fn obtain_shaped_text(
         &self,
         key: &TextMeasureKey,
@@ -953,6 +972,10 @@ fn baseline_offset(paragraph: &Paragraph, attrs: &TextAttrs) -> f32 {
 /// Counterpart of [`baseline_offset`] for the TextBlob fast path.
 /// Derives the ascent / descent from the cached
 /// [`TextMetrics`] rather than from a live paragraph.
+///
+/// Unused today: the TextBlob fast path is disabled pending golden
+/// verification (see `try_fast_path_paint`).
+#[allow(dead_code)]
 fn blob_baseline_offset(metrics: &TextMetrics, attrs: &TextAttrs) -> f32 {
     y_baseline_offset(
         attrs.baseline,
@@ -964,6 +987,9 @@ fn blob_baseline_offset(metrics: &TextMetrics, attrs: &TextAttrs) -> f32 {
 /// Dummy paint used only so `SkFont::measure_str` returns a width
 /// without forcing an allocation.  The real fill/stroke paint is
 /// applied at draw time on the SkTextBlob itself.
+///
+/// Unused today: same disabled fast path as [`blob_baseline_offset`].
+#[allow(dead_code)]
 fn paint_for_measure() -> &'static Paint {
     use std::sync::OnceLock;
     static PAINT: OnceLock<Paint> = OnceLock::new();

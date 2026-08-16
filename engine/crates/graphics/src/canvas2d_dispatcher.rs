@@ -12,11 +12,10 @@
 use shared::error::EngineResult;
 use shared::protocol::render_cmd::{Canvas2DCmd, CanvasId};
 
-use crate::backend::gl::text::TextContext;
 use crate::damage_effect::DamageEffect;
 use crate::{CanvasManager, canvas::BackingSizeOwner};
 
-/// Renderer-side shim around a shared [`TextContext`].
+/// Renderer-side shim around a shared [`TextContext`](crate::backend::gl::text::TextContext).
 ///
 /// The struct itself is stateless beyond the font registry; the actual
 /// Canvas2D state (paints, paths, CTM, …) lives per-canvas inside
@@ -36,12 +35,6 @@ pub(crate) struct Renderer2d {
 }
 
 impl Renderer2d {
-    pub(crate) fn new() -> (Self, shared::text_measurer::SharedTextMeasurer) {
-        let (shared, measurer) =
-            crate::text_measurer_impl::into_shared_measurer(TextContext::new());
-        (Self { text: shared }, measurer)
-    }
-
     /// Construct with an externally-built shared `TextContext`
     /// (F-2).  Used by `RenderThread::spawn`, which builds the
     /// pair off-thread so the `SharedTextMeasurer` half can be
