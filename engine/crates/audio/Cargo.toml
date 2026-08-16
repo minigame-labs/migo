@@ -9,7 +9,16 @@ name = "audio"
 [dependencies]
 
 # Decoders - lightweight combination
-minimp3 = "0.6"      # MP3, MIT license
+#
+# minimp3-sys directly, not the `minimp3` wrapper crate: this crate only ever
+# calls the raw `mp3dec_*` C functions (see decoder/mp3.rs) and manages
+# `mp3dec_t` itself, so the wrapper's own safe `Decoder` type -- and its
+# `slice-ring-buffer` dependency, which RUSTSEC-2025-0044 documents as having
+# four double-free vulnerabilities reachable through safe APIs and no fixed
+# upgrade available -- is dead weight this crate never calls into. Depending
+# on -sys directly removes it from the dependency tree instead of leaving it
+# compiled in on the strength of "but we never call that part."
+minimp3-sys = "0.6"  # MP3, MIT license
 lewton = "0.10"      # OGG Vorbis, MIT/Apache-2.0
 hound = "3.5"        # WAV, Apache-2.0
 
