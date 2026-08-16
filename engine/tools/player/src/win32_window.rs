@@ -136,7 +136,7 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -
 #[derive(Clone, Copy, Debug)]
 pub enum PointerEvent {
     /// `button` is in DOM `MouseEvent.button` order: 0 primary, 1 middle,
-    /// 2 secondary -- the same numbering wx documents for `onMouseDown`.
+    /// 2 secondary -- the same numbering the common mini-game platform documents for `onMouseDown`.
     Down {
         x: f32,
         y: f32,
@@ -249,7 +249,7 @@ impl Win32Window {
     fn record_pointer(&mut self, msg: &Msg) {
         let x = ((msg.l_param & 0xFFFF) as u16) as i16 as f32;
         let y = (((msg.l_param >> 16) & 0xFFFF) as u16) as i16 as f32;
-        // DOM button ordinals, which is also what wx documents: 0 left,
+        // DOM button ordinals, which is also what the common mini-game platform documents: 0 left,
         // 1 middle, 2 right. Win32 has a message per button rather than a code.
         let event = match msg.message {
             WM_MOUSEMOVE => PointerEvent::Move { x, y },

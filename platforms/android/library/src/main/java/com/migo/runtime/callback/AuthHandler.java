@@ -1,7 +1,7 @@
 package com.migo.runtime.callback;
 
 /**
- * Host-provided authentication handler for {@code wx.login}/{@code wx.checkSession}.
+ * Host-provided authentication handler for {@code migo.login}/{@code migo.checkSession}.
  * <p>
  * Register this handler via {@link com.migo.runtime.GameSession#setAuthHandler(AuthHandler)}
  * before the game starts, then bridge to your platform auth SDK.
@@ -121,7 +121,7 @@ public interface AuthHandler {
         void onFailure(String reason, Integer errno);
     }
 
-    /** User profile fields mapped to wx.getUserInfo(). */
+    /** User profile fields mapped to migo.getUserInfo(). */
     final class UserInfo {
         public String nickName = "";
         public String avatarUrl = "";

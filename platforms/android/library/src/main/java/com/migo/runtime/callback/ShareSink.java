@@ -1,7 +1,7 @@
 package com.migo.runtime.callback;
 
 /**
- * The channel a {@link ShareHandler} settles {@code wx.shareAppMessage()} on.
+ * The channel a {@link ShareHandler} settles {@code migo.shareAppMessage()} on.
  * <p>
  * Exactly one of these methods takes effect. The first call settles the
  * request; later calls do nothing, so a share sheet that reports both a send
@@ -19,9 +19,9 @@ public interface ShareSink {
     /**
      * Report that the share flow finished.
      * <p>
-     * wx does not tell content whether the user actually sent the message, and
+     * The common mini-game platform does not tell content whether the user actually sent the message, and
      * neither does this: {@code shareAppMessage()} resolves when the sheet is
-     * done with. Content that pays a reward for sharing is reading a signal wx
+     * done with. Content that pays a reward for sharing is reading a signal the platform
      * never gave it.
      */
     void settleShared();

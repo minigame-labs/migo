@@ -196,8 +196,8 @@ pub fn storage_get_sync_with_scheduler(
     quota_bytes: u64,
 ) -> Result<Option<String>, EngineError> {
     // Estimated byte size is only used for the scheduler's active-
-    // byte accounting; a rough upper bound (WX per-value max is
-    // 1 MiB) is enough.
+    // byte accounting; a rough upper bound (the common mini-game platform
+    // per-value max is 1 MiB) is enough.
     let request = storage_get_request(RequestKind::Sync, 0);
     scheduler
         .run_sync(&request, move || storage_get(&dir, &key, quota_bytes))

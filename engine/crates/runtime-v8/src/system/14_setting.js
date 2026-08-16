@@ -10,7 +10,7 @@ import { wrapAsync, createDeferredApi, createListenerGroup } from "ext:host_v8_b
 // ---- authorisation state ---------------------------------------------------
 //
 // The host owns this. There is no local map seeded with defaults: the previous
-// one initialised every scope to `true`, so `wx.getSetting()` told content it
+// one initialised every scope to `true`, so `migo.getSetting()` told content it
 // held permissions nobody had granted, and a game that checked before acting
 // was misled precisely because it checked.
 //

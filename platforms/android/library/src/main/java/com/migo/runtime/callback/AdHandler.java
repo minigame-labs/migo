@@ -17,7 +17,7 @@ package com.migo.runtime.callback;
  * The close carries {@code false} deliberately: a runtime that reported a
  * completed view with no advert behind it would have publishers paying out
  * rewards while earning nothing. It is reported at all because content following
- * the wx idiom decides its payout and resumes gameplay in {@code onClose} -- an
+ * the common mini-game platform's idiom decides its payout and resumes gameplay in {@code onClose} -- an
  * error alone leaves the player looking at a paused game.
  * <p>
  * A handler that sells only some formats gets the same treatment for the rest:
@@ -64,7 +64,7 @@ public interface AdHandler {
      * @param adId        runtime-allocated handle for this ad
      * @param adType      one of the {@code TYPE_*} constants
      * @param adUnitId    the publisher's ad slot id, as content supplied it
-     * @param optionsJson remaining wx-style creation options as a JSON object
+     * @param optionsJson remaining platform-style creation options as a JSON object
      *                    ({@code adIntervals}, {@code style}, {@code adTheme},
      *                    {@code gridCount}, {@code count}, {@code multiton});
      *                    never null, possibly {@code "{}"}

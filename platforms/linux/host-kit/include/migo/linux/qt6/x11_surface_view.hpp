@@ -54,11 +54,11 @@ public:
     /// Which pointer streams a mouse produces.
     ///
     /// The C ABI carries both because a host, not the engine, knows what its
-    /// content listens for: wx content written for a phone listens for touch,
-    /// wx content written for PC WeChat listens for the mouse, and neither is
+    /// content listens for: mini-game content written for a phone listens for touch,
+    /// content written for a PC mini-game platform listens for the mouse, and neither is
     /// synthesized from the other. The default sends both, because a desktop
     /// host most often runs phone-first content that would otherwise receive
-    /// nothing at all. Content that listens for both -- rare in wx, common in
+    /// nothing at all. Content that listens for both -- rare on mini-game platforms, common in
     /// HTML5 -- would act on one press twice, so it narrows this explicitly.
     enum class PointerDelivery : std::uint8_t { TouchAndMouse, TouchOnly, MouseOnly };
 

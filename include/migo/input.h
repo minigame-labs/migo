@@ -31,7 +31,7 @@ MIGO_BEGIN_DECLS
  */
 
 /*
- * Touch, including on desktop. wx mini-game content listens for
+ * Touch, including on desktop. Mini-game content listens for
  * touchstart/touchmove/touchend and nothing else, so a host with a mouse maps it
  * to a single touch point with id 0 rather than expecting a separate pointer
  * event model.
@@ -127,10 +127,11 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_touch(
 /*
  * Desktop pointer: mouse buttons, motion, and the wheel.
  *
- * Separate from touch above, and a host chooses which streams it sends. wx
- * content written for a phone listens for touch; wx content written for PC
- * WeChat listens for the mouse, which is why these names are on the wx surface
- * at all. A desktop host serving phone-first content may send both. Migo
+ * Separate from touch above, and a host chooses which streams it sends.
+ * Mini-game content written for a phone listens for touch; content written
+ * for a PC mini-game platform listens for the mouse, which is why these
+ * names are on the mini-game surface at all. A desktop host serving
+ * phone-first content may send both. Migo
  * synthesizes neither from the other: only the host knows what its content and
  * its device call for, and a runtime that guessed would double-deliver every
  * click to content that listens for both.
@@ -237,7 +238,7 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_wheel_event(
     const MigoWheelEvent *event);
 
 /*
- * Soft keyboard, wx model.
+ * Soft keyboard, common mini-game platform model.
  *
  * The value a text event carries is the field's WHOLE CURRENT TEXT, not the
  * keystroke that changed it. A host that sends only the newly typed character
@@ -394,7 +395,7 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_key_event(
 /*
  * IME composition.
  *
- * wx has no composition API, so the reference is the DOM CompositionEvent.
+ * Mainstream mini-game platforms have no composition API, so the reference is the DOM CompositionEvent.
  * Composition is the IN-PROGRESS state of IME input: typing pinyin shows a
  * preedit string before any of it is committed. It is distinct from the soft
  * keyboard above, which reports text that has ALREADY been committed.
@@ -446,7 +447,7 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_composition_event(
 /*
  * Gamepads.
  *
- * wx has no gamepad API, so the shape here is the Web one Migo replaces:
+ * Mainstream mini-game platforms have no gamepad API, so the shape here is the Web one Migo replaces:
  * content calls navigator.getGamepads() and listens for gamepadconnected.
  * Inventing a Migo-shaped API instead would make existing HTML5 games not work
  * for no reason.

@@ -38,7 +38,7 @@ class ResponseBase {
     }
 
     // Callbacks receive this instance directly (not toJSON output), so
-    // the wx-standard `res.errMsg` must be a live getter, not just a
+    // the common mini-game platform's standard `res.errMsg` must be a live getter, not just a
     // toJSON field. Same reason header/errno getters exist on the
     // subclasses below.
     get errMsg() {

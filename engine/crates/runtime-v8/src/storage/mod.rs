@@ -64,12 +64,12 @@ pub(crate) const MAX_TOTAL_BYTES: u64 = LIMIT_SIZE_KB as u64 * 1024;
 /// directory. A host that runs several games -- a game centre with a catalogue
 /// of third-party titles is the case this product is sold into -- would
 /// otherwise give all of them one SQLite file: any game could read another's
-/// saves by guessing keys, a single `wx.clearStorage()` would wipe the whole
+/// saves by guessing keys, a single `migo.clearStorage()` would wipe the whole
 /// catalogue, and the 10 MB quota would be a shared pool one game could
 /// exhaust for the rest. Code, cache and user-data directories were already
 /// per-game; this was the one that was not.
 ///
-/// It also restores wx's own semantics, where each mini-game has its own 10 MB.
+/// It also restores the common mini-game platform's own semantics, where each mini-game has its own 10 MB.
 ///
 /// Fails when no game is loaded rather than falling back to a shared location:
 /// `game_paths` is populated when a module is evaluated, so content cannot be

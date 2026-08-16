@@ -33,9 +33,9 @@ If in doubt, ask at **licensing@minigame-labs.com** — permission for reasonabl
 
 Migo implements a mini-game API surface that is **compatible in style** with mainstream mini-game platforms. To be precise about what this means:
 
-- References in this project to a **"WX mini-game API"** (or similar) denote a **publicly observable API specification / shape**, used solely for interoperability so that existing games can run unmodified. They do **not** refer to, invoke, or imply any affiliation with, endorsement by, or licensing from any third-party brand, platform, or company.
-- Migo is **not** affiliated with, sponsored by, or endorsed by Tencent, WeChat/Weixin, or any other mini-game platform vendor.
-- "WeChat", "Weixin", "微信", and related marks are trademarks of their respective owners. All other product names, logos, and brands are property of their respective owners and are used for **identification purposes only**.
+- References in this project to a **mainstream mini-game API** (or similar) denote a **publicly observable API specification / shape**, used solely for interoperability so that existing games can run unmodified. They do **not** refer to, invoke, or imply any affiliation with, endorsement by, or licensing from any third-party brand, platform, or company.
+- Migo is **not** affiliated with, sponsored by, or endorsed by any mini-game platform vendor.
+- All product names, logos, and brands referenced anywhere in this project are property of their respective owners and are used, where used at all, for **identification purposes only**.
 - "Business Source License" is a trademark of MariaDB Corporation Ab.
 
 ## Test and Demo Content

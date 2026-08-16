@@ -41,7 +41,7 @@ const FALLBACK_INTERSTITIAL_DURATION_MS = 100;
 const FALLBACK_REWARDED_VIDEO_DURATION_MS = 500;
 
 // Layout fields that a positioned ad forwards to the host when content mutates
-// them (wx content does `banner.style.top = y` directly on the style object).
+// them (mini-game content does `banner.style.top = y` directly on the style object).
 const POSITION_KEYS = ["left", "top", "width", "height"];
 
 // ==================== Host availability ====================
@@ -83,7 +83,7 @@ const _adCapabilities = new SafeMap();
 // restarting at 1 would let a replacement runtime's ad receive the retired
 // one's events -- including a reward verdict, which is the one event here that
 // must never reach the wrong ad. Exhaustion throws out of the `AdBase`
-// constructor, which is what `wx.createRewardedVideoAd` and its siblings
+// constructor, which is what `migo.createRewardedVideoAd` and its siblings
 // already do for a refused creation: they return an ad or they do not return.
 function _allocAdId() {
   return allocateHostCallbackId();
@@ -177,7 +177,7 @@ class AdBase {
   #hosted = false;
 
   // `adType` and `adUnitId` are what the host needs to resolve a real ad slot;
-  // `options` carries the remaining wx-style creation fields verbatim.
+  // `options` carries the remaining platform-style creation fields verbatim.
   constructor(eventTypes, adType, adUnitId, options) {
     for (const type of eventTypes) {
       this.#listeners[type] = createListenerGroup(`Ad ${type}`);
@@ -243,7 +243,7 @@ class AdBase {
   }
 
   // Send one command to the host. Host-side failures surface as an `error`
-  // event rather than a thrown exception, matching wx semantics (content
+  // event rather than a thrown exception, matching the common mini-game platform's semantics (content
   // listens on onError; it does not try/catch show()).
   _command(op, extra) {
     if (!this.#hosted || this.#destroyed) return;
@@ -267,7 +267,7 @@ class AdBase {
 
   // Make layout writes on a style object reach the host.
   //
-  // wx content mutates the style object directly (`banner.style.top = y`), so
+  // Mini-game content mutates the style object directly (`banner.style.top = y`), so
   // the write has to be intercepted. Accessors are installed in place, once per
   // ad, over just the positional keys.
   //

@@ -10,7 +10,7 @@
 `migo.*` 是这个引擎唯一安装的原生能力面——不多不少，任何规模都一样。这个仓库就保持这一点：一个纯粹的运行时，不掺任何适配层代码。现有内容期望的其他一切，都是独立发布、可组合的适配层包：
 
 - **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** —— 浏览器风格的 BOM/DOM 层(`window`、`document`、`Image`、`XMLHttpRequest` 等)，给假设自己跑在浏览器环境里的引擎用(Cocos、Egret、Laya、Pixi、原生 Canvas/WebGL)。
-- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** —— 发布 `globalThis.wx`，映射到 `migo.*`，给按微信小游戏全局对象写的内容用(未经改动的微信小游戏源码，或形态类似的小游戏平台)。
+- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** —— 发布 `globalThis.wx`，映射到 `migo.*`，给按主流小游戏全局对象写的内容用(未经改动的小游戏源码，或形态类似的小游戏平台)。
 
 这两层各自只碰互不重叠的全局对象，可以自由组合——按内容实际需要，选零个、一个或两个都要。以后再来一个平台(比如快游戏联盟成员)，还是同一个配方:加一个新的适配层包，引擎不用改。
 
@@ -116,7 +116,7 @@ migo/
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | 各平台宿主集成示例，一个平台一个目录 |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Migo 与 WebView 的可复现对比测试 |
 | [migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter) | 浏览器风格 BOM/DOM 兼容适配层 |
-| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | 微信小游戏形态兼容适配层 |
+| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | 主流小游戏形态兼容适配层 |
 
 ## 许可证
 

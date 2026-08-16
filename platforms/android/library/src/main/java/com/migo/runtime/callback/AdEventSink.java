@@ -75,7 +75,7 @@ public interface AdEventSink {
      * Report that a full-screen ad could not be shown at all.
      * <p>
      * Both halves matter. The error tells content (and your logcat) why, and the
-     * close is what lets content continue: the wx idiom decides the payout and
+     * close is what lets content continue: the common mini-game platform's idiom decides the payout and
      * resumes gameplay in {@code onClose}, so a rewarded video that reports only
      * an error leaves the player looking at a paused game forever. The verdict is
      * {@code false}, so nothing is minted -- this reports the absence of an

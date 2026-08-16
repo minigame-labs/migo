@@ -3,15 +3,16 @@
 # not install.
 #
 # The engine builds only `migo` (see `97_migo_namespace.js`) -- there is no
-# `wx` global unless a host or game explicitly loads a platform-compat
+# second namespace unless a host or game explicitly loads a platform-compat
 # adapter, which none of the conformance content under tests/c_host does.
-# `wx.anything` there throws ReferenceError on first use, which aborts paint
-# and leaves the screen black -- with no clue in the failure that a missing
-# namespace was the problem. That is exactly how it shipped once: every probe
-# written for the gamepad and IME work called `wx.getGamepads()` (back when
-# gamepad specifically was migo-only even while the engine still built a `wx`
-# mirror for everything else), and the black screen was read as a
-# frame-driving or rendering fault on the device.
+# Referencing an undeclared namespace there throws ReferenceError on first
+# use, which aborts paint and leaves the screen black -- with no clue in the
+# failure that a missing namespace was the problem. That is exactly how it
+# shipped once: every probe written for the gamepad and IME work called
+# `getGamepads()` through a namespace that did not mirror it (back when
+# gamepad specifically was migo-only even while the engine still built a
+# second, platform-compat namespace for everything else), and the black
+# screen was read as a frame-driving or rendering fault on the device.
 #
 # Scope: the conformance content under tests/c_host. The host-integration
 # examples that used to live beside it moved to minigame-labs/migo-examples,

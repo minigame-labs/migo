@@ -22,9 +22,9 @@ const loadFont = (path, family) => {
         console.error('loadFont: family must be a string when provided');
         return '';
     }
-    console.info('wx.loadFont called: path=' + path + (family ? ', family=' + family : ''));
+    console.info('migo.loadFont called: path=' + path + (family ? ', family=' + family : ''));
     const name = ops.op_load_font(path, family);
-    console.info('wx.loadFont result: path=' + path + ', family=' + (name || 'null'));
+    console.info('migo.loadFont result: path=' + path + ', family=' + (name || 'null'));
     // R-10: bump the global font epoch so every per-canvas JS
     // measureText cache invalidates its stored metrics on the
     // next access.  Cheap monotonic counter; compared against
@@ -39,45 +39,6 @@ const loadFont = (path, family) => {
     globalThis.__migoFontEpoch = (globalThis.__migoFontEpoch | 0) + 1;
     return name;
 };
-
-// wx.loadFont is a first-class WeChat API. `globalThis.loadFont` is set
-// unconditionally: `migo.loadFont` picks it up automatically through
-// 97_migo_namespace.js's ordinary namespace mirroring, without this
-// function's help.
-//
-// The accessor below is the engine's only involvement with `wx`: it does not
-// build a `wx` object itself (that is an external adapter's job, same
-// pattern as migo-web-adapter's BOM/DOM layer), but if a game or adapter assigns
-// `globalThis.wx` -- now or later, and reassigned as many times as it likes
-// -- loadFont stays in sync on whatever it points to, without this file
-// knowing anything about who set it or why.
-function _installWxLoadFontAlias() {
-    try {
-        globalThis.loadFont = loadFont;
-        let wxObj = globalThis.wx;
-        function patchWx(v) {
-            if (v && typeof v === 'object') {
-                try { v.loadFont = loadFont; } catch (_) {}
-            }
-        }
-        patchWx(wxObj);
-        console.info('wx.loadFont bridge installed: wx=' + (typeof globalThis.wx) + ', hasWxLoadFont=' + !!(globalThis.wx && globalThis.wx.loadFont));
-        try {
-            Object.defineProperty(globalThis, 'wx', {
-                configurable: true,
-                get() { return wxObj; },
-                set(v) {
-                    wxObj = v;
-                    patchWx(wxObj);
-                },
-            });
-        } catch (_) {
-            patchWx(globalThis.wx);
-        }
-    } catch (_) {}
-}
-
-_installWxLoadFontAlias();
 
 /**
  * getTextLineHeight(object)

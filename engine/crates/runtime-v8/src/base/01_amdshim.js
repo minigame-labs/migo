@@ -62,7 +62,7 @@ function define(name, deps, factory) {
 }
 
 // NOTE: do NOT set define.amd = true here.
-// On wx-android, the platform-provided define() does NOT have .amd set.
+// On a common mini-game platform's Android runtime, the platform-provided define() does NOT have .amd set.
 // Setting define.amd = true causes UMD modules inside browserify/webpack
 // bundles (e.g. tslib) to mistakenly take the AMD path, registering into
 // the global AMD registry instead of populating module.exports. This leaves

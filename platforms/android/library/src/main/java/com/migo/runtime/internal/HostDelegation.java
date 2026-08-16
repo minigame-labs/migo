@@ -154,7 +154,7 @@ final class HostDelegation {
                     }
                 }
                 // Emitted even when empty. "Nothing is granted" is an answer, and
-                // content following the wx idiom reads res.authSetting off a success
+                // content following the common mini-game platform's idiom reads res.authSetting off a success
                 // without checking that it exists -- omitting the field turns that
                 // into a TypeError rather than an empty object.
                 settlement.succeed(Collections.singletonMap("authSetting", (Object) scopes));

@@ -2,7 +2,7 @@ package com.migo.runtime.callback;
 
 /**
  * The channel a {@link NavigationHandler} settles
- * {@code wx.navigateToMiniProgram()} on.
+ * {@code migo.navigateToMiniProgram()} on.
  * <p>
  * Exactly one of these methods takes effect. The first call settles the
  * request; later calls do nothing, so a host that reports both an arrival and a

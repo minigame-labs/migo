@@ -167,13 +167,13 @@ The candidate cannot be declared stable until all of the following exist:
   **touch done** (`migo_session_send_touch`: batched, one copy at the boundary, no
   allocation, sharing the engine path Android already drives). **Desktop pointer done**:
   `migo_session_send_pointer_event` and `migo_session_send_wheel_event`. Until 2026-07-22 the
-  runtime published `onMouseDown`/`onMouseMove`/`onMouseUp`/`onWheel` — names the wx surface
-  really defines, because wx mini-games run on PC WeChat — with the JS listener groups and
+  runtime published `onMouseDown`/`onMouseMove`/`onMouseUp`/`onWheel` — names the common
+  mini-game surface really defines, because mini-games run on PC clients of that platform — with the JS listener groups and
   their `_internalTrigger*` hooks present but *no producer anywhere*: no engine code called
   them and no host could, so content registering one was silently never called, on every
   platform, with no error. Deleting the listeners would not have been the fix; they are part
-  of the wx surface Migo clones, and removing them turns a silent no-op into a `TypeError`
-  for PC wx content. The fix was the missing host channel, in the shape the soft keyboard
+  of the common mini-game surface Migo clones, and removing them turns a silent no-op into a `TypeError`
+  for PC mini-game content. The fix was the missing host channel, in the shape the soft keyboard
   already used: the engine exposes the capability, the host produces the events, and neither
   stream is synthesized from the other — an Android host sends touch, a desktop host sends
   the mouse, and a desktop host serving phone-first content may send both, because only the
@@ -206,12 +206,12 @@ The candidate cannot be declared stable until all of the following exist:
   whose tail holds *valid* modifier bits -- garbage there would be caught by the known-bits
   check and surface as an error, whereas a plausible value would surface as content being
   told Ctrl and Alt are held when the host said nothing at all. **IME composition done**: the engine had no way to
-  represent a preedit string, so this added both halves. wx has none, so the shape is the DOM
+  represent a preedit string, so this added both halves. The common mini-game platform has none, so the shape is the DOM
   `CompositionEvent` -- `compositionstart`/`update`/`end` carrying the whole current preedit,
   driven by `migo_session_send_composition_event`. It sits alongside the soft keyboard rather
   than replacing it: the keyboard reports committed text, composition reports what is still
   being typed, and content drawing its own text field needs both. **gamepad done**: the engine had none at all -- no JS
-  API, no `HostCommand`, no dispatch -- so this added both halves. wx has no gamepad API, so
+  API, no `HostCommand`, no dispatch -- so this added both halves. Mainstream mini-game platforms have no gamepad API, so
   the shape is the W3C one Migo replaces: `navigator.getGamepads()` plus
   `gamepadconnected`/`gamepaddisconnected`, driven by `migo_session_set_gamepad_connected`
   and `migo_session_send_gamepad_state`. The Web API is polled rather than evented, so a

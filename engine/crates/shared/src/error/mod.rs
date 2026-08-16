@@ -239,8 +239,8 @@ impl From<std::io::Error> for EngineError {
         let code = io_error_to_error_code(&e);
         // Node.js convention: negative errno in the JS surface
         // (`err.errno === -2` for ENOENT, not 2). We mirror that so
-        // game code written against the Node/WX `err.errno` shape
-        // ports cleanly.
+        // game code written against the Node/mini-game-platform
+        // `err.errno` shape ports cleanly.
         let errno = e.raw_os_error().map(|n| -n);
         let err = EngineError::new(code).with_detail(e.to_string());
         match errno {

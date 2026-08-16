@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Whatever `harden_global_scope` removes must never have been mirrored.
 #
-# The runtime publishes two namespaces to content, `wx` and `migo`, built in
+# The runtime publishes one namespace to content, `migo`, built in
 # `97_migo_namespace.js` by copying property descriptors off globalThis during
 # bootstrap. deno_core's internals are removed from globalThis afterwards, by
 # `harden_global_scope` in Rust -- deleting them from JS instead breaks
 # deno_core's snapshot restore path, so the ordering is forced.
 #
 # A mirror built first therefore captures whatever hardening deletes later, and
-# deleting the global does nothing to the copy. That is how `wx.Deno.core.ops`
+# deleting the global does nothing to the copy. That is how, before the engine
+# stopped building a second published namespace of its own, its `.Deno.core.ops`
 # ended up handing content 616 invocable ops, past every JS-level API and the
 # policies built on them. `__bootstrap` escaped only because the mirror filter
 # happens to skip underscore-prefixed names.
@@ -122,10 +123,10 @@ if not excluded:
 for name in sorted(deleted - excluded):
     failures.append(
         f"`{name}` is deleted from globalThis by harden_global_scope but is not in "
-        f"`_RUNTIME_INTERNALS` ({namespace_js.relative_to(root)}). The wx/migo "
-        f"mirrors are built before hardening runs, so they captured `{name}` and "
+        f"`_RUNTIME_INTERNALS` ({namespace_js.relative_to(root)}). The migo "
+        f"mirror is built before hardening runs, so it captured `{name}` and "
         "deleting the global does not reach the copy -- content can still get it "
-        "off `wx` or `migo`."
+        "off `migo`."
     )
 
 if failures:

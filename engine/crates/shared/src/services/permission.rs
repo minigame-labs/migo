@@ -2,10 +2,11 @@
 //!
 //! # Why the runtime cannot answer this itself
 //!
-//! WeChat is both the runtime and the host: it owns the user relationship, the
-//! consent dialog, and the persistent record of what each mini-game was
-//! granted. Migo is embedded in someone else's app and owns none of those. So
-//! the three things wx merges have to be split:
+//! A mainstream mini-game platform is both the runtime and the host: it owns
+//! the user relationship, the consent dialog, and the persistent record of
+//! what each mini-game was granted. Migo is embedded in someone else's app and
+//! owns none of those. So the three things that platform convention merges
+//! have to be split:
 //!
 //! - **the game declares** which scopes it uses, in `game.json`'s `permission`
 //!   field, together with the reason text a prompt should show;
@@ -21,11 +22,11 @@
 //! With no host permission handler installed, every scope is denied.
 //!
 //! The state this replaces was a JavaScript object with every scope hardcoded
-//! to `true`, so `wx.getSetting()` told content it held permissions nobody had
-//! granted and `wx.authorize()` -- an API whose entire purpose is to ask the
-//! user -- returned success without asking anyone. In a game centre that means
-//! a third-party title reaches the camera under the *host app's* grant, with
-//! nobody ever asked whether that game should have it.
+//! to `true`, so `migo.getSetting()` told content it held permissions nobody
+//! had granted and `migo.authorize()` -- an API whose entire purpose is to ask
+//! the user -- returned success without asking anyone. In a game centre that
+//! means a third-party title reaches the camera under the *host app's* grant,
+//! with nobody ever asked whether that game should have it.
 //!
 //! A runtime that grants permissions on its own is the same class of defect as
 //! one that mints ad rewards on its own, and gets the same answer: without a
@@ -39,12 +40,12 @@
 
 use crate::protocol::error::ServiceError;
 
-/// A wx authorisation scope.
+/// A mini-game authorisation scope.
 ///
-/// Content addresses these by their wx string (`"scope.camera"`), which is what
-/// crosses the boundary; this enum exists so the runtime's own call sites name
-/// a capability rather than repeat a string literal, and so adding a capability
-/// is a compile error at every site that must classify it.
+/// Content addresses these by their platform-facing string (`"scope.camera"`),
+/// which is what crosses the boundary; this enum exists so the runtime's own
+/// call sites name a capability rather than repeat a string literal, and so
+/// adding a capability is a compile error at every site that must classify it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
     UserInfo,
@@ -60,12 +61,13 @@ pub enum Scope {
     Bluetooth,
     AddPhoneContact,
     AddPhoneCalendar,
-    WxFriendInteraction,
+    FriendInteraction,
     GameClubData,
 }
 
 impl Scope {
-    /// Every scope wx defines, in the order `wx.getSetting()` reports them.
+    /// Every scope the common mini-game surface defines, in the order
+    /// `migo.getSetting()` reports them.
     ///
     /// Exhaustive on purpose: a new variant that is not listed here is a
     /// capability `getSetting` would silently omit, so the list and the enum
@@ -84,12 +86,12 @@ impl Scope {
         Scope::Bluetooth,
         Scope::AddPhoneContact,
         Scope::AddPhoneCalendar,
-        Scope::WxFriendInteraction,
+        Scope::FriendInteraction,
         Scope::GameClubData,
     ];
 
-    /// The wx-facing name, e.g. `"scope.camera"`.
-    pub const fn as_wx_str(self) -> &'static str {
+    /// The platform-facing name, e.g. `"scope.camera"`.
+    pub const fn as_minigame_str(self) -> &'static str {
         match self {
             Scope::UserInfo => "scope.userInfo",
             Scope::UserLocation => "scope.userLocation",
@@ -104,18 +106,21 @@ impl Scope {
             Scope::Bluetooth => "scope.bluetooth",
             Scope::AddPhoneContact => "scope.addPhoneContact",
             Scope::AddPhoneCalendar => "scope.addPhoneCalendar",
-            Scope::WxFriendInteraction => "scope.WxFriendInteraction",
+            Scope::FriendInteraction => "scope.WxFriendInteraction",
             Scope::GameClubData => "scope.gameClubData",
         }
     }
 
-    /// Parse a wx-facing scope name.
+    /// Parse a platform-facing scope name.
     ///
     /// Unknown names return `None` rather than a default: content may pass an
-    /// arbitrary string to `wx.authorize`, and treating an unrecognised scope
+    /// arbitrary string to `migo.authorize`, and treating an unrecognised scope
     /// as any known one would grant the wrong capability.
-    pub fn from_wx_str(name: &str) -> Option<Scope> {
-        Scope::ALL.iter().copied().find(|s| s.as_wx_str() == name)
+    pub fn from_minigame_str(name: &str) -> Option<Scope> {
+        Scope::ALL
+            .iter()
+            .copied()
+            .find(|s| s.as_minigame_str() == name)
     }
 }
 
@@ -126,10 +131,11 @@ impl Scope {
 /// gate or a cleanup exemption in the runtime layer. This keeps service
 /// ownership here without making `shared` know runtime operation names.
 ///
-/// Only capabilities wx itself gates appear here. `clipboard` and `scan_code`
-/// are absent because wx does not put them behind a scope, and inventing scopes
-/// wx has no notion of would mean existing games hitting an authorisation flow
-/// that does not exist on the platform they were written for.
+/// Only capabilities the common mini-game surface itself gates appear here.
+/// `clipboard` and `scan_code` are absent because that surface does not put
+/// them behind a scope, and inventing scopes it has no notion of would mean
+/// existing games hitting an authorisation flow that does not exist on the
+/// platform they were written for.
 ///
 /// `image_api` is deliberately absent despite `saveImageToPhotosAlbum` needing
 /// `scope.writePhotosAlbum`: the accessor also serves `compressImage` and
@@ -158,9 +164,10 @@ pub const GATED_SERVICE_METHODS: &[(&str, Scope)] = &[
 pub enum ScopeState {
     /// The host has not been asked, or has not answered yet.
     ///
-    /// Distinct from `Denied` because wx does not re-prompt after a refusal:
-    /// content that was denied must be sent to `openSetting` instead, and
-    /// collapsing the two would either re-prompt forever or refuse to ever ask.
+    /// Distinct from `Denied` because the common mini-game convention does not
+    /// re-prompt after a refusal: content that was denied must be sent to
+    /// `openSetting` instead, and collapsing the two would either re-prompt
+    /// forever or refuse to ever ask.
     Unknown,
     Granted,
     Denied,
@@ -173,7 +180,7 @@ pub enum ScopeState {
 pub trait PermissionService: Send + Sync {
     /// The host's current decision for one scope, without asking the user.
     ///
-    /// Must not prompt: this backs `wx.getSetting()`, which content calls to
+    /// Must not prompt: this backs `migo.getSetting()`, which content calls to
     /// decide whether to *offer* a feature, often during layout.
     fn scope_state(&self, _scope: Scope) -> ScopeState {
         ScopeState::Unknown
@@ -183,7 +190,7 @@ pub trait PermissionService: Send + Sync {
     ///
     /// JSON fields (input):
     /// - `requestId`: number, correlates the reply
-    /// - `scope`: string, the wx scope name
+    /// - `scope`: string, the platform-facing scope name
     /// - `desc`: string, the reason text the game declared in `game.json`
     ///   (empty when it declared none) -- a host cannot write an honest prompt
     ///   without it
@@ -202,18 +209,18 @@ mod tests {
     use super::*;
 
     /// `ALL` and the enum must not drift: a scope missing from `ALL` is one
-    /// `wx.getSetting()` never reports, which reads to content as "this
+    /// `migo.getSetting()` never reports, which reads to content as "this
     /// capability does not exist" rather than "not granted".
     #[test]
-    fn every_scope_round_trips_through_its_wx_name() {
+    fn every_scope_round_trips_through_its_minigame_name() {
         for scope in Scope::ALL {
-            let name = scope.as_wx_str();
+            let name = scope.as_minigame_str();
             assert_eq!(
-                Scope::from_wx_str(name),
+                Scope::from_minigame_str(name),
                 Some(*scope),
                 "{name} did not round-trip"
             );
-            assert!(name.starts_with("scope."), "{name} is not a wx scope name");
+            assert!(name.starts_with("scope."), "{name} is not a scope name");
         }
     }
 
@@ -222,9 +229,9 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for scope in Scope::ALL {
             assert!(
-                seen.insert(scope.as_wx_str()),
+                seen.insert(scope.as_minigame_str()),
                 "{} appears twice in Scope::ALL",
-                scope.as_wx_str()
+                scope.as_minigame_str()
             );
         }
         assert_eq!(seen.len(), Scope::ALL.len());
@@ -240,7 +247,11 @@ mod tests {
             "camera",
             "SCOPE.CAMERA",
         ] {
-            assert_eq!(Scope::from_wx_str(name), None, "{name:?} was accepted");
+            assert_eq!(
+                Scope::from_minigame_str(name),
+                None,
+                "{name:?} was accepted"
+            );
         }
     }
 

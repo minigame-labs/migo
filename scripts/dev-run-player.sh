@@ -2,7 +2,7 @@
 # scripts/dev-run-player.sh
 #
 # Build + run the headless Linux dev player (engine/tools/player) on
-# x86_64-unknown-linux-gnu, rendering a wx-style minigame bundle offscreen.
+# x86_64-unknown-linux-gnu, rendering a mini-game-shaped bundle offscreen.
 #
 # Usage:
 #   scripts/dev-run-player.sh [GAME_BUNDLE_DIR] [SECONDS]

@@ -10,12 +10,12 @@ pub struct LinuxPlatform {
     /// Supplied by an embedding host that services the keyboard itself.
     ///
     /// The Linux engine layer has no keyboard of its own, so this is the only way content's
-    /// `wx.showKeyboard` reaches anything at all.
+    /// `migo.showKeyboard` reaches anything at all.
     host_keyboard: Option<Arc<dyn KeyboardService>>,
     /// The window the host is presenting into, in physical pixels.
     ///
     /// Only the host knows this -- the engine layer is handed a surface, not a
-    /// window -- and without it `wx.getSystemInfoSync()` reports a zero-sized
+    /// window -- and without it `migo.getSystemInfoSync()` reports a zero-sized
     /// window, so content that lays itself out from `windowWidth`/`windowHeight`
     /// stacks everything at the origin. Nothing in the rendering path is wrong
     /// when that happens, which is why no rendering test catches it.

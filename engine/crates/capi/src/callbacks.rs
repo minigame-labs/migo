@@ -35,7 +35,7 @@ pub const MIGO_KEYBOARD_FLAG_NONE: u32 = 0;
 pub const MIGO_KEYBOARD_FLAG_MULTIPLE: u32 = 1 << 0;
 pub const MIGO_KEYBOARD_FLAG_CONFIRM_HOLD: u32 = 1 << 1;
 
-/// `MIGO_KEYBOARD_CONFIRM_*`, in wx's order.
+/// `MIGO_KEYBOARD_CONFIRM_*`, in the common mini-game platform's order.
 pub const MIGO_KEYBOARD_CONFIRM_DONE: u32 = 0;
 pub const MIGO_KEYBOARD_CONFIRM_NEXT: u32 = 1;
 pub const MIGO_KEYBOARD_CONFIRM_SEARCH: u32 = 2;

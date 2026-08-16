@@ -65,9 +65,9 @@ MigoQtX11SurfaceView::MigoQtX11SurfaceView(SurfaceHost &surface_host, QWidget &p
     setAttribute(Qt::WA_AcceptTouchEvents);
     setAttribute(Qt::WA_InputMethodEnabled);
     setFocusPolicy(Qt::StrongFocus);
-    // Hover reaches the mouse stream, which is the point of having one: PC wx
+    // Hover reaches the mouse stream, which is the point of having one: PC mini-game
     // content listens for `onMouseMove` without a button held. The touch stream
-    // still only sees motion while pressed, because wx content on a phone has
+    // still only sees motion while pressed, because mini-game content on a phone has
     // no hover concept and a free motion stream would be events no game reads.
     setMouseTracking(true);
     release_timer_.setInterval(kFastReleasePollIntervalMs);
@@ -401,7 +401,7 @@ void MigoQtX11SurfaceView::deliverPointer(const QMouseEvent &event, std::uint32_
 }
 
 void MigoQtX11SurfaceView::deliverMouseAsTouch(const QMouseEvent &event, MigoTouchType kind) {
-    // wx content has no hover concept, so a mouse maps to one finger with id 0
+    // mini-game content has no hover concept, so a mouse maps to one finger with id 0
     // and only while a button is held. A free-motion stream would be events no
     // game reads.
     MigoTouchPoint &point = touch_points_[0];

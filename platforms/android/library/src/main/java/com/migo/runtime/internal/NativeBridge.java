@@ -544,7 +544,7 @@ public final class NativeBridge {
     public static native void onAdEvent(int sessionId, String eventJson);
 
     /**
-     * Settle one pending {@code wx.authorize()} call.
+     * Settle one pending {@code migo.authorize()} call.
      *
      * @param sessionId  The session ID
      * @param resultJson JSON carrying requestId and granted, or an error
@@ -555,7 +555,7 @@ public final class NativeBridge {
      * Record the host's standing decision for one scope.
      *
      * @param sessionId The session ID
-     * @param scope     wx scope name
+     * @param scope     platform scope name
      * @param granted   whether the game may use it
      */
     public static native boolean updatePermission(int sessionId, String scope, boolean granted);

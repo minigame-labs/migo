@@ -8,14 +8,14 @@ package com.migo.runtime.callback;
  * before the game starts.
  *
  * <h2>Why this is yours and not the runtime's</h2>
- * WeChat is both the runtime and the host, so it owns the user relationship,
+ * A mainstream mini-game platform is both the runtime and the host, so it owns the user relationship,
  * the consent dialog, and the record of what each mini-game was granted. Migo
- * runs inside your app and owns none of those. What wx merges, this splits: the
+ * runs inside your app and owns none of those. What the common mini-game platform merges, this splits: the
  * game declares its scopes in {@code game.json}, <em>you</em> decide, and the
  * runtime only carries the question and the answer.
  *
  * <h2>Without a handler</h2>
- * Every scope is denied. {@code wx.getSetting()} reports nothing granted and
+ * Every scope is denied. {@code migo.getSetting()} reports nothing granted and
  * capability calls fail with {@code auth deny}.
  * <p>
  * That is deliberate, and it is the same answer the ad bridge gives when no ad
@@ -45,14 +45,14 @@ public interface PermissionHandler {
     /**
      * Decide a scope, prompting the user if you see fit.
      * <p>
-     * wx does not re-prompt after a refusal: content that was denied is meant
-     * to be sent to {@code wx.openSetting()} instead. If you have already been
+     * The common mini-game platform does not re-prompt after a refusal: content that was denied is meant
+     * to be sent to {@code migo.openSetting()} instead. If you have already been
      * refused, answering {@code false} straight away preserves that behaviour;
      * prompting again on every call does not.
      *
      * @param requestId correlates the answer; pass it back to
      *                  {@link PermissionSink#resolveRequest}
-     * @param scope     wx scope name, e.g. {@code "scope.camera"}
+     * @param scope     platform scope name, e.g. {@code "scope.camera"}
      * @param desc      the reason text the game declared in {@code game.json},
      *                  empty when it declared none. Shown to the user; a prompt
      *                  without it cannot say why the game is asking

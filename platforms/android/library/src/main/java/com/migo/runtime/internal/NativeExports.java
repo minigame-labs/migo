@@ -3088,7 +3088,7 @@ public final class NativeExports {
         SHOW("showAd") {
             @Override
             void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
-                // The close is not decoration: content following the wx idiom
+                // The close is not decoration: content following the common mini-game platform's idiom
                 // decides its payout and resumes gameplay in onClose. It carries
                 // isEnded = false, so reporting that no advert was shown mints
                 // nothing.
@@ -3109,7 +3109,7 @@ public final class NativeExports {
             @Override
             void settleWithoutAdvert(AdEventSink sink, int adId, String reason) {
                 // A layout write owes content no event, with a host or without
-                // one: wx has no callback for it.
+                // one: the common mini-game platform has no callback for it.
             }
         },
         DESTROY("destroyAd") {
@@ -3300,7 +3300,7 @@ public final class NativeExports {
     // ==================== Permission ====================
     //
     // The host decides; this is transport. Standing decisions go straight into
-    // the native cache that `require_scope` reads, and one-off `wx.authorize()`
+    // the native cache that `require_scope` reads, and one-off `migo.authorize()`
     // replies settle the pending promise. Nothing is kept in JavaScript: a
     // permission answer content can reach is a permission answer content can
     // change.
@@ -3489,7 +3489,7 @@ public final class NativeExports {
         return raced != null ? raced : created;
     }
 
-    /** @hide Called from native when content calls wx.authorize(). */
+    /** @hide Called from native when content calls migo.authorize(). */
     public static void permissionRequest(int sessionId, String requestJson) {
         int requestId = 0;
         String scope = "";

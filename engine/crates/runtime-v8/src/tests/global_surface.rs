@@ -161,7 +161,7 @@ mod global_surface_tests {
         }
     }
 
-    /// Gamepad is a Web content capability, not a wx API: it must be present
+    /// Gamepad is a Web content capability, not a mini-game platform API: it must be present
     /// on `migo` and native bridge internals must stay off the public global.
     #[test]
     fn gamepad_transport_is_migo_only_and_native_hooks_remain_private() {

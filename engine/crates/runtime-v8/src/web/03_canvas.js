@@ -260,7 +260,7 @@ const dispatchWebglContextEvent = (type) => {
 // The host's surface-change ingress.
 //
 // Deliberately here, in the always-compiled canvas module, rather than beside
-// `wx.onWindowResize`. Adopting the surface size is not a connectivity feature:
+// `migo.onWindowResize`. Adopting the surface size is not a connectivity feature:
 // a Slim build has no window-info service and still has a surface, and a canvas
 // that keeps the size the window had before a rotation is a rendering defect,
 // not a missing API. It used to live in the `system` extension, which

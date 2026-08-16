@@ -374,8 +374,8 @@ pub enum HostCommand {
     /// Window/input focus changed independently of app visibility.
     ///
     /// The runtime forwards this into a profile-neutral adapter hook. HTML5
-    /// adapters translate it to window focus/blur; wx profiles leave it as
-    /// retained engine state because wx has no equivalent public API.
+    /// adapters translate it to window focus/blur; the common mini-game platform leaves it as
+    /// retained engine state because that platform has no equivalent public API.
     OnFocusChanged { focused: bool },
 
     // ---- Audio Events ----
@@ -639,8 +639,8 @@ pub enum HostCommand {
     /// Mouse button pressed.
     ///
     /// Triggers `migo.onMouseDown` callbacks. Distinct from `OnTouch`, and a
-    /// host chooses which it sends: wx content written for a phone listens for
-    /// touch, wx content written for PC WeChat listens for the mouse, and only
+    /// host chooses which it sends: mini-game content written for a phone listens for
+    /// touch, content written for a PC mini-game platform listens for the mouse, and only
     /// the host knows which streams its content and its device call for. The
     /// engine synthesizes neither from the other.
     OnMouseDown {

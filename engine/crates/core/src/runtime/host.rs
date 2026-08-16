@@ -233,7 +233,7 @@ pub(crate) struct Host {
     render_error_throttle: HashMap<&'static str, Instant>,
 
     /// Pending `onShow` script captured while Android has resumed the Activity
-    /// but has not yet delivered a fresh Surface.  WeChat/Chromium effectively
+    /// but has not yet delivered a fresh Surface.  Mainstream mini-game platforms and browsers effectively
     /// dispatch visibility callbacks only once the page can render again; doing
     /// it earlier lets game code run against a paused render/audio subsystem.
     pending_on_show_args: Option<Cow<'static, str>>,

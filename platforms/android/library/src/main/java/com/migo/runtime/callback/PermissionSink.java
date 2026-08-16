@@ -4,9 +4,9 @@ package com.migo.runtime.callback;
  * The channel a {@link PermissionHandler} answers on.
  * <p>
  * Two separate things, because they answer different questions:
- * {@link #setScope} is the standing decision {@code wx.getSetting()} reports
+ * {@link #setScope} is the standing decision {@code migo.getSetting()} reports
  * and every capability call is checked against; {@link #resolveRequest} settles
- * one pending {@code wx.authorize()}.
+ * one pending {@code migo.authorize()}.
  *
  * <h2>Threading</h2>
  * Every method is safe from any thread. That is the point: deciding usually
@@ -28,15 +28,15 @@ public interface PermissionSink {
      * the next capability call.
      * <p>
      * A scope you never set reads as "not decided", which is distinct from
-     * denied: content may still ask about it, and {@code wx.authorize()} is how.
+     * denied: content may still ask about it, and {@code migo.authorize()} is how.
      *
-     * @param scope   wx scope name, e.g. {@code "scope.camera"}
+     * @param scope   platform scope name, e.g. {@code "scope.camera"}
      * @param granted whether the game may use it
      */
     void setScope(String scope, boolean granted);
 
     /**
-     * Settle one pending {@code wx.authorize()} call.
+     * Settle one pending {@code migo.authorize()} call.
      * <p>
      * Does not by itself change the standing decision — call {@link #setScope}
      * for that. Granting a request without recording it would let the game act
@@ -50,12 +50,12 @@ public interface PermissionSink {
     void resolveRequest(int requestId, boolean granted);
 
     /**
-     * Settle one pending {@code wx.authorize()} call as failed.
+     * Settle one pending {@code migo.authorize()} call as failed.
      * <p>
      * For "could not ask" — no activity, a dialog that could not be shown — as
      * opposed to "asked and refused", which is
      * {@code resolveRequest(requestId, false)}. Content distinguishes the two:
-     * a refusal sends the user to {@code wx.openSetting()}, an error is worth
+     * a refusal sends the user to {@code migo.openSetting()}, an error is worth
      * retrying.
      *
      * @param requestId the id passed to

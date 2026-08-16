@@ -528,7 +528,7 @@ mod ad_reward_integrity_tests {
     }
 
     /// A host-side failure surfaces as an `error` event, not as an exception
-    /// out of `show()` -- wx content listens on `onError` and does not wrap
+    /// out of `show()` -- mini-game content listens on `onError` and does not wrap
     /// `show()` in try/catch.
     #[tokio::test(start_paused = true)]
     async fn host_command_failures_surface_as_error_events() {
