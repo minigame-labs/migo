@@ -2,7 +2,7 @@
 //!
 //! Android delivers `surfaceCreated` at one size and `surfaceChanged` at
 //! another moments later (the system bars hiding is the common cause), and the
-//! content's `wx.createCanvas()` lands in between. A canvas that reports the
+//! content's `migo.createCanvas()` lands in between. A canvas that reports the
 //! first of those two sizes forever leaves every game that fills its canvas
 //! with a dead band along the edge the surface grew into -- while every layer
 //! reports success, because nothing in the rendering path is wrong.
@@ -157,7 +157,7 @@ mod canvas_follows_surface_tests {
         let size = SurfaceSize::new(360, 745);
         let (mut rt, _stub) = boot_runtime(size.clone());
 
-        eval(&mut rt, "globalThis.__c = wx.createCanvas();");
+        eval(&mut rt, "globalThis.__c = migo.createCanvas();");
         assert_js(
             &mut rt,
             "let __ok = __c.width === 360 && __c.height === 745; \
@@ -184,7 +184,7 @@ mod canvas_follows_surface_tests {
         let size = SurfaceSize::new(360, 745);
         let (mut rt, _stub) = boot_runtime(size.clone());
 
-        eval(&mut rt, "globalThis.__c = wx.createCanvas();");
+        eval(&mut rt, "globalThis.__c = migo.createCanvas();");
         eval(&mut rt, TRIGGER_RESIZE);
 
         assert_js(
@@ -208,7 +208,7 @@ mod canvas_follows_surface_tests {
 
         eval(
             &mut rt,
-            "globalThis.__c = wx.createCanvas(); __c.width = 800; __c.height = 600;",
+            "globalThis.__c = migo.createCanvas(); __c.width = 800; __c.height = 600;",
         );
 
         // The surface moves underneath it.
@@ -234,7 +234,7 @@ mod canvas_follows_surface_tests {
 
         eval(
             &mut rt,
-            "globalThis.__c = wx.createCanvas(); __c.width = 800;",
+            "globalThis.__c = migo.createCanvas(); __c.width = 800;",
         );
 
         size.set(360, 780);
@@ -257,7 +257,7 @@ mod canvas_follows_surface_tests {
 
         eval(
             &mut rt,
-            "globalThis.__main = wx.createCanvas(); globalThis.__off = wx.createCanvas();",
+            "globalThis.__main = migo.createCanvas(); globalThis.__off = migo.createCanvas();",
         );
         let before = size.get();
 
@@ -288,7 +288,7 @@ mod canvas_follows_surface_tests {
 
         // If the resize had created it, this first `createCanvas()` would return
         // the canvas built during the resize rather than one measured now.
-        eval(&mut rt, "globalThis.__c = wx.createCanvas();");
+        eval(&mut rt, "globalThis.__c = migo.createCanvas();");
         assert_js(
             &mut rt,
             "let __ok = __c.width === 360 && __c.height === 780; \

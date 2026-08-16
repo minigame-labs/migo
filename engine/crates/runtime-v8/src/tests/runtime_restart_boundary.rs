@@ -356,49 +356,49 @@ mod runtime_restart_boundary_tests {
                 globalThis.__checked.push(name);
             };
 
-            __assertTakesOneId('wx.login', wx.login && function () { return wx.login({}); });
+            __assertTakesOneId('migo.login', migo.login && function () { return migo.login({}); });
             __assertTakesOneId(
-                'wx.requestMidasPayment',
-                wx.requestMidasPayment && function () { return wx.requestMidasPayment({ offerId: 'x' }); },
+                'migo.requestMidasPayment',
+                migo.requestMidasPayment && function () { return migo.requestMidasPayment({ offerId: 'x' }); },
             );
-            __assertTakesOneId('wx.loadSubpackage', function () { return wx.loadSubpackage({ name: 'sub' }); });
+            __assertTakesOneId('migo.loadSubpackage', function () { return migo.loadSubpackage({ name: 'sub' }); });
             // Not a deferred call: the id names a player the platform keeps in
             // a map that outlives this isolate, and it is what every later
             // `onVideoEvent` routes by. A module counter restarting at 1 aims
             // the retired runtime's events at the replacement's objects.
-            __assertTakesOneId('wx.createVideo', wx.createVideo && function () { return wx.createVideo({}); });
+            __assertTakesOneId('migo.createVideo', migo.createVideo && function () { return migo.createVideo({}); });
             // The same property for the callback-routed resources: each id names
             // something the host owns in a table that outlives this isolate, so
             // a module counter restarting at 1 points the retired runtime's
             // events -- camera frames, audio playback, an ad's reward verdict --
             // at the replacement runtime's objects.
-            __assertTakesOneId('wx.createCamera', wx.createCamera && function () { return wx.createCamera({}); });
+            __assertTakesOneId('migo.createCamera', migo.createCamera && function () { return migo.createCamera({}); });
             __assertTakesOneId(
-                'wx.createInnerAudioContext',
-                wx.createInnerAudioContext && function () { return wx.createInnerAudioContext(); },
+                'migo.createInnerAudioContext',
+                migo.createInnerAudioContext && function () { return migo.createInnerAudioContext(); },
             );
             __assertTakesOneId(
-                'wx.createRewardedVideoAd',
-                wx.createRewardedVideoAd && function () { return wx.createRewardedVideoAd({ adUnitId: 'x' }); },
+                'migo.createRewardedVideoAd',
+                migo.createRewardedVideoAd && function () { return migo.createRewardedVideoAd({ adUnitId: 'x' }); },
             );
             // The UI results that had no id at all until now: each settled by
             // `shift()` on its own array, so nothing about them was correlated.
-            __assertTakesOneId('wx.showModal', wx.showModal && function () { return wx.showModal({}); });
+            __assertTakesOneId('migo.showModal', migo.showModal && function () { return migo.showModal({}); });
             __assertTakesOneId(
-                'wx.showActionSheet',
-                wx.showActionSheet && function () { return wx.showActionSheet({ itemList: ['a'] }); },
+                'migo.showActionSheet',
+                migo.showActionSheet && function () { return migo.showActionSheet({ itemList: ['a'] }); },
             );
             __assertTakesOneId(
-                'wx.openAppAuthorizeSetting',
-                wx.openAppAuthorizeSetting && function () { return wx.openAppAuthorizeSetting({}); },
+                'migo.openAppAuthorizeSetting',
+                migo.openAppAuthorizeSetting && function () { return migo.openAppAuthorizeSetting({}); },
             );
             // `_timeout: 0` because this one keeps `createDeferredApi`'s default
             // 30s auto-reject, and scheduling a timer in a harness with no Tokio
             // reactor aborts the process instead of failing a test.
             __assertTakesOneId(
-                'wx.openSystemBluetoothSetting',
-                wx.openSystemBluetoothSetting
-                    && function () { return wx.openSystemBluetoothSetting({ _timeout: 0 }); },
+                'migo.openSystemBluetoothSetting',
+                migo.openSystemBluetoothSetting
+                    && function () { return migo.openSystemBluetoothSetting({ _timeout: 0 }); },
             );
             "#,
         );

@@ -10,7 +10,7 @@
 Two adapter profiles let existing games run with zero or minimal changes:
 
 - **Cross-engine HTML5 / Canvas2D / WebGL** — Cocos, Egret, Pixi and vanilla Canvas games run unmodified; the adapter supplies a browser-style BOM/DOM.
-- **Mini-game API style** — a mini-game platform–style environment through the `wx` namespace adapter layer.
+- **Mini-game platform style** — content ported from a mini-game platform (WeChat, a quick-game alliance member, etc.) runs through a platform-specific compat adapter that maps its global onto `migo.*`. The engine itself installs only `migo`; each platform's shape is an opt-in adapter, not something baked into every build.
 
 ## Why Migo
 

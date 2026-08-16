@@ -2,7 +2,7 @@
 # Whatever `harden_global_scope` removes must never have been mirrored.
 #
 # The runtime publishes two namespaces to content, `wx` and `migo`, built in
-# `97_wx_namespace.js` by copying property descriptors off globalThis during
+# `97_migo_namespace.js` by copying property descriptors off globalThis during
 # bootstrap. deno_core's internals are removed from globalThis afterwards, by
 # `harden_global_scope` in Rust -- deleting them from JS instead breaks
 # deno_core's snapshot restore path, so the ordering is forced.
@@ -36,7 +36,7 @@ import sys
 root = pathlib.Path(sys.argv[1]).resolve()
 
 harden_rs = root / "engine/crates/runtime-v8/src/lib.rs"
-namespace_js = root / "engine/crates/runtime-v8/src/97_wx_namespace.js"
+namespace_js = root / "engine/crates/runtime-v8/src/97_migo_namespace.js"
 
 for required in (harden_rs, namespace_js):
     if not required.exists():

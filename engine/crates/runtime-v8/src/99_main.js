@@ -1,7 +1,7 @@
 import { primordials } from "ext:core/mod.js";
 import { windowOrWorkerGlobalScope } from "ext:runtime/98_global_scope_shared.js";
 import { WindowGlobalScope } from "ext:runtime/98_global_scope_window.js";
-import { installApiNamespaces } from "ext:runtime/97_wx_namespace.js";
+import { installApiNamespaces } from "ext:runtime/97_migo_namespace.js";
 import { initializeEventHandlers } from "ext:host_v8_event/01_event.js";
 import { _perf, _perfEnable, _perfDisable } from "ext:host_v8_base/05_perf.js";
 
@@ -38,11 +38,10 @@ Object.defineProperty(globalThis, '_perf', {
     writable: false,
 });
 
-// Install the engine (`migo`) and wx-compatible (`wx`) API projections from
-// globalThis. Must run after every feature's 99_global_scope.js has
-// registered its APIs (the runtime extension is loaded last in lib.rs, so by
-// here all registrations are done) and after the BOM/_perf installs above
-// (which use the _NON_WX exclusion list to stay off the wx namespace).
+// Install the engine's `migo` API projection from globalThis. Must run after
+// every feature's 99_global_scope.js has registered its APIs (the runtime
+// extension is loaded last in lib.rs, so by here all registrations are done)
+// and after the _perf install above (which is excluded from the projection).
 installApiNamespaces();
 
 // NOTE: `delete globalThis.Deno` / `delete globalThis.__bootstrap` are NOT done

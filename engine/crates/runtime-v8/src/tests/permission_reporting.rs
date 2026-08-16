@@ -1,7 +1,7 @@
-//! `wx.getSetting()` reports the host's answer, not a local optimism.
+//! `migo.getSetting()` reports the host's answer, not a local optimism.
 //!
 //! It used to return a JavaScript object with every scope initialised to
-//! `true`, and `wx.authorize()` set its own entry and returned success without
+//! `true`, and `migo.authorize()` set its own entry and returned success without
 //! asking anyone. So content was told it held permissions nobody had granted,
 //! and the API whose entire purpose is to obtain consent obtained none. A game
 //! that checked before acting was misled *because* it checked.
@@ -119,7 +119,7 @@ mod permission_reporting_tests {
             "<test:getSetting>",
             FastString::from_static(
                 "globalThis.__res = null; \
-                 wx.getSetting({ success: (r) => { globalThis.__res = r; } });",
+                 migo.getSetting({ success: (r) => { globalThis.__res = r; } });",
             ),
         )
         .expect("getSetting");
@@ -141,7 +141,7 @@ mod permission_reporting_tests {
             "<test:getSetting>",
             FastString::from_static(
                 "globalThis.__res = null; \
-                 wx.getSetting({ success: (r) => { globalThis.__res = r; } });",
+                 migo.getSetting({ success: (r) => { globalThis.__res = r; } });",
             ),
         )
         .expect("getSetting");
@@ -164,7 +164,7 @@ mod permission_reporting_tests {
             "<test:getSetting>",
             FastString::from_static(
                 "globalThis.__res = null; \
-                 wx.getSetting({ success: (r) => { globalThis.__res = r; } });",
+                 migo.getSetting({ success: (r) => { globalThis.__res = r; } });",
             ),
         )
         .expect("getSetting");
@@ -176,17 +176,17 @@ mod permission_reporting_tests {
         );
     }
 
-    /// Every scope wx defines is reported, so content that iterates the map
-    /// sees the same key set it sees on wx.
+    /// Every permission scope this engine defines is reported, so content
+    /// that iterates the map sees a complete key set.
     #[test]
-    fn every_wx_scope_appears_in_the_report() {
+    fn every_permission_scope_appears_in_the_report() {
         let services: Arc<dyn DeviceServices> = Arc::new(Bundle);
         let mut rt = boot(Some(services));
         rt.execute_script(
             "<test:getSetting>",
             FastString::from_static(
                 "globalThis.__res = null; \
-                 wx.getSetting({ success: (r) => { globalThis.__res = r; } });",
+                 migo.getSetting({ success: (r) => { globalThis.__res = r; } });",
             ),
         )
         .expect("getSetting");
@@ -218,7 +218,7 @@ mod permission_reporting_tests {
                 "globalThis[Symbol.for('Migo.hostBridge')] \
                      ._internalUpdateAuthSetting('scope.record', true); \
                  globalThis.__res = null; \
-                 wx.getSetting({ success: (r) => { globalThis.__res = r; } });",
+                 migo.getSetting({ success: (r) => { globalThis.__res = r; } });",
             ),
         )
         .expect("forge attempt");
@@ -241,7 +241,7 @@ mod permission_reporting_tests {
             "<test:authorize>",
             FastString::from_static(
                 "globalThis.__ok2 = null; globalThis.__fail = null; \
-                 wx.authorize({ scope: 'scope.camera', \
+                 migo.authorize({ scope: 'scope.camera', \
                                 success: () => { globalThis.__ok2 = true; }, \
                                 fail: (e) => { globalThis.__fail = e; } });",
             ),

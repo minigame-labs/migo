@@ -17,7 +17,7 @@
 // stopped painting for good reports. Zero frames between a hide and a show that
 // both happened, followed by a count that climbs again, is the only reading that
 // means what it says.
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 const ctx = canvas.getContext('2d');
 
 const AWAKE = '#1b5e9c';   // blue  -- running, no cycle observed yet
@@ -35,13 +35,13 @@ let framesWhileHidden = -1;
 // reading the pixels of a *counter* was how a run of this probe was first
 // misread as a missing callback. `MIGO_CAPI_LOG=info` turns these into logcat
 // lines, which timestamps each event against the surface transitions beside it.
-wx.onHide(function () {
+migo.onHide(function () {
   hides = hides + 1;
   framesAtHide = frames;
   console.error('[lifecycle-probe] onHide at frame ' + frames);
 });
 
-wx.onShow(function () {
+migo.onShow(function () {
   shows = shows + 1;
   // Read on the way back in, not while away: a frame the engine painted after
   // the hide is exactly what this counts, so the window has to close here.

@@ -133,11 +133,9 @@ mod global_surface_tests {
             &mut rt,
             "const coreNames = ['createCanvas', 'request', 'getFileSystemManager', \
                                 'setStorage', 'onTouchStart', 'setTimeout']; \
-             const missingCore = coreNames.filter(k => typeof wx[k] === 'undefined'); \
              const missingMigo = coreNames.filter(k => typeof migo[k] === 'undefined'); \
-             let __ok = wx !== migo && missingCore.length === 0 && missingMigo.length === 0 \
-                 && wx.createCanvas === migo.createCanvas; \
-             let __msg = 'missing core=' + JSON.stringify(missingCore)",
+             let __ok = missingMigo.length === 0; \
+             let __msg = 'missing core=' + JSON.stringify(missingMigo)",
         );
 
         let expected = [
@@ -155,7 +153,7 @@ mod global_surface_tests {
             assert_js(
                 &mut rt,
                 &format!(
-                    "const actual = typeof wx[{name:?}] !== 'undefined'; \
+                    "const actual = typeof migo[{name:?}] !== 'undefined'; \
                      let __ok = actual === {should_exist}; \
                      let __msg = {name:?} + ' actual=' + actual + ' expected=' + {should_exist}"
                 ),
@@ -163,9 +161,8 @@ mod global_surface_tests {
         }
     }
 
-    /// Gamepad is a Web content capability, not a wx API. The engine namespace
-    /// exposes the transport primitives used by the HTML5 adapter, while the wx
-    /// compatibility namespace must not invent API names absent from wx.
+    /// Gamepad is a Web content capability, not a wx API: it must be present
+    /// on `migo` and native bridge internals must stay off the public global.
     #[test]
     fn gamepad_transport_is_migo_only_and_native_hooks_remain_private() {
         let mut rt = boot_runtime();
@@ -175,13 +172,11 @@ mod global_surface_tests {
                             'offGamepadConnected', 'onGamepadDisconnected', \
                             'offGamepadDisconnected']; \
              const missingMigo = names.filter(k => typeof migo[k] !== 'function'); \
-             const leakedWx = names.filter(k => typeof wx[k] !== 'undefined'); \
              const bridge = globalThis[Symbol.for('Migo.hostBridge')]; \
-             let __ok = missingMigo.length === 0 && leakedWx.length === 0 \
+             let __ok = missingMigo.length === 0 \
                  && typeof bridge._internalTriggerGamepadConnected === 'function' \
                  && typeof globalThis._internalTriggerGamepadConnected === 'undefined'; \
-             let __msg = 'missing migo=' + JSON.stringify(missingMigo) \
-                 + ' leaked wx=' + JSON.stringify(leakedWx)",
+             let __msg = 'missing migo=' + JSON.stringify(missingMigo)",
         );
     }
 

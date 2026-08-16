@@ -1,27 +1,34 @@
-// wx namespace mirror.
+// migo namespace: the one surface every game gets, unconditionally.
 //
-// wx mini-game code is hard-coded against the global `wx` object
-// (`wx.createCanvas`, `wx.getSystemInfoSync`, `wx.onTouchStart`, ...). On real
-// wx Android, `wx` is a distinct object that holds ~463 APIs (verified
-// against wx-android.json), separate from GameGlobal.
+// Earlier revisions of this file also built a mini-game-platform-compatible
+// mirror unconditionally (later, behind a Cargo feature). Neither is here
+// anymore: `migo` is the engine's only default global, full stop. Content
+// ported from a mini-game platform (WeChat, a quick-game alliance member,
+// etc.) gets that platform's global from an external, platform-specific
+// adapter package instead (the same pattern the BOM/DOM adapter already
+// uses -- see `adapter/`), loaded by the host or the game itself, not baked
+// into every build whether it's wanted or not. `_NON_MINIGAME_API` below is
+// kept as reference data for those adapters and for
+// `scripts/test-content-namespace-contract.sh`: it documents which of
+// migo's own capabilities go beyond the common mini-game API surface, which
+// the engine still knows and still needs to publish accurately even though
+// it no longer acts on it to build anything itself.
 //
-// migo currently registers its low-level APIs directly on globalThis. Keep
-// those registrations for backward compatibility, then build two deliberate
-// projections: `migo` is the engine capability namespace consumed by adapters,
-// while `wx` contains only APIs that belong to the wx compatibility surface.
+// migo registers its low-level APIs directly on globalThis; this file
+// projects them onto one deliberate namespace object so app code has a
+// stable surface to extend without mutating globalThis itself.
 //
 // Rules:
-//   - Shared APIs hold the same function references on both namespaces.
-//   - Engine/Web transport primitives that wx does not define stay on `migo`.
-//   - GameGlobal, global remain aliases of globalThis (matches wx behavior).
+//   - GameGlobal, global remain aliases of globalThis (matches the
+//     mini-game-platform content model this engine is compatible with).
 //   - JS built-ins (Object/Array/Promise/...), self-references
-//     (globalThis/wx/migo/GameGlobal/global), and runtime internals
-//     (_perf, console) are NOT mirrored onto `wx`.
+//     (globalThis/migo/GameGlobal/global), and runtime internals (_perf,
+//     console) are NOT mirrored onto `migo`.
 
 import { primordials } from "ext:core/mod.js";
 const { ObjectDefineProperty } = primordials;
 
-// Anything in this set is intentionally NOT mirrored onto the `wx` object.
+// Anything in this set is intentionally NOT mirrored onto the `migo` object.
 // JS built-ins -- present on every globalThis. Sourced from V8's standard
 // realm; we list them statically because they don't change between sessions.
 const _JS_BUILTINS = new Set([
@@ -60,25 +67,25 @@ const _JS_BUILTINS = new Set([
     "WebAssembly",
 ]);
 
-// Self-references and runtime internals are not part of either API namespace.
+// Self-references and runtime internals are not part of the migo namespace.
 //
 // ORDERING HAZARD -- read before adding anything to globalThis.
 //
-// These namespaces are built here, during bootstrap. `harden_global_scope`
+// This namespace is built here, during bootstrap. `harden_global_scope`
 // (Rust, `lib.rs`) deletes the deno_core internals from globalThis *after*
 // that, because deleting them from JS breaks deno_core's snapshot restore
 // path. So a mirror built first captures whatever hardening deletes later, and
 // deleting the global afterwards does nothing to the copy.
 //
-// That is not hypothetical: `Deno` was mirrored onto both namespaces and
-// `wx.Deno.core.ops` handed content 616 invocable ops -- the whole native
-// surface, past every JS-level API and policy. `__bootstrap` escaped only
-// because it happens to start with an underscore.
+// That is not hypothetical: `Deno` was once mirrored onto the published
+// namespace and `<namespace>.Deno.core.ops` handed content 616 invocable ops
+// -- the whole native surface, past every JS-level API and policy.
+// `__bootstrap` escaped only because it happens to start with an underscore.
 //
 // So anything hardening removes must be listed here too, and the two lists are
 // kept in agreement by `scripts/test-runtime-internals-not-published.sh`. The
 // behavioural backstop is `tests/published_namespace_isolation.rs`, which
-// searches the published namespaces for an op table by shape rather than by
+// searches the published namespace for an op table by shape rather than by
 // name -- a new internal that leaks fails there even if nobody updates a list.
 const _RUNTIME_INTERNALS = new Set([
     "Deno",             // deno_core: `.core.ops` is the entire native surface
@@ -86,16 +93,20 @@ const _RUNTIME_INTERNALS = new Set([
 ]);
 
 const _NON_API = new Set([
-    "GameGlobal", "global", "migo", "wx",     // self-references (added below or by 99_main.js)
-    "_perf",                                   // host-only profiler hook
-    "console",                                 // standard JS, not wx-namespaced
-    "_CCSettings",                             // engine-compat shim (Cocos)
+    "GameGlobal", "global", "migo",     // self-references (added below or by 99_main.js)
+    "_perf",                             // host-only profiler hook
+    "console",                           // standard JS, not namespaced
+    "_CCSettings",                       // engine-compat shim (Cocos)
     ..._RUNTIME_INTERNALS,
 ]);
 
 // Browser content capabilities implemented by the native runtime and surfaced
-// by the HTML5 adapter. wx has no corresponding public names.
-const _NON_WX = new Set([
+// by the HTML5 adapter. No mini-game platform (WeChat, a quick-game alliance
+// member, etc.) has a corresponding public name for these -- kept here as
+// reference data for any platform-compat adapter and for
+// scripts/test-content-namespace-contract.sh, neither of which this file
+// acts on directly anymore.
+const _NON_MINIGAME_API = new Set([
     "getGamepads",
     "onGamepadConnected", "offGamepadConnected",
     "onGamepadDisconnected", "offGamepadDisconnected",
@@ -122,8 +133,8 @@ function _copyApiNamespace(excluded) {
         const key = keys[i];
         if (!_shouldMirrorApi(key) || excluded.has(key)) continue;
         // Mirror the descriptor as-is so getters/setters and writability are
-        // preserved.  The wx object holds the same function references as
-        // globalThis -- equality holds, identity holds.
+        // preserved. The namespace object holds the same function references
+        // as globalThis -- equality holds, identity holds.
         try {
             const desc = Object.getOwnPropertyDescriptor(globalThis, key);
             if (desc) ObjectDefineProperty(namespace, key, desc);
@@ -136,14 +147,9 @@ function _copyApiNamespace(excluded) {
 
 function installApiNamespaces() {
     const migo = _copyApiNamespace(new Set());
-    const wx = _copyApiNamespace(_NON_WX);
 
-    // Enumerable to match wx Android, where `wx` appears in
-    // Object.getOwnPropertyNames(GameGlobal). Namespace objects are distinct:
-    // app/adapters may extend migo without silently mutating the wx contract.
-    ObjectDefineProperty(globalThis, "wx", {
-        value: wx, writable: true, enumerable: true, configurable: true,
-    });
+    // Enumerable to match the wx-shaped content model, where the namespace
+    // appears in Object.getOwnPropertyNames(GameGlobal).
     ObjectDefineProperty(globalThis, "migo", {
         value: migo, writable: true, enumerable: true, configurable: true,
     });

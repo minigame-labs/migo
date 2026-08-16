@@ -9,7 +9,7 @@
 // rest arrives at the surface as whatever was there -- the "content renders into
 // a corner" symptom, as pixels. The gate requires exactly one colour on the
 // surface, which is what that breaks.
-const canvas = wx.createCanvas();
+const canvas = migo.createCanvas();
 // A fixed resolution, the Phaser `Scale.NONE` shape, and deliberately neither the
 // initial surface nor the resized one so no coincidence can make a moved buffer
 // look right.
@@ -23,7 +23,7 @@ const KEPT = '#33cc66';    // green -- the content's own resolution, filled edge
 let initial = null;
 
 function paint() {
-  const info = wx.getSystemInfoSync();
+  const info = migo.getSystemInfoSync();
   const extent = Math.round(info.windowWidth) + 'x' + Math.round(info.windowHeight);
   if (initial === null) initial = extent;
 
