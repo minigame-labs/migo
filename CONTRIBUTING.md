@@ -1,5 +1,7 @@
 # Contributing to Migo
 
+[English](CONTRIBUTING.md) | [中文](CONTRIBUTING.zh-CN.md)
+
 Thanks for your interest in contributing to **Migo**! This document explains how to report issues, propose changes, and submit pull requests.
 
 ## Table of Contents
@@ -162,4 +164,3 @@ For corporate contributors: please open an issue labeled `cla` (or contact the m
 ## Questions
 
 - Use GitHub Issues for bugs and tasks: https://github.com/minigame-labs/migo/issues
-- (Optional) Enable Discussions for Q&A and ideas in repo settings, then link it here.

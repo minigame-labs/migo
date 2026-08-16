@@ -73,7 +73,7 @@ The soft keyboard splits the same way. On Linux the host has no keyboard to
 raise, so `on_show_keyboard` only proves the callback arrives with the right
 options. On Android it drives the real system IME through
 `ANativeActivity_showSoftInput`, which is the only place content's
-`wx.showKeyboard` raises an actual keyboard — and the only place the rule that
+`migo.showKeyboard` raises an actual keyboard — and the only place the rule that
 a host-supplied keyboard beats the platform's is load-bearing, since Android's
 own accessor claims a keyboard it reaches over JNI to a Java SDK that a pure
 native host does not have.

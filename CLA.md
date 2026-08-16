@@ -1,5 +1,8 @@
 # Migo Contributor License Agreement (CLA)
 
+> This document is the authoritative English version. It is not translated,
+> to avoid the legal risk of a translation drifting from the source text.
+
 Thank you for your interest in contributing to **Migo**.
 
 By submitting a Contribution to the Migo project, you agree to the following terms:

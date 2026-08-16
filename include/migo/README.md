@@ -277,9 +277,11 @@ The candidate cannot be declared stable until all of the following exist:
   22-symbol export surface, the freshness-gated snapshot identity, the complete staged-file
   hashes, and that a real `find_package(migo)` consumer links with every `migo_*` resolved. A
   versioned shared object and pkg-config are deliberately not provided — an NDK host links a
-  static library through CMake, so those would be shape without a consumer. **Open before any
-  release**: regenerate verified V8 component manifests for both ABIs; regenerate the now-stale
-  arm64 full/slim/Worker snapshots; add the missing x86_64 full/slim snapshots; then rebuild and
+  static library through CMake, so those would be shape without a consumer. The snapshot
+  half of this is resolved: all eight `SNAPSHOT-<kind>-<profile>-android-<arch>.bin`
+  identities (host full/slim and Worker full, both ABIs) regenerated fresh and
+  `scripts/check-snapshot-freshness.sh` reports every one current. **Open before any
+  release**: regenerate verified V8 component manifests for both ABIs, then rebuild and
   run the minimum/latest device gates. The `-DANDROID_STL` matrix beyond the proven
   `c++_shared` consumer also remains open.
 

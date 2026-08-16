@@ -466,9 +466,19 @@ public headers, and a CMake package. Builds on Linux.
 - OpenHarmony SDK (5.1.0-Release or later; ~3.2 GB). Install
   instructions are in the header of `scripts/dev-setup-ohos.sh`.
   Set `OHOS_NDK_HOME` to the directory containing `native/`.
-- A `rusty_v8_src` checkout at `../rusty_v8_src` relative to the
-  repo root (required by `scripts/build-v8-ohos.sh` to build the
-  OpenHarmony V8 archive from source).
+- The OpenHarmony V8 archive, normally **fetched prebuilt** rather than
+  built:
+
+  ```bash
+  bash scripts/fetch-v8-archives.sh x86_64-linux-ohos aarch64-linux-ohos
+  ```
+
+  `build-ohos-sdk.sh` only falls back to building V8 from source
+  (`scripts/build-v8-ohos.sh`, which needs a `rusty_v8_src` checkout at
+  `../rusty_v8_src` relative to the repo root) when no archive is already
+  present at `engine/third_party/rusty_v8/<arch>-linux-ohos/librusty_v8.a` —
+  fetch it first and that multi-hour step never runs. This is the same
+  archive `release-ohos` fetches in CI.
 
 **Verify the SDK and print required exports**:
 
@@ -504,8 +514,11 @@ bash scripts/test-ohos-sdk-contract.sh dist/migo-ohos-x86_64
   HarmonyOS NEXT hardware.
 - Multi-touch is unverified: `hdc` cannot synthesise a second pointer.
 
-OpenHarmony has no published release yet; nothing appears under
-GitHub Releases for this platform.
+OpenHarmony has published releases since v0.9.2 (`release-ohos` in
+`release.yml`, GitHub-hosted `ubuntu-latest`, no device involved — it fetches
+the prebuilt V8 archive and SDK, then builds and stages the package). The
+device-side gaps above are about what has been *run* and verified on real
+hardware, not about whether the package ships.
 
 ---
 

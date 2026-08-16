@@ -1,20 +1,24 @@
 # Migo Runtime SDK for Android
 
-轻量级、高性能的 JavaScript 游戏运行时 Android SDK。
+[English](README.md) | [中文](README.zh-CN.md)
 
-## 特性
+A lightweight, high-performance JavaScript game runtime for Android.
 
-- 🚀 **高性能** - 原生 Rust 引擎 + OpenGL ES 渲染
-- 📱 **API 26+** - 支持 Android 8.0 及以上版本
-- 🔧 **零依赖** - 无需 AndroidX、Kotlin 或其他第三方库
-- 🎮 **游戏就绪** - 支持 Canvas 2D 和 WebGL
-- 🔒 **沙箱隔离** - 每个游戏独立的文件系统空间
+## Features
 
-## 安装
+- 🚀 **High Performance** - Native Rust engine with OpenGL ES rendering
+- 📱 **API 26+** - Supports Android 8.0 Oreo and above
+- 🔧 **Zero Dependencies** - No AndroidX, Kotlin, or third-party libraries required
+- 🎮 **Game Ready** - Canvas 2D and WebGL support
+- 🔒 **Sandboxed Filesystem** - Isolated file storage per game
 
-发布构建提供两个产品：`full` 保留全部 `wx.*` 平台能力，`slim` 仅保留渲染、
-输入、生命周期、存储/VFS、网络、subpackage 与 host message 核心。两者都保留
-代码签名、V8 资源限制及 API 26 地板。
+## Installation
+
+Release builds have two products: `slim` keeps the base capability set —
+rendering, input, lifecycle, storage/VFS, network, subpackages, and host
+messaging — plus code signing and V8 resource limits; `full` adds sensors,
+extended media, connectivity, commerce/payment, and system capability groups
+on top of that base. Both enforce API 26.
 
 ```bash
 bash scripts/build-aar.sh --product-profile full release
@@ -23,16 +27,16 @@ bash scripts/build-aar.sh --product-profile slim release
 
 ### Gradle
 
-将 AAR 添加到项目：
+Add the AAR to your project:
 
 ```groovy
 dependencies {
-    implementation files('libs/migo-0.9.1-android.aar')
+    implementation files('libs/migo-0.9.3-android.aar')
 }
 ```
 
-AAR 同时包含 `arm64-v8a` 和 `x86_64`（34 MB）。**上架的应用只带一个 ABI**：在
-`defaultConfig` 里加
+The AAR carries both `arm64-v8a` and `x86_64` (34 MB). **A shipped app carries one
+ABI**: add
 
 ```groovy
 android {
@@ -42,14 +46,14 @@ android {
 }
 ```
 
-打包进 APK 的原生库就是 17 MB；发 App Bundle 则由 Play 按设备分发，`x86_64`
-对终端用户的下载量贡献为零。
+and the packaged native library is 17 MB. Publish an App Bundle instead and Play
+delivers per device, so `x86_64` contributes nothing to the end-user download.
 
-Maven 仓库尚未发布，暂时只能用本地 AAR。
+There is no Maven repository yet; use the local AAR.
 
-## 快速开始
+## Quick Start
 
-### 基础用法
+### Basic Usage
 
 ```java
 import com.migo.runtime.MigoRuntime;
@@ -63,27 +67,27 @@ public class GameActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         
-        // 1. 创建 SurfaceView 用于渲染
+        // 1. Create a SurfaceView for rendering
         SurfaceView surfaceView = new SurfaceView(this);
         setContentView(surfaceView);
 
-        // 2. 配置运行时
+        // 2. Configure the runtime
         RuntimeConfig config = new RuntimeConfig.Builder(this)
             .setDebugEnabled(BuildConfig.DEBUG)
             .setLogLevel(RuntimeConfig.LogLevel.DEBUG)
             .setTargetFps(60)
             .build();
 
-        // 3. 设置 Surface 回调
+        // 3. Set up surface callbacks
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
-                // 4. 创建游戏会话（每个游戏需要唯一的 gameId）
+                // 4. Create game session (each game needs a unique gameId)
                 session = MigoRuntime.getInstance()
                     .createSession(GameActivity.this, holder.getSurface(), config, "my-game-id");
                 
-                // 5. 启动游戏（从隔离的 code 目录加载）
-                // 游戏代码应放在: session.getPaths().getCodeDir()
+                // 5. Start the game (loads from isolated code directory)
+                // Place game code in: session.getPaths().getCodeDir()
                 session.startGame("game.js");
             }
 
@@ -102,7 +106,7 @@ public class GameActivity extends Activity {
             }
         });
 
-        // 6. 处理触摸事件
+        // 6. Handle touch events
         surfaceView.setOnTouchListener((v, event) -> {
             if (session != null) {
                 return session.dispatchTouchEvent(event);
@@ -134,36 +138,36 @@ public class GameActivity extends Activity {
 }
 ```
 
-### 使用事件回调
+### With Event Callbacks
 
 ```java
-// 设置统一事件监听器
+// Set up unified session listener
 session.setListener(new GameSessionListener() {
     @Override
     public void onGameReady() {
-        Log.i(TAG, "游戏已就绪!");
+        Log.i(TAG, "Game is ready!");
         hideLoadingScreen();
     }
 
     @Override
     public void onGameExit(int exitCode) {
-        Log.i(TAG, "游戏退出，代码: " + exitCode);
+        Log.i(TAG, "Game exited with code: " + exitCode);
         finish();
     }
 
     @Override
     public void onError(int errorCode, String message, boolean recoverable) {
-        Log.e(TAG, "错误 " + errorCode + ": " + message);
+        Log.e(TAG, "Error " + errorCode + ": " + message);
         if (!recoverable) {
             showErrorDialog(message);
         }
     }
 
-    // 可选: 覆写 onLoadingProgress / onPaused / onResumed 等
+    // Optional: override onLoadingProgress / onPaused / onResumed etc.
 });
 ```
 
-### 安全的会话创建（无异常版本）
+### Safe Session Creation (Non-throwing)
 
 ```java
 MigoRuntime.Result<GameSession> result = MigoRuntime.getInstance()
@@ -171,17 +175,18 @@ MigoRuntime.Result<GameSession> result = MigoRuntime.getInstance()
 
 if (result.isSuccess()) {
     session = result.getValue();
-    session.startGame("game.js");  // 使用默认 code 目录
+    session.startGame("game.js");  // uses paths.getCodeDir()
 } else {
     int errorCode = result.getErrorCode();
     String message = result.getErrorMessage();
-    Log.e(TAG, "创建会话失败: " + ErrorCode.getMessage(errorCode));
+    Log.e(TAG, "Failed to create session: " + ErrorCode.getMessage(errorCode));
 }
 ```
 
-### 注册宿主回调 Handler（Auth / GameLog / Subpackage）
+### Register Host Handlers (Auth / GameLog / Subpackage)
 
-在最新 API 中，`GameSession` 支持三类宿主回调。建议在 `startGame()` 前注册。
+In the latest API, `GameSession` supports three host callback handlers.
+Register them before `startGame()` whenever possible.
 
 ```java
 session.setAuthHandler(new AuthHandler() {
@@ -205,201 +210,118 @@ session.setSubpackageHandler((request, callback) -> {
 });
 ```
 
-- `setAuthHandler(AuthHandler)`：处理 `wx.login` / `wx.checkSession` / `wx.getUserInfo` / `wx.getPhoneNumber`
-- `setGameLogHandler(GameLogHandler)`：接收小游戏上报日志（JSON 字符串）
-- `setSubpackageHandler(SubpackageHandler)`：处理 `loadSubpackage` / `preDownloadSubpackage` 的下载过程
+- `setAuthHandler(AuthHandler)`: backs `migo.login` / `migo.checkSession` / `migo.getUserInfo` / `migo.getPhoneNumber` (and the same calls made through a platform-compat adapter, e.g. `migo-wx-adapter`)
+- `setGameLogHandler(GameLogHandler)`: receives game-reported logs (JSON string)
+- `setSubpackageHandler(SubpackageHandler)`: handles `loadSubpackage` / `preDownloadSubpackage` downloads
 
-## 文件系统隔离
-
-每个游戏都有独立的沙箱化目录，通过 `GamePaths` 管理：
-
-### 目录结构
-
-```
-/data/data/com.your.app/
-├── files/migo/games/{gameId}/     # 持久化存储
-│   ├── code/                      # 游戏代码（只读）
-│   └── user_data/                 # 用户数据（读写）
-│
-└── cache/migo/games/{gameId}/     # 缓存存储（系统可清理）
-    └── tmp/                       # 临时文件（会话结束清理）
-```
-
-### JavaScript 虚拟路径
-
-在 JS 代码中，所有路径都是虚拟的，防止游戏访问其他游戏或系统文件：
-
-```javascript
-import { env } from 'migo:env';
-
-// 虚拟路径常量
-env.USER_DATA_PATH  // "/user"  - 用户数据（持久化）
-env.CACHE_PATH      // "/cache" - 缓存文件
-env.CODE_PATH       // "/code"  - 游戏代码（只读）
-env.TEMP_PATH       // "/tmp"   - 临时文件
-
-// 使用示例
-const fs = require('migo:fs');
-
-// 保存游戏进度
-fs.writeFileSync('/user/save.json', JSON.stringify(saveData));
-
-// 读取配置
-const config = JSON.parse(fs.readFileSync('/code/config.json'));
-
-// 写入缓存
-fs.writeFileSync('/cache/downloaded_asset.png', imageData);
-```
-
-### Java 路径管理
-
-```java
-GameSession session = runtime.createSession(activity, surface, config, "my-game-id");
-GamePaths paths = session.getPaths();
-
-// 获取真实路径
-File codeDir = paths.getCodeDir();       // 放置游戏代码
-File userDataDir = paths.getUserDataDir(); // 用户数据
-File cacheDir = paths.getCacheDir();     // 缓存文件
-File tempDir = paths.getTempDir();       // 临时文件
-
-// 首次安装且该 gameId 没有活动 session 时，才可直接填充空的 codeDir
-unzipGamePackage(downloadedZip, codeDir);
-
-// 启动游戏
-session.startGame("game.js");
-
-// 获取存储使用情况
-long userDataSize = paths.getUserDataSize();  // 用户数据大小（字节）
-long cacheSize = paths.getCacheSize();         // 缓存大小（字节）
-
-// 清理缓存
-paths.cleanupTemp();  // 清理临时文件
-
-// 完全删除游戏数据
-paths.deleteAll();    // 卸载游戏
-```
-
-签名树首次成功启动后会被封存为只读。更新同一 `gameId` 时，必须先停止并销毁
-全部相关 session，并把部署事务与新的 `startGame` 串行化：在 sibling 目录构建完整
-staging tree，再用可恢复的整树事务发布，恢复完成后才允许启动。API 26 的
-`File.renameTo` 不保证原子替换非空目录，不能把它单独当作更新事务；也不得在活动
-`codeDir` 中原地解压或覆盖文件。
-
-### gameId 要求
-
-- 长度: 1-64 字符
-- 允许字符: `a-z`, `A-Z`, `0-9`, `_`, `-`
-- 示例: `puzzle-game`, `com_example_game`, `game123`
-
-## 配置选项
+## Configuration Options
 
 ```java
 RuntimeConfig config = new RuntimeConfig.Builder(context)
-    // 性能
-    .setTargetFps(60)              // 30-120, 默认: 60
+    // Performance
+    .setTargetFps(60)              // 30-120, default: 60
     
-    // 调试
-    .setDebugEnabled(true)         // 启用调试功能
+    // Debugging
+    .setDebugEnabled(true)         // Enable debug features
     .setLogLevel(LogLevel.DEBUG)   // TRACE, DEBUG, INFO, WARN, ERROR, OFF
     
-    // 目录
-    .setCodeCacheDir(codeCacheDir) // 编译代码缓存目录
+    // Directories
+    .setCodeCacheDir(codeCacheDir) // For compiled code
     
     .build();
 ```
 
-## 错误处理
+## Error Handling
 
-SDK 使用结构化的错误码：
+The SDK uses structured error codes for all operations:
 
 ```java
-// 错误码
-ErrorCode.SUCCESS               //  0: 成功
-ErrorCode.ERR_INIT_FAILED       // -1000: 初始化失败
-ErrorCode.ERR_INVALID_SURFACE   // -1001: 无效 Surface
-ErrorCode.ERR_INVALID_CONFIG    // -1002: 无效配置
-ErrorCode.ERR_NATIVE_LOAD_FAILED// -1003: 原生库加载失败
-ErrorCode.ERR_SESSION_DESTROYED // -2000: Session 已销毁
-ErrorCode.ERR_CODE_DIR_NOT_FOUND// -2002: 代码目录不存在
-ErrorCode.ERR_ENTRY_NOT_FOUND   // -2003: 入口文件不存在
-ErrorCode.ERR_JS_EXECUTION      // -2004: JS 执行错误
-ErrorCode.ERR_INVALID_ACTIVITY  // -5004: 无效 Activity
+// Error codes
+ErrorCode.SUCCESS               //  0: Success
+ErrorCode.ERR_INIT_FAILED       // -1000: Initialization failed
+ErrorCode.ERR_INVALID_SURFACE   // -1001: Invalid Surface
+ErrorCode.ERR_INVALID_CONFIG    // -1002: Invalid configuration
+ErrorCode.ERR_NATIVE_LOAD_FAILED// -1003: Native library load failed
+ErrorCode.ERR_SESSION_DESTROYED // -2000: Session destroyed
+ErrorCode.ERR_CODE_DIR_NOT_FOUND// -2002: Code directory not found
+ErrorCode.ERR_ENTRY_NOT_FOUND   // -2003: Entry point not found
+ErrorCode.ERR_JS_EXECUTION      // -2004: JavaScript execution error
+ErrorCode.ERR_INVALID_ACTIVITY  // -5004: Invalid Activity
 
-// 获取可读的错误消息
+// Get human-readable message
 String message = ErrorCode.getMessage(code);
 ```
 
-## API 参考
+## API Reference
 
 ### MigoRuntime
 
-主入口（单例）：
+The main entry point (singleton):
 
-| 方法 | 描述 |
-|------|------|
-| `getInstance()` | 获取单例实例 |
-| `createSession(Activity, Surface, RuntimeConfig, String gameId)` | 创建游戏会话（Activity 绑定） |
-| `createSession(Context, Surface, RuntimeConfig, String gameId)` | 创建游戏会话（无 Activity 绑定） |
-| `createSessionSafe(Activity, Surface, RuntimeConfig, String gameId)` | 无异常版本 |
-| `getVersion()` | 获取 SDK 版本 |
-| `getNativeVersion()` | 获取原生引擎版本 |
-| `isNativeLoaded()` | 检查原生库是否加载 |
-| `isDeviceSupported()` | 检查设备兼容性 |
-| `getActiveSessionCount()` | 获取当前活跃会话数 |
-| `getMinSdkVersion()` | 获取最低支持 API 等级 |
+| Method | Description |
+|--------|-------------|
+| `getInstance()` | Get the singleton instance |
+| `createSession(Activity, Surface, RuntimeConfig, String gameId)` | Create a game session (Activity-bound) |
+| `createSession(Context, Surface, RuntimeConfig, String gameId)` | Create a game session (without Activity binding) |
+| `createSessionSafe(Activity, Surface, RuntimeConfig, String gameId)` | Non-throwing version |
+| `getVersion()` | Get SDK version |
+| `getNativeVersion()` | Get native engine version |
+| `isNativeLoaded()` | Check if native library loaded |
+| `isDeviceSupported()` | Check device compatibility |
+| `getActiveSessionCount()` | Get active session count |
+| `getMinSdkVersion()` | Get minimum supported API level |
 
 ### GameSession
 
-游戏会话（实现 `Closeable`）：
+Represents an active game session (implements `Closeable`):
 
-| 方法 | 描述 |
-|------|------|
-| `startGame(String entryPoint)` | 启动游戏（从 `paths.getCodeDir()`） |
-| `startGameSafe(String entryPoint)` | 无异常版本 |
-| `pause()` | 暂停游戏 |
-| `resume()` | 恢复游戏 |
-| `restart()` | 重启游戏 |
-| `updateSurface(Surface)` | 更新渲染表面 |
-| `dispatchTouchEvent(MotionEvent)` | 处理触摸输入 |
-| `dispatchMemoryWarning(int)` | 转发内存告警 |
-| `setListener(GameSessionListener)` | 注册统一会话事件回调 |
-| `setAuthHandler(AuthHandler)` | 注册鉴权回调 |
-| `setGameLogHandler(GameLogHandler)` | 注册游戏日志回调 |
-| `setSubpackageHandler(SubpackageHandler)` | 注册分包下载回调 |
-| `close()` / `destroy()` | 释放资源 |
-| `isValid()` | 检查会话是否有效 |
-| `isGameStarted()` | 检查游戏是否已启动 |
+| Method | Description |
+|--------|-------------|
+| `startGame(String entryPoint)` | Start game (from `paths.getCodeDir()`) |
+| `startGameSafe(String entryPoint)` | Non-throwing version |
+| `pause()` | Pause the game |
+| `resume()` | Resume the game |
+| `restart()` | Restart the game |
+| `updateSurface(Surface)` | Update rendering surface |
+| `dispatchTouchEvent(MotionEvent)` | Handle touch input |
+| `dispatchMemoryWarning(int)` | Forward memory pressure signal |
+| `setListener(GameSessionListener)` | Register unified session listener |
+| `setAuthHandler(AuthHandler)` | Register auth handler |
+| `setGameLogHandler(GameLogHandler)` | Register game log handler |
+| `setSubpackageHandler(SubpackageHandler)` | Register subpackage download handler |
+| `close()` / `destroy()` | Release resources |
+| `isValid()` | Check if session is valid |
+| `isGameStarted()` | Check if game started |
 
 ### RuntimeConfig.Builder
 
-配置构建器：
+Configuration builder:
 
-| 方法 | 默认值 | 描述 |
-|------|--------|------|
-| `setTargetFps(int)` | 60 | 目标帧率 (30-120) |
-| `setDebugEnabled(boolean)` | false | 调试模式 |
-| `setLogLevel(LogLevel)` | WARN | 日志级别 |
-| `setCodeCacheDir(String)` | cacheDir | 代码缓存目录 |
+| Method | Default | Description |
+|--------|---------|-------------|
+| `setTargetFps(int)` | 60 | Target frame rate (30-120) |
+| `setDebugEnabled(boolean)` | false | Debug mode |
+| `setLogLevel(LogLevel)` | WARN | Log verbosity |
+| `setCodeCacheDir(String)` | cacheDir | Compiled code directory |
 
 ## ProGuard
 
-库已包含 ProGuard 规则。如需添加自定义规则：
+The library includes ProGuard rules. If you need to add custom rules:
 
 ```proguard
-# 保留公共 API
+# Keep public API
 -keep public class com.migo.runtime.** { public *; }
 
-# 保留回调接口
+# Keep callback interfaces
 -keep interface com.migo.runtime.callback.** { *; }
 ```
 
-## 系统要求
+## Requirements
 
-- **最低 SDK**: 26 (Android 8.0 Oreo)
-- **目标 SDK**: 34 (Android 14)
-- **支持的 ABI**: arm64-v8a, x86_64
+- **Minimum SDK**: 26 (Android 8.0 Oreo)
+- **Target SDK**: 34 (Android 14)
+- **Supported ABIs**: arm64-v8a, x86_64
 
-## 许可证
+## License
 
-请查看项目根目录的许可证信息。
+See the project root for license information.
