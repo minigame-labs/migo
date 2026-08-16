@@ -15,7 +15,8 @@ use tokio::sync::{Notify, mpsc};
 use tracing::debug;
 
 use crate::decoder::mp3::{
-    Mp3FrameDecoder, Mp3Step, STREAM_LOOKAHEAD_BYTES, append_as_f32, first_frame_at_front,
+    MAX_SAMPLES_PER_FRAME, Mp3FrameDecoder, Mp3Step, STREAM_LOOKAHEAD_BYTES, append_as_f32,
+    first_frame_at_front,
 };
 use crate::off_worker::OffWorker;
 
@@ -510,7 +511,7 @@ impl Mp3StreamDecoder {
             channels: 0,
             target_sample_rate,
             resampler: None,
-            scratch: Vec::with_capacity(minimp3::MAX_SAMPLES_PER_FRAME),
+            scratch: Vec::with_capacity(MAX_SAMPLES_PER_FRAME),
         }
     }
 

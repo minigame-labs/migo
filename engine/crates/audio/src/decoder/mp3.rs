@@ -1,9 +1,15 @@
 use std::ffi::c_int;
 
-use minimp3::ffi;
+use minimp3_sys as ffi;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 
 use super::DecodedAudio;
+
+/// Largest number of samples (all channels combined) one MP3 frame can decode
+/// to. Mirrors the constant the `minimp3` wrapper crate derives from the same
+/// `-sys` binding, which this crate does not depend on -- see the comment on
+/// the `minimp3-sys` line in Cargo.toml for why.
+pub(crate) const MAX_SAMPLES_PER_FRAME: usize = ffi::MINIMP3_MAX_SAMPLES_PER_FRAME as usize;
 
 /// Largest MPEG-1 Layer III frame in bytes (320 kb/s at 32 kHz, padded).
 const MAX_FRAME_BYTES: usize = 1441;
@@ -55,7 +61,7 @@ pub(crate) struct Mp3FrameDecoder {
     state: Box<ffi::mp3dec_t>,
     /// Sized by minimp3's documented maximum for a single frame, which is the
     /// contract the `pcm` pointer below is passed under.
-    pcm: Box<[i16; minimp3::MAX_SAMPLES_PER_FRAME]>,
+    pcm: Box<[i16; MAX_SAMPLES_PER_FRAME]>,
 }
 
 impl Mp3FrameDecoder {
@@ -76,7 +82,7 @@ impl Mp3FrameDecoder {
 
         Self {
             state,
-            pcm: Box::new([0; minimp3::MAX_SAMPLES_PER_FRAME]),
+            pcm: Box::new([0; MAX_SAMPLES_PER_FRAME]),
         }
     }
 
@@ -149,10 +155,10 @@ impl Mp3FrameDecoder {
 
         let channels = info.channels.max(1) as usize;
         let total = (samples_per_channel as usize).saturating_mul(channels);
-        debug_assert!(total <= minimp3::MAX_SAMPLES_PER_FRAME);
+        debug_assert!(total <= MAX_SAMPLES_PER_FRAME);
 
         Mp3Step::Frame {
-            pcm: &self.pcm[..total.min(minimp3::MAX_SAMPLES_PER_FRAME)],
+            pcm: &self.pcm[..total.min(MAX_SAMPLES_PER_FRAME)],
             sample_rate: info.hz.max(0) as u32,
             channels: channels as u32,
             consumed,
