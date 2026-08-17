@@ -279,12 +279,27 @@ migo_engine_create(const MigoEngineConfig *config, MigoEngine **out_engine);
 /*
  * All child sessions must be destroyed before engine destruction. MIGO_OK
  * consumes and releases the Engine handle; the pointer is invalid afterward.
+ *
  * Successful Engine destruction is a thread-completion barrier. It does not
- * return until every Migo-owned worker transferred by its Sessions has exited.
- * Calling from one of those workers returns MIGO_ERROR_INVALID_STATE without
- * consuming the Engine; retry from a host thread after the callback unwinds.
- * Only after it returns may the host destroy native display/window resources or
- * unload the Migo library.
+ * return until every Migo-owned worker transferred by its Sessions has exited:
+ * those are the engine threads a Session hands to the Engine as it is
+ * destroyed, and each one is joined here. Calling from one of them returns
+ * MIGO_ERROR_INVALID_STATE without consuming the Engine; retry from a host
+ * thread after the callback unwinds. Only after it returns may the host destroy
+ * native display/window resources or unload the Migo library.
+ *
+ * The barrier does NOT extend to threads created by content through the JS
+ * `Worker` API. Dropping a Session's runtime interrupts each such isolate and
+ * signals its message loop to stop, but nothing waits for the thread to finish
+ * unwinding, so one may still be running when this call returns. The practical
+ * consequence is for hosts that unload the library rather than exiting the
+ * process: unloading immediately can pull the code out from under a worker
+ * that is still tearing its isolate down. Hosts that only exit, or that keep
+ * the library loaded for the process lifetime, are unaffected.
+ *
+ * This is a known gap rather than a designed guarantee, stated here because a
+ * host cannot see it from the outside and the safe-to-unload question is
+ * exactly what this paragraph exists to answer.
  */
 MIGO_API MigoResult MIGO_CALL migo_engine_destroy(MigoEngine *engine);
 
