@@ -101,6 +101,13 @@ typedef void(MIGO_CALL *MigoTaskFn)(void *task_context);
 /*
  * MIGO_OK transfers the task to the dispatcher, which must invoke it exactly
  * once (inline or later). Any error leaves task ownership with Migo.
+ *
+ * This is the one result that travels from the host into Migo rather than out
+ * of it, and Migo distinguishes only MIGO_OK from everything else: on any error
+ * it reclaims the task, drops it unrun, and logs the value it was given. A host
+ * refusing a task should therefore return MIGO_ERROR_DISPATCH_REJECTED, which
+ * exists for this and makes that log line say what happened; no other code
+ * carries extra meaning here.
  */
 typedef MigoResult(MIGO_CALL *MigoDispatchFn)(void *dispatcher_context,
                                               MigoTaskFn task,
@@ -320,6 +327,21 @@ MIGO_API MigoResult MIGO_CALL migo_engine_destroy(MigoEngine *engine);
  *
  * migo_engine_create and migo_session_create may themselves be called
  * concurrently from different host threads.
+ *
+ * *out_session is written only on success, so a caller must initialise it
+ * itself if it intends to test the pointer after a failure.
+ *
+ *   MIGO_ERROR_INVALID_ARGUMENT  engine, config, or out_session was NULL;
+ *                                config's struct_size is smaller than the
+ *                                minimum versioned record; or config.flags is
+ *                                non-zero, since no MigoSessionFlags bit is
+ *                                defined at this ABI version
+ *   MIGO_ERROR_UNSUPPORTED_ABI   config.abi_version does not match this engine
+ *                                build, or struct_size claims a record larger
+ *                                than this build knows
+ *   MIGO_ERROR_INTERNAL          the Engine's live-session bookkeeping lock was
+ *                                poisoned by an earlier panic; rare, and logged
+ *                                when it happens
  */
 MIGO_API MigoResult MIGO_CALL migo_session_create(
     MigoEngine *engine,
