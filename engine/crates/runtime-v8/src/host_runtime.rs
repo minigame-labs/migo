@@ -130,6 +130,27 @@ impl HostJsRuntime {
         // When no snapshot is available, we fall back to main_extensions()
         // which creates fully-initialized extensions with JS from source.
         let t0 = Instant::now();
+        // This crate's own unit tests boot from source, never from the snapshot.
+        //
+        // V8's snapshot mode is decided process-wide on first init, so one test
+        // binary cannot hold both snapshot-booted and source-booted runtimes:
+        // mixing them aborts with SIGILL during teardown, after every test has
+        // already reported success. `tests/snapshot_roundtrip.rs` records the same
+        // constraint from the creation side and answers it the same way -- its own
+        // binary, its own process.
+        //
+        // Without this, `cargo test -p migo-runtime-v8` passes on CI and aborts on
+        // a developer machine, purely because CI has no host V8 archive for
+        // build.rs to validate a snapshot against and so embeds none. The suite
+        // should not depend on which machine it runs on.
+        //
+        // `cfg(test)` covers exactly the unit-test harness. Integration tests under
+        // `tests/` link the library compiled without it, so they still get the real
+        // snapshot -- which is what makes a dedicated binary the place to exercise
+        // that path -- and shipping builds are untouched.
+        #[cfg(test)]
+        let snapshot_bytes: Option<&'static [u8]> = None;
+        #[cfg(not(test))]
         let snapshot_bytes = crate::snapshot::SNAPSHOT_BYTES;
         let use_snapshot = snapshot_bytes.is_some();
 
