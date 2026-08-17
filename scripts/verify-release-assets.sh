@@ -8,14 +8,19 @@
 # everything", is deliberate. The two mechanisms are not competing designs; each fits a
 # different provenance model. A sidecar is produced next to its own artifact by whoever
 # built it, so it composes across build machines. A single checksum manifest needs one
-# publisher that sees every asset. While Windows and OpenHarmony are still built by
-# hand -- their librusty_v8 archives are not published, so no CI job can build them --
-# the release necessarily mixes both, and a check that insisted on one mechanism would
-# have to be switched off for exactly the releases that need it most.
+# publisher that sees every asset.
 #
-# So the mechanism count is a consequence, not a decision: as each platform moves into
-# CI its sidecar disappears on its own, and when the last one does, the sidecar branch
-# of this check has zero members and can be deleted along with the generation of them.
+# Both are load-bearing today, and neither is a stopgap. An earlier version of this
+# comment explained the pair as a consequence of Windows and OpenHarmony being built by
+# hand, and predicted the sidecar branch would empty out as each platform moved into CI.
+# Neither half still holds: release.yml now builds every platform, Windows and
+# OpenHarmony included, each fetching and verifying its own librusty_v8 through
+# scripts/fetch-v8-archives.sh -- and the sidecars come from Android, which publishes
+# `<asset>.attestation.json` beside every artifact it builds *in* CI, by design.
+#
+# The practical consequence of getting that backwards is deleting the sidecar branch of
+# this check, on the theory that it has no members left, and silently dropping the
+# provenance Android's release assets actually carry.
 #
 # This is also the only check that can catch an asset uploaded outside the process,
 # because it reads what was published rather than what a workflow intended. It
