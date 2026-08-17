@@ -290,15 +290,20 @@ jobs:
       # asserts that, so the two lists cannot drift apart the way the test lists
       # once did.
       #
-      # Lints are capped to `warn` (incl. deny-by-default correctness lints like
-      # clippy::erasing_op / await_holding_lock): pinning to 1.95.0 (frozen V8
-      # build chain) surfaced a large backlog of PRE-EXISTING lints across the
-      # workspace that predate this branch. `--cap-lints warn` keeps clippy
-      # running and reporting (compile errors still fail the build) without the
-      # backlog blocking. Remove the cap after the dedicated lint-cleanup PR.
+      # No `--cap-lints warn` here, deliberately. That cap was added to get past
+      # a pre-existing lint backlog, but it caps *every* lint, so it also
+      # downgraded the deny-by-default correctness ones -- erasing_op,
+      # never_loop, await_holding_lock -- to warnings nobody fails on. The
+      # backlog never needed it: the style lints are warn-by-default, and clippy
+      # exits 0 on warnings, so only the correctness errors were actually
+      # blocking. Those were audited one by one and every single hit was benign
+      # test code (pixel-index formulas kept in `(row * w + col) * bpp` form, a
+      # rotation matrix written as literals, a vestigial `loop`); each is now
+      # either fixed or carries a scoped `#[allow]` stating why. So correctness
+      # lints gate again, and the style backlog still just warns.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets
 
       # Blocking gate for the crates that need no extra system packages (shared +
       # io + runtime-v8). All their lib tests must pass. Previously-masked failures
@@ -642,7 +647,7 @@ jobs:
       # the dedicated lint-cleanup work, in both jobs at once.
       - name: Run clippy lints (crates needing host system packages)
         working-directory: engine
-        run: cargo clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio --all-targets
 
       - name: Run Rust tests (graphics, core, capi, platform, audio)
         working-directory: engine

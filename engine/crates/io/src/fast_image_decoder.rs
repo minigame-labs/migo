@@ -876,6 +876,11 @@ pub fn resize_image(img: NormalizedImage, _target_w: u32, _target_h: u32) -> Nor
 }
 
 #[cfg(test)]
+// Pixel indices here are written out in full as `(row * width + col) * bpp`,
+// including the terms that multiply by zero or one. Reducing `(0 * 4 + 2) * 4`
+// to `8` would satisfy the lint and lose the thing the line is for: which pixel
+// the assertion is about. The formula is the documentation.
+#[allow(clippy::erasing_op, clippy::identity_op)]
 mod crop_tests {
     use super::*;
     use std::sync::Arc;

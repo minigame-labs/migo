@@ -482,6 +482,11 @@ pub(crate) fn state_allows_partial(state: &crate::backend::gl::state::Canvas2DSt
 }
 
 #[cfg(test)]
+// The 0.7071068 literals are the entries of a 45-degree rotation matrix, laid
+// out as `[cos, sin, -sin, cos, 0, 0]` so the matrix is readable as a matrix.
+// Swapping them for FRAC_1_SQRT_2 would name the number and hide the shape,
+// and these tests are about the shape.
+#[allow(clippy::approx_constant)]
 mod partial_damage_tests {
     use super::*;
     use crate::backend::gl::state::Canvas2DState;
