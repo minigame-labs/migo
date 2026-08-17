@@ -25,7 +25,31 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # `dtolnay/rust-toolchain@1.95.0` is not an action version -- the tag *is*
+      # the Rust toolchain version, and it mirrors `engine/rust-toolchain.toml`,
+      # which pins 1.95.0 as the frozen reproducible build chain and says in so
+      # many words to "bump deliberately". Left to Dependabot it proposes moving
+      # CI to a different rustc than the repository pins, which is a build-chain
+      # change wearing an action-update costume. Bump both together, by hand.
+      - dependency-name: "dtolnay/rust-toolchain"
     groups:
+      # These two are a matched pair and must never arrive separately, majors
+      # included. upload-artifact v7 added "direct uploads" (a single file stored
+      # unzipped) and download-artifact v8 changed to cope with exactly that --
+      # it now checks Content-Type before unzipping. release.yml has six uploads
+      # feeding one download that collects the release assets, so a run with
+      # mismatched majors can fail to assemble a release. Nothing in PR CI would
+      # catch it either: that download only executes during an actual release.
+      # Listed before the catch-all group so it wins for these two dependencies.
+      artifact-actions:
+        patterns:
+          - "actions/upload-artifact"
+          - "actions/download-artifact"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
       # One PR for the routine bumps; anything major still comes on its own so
       # the breaking change is reviewed by itself.
       actions-minor-and-patch:
