@@ -28,6 +28,24 @@ MIGO_BEGIN_DECLS
  * backpressure can exhaust it. The first refusal in a saturation episode is
  * also reported through MigoOnErrorFn; a later successful input call rearms
  * that notification.
+ *
+ * Backpressure is only reached once a call is well-formed. Every
+ * migo_session_send_* call validates its Session and its event record the same
+ * way first, so these three rejections are possible for all of them and are
+ * not repeated in the per-function notes below:
+ *
+ *   MIGO_ERROR_INVALID_ARGUMENT  session or the event pointer was NULL, the
+ *                                event's struct_size is smaller than the
+ *                                minimum versioned record, or a field holds a
+ *                                value this ABI does not define
+ *   MIGO_ERROR_UNSUPPORTED_ABI   the event's abi_version does not match this
+ *                                engine build, or struct_size claims a record
+ *                                larger than this build knows
+ *   MIGO_ERROR_INVALID_STATE     the Session has already been destroyed, or it
+ *                                has no live host to deliver to
+ *
+ * A rejected event is never partially delivered: validation completes before
+ * anything is enqueued, so a failed call leaves the input stream untouched.
  */
 
 /*
