@@ -124,7 +124,7 @@ zune-image = { version = "0.5", default-features = false, features = ["jpeg", "p
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 
 # LRU cache for decoded images
-lru = "0.16"
+lru = "0.18"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12"
 
