@@ -25,6 +25,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # `dtolnay/rust-toolchain@1.95.0` is not an action version -- the tag *is*
+      # the Rust toolchain version, and it mirrors `engine/rust-toolchain.toml`,
+      # which pins 1.95.0 as the frozen reproducible build chain and says in so
+      # many words to "bump deliberately". Left to Dependabot it proposes moving
+      # CI to a different rustc than the repository pins, which is a build-chain
+      # change wearing an action-update costume. Bump both together, by hand.
+      - dependency-name: "dtolnay/rust-toolchain"
     groups:
       # One PR for the routine bumps; anything major still comes on its own so
       # the breaking change is reviewed by itself.
