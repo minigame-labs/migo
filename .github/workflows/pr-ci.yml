@@ -602,11 +602,18 @@ jobs:
   # does not fit that job's 20-minute budget. Runs in parallel with the Android
   # job, so the wall clock is unchanged.
   #
-  # NO Rust cache, for the same reason the Android and snapshot jobs refuse it:
-  # Swatinem/rust-cache prunes large files out of each build script's OUT_DIR while
-  # keeping the fingerprint fresh, so on a cache hit the `v8` crate's
-  # `librusty_v8.a` is gone and the link fails on the second run rather than the
-  # first. These crates link V8 through runtime-v8.
+  # This job DOES cache, unlike the Android and snapshot jobs, because the hazard
+  # those two avoid does not reach it. There, the V8 archive is fetched by
+  # scripts/fetch-v8-archives.sh into engine/third_party/rusty_v8/<triple>/ --
+  # outside the `engine -> target` workspace the cache covers. A warm run restores
+  # the build script's fingerprint but not the archive it refers to, cargo skips
+  # the script that would have copied it, and the link fails with "could not find
+  # native static library rusty_v8" on the second run rather than the first.
+  #
+  # Here there is no fetch step: the `v8` crate resolves its own archive under
+  # target/, which the cache stores and restores with everything else. Observed
+  # rather than assumed -- warm runs report `full match: true` and go green in
+  # ~2.5 min against ~45 cold, with all 827 tests running and no link failure.
   host-engine-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 90
