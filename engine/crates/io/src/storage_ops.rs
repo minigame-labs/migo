@@ -90,12 +90,13 @@ fn store_for(dir: &Path, quota_bytes: u64) -> Result<KvStore, EngineError> {
     Ok(map.entry(key).or_insert(new_kv).clone())
 }
 
-/// Test-only hatch to reset the process-wide store cache between
-/// tests. Safe to call concurrently — idempotent.
-#[cfg(test)]
-pub fn __reset_stores_for_test() {
-    STORES.lock().clear();
-}
+// No test-only cache reset exists on purpose. Every test keys off its own
+// `tempdir()`, which is a fresh unique absolute path, so a stale entry for
+// that key is impossible and there is nothing to reset. A global
+// `STORES.lock().clear()` used to run before each test and was actively
+// harmful: cargo runs tests in parallel threads against this one process-wide
+// map, so one test's reset would wipe the entry another test had just
+// inserted, out from under it.
 
 // ---------------------------------------------------------------------------
 // Scheduler plumbing
@@ -284,7 +285,6 @@ mod tests {
     const QUOTA: u64 = 1024 * 1024; // 1 MiB in tests
 
     fn fresh_dir() -> tempfile::TempDir {
-        __reset_stores_for_test();
         tempdir().unwrap()
     }
 
