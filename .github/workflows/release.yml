@@ -622,7 +622,7 @@ jobs:
             > reports/size-report.txt || true
 
       - name: Upload the size report as a workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: size-report
           path: reports/size-report.txt
@@ -670,7 +670,7 @@ jobs:
       # exactly why SHA256SUMS.txt used to cover only this job's output while its name
       # implied the release.
       - name: Upload the staged Android assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets-android
           path: dist/release
@@ -784,7 +784,7 @@ jobs:
           bash scripts/package-sdk.sh dist/migo-linux-arm64 --output-dir dist/release
 
       - name: Upload the staged Linux assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets-linux
           path: dist/release
@@ -862,7 +862,7 @@ jobs:
           done
 
       - name: Upload the staged OpenHarmony assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets-ohos
           path: dist/release
@@ -958,7 +958,7 @@ jobs:
           bash scripts/package-sdk.sh dist/migo-windows-x86_64 --output-dir dist/release
 
       - name: Upload the staged Windows assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets-windows
           path: dist/release
@@ -1039,7 +1039,7 @@ jobs:
           bash scripts/package-sdk.sh dist/migo-windows-arm64 --output-dir dist/release
 
       - name: Upload the staged Windows arm64 assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets-windows-arm64
           path: dist/release
