@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
 
@@ -477,7 +477,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
@@ -618,7 +618,7 @@ jobs:
           lfs: false
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           # Not the default: this action installs a minimal profile, so clippy has
           # to be asked for. Without it the lint step below fails to find the

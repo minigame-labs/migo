@@ -38,7 +38,7 @@ jobs:
           bash scripts/check-snapshot-freshness.sh --snapshot-kind worker --product-profile full --os linux
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
 
@@ -421,7 +421,7 @@ jobs:
           lfs: false
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
@@ -480,7 +480,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
@@ -733,7 +733,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
@@ -821,7 +821,7 @@ jobs:
       # list to keep in step. The build scripts run cargo from engine/, so that file
       # applies and rustup installs what it names.
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       # Two reasons, and the second one is not about space. Measured sizes: the
       # extracted SDK is 2.9 GB, each OpenHarmony cargo target directory is 4.4 GB, and
@@ -899,7 +899,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -997,7 +997,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: aarch64-pc-windows-msvc
 
