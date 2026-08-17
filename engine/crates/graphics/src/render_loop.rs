@@ -40,6 +40,11 @@ use crate::{CanvasHandler, CanvasManager, RendererGL};
 /// etc.), which is why `RenderLoopState` is deliberately not
 /// `Clone` or `Default` — constructing it is a coordinated
 /// startup sequence in `RenderThread::spawn`.
+// Unconstructed today: the incremental migration this module was built
+// for (see the module doc above) hasn't landed its first handler yet, so
+// `render_thread.rs` still threads its own local state and its own
+// private `LoopCtl` rather than this one.
+#[allow(dead_code)]
 pub(crate) struct RenderLoopState {
     pub(crate) cm: CanvasManager,
     pub(crate) canvas_handler: CanvasHandler,
@@ -73,6 +78,7 @@ pub(crate) struct RenderLoopState {
 /// teardown.  Equivalent to the private `LoopCtl` previously
 /// declared inside the `RenderThread::spawn` body; extracted so
 /// the struct and handlers can share a single vocabulary.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoopCtl {
     Continue,

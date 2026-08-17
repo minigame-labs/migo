@@ -101,6 +101,14 @@ impl FrameDamageAccumulator {
     /// swap path / stats; callers that want per-rect granularity
     /// (partial-update driver call) should use
     /// [`Self::resolve_rects`].
+    ///
+    /// Unused by production code today -- the swap path already
+    /// switched to [`Self::resolve_rects`] for partial-update
+    /// support, and no stats consumer has been wired to the
+    /// bounding-box form yet. Kept, not deleted: it is exhaustively
+    /// unit-tested and a legitimate, correct alternate view of the
+    /// same accumulator.
+    #[allow(dead_code)]
     pub(crate) fn resolve(&self, surface_size: (i32, i32)) -> ResolvedDamage {
         let mut tracker = DamageTracker::new(surface_size);
         for r in &self.rects {

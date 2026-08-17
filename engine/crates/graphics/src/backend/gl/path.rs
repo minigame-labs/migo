@@ -23,7 +23,7 @@
 
 use skia_safe::{Matrix, Path, PathDirection, Point, Rect, path_builder::PathBuilder};
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 
 /// Canvas2D-style incremental path builder around a Skia [`PathBuilder`].
 pub struct CanvasPath {
@@ -252,6 +252,7 @@ fn normalise_arc(start: f32, end: f32, ccw: bool) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
 
     /// Snapshot + copy bounds into an owned value so the snapshot `Path`'s
     /// borrow of the bounds rect lifetime-wise doesn't leak into callers.

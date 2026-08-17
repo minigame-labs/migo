@@ -76,26 +76,6 @@ pub fn check_pbo_support(gl: &glow::Context) -> bool {
     }
 }
 
-/// Upload image data to GPU texture using PBO for async transfer
-///
-/// This function:
-/// 1. Creates a PBO and fills it with image data
-/// 2. Initiates async DMA transfer from PBO to texture
-/// 3. The actual transfer happens asynchronously
-///
-/// When a `PboPool` is provided, PBOs are reused from the pool to avoid
-/// GL object churn on frequent image loads.
-///
-/// Note: On ES 2.0, this falls back to synchronous upload
-pub fn upload_texture_with_pbo(
-    gl: &glow::Context,
-    image: &NormalizedImage,
-    use_pbo: bool,
-    pool: Option<&mut PboPool>,
-) -> EngineResult<PboUploadResult> {
-    upload_texture_with_pbo_ext(gl, image, use_pbo, pool, false)
-}
-
 /// Extended version that additionally knows whether the driver supports
 /// `glTexStorage2D`.  When `true`, we allocate the texture immutably up
 /// front (one driver-side layout decision instead of per-level guessing)

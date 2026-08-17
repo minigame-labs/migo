@@ -521,11 +521,6 @@ pub(crate) struct CanvasManager {
 }
 
 impl CanvasManager {
-    /// Direct access to the glow GL context (for SpriteBatcher and other direct-GL paths).
-    pub(crate) fn gl(&self) -> &glow::Context {
-        &self.gl
-    }
-
     /// This session's text texture cache.  The render loop uses it for
     /// the memory-pressure trim and the font-generation bump, both of
     /// which must stay scoped to this session.
@@ -3681,6 +3676,13 @@ impl CanvasManager {
     /// touched canvas (empty-canvas-id GL batches, panic recovery);
     /// normal WebGL batch dispatch uses [`mark_2d_context_stale`]
     /// for narrower invalidation.
+    ///
+    /// Unused today: every current caller of the fall-back paths
+    /// described above reaches for the narrower
+    /// [`Self::mark_all_2d_contexts_stale_bits`] instead. Kept as
+    /// the documented full-invalidation escape hatch for a
+    /// fall-back path that can't identify which bits are dirty.
+    #[allow(dead_code)]
     pub(crate) fn mark_all_2d_contexts_stale(&mut self) {
         for ctx in self.contexts_2d.values_mut() {
             ctx.mark_state_stale();
@@ -3741,46 +3743,6 @@ impl CanvasManager {
 
     pub(crate) fn flush_dirty_2d_contexts(&mut self) -> EngineResult<Vec<CanvasId>> {
         context_2d_impl::flush_dirty_2d_contexts(self)
-    }
-
-    /// Read pixel data from the current framebuffer via glReadPixels.
-    ///
-    /// This is a read-only operation — it does NOT modify the framebuffer and
-    /// therefore does NOT contribute to frame damage. The caller is responsible
-    /// for ensuring all prior rendering (Canvas2D Skia flush, GL draw calls)
-    /// has been materialized before calling this. In the current model, the
-    /// unified collector's `flush_as_barrier()` + trailing `Materialize` handles
-    /// this before the sync readback command reaches the render thread.
-    pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
-        let len = (width * height * 4) as usize;
-        let mut buf = vec![0u8; len];
-        unsafe {
-            self.gl.read_pixels(
-                x,
-                y,
-                width as i32,
-                height as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut buf)),
-            );
-        }
-        // glReadPixels returns rows in bottom-to-top order; flip to top-to-bottom
-        let row_bytes = (width * 4) as usize;
-        let row_count = height as usize;
-        for r in 0..row_count / 2 {
-            let top = r * row_bytes;
-            let bot = (row_count - 1 - r) * row_bytes;
-            // SAFETY: top and bot slices are non-overlapping (r < row_count - 1 - r)
-            unsafe {
-                std::ptr::swap_nonoverlapping(
-                    buf.as_mut_ptr().add(top),
-                    buf.as_mut_ptr().add(bot),
-                    row_bytes,
-                );
-            }
-        }
-        buf
     }
 
     // ==================== Image Management ====================
@@ -5452,17 +5414,6 @@ impl CanvasManager {
                 unsafe { self.gl.delete_texture(tex) };
             }
         }
-    }
-
-    /// Look up an image by id.  Returns the raw GL texture + dimensions +
-    /// colour/alpha metadata.  Callers that want a Skia `SkImage` wrap
-    /// the texture via `ImageStore::resolve_as_sk_image` using their
-    /// canvas's `GrDirectContext`.
-    pub(crate) fn get_shared_image(
-        &self,
-        image_id: u32,
-    ) -> Option<crate::backend::gl::image_store::StoredImage> {
-        self.image_registry.get_shared_texture(image_id)
     }
 
     /// Access the PBO pool for WebGL texture uploads.

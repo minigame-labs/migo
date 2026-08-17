@@ -471,13 +471,6 @@ fn execute_gl_batch(
     batch_hit_onscreen
 }
 
-/// Helper: treat an empty GL batch as non-state-mutating so we don't
-/// invalidate Skia's cache for a no-op.
-#[inline]
-fn commands_was_empty(n: usize) -> bool {
-    n == 0
-}
-
 /// Execute a FramePacket using caller-provided callbacks for each batch type.
 /// Used by tests to verify packet structure and ordering without a real GL context.
 /// Production code uses `execute_frame_packet` which handles `Materialize` directly.
@@ -2505,7 +2498,7 @@ impl RenderThread {
                 let present_frame_and_signal_raf = |cm: &mut CanvasManager,
                                                          renderer_2d: &mut Renderer2d,
                                                          dirty: &mut bool,
-                                                         paused: bool,
+                                                         _paused: bool,
                                                          should_present: bool,
                                                          ts: f64,
                                                          debug_stats: &shared::stats::DebugStats,

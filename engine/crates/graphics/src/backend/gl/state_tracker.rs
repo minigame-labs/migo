@@ -20,8 +20,6 @@
 //! issued (the tracked value differs, or we have no prior value yet)
 //! and `false` when the call is redundant.
 
-use std::collections::HashSet;
-
 use glow::{self};
 
 use crate::canvas::{BlendEquation, BlendFactors, CanvasGLState, MAX_UNIFORM_CACHE};
@@ -34,7 +32,7 @@ use shared::protocol::render_cmd::{BufferId, ProgramId, VaoId};
 /// Returns `true` if `glUseProgram(new)` must actually be issued.
 ///
 /// The tracker treats "unknown" (no previous program) as "must issue".
-pub fn update_use_program(state: &mut CanvasGLState, new: ProgramId) -> bool {
+pub(crate) fn update_use_program(state: &mut CanvasGLState, new: ProgramId) -> bool {
     if state.current_program == Some(new) {
         return false;
     }
@@ -55,7 +53,7 @@ pub fn update_use_program(state: &mut CanvasGLState, new: ProgramId) -> bool {
 /// if the upload is not redundant and should be issued. On `true`, normal-size
 /// values update the cache so the *next* identical call dedups; oversized
 /// values deliberately bypass retention and therefore continue to return true.
-pub fn update_uniform(
+pub(crate) fn update_uniform(
     state: &mut CanvasGLState,
     program: ProgramId,
     location: u32,
@@ -83,7 +81,11 @@ pub fn update_uniform(
 /// `glBindBuffer`, `false` when the binding already matches.  Any
 /// target we don't track is conservatively forwarded (returns
 /// `true`) rather than silently skipped.
-pub fn update_bind_buffer(state: &mut CanvasGLState, target: u32, new: Option<BufferId>) -> bool {
+pub(crate) fn update_bind_buffer(
+    state: &mut CanvasGLState,
+    target: u32,
+    new: Option<BufferId>,
+) -> bool {
     const GL_ARRAY_BUFFER: u32 = 0x8892;
     const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
     const GL_UNIFORM_BUFFER: u32 = 0x8A11;
@@ -127,7 +129,7 @@ pub fn update_bind_buffer(state: &mut CanvasGLState, target: u32, new: Option<Bu
 /// `bindBufferRange` with a different offset/size re-binds.
 ///
 /// Returns `true` when the GL call must be issued.
-pub fn update_bind_buffer_base(
+pub(crate) fn update_bind_buffer_base(
     state: &mut CanvasGLState,
     target: u32,
     index: u32,
@@ -152,7 +154,7 @@ pub fn update_bind_buffer_base(
 /// Track `glBindBufferRange(target, index, buf, offset, size)`
 /// (WebGL 2).  Dedup key includes offset and size so partial
 /// re-binds never coalesce with full bindings.
-pub fn update_bind_buffer_range(
+pub(crate) fn update_bind_buffer_range(
     state: &mut CanvasGLState,
     target: u32,
     index: u32,
@@ -172,7 +174,7 @@ pub fn update_bind_buffer_range(
     true
 }
 
-pub fn update_bind_vertex_array(state: &mut CanvasGLState, new: Option<VaoId>) -> bool {
+pub(crate) fn update_bind_vertex_array(state: &mut CanvasGLState, new: Option<VaoId>) -> bool {
     let new = new.unwrap_or(0);
     if state.bound_vao == Some(new) {
         return false;
@@ -190,7 +192,7 @@ pub fn update_bind_vertex_array(state: &mut CanvasGLState, new: Option<VaoId>) -
 // Textures
 // ============================================================================
 
-pub fn update_active_texture(state: &mut CanvasGLState, unit: u32) -> bool {
+pub(crate) fn update_active_texture(state: &mut CanvasGLState, unit: u32) -> bool {
     if state.active_texture_unit == Some(unit) {
         return false;
     }
@@ -201,7 +203,7 @@ pub fn update_active_texture(state: &mut CanvasGLState, unit: u32) -> bool {
 /// Dedup `glBindTexture(TEXTURE_2D, tex)` scoped to the currently
 /// active texture unit.  Callers without explicit active-unit tracking
 /// must treat this as a pessimistic update (return `true`).
-pub fn update_bind_texture_2d(state: &mut CanvasGLState, tex: Option<u32>) -> bool {
+pub(crate) fn update_bind_texture_2d(state: &mut CanvasGLState, tex: Option<u32>) -> bool {
     let unit = match state.active_texture_unit {
         Some(u) => u,
         None => return true,
@@ -223,7 +225,13 @@ pub fn update_bind_texture_2d(state: &mut CanvasGLState, tex: Option<u32>) -> bo
 /// engines (often with the same values) — without dedup we pay an
 /// unconditional GL round-trip per frame per canvas.
 #[inline]
-pub fn update_viewport(state: &mut CanvasGLState, x: i32, y: i32, width: i32, height: i32) -> bool {
+pub(crate) fn update_viewport(
+    state: &mut CanvasGLState,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
     let new = (x, y, width, height);
     if state.viewport == Some(new) {
         return false;
@@ -236,11 +244,11 @@ pub fn update_viewport(state: &mut CanvasGLState, x: i32, y: i32, width: i32, he
 // Blend state
 // ============================================================================
 
-pub fn update_blend_func(state: &mut CanvasGLState, src: u32, dst: u32) -> bool {
+pub(crate) fn update_blend_func(state: &mut CanvasGLState, src: u32, dst: u32) -> bool {
     update_blend_func_separate(state, src, dst, src, dst)
 }
 
-pub fn update_blend_func_separate(
+pub(crate) fn update_blend_func_separate(
     state: &mut CanvasGLState,
     src_rgb: u32,
     dst_rgb: u32,
@@ -260,11 +268,11 @@ pub fn update_blend_func_separate(
     true
 }
 
-pub fn update_blend_equation(state: &mut CanvasGLState, mode: u32) -> bool {
+pub(crate) fn update_blend_equation(state: &mut CanvasGLState, mode: u32) -> bool {
     update_blend_equation_separate(state, mode, mode)
 }
 
-pub fn update_blend_equation_separate(
+pub(crate) fn update_blend_equation_separate(
     state: &mut CanvasGLState,
     mode_rgb: u32,
     mode_alpha: u32,
@@ -280,7 +288,13 @@ pub fn update_blend_equation_separate(
     true
 }
 
-pub fn update_blend_color(state: &mut CanvasGLState, r: f32, g: f32, b: f32, a: f32) -> bool {
+pub(crate) fn update_blend_color(
+    state: &mut CanvasGLState,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) -> bool {
     let new = (r, g, b, a);
     if state.blend_color == Some(new) {
         return false;
@@ -293,7 +307,7 @@ pub fn update_blend_color(state: &mut CanvasGLState, r: f32, g: f32, b: f32, a: 
 // Depth / cull / front-face / misc scalars
 // ============================================================================
 
-pub fn update_depth_func(state: &mut CanvasGLState, func: u32) -> bool {
+pub(crate) fn update_depth_func(state: &mut CanvasGLState, func: u32) -> bool {
     if state.depth_func == Some(func) {
         return false;
     }
@@ -301,7 +315,7 @@ pub fn update_depth_func(state: &mut CanvasGLState, func: u32) -> bool {
     true
 }
 
-pub fn update_depth_mask(state: &mut CanvasGLState, flag: bool) -> bool {
+pub(crate) fn update_depth_mask(state: &mut CanvasGLState, flag: bool) -> bool {
     if state.depth_mask == Some(flag) {
         return false;
     }
@@ -309,7 +323,7 @@ pub fn update_depth_mask(state: &mut CanvasGLState, flag: bool) -> bool {
     true
 }
 
-pub fn update_depth_range(state: &mut CanvasGLState, near: f32, far: f32) -> bool {
+pub(crate) fn update_depth_range(state: &mut CanvasGLState, near: f32, far: f32) -> bool {
     let new = (near, far);
     if state.depth_range == Some(new) {
         return false;
@@ -328,7 +342,7 @@ pub fn update_depth_range(state: &mut CanvasGLState, near: f32, far: f32) -> boo
 /// we track per-face separately for the `_separate` calls and
 /// duplicate the write when `FRONT_AND_BACK` is the face.
 #[inline]
-pub fn update_stencil_func(
+pub(crate) fn update_stencil_func(
     state: &mut CanvasGLState,
     face: u32,
     func: u32,
@@ -353,7 +367,7 @@ pub fn update_stencil_func(
 }
 
 #[inline]
-pub fn update_stencil_op(
+pub(crate) fn update_stencil_op(
     state: &mut CanvasGLState,
     face: u32,
     sfail: u32,
@@ -378,7 +392,7 @@ pub fn update_stencil_op(
 }
 
 #[inline]
-pub fn update_stencil_mask(state: &mut CanvasGLState, face: u32, mask: u32) -> bool {
+pub(crate) fn update_stencil_mask(state: &mut CanvasGLState, face: u32, mask: u32) -> bool {
     let same = |k: u32| state.stencil_mask.get(&k) == Some(&mask);
     if face == glow::FRONT_AND_BACK {
         if same(glow::FRONT) && same(glow::BACK) {
@@ -404,7 +418,7 @@ pub fn update_stencil_mask(state: &mut CanvasGLState, face: u32, mask: u32) -> b
 /// `pname` covers every pname the driver accepts; unknown pnames fall
 /// back to "update and issue" every call (same as before).
 #[inline]
-pub fn update_pixel_store_i32(state: &mut CanvasGLState, pname: u32, param: i32) -> bool {
+pub(crate) fn update_pixel_store_i32(state: &mut CanvasGLState, pname: u32, param: i32) -> bool {
     if state.pixel_store_i32.get(&pname) == Some(&param) {
         return false;
     }
@@ -412,7 +426,7 @@ pub fn update_pixel_store_i32(state: &mut CanvasGLState, pname: u32, param: i32)
     true
 }
 
-pub fn update_cull_face(state: &mut CanvasGLState, mode: u32) -> bool {
+pub(crate) fn update_cull_face(state: &mut CanvasGLState, mode: u32) -> bool {
     if state.cull_face == Some(mode) {
         return false;
     }
@@ -420,7 +434,7 @@ pub fn update_cull_face(state: &mut CanvasGLState, mode: u32) -> bool {
     true
 }
 
-pub fn update_front_face(state: &mut CanvasGLState, mode: u32) -> bool {
+pub(crate) fn update_front_face(state: &mut CanvasGLState, mode: u32) -> bool {
     if state.front_face == Some(mode) {
         return false;
     }
@@ -428,7 +442,7 @@ pub fn update_front_face(state: &mut CanvasGLState, mode: u32) -> bool {
     true
 }
 
-pub fn update_line_width(state: &mut CanvasGLState, width: f32) -> bool {
+pub(crate) fn update_line_width(state: &mut CanvasGLState, width: f32) -> bool {
     if state.line_width == Some(width) {
         return false;
     }
@@ -436,28 +450,12 @@ pub fn update_line_width(state: &mut CanvasGLState, width: f32) -> bool {
     true
 }
 
-pub fn update_polygon_offset(state: &mut CanvasGLState, factor: f32, units: f32) -> bool {
+pub(crate) fn update_polygon_offset(state: &mut CanvasGLState, factor: f32, units: f32) -> bool {
     let new = (factor, units);
     if state.polygon_offset == Some(new) {
         return false;
     }
     state.polygon_offset = Some(new);
-    true
-}
-
-pub fn update_unpack_alignment(state: &mut CanvasGLState, alignment: i32) -> bool {
-    if state.unpack_alignment == Some(alignment) {
-        return false;
-    }
-    state.unpack_alignment = Some(alignment);
-    true
-}
-
-pub fn update_pack_alignment(state: &mut CanvasGLState, alignment: i32) -> bool {
-    if state.pack_alignment == Some(alignment) {
-        return false;
-    }
-    state.pack_alignment = Some(alignment);
     true
 }
 
@@ -473,7 +471,7 @@ pub fn update_pack_alignment(state: &mut CanvasGLState, alignment: i32) -> bool 
 const GL_STENCIL_TEST: u32 = 0x0B90;
 
 /// `glEnable(cap)` — returns true if a real call is required.
-pub fn update_enable(state: &mut CanvasGLState, cap: u32) -> bool {
+pub(crate) fn update_enable(state: &mut CanvasGLState, cap: u32) -> bool {
     if state.enabled_caps.contains(&cap) {
         return cap == GL_STENCIL_TEST;
     }
@@ -483,7 +481,7 @@ pub fn update_enable(state: &mut CanvasGLState, cap: u32) -> bool {
 }
 
 /// `glDisable(cap)` — returns true if a real call is required.
-pub fn update_disable(state: &mut CanvasGLState, cap: u32) -> bool {
+pub(crate) fn update_disable(state: &mut CanvasGLState, cap: u32) -> bool {
     if state.disabled_caps.contains(&cap) {
         return cap == GL_STENCIL_TEST;
     }
@@ -502,7 +500,11 @@ pub fn update_disable(state: &mut CanvasGLState, cap: u32) -> bool {
 /// WebGL spec: the same `target` value covers DRAW / READ on WebGL 1
 /// (they're identical), but WebGL 2 separates them.  We shadow per
 /// target key to keep both cases correct.
-pub fn update_bind_framebuffer(state: &mut CanvasGLState, target: u32, fb: Option<u32>) -> bool {
+pub(crate) fn update_bind_framebuffer(
+    state: &mut CanvasGLState,
+    target: u32,
+    fb: Option<u32>,
+) -> bool {
     match state.bound_framebuffer.get(&target) {
         Some(shadow) if *shadow == fb => false,
         _ => {
@@ -532,7 +534,7 @@ pub fn update_bind_framebuffer(state: &mut CanvasGLState, target: u32, fb: Optio
 ///
 /// All three targets, because binding `FRAMEBUFFER` sets the draw *and* read
 /// bindings, and the blit this most often follows clobbered the read target too.
-pub fn record_default_framebuffer_bind(state: &mut CanvasGLState) {
+pub(crate) fn record_default_framebuffer_bind(state: &mut CanvasGLState) {
     for target in [
         glow::FRAMEBUFFER,
         glow::DRAW_FRAMEBUFFER,
@@ -545,7 +547,7 @@ pub fn record_default_framebuffer_bind(state: &mut CanvasGLState) {
 
 /// `glBindRenderbuffer(RENDERBUFFER, rb)` dedup.  Only one target
 /// (`GL_RENDERBUFFER`) exists in GLES; tracked with a single slot.
-pub fn update_bind_renderbuffer(state: &mut CanvasGLState, rb: Option<u32>) -> bool {
+pub(crate) fn update_bind_renderbuffer(state: &mut CanvasGLState, rb: Option<u32>) -> bool {
     match state.bound_renderbuffer {
         Some(shadow) if shadow == rb => false,
         _ => {
@@ -556,7 +558,13 @@ pub fn update_bind_renderbuffer(state: &mut CanvasGLState, rb: Option<u32>) -> b
 }
 
 /// `glColorMask(r, g, b, a)`.
-pub fn update_color_mask(state: &mut CanvasGLState, r: bool, g: bool, b: bool, a: bool) -> bool {
+pub(crate) fn update_color_mask(
+    state: &mut CanvasGLState,
+    r: bool,
+    g: bool,
+    b: bool,
+    a: bool,
+) -> bool {
     let new = (r, g, b, a);
     if state.color_mask == new {
         return false;
@@ -571,7 +579,7 @@ pub fn update_color_mask(state: &mut CanvasGLState, r: bool, g: bool, b: bool, a
 
 /// `glEnableVertexAttribArray(index)`.  Returns `true` when the index
 /// isn't already tracked as enabled.
-pub fn update_enable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
+pub(crate) fn update_enable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
     // Enable state is per-VAO: scope the shadow by the bound VAO so that
     // re-enabling the same index on a different VAO still hits the driver.
     let key = (state.bound_vao.unwrap_or(0), index);
@@ -584,7 +592,7 @@ pub fn update_enable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> boo
 
 /// `glDisableVertexAttribArray(index)`.  Returns `true` when the index
 /// was previously tracked as enabled *for the currently bound VAO*.
-pub fn update_disable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
+pub(crate) fn update_disable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
     let key = (state.bound_vao.unwrap_or(0), index);
     if !state.enabled_vertex_attribs.contains(&key) {
         return false;
@@ -608,7 +616,7 @@ pub fn update_disable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bo
 /// a call just because `(size,type,...)` repeat — ignoring that
 /// the current buffer is different — paints the next draw from the
 /// WRONG vertex stream.  Static review caught this as a P0 bug.
-pub fn update_vertex_attrib_pointer(
+pub(crate) fn update_vertex_attrib_pointer(
     state: &mut CanvasGLState,
     index: u32,
     size: i32,
@@ -643,7 +651,11 @@ pub fn update_vertex_attrib_pointer(
 
 /// `glVertexAttribDivisor(index, divisor)` dedup for WebGL 2 /
 /// instanced_arrays.  A cheap keyed-shadow check.
-pub fn update_vertex_attrib_divisor(state: &mut CanvasGLState, index: u32, divisor: u32) -> bool {
+pub(crate) fn update_vertex_attrib_divisor(
+    state: &mut CanvasGLState,
+    index: u32,
+    divisor: u32,
+) -> bool {
     // Divisor is per-VAO: scope the shadow by the bound VAO.
     let key = (state.bound_vao.unwrap_or(0), index);
     match state.vertex_attrib_divisor.get(&key).copied() {
@@ -657,7 +669,7 @@ pub fn update_vertex_attrib_divisor(state: &mut CanvasGLState, index: u32, divis
 
 /// Test-only helper: construct a fresh state as the baseline for tests.
 #[cfg(test)]
-pub fn fresh_state() -> CanvasGLState {
+pub(crate) fn fresh_state() -> CanvasGLState {
     CanvasGLState::default()
 }
 
@@ -972,14 +984,6 @@ mod tests {
         assert!(update_front_face(&mut s, 0x0900));
         assert!(update_line_width(&mut s, 1.0));
         assert!(update_polygon_offset(&mut s, 0.0, 0.0));
-        assert!(update_unpack_alignment(&mut s, 4));
-        assert!(update_pack_alignment(&mut s, 4));
-    }
-
-    // HashSet imported only so `enabled_caps`/`disabled_caps` don't warn.
-    #[allow(dead_code)]
-    fn _force_use_hashset() -> HashSet<u32> {
-        HashSet::new()
     }
 
     // ---------------------------------------------------------------------

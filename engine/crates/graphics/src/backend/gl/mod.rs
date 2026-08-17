@@ -24,7 +24,7 @@ pub mod image_store;
 pub mod paint;
 pub mod path;
 pub mod state;
-pub mod state_tracker;
+pub(crate) mod state_tracker;
 pub mod surface;
 pub mod text;
 pub mod text_attrs;

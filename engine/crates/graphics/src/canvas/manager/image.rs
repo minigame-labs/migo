@@ -279,12 +279,6 @@ impl ImageRegistry {
         self.store.get(image_id).copied()
     }
 
-    /// Expose the underlying store for code paths (e.g. Skia image
-    /// resolution) that need the full entry plus a `GrDirectContext`.
-    pub fn store(&self) -> &ImageStore {
-        &self.store
-    }
-
     /// Current `SkImage` wrapper cache size.  Snapshotted into
     /// `DebugStats.sk_image_wrappers` so the overlay visualises
     /// per-`GrDirectContext` duplication.
