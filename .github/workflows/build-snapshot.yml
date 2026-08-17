@@ -87,7 +87,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         # No LFS download: the gate validates large objects from pointer oid/size.
       - name: Check snapshot freshness
         run: |
@@ -111,7 +111,7 @@ jobs:
       # must link the android-x86_64 one so the snapshot's external-reference
       # table matches the .so's V8 exactly.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 

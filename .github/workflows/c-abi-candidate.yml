@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Compile C ABI candidate with GCC and Clang
         run: |
@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Compile C ABI candidate for LLP64 and x86 ILP32 with MSVC
         shell: pwsh

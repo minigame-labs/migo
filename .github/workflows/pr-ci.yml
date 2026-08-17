@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -419,7 +419,7 @@ jobs:
 
     steps:
       - name: Checkout (without LFS)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -451,7 +451,7 @@ jobs:
       # blobs, and the V8 archives are fetched from a release asset by the step
       # below -- see .gitattributes for why.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -613,7 +613,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 

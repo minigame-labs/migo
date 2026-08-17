@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         # No LFS download: freshness reads committed pointer oid/size identities.
 
       # Block the release if any committed profile/ABI snapshot identity is
@@ -383,7 +383,7 @@ jobs:
 
     steps:
       - name: Checkout (without LFS)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -416,7 +416,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -457,7 +457,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -723,7 +723,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -806,7 +806,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -889,7 +889,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -987,7 +987,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -1062,7 +1062,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
@@ -1171,7 +1171,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           lfs: false
 
