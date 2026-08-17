@@ -161,6 +161,8 @@ MIGO_STATIC_ASSERT(offsetof(MigoSurfaceReleaseStatus, state) == 16,
 MIGO_BEGIN_DECLS
 
 /*
+ * Attach a native Surface to a Session and publish it for presentation.
+ *
  * The first successful attach fixes the Session's graphics platform identity.
  * Later native-target replacement is supported only within that identity:
  * Android in the same process, X11 on the same server using the Session's
@@ -168,6 +170,54 @@ MIGO_BEGIN_DECLS
  * same ANGLE device. A different
  * backend/display returns MIGO_ERROR_INVALID_STATE synchronously, publishes no
  * attachment, and enqueues no render command; the Session remains retryable.
+ *
+ * out_attachment is cleared to NULL before anything else is validated, so on
+ * every failure it is NULL and a caller can branch on the handle alone.
+ *
+ * Two rejections are deliberately distinct, because they call for different
+ * responses. A value this ABI does not define at all is a caller bug and gives
+ * MIGO_ERROR_INVALID_ARGUMENT. A value this ABI does define but this build
+ * does not implement gives MIGO_ERROR_UNSUPPORTED_CAPABILITY, and the caller's
+ * recovery is to ask for less -- capability bits are requirements, never hints,
+ * so the engine refuses rather than quietly downgrading.
+ *
+ *   MIGO_ERROR_INVALID_ARGUMENT  session, descriptor, or out_attachment was
+ *                                NULL; descriptor's struct_size is smaller
+ *                                than the minimum versioned record; a field is
+ *                                out of range (generation zero, a width or
+ *                                height that is zero or above INT32_MAX, a
+ *                                scale factor that is not finite and positive,
+ *                                a non-zero flags or reserved field); a color
+ *                                space, alpha mode, or presentation mode this
+ *                                ABI does not define; platform_kind is not a
+ *                                defined MIGO_PLATFORM_* value; or the
+ *                                platform payload disagrees with platform_kind
+ *                                or carries a NULL native window
+ *   MIGO_ERROR_UNSUPPORTED_ABI   descriptor.abi_version does not match this
+ *                                engine build, or struct_size claims a record
+ *                                larger than this build knows
+ *   MIGO_ERROR_UNSUPPORTED_CAPABILITY
+ *                                a defined request this build does not
+ *                                implement: MIGO_COLOR_SPACE_DISPLAY_P3 or
+ *                                MIGO_COLOR_SPACE_EXTENDED_SRGB, premultiplied
+ *                                or postmultiplied alpha, mailbox or immediate
+ *                                presentation, or any non-zero capability_flags
+ *   MIGO_ERROR_UNSUPPORTED_PLATFORM
+ *                                platform_kind is defined but not attachable
+ *                                by this build -- the same fact
+ *                                migo_query_capabilities reports through
+ *                                platform_kinds
+ *   MIGO_ERROR_STALE_SURFACE     descriptor.generation is not newer than the
+ *                                newest attach this Session has already
+ *                                accepted
+ *   MIGO_ERROR_INVALID_STATE     the Session is already closed, another
+ *                                Surface transition is running, an attachment
+ *                                is already active, or the descriptor names a
+ *                                different backend/display than the first
+ *                                successful attach fixed
+ *   MIGO_ERROR_INTERNAL          the Session state lock was poisoned, or the
+ *                                host-side lease or dispatch failed; rare, and
+ *                                logged when it happens
  */
 MIGO_API MigoResult MIGO_CALL migo_session_attach_surface(
     MigoSession *session,
