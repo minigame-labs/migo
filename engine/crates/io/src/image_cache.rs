@@ -752,9 +752,22 @@ impl ImageCache {
         }
         let freed = start_size.saturating_sub(self.current_size);
         self.trim_bytes_released += freed as u64;
-        shared::stats::io_metrics_global()
+        // Saturating, not wrapping. This counter is cumulative and its wire
+        // slot is a fixed 4 bytes, and `TrimLevel::Background` retains nothing,
+        // so each trip through the background can charge it the whole budget --
+        // 64 background transitions at the 64 MiB default is enough to wrap it.
+        // A plain `fetch_add` would then report a near-zero total to whoever is
+        // reading it precisely because they are chasing memory pressure. Pinned
+        // at u32::MAX it reads as "at least 4 GiB", which is the honest answer;
+        // widening the field would move a published offset in the stats blob.
+        let freed_u32 = u32::try_from(freed).unwrap_or(u32::MAX);
+        let _ = shared::stats::io_metrics_global()
             .image_cache_trim_bytes
-            .fetch_add(freed as u32, std::sync::atomic::Ordering::Relaxed);
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |total| Some(total.saturating_add(freed_u32)),
+            );
         freed
     }
 
@@ -1017,6 +1030,44 @@ mod tests {
         let before = cache.stats().size_bytes;
         assert_eq!(cache.trim(TrimLevel::RunningModerate), 0);
         assert_eq!(cache.stats().size_bytes, before);
+    }
+
+    /// The cumulative trim counter must saturate, never wrap.
+    ///
+    /// `image_cache_trim_bytes` is a process-wide `AtomicU32` and
+    /// `TrimLevel::Background` retains nothing, so roughly 64 background
+    /// transitions at the 64 MiB default budget are enough to carry it past
+    /// `u32::MAX`. Wrapping there would report a near-zero total to exactly the
+    /// person reading it because they are chasing memory pressure.
+    ///
+    /// The assertion is "never goes backwards" rather than an exact value on
+    /// purpose: the counter is a shared singleton other tests in this binary
+    /// also add to, and monotonicity is the property that distinguishes a
+    /// saturating add from a wrapping one without depending on test ordering.
+    #[test]
+    fn trim_byte_counter_saturates_instead_of_wrapping() {
+        use std::sync::atomic::Ordering;
+        let counter = &shared::stats::io_metrics_global().image_cache_trim_bytes;
+        // Park it just under the ceiling. Nothing in the codebase ever
+        // decrements this counter, so from here any decrease is a wrap.
+        let seed = u32::MAX - 1024;
+        counter.store(seed, Ordering::Relaxed);
+
+        let img_bytes = 32 * 32 * 4; // 4 KiB, comfortably more than the 1 KiB headroom
+        let mut cache = ImageCache::with_limits(16, 8 * img_bytes);
+        cache.insert(
+            full_res_key("/wrap.png".into(), 1),
+            rgba(32, 32),
+            ONE_SESSION,
+        );
+        assert_eq!(cache.trim(TrimLevel::Background), img_bytes);
+
+        let after = counter.load(Ordering::Relaxed);
+        assert!(
+            after >= seed,
+            "cumulative trim counter wrapped: {after} < seed {seed}"
+        );
+        assert_eq!(after, u32::MAX, "should have pinned at the ceiling");
     }
 
     /// Aggressive levels stay absolute: everything unpinned goes, whatever the
