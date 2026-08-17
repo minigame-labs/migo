@@ -25,12 +25,12 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine -> target
           cache-on-failure: true
@@ -477,7 +477,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
@@ -493,7 +493,7 @@ jobs:
       # a reliable uncached build beats a cache that fails every other run.
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
 
       # Pins one NDK for the whole job (see the action for why every NDK env var
       # must point at it, not just ANDROID_NDK_HOME).
@@ -618,7 +618,7 @@ jobs:
           lfs: false
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           # Not the default: this action installs a minimal profile, so clippy has
           # to be asked for. Without it the lint step below fails to find the

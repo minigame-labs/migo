@@ -129,7 +129,7 @@ jobs:
         run: bash scripts/fetch-v8-archives.sh
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           targets: x86_64-linux-android
 
@@ -143,7 +143,7 @@ jobs:
       # change, so a reliable ~15 min cold build beats a fragile cached one.
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
 
       # Pins the same NDK the .so build uses, exported via $GITHUB_ENV for the
       # cross-compile AND emulator steps. See the action for why every NDK env
@@ -185,7 +185,7 @@ jobs:
       # `set -o pipefail` is even illegal in dash). Each line is a self-contained
       # command with literal paths. The action stops on the first failing line.
       - name: Generate snapshot on x86_64 emulator
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 29
           arch: x86_64

@@ -53,7 +53,7 @@ jobs:
         run: ./scripts/test-c-abi-msvc-lane.ps1 -RepoRoot $PWD.Path
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           targets: i686-pc-windows-msvc
 
