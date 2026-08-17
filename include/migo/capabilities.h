@@ -53,6 +53,11 @@ MIGO_STATIC_ASSERT(offsetof(MigoCapabilities, platform_kinds) == 16, "platform_k
  * written at all, so a failed query cannot be mistaken for a successful one
  * that reported nothing.
  *
+ * The only failure is MIGO_ERROR_INVALID_ARGUMENT: out was NULL, or its
+ * struct_size is smaller than the minimum record this ABI defines. Note that
+ * MIGO_ERROR_UNSUPPORTED_ABI is deliberately absent -- it is the rejection this
+ * entry point exists to avoid.
+ *
  * The reported platform_kinds is the same fact migo_session_attach_surface
  * enforces, not a second copy of it.
  */
