@@ -197,6 +197,21 @@ jobs:
       # Read from the compiled classes rather than scraped from sources: a rule
       # for what "looks public" misses things, and what it misses is what
       # changes unnoticed.
+      # quality-gate runs ./gradlew twice (this step and the merged-manifest
+      # permission contract) but cached nothing, so every run re-downloaded the
+      # wrapper distribution from services.gradle.org. That is a network round
+      # trip a contract gate does not need, and it fails the job outright when
+      # the download is reset mid-flight -- which it has been. Same cache the
+      # Android build job already uses.
+      - name: Gradle cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('platforms/android/**/*.gradle*') }}
+          restore-keys: gradle-
+
       - name: Android host API v0 contract
         run: |
           (cd platforms/android && ./gradlew --no-daemon :library:compileFullDebugJavaWithJavac)
