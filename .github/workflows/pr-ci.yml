@@ -637,6 +637,17 @@ jobs:
       # The last three are needed at link time even though the finished binaries do
       # not end up depending on them: `-l` has to resolve before `--as-needed` can
       # drop it.
+      # This job compiles Skia from source, which fetches a large tarball from
+      # codeload.github.com on every run. Uncached that is both the slowest step
+      # here and a recurring flake: a 429 from that host failed this job outright
+      # on an unrelated PR. quality-gate and build already cache the same
+      # workspace; this job was the one longest-pole job left without it.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: engine -> target
+          cache-on-failure: true
+
       - name: Install the engine's host build dependencies
         run: |
           sudo apt-get update -qq
