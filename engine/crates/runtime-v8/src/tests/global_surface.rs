@@ -16,7 +16,7 @@
 mod global_surface_tests {
     use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool};
 
-    use deno_core::{FastString, JsRuntime, RuntimeOptions};
+    use deno_core::{FastString, JsRuntime, RuntimeOptions, v8};
     use shared::{
         channel::ThreadWakeup,
         device::gpu_caps::GpuCaps,
@@ -81,6 +81,104 @@ mod global_surface_tests {
         );
         rt.execute_script("<test:assert>", FastString::from(wrapped))
             .expect("assertion script");
+    }
+
+    /// Every name this build publishes to content, pinned against a committed
+    /// baseline.
+    ///
+    /// The C ABI has `scripts/test-c-abi-surface-candidate.sh` and the Android
+    /// host API has `platforms/android/host-api-v0.txt`; this is the same gate
+    /// for the third external binding, and the one games actually consume. The
+    /// tests around it check named things -- these six core APIs exist, `Deno`
+    /// does not -- which is a rule about the names someone thought to list. The
+    /// `Deno` leak survived exactly that: the exclusion list was correct for the
+    /// names on it. A whole-surface baseline has no list to be incomplete.
+    ///
+    /// **What this pins is the source-booted surface.** A shipped session boots
+    /// from the V8 startup snapshot instead, and the two differ: snapshot boot
+    /// does not publish `migo.Temporal` or `migo.Float16Array`, because `migo` is
+    /// built by mirroring globalThis during bootstrap and is therefore frozen at
+    /// snapshot-generation time. Pinning source boot is deliberate -- it needs no
+    /// device, no GL and no CI plumbing, and it still catches every API added,
+    /// removed or renamed, and every internal newly leaked onto either object.
+    /// It is not a substitute for checking the shipped surface; see
+    /// `scripts/dump-api-surface.sh`, which runs the real player.
+    ///
+    /// To change the surface on purpose:
+    ///   MIGO_UPDATE_SURFACE_BASELINE=1 cargo test -p migo-runtime-v8 --lib published_surface
+    /// and commit the regenerated baseline with the change.
+    #[test]
+    fn published_surface_matches_the_committed_baseline() {
+        const BASELINE: &str = include_str!("published_surface_v0.txt");
+
+        let mut rt = boot_runtime();
+        let src = "JSON.stringify({g:Object.getOwnPropertyNames(globalThis).sort(), \
+                    m:(typeof migo==='object'&&migo)?Object.getOwnPropertyNames(migo).sort():[]})";
+        let dumped = rt
+            .execute_script("<test:surface>", FastString::from(src.to_string()))
+            .expect("surface dump script");
+        let json = {
+            let main_context = rt.main_context();
+            let isolate = rt.v8_isolate();
+            v8::scope_with_context!(scope, isolate, &main_context);
+            let local = v8::Local::new(scope, dumped);
+            local.to_rust_string_lossy(scope)
+        };
+
+        // Deliberately not serde: this file is a list of names, and a hand-rolled
+        // split keeps the gate readable without a dependency on how the dump is
+        // shaped.
+        let names = |key: &str| -> Vec<String> {
+            let head = format!("\"{key}\":[");
+            let rest = &json[json.find(&head).expect("dump key") + head.len()..];
+            let body = &rest[..rest.find(']').expect("dump array end")];
+            body.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim_matches('"').to_string())
+                .collect()
+        };
+        let mut actual = vec!["[globalThis]".to_string()];
+        actual.extend(names("g"));
+        actual.push("[migo]".to_string());
+        actual.extend(names("m"));
+
+        if std::env::var("MIGO_UPDATE_SURFACE_BASELINE").is_ok() {
+            let header: Vec<&str> = BASELINE
+                .lines()
+                .take_while(|l| l.starts_with('#'))
+                .collect();
+            let body = format!("{}\n{}\n", header.join("\n"), actual.join("\n"));
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/tests/published_surface_v0.txt"
+                ),
+                body,
+            )
+            .expect("rewrite baseline");
+            return;
+        }
+
+        let expected: Vec<&str> = BASELINE
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect();
+        let actual_ref: Vec<&str> = actual.iter().map(String::as_str).collect();
+        if actual_ref != expected {
+            let added: Vec<&&str> = actual_ref
+                .iter()
+                .filter(|n| !expected.contains(n))
+                .collect();
+            let removed: Vec<&&str> = expected
+                .iter()
+                .filter(|n| !actual_ref.contains(n))
+                .collect();
+            panic!(
+                "published JS surface changed.\n  added:   {added:?}\n  removed: {removed:?}\n\
+                 If this is intended, regenerate with \
+                 MIGO_UPDATE_SURFACE_BASELINE=1 and commit the diff."
+            );
+        }
     }
 
     /// A security audit dumps own property names of the global. After P0
