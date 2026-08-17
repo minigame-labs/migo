@@ -96,6 +96,35 @@ typedef uint32_t MigoLifecycleState;
 
 MIGO_BEGIN_DECLS
 
+/*
+ * Results common to the entry points below, stated once so each function's own
+ * notes can be about what is specific to it.
+ *
+ * A NULL MigoSession * or MigoEngine * is always MIGO_ERROR_INVALID_ARGUMENT.
+ * A non-NULL MigoSession * naming a Session that has already been destroyed is
+ * always MIGO_ERROR_INVALID_STATE. The two are distinguished because they call
+ * for different fixes -- the first is a bug at the call site, the second is a
+ * lifetime the host has already ended.
+ *
+ * MIGO_ERROR_INVALID_STATE otherwise means whatever the individual function
+ * documents; it is not one condition. migo_engine_destroy returns it for an
+ * Engine that still owns live Sessions, for instance, which says nothing about
+ * the handle itself.
+ *
+ * Every call taking a versioned record -- one beginning with struct_size and
+ * abi_version -- validates it the same way too: NULL, or a struct_size smaller
+ * than the minimum record this ABI defines, is MIGO_ERROR_INVALID_ARGUMENT; an
+ * abi_version this build does not implement, or a struct_size claiming a record
+ * larger than this build knows, is MIGO_ERROR_UNSUPPORTED_ABI. A rejected
+ * record is never partially applied: validation finishes before any field of it
+ * reaches engine state.
+ *
+ * MIGO_ERROR_INTERNAL means an invariant inside the engine failed rather than
+ * anything about the call: a lock left poisoned by an earlier panic, or a
+ * host-side dispatch that did not complete. It is always logged, and it is not
+ * a retry the caller can reason about.
+ */
+
 typedef void(MIGO_CALL *MigoTaskFn)(void *task_context);
 
 /*
@@ -402,7 +431,10 @@ migo_session_set_focus(MigoSession *session, uint8_t focused);
  * callback argument on Android. Calling this without having been asked is
  * harmless but pointless: the engine renders at most one frame per request.
  *
- * Returns MIGO_ERROR_INVALID_STATE when no surface is attached.
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached, and
+ * MIGO_ERROR_INVALID_ARGUMENT when frame_time_nanos is negative. The timestamp
+ * is signed to match the platform callbacks it comes from, not because time
+ * before the clock's zero is meaningful.
  */
 MIGO_API MigoResult MIGO_CALL
 migo_session_notify_vsync(MigoSession *session, int64_t frame_time_nanos);
