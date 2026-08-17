@@ -75,12 +75,19 @@ async function _startRafLoop() {
 // on resume when idle). Mirrors browser engines kicking their compositor/RAF
 // scheduler on visibility changes. Exposed as a global so Host::enter_foreground
 // can call it once the render thread has a valid surface again.
-globalThis.__migo_restart_raf_loop = function () {
-    if (!__rafLoopRunning && Object.keys(__raf_callbacks).length > 0) {
-        __rafLoopRunning = true;
-        _startRafLoop();
-    }
-};
+Object.defineProperty(globalThis, "__migo_restart_raf_loop", {
+    // Non-enumerable for the same reason as the frame-end hooks: the host
+    // reaches this by name, content should not meet it while enumerating.
+    value: function () {
+        if (!__rafLoopRunning && Object.keys(__raf_callbacks).length > 0) {
+            __rafLoopRunning = true;
+            _startRafLoop();
+        }
+    },
+    enumerable: false,
+    writable: true,
+    configurable: true,
+});
 
 const setPreferredFramesPerSecond = (fps) => {
     op_set_preferred_fps(Math.max(1, Math.min(120, fps | 0)));

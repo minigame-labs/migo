@@ -1357,13 +1357,30 @@ if (!globalThis._force_readback) {
 // interleaved FramePacket from both Canvas2D and GL segments, with
 // Materialize barriers at 2D->GL transitions.
 if (!globalThis.__migo_frame_end_hooks) {
-    globalThis.__migo_frame_end_hooks = [];
-    globalThis.__migo_frame_end_all = () => {
-        const hooks = globalThis.__migo_frame_end_hooks;
-        for (let i = 0; i < hooks.length; i++) {
-            hooks[i]();
-        }
-    };
+    // Non-enumerable, like `_perf` in 99_main.js and `_force_readback`: these
+    // are engine internals the host bridge reaches by name, not published API,
+    // so content walking `Object.keys(globalThis)` or `for...in` should not
+    // find them. They stay writable and configurable -- the array is pushed
+    // into below, and 03_raf.js assigns its own hook the same way -- so this
+    // changes what content *enumerates*, not what it could reach if it looked
+    // them up directly by name.
+    Object.defineProperty(globalThis, "__migo_frame_end_hooks", {
+        value: [],
+        enumerable: false,
+        writable: true,
+        configurable: true,
+    });
+    Object.defineProperty(globalThis, "__migo_frame_end_all", {
+        value: () => {
+            const hooks = globalThis.__migo_frame_end_hooks;
+            for (let i = 0; i < hooks.length; i++) {
+                hooks[i]();
+            }
+        },
+        enumerable: false,
+        writable: true,
+        configurable: true,
+    });
 }
 globalThis.__migo_frame_end_hooks.push(() => {
     // Flush any pending GL stream BEFORE building the frame packet so that
