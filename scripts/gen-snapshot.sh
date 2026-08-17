@@ -29,11 +29,14 @@
 #   --keep            leave the pushed binary/lib on the device afterwards
 #                     (--os android only).
 #
-# --os ohos and --os windows are not implemented here yet: ohos needs an
-# hdc-reachable device/emulator bridge and windows has no V8 archive until
-# Task 2 seals one (see docs/superpowers/specs/2026-08-12-release-artifact-
-# standard-design.md). Both fail closed with a clear message rather than
-# half-working.
+# --os ohos and --os windows are not implemented here. Both now have a committed
+# V8 archive under engine/third_party/rusty_v8/, so what is missing is a way to
+# *run* the generator on them: a snapshot is platform-bound, so it has to be
+# produced by the same platform's V8 -- OpenHarmony would need an hdc-reachable
+# device or emulator, and Windows would need the generator run on a Windows host.
+# Until then those targets ship no snapshot and build.rs falls back to loading
+# extension JS from source, which is correct but a slower cold start. Both fail
+# closed with a clear message rather than half-working.
 #
 # Environment:
 #   ANDROID_NDK_HOME  an NDK to prefer; checked against the pin like any other

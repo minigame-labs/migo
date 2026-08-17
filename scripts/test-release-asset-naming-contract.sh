@@ -14,7 +14,7 @@
 # the real one with no way for a consumer to tell them apart. A stale name now fails
 # here instead of being uploaded.
 #
-# The scheme (spec: docs/superpowers/specs/2026-08-12-release-artifact-standard-design.md):
+# The scheme:
 #
 #   migo-<version>-android.aar                       Java/Kotlin -- `.aar` already says
 #                                                    "Android", so no api segment, and

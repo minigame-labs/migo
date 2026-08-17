@@ -80,8 +80,7 @@ Android and Linux, rather than hand-tarred.
 ### Added
 - `migo-<version>-android.aar` — the single Java/Kotlin AAR (universal, both
   ABIs); the slim and arm64-only AAR variants are no longer published (a
-  consumer's own `abiFilters`/App Bundle already owns that choice — see
-  `docs/superpowers/specs/2026-08-12-release-artifact-standard-design.md`)
+  consumer's own `abiFilters`/App Bundle already owns that choice)
 - `migo-<version>-capi-<platform>-<arch>.tar.gz` for `android`, `linux`,
   `windows`, and `ohos`, each with a package manifest and reproducible
   packaging (`scripts/package-sdk.sh`)
