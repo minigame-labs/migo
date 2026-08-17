@@ -284,12 +284,32 @@ SO_BUILD="$ENGINE_DIR/target/$TARGET/release/libmigo.so.$VERSION"
 # choice rather than relying on undocumented driver heuristics.
 SYSROOT_LIB_DIR="$MIGO_SYSROOT/usr/lib/$MIGO_SYSROOT_LIB_TRIPLET"
 
+# --strip-all: this library is linked here by hand rather than by cargo, so the
+# `strip = "symbols"` that [profile.release] asks for never reached it. The
+# Android library is built through `cargo ndk` and does get stripped, so the two
+# platforms shipped differently -- an omission of this link step, not a decision
+# taken about Linux. Measured on the 0.9.1 x86_64 package: 79.5MB -> 57.6MB, and
+# the 22MB is .strtab (16.4MB) plus .symtab (3.2MB) plus leftover .debug_*.
+#
+# Nothing reads any of it. Every consumer of this file goes through the dynamic
+# tables -- abi-floor-audit.py's floor/exports/needed and the package contract's
+# SONAME check all run objdump -T or -p -- or through raw bytes, as the
+# snapshot-embedding contract does when it searches .rodata for the blob. A
+# shared object keeps .dynsym/.dynstr through a strip, and the version script
+# below still decides what is exported: `objdump -T` output is byte-identical
+# before and after, all 24 migo_* exports included.
+#
+# Left to the linker rather than a separate strip pass because the aarch64
+# package is cross-linked on an x86_64 release runner. A host binutils `strip`
+# cannot read that output, llvm-strip is not guaranteed to be installed there,
+# and this script already requires lld -- which can, on both targets.
 # shellcheck disable=SC2086  # NATIVE_LIBS is a flag list and must word-split
 "$CXX" --target="$MIGO_SYSROOT_LIB_TRIPLET" --ld-path="$LLD_BIN" -shared -o "$SO_BUILD" \
     -Wl,--version-script="$SO_MAP" \
     -Wl,-soname,libmigo.so.1 \
     -Wl,--no-undefined \
     -Wl,--gc-sections \
+    -Wl,--strip-all \
     "${UNDEF_ARGS[@]}" \
     "$ENGINE_DIR/target/$TARGET/release/libmigo_capi.a" \
     $NATIVE_LIBS \
