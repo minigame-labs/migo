@@ -1076,7 +1076,7 @@ jobs:
       # contents, instead of in a pattern list that has to be kept in step with the
       # jobs.
       - name: Collect every platform's staged assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-assets-*
           merge-multiple: true
