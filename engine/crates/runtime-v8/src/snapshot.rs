@@ -51,16 +51,40 @@ use crate::{payment, share};
 ///
 /// Snapshots are produced by `migo-snapshot-gen` (cross-compiled to a target
 /// ABI and run on that ABI's emulator/device) and stored per product/arch under
-/// `snapshots/SNAPSHOT-<profile>-<arch>.bin`. V8 startup snapshots are **platform-bound**
-/// (OS + CPU arch): an android-<arch> snapshot only loads in that exact
-/// android-<arch> V8, so `build.rs` embeds the file matching
-/// `CARGO_CFG_TARGET_ARCH` and ONLY for android targets. Host builds
-/// (`cargo test`, dev) never embed and fall back to loading extension JS from
-/// source.
+/// `snapshots/SNAPSHOT-<profile>-<os>-<arch>.bin`. V8 startup snapshots are
+/// **platform-bound** (OS + CPU arch): an android-aarch64 snapshot only loads
+/// in that exact android-aarch64 V8, so `build.rs` embeds the file matching the
+/// target's OS *and* arch.
 ///
-/// When the matching snapshot exists, `build.rs` sets the `migo_has_snapshot`
-/// cfg + `MIGO_SNAPSHOT_PATH` and we embed it via `include_bytes!`; otherwise
-/// `SNAPSHOT_BYTES` is `None` (from-source fallback, slower cold start).
+/// When that file exists **and validates**, `build.rs` sets the
+/// `migo_has_snapshot` cfg + `MIGO_SNAPSHOT_PATH` and we embed it via
+/// `include_bytes!`; otherwise `SNAPSHOT_BYTES` is `None` (from-source
+/// fallback, slower cold start).
+///
+/// Two consequences of "and validates" that are easy to get wrong:
+///
+/// * **Host builds are not excluded.** `build.rs` handles linux-gnu, ohos and
+///   windows-msvc alongside android, so a host `cargo test` *does* embed the
+///   linux snapshot -- but only when `third_party/rusty_v8/<triple>/librusty_v8.a`
+///   is present, because validation hashes it. That archive is untracked, so a
+///   bare CI checkout has no snapshot and every test boots from source, while a
+///   developer machine set up to run the player boots from the snapshot. The
+///   same suite therefore exercises different code on the two.
+///
+/// * **Editing this crate turns the snapshot off.** Validation also hashes every
+///   `*.rs` and `*.js` under `runtime-v8`, so any edit here -- test code
+///   included -- drops `migo_has_snapshot` until the snapshot is regenerated on
+///   a device. A test that only runs "when a snapshot is embedded" silently
+///   stops running the moment you touch this crate.
+///
+/// A process must not mix the two boot modes. Creating a snapshot-booted
+/// runtime (`HostJsRuntime`) concurrently with a source-booted bare `JsRuntime`
+/// aborts with SIGILL during process teardown, after every test has already
+/// reported success. `cargo test -p migo-runtime-v8 --lib tests::v8_limits`
+/// reproduces it on a machine that has the host V8 archive; either submodule
+/// alone passes, and `--test-threads=1` passes. Production never mixes -- a
+/// session's runtimes all come from the same build -- so this constrains test
+/// layout, not the engine.
 #[cfg(migo_has_snapshot)]
 pub static SNAPSHOT_BYTES: Option<&'static [u8]> = Some(include_bytes!(env!("MIGO_SNAPSHOT_PATH")));
 
