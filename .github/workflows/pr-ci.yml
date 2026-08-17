@@ -424,12 +424,22 @@ jobs:
           lfs: false
 
       - name: Install Qt/X11 Host Kit dependencies
+        # Bounded and retried like the other apt steps. This is the list most
+        # exposed to a slow mirror -- it is the largest, and this job's ceiling
+        # is 15 minutes, so an unbounded install can spend the entire budget
+        # before the contract it exists to run has started.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build g++ ripgrep xvfb xauth \
-            qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
-            libx11-dev libxkbcommon-x11-dev libxcb-cursor0
+          install_deps() {
+            timeout 90 sudo apt-get update || return 1
+            timeout 300 sudo apt-get install -y \
+              cmake ninja-build g++ ripgrep xvfb xauth \
+              qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
+              libx11-dev libxkbcommon-x11-dev libxcb-cursor0 || return 1
+          }
+          install_deps || {
+            echo "Qt/X11 dependency install stalled or failed; retrying once" >&2
+            install_deps
+          }
 
       # --sanitize reruns the same binaries under ASan/UBSan. Enforced here
       # rather than left to a developer's machine: the input tests count
@@ -649,13 +659,27 @@ jobs:
           cache-on-failure: true
 
       - name: Install the engine's host build dependencies
+        # Bounded and retried for the reason the ILP32 lane already is: a
+        # stalled mirror hung this exact step for 90 minutes, producing no
+        # output at all because -qq suppresses progress, until the job's
+        # ceiling cancelled it. Read from the outside that is "the tests hung",
+        # which is the wrong place to look. One slow mirror should cost a
+        # bounded retry, not the whole budget -- and the budget here has to
+        # stay large for a cold cache that rebuilds Skia from source, so it
+        # cannot double as the guard against a hung apt.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            ninja-build \
-            libgl-dev libegl-dev libgles-dev \
-            libfontconfig1-dev libfreetype-dev \
-            libasound2-dev
+          install_deps() {
+            timeout 90 sudo apt-get update -qq || return 1
+            timeout 300 sudo apt-get install -y -qq \
+              ninja-build \
+              libgl-dev libegl-dev libgles-dev \
+              libfontconfig1-dev libfreetype-dev \
+              libasound2-dev || return 1
+          }
+          install_deps || {
+            echo "host build dependency install stalled or failed; retrying once" >&2
+            install_deps
+          }
 
       # These five crates' clippy ran in no job at all until now, for the same
       # reason their tests did not: quality-gate installs no system packages and
