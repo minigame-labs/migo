@@ -289,7 +289,7 @@ jobs:
       # the pre-existing backlog. Mirrors pr-ci.yml so the tag gate matches PR CI.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets
 
       # `--tests` mirrors pr-ci.yml: `--lib` skipped the frame-boundary allocation
       # gate (shared/tests/frame_cycle_allocation.rs) and both snapshot round-trips,
@@ -421,7 +421,7 @@ jobs:
 
       - name: Run clippy lints (crates needing host system packages)
         working-directory: engine
-        run: cargo clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio --all-targets
 
       - name: Run Rust tests (graphics, core, capi, platform, audio)
         working-directory: engine

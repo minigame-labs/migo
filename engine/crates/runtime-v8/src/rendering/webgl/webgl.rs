@@ -169,21 +169,26 @@ mod tests {
     fn recv_gl_commands(
         render_rx: &crossbeam_channel::Receiver<RenderCommand>,
     ) -> shared::command_vec_pool::PooledVec<GLCmd> {
-        loop {
-            match render_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("expected flushed WebGL frame packet")
-            {
-                RenderCommand::FramePacket(packet) => {
-                    for op in packet.into_ops() {
-                        if let FrameOp::GlBatch(payload) = op {
-                            return payload.commands;
-                        }
+        // Not a loop: every arm below either returns or panics, so the first
+        // packet decides the outcome. It was written as `loop { .. }`, which
+        // read as "keep receiving until a GL batch turns up" -- a retry this
+        // helper never performed, because a packet carrying no GL batch panics
+        // rather than waiting for the next one. That is the right behaviour for
+        // a test that asserts the flush produced a batch; the loop was the part
+        // that lied.
+        match render_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expected flushed WebGL frame packet")
+        {
+            RenderCommand::FramePacket(packet) => {
+                for op in packet.into_ops() {
+                    if let FrameOp::GlBatch(payload) = op {
+                        return payload.commands;
                     }
-                    panic!("flushed frame packet did not contain a GL batch");
                 }
-                other => panic!("unexpected render command before GL batch: {other:?}"),
+                panic!("flushed frame packet did not contain a GL batch");
             }
+            other => panic!("unexpected render command before GL batch: {other:?}"),
         }
     }
 
