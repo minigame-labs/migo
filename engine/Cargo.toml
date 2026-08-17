@@ -79,7 +79,19 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 #   Features:
 #     gl + egl        OpenGL ES + EGL context (required on Android)
 #     textlayout      SkParagraph / SkShaper / HarfBuzz / ICU (browser-grade text)
-#     binary-cache    download prebuilt skia for host builds (fast dev loop)
+#     binary-cache    would download prebuilt skia instead of compiling it, but
+#                     never does for this feature set: rust-skia publishes no
+#                     binary built with `embed-freetype`. Of the 13 prebuilt
+#                     x86_64-unknown-linux-gnu archives in skia-binaries 0.93.1,
+#                     zero carry the `ftembed` tag this combination asks for, so
+#                     the lookup 404s and skia-bindings falls back to building
+#                     from source -- every clean build, on CI and on a laptop.
+#                     That is where host-engine-tests spends most of its ~50
+#                     minutes, and it is why that job now caches its workspace.
+#                     Kept enabled so the day a matching binary is published it
+#                     starts being used; dropping `embed-freetype` to reach an
+#                     existing archive would change what ships, not just how it
+#                     is built.
 #     embed-icudtl    bundle icudtl.dat (~10 MiB) into the binary
 #     embed-freetype  bundle FreeType inside libmigo.so
 #
