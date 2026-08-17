@@ -915,15 +915,8 @@ pub unsafe extern "C" fn migo_session_set_focus(
     })
 }
 
-// ---- Surface ----------------------------------------------------------------
+// ---- Development logging ----------------------------------------------------
 
-/// # Safety
-
-/// Install a log subscriber when `MIGO_CAPI_LOG` is set.
-///
-/// A library has no business hijacking the process's global logger, so this is
-/// opt-in and off by default. Hosts receive operational errors through
-/// `on_error`; this switch exists only for additional engine diagnostics.
 /// The level `MIGO_CAPI_LOG` asks for, if a host set it.
 ///
 /// Read in one place because it has two consumers that have to agree: the
@@ -942,6 +935,11 @@ fn dev_log_level() -> Option<shared::config::LogLevel> {
     })
 }
 
+/// Install a log subscriber when `MIGO_CAPI_LOG` is set.
+///
+/// A library has no business hijacking the process's global logger, so this is
+/// opt-in and off by default. Hosts receive operational errors through
+/// `on_error`; this switch exists only for additional engine diagnostics.
 fn init_dev_logging() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
