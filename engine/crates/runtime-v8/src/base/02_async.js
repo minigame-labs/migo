@@ -46,6 +46,25 @@ function allocateHostCallbackId() {
 // caller awaiting the promise asked about the *operation*, not about its own
 // callback. Reported rather than swallowed, matching the `ready` callback in
 // 16_jssdk.js, so a throwing callback stays debuggable instead of vanishing.
+// The message of something that was thrown, when there is no guarantee it is
+// an Error.
+//
+// `(e.message || String(e))` reads as if it already handles that, and does not:
+// a thrown `undefined` makes the property read itself throw, so the handler
+// meant to report the failure becomes a second, worse one. That is not
+// hypothetical -- a failing `#[op2(fast)]` returning AudioError arrives here as
+// literal `undefined`, which is how `setInnerAudioOption` came to throw a
+// TypeError out of itself on any platform without audio services, running
+// neither `fail` nor `complete`.
+//
+// Deliberately not `errorToString`: that one prepends the name and appends the
+// stack, and these strings are content-visible `errMsg` values.
+function errorMessage(err) {
+    if (err == null) return String(err);
+    var m = err.message;
+    return (typeof m === 'string' && m) ? m : String(err);
+}
+
 function invokeCallback(apiName, kind, cb, res) {
     if (typeof cb !== 'function') return;
     try {
@@ -90,14 +109,14 @@ function wrapAsync(apiName, fn, options) {
                         console.warn('[MigoPerf][Async] ' + apiName + ' (fail): ' + totalElapsed.toFixed(0) + 'ms');
                     }
                 }
-                const res = { errMsg: apiName + ':fail ' + (e.message || String(e)) };
+                const res = { errMsg: apiName + ':fail ' + errorMessage(e) };
                 invokeCallback(apiName, 'fail', fail, res);
                 invokeCallback(apiName, 'complete', complete, res);
                 throw res;
             }
         );
     } catch (e) {
-        const res = { errMsg: apiName + ':fail ' + (e.message || String(e)) };
+        const res = { errMsg: apiName + ':fail ' + errorMessage(e) };
         queueMicrotask(function () { invokeCallback(apiName, 'fail', fail, res); });
         queueMicrotask(function () { invokeCallback(apiName, 'complete', complete, res); });
         return Promise.reject(res);
@@ -419,4 +438,5 @@ export {
     // second local implementation of "run these without letting one stop the
     // rest" is a second answer to that.
     invokeCallback,
+    errorMessage,
 };
