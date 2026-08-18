@@ -15,7 +15,7 @@ import {
   op_audio_set_inner_audio_option,
   op_audio_get_available_audio_sources,
 } from "ext:core/ops";
-import { allocateHostCallbackId, createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { allocateHostCallbackId, createListenerGroup, invokeCallback } from "ext:host_v8_base/02_async.js";
 
 // ID counter for InnerAudioContext instances
 
@@ -485,13 +485,13 @@ function setInnerAudioOption(options = {}) {
   try {
     op_audio_set_inner_audio_option(mixWithOther, obeyMuteSwitch, speakerOn);
     const res = { errMsg: 'setInnerAudioOption:ok' };
-    if (success) success(res);
-    if (complete) complete(res);
+    invokeCallback('setInnerAudioOption', 'success', success, res);
+    invokeCallback('setInnerAudioOption', 'complete', complete, res);
     return Promise.resolve(res);
   } catch (err) {
     const res = { errMsg: 'setInnerAudioOption:fail ' + (err.message || String(err)) };
-    if (fail) fail(res);
-    if (complete) complete(res);
+    invokeCallback('setInnerAudioOption', 'fail', fail, res);
+    invokeCallback('setInnerAudioOption', 'complete', complete, res);
     return Promise.reject(res);
   }
 }
@@ -502,13 +502,13 @@ function getAvailableAudioSources(options = {}) {
   try {
     const sources = op_audio_get_available_audio_sources();
     const res = { errMsg: 'getAvailableAudioSources:ok', audioSources: sources };
-    if (success) success(res);
-    if (complete) complete(res);
+    invokeCallback('getAvailableAudioSources', 'success', success, res);
+    invokeCallback('getAvailableAudioSources', 'complete', complete, res);
     return Promise.resolve(res);
   } catch (err) {
     const res = { errMsg: 'getAvailableAudioSources:fail ' + (err.message || String(err)) };
-    if (fail) fail(res);
-    if (complete) complete(res);
+    invokeCallback('getAvailableAudioSources', 'fail', fail, res);
+    invokeCallback('getAvailableAudioSources', 'complete', complete, res);
     return Promise.reject(res);
   }
 }

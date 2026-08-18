@@ -18,6 +18,7 @@ import { wrapAsync } from "ext:host_v8_base/02_async.js";
 import {
     allocateHostCallbackId,
     parseHostCallbackId,
+    invokeCallback,
 } from "ext:host_v8_base/02_async.js";
 
 const noop = function () {};
@@ -84,13 +85,13 @@ function _settleMidas(requestId, result) {
     if (result.error) {
         var res = { errMsg: result.error };
         if (result.errCode !== undefined) res.errCode = result.errCode;
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('requestMidasPayment', 'fail', pending.fail, res);
+        invokeCallback('requestMidasPayment', 'complete', pending.complete, res);
         pending.reject(res);
     } else {
         var res = { errMsg: 'requestMidasPayment:ok' };
-        pending.success(res);
-        pending.complete(res);
+        invokeCallback('requestMidasPayment', 'success', pending.success, res);
+        invokeCallback('requestMidasPayment', 'complete', pending.complete, res);
         pending.resolve(res);
     }
 }
@@ -150,13 +151,13 @@ function _settleMidasGameItem(requestId, result) {
     if (result.error) {
         var res = { errMsg: result.error };
         if (result.errCode !== undefined) res.errCode = result.errCode;
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('requestMidasPaymentGameItem', 'fail', pending.fail, res);
+        invokeCallback('requestMidasPaymentGameItem', 'complete', pending.complete, res);
         pending.reject(res);
     } else {
         var res = { errMsg: 'requestMidasPaymentGameItem:ok' };
-        pending.success(res);
-        pending.complete(res);
+        invokeCallback('requestMidasPaymentGameItem', 'success', pending.success, res);
+        invokeCallback('requestMidasPaymentGameItem', 'complete', pending.complete, res);
         pending.resolve(res);
     }
 }

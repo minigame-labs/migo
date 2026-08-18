@@ -7,6 +7,7 @@ import {
 import {
     allocateHostCallbackId,
     parseHostCallbackId,
+    invokeCallback,
 } from "ext:host_v8_base/02_async.js";
 
 const noop = () => {};
@@ -184,15 +185,15 @@ function _internalOnLoginResult(resultJson) {
         if (result.errno !== undefined) {
             res.errno = result.errno;
         }
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('login', 'fail', pending.fail, res);
+        invokeCallback('login', 'complete', pending.complete, res);
         return;
     }
 
     if (typeof result.code !== "string" || result.code.length === 0) {
         const res = { errMsg: "login:fail invalid code" };
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('login', 'fail', pending.fail, res);
+        invokeCallback('login', 'complete', pending.complete, res);
         return;
     }
 
@@ -200,8 +201,8 @@ function _internalOnLoginResult(resultJson) {
         errMsg: "login:ok",
         code: result.code,
     };
-    pending.success(res);
-    pending.complete(res);
+    invokeCallback('login', 'success', pending.success, res);
+    invokeCallback('login', 'complete', pending.complete, res);
 }
 
 function _internalOnCheckSessionResult(resultJson) {
@@ -222,15 +223,15 @@ function _internalOnCheckSessionResult(resultJson) {
         if (result.errno !== undefined) {
             res.errno = result.errno;
         }
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('checkSession', 'fail', pending.fail, res);
+        invokeCallback('checkSession', 'complete', pending.complete, res);
         pending.reject(res);
         return;
     }
 
     const res = { errMsg: "checkSession:ok" };
-    pending.success(res);
-    pending.complete(res);
+    invokeCallback('checkSession', 'success', pending.success, res);
+    invokeCallback('checkSession', 'complete', pending.complete, res);
     pending.resolve(res);
 }
 
@@ -249,15 +250,15 @@ function _internalOnGetUserInfoResult(resultJson) {
 
     if (typeof result.error === "string" && result.error.length > 0) {
         const res = { errMsg: _toErrMsg("getUserInfo", result.error) };
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('getUserInfo', 'fail', pending.fail, res);
+        invokeCallback('getUserInfo', 'complete', pending.complete, res);
         return;
     }
 
     if (!result.userInfo || typeof result.userInfo !== "object") {
         const res = { errMsg: "getUserInfo:fail invalid userInfo" };
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('getUserInfo', 'fail', pending.fail, res);
+        invokeCallback('getUserInfo', 'complete', pending.complete, res);
         return;
     }
 
@@ -282,8 +283,8 @@ function _internalOnGetUserInfoResult(resultJson) {
         res.cloudID = result.cloudID;
     }
 
-    pending.success(res);
-    pending.complete(res);
+    invokeCallback('getUserInfo', 'success', pending.success, res);
+    invokeCallback('getUserInfo', 'complete', pending.complete, res);
 }
 
 function _internalOnGetPhoneNumberResult(resultJson) {
@@ -304,15 +305,15 @@ function _internalOnGetPhoneNumberResult(resultJson) {
         if (result.errno !== undefined) {
             res.errno = result.errno;
         }
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('getPhoneNumber', 'fail', pending.fail, res);
+        invokeCallback('getPhoneNumber', 'complete', pending.complete, res);
         return;
     }
 
     if (typeof result.code !== "string" || result.code.length === 0) {
         const res = { errMsg: "getPhoneNumber:fail invalid code" };
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback('getPhoneNumber', 'fail', pending.fail, res);
+        invokeCallback('getPhoneNumber', 'complete', pending.complete, res);
         return;
     }
 
@@ -320,8 +321,8 @@ function _internalOnGetPhoneNumberResult(resultJson) {
         errMsg: "getPhoneNumber:ok",
         code: result.code,
     };
-    pending.success(res);
-    pending.complete(res);
+    invokeCallback('getPhoneNumber', 'success', pending.success, res);
+    invokeCallback('getPhoneNumber', 'complete', pending.complete, res);
 }
 
 // getUserProfile - deprecated but still used by some games.
@@ -340,8 +341,18 @@ function getUserProfile(options = {}) {
         try {
             requestId = allocateHostCallbackId();
             _pendingUserInfo.set(requestId, {
-                success: function (res) { success(res); resolve(res); },
-                fail: function (res) { fail(res); reject(res); },
+                // The caller's callback runs first, but it must not decide
+                // whether this promise settles: a `success` that threw here
+                // skipped `resolve` and left `await getUserProfile()` pending
+                // forever.
+                success: function (res) {
+                    invokeCallback('getUserProfile', 'success', success, res);
+                    resolve(res);
+                },
+                fail: function (res) {
+                    invokeCallback('getUserProfile', 'fail', fail, res);
+                    reject(res);
+                },
                 complete,
             });
             op_get_user_info(JSON.stringify({
