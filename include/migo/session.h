@@ -6,10 +6,26 @@
 typedef uint64_t MigoEngineFlags;
 #define MIGO_ENGINE_FLAG_NONE UINT64_C(0)
 /*
- * Run content that carries no signing receipt. Development and testing only:
- * production hosts leave this clear so unsigned content is refused. It is an
- * explicit opt-in rather than a default because silently accepting unsigned
- * content is exactly the failure a signing check exists to prevent.
+ * Run content that carries no signing receipt. It is an explicit opt-in rather
+ * than a default because silently accepting unsigned content is exactly the
+ * failure a signing check exists to prevent.
+ *
+ * Leaving it clear enables signature enforcement, and today that is not a
+ * configuration a C ABI host can complete: verification needs an Ed25519 public
+ * key, this ABI has nowhere to put one, and enforcement is fail-closed. Every
+ * module load then stops with MIGO_ERROR_INTERNAL and a logged
+ *
+ *     code signing enabled but public key is missing
+ *     (set InitOptions.code_signing_pubkey (hex Ed25519 public key))
+ *
+ * naming a setting only the Android binding reaches
+ * (RuntimeConfig.Builder.setCodeSigningPubkey). So a host built on this header
+ * has one configuration that loads content, and it is this flag.
+ *
+ * Stated here rather than left to be discovered: the fail-closed behaviour is
+ * correct and is not what is missing. What is missing is the key, and until the
+ * ABI carries one, "leave this clear in production" would be advice to ship
+ * something that cannot start.
  */
 #define MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT (UINT64_C(1) << 0)
 
