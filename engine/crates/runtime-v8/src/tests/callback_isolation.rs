@@ -1,0 +1,162 @@
+//! A caller's callback that throws must not decide whether the others run.
+//!
+//! `success`, `fail` and `complete` are the app's functions. The engine calls
+//! them in sequence and then settles its own promise, so before this was fixed
+//! a `success` that threw took the rest of the sequence with it: `complete`
+//! never ran, even though every mini-game API documents it as running either
+//! way. Content that hides a loading spinner in `complete` left it on screen,
+//! and the only clue was the app's own exception.
+//!
+//! The dispatch under test is the real `createDeferredApi`, settled the way the
+//! platform settles it, so this asserts about the code that ships rather than a
+//! reimplementation of it.
+
+#[cfg(test)]
+mod callback_isolation_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use deno_core::{FastString, JsRuntime, RuntimeOptions};
+    use shared::callback_id::CallbackIdAllocator;
+    use shared::channel::ThreadWakeup;
+    use shared::device::gpu_caps::GpuCaps;
+    use shared::op_state::{AudioSender, HostOpState, NetworkPolicy};
+    use shared::render_command_sender::CommandSender;
+
+    deno_core::extension!(
+        callback_isolation_bridge,
+        deps = [host_v8_base],
+        esm_entry_point = "ext:callback_isolation_bridge/bridge.js",
+        esm = ["ext:callback_isolation_bridge/bridge.js" = {
+            source = r#"
+                import { createDeferredApi } from "ext:host_v8_base/02_async.js";
+                globalThis.__createDeferredApi = createDeferredApi;
+            "#
+        },],
+    );
+
+    fn test_host_state() -> HostOpState {
+        let (render_tx, _render_rx) = CommandSender::new();
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
+
+        HostOpState {
+            callback_ids: Arc::new(CallbackIdAllocator::default()),
+            runtime_generation: 1,
+            id: 1,
+            app_cache_dir: PathBuf::from("/tmp/cache"),
+            app_files_dir: PathBuf::from("/tmp/files"),
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            mount_table: None,
+            render_tx,
+            text_measurer: None,
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
+            host_tx,
+            device_services: None,
+            raf_rx: None,
+            raf_demand: Arc::new(shared::raf_signal::RafDemand::new()),
+            request_vsync: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
+            network_policy: NetworkPolicy::default(),
+            backgrounded: Arc::new(AtomicBool::new(false)),
+            timer_backgrounded: Arc::new(AtomicBool::new(false)),
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: Arc::new(shared::op_state::ContextLostState::default()),
+            code_signing_enabled: false,
+            gpu_caps: GpuCaps::new(),
+        }
+    }
+
+    fn exec(rt: &mut JsRuntime, source: impl Into<String>) {
+        rt.execute_script("<test:callbacks>", FastString::from(source.into()))
+            .expect("callback probe script");
+    }
+
+    fn assert_js(rt: &mut JsRuntime, expression: &str) {
+        let script = format!(
+            "if (!({expression})) throw new Error('log=' + JSON.stringify(globalThis.__log));"
+        );
+        if let Err(error) = rt.execute_script("<test:callbacks>", FastString::from(script)) {
+            panic!("assertion failed: {expression}\n{error}");
+        }
+    }
+
+    /// Timeouts disabled, so nothing settles on a clock instead of on a result.
+    fn boot() -> JsRuntime {
+        let mut extensions = crate::main_extensions(test_host_state());
+        extensions.push(callback_isolation_bridge::init());
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions,
+            ..Default::default()
+        });
+        crate::harden_global_scope(&mut rt);
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__log = [];
+            globalThis.__api = globalThis.__createDeferredApi('probe', 0);
+            globalThis.__ids = [];
+            "#,
+        );
+        rt
+    }
+
+    /// A `success` that throws must not swallow `complete`.
+    #[test]
+    fn a_throwing_success_callback_still_runs_complete() {
+        let mut rt = boot();
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__api.invoke(
+                {
+                    success: function () {
+                        globalThis.__log.push('success');
+                        throw new Error('boom');
+                    },
+                    complete: function () { globalThis.__log.push('complete'); },
+                },
+                function (_opts, id) { globalThis.__ids.push(id); },
+            ).catch(function () {});
+            "#,
+        );
+        exec(
+            &mut rt,
+            "globalThis.__api.settle(JSON.stringify({ requestId: globalThis.__ids[0] }));",
+        );
+        assert_js(&mut rt, "globalThis.__log.join(',') === 'success,complete'");
+    }
+
+    /// The same on the failure path: a throwing `fail` must not swallow
+    /// `complete` either. Separate from the success case because the two are
+    /// separate branches, and a fix that reached only one would still pass the
+    /// other test.
+    #[test]
+    fn a_throwing_fail_callback_still_runs_complete() {
+        let mut rt = boot();
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__api.invoke(
+                {
+                    fail: function () {
+                        globalThis.__log.push('fail');
+                        throw new Error('boom');
+                    },
+                    complete: function () { globalThis.__log.push('complete'); },
+                },
+                function (_opts, id) { globalThis.__ids.push(id); },
+            ).catch(function () {});
+            "#,
+        );
+        exec(
+            &mut rt,
+            "globalThis.__api.settle(JSON.stringify({ requestId: globalThis.__ids[0], \
+             error: 'probe:fail nope' }));",
+        );
+        assert_js(&mut rt, "globalThis.__log.join(',') === 'fail,complete'");
+    }
+}

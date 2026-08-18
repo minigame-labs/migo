@@ -39,6 +39,22 @@ function allocateHostCallbackId() {
     return id;
 }
 
+// Invoke one of the caller's callbacks without letting it escape.
+//
+// These are the app's functions, not ours. One that throws must not decide
+// whether the rest run: `complete` is documented as running either way, and a
+// caller awaiting the promise asked about the *operation*, not about its own
+// callback. Reported rather than swallowed, matching the `ready` callback in
+// 16_jssdk.js, so a throwing callback stays debuggable instead of vanishing.
+function invokeCallback(apiName, kind, cb, res) {
+    if (typeof cb !== 'function') return;
+    try {
+        cb(res);
+    } catch (e) {
+        console.error(apiName + ' ' + kind + ' callback error:', e);
+    }
+}
+
 function wrapAsync(apiName, fn, options) {
     const { success, fail, complete } = options || {};
     const profiling = _perf.enabled;
@@ -63,8 +79,8 @@ function wrapAsync(apiName, fn, options) {
                 const res = (typeof value === 'object' && value !== null)
                     ? { errMsg: apiName + ':ok', ...value }
                     : { errMsg: apiName + ':ok' };
-                if (typeof success === 'function') success(res);
-                if (typeof complete === 'function') complete(res);
+                invokeCallback(apiName, 'success', success, res);
+                invokeCallback(apiName, 'complete', complete, res);
                 return res;
             },
             function (e) {
@@ -75,15 +91,15 @@ function wrapAsync(apiName, fn, options) {
                     }
                 }
                 const res = { errMsg: apiName + ':fail ' + (e.message || String(e)) };
-                if (typeof fail === 'function') fail(res);
-                if (typeof complete === 'function') complete(res);
+                invokeCallback(apiName, 'fail', fail, res);
+                invokeCallback(apiName, 'complete', complete, res);
                 throw res;
             }
         );
     } catch (e) {
         const res = { errMsg: apiName + ':fail ' + (e.message || String(e)) };
-        if (typeof fail === 'function') queueMicrotask(function () { fail(res); });
-        if (typeof complete === 'function') queueMicrotask(function () { complete(res); });
+        queueMicrotask(function () { invokeCallback(apiName, 'fail', fail, res); });
+        queueMicrotask(function () { invokeCallback(apiName, 'complete', complete, res); });
         return Promise.reject(res);
     }
 }
@@ -157,8 +173,8 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
         if (parsed.error) {
             var res = { errMsg: parsed.error };
             if (parsed.errCode !== undefined) res.errCode = parsed.errCode;
-            if (entry.fail) entry.fail(res);
-            if (entry.complete) entry.complete(res);
+            invokeCallback(apiName, 'fail', entry.fail, res);
+            invokeCallback(apiName, 'complete', entry.complete, res);
             entry.reject(res);
         } else {
             var res = { errMsg: apiName + ':ok' };
@@ -167,8 +183,8 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
                 var k = keys[i];
                 if (k !== 'requestId') res[k] = parsed[k];
             }
-            if (entry.success) entry.success(res);
-            if (entry.complete) entry.complete(res);
+            invokeCallback(apiName, 'success', entry.success, res);
+            invokeCallback(apiName, 'complete', entry.complete, res);
             entry.resolve(res);
         }
     }
@@ -188,8 +204,8 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
                 requestId = allocateHostCallbackId();
             } catch (e) {
                 var allocFailure = { errMsg: apiName + ':fail ' + e.message };
-                if (fail) fail(allocFailure);
-                if (complete) complete(allocFailure);
+                invokeCallback(apiName, 'fail', fail, allocFailure);
+                invokeCallback(apiName, 'complete', complete, allocFailure);
                 reject(allocFailure);
                 return;
             }
@@ -213,8 +229,8 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
                     if (!e) return;
                     _pending.delete(requestId);
                     var res = { errMsg: apiName + ':fail timeout' };
-                    try { if (e.fail) e.fail(res); } catch (_) {}
-                    try { if (e.complete) e.complete(res); } catch (_) {}
+                    invokeCallback(apiName, 'fail', e.fail, res);
+                    invokeCallback(apiName, 'complete', e.complete, res);
                     e.reject(res);
                 }, ms);
             }
@@ -227,8 +243,8 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
                     _pending.delete(requestId);
                     if (entry._timer) clearTimeout(entry._timer);
                     var res = { errMsg: apiName + ':fail ' + e.message };
-                    if (fail) fail(res);
-                    if (complete) complete(res);
+                    invokeCallback(apiName, 'fail', fail, res);
+                    invokeCallback(apiName, 'complete', complete, res);
                     reject(res);
                 }
             }
@@ -398,4 +414,9 @@ export {
     // parser here is a second answer to who an id belongs to.
     allocateHostCallbackId,
     parseHostCallbackId,
+    // Same reasoning as the id allocator above: a module that settles its own
+    // pending map still owes the caller the documented callback sequence, and a
+    // second local implementation of "run these without letting one stop the
+    // rest" is a second answer to that.
+    invokeCallback,
 };

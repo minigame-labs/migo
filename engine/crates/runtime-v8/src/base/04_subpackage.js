@@ -1,6 +1,6 @@
 import { op_download_subpackage, op_install_subpackage, op_is_subpackage_installed, op_is_subpackage_persisted, op_get_mount_generation, op_get_subpackage_identity, op_get_sub_packages, op_get_workers_path } from "ext:core/ops";
 import { require as amdRequire } from "ext:host_v8_base/01_amdshim.js";
-import { allocateHostCallbackId, createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { allocateHostCallbackId, createListenerGroup, invokeCallback } from "ext:host_v8_base/02_async.js";
 
 const noop = () => {};
 
@@ -175,8 +175,8 @@ function _settle(requestId, error) {
                     // Local execution succeeded despite download error
                     pending.task._triggerProgress(100, 1, 1);
                     const res = { errMsg: `${pending.apiName}:ok` };
-                    pending.success(res);
-                    pending.complete(res);
+                    invokeCallback(pending.apiName, 'success', pending.success, res);
+                    invokeCallback(pending.apiName, 'complete', pending.complete, res);
                     return;
                 }
             } catch (_) {
@@ -184,8 +184,8 @@ function _settle(requestId, error) {
             }
         }
         const res = { errMsg: `${pending.apiName}:fail ${error}` };
-        pending.fail(res);
-        pending.complete(res);
+        invokeCallback(pending.apiName, 'fail', pending.fail, res);
+        invokeCallback(pending.apiName, 'complete', pending.complete, res);
         return;
     }
 
@@ -195,16 +195,16 @@ function _settle(requestId, error) {
             _executeSubpackage(pending.pkg);
         } catch (e) {
             const res = { errMsg: `${pending.apiName}:fail ${_errorText(e)}` };
-            pending.fail(res);
-            pending.complete(res);
+            invokeCallback(pending.apiName, 'fail', pending.fail, res);
+            invokeCallback(pending.apiName, 'complete', pending.complete, res);
             return;
         }
     }
 
     pending.task._triggerProgress(100, 1, 1);
     const res = { errMsg: `${pending.apiName}:ok` };
-    pending.success(res);
-    pending.complete(res);
+    invokeCallback(pending.apiName, 'success', pending.success, res);
+    invokeCallback(pending.apiName, 'complete', pending.complete, res);
 }
 
 // Local-only fallback when platform service is unavailable.

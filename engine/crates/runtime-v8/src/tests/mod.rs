@@ -15,6 +15,7 @@
 #[cfg(feature = "api-system")]
 mod ad_reward_integrity;
 mod binary_helper;
+mod callback_isolation;
 mod canvas_follows_surface;
 mod global_surface;
 mod host_bridge_dispatch;

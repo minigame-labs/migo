@@ -9,7 +9,7 @@ import {
   op_camera_listen_frame_change,
   op_camera_close_frame_change,
 } from "ext:core/ops";
-import { allocateHostCallbackId, wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { allocateHostCallbackId, wrapAsync, createListenerGroup, invokeCallback } from "ext:host_v8_base/02_async.js";
 
 // Camera instance registry: cameraId -> Camera
 const _cameras = new Map();
@@ -263,14 +263,10 @@ function createCamera(options = {}) {
     camera = new Camera(cameraId);
     _cameras.set(cameraId, camera);
 
-    if (typeof options.success === "function") {
-      options.success({ camera });
-    }
+    invokeCallback("createCamera", "success", options.success, { camera });
   } catch (e) {
     const errMsg = "createCamera:fail " + (e.message || String(e));
-    if (typeof options.fail === "function") {
-      options.fail({ errMsg });
-    }
+    invokeCallback("createCamera", "fail", options.fail, { errMsg });
     // The host refused, but the id is this runtime's: content still gets a
     // handle so its later calls fail cleanly instead of on `undefined`. With no
     // id there is no handle to give -- a Camera under an id nobody allocated
@@ -280,9 +276,7 @@ function createCamera(options = {}) {
       _cameras.set(cameraId, camera);
     }
   } finally {
-    if (typeof options.complete === "function") {
-      options.complete();
-    }
+    invokeCallback("createCamera", "complete", options.complete, undefined);
   }
 
   return camera;
