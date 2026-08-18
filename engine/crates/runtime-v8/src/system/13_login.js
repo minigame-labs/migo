@@ -70,19 +70,39 @@ function login(options = {}) {
         ? Math.floor(opts.timeout)
         : undefined;
 
-    let requestId;
-    try {
-        requestId = allocateHostCallbackId();
-        _pendingLogin.set(requestId, { success, fail, complete });
-        op_login(JSON.stringify({ requestId, timeout }));
-    } catch (error) {
-        _pendingLogin.delete(requestId);
-        const res = { errMsg: `login:fail ${_safeErrorMessage(error)}` };
-        queueMicrotask(function () {
-            fail(res);
-            complete(res);
-        });
-    }
+    // Returns a Promise as well as taking callbacks, like every other
+    // API on this surface -- and like `checkSession` and `getUserProfile`
+    // in this very file. Without one, `await migo.login()` resolved
+    // immediately on `undefined` and content carried on before the call
+    // had finished. Settlement is folded into the stored callbacks, which
+    // is `getUserProfile`'s shape here and leaves the settle functions
+    // untouched.
+    return new Promise(function (resolve, reject) {
+        let requestId;
+        try {
+            requestId = allocateHostCallbackId();
+            _pendingLogin.set(requestId, {
+                success: function (res) {
+                    invokeCallback("login", "success", success, res);
+                    resolve(res);
+                },
+                fail: function (res) {
+                    invokeCallback("login", "fail", fail, res);
+                    reject(res);
+                },
+                complete,
+            });
+            op_login(JSON.stringify({ requestId, timeout }));
+        } catch (error) {
+            _pendingLogin.delete(requestId);
+            const res = { errMsg: `login:fail ${_safeErrorMessage(error)}` };
+            queueMicrotask(function () {
+                invokeCallback("login", "fail", fail, res);
+                invokeCallback("login", "complete", complete, res);
+                reject(res);
+            });
+        }
+    });
 }
 
 function checkSession(options = {}) {
@@ -124,19 +144,39 @@ function getUserInfo(options = {}) {
     const withCredentials = opts.withCredentials === true;
     const lang = _normalizeLang(opts.lang);
 
-    let requestId;
-    try {
-        requestId = allocateHostCallbackId();
-        _pendingUserInfo.set(requestId, { success, fail, complete });
-        op_get_user_info(JSON.stringify({ requestId, withCredentials, lang }));
-    } catch (error) {
-        _pendingUserInfo.delete(requestId);
-        const res = { errMsg: `getUserInfo:fail ${_safeErrorMessage(error)}` };
-        queueMicrotask(function () {
-            fail(res);
-            complete(res);
-        });
-    }
+    // Returns a Promise as well as taking callbacks, like every other
+    // API on this surface -- and like `checkSession` and `getUserProfile`
+    // in this very file. Without one, `await migo.getUserInfo()` resolved
+    // immediately on `undefined` and content carried on before the call
+    // had finished. Settlement is folded into the stored callbacks, which
+    // is `getUserProfile`'s shape here and leaves the settle functions
+    // untouched.
+    return new Promise(function (resolve, reject) {
+        let requestId;
+        try {
+            requestId = allocateHostCallbackId();
+            _pendingUserInfo.set(requestId, {
+                success: function (res) {
+                    invokeCallback("getUserInfo", "success", success, res);
+                    resolve(res);
+                },
+                fail: function (res) {
+                    invokeCallback("getUserInfo", "fail", fail, res);
+                    reject(res);
+                },
+                complete,
+            });
+            op_get_user_info(JSON.stringify({ requestId, withCredentials, lang }));
+        } catch (error) {
+            _pendingUserInfo.delete(requestId);
+            const res = { errMsg: `getUserInfo:fail ${_safeErrorMessage(error)}` };
+            queueMicrotask(function () {
+                invokeCallback("getUserInfo", "fail", fail, res);
+                invokeCallback("getUserInfo", "complete", complete, res);
+                reject(res);
+            });
+        }
+    });
 }
 
 function getPhoneNumber(options = {}) {
@@ -148,23 +188,43 @@ function getPhoneNumber(options = {}) {
     const isRealtime = opts.isRealtime === true;
     const phoneNumberNoQuotaToast = opts.phoneNumberNoQuotaToast !== false;
 
-    let requestId;
-    try {
-        requestId = allocateHostCallbackId();
-        _pendingPhoneNumber.set(requestId, { success, fail, complete });
-        op_get_phone_number(JSON.stringify({
-            requestId,
-            isRealtime,
-            phoneNumberNoQuotaToast,
-        }));
-    } catch (error) {
-        _pendingPhoneNumber.delete(requestId);
-        const res = { errMsg: `getPhoneNumber:fail ${_safeErrorMessage(error)}` };
-        queueMicrotask(function () {
-            fail(res);
-            complete(res);
-        });
-    }
+    // Returns a Promise as well as taking callbacks, like every other
+    // API on this surface -- and like `checkSession` and `getUserProfile`
+    // in this very file. Without one, `await migo.getPhoneNumber()` resolved
+    // immediately on `undefined` and content carried on before the call
+    // had finished. Settlement is folded into the stored callbacks, which
+    // is `getUserProfile`'s shape here and leaves the settle functions
+    // untouched.
+    return new Promise(function (resolve, reject) {
+        let requestId;
+        try {
+            requestId = allocateHostCallbackId();
+            _pendingPhoneNumber.set(requestId, {
+                success: function (res) {
+                    invokeCallback("getPhoneNumber", "success", success, res);
+                    resolve(res);
+                },
+                fail: function (res) {
+                    invokeCallback("getPhoneNumber", "fail", fail, res);
+                    reject(res);
+                },
+                complete,
+            });
+            op_get_phone_number(JSON.stringify({
+                requestId,
+                isRealtime,
+                phoneNumberNoQuotaToast,
+            }));
+        } catch (error) {
+            _pendingPhoneNumber.delete(requestId);
+            const res = { errMsg: `getPhoneNumber:fail ${_safeErrorMessage(error)}` };
+            queueMicrotask(function () {
+                invokeCallback("getPhoneNumber", "fail", fail, res);
+                invokeCallback("getPhoneNumber", "complete", complete, res);
+                reject(res);
+            });
+        }
+    });
 }
 
 function _internalOnLoginResult(resultJson) {
