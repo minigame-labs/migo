@@ -415,7 +415,9 @@ jobs:
   # ── Job 2: Linux Qt Host Kit (isolated source contract; no V8/LFS) ──
   linux-qt-host-kit:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Normally 1-2 min. The ceiling is headroom for the bounded apt retries
+    # above, so a slow mirror costs a retry rather than the whole job.
+    timeout-minutes: 25
 
     steps:
       - name: Checkout (without LFS)
@@ -429,16 +431,26 @@ jobs:
         # is 15 minutes, so an unbounded install can spend the entire budget
         # before the contract it exists to run has started.
         run: |
-          install_deps() {
-            timeout 90 sudo apt-get update || return 1
+          # `update` is advisory. Against a mirror that is down, apt retries
+          # internally and reports `Ign:` per index, then falls back to the
+          # indexes already on the image -- from which these packages still
+          # install. Bounding it and treating that as fatal turned a survivable
+          # mirror outage into a failed job, which is what happened here when
+          # azure.archive.ubuntu.com went dark. Still bounded, so a hung mirror
+          # cannot sit on the runner.
+          timeout 180 sudo apt-get update \
+            || echo "apt-get update incomplete; continuing on the image's indexes" >&2
+          # The install is the real gate: if the packages cannot be had, the
+          # contract below cannot run, so this one fails the step.
+          install_pkgs() {
             timeout 300 sudo apt-get install -y \
               cmake ninja-build g++ ripgrep xvfb xauth \
               qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
               libx11-dev libxkbcommon-x11-dev libxcb-cursor0 || return 1
           }
-          install_deps || {
-            echo "Qt/X11 dependency install stalled or failed; retrying once" >&2
-            install_deps
+          install_pkgs || {
+            echo "Qt/X11 package install failed; retrying once" >&2
+            install_pkgs
           }
 
       # --sanitize reruns the same binaries under ASan/UBSan. Enforced here
@@ -675,17 +687,21 @@ jobs:
         # stay large for a cold cache that rebuilds Skia from source, so it
         # cannot double as the guard against a hung apt.
         run: |
-          install_deps() {
-            timeout 90 sudo apt-get update -qq || return 1
+          # Advisory for the same reason as the Qt job: a mirror that is down
+          # makes `update` report per-index failures, and the packages still
+          # install from the indexes already on the image.
+          timeout 180 sudo apt-get update -qq \
+            || echo "apt-get update incomplete; continuing on the image's indexes" >&2
+          install_pkgs() {
             timeout 300 sudo apt-get install -y -qq \
               ninja-build \
               libgl-dev libegl-dev libgles-dev \
               libfontconfig1-dev libfreetype-dev \
               libasound2-dev || return 1
           }
-          install_deps || {
-            echo "host build dependency install stalled or failed; retrying once" >&2
-            install_deps
+          install_pkgs || {
+            echo "host build dependency install failed; retrying once" >&2
+            install_pkgs
           }
 
       # These five crates' clippy ran in no job at all until now, for the same
