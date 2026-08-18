@@ -134,6 +134,14 @@ impl KvStore {
         //   - temp_store=MEMORY keeps transient B-tree pages in RAM.
         //   - wal_autocheckpoint=1000 (pages) is the default; keep it
         //     explicit so future sqlite upgrades can't silently change.
+        // Wait rather than fail instantly when another connection holds a lock.
+        // SQLite's default is a zero timeout, so any contention -- a checkpoint,
+        // or a second process opening the same file -- surfaces as an immediate
+        // `database is locked` rather than a short wait. Set before the first
+        // pragma, since `journal_mode` is itself a lock-taking statement.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(sql_err("kv: busy_timeout"))?;
+
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(sql_err("kv: pragma journal_mode"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
