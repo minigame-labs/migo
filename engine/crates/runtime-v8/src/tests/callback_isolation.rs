@@ -35,6 +35,9 @@ mod callback_isolation_tests {
         esm = ["ext:callback_isolation_bridge/bridge.js" = {
             source = r#"
                 import { createDeferredApi } from "ext:host_v8_base/02_async.js";
+                import { op_audio_create_context, op_worker_terminate } from "ext:core/ops";
+                globalThis.__audioOp = function () { return op_audio_create_context(1, 44100); };
+                globalThis.__workerOp = function () { return op_worker_terminate(); };
                 globalThis.__createDeferredApi = createDeferredApi;
             "#
         },],
@@ -202,5 +205,44 @@ mod callback_isolation_tests {
             "globalThis.__threw === false \
              && globalThis.__log.join(',') === 'fail:string,complete'",
         );
+    }
+
+    /// An op's error must reach JS as a constructible Error, not as `undefined`.
+    ///
+    /// `#[class("AudioError")]` on the Rust side only names the class; deno_core
+    /// still needs a JS constructor registered under that exact name to build
+    /// the object. `IOError` had one (`02_file_manager.js`), `AudioError` and
+    /// `WorkerError` did not, so their ops threw literal `undefined` -- which is
+    /// what made `setInnerAudioOption` throw a TypeError out of itself, and what
+    /// would still leave every audio and worker failure carrying an errMsg of
+    /// "undefined" now that #102 has made that non-fatal.
+    ///
+    /// Asserted per class rather than in one loop: each name is registered
+    /// separately, so one that is missed has to fail on its own.
+    #[test]
+    fn a_failing_op_error_is_constructible_in_js() {
+        let mut rt = boot();
+        for (probe, class) in [("__audioOp", "AudioError"), ("__workerOp", "WorkerError")] {
+            exec(
+                &mut rt,
+                &format!(
+                    r#"
+                    globalThis.__log = [];
+                    try {{
+                        globalThis.{probe}();
+                        globalThis.__log.push('no-throw');
+                    }} catch (e) {{
+                        globalThis.__log.push(
+                            (e === undefined ? 'undefined' : (e.name || 'unnamed'))
+                            + '/' + (typeof (e && e.message)));
+                    }}
+                    "#
+                ),
+            );
+            assert_js(
+                &mut rt,
+                &format!("globalThis.__log.join(',') === '{class}/string'"),
+            );
+        }
     }
 }

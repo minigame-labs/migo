@@ -6,6 +6,22 @@ import {
   op_audio_param_cancel_scheduled,
   op_audio_set_node_param,
 } from "ext:core/ops";
+import { core, primordials } from "ext:core/mod.js";
+
+// The Rust side declares this error's class as "AudioError" (see audio/ops.rs). deno_core
+// can only construct it if a JS constructor is registered under that exact name;
+// without one the throw arrives in JS as literal `undefined`, and every handler
+// that reads `.message` off it fails instead of reporting the error. Registered
+// here for the same reason `IOError` is registered in 02_file_manager.js.
+const { Error: _PrimError } = primordials;
+class AudioError extends _PrimError {
+  constructor(msg) {
+    super(msg);
+    this.name = "AudioError";
+  }
+}
+core.registerErrorClass("AudioError", AudioError);
+
 
 class AudioParam {
   #value;
