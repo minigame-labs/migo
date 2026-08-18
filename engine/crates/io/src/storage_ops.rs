@@ -74,19 +74,24 @@ static STORES: LazyLock<Mutex<HashMap<PathBuf, KvStore>>> =
 
 fn store_for(dir: &Path, quota_bytes: u64) -> Result<KvStore, EngineError> {
     let key = dir.to_path_buf();
-    {
-        let map = STORES.lock();
-        if let Some(kv) = map.get(&key) {
-            return Ok(kv.clone());
-        }
-    }
-    // Lock-release-reacquire race: two callers could both reach the
-    // open() below at the same time. `insert` takes whichever wins;
-    // both Arc<KvStore> wrappers end up pointing at the same SQLite
-    // file, and SQLite itself is process-local so opening the same
-    // file twice is cheap.
-    let new_kv = KvStore::open(dir.join("storage.db"), quota_bytes)?;
+    // The lock is held across `open`, not released around it.
+    //
+    // It used to be released, on the reasoning that two callers both reaching
+    // `open` was harmless because "opening the same file twice is cheap". It is
+    // not: `KvStore::open` sets `journal_mode=WAL`, and that pragma needs a lock
+    // no other connection holds. Ten `setStorage` calls issued together -- which
+    // is ordinary content code -- arrive on ten scheduler threads, all miss this
+    // cache because the file does not exist yet, and all open at once; one loses
+    // and the write fails with `kv: pragma journal_mode: database is locked`.
+    // Reproduced at roughly one run in five before this change.
+    //
+    // Serialising here costs one brief hold per storage directory per process,
+    // on a path that runs once.
     let mut map = STORES.lock();
+    if let Some(kv) = map.get(&key) {
+        return Ok(kv.clone());
+    }
+    let new_kv = KvStore::open(dir.join("storage.db"), quota_bytes)?;
     Ok(map.entry(key).or_insert(new_kv).clone())
 }
 
@@ -286,6 +291,43 @@ mod tests {
 
     fn fresh_dir() -> tempfile::TempDir {
         tempdir().unwrap()
+    }
+
+    /// Concurrent first writes to a brand-new store must all land.
+    ///
+    /// Ten `setStorage` calls issued together is ordinary content behaviour, and
+    /// they arrive on separate scheduler threads against a directory where no
+    /// `storage.db` exists yet -- so every one of them misses the handle cache
+    /// and races to open and initialise the same file. Sequential writes never
+    /// showed a problem; this is the shape that did.
+    #[test]
+    fn concurrent_first_writes_to_a_new_store_all_land() {
+        let dir = fresh_dir();
+        let path = dir.path().to_path_buf();
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let key = format!("k{i}");
+                storage_set(&p, &key, &format!("v{i}"), QUOTA).map_err(|e| format!("{key}: {e:?}"))
+            }));
+        }
+        let mut failures = Vec::new();
+        for h in handles {
+            if let Err(e) = h.join().expect("writer thread") {
+                failures.push(e);
+            }
+        }
+        assert!(failures.is_empty(), "writes failed: {failures:?}");
+        for i in 0..10 {
+            assert_eq!(
+                storage_get(&path, &format!("k{i}"), QUOTA)
+                    .unwrap()
+                    .as_deref(),
+                Some(format!("v{i}").as_str()),
+                "k{i} did not survive the concurrent open"
+            );
+        }
     }
 
     #[test]

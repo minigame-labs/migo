@@ -13,6 +13,23 @@ import {
     op_revoke_buffer_url,
 } from "ext:core/ops";
 import { promisify } from "ext:host_v8_base/02_async.js";
+import { core, primordials } from "ext:core/mod.js";
+
+// Registered for the reason `IOError` is (see 02_file_manager.js): the Rust side
+// names this class in `#[class("StorageError")]`, and deno_core can only build the
+// object if a constructor exists under that exact name. Without one it produces
+// `undefined`, and the async op path then calls `ErrorCaptureStackTrace` on it
+// without the `typeof === "object"` guard `buildCustomError` has -- so V8 raises
+// `TypeError: invalid_argument` and that replaces the real error on its way out.
+const { Error: _PrimErrorS } = primordials;
+class StorageError extends _PrimErrorS {
+  constructor(msg) {
+    super(msg);
+    this.name = "StorageError";
+  }
+}
+core.registerErrorClass("StorageError", StorageError);
+
 
 // ==================== Type-tagged serialization ====================
 //
