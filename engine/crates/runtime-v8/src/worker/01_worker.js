@@ -4,6 +4,21 @@ import { op_worker_create,
     op_worker_recv_error,
     op_worker_terminate } from "ext:core/ops";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { core, primordials } from "ext:core/mod.js";
+
+// The Rust side declares this error's class as "WorkerError" (see worker/mod.rs). deno_core
+// can only construct it if a JS constructor is registered under that exact name;
+// without one the throw arrives in JS as literal `undefined`, and every handler
+// that reads `.message` off it fails instead of reporting the error. Registered
+// here for the same reason `IOError` is registered in 02_file_manager.js.
+const { Error: _PrimError } = primordials;
+class WorkerError extends _PrimError {
+  constructor(msg) {
+    super(msg);
+    this.name = "WorkerError";
+  }
+}
+core.registerErrorClass("WorkerError", WorkerError);
 
 let currentWorker = null;
 class WorkerInstance {
