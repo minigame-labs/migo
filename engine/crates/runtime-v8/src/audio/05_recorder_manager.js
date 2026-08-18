@@ -5,7 +5,7 @@ import {
   op_recorder_resume,
   op_recorder_stop,
 } from "ext:core/ops";
-import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { createListenerGroup, errorMessage } from "ext:host_v8_base/02_async.js";
 
 // Singleton instance
 let _instance = null;
@@ -69,7 +69,7 @@ class RecorderManager {
     try {
       op_recorder_start(JSON.stringify(opts));
     } catch (e) {
-      this.#fireListeners("error", { errMsg: e.message || String(e) });
+      this.#fireListeners("error", { errMsg: errorMessage(e) });
     }
   }
 
@@ -78,7 +78,7 @@ class RecorderManager {
     try {
       op_recorder_pause();
     } catch (e) {
-      this.#fireListeners("error", { errMsg: e.message || String(e) });
+      this.#fireListeners("error", { errMsg: errorMessage(e) });
     }
   }
 
@@ -87,7 +87,7 @@ class RecorderManager {
     try {
       op_recorder_resume();
     } catch (e) {
-      this.#fireListeners("error", { errMsg: e.message || String(e) });
+      this.#fireListeners("error", { errMsg: errorMessage(e) });
     }
   }
 
@@ -96,7 +96,7 @@ class RecorderManager {
     try {
       op_recorder_stop();
     } catch (e) {
-      this.#fireListeners("error", { errMsg: e.message || String(e) });
+      this.#fireListeners("error", { errMsg: errorMessage(e) });
     }
   }
 

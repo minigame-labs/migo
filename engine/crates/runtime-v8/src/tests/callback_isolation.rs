@@ -10,6 +10,10 @@
 //! The dispatch under test is the real `createDeferredApi`, settled the way the
 //! platform settles it, so this asserts about the code that ships rather than a
 //! reimplementation of it.
+//!
+//! The last test is the same property one layer earlier: a callback that is
+//! never reached cannot honour any contract, and an API whose own failure
+//! handler throws reaches none of them.
 
 #[cfg(test)]
 mod callback_isolation_tests {
@@ -158,5 +162,45 @@ mod callback_isolation_tests {
              error: 'probe:fail nope' }));",
         );
         assert_js(&mut rt, "globalThis.__log.join(',') === 'fail,complete'");
+    }
+
+    /// A failing op must reach `fail` and `complete`, not throw past them.
+    ///
+    /// `setInnerAudioOption` is backed by an `#[op2(fast)]` that returns
+    /// `Err(AudioError)` whenever the host offers no audio platform -- true of
+    /// this harness and of any real platform without one. That error arrives in
+    /// JS as literal `undefined`, so the handler's `(err.message || ...)` threw
+    /// a TypeError out of the API itself: content got an uncaught exception
+    /// from a call documented to report failure through `fail`. Verified
+    /// against the shipped 0.9.1 Linux SDK before the fix:
+    ///
+    /// ```text
+    /// THREW OUT OF setInnerAudioOption: TypeError: Cannot read properties of
+    /// undefined (reading 'message')
+    /// ```
+    #[test]
+    fn a_failing_op_reports_through_fail_rather_than_throwing() {
+        let mut rt = boot();
+        exec(
+            &mut rt,
+            r#"
+            globalThis.__threw = false;
+            try {
+                migo.setInnerAudioOption({
+                    fail: function (res) {
+                        globalThis.__log.push('fail:' + (res && typeof res.errMsg));
+                    },
+                    complete: function () { globalThis.__log.push('complete'); },
+                });
+            } catch (e) {
+                globalThis.__threw = true;
+            }
+            "#,
+        );
+        assert_js(
+            &mut rt,
+            "globalThis.__threw === false \
+             && globalThis.__log.join(',') === 'fail:string,complete'",
+        );
     }
 }
