@@ -245,4 +245,41 @@ mod callback_isolation_tests {
             );
         }
     }
+
+    /// Every API on this surface is callback-and-Promise dual mode. Three were
+    /// not.
+    ///
+    /// `login`, `getUserInfo` and `getPhoneNumber` returned `undefined`, so
+    /// `await migo.login()` resolved immediately on nothing and content carried
+    /// on as though the call had finished. `checkSession` and `getUserProfile`,
+    /// in the same file, always returned one. A surface sweep of 25 APIs found
+    /// exactly these three.
+    ///
+    /// The assertion is the synchronous half -- that a thenable comes back at
+    /// all -- because that is precisely what was missing; how it settles is the
+    /// shared `_pending` machinery the other two already exercise.
+    #[test]
+    fn the_login_apis_return_a_promise_like_every_other_api() {
+        let mut rt = boot();
+        for api in [
+            "login",
+            "getUserInfo",
+            "getPhoneNumber",
+            "checkSession",
+            "getUserProfile",
+        ] {
+            exec(
+                &mut rt,
+                &format!(
+                    r#"
+                    globalThis.__log = [];
+                    var r = migo.{api}({{ desc: 'd', fail: function () {{}}, complete: function () {{}} }});
+                    globalThis.__log.push(r && typeof r.then === 'function' ? 'thenable' : 'MISSING');
+                    if (r && r.catch) {{ r.catch(function () {{}}); }}
+                    "#
+                ),
+            );
+            assert_js(&mut rt, "globalThis.__log.join(',') === 'thenable'");
+        }
+    }
 }
