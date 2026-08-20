@@ -119,7 +119,7 @@ migo/
 
 ## License
 
-Migo is **source-available** under the [Business Source License 1.1](LICENSE). **Each released version converts to Apache 2.0 four years after it is published.**
+Migo is **source-available** under the [Business Source License 1.1](LICENSE). **Each released version converts to Apache 2.0 four years after that version is published** — the date is stamped in the `LICENSE` each release ships with (currently 2030-08-15).
 
 - **Read, audit, build, test, benchmark, modify and port** — granted to everyone, at any scale, unconditionally.
 - **Ship Migo inside your own app** — free while under USD 1,000,000 annual revenue and 3,000,000 MAU.
@@ -140,4 +140,6 @@ Migo builds on [Deno Core](https://github.com/denoland/deno_core), [V8](https://
 ## Support
 
 - Issues: https://github.com/minigame-labs/migo/issues
-- Docs: https://github.com/minigame-labs/migo/wiki
+- Integration guide: [migo-examples](https://github.com/minigame-labs/migo-examples) — a runnable game and per-host build/run instructions
+- Building from source: [BUILD.md](BUILD.md)
+- Commercial licensing: licensing@minigame-labs.com

@@ -15,7 +15,7 @@
 
 ### 备用联系方式
 
-- 邮箱：**security@minigame-labs.com**（仅在该邮箱可用/有人监控时）
+- 邮箱：**security@minigame-labs.com**
 
 > 如果不确定某个问题是否与安全相关，请优先使用私密安全公告。
 
