@@ -127,6 +127,14 @@ jobs:
       - name: Release version contract
         run: bash scripts/test-release-version-contract.sh
 
+      # A fixed Change Date shrinks with every release made under it, and nothing
+      # notices: a release cut after it passes is published under Apache-2.0 on day
+      # one. The date is re-stamped each release as publication + 4 years; this
+      # checks it is still a date, still ahead, still inside BSL's four-year cap,
+      # and still what LEGAL.md and both READMEs tell readers.
+      - name: License change date contract
+        run: bash scripts/test-license-change-date-contract.sh
+
       # A release artifact that records when it was built cannot be rebuilt and
       # compared, which is what Phase 1's same-source byte equality rests on. The
       # AAR metadata recorded the SOURCE_DATE_EPOCH it was given and then stamped a

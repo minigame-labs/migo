@@ -120,7 +120,7 @@ migo/
 
 ## 许可证
 
-Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BSL 1.1）。**每个发布版本在其发布满 4 年时自动转为 Apache 2.0。**
+Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BSL 1.1）。**每个发布版本在其发布满四年时转为 Apache 2.0** —— 具体日期就写在该版本随附的 `LICENSE` 里（当前为 2030-08-15）。
 
 - **阅读、审计、构建、测试、评测、修改、移植** —— 任何规模、任何主体，无条件授予。
 - **把 Migo 嵌进你自己的 App 上线** —— 年营收 ≤ USD 1,000,000 且月活 ≤ 3,000,000 时免费。
@@ -141,4 +141,6 @@ Migo 构建于 [Deno Core](https://github.com/denoland/deno_core)、[V8](https:/
 ## 支持
 
 - Issues: https://github.com/minigame-labs/migo/issues
-- 文档: https://github.com/minigame-labs/migo/wiki
+- 集成指南：[migo-examples](https://github.com/minigame-labs/migo-examples) —— 可运行的游戏与各宿主的构建/运行说明
+- 从源码构建：[BUILD.md](BUILD.md)
+- 商业许可：licensing@minigame-labs.com

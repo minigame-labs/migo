@@ -15,7 +15,7 @@ We take the security of **Migo** seriously. If you believe you have found a secu
 
 ### Alternative Contact
 
-- Email: **security@minigame-labs.com** (only if available / monitored)
+- Email: **security@minigame-labs.com**
 
 > If you are unsure whether an issue is security-related, please use a private advisory.
 
