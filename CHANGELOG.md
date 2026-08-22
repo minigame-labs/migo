@@ -22,6 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three games: first frame 385→274 ms (bunnymark), 384→263 (canvasmark),
   523→368 (endless-runner) — 29–32% faster than WebView, where Migo had been
   slower.
+- Session creation is ~38 ms cheaper. Building the Canvas2D text context
+  costs 35-41 ms on an arm64 device -- `SkFontMgr_Android` parses
+  `/system/etc/fonts.xml` and enumerates the system families, then the
+  bundled fallback face is parsed on top -- and it was being done on the host
+  thread inside `RenderThread::spawn`, before the render thread existed. Every
+  session therefore delayed the start of EGL/Skia initialization by that much
+  and then waited for it, whether or not the game ever drew a glyph. The
+  context is now built by the render thread once its GPU capabilities are
+  published: off the host's critical path, and still long before any game code
+  can ask for a glyph, so no first `fillText` pays for it either. `Host::new`
+  drops from 88-99 ms to 50-58 ms; game-ready improves by 16-53 ms across the
+  three benchmark games.
+- The log level a host configures now takes effect. `tracing` caches what it
+  thinks of a callsite the first time it sees one, and the dynamic level filter
+  did not opt out of that: a callsite first reached while the process default
+  was `Warn` was cached as disabled and stayed dead, so a host that asked for
+  `Info` got silence -- including for the startup timings, which are emitted
+  while the host is being built and so could never be seen.
 - The host event loop no longer logs a warning when it parks with nothing
   pending. It does that three times on every single launch, in the window
   before the game registers its first `requestAnimationFrame`; a warning on

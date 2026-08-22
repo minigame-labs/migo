@@ -53,7 +53,7 @@ use shared::surface::{
     SurfaceReleaseDisposition,
 };
 use shared::{FrameOp, FramePacket};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use shared::raf_signal::RafSender;
 
@@ -1703,9 +1703,14 @@ impl RenderThread {
         // both halves — the render thread's `Renderer2d` and the
         // type-erased handle we expose on `RenderThread` — pick
         // up the same `Arc`.
-        let (shared_text_ctx, text_measurer) = crate::text_measurer_impl::into_shared_measurer(
-            crate::backend::gl::text::TextContext::new(),
-        );
+        // Deferred on purpose: building this costs 35-41 ms of system-font
+        // parsing, and it was being paid here -- on the host thread, before the
+        // render thread had even been spawned -- so it delayed the start of
+        // EGL/Skia initialization by that much on every single session. The
+        // render thread builds it once its GPU capabilities are published,
+        // which is still well before any game code can ask for a glyph.
+        let (shared_text_ctx, text_measurer) =
+            crate::text_measurer_impl::deferred_shared_measurer();
 
         let event_tx_thread = event_tx.clone();
         let shared_text_ctx_for_thread = shared_text_ctx.clone();
@@ -1780,6 +1785,28 @@ impl RenderThread {
                 // published Failed and must never be overwritten by Ready.
                 if !startup_failed {
                     cm.publish_gpu_caps();
+                }
+
+                // Build the text context here, and not before.
+                //
+                // It costs 35-41 ms of system-font parsing on an arm64 device
+                // (`SkFontMgr_Android` walks /system/etc/fonts.xml, then the
+                // bundled fallback face is parsed on top). It used to be built
+                // on the host thread inside `RenderThread::spawn` -- before this
+                // thread existed -- so it pushed the start of EGL/Skia
+                // initialization back by that much and the host then waited for
+                // the result. Here it is off the host's critical path in both
+                // directions: after the caps that unblock the host, and long
+                // before any game code can ask for a glyph, so no first
+                // `fillText` pays for it either.
+                if !startup_failed {
+                    let built = std::time::Instant::now();
+                    shared_text_ctx.lock().get();
+                    debug!(
+                        "[RenderThread host={}] text context built: {:.1}ms",
+                        host_id,
+                        built.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
 
                 // Create GL function loader.
@@ -2317,8 +2344,9 @@ impl RenderThread {
                             // measurement contention is on the JS side
                             // which locks separately.
                             let mut text_ctx = renderer_2d.text.lock();
-                            if let Some(registration) =
-                                text_ctx.register_family_aliases(aliases.as_ref().as_slice(), &bytes)
+                            if let Some(registration) = text_ctx
+                                .get()
+                                .register_family_aliases(aliases.as_ref().as_slice(), &bytes)
                             {
                                 // A newly-registered / replaced typeface
                                 // can change how any cached text rendered:
@@ -2365,8 +2393,8 @@ impl RenderThread {
                                 direction: TextDirection::Inherit,
                             };
                             // Empty-string layout still reports line metrics.
-                            let text_ctx = renderer_2d.text.lock();
-                            let m = text_ctx.measure_text(" ", &attrs);
+                            let mut text_ctx = renderer_2d.text.lock();
+                            let m = text_ctx.get().measure_text(" ", &attrs);
                             drop(text_ctx);
                             let line_height = m.font_bounding_box_ascent
                                 + m.font_bounding_box_descent;
