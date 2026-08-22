@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can ask for a glyph, so no first `fillText` pays for it either. `Host::new`
   drops from 88-99 ms to 50-58 ms; game-ready improves by 16-53 ms across the
   three benchmark games.
+- Creating a session no longer waits for the GPU. `Host::new` blocked on the
+  render thread publishing its capabilities -- 30-44 ms with the caller's
+  `createSession` blocked behind it -- although nothing between that point and
+  the first line of launch JS reads them. The wait moved to just before any
+  prelude or module runs, which is where the invariant it protects was always
+  written down: no untrusted JS may observe the provisional all-false
+  capability snapshot. A GPU failure is now reported from `startGame` rather
+  than from `createSession`. Game-ready improves a further 10-21 ms.
 - The GLES dispatch table is built once per session instead of twice.
   `glow::Context::from_loader_function` resolves 709 symbols through
   `eglGetProcAddress`, which costs 41-50 ms on an arm64 device, and it was
