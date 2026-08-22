@@ -69,6 +69,8 @@ RUST_BUILD_SCRIPT="$SCRIPT_DIR/build-android-so.sh"
 MANIFEST_GENERATOR="$SCRIPT_DIR/generate-android-artifact-manifests.py"
 BUILD_METADATA_WRITER="$SCRIPT_DIR/write-android-build-metadata.py"
 AAR_MANIFEST_VERIFIER="$SCRIPT_DIR/verify-android-aar-manifests.py"
+NOJNI_DERIVE_TOOL="$SCRIPT_DIR/derive-android-nojni-assets.py"
+NOJNI_CONTRACT="$SCRIPT_DIR/test-android-nojni-aar-contract.sh"
 MANIFEST_TOOL_MANIFEST="$REPO_ROOT/tools/artifact-manifest/Cargo.toml"
 MANIFEST_BUILD_ROOT="$LIBRARY_DIR/build/generated/migoArtifactManifest"
 MANIFEST_ASSET_ROOT="$MANIFEST_BUILD_ROOT/assets/migo/artifacts"
@@ -536,6 +538,79 @@ build_aar() {
 }
 
 # ------------------------------------------------------------
+# Split the published AAR into an engine-less AAR and its engine archives
+# ------------------------------------------------------------
+#
+# A host integrating Migo pays ~17 MB of first-install download and ~45 MB
+# installed for libmigo.so per ABI, whether or not a user ever opens a
+# mini-game. These two assets let that cost be deferred to the first launch of a
+# game; see MigoNativeLoader on the Java side. Nothing about the default
+# integration changes -- migo-<version>-android.aar still carries the engine.
+stage_external_engine_assets() {
+    local out_dir="$1"
+    local published_aar="$2"
+    local artifact_name="$3"
+    local base="${artifact_name%.aar}"
+
+    # The published artifact gets the published names; every other variant keeps
+    # its own descriptive base for the same reason its AAR does -- two builds in
+    # one dist/ must never overwrite each other. The derivation runs for both, so
+    # a PR that builds only debug variants still exercises this path and its gate.
+    local nojni="$out_dir/$base-nojni.aar"
+    local template="$out_dir/$base-jni-{arch}.tar.gz"
+    local compress_level=1
+    if [[ "$artifact_name" == migo-*-android.aar ]]; then
+        local version
+        version="$(read_release_version "$REPO_ROOT")"
+        nojni="$out_dir/migo-$version-android-nojni.aar"
+        template="$out_dir/migo-$version-jni-android-{arch}.tar.gz"
+        # Only what ships is worth -9: over a debug engine it costs minutes and
+        # buys a file nobody downloads.
+        compress_level=9
+    fi
+
+    print_info "Deriving the engine-less AAR and engine archives..."
+    rm -f "$nojni" "$nojni.attestation.json"
+    local stale
+    for stale in $(printf '%s\n' "${template/\{arch\}/arm64}" "${template/\{arch\}/x86_64}"); do
+        rm -f "$stale" "$stale.attestation.json"
+    done
+
+    python3 "$NOJNI_DERIVE_TOOL" \
+        --aar "$published_aar" \
+        --nojni-out "$nojni" \
+        --archive-template "$template" \
+        --source-date-epoch "${SOURCE_DATE_EPOCH_VALUE:-0}" \
+        --compress-level "$compress_level"
+
+    local archives=()
+    local arch
+    for arch in "${ARCHITECTURES[@]}"; do
+        case "$arch" in
+            arm64-v8a) archives+=("${template/\{arch\}/arm64}") ;;
+            x86_64) archives+=("${template/\{arch\}/x86_64}") ;;
+            *) print_error "No release arch segment for ABI $arch"; exit 1 ;;
+        esac
+    done
+
+    # The split is only trustworthy if something checks it changed nothing else.
+    # It runs here rather than only in CI so a local build cannot produce a pair
+    # nobody compared.
+    bash "$NOJNI_CONTRACT" "$published_aar" "$nojni" "${archives[@]}"
+
+    if [[ -f "$MANIFEST_INDEX" ]]; then
+        local asset
+        for asset in "$nojni" "${archives[@]}"; do
+            [[ -f "$asset" ]] || continue
+            "$MANIFEST_TOOL" attest "$asset" "$MANIFEST_INDEX" "$asset.attestation.json" >/dev/null
+            "$MANIFEST_TOOL" verify-attestation "$asset.attestation.json" "$asset" \
+                "$MANIFEST_INDEX" >/dev/null
+            print_success "Release attestation -> $(basename "$asset").attestation.json"
+        done
+    fi
+}
+
+# ------------------------------------------------------------
 # Collect Outputs
 # ------------------------------------------------------------
 collect_outputs() {
@@ -584,6 +659,14 @@ collect_outputs() {
         "$MANIFEST_TOOL" verify-attestation "$attestation" "$output_aar" "$MANIFEST_INDEX" >/dev/null
         print_success "Release attestation -> $attestation"
     fi
+
+    # The engine-less AAR and its engine archives are DERIVED from the artifact
+    # above, never built alongside it. Two builds would be two chances to publish
+    # a classes.jar and a libmigo.so that were never verified against each other,
+    # and nothing in a Gradle build would notice. Only the canonical artifact is
+    # split: every other variant name exists so local builds cannot collide, and
+    # none of them is published.
+    stage_external_engine_assets "$out_dir" "$output_aar" "$artifact_name"
 
     cat > "$version_metadata" << EOF
 {

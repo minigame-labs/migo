@@ -703,6 +703,12 @@ jobs:
           for asset in \
             "migo-$VERSION-android.aar" \
             "migo-$VERSION-android.aar.attestation.json" \
+            "migo-$VERSION-android-nojni.aar" \
+            "migo-$VERSION-android-nojni.aar.attestation.json" \
+            "migo-$VERSION-jni-android-arm64.tar.gz" \
+            "migo-$VERSION-jni-android-arm64.tar.gz.attestation.json" \
+            "migo-$VERSION-jni-android-x86_64.tar.gz" \
+            "migo-$VERSION-jni-android-x86_64.tar.gz.attestation.json" \
             "migo-$VERSION-capi-android-arm64.tar.gz" \
             "migo-$VERSION-capi-android-arm64.tar.gz.attestation.json" \
             "migo-$VERSION-capi-android-x86_64.tar.gz" \

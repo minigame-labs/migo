@@ -17,6 +17,30 @@ Migo is **source-available** under the [Business Source License 1.1](LICENSE) (B
 
 Please refer to [LICENSE](LICENSE) for the authoritative and binding terms. This document is a plain-language summary and does not override the license text.
 
+### Hosting the engine binary to deliver it into your own app
+
+Migo's Android SDK can be integrated without packaging `libmigo.so` in your APK,
+so that users who never open a mini-game never download it (see
+`MigoNativeLoader`). Doing that means putting the engine binary somewhere your
+app can fetch it — a Play Feature Delivery module, or, on stores that have no
+such mechanism, storage you control.
+
+**That is a permitted way to ship Migo inside Your App under the Additional Use
+Grant, not a Competitive Offering.** The Use Limitation's first example targets
+distributing Migo *as* a library or SDK to third parties; an endpoint that exists
+to deliver the engine into your own application is the opposite of that, even
+though the bytes travel separately from the rest of your app. Two things keep it
+on this side of the line, and both are conditions of this clarification:
+
+- the endpoint serves your app's own delivery, not third parties looking for a
+  mini-game engine to build on; and
+- you do not present the hosted file as an SDK, a library, or a general-purpose
+  runtime download.
+
+This paragraph states the licensor's intent. It is a clarification of the
+existing grant and does not enlarge it; where it and [LICENSE](LICENSE) differ,
+the license text governs.
+
 ## The Migo Name and Logo
 
 "Migo" and the Migo logo are trademarks of the Migo Authors. The BSL 1.1 grant covers the **software**; it grants no rights in the name or logo (see the Terms section of [LICENSE](LICENSE)).
