@@ -121,8 +121,9 @@ public final class MigoRuntime {
     private static final Object LOCK = new Object();
     private static volatile MigoRuntime sInstance;
 
+    private final Object nativeLock = new Object();
     private volatile boolean nativeLoaded = false;
-    private String nativeVersion = "unknown";
+    private volatile String nativeVersion = "unknown";
     private volatile Throwable nativeLoadError;
 
     /**
@@ -142,21 +143,57 @@ public final class MigoRuntime {
     }
 
     private MigoRuntime() {
-        try {
-            System.loadLibrary("migo");
-            nativeLoaded = true;
-            nativeVersion = NativeBridge.version();
-            if (nativeVersion == null) {
-                nativeVersion = "unknown";
+        // Deliberately empty. Obtaining the singleton must not pull ~45 MB of
+        // engine into the process: a host that delivers the binary itself
+        // (see MigoNativeLoader) needs to wire Migo up in Application.onCreate
+        // and only pay for the engine when a user actually opens a game. Every
+        // accessor below that needs native calls ensureNative() first, so the
+        // packaged default behaves exactly as it did when this constructor
+        // loaded the library.
+    }
+
+    /**
+     * Load the engine on first use.
+     *
+     * @return true when native calls may be made
+     */
+    private boolean ensureNative() {
+        if (nativeLoaded) {
+            return true;
+        }
+        synchronized (nativeLock) {
+            if (nativeLoaded) {
+                return true;
             }
+            if (!MigoNativeLoader.ensureLoaded()) {
+                nativeVersion = "load_failed";
+                nativeLoadError = MigoNativeLoader.lastError();
+                return false;
+            }
+            String reported;
+            try {
+                reported = NativeBridge.version();
+            } catch (UnsatisfiedLinkError e) {
+                // The library is in the process but its JNI registration is
+                // not what this SDK expects -- a mismatched engine that
+                // dlopen() had no reason to reject.
+                nativeVersion = "load_failed";
+                nativeLoadError = e;
+                Log.e("MigoRuntime", "Native library loaded but unusable: " + e.getMessage());
+                return false;
+            }
+            nativeVersion = reported == null ? "unknown" : reported;
             if (!nativeVersion.equals(SDK_VERSION)) {
-                Log.w("MigoRuntime", "SDK/native version mismatch: SDK=" + SDK_VERSION + " native=" + nativeVersion);
+                // A host-delivered binary cannot reach here mismatched: it is
+                // checked against this build's artifact manifest before load.
+                // This remains a warning for the packaged case, where the AAR's
+                // own contents are gated at build time instead.
+                Log.w("MigoRuntime", "SDK/native version mismatch: SDK=" + SDK_VERSION
+                        + " native=" + nativeVersion);
             }
-        } catch (UnsatisfiedLinkError e) {
-            nativeLoaded = false;
-            nativeVersion = "load_failed";
-            nativeLoadError = e;
-            Log.e("MigoRuntime", "Failed to load native library: " + e.getMessage());
+            nativeLoadError = null;
+            nativeLoaded = true;
+            return true;
         }
     }
 
@@ -177,6 +214,7 @@ public final class MigoRuntime {
      * @return Native version (e.g., "0.1.0"), or "unknown" if not loaded
      */
     public String getNativeVersion() {
+        ensureNative();
         return nativeVersion;
     }
 
@@ -186,7 +224,7 @@ public final class MigoRuntime {
      * @return true if native library loaded successfully
      */
     public boolean isNativeLoaded() {
-        return nativeLoaded;
+        return ensureNative();
     }
 
     /**
@@ -196,6 +234,7 @@ public final class MigoRuntime {
      * @return The load error, or null if the native library loaded successfully
      */
     public Throwable getNativeLoadError() {
+        ensureNative();
         return nativeLoadError;
     }
 
@@ -205,7 +244,7 @@ public final class MigoRuntime {
      * @return Minimum API level required by the native engine
      */
     public int getMinSdkVersion() {
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             return FALLBACK_MIN_SDK;
         }
         try {
@@ -227,7 +266,7 @@ public final class MigoRuntime {
      * @return {@code true} if ICU data is ready for text layout
      */
     public boolean initIcuData(String icuDataPath) {
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             return false;
         }
         if (icuDataPath == null || icuDataPath.trim().isEmpty()) {
@@ -256,6 +295,15 @@ public final class MigoRuntime {
         ThreadCheck.ensureMainThread();
         validateCreateSession(activity, surface, config);
         validateGameId(gameId);
+
+        // The engine may not be in the process yet: it is loaded on first use,
+        // and a host that delivers the binary itself may not have delivered it.
+        // Without this the failure surfaces as an UnsatisfiedLinkError out of
+        // the JNI call below, naming a method rather than the real cause.
+        if (!ensureNative()) {
+            throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
+                    "Native library not loaded", nativeLoadError);
+        }
 
         // Initialize app context
         AppContext.init(activity);
@@ -310,7 +358,7 @@ public final class MigoRuntime {
         }
         validateGameId(gameId);
 
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
                     "Native library not loaded", nativeLoadError);
         }
@@ -371,7 +419,7 @@ public final class MigoRuntime {
      * @return true if device is supported
      */
     public boolean isDeviceSupported() {
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             return false;
         }
         return Build.VERSION.SDK_INT >= getMinSdkVersion();
@@ -401,7 +449,7 @@ public final class MigoRuntime {
             throw new MigoException(ErrorCode.ERR_INVALID_CONFIG,
                     ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG));
         }
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
                     "Native library not loaded", nativeLoadError);
         }

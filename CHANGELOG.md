@@ -7,21 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Android hosts can keep the engine out of their first install. `libmigo.so`
+  is ~17 MB of store download and ~45 MB installed per ABI, paid by every
+  user whether or not they ever open a mini-game. Two new release assets let
+  that cost move to the first game launch: `migo-<version>-android-nojni.aar`
+  (the published AAR with `jni/**` deleted) and
+  `migo-<version>-jni-android-<arch>.tar.gz` (the bytes it no longer carries).
+  A host installs a `NativeLibraryProvider` through the new `MigoNativeLoader`
+  and hands over the file; Migo verifies it against the artifact manifest the
+  AAR already embeds before loading it, so a partial download or a mirror
+  still serving the previous release fails with a readable reason instead of
+  crashing inside the engine. Migo downloads nothing itself: on Google Play
+  the only compliant source is Play Feature Delivery, and stores without it
+  expect the host to serve the file, so one built-in downloader would be
+  wrong for one of the two.
+- `scripts/test-android-nojni-aar-contract.sh`, which holds the engine-less
+  AAR to being a deletion rather than a second build -- identical
+  `classes.jar`, identical embedded artifact identities, and every removed
+  byte accounted for in exactly one engine archive.
+
 ### Changed
-- Android cold start reaches its first frame ~37% sooner. Two costs sat on
-  that path and neither had to: full-screen immersive mode was applied from
-  `createSession`, i.e. after the window had already been laid out with the
-  system bars and the surface created at that smaller size, so every launch
-  resized the window and made the engine rebuild its GPU-side surface
-  mid-startup; and the session was created inside the `surfaceCreated`
-  callback, holding the main thread for ~114 ms in the middle of the
-  traversal that draws the window. Immersive mode is now applied in
-  `MigoGameActivity.onCreate`, before the surface exists, and session
-  creation is posted so the traversal can finish and draw first. Measured on
-  a Mate 30 Pro against the Android System WebView, both running the same
-  three games: first frame 385→274 ms (bunnymark), 384→263 (canvasmark),
-  523→368 (endless-runner) — 29–32% faster than WebView, where Migo had been
-  slower.
+- The native library now loads on first use rather than in
+  `MigoRuntime.getInstance()`. Every accessor that needs native calls loads
+  first, so the packaged default behaves exactly as before; what changes is
+  that merely obtaining the singleton no longer pulls the engine into the
+  process.
+- `LEGAL.md` states that hosting the engine binary to deliver it into your
+  own app is covered by the Additional Use Grant and is not a Competitive
+  Offering.
+
+### Changed
+- Android cold start is materially faster, and now leads the system WebView on
+  both metrics for all three benchmark games. Five costs sat on that path and
+  none had to. Full-screen immersive mode was applied from `createSession` --
+  after the window had been laid out with the system bars and the surface
+  created at that smaller size -- so every launch resized the window and made
+  the engine rebuild its GPU-side surface mid-startup; it is now applied in
+  `MigoGameActivity.onCreate`, before the surface exists. And the session was
+  created inside the `surfaceCreated` callback, holding the main thread for
+  ~114 ms in the middle of the traversal that draws the window; it is now
+  posted so the traversal can finish and draw first. The three engine-side
+  costs are the entries below. Measured on a Mate 30 Pro against the device's
+  Android System WebView, medians of 3 cold runs: first frame 385→274 ms
+  (bunnymark), 384→258 (canvasmark), 523→344 (endless-runner); game-ready
+  523→400, 378→336, 804→605. Steady-state fps and memory are unchanged.
 - Session creation is ~38 ms cheaper. Building the Canvas2D text context
   costs 35-41 ms on an arm64 device -- `SkFontMgr_Android` parses
   `/system/etc/fonts.xml` and enumerates the system families, then the
