@@ -36,8 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LEGAL.md` states that hosting the engine binary to deliver it into your
   own app is covered by the Additional Use Grant and is not a Competitive
   Offering.
-
-### Changed
 - Android cold start is materially faster, and now leads the system WebView on
   both metrics for all three benchmark games. Five costs sat on that path and
   none had to. Full-screen immersive mode was applied from `createSession` --
