@@ -1809,10 +1809,13 @@ impl RenderThread {
                     );
                 }
 
-                // Create GL function loader.
-                let gl = unsafe {
-                    glow::Context::from_loader_function(|symbol| cm.gl_proc_address(symbol))
-                };
+                // Reuse the manager's dispatch table rather than resolving the
+                // whole thing again. `from_loader_function` asks the driver for
+                // 709 symbols and costs 41-50 ms on this device; the manager
+                // already paid that, on this thread, against an EGL context in
+                // the same share group, so a second table would be identical
+                // and would only delay the first frame.
+                let gl = cm.gl_shared();
 
                 // ---- Timing sources ----
                 // When an external vsync source is available (Choreographer, or a

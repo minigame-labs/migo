@@ -224,7 +224,7 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
         let (gl_ref, shadow_ref) = {
             let cm_mut: &mut CanvasManager = cm;
             (
-                &cm_mut.gl as *const _,
+                &*cm_mut.gl as *const glow::Context,
                 cm_mut.gl_state.entry(id).or_default() as *mut _,
             )
         };

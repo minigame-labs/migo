@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can ask for a glyph, so no first `fillText` pays for it either. `Host::new`
   drops from 88-99 ms to 50-58 ms; game-ready improves by 16-53 ms across the
   three benchmark games.
+- The GLES dispatch table is built once per session instead of twice.
+  `glow::Context::from_loader_function` resolves 709 symbols through
+  `eglGetProcAddress`, which costs 41-50 ms on an arm64 device, and it was
+  being paid twice: once by `CanvasManager`, with the host thread waiting on
+  it, and again by the render thread immediately afterwards, delaying the
+  first frame by the same amount. Both were built on the render thread from
+  EGL contexts in one share group, so the manager's table now serves both.
+  Game-ready drops a further 40-53 ms.
 - The log level a host configures now takes effect. `tracing` caches what it
   thinks of a callsite the first time it sees one, and the dynamic level filter
   did not opt out of that: a callsite first reached while the process default
