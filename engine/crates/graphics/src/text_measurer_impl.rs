@@ -126,10 +126,12 @@ impl TextMeasurer for TextMeasurerAdapter {
 
     fn register_font(&self, aliases: &[String], bytes: &[u8]) -> Option<String> {
         let mut ctx = self.inner.lock();
-        ctx.get().register_family_aliases(aliases, bytes).and_then(|reg| {
-            reg.internal_family
-                .or_else(|| reg.aliases.into_iter().next())
-        })
+        ctx.get()
+            .register_family_aliases(aliases, bytes)
+            .and_then(|reg| {
+                reg.internal_family
+                    .or_else(|| reg.aliases.into_iter().next())
+            })
     }
 }
 
