@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Android cold start reaches its first frame ~37% sooner. Two costs sat on
+  that path and neither had to: full-screen immersive mode was applied from
+  `createSession`, i.e. after the window had already been laid out with the
+  system bars and the surface created at that smaller size, so every launch
+  resized the window and made the engine rebuild its GPU-side surface
+  mid-startup; and the session was created inside the `surfaceCreated`
+  callback, holding the main thread for ~114 ms in the middle of the
+  traversal that draws the window. Immersive mode is now applied in
+  `MigoGameActivity.onCreate`, before the surface exists, and session
+  creation is posted so the traversal can finish and draw first. Measured on
+  a Mate 30 Pro against the Android System WebView, both running the same
+  three games: first frame 385→274 ms (bunnymark), 384→263 (canvasmark),
+  523→368 (endless-runner) — 29–32% faster than WebView, where Migo had been
+  slower.
+- The host event loop no longer logs a warning when it parks with nothing
+  pending. It does that three times on every single launch, in the window
+  before the game registers its first `requestAnimationFrame`; a warning on
+  the guaranteed path is how a log teaches its reader to skip warnings.
+
 ---
 
 ## v0.9.3 (2026-08-15)

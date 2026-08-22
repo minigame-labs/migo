@@ -6,6 +6,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.graphics.Rect;
 import android.view.SurfaceHolder;
@@ -151,6 +153,9 @@ public class MigoGameActivity extends Activity
         return intent;
     }
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private Runnable pendingInit;
+
     private static RuntimeConfig consumePendingConfig(Intent intent) {
         if (intent == null) {
             return null;
@@ -187,6 +192,7 @@ public class MigoGameActivity extends Activity
         }
 
         applyStartupOrientation();
+        applyStartupImmersiveMode();
 
         // Create surface view
         FrameLayout root = new FrameLayout(this);
@@ -223,14 +229,14 @@ public class MigoGameActivity extends Activity
         } else if (orientationHelper.getTargetOrientation() != null) {
             Rect frame = holder.getSurfaceFrame();
             if (orientationHelper.surfaceMatches(frame.width(), frame.height())) {
-                initializeGame(holder);
+                scheduleInitializeGame(holder);
             } else {
                 Log.i(TAG, "surfaceCreated: deferring init until surface matches "
                         + orientationHelper.getTargetOrientation());
-                orientationHelper.defer(holder, this::initializeGame);
+                orientationHelper.defer(holder, this::scheduleInitializeGame);
             }
         } else {
-            initializeGame(holder);
+            scheduleInitializeGame(holder);
         }
     }
 
@@ -244,9 +250,9 @@ public class MigoGameActivity extends Activity
             SurfaceHolder pending = orientationHelper.consumePending();
             if (pending != null && orientationHelper.surfaceMatches(width, height)) {
                 Log.i(TAG, "surfaceChanged: surface matches, initializing game");
-                initializeGame(pending);
+                scheduleInitializeGame(pending);
             } else if (pending != null) {
-                orientationHelper.defer(pending, this::initializeGame);
+                orientationHelper.defer(pending, this::scheduleInitializeGame);
             }
         }
     }
@@ -254,6 +260,7 @@ public class MigoGameActivity extends Activity
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         Log.i(TAG, "surfaceDestroyed");
+        cancelPendingInit();
         orientationHelper.cancel();
         if (session != null && session.isValid()) {
             session.onSurfaceDestroyed();
@@ -284,6 +291,7 @@ public class MigoGameActivity extends Activity
 
     @Override
     protected void onDestroy() {
+        cancelPendingInit();
         orientationHelper.cancel();
         unregisterComponentCallbacks(this);
         if (session != null) {
@@ -403,6 +411,71 @@ public class MigoGameActivity extends Activity
         Log.i(TAG, "startGameSafe result=" + startResult);
         if (startResult != ErrorCode.SUCCESS) {
             onLaunchFailed(startResult, ErrorCode.getMessage(startResult));
+        }
+    }
+
+    /**
+     * Go full-screen before the surface exists, not after.
+     * <p>
+     * Immersive mode is on by default, and {@code createSession} applies it --
+     * which is after the window has already been laid out with the system bars
+     * and after the surface was created at that smaller size. Hiding the bars
+     * then resizes the window, so every launch produced a second
+     * {@code surfaceChanged} and made the engine tear down and rebuild its
+     * GPU-side surface while the game was still starting. Measured on a Mate 30
+     * Pro, the surface went 2235x1080 -> 2340x1080 some 66 ms after the first
+     * one, all of it on the path to first frame.
+     * <p>
+     * Applying the same flags here, before {@code setContentView}, means the
+     * first surface is already the final one. {@code createSession} still calls
+     * it for hosts that embed {@link MigoGameView} instead of subclassing this
+     * activity; the operation is idempotent window state, so the second call
+     * changes nothing.
+     */
+    /**
+     * Start the session on the next main-thread message rather than inside the
+     * surface callback.
+     * <p>
+     * {@code surfaceCreated} is delivered from the middle of a
+     * {@code ViewRootImpl} traversal, and creating a session is not cheap: it
+     * spawns the host thread and blocks until that thread has built the V8
+     * isolate and the graphics stack. Measured on a Mate 30 Pro that is ~114 ms
+     * of the launch, and every millisecond of it is a millisecond the window
+     * cannot finish its first draw -- the activity transition stalls and the
+     * system reports the activity displayed that much later.
+     * <p>
+     * Nothing about the session needs to happen inside the traversal. Posting it
+     * lets the traversal finish and draw, then does the same work one message
+     * later. The game itself starts at most one frame later than before; the
+     * window appears far sooner and the main thread is never held.
+     */
+    private void scheduleInitializeGame(SurfaceHolder holder) {
+        cancelPendingInit();
+        final SurfaceHolder target = holder;
+        pendingInit = new Runnable() {
+            @Override
+            public void run() {
+                pendingInit = null;
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                initializeGame(target);
+            }
+        };
+        mainHandler.post(pendingInit);
+    }
+
+    /** Drop a scheduled start whose surface or activity is going away. */
+    private void cancelPendingInit() {
+        if (pendingInit != null) {
+            mainHandler.removeCallbacks(pendingInit);
+            pendingInit = null;
+        }
+    }
+
+    private void applyStartupImmersiveMode() {
+        if (config != null && config.isImmersiveMode()) {
+            DisplayCompat.enterImmersiveMode(this);
         }
     }
 
