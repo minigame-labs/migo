@@ -58,6 +58,31 @@ bash scripts/fetch-v8-archives.sh          # Android 目标（构建默认）
 bash scripts/fetch-v8-archives.sh --all    # 所有带 manifest 的目标
 ```
 
+### 让引擎不进首包（Android）
+
+`libmigo.so` 单 ABI 约占 17 MB 商店下载、45 MB 安装体积。如果小游戏只是你 app 的次要功能，
+可以发一个不含它的 APK，等用户第一次打开小游戏时再取——从不打开的用户就永远不用为它付费。
+
+依赖 `migo-<version>-android-nojni.aar` 而不是 `migo-<version>-android.aar`，
+引擎从 `migo-<version>-jni-android-<arch>.tar.gz` 取，然后交给 SDK：
+
+```java
+MigoNativeLoader.setProvider(context, abi -> {
+    File engine = new File(context.getNoBackupFilesDir(), abi + "/libmigo.so");
+    return engine.isFile() ? engine : null;   // null 表示"还没下载好"
+});
+```
+
+文件在加载前会对 AAR 内嵌的 artifact manifest 做校验，所以下载不完整、或镜像还在发上一个版本，
+都会以可读的原因失败，而不是在引擎内部崩溃。`MigoNativeLoader.requiredArtifact(context)`
+返回需要比对的摘要。
+
+从哪里取取决于你上哪个商店：Google Play 上唯一合规的来源是
+[Play Feature Delivery](https://developer.android.com/guide/playcore/feature-delivery)
+（从 Play 之外获取可执行代码违反 Device and Network Abuse 政策）；没有 Feature Delivery 的商店
+则预期你自己托管该文件，[LEGAL.md](LEGAL.md) 已明确这是被许可的。Migo 自己不下载任何东西——
+内置一个下载器必然对其中一种商店是错的。
+
 ## 架构
 
 ```text

@@ -57,6 +57,34 @@ bash scripts/fetch-v8-archives.sh          # Android targets (the build default)
 bash scripts/fetch-v8-archives.sh --all    # every target that has a manifest
 ```
 
+### Keeping the engine out of your first install (Android)
+
+`libmigo.so` is about 17 MB of store download and 45 MB installed, per ABI. If a
+mini-game is a secondary feature of your app, you can ship an APK without it and
+fetch it the first time a user opens a game — users who never do never pay for it.
+
+Depend on `migo-<version>-android-nojni.aar` instead of `migo-<version>-android.aar`,
+take the engine from `migo-<version>-jni-android-<arch>.tar.gz`, and hand it over:
+
+```java
+MigoNativeLoader.setProvider(context, abi -> {
+    File engine = new File(context.getNoBackupFilesDir(), abi + "/libmigo.so");
+    return engine.isFile() ? engine : null;   // null means "not downloaded yet"
+});
+```
+
+The file is verified against the artifact manifest embedded in the AAR before it
+is loaded, so a partial download or a mirror serving the previous release fails
+with a readable reason instead of crashing inside the engine.
+`MigoNativeLoader.requiredArtifact(context)` returns the digest to check against.
+
+Where you may fetch it from depends on your store: on Google Play the only
+compliant source is [Play Feature Delivery](https://developer.android.com/guide/playcore/feature-delivery)
+(fetching executable code from anywhere else violates the Device and Network Abuse
+policy); stores without Feature Delivery expect you to host the file yourself,
+which [LEGAL.md](LEGAL.md) confirms is permitted. Migo never downloads anything
+itself, because one built-in downloader would be wrong for one of the two.
+
 ## Architecture
 
 ```text

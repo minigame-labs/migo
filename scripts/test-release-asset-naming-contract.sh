@@ -19,6 +19,18 @@
 #   migo-<version>-android.aar                       Java/Kotlin -- `.aar` already says
 #                                                    "Android", so no api segment, and
 #                                                    it is multi-ABI so no arch segment
+#   migo-<version>-android-nojni.aar                 the same AAR with `jni/**` removed,
+#                                                    for hosts that deliver the engine at
+#                                                    runtime instead of shipping ~17 MB of
+#                                                    download to users who may never open a
+#                                                    mini-game. `nojni` names exactly what
+#                                                    was deleted, which is what lets
+#                                                    test-android-nojni-aar-contract.sh
+#                                                    assert the relationship between the two
+#   migo-<version>-jni-android-<arch>.tar.gz         the bytes `-nojni` does not carry. One
+#                                                    slice each, so unlike the AARs these do
+#                                                    take an arch segment -- same reason the
+#                                                    capi packages do
 #   migo-<version>-capi-<platform>-<arch>.tar.gz     C ABI
 #   migo-<version>-sbom.cdx.json
 #   <any of the above>.attestation.json
@@ -59,6 +71,8 @@ staging = pathlib.Path(sys.argv[2])
 version = (root / "release/VERSION").read_text(encoding="utf-8").strip()
 
 AAR = re.compile(rf"^migo-{re.escape(version)}-android\.aar$")
+NOJNI_AAR = re.compile(rf"^migo-{re.escape(version)}-android-nojni\.aar$")
+JNI = re.compile(rf"^migo-{re.escape(version)}-jni-android-({'|'.join(ARCHES)})\.tar\.gz$")
 CAPI = re.compile(
     rf"^migo-{re.escape(version)}-capi-({'|'.join(PLATFORMS)})-({'|'.join(ARCHES)})\.tar\.gz$"
 )
@@ -66,7 +80,13 @@ SBOM = re.compile(rf"^migo-{re.escape(version)}-sbom\.cdx\.json$")
 
 
 def payload_ok(name: str) -> bool:
-    return bool(AAR.match(name) or CAPI.match(name) or SBOM.match(name))
+    return bool(
+        AAR.match(name)
+        or NOJNI_AAR.match(name)
+        or JNI.match(name)
+        or CAPI.match(name)
+        or SBOM.match(name)
+    )
 
 
 def why_rejected(name: str) -> str:
@@ -87,7 +107,7 @@ def why_rejected(name: str) -> str:
     # Shape is right but the version is not: the failure a shape-only check would miss,
     # and the one a copied-forward asset from the previous release produces.
     loose = re.match(
-        rf"^migo-(\d+\.\d+\.\d+[^-]*)-(capi-)?({'|'.join(PLATFORMS)}|android|sbom)",
+        rf"^migo-(\d+\.\d+\.\d+[^-]*)-(capi-|jni-)?({'|'.join(PLATFORMS)}|android|sbom)",
         name,
     )
     if loose and loose.group(1) != version:
@@ -97,10 +117,15 @@ def why_rejected(name: str) -> str:
             "once downloaded"
         )
     if name.endswith(".aar"):
-        return f"is not `migo-{version}-android.aar`. One AAR is published, multi-ABI, under one name"
+        return (
+            f"is neither `migo-{version}-android.aar` nor `migo-{version}-android-nojni.aar`. "
+            "Exactly two AARs are published -- the multi-ABI one and the same build with "
+            "`jni/**` deleted -- and neither takes an arch segment"
+        )
     if name.endswith(".tar.gz"):
         return (
-            f"is not `migo-{version}-capi-<platform>-<arch>.tar.gz` with platform in "
+            f"is neither `migo-{version}-capi-<platform>-<arch>.tar.gz` nor "
+            f"`migo-{version}-jni-android-<arch>.tar.gz`, with platform in "
             f"{list(PLATFORMS)} and arch in {list(ARCHES)}"
         )
     return (

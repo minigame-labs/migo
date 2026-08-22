@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Android hosts can keep the engine out of their first install. `libmigo.so`
+  is ~17 MB of store download and ~45 MB installed per ABI, paid by every
+  user whether or not they ever open a mini-game. Two new release assets let
+  that cost move to the first game launch: `migo-<version>-android-nojni.aar`
+  (the published AAR with `jni/**` deleted) and
+  `migo-<version>-jni-android-<arch>.tar.gz` (the bytes it no longer carries).
+  A host installs a `NativeLibraryProvider` through the new `MigoNativeLoader`
+  and hands over the file; Migo verifies it against the artifact manifest the
+  AAR already embeds before loading it, so a partial download or a mirror
+  still serving the previous release fails with a readable reason instead of
+  crashing inside the engine. Migo downloads nothing itself: on Google Play
+  the only compliant source is Play Feature Delivery, and stores without it
+  expect the host to serve the file, so one built-in downloader would be
+  wrong for one of the two.
+- `scripts/test-android-nojni-aar-contract.sh`, which holds the engine-less
+  AAR to being a deletion rather than a second build -- identical
+  `classes.jar`, identical embedded artifact identities, and every removed
+  byte accounted for in exactly one engine archive.
+
+### Changed
+- The native library now loads on first use rather than in
+  `MigoRuntime.getInstance()`. Every accessor that needs native calls loads
+  first, so the packaged default behaves exactly as before; what changes is
+  that merely obtaining the singleton no longer pulls the engine into the
+  process.
+- `LEGAL.md` states that hosting the engine binary to deliver it into your
+  own app is covered by the Additional Use Grant and is not a Competitive
+  Offering.
+
 ---
 
 ## v0.9.3 (2026-08-15)
