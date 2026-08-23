@@ -182,7 +182,15 @@ fn decide_async_upload_reject_action(
 pub(crate) struct CanvasManager {
     egl_provider: std::sync::Arc<dyn EglProvider>,
     egl: egl_ops::EglRuntime,
-    gl: glow::Context,
+    /// Shared so the render thread can reuse this table instead of building a
+    /// second one. `glow::Context::from_loader_function` resolves the whole
+    /// GLES dispatch table -- 709 symbols on this device -- and that measured
+    /// 41-50 ms. It was being paid twice per session: once here, blocking the
+    /// host thread's GPU join, and once again in `RenderThread` right after,
+    /// delaying the first frame by the same amount. Both contexts are built on
+    /// the render thread from EGL contexts in one share group, so one table
+    /// serves both.
+    gl: std::sync::Arc<glow::Context>,
     display: egl::Display,
     config: egl::Config,
     /// See `EglInitResult::surfaceless`.
@@ -528,6 +536,15 @@ impl CanvasManager {
         &self.text_cache
     }
 
+    /// The GL dispatch table this manager built, for the render thread to reuse.
+    ///
+    /// See the `gl` field: building a second one costs 41-50 ms of
+    /// `eglGetProcAddress` on the path to first frame, for a table identical to
+    /// this one.
+    pub(crate) fn gl_shared(&self) -> std::sync::Arc<glow::Context> {
+        std::sync::Arc::clone(&self.gl)
+    }
+
     /// Resolve a GL entry point from the exact EGL implementation injected for
     /// this manager. Used only while constructing render-thread dispatch tables.
     pub(crate) fn gl_proc_address(&self, symbol: &str) -> *const std::ffi::c_void {
@@ -761,7 +778,7 @@ impl CanvasManager {
         Ok(Self {
             egl_provider,
             egl,
-            gl,
+            gl: std::sync::Arc::new(gl),
             display,
             config,
             surfaceless,
@@ -3732,7 +3749,7 @@ impl CanvasManager {
         &mut self,
         canvas_id: CanvasId,
     ) -> context_2d_impl::Canvas2DGlScopeGuard {
-        let gl_ptr: *const glow::Context = &self.gl;
+        let gl_ptr: *const glow::Context = &*self.gl;
         let shadow = self.gl_state.entry(canvas_id).or_default() as *mut _;
         // SAFETY: `self.gl` is never mutated; `gl_state` is borrowed
         // only through this pointer until the guard drops.  The

@@ -201,6 +201,11 @@ pub(crate) struct Host {
     last_game_id: Option<String>,
     last_entry: Option<String>,
 
+    /// When the render thread was launched, i.e. when the GPU readiness budget
+    /// started. Kept so the wait for it can happen later than this struct is
+    /// built without moving the deadline. See [`Host::ensure_gpu_ready`].
+    gpu_init_started: Instant,
+
     /// Shared flag: `true` while the app is backgrounded (OnHide).
     /// Network polling ops check this to throttle CPU usage.
     backgrounded: Arc<AtomicBool>,
@@ -563,36 +568,22 @@ impl Host {
             t_js_done.duration_since(t_js_start).as_secs_f64() * 1000.0
         );
 
-        // The render thread has been initializing EGL/GL/Skia concurrently with
-        // HostJsRuntime::new. Join before watchdog installation, Host publication,
-        // the caller's ready signal, or any untrusted game evaluation. This keeps
-        // image ops from observing the provisional all-false capability snapshot.
-        let t_gpu_join_start = Instant::now();
-        let gpu_join_error = match gpu_caps.wait_ready_until(gpu_init_started, GPU_INIT_TIMEOUT) {
-            shared::device::gpu_caps::GpuCapsReadyState::Ready => None,
-            shared::device::gpu_caps::GpuCapsReadyState::Failed(detail) => Some(
-                shared::error::EngineError::new(shared::error::ErrorCode::Render2DInitError)
-                    .with_detail(detail),
-            ),
-            shared::device::gpu_caps::GpuCapsReadyState::Timeout => Some(
-                shared::error::EngineError::new(shared::error::ErrorCode::Timeout)
-                    .with_detail("render thread did not publish GPU caps within 2 seconds"),
-            ),
-        };
-        if let Some(error) = gpu_join_error {
-            // Preserve V8 thread affinity and the normal Host teardown order:
-            // destroy the isolate while still on its owner thread, then stop GL.
-            drop(js);
-            render.shutdown_detached();
-            return Err(error);
-        }
-        let t_gpu_ready = Instant::now();
-        info!(
-            "[Host {}] GPU init joined: {:.1}ms since readiness budget start, residual wait {:.1}ms",
-            id,
-            t_gpu_ready.duration_since(gpu_init_started).as_secs_f64() * 1000.0,
-            t_gpu_ready.duration_since(t_gpu_join_start).as_secs_f64() * 1000.0,
-        );
+        // The render thread is still initializing EGL/GL/Skia. Waiting for it
+        // used to happen right here, and the caller paid for it: `Host::new`
+        // ran on the host thread while the JNI `init` that asked for it was
+        // blocked, so 30-44 ms of GPU startup sat between a host calling
+        // `createSession` and being able to start a game. Nothing between here
+        // and the first line of game JS needs the capabilities -- not the
+        // watchdog, not publication, not the ready signal -- so the wait moved
+        // to `ensure_gpu_ready`, called from `on_evaluate_module` before any
+        // prelude or module runs. The invariant it protects is unchanged and is
+        // the one that was always written down: no untrusted JS may observe the
+        // provisional all-false capability snapshot.
+        //
+        // The cost of moving it is where a GPU failure surfaces: it is now
+        // reported from `startGame` rather than from `createSession`. Both
+        // paths already carry an error to the host, and a session nobody starts
+        // a game in never needed the GPU.
 
         // ---- Process deadline watchdog (v8-limits) ----
         // Install AFTER trusted runtime/bootstrap construction and BEFORE any
@@ -613,13 +604,12 @@ impl Host {
 
         let t_total = Instant::now();
         info!(
-            "[Host {}] Host::new() total: {:.1}ms (pre_js={:.1}ms, JsRuntime={:.1}ms, gpu_join_wait={:.1}ms, post_join={:.1}ms)",
+            "[Host {}] Host::new() total: {:.1}ms (pre_js={:.1}ms, JsRuntime={:.1}ms, post_js={:.1}ms)",
             id,
             t_total.duration_since(t_start).as_secs_f64() * 1000.0,
             t_pre_js_done.duration_since(t_start).as_secs_f64() * 1000.0,
             t_js_done.duration_since(t_js_start).as_secs_f64() * 1000.0,
-            t_gpu_ready.duration_since(t_gpu_join_start).as_secs_f64() * 1000.0,
-            t_total.duration_since(t_gpu_ready).as_secs_f64() * 1000.0,
+            t_total.duration_since(t_js_done).as_secs_f64() * 1000.0,
         );
 
         let host = Self {
@@ -648,6 +638,7 @@ impl Host {
             pending_on_show_args: None,
             input_state: InputState::default(),
             gpu_caps,
+            gpu_init_started,
             render_notify,
         };
         startup_guard.disarm();
@@ -1331,10 +1322,52 @@ impl Host {
         }
     }
 
+    /// Wait for the render thread to publish its GPU capabilities.
+    ///
+    /// Called before the first line of game-supplied JS and nowhere else. Image
+    /// ops read the capability snapshot to choose upload paths, and the
+    /// provisional snapshot is all-false, so content must never run against it;
+    /// nothing before this point reads it at all.
+    ///
+    /// The deadline is measured from when the render thread was launched, not
+    /// from this call, so deferring the wait cannot extend the budget.
+    ///
+    /// Idempotent: after the first success this is an atomic load.
+    fn ensure_gpu_ready(&mut self) -> EngineResult<()> {
+        let waited = Instant::now();
+        match self
+            .gpu_caps
+            .wait_ready_until(self.gpu_init_started, GPU_INIT_TIMEOUT)
+        {
+            shared::device::gpu_caps::GpuCapsReadyState::Ready => {
+                info!(
+                    "[Host {}] GPU caps ready: {:.1}ms since readiness budget start, residual wait {:.1}ms",
+                    self.id,
+                    self.gpu_init_started.elapsed().as_secs_f64() * 1000.0,
+                    waited.elapsed().as_secs_f64() * 1000.0,
+                );
+                Ok(())
+            }
+            shared::device::gpu_caps::GpuCapsReadyState::Failed(detail) => Err(
+                shared::error::EngineError::new(shared::error::ErrorCode::Render2DInitError)
+                    .with_detail(detail),
+            ),
+            shared::device::gpu_caps::GpuCapsReadyState::Timeout => Err(
+                shared::error::EngineError::new(shared::error::ErrorCode::Timeout)
+                    .with_detail("render thread did not publish GPU caps within 2 seconds"),
+            ),
+        }
+    }
+
     async fn on_evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
         let t_eval_start = Instant::now();
         self.last_game_id = Some(game_id.clone());
         self.last_entry = Some(entry.clone());
+
+        // Before any prelude, and so before any JS the host or the game
+        // supplied. This is the point the all-false capability snapshot must
+        // not survive past.
+        self.ensure_gpu_ready()?;
 
         // Run boot prelude scripts (e.g. BOM/DOM adapter for browser-style
         // games) before the main module loads. Prelude failures abort the

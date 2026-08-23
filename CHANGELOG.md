@@ -36,6 +36,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LEGAL.md` states that hosting the engine binary to deliver it into your
   own app is covered by the Additional Use Grant and is not a Competitive
   Offering.
+- Android cold start is materially faster, and now leads the system WebView on
+  both metrics for all three benchmark games. Five costs sat on that path and
+  none had to. Full-screen immersive mode was applied from `createSession` --
+  after the window had been laid out with the system bars and the surface
+  created at that smaller size -- so every launch resized the window and made
+  the engine rebuild its GPU-side surface mid-startup; it is now applied in
+  `MigoGameActivity.onCreate`, before the surface exists. And the session was
+  created inside the `surfaceCreated` callback, holding the main thread for
+  ~114 ms in the middle of the traversal that draws the window; it is now
+  posted so the traversal can finish and draw first. The three engine-side
+  costs are the entries below. Measured on a Mate 30 Pro against the device's
+  Android System WebView, medians of 3 cold runs: first frame 385→274 ms
+  (bunnymark), 384→258 (canvasmark), 523→344 (endless-runner); game-ready
+  523→400, 378→336, 804→605. Steady-state fps and memory are unchanged.
+- Session creation is ~38 ms cheaper. Building the Canvas2D text context
+  costs 35-41 ms on an arm64 device -- `SkFontMgr_Android` parses
+  `/system/etc/fonts.xml` and enumerates the system families, then the
+  bundled fallback face is parsed on top -- and it was being done on the host
+  thread inside `RenderThread::spawn`, before the render thread existed. Every
+  session therefore delayed the start of EGL/Skia initialization by that much
+  and then waited for it, whether or not the game ever drew a glyph. The
+  context is now built by the render thread once its GPU capabilities are
+  published: off the host's critical path, and still long before any game code
+  can ask for a glyph, so no first `fillText` pays for it either. `Host::new`
+  drops from 88-99 ms to 50-58 ms; game-ready improves by 16-53 ms across the
+  three benchmark games.
+- Creating a session no longer waits for the GPU. `Host::new` blocked on the
+  render thread publishing its capabilities -- 30-44 ms with the caller's
+  `createSession` blocked behind it -- although nothing between that point and
+  the first line of launch JS reads them. The wait moved to just before any
+  prelude or module runs, which is where the invariant it protects was always
+  written down: no untrusted JS may observe the provisional all-false
+  capability snapshot. A GPU failure is now reported from `startGame` rather
+  than from `createSession`. Game-ready improves a further 10-21 ms.
+- The GLES dispatch table is built once per session instead of twice.
+  `glow::Context::from_loader_function` resolves 709 symbols through
+  `eglGetProcAddress`, which costs 41-50 ms on an arm64 device, and it was
+  being paid twice: once by `CanvasManager`, with the host thread waiting on
+  it, and again by the render thread immediately afterwards, delaying the
+  first frame by the same amount. Both were built on the render thread from
+  EGL contexts in one share group, so the manager's table now serves both.
+  Game-ready drops a further 40-53 ms.
+- The log level a host configures now takes effect. `tracing` caches what it
+  thinks of a callsite the first time it sees one, and the dynamic level filter
+  did not opt out of that: a callsite first reached while the process default
+  was `Warn` was cached as disabled and stayed dead, so a host that asked for
+  `Info` got silence -- including for the startup timings, which are emitted
+  while the host is being built and so could never be seen.
+- The host event loop no longer logs a warning when it parks with nothing
+  pending. It does that three times on every single launch, in the window
+  before the game registers its first `requestAnimationFrame`; a warning on
+  the guaranteed path is how a log teaches its reader to skip warnings.
 
 ---
 

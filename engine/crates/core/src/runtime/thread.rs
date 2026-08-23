@@ -5,7 +5,7 @@ use std::{
 };
 
 use tokio::runtime::{Builder, Runtime};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use shared::{
     config::InitOptions,
@@ -359,12 +359,18 @@ fn spawn_host_thread_inner(
                                     break 'outer;
                                 }
                                 // Event loop returned Ok — no pending ops/timers/promises.
-                                // With op-based RAF this normally shouldn't happen (the pending
-                                // op_await_next_frame keeps the loop alive).  Safety fallback:
-                                // park on the command channel + render/audio signals (no polling
+                                // Ordinary once the game is running, because the pending
+                                // op_await_next_frame keeps the loop alive; ordinary *before* it
+                                // is running too, which is what this used to claim was abnormal.
+                                // It fires three times on every single launch, in the window
+                                // between the host thread coming up and the game registering its
+                                // first rAF -- a warning on the guaranteed path is how a log
+                                // teaches its reader to skip warnings.
+                                //
+                                // Park on the command channel + render/audio signals (no polling
                                 // timer) so a ContextLost or a first audio command during an idle
                                 // stretch is still handled promptly.
-                                warn!("[Host {}] event loop idle, parking on command/render/audio signals", id);
+                                debug!("[Host {}] event loop idle, parking on command/render/audio signals", id);
                                 loop {
                                     tokio::select! {
                                         biased;
