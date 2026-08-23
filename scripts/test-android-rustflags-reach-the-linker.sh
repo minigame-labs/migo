@@ -164,4 +164,27 @@ for triple in $declared_targets; do
     done
 done
 
+# 5. The same trap, one door along. `build-linux-sdk.sh` also exports RUSTFLAGS,
+#    and today that discards nothing because neither `[build].rustflags` nor the
+#    host target declares any. The day one is added it would vanish exactly as
+#    the Android ones did, on a build with no gate watching. So the absence is
+#    asserted rather than assumed: adding flags there is fine, but that script
+#    has to carry them first.
+stray="$(python3 - "$CONFIG" <<'STRAY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+if config.get("build", {}).get("rustflags"):
+    print("[build].rustflags")
+host = config.get("target", {}).get("x86_64-unknown-linux-gnu", {})
+if host.get("rustflags"):
+    print("[target.x86_64-unknown-linux-gnu].rustflags")
+STRAY
+)"
+[[ -z "$stray" ]] || fail "declared where an exporting build script would discard them:
+$(printf '        %s\n' $stray)
+      scripts/build-linux-sdk.sh sets RUSTFLAGS, which replaces these rather
+      than merging. Teach that script to carry them (see config_rustflags in
+      build-android-so.sh) before declaring any here."
+
 echo "PASS: config rustflags reach the Android link ($checked target(s))"
