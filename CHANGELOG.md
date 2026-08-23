@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `MigoNativeLoader.prepare(context, file)`, for hosts that deliver the engine
+  themselves. It runs the same verification the load already does, on the
+  thread the caller is on. It does not make the load safer -- what it changes
+  is when a bad file is found: a truncated download or a mirror serving the
+  previous release is otherwise discovered when a user opens a game, as a
+  launch failure, rather than by the download code that still has the network
+  connection. It also keeps the check off the main thread; verification is
+  41 ms for a 45 MB release engine on a Mate 30 Pro, and the load afterwards
+  finds the result recorded and hashes nothing.
+
+### Added
 - Android hosts can keep the engine out of their first install. `libmigo.so`
   is ~17 MB of store download and ~45 MB installed per ABI, paid by every
   user whether or not they ever open a mini-game. Two new release assets let

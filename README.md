@@ -76,7 +76,10 @@ MigoNativeLoader.setProvider(context, abi -> {
 The file is verified against the artifact manifest embedded in the AAR before it
 is loaded, so a partial download or a mirror serving the previous release fails
 with a readable reason instead of crashing inside the engine.
-`MigoNativeLoader.requiredArtifact(context)` returns the digest to check against.
+`MigoNativeLoader.requiredArtifact(context)` returns the digest to check against,
+and `MigoNativeLoader.prepare(context, file)` runs that check on the thread you
+call it from — so your download code learns about a bad file immediately rather
+than a user meeting it as a launch failure later.
 
 Where you may fetch it from depends on your store: on Google Play the only
 compliant source is [Play Feature Delivery](https://developer.android.com/guide/playcore/feature-delivery)
