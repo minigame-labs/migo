@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- An unparseable `ctx.font` assignment is a no-op again, on both sides of the
+  engine. WHATWG says an invalid value leaves the previous font in effect, and
+  the render thread already did that -- it rejected the shorthand and kept its
+  state. The JS thread did not: it stored the string and `measureText` answered
+  from a best-effort parse of it. So a typo'd font string measured at one size
+  and painted at another, silently. `ctx.font = "definitely not a font"` after
+  `64px "..."` measured 36 px of text the engine painted 221 px of. The check
+  now happens once, in `op_set_font`, ahead of both -- so an invalid value never
+  reaches either side and `ctx.font` never reports one. The strict parser moved
+  to `shared` to make that possible, which is also what finally makes the
+  "one parser, one source of truth" comment in the 2D context true.
+
 ### Added
 - Android hosts can keep the engine out of their first install. `libmigo.so`
   is ~17 MB of store download and ~45 MB installed per ABI, paid by every
@@ -70,6 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written down: no untrusted JS may observe the provisional all-false
   capability snapshot. A GPU failure is now reported from `startGame` rather
   than from `createSession`. Game-ready improves a further 10-21 ms.
+- The dev player deploys a whole game bundle, not just `game.js` and
+  `game.json`. It copied those two files by name, so it could not run any
+  bundle carrying an asset -- a font, an image, a sub-package -- which made a
+  whole category of conformance test impossible to write.
 - The GLES dispatch table is built once per session instead of twice.
   `glow::Context::from_loader_function` resolves 709 symbols through
   `eglGetProcAddress`, which costs 41-50 ms on an arm64 device, and it was
