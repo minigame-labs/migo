@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The first `readPixels` on a WebGL context no longer returns an empty buffer.
+  While one canvas exists and nothing has read the default framebuffer, WebGL
+  renders straight to the window surface and the intermediate DrawingBuffer is
+  bypassed. The first readback ends that bypass -- a read needs a real FBO --
+  and the engine bound the DrawingBuffer without putting anything in it, so the
+  read returned `[0,0,0,0]` for pixels the game had just drawn. It happens once
+  per context, at startup, which is the hardest kind of bug to notice and the
+  easiest to blame on the content; content that builds textures by drawing and
+  reading back gets one empty texture. `signal_default_fbo_readback` has
+  documented this snapshot since the flag was introduced -- only the code was
+  missing. Found by a new WebGL bundle in migo-conformance on its first run.
+
 ### Added
 - Android hosts can keep the engine out of their first install. `libmigo.so`
   is ~17 MB of store download and ~45 MB installed per ABI, paid by every

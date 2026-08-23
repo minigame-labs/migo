@@ -2768,10 +2768,52 @@ impl CanvasManager {
     /// readback that triggered this signal sees valid content immediately,
     /// not just on subsequent frames.
     pub(crate) fn signal_default_fbo_readback(&mut self) {
-        if should_latch_default_fbo_readback(self.needs_default_fbo_readback) {
-            self.needs_default_fbo_readback = true;
-            self.evaluate_bypass();
+        if !should_latch_default_fbo_readback(self.needs_default_fbo_readback) {
+            return;
         }
+        // Take the snapshot while bypass is still on, so the surface is still
+        // the thing the game has been drawing into. Without it the mode change
+        // below binds a DrawingBuffer that has never been written, and the
+        // readback that asked for this returns an empty buffer for pixels the
+        // game just drew -- once, on the first read of a context, which is the
+        // hardest kind of bug to notice and the easiest to blame on content.
+        // The doc comment above has described this snapshot since the flag was
+        // introduced; only the code was missing.
+        let onscreen_id = CanvasId::from(1u32);
+        // `glBlitFramebuffer` is GLES 3.0+. On GLES 2 there is no snapshot to
+        // take and the first read after the mode change is empty, as before.
+        let mut snapshot_attempted = false;
+        if self.gles_major >= 3 {
+            if let Some(entry) = self.canvases.get(&onscreen_id) {
+                if entry.bypass_drawing_buffer {
+                    if let Some(db) = entry.drawing_buffer.as_ref() {
+                        snapshot_attempted = true;
+                        if !drawing_buffer::blit_from_surface(
+                            &self.gl,
+                            db,
+                            entry.physical_width,
+                            entry.physical_height,
+                        ) {
+                            tracing::warn!(
+                                "default-FBO readback: could not snapshot the surface into \
+                                 the DrawingBuffer; this read sees an empty buffer"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if snapshot_attempted {
+            // The blit leaves FBO 0 bound on every path, successful or not, so
+            // the shadow has to say so -- otherwise the next draw is issued
+            // against a binding the tracker believes is something else.
+            crate::backend::gl::state_tracker::record_default_framebuffer_bind(
+                self.gl_state.entry(onscreen_id).or_default(),
+            );
+        }
+
+        self.needs_default_fbo_readback = true;
+        self.evaluate_bypass();
     }
 
     pub(crate) fn evaluate_bypass(&mut self) {
