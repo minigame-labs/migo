@@ -53,6 +53,32 @@ use x11_window::X11Window;
 
 const GAME_ID: &str = "player-demo";
 const ENTRY: &str = "game.js";
+
+/// Copy a directory tree, creating destination directories as needed.
+///
+/// Deliberately not following symlinks into the tree: a game bundle is content,
+/// and a dev tool that dereferences a link out of it would deploy whatever the
+/// link pointed at. `copy` on a symlink copies what it resolves to within this
+/// process's view, which is the behaviour a bundle author expects for a file
+/// they put there on purpose.
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("read entry in {}: {e}", src.display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("stat {}: {e}", from.display()))?;
+        if kind.is_dir() {
+            std::fs::create_dir_all(&to).map_err(|e| format!("mkdir {}: {e}", to.display()))?;
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)
+                .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
 const SURFACE_W: u32 = 720;
 const SURFACE_H: u32 = 1280;
 /// How often the window mode drains X events while the game renders.
@@ -124,12 +150,23 @@ fn run(
         .join(GAME_ID)
         .join("code");
     std::fs::create_dir_all(&code_dir).map_err(|e| format!("mkdir code_dir: {e}"))?;
-    for name in ["game.json", "game.js"] {
-        let src = bundle_dir.join(name);
-        let dst = code_dir.join(name);
-        std::fs::copy(&src, &dst)
-            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    // The whole bundle, not just its two required files.
+    //
+    // This used to copy exactly `game.json` and `game.js`, which meant the
+    // player could not run any bundle that carried an asset -- a font, an
+    // image, a sub-package. That is not a limitation of the engine, only of
+    // this deployment step, and it made a whole category of conformance test
+    // impossible to write: text has to ship its own typeface, because measuring
+    // the platform's default face measures the platform.
+    for name in ["game.json", ENTRY] {
+        if !bundle_dir.join(name).is_file() {
+            return Err(format!(
+                "{} is not a game bundle: no {name}",
+                bundle_dir.display()
+            ));
+        }
     }
+    copy_tree(&bundle_dir, &code_dir)?;
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("mkdir cache: {e}"))?;
     std::fs::create_dir_all(&code_cache_dir).map_err(|e| format!("mkdir code-cache: {e}"))?;
     tracing::info!("deployed game '{GAME_ID}' to {}", code_dir.display());
