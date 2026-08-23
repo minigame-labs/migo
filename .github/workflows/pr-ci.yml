@@ -594,6 +594,14 @@ jobs:
       - name: Android AAR reproducibility
         run: bash scripts/test-android-aar-reproducibility.sh
 
+      # An SDK that ships a runtime library picks that library's version for its
+      # host, and the published v0.9.3 AAR shipped ~2 MB of `libc++_shared.so`
+      # that no shipped .so ever named in DT_NEEDED. Needs the freshly built
+      # AARs from the step above.
+      - name: Android shipped natives are reachable
+        run: bash scripts/test-android-native-deps-contract.sh
+
+
       - name: Analyze AAR size report
         run: |
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-debug.aar \

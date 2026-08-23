@@ -494,10 +494,48 @@ build_platform() {
     print_success "Copied -> $dst_so"
 
     # --------------------------------------------------------
-    # Copy libc++_shared.so (required by cpal/oboe shared STL)
-    # Note: cannot use static STL because V8's prebuilt librusty_v8.a
-    # already embeds static libc++ symbols — linking both causes duplicates.
+    # Ship libc++_shared.so only if libmigo.so actually asks for it.
+    #
+    # It used to be copied unconditionally, for cpal/oboe's shared STL. That
+    # stopped being true without anyone noticing: `librusty_v8.a` carries
+    # Chromium's own libc++ statically, the link resolves every C++ runtime
+    # symbol from it, and the produced `libmigo.so` has no DT_NEEDED entry for
+    # `libc++_shared.so` at all -- verified on arm64 full, arm64 slim, and the
+    # x86_64 binary inside the published v0.9.3 AAR. Its only two undefined
+    # C++-ish symbols, `__cxa_atexit` and `__cxa_finalize`, come from bionic's
+    # libc.
+    #
+    # So every integration carried ~1 MB per ABI that nothing loaded (~2 MB in
+    # the published dual-ABI AAR), and shipped a libc++ that could collide with
+    # the host's own -- when two AARs both provide `libc++_shared.so`, Gradle
+    # picks one, and the loser's libraries get an ABI they were not built
+    # against.
+    #
+    # Asking the binary is the whole point: this stays correct if a future
+    # dependency really does need the shared STL, and stays quiet when none
+    # does. Removed by hand it would come back the first time someone
+    # "restored" the copy. test-android-native-deps-contract.sh is the gate.
     # --------------------------------------------------------
+    local readelf_bin=""
+    if [[ -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$(get_host_platform 2>/dev/null)/bin/llvm-readelf" ]]; then
+        readelf_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$(get_host_platform)/bin/llvm-readelf"
+    elif command -v llvm-readelf &>/dev/null; then
+        readelf_bin="$(command -v llvm-readelf)"
+    elif command -v readelf &>/dev/null; then
+        readelf_bin="$(command -v readelf)"
+    fi
+    if [[ -z "$readelf_bin" ]]; then
+        print_error "no readelf available to read $dst_so's shared-library dependencies"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
+    fi
+    if ! "$readelf_bin" --dynamic "$dst_so" 2>/dev/null | grep -q 'NEEDED.*libc++_shared\.so'; then
+        print_info "libc++_shared.so not needed by $(basename "$dst_so"); not shipping it"
+        rm -f "$dst_dir/libc++_shared.so"
+        export RUSTFLAGS="$orig_rustflags"
+        return 0
+    fi
+
     local host_platform
     if ! host_platform=$(get_host_platform); then
         print_warning "Unable to detect NDK host platform under: $ANDROID_NDK_HOME/toolchains/llvm/prebuilt"

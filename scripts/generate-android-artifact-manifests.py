@@ -84,6 +84,30 @@ def require_sha256(value: Any, label: str) -> str:
     return value
 
 
+def hashes_for_slice(abi, runtime_binary, archive_hash, binding_path, cxx_runtime):
+    """Hashes for what this slice actually ships.
+
+    `cxx_runtime` is recorded only when `libc++_shared.so` is in the payload.
+    It is not always: `build-android-so.sh` ships the shared STL if and only if
+    `libmigo.so` names it in DT_NEEDED, and today none of the four Android
+    binaries does -- V8's archive carries Chromium's libc++ statically. A
+    manifest that claimed a hash for a file the AAR does not contain would be
+    describing a different artifact, so the field follows the payload.
+
+    The Android SDK reads only `runtime_binary`; `cxx_runtime` is provenance.
+    `verify-android-aar-manifests.py` holds the two sides together: present in
+    one and absent in the other fails either way round.
+    """
+    hashes = {
+        "runtime_binary": sha256_file(runtime_binary, f"{abi} libmigo.so"),
+        "v8_archive": archive_hash,
+        "rust_binding": sha256_file(binding_path, f"{abi} V8 binding"),
+    }
+    if cxx_runtime.exists():
+        hashes["cxx_runtime"] = sha256_file(cxx_runtime, f"{abi} libc++ runtime")
+    return hashes
+
+
 def sha256_file(path: pathlib.Path, label: str) -> str:
     digest = hashlib.sha256()
     try:
@@ -388,12 +412,9 @@ def generate(arguments: argparse.Namespace) -> None:
                     "backend_family": "gles-native",
                     "required_api": "OpenGL ES 3.0",
                 },
-                "hashes": {
-                    "runtime_binary": sha256_file(runtime_binary, f"{abi} libmigo.so"),
-                    "v8_archive": archive_hash,
-                    "rust_binding": sha256_file(binding_path, f"{abi} V8 binding"),
-                    "cxx_runtime": sha256_file(cxx_runtime, f"{abi} libc++ runtime"),
-                },
+                "hashes": hashes_for_slice(
+                    abi, runtime_binary, archive_hash, binding_path, cxx_runtime
+                ),
                 "provenance": metadata["provenance"],
             }
             draft_path = staging / f".{abi}.input.json"
