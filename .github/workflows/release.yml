@@ -192,6 +192,14 @@ jobs:
       - name: Android merged manifest permission contract
         run: bash scripts/test-android-merged-manifest-permissions.sh
 
+      # Cargo's RUSTFLAGS replaces `[target.<triple>].rustflags` rather than
+      # merging, and the AAR build has to set RUSTFLAGS. For as long as it did
+      # that blindly, every flag in the config was dropped on the one build that
+      # ships: 3.47 MiB of `.text` that `--gc-sections` and `--icf=all` should
+      # have removed. Costs nothing to run; builds nothing.
+      - name: Android rustflags reach the linker
+        run: bash scripts/test-android-rustflags-reach-the-linker.sh
+
       # The host-bridge holder is reachable from content (`Symbol.for` reads the
       # global registry), and closing that is an all-or-nothing migration of
       # every call site -- one left behind evaluates against a deleted holder
