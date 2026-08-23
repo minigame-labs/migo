@@ -181,7 +181,10 @@ public class MigoGameActivity extends Activity
             return;
         }
         if (config == null) {
-            config = new RuntimeConfig.Builder(this).build();
+            config = onCreateRuntimeConfig();
+            if (config == null) {
+                config = new RuntimeConfig.Builder(this).build();
+            }
         }
 
         // Check runtime support
@@ -341,6 +344,31 @@ public class MigoGameActivity extends Activity
     protected void onLaunchFailed(int errorCode, String message) {
         Log.e(TAG, "Launch failed: [" + errorCode + "] " + message);
         finish();
+    }
+
+    /**
+     * The configuration to run with when the launch did not carry one.
+     *
+     * <p>{@link #buildLaunchIntent} hands a config over through an in-process
+     * table keyed by a token in the intent, which works only when whatever
+     * started this activity is in this process. A game opened from a deep link,
+     * a notification, a launcher shortcut or {@code am start} is not: the token
+     * is absent, and such a launch silently ran on a default config, whatever
+     * the host had configured everywhere else.
+     *
+     * <p>Override it to describe how your app runs games, and the same
+     * description then applies however the activity was reached. The default
+     * returns {@code null}, which keeps the previous behaviour exactly: a plain
+     * {@code RuntimeConfig} built from this context.
+     *
+     * <p>Called from {@code onCreate}, before the surface exists, so it is also
+     * the place to make sure the game's files are where the runtime will look
+     * for them.
+     *
+     * @return the configuration to use, or {@code null} for the default
+     */
+    protected RuntimeConfig onCreateRuntimeConfig() {
+        return null;
     }
 
     /**

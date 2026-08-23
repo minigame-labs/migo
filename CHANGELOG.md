@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `MigoGameActivity.onCreateRuntimeConfig()`. A config handed to
+  `buildLaunchIntent` travels through an in-process table keyed by a token in
+  the intent, so it reaches the activity only when whatever started it was in
+  the same process. A game opened from a deep link, a notification, a launcher
+  shortcut or `am start` is not: the token is absent and the launch silently ran
+  on a default config, whatever the host had configured everywhere else.
+  Overriding this describes how the app runs games once, and it applies however
+  the activity was reached. The default returns `null`, which is exactly the
+  previous behaviour.
+
+### Fixed
+- `test-android-host-api-contract.sh` froze nothing an embedder reaches by
+  subclassing. It read the surface with `javap -public`, so
+  `MigoGameActivity`'s `onCreateGameListener`, `onLaunchFailed`,
+  `onSessionCreated` and `getGameSession` -- the documented, "zero-boilerplate"
+  integration path -- were outside the freeze along with every other protected
+  member. R8 once marked exactly those methods `final` in the release AAR and
+  external subclasses stopped compiling; this gate could not have seen it. It
+  now reads `-protected`, and the baseline grew by the 13 members that were
+  never pinned.
+
 ### Fixed
 - An unparseable `ctx.font` assignment is a no-op again, on both sides of the
   engine. WHATWG says an invalid value leaves the previous font in effect, and
