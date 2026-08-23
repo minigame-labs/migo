@@ -59,7 +59,7 @@ impl ParsedFont {
 /// previous `font` on `None` to mirror browser behaviour.
 ///
 /// G-2 note: a second CSS-font parser lives in
-/// [`shared::css_font::parse_css_font`] for the JS-thread
+/// [`crate::css_font::parse_css_font`] for the JS-thread
 /// `measureText` fast path (F-2).  The two parsers are kept in
 /// sync via [`tests::shared_and_render_agree_on_canonical_inputs`]
 /// which pins the matrix of inputs where the two must produce
@@ -503,7 +503,7 @@ mod tests {
                 Some(p) => p,
                 None => panic!("render parser rejected canonical input: {input:?}"),
             };
-            let shared_out = shared::css_font::parse_css_font(input);
+            let shared_out = crate::css_font::parse_css_font(input);
             assert!(
                 (render.size_px - shared_out.size).abs() < 0.05,
                 "size disagreement on {input:?}: render={} shared={}",

@@ -654,7 +654,7 @@ fn _force_use_imports() {
 /// shorthand leaves `state.text` untouched, matching Blink's "invalid
 /// font assignment is a no-op" policy.
 pub(crate) fn apply_parsed_font(state: &mut Canvas2DState, font: &str) {
-    if let Some(parsed) = super::font_parse::parse_font_shorthand(font) {
+    if let Some(parsed) = shared::css_font_shorthand::parse_font_shorthand(font) {
         // Diag: parsed OK.  Logged at trace because SetFont can
         // fire once per UI element per frame in Cocos Creator
         // games; trace keeps the hot path free unless the
