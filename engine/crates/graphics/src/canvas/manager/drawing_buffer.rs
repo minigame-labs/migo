@@ -276,6 +276,102 @@ pub(crate) fn destroy(gl: &glow::Context, db: DrawingBuffer) {
 /// modified its attachments), this function re-attaches the original textures
 /// before retrying the blit.
 #[inline]
+/// Copy the window surface into the DrawingBuffer.
+///
+/// The reverse of [`blit_to_surface`], and it exists for one moment: the frame
+/// in which the engine stops bypassing the DrawingBuffer because the game asked
+/// to read the default framebuffer. Until then WebGL has been drawing straight
+/// to the surface, so the DrawingBuffer holds nothing; binding it and answering
+/// the read from it returns an empty buffer for pixels the game just drew.
+/// `signal_default_fbo_readback` documents this snapshot; this is it.
+///
+/// Always a full-surface copy. There is no damage history that spans the mode
+/// change -- that is exactly why the mode change discards it -- so there is no
+/// smaller correct rectangle.
+pub(crate) fn blit_from_surface(
+    gl: &glow::Context,
+    db: &DrawingBuffer,
+    surface_w: u32,
+    surface_h: u32,
+) -> bool {
+    if surface_w == 0 || surface_h == 0 || db.width == 0 || db.height == 0 {
+        return false;
+    }
+    let mut succeeded = false;
+    unsafe {
+        clear_gl_errors(gl);
+
+        // Same reason as the forward blit: `glBlitFramebuffer` writes through
+        // the scissor test, and a game routinely leaves one enabled over a
+        // sub-window box. Restored on every exit path below.
+        let scissor_was_enabled = gl.is_enabled(glow::SCISSOR_TEST);
+        if scissor_was_enabled {
+            gl.disable(glow::SCISSOR_TEST);
+        }
+
+        'blit: {
+            // READ from the window surface (FBO 0), DRAW to the DrawingBuffer.
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(db.fbo));
+
+            let err = gl.get_error();
+            if err != glow::NO_ERROR {
+                tracing::warn!(
+                    "DrawingBuffer reverse blit: bind failed (gl_error=0x{err:X}), db={}x{} surface={}x{}",
+                    db.width,
+                    db.height,
+                    surface_w,
+                    surface_h
+                );
+                break 'blit;
+            }
+
+            let status = gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                tracing::warn!(
+                    "DrawingBuffer reverse blit: destination FBO incomplete (0x{status:X})"
+                );
+                break 'blit;
+            }
+
+            // NEAREST when the rectangles match, which is the ordinary case;
+            // `glBlitFramebuffer` rejects a scaling blit asking for NEAREST on
+            // some drivers, and a scaled snapshot is better than none.
+            let filter = if db.width == surface_w && db.height == surface_h {
+                glow::NEAREST
+            } else {
+                glow::LINEAR
+            };
+            gl.blit_framebuffer(
+                0,
+                0,
+                surface_w as i32,
+                surface_h as i32,
+                0,
+                0,
+                db.width as i32,
+                db.height as i32,
+                glow::COLOR_BUFFER_BIT,
+                filter,
+            );
+            let err = gl.get_error();
+            if err != glow::NO_ERROR {
+                tracing::warn!("DrawingBuffer reverse blit: blit failed (gl_error=0x{err:X})");
+                break 'blit;
+            }
+            succeeded = true;
+        }
+
+        // Leave the binding where the bypass path expects it, and give the
+        // game back the scissor state it set.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        if scissor_was_enabled {
+            gl.enable(glow::SCISSOR_TEST);
+        }
+    }
+    succeeded
+}
+
 pub(crate) fn blit_to_surface(
     gl: &glow::Context,
     db: &DrawingBuffer,
