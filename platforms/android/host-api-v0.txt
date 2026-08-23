@@ -1,3 +1,16 @@
+  protected com.migo.runtime.GameSession getGameSession();
+  protected com.migo.runtime.RuntimeConfig onCreateRuntimeConfig();
+  protected com.migo.runtime.callback.GameSessionListener onCreateGameListener();
+  protected static android.content.Intent buildLaunchIntent(android.content.Context, java.lang.Class<? extends com.migo.runtime.MigoGameActivity>, java.lang.String, java.lang.String, com.migo.runtime.RuntimeConfig);
+  protected void onAttachedToWindow();
+  protected void onCreate(android.os.Bundle);
+  protected void onDestroy();
+  protected void onDetachedFromWindow();
+  protected void onDetachedFromWindow();
+  protected void onLaunchFailed(int, java.lang.String);
+  protected void onPause();
+  protected void onResume();
+  protected void onSessionCreated(com.migo.runtime.GameSession);
   public T getOrThrow();
   public T getValue();
   public abstract java.io.File resolve(java.lang.String);
