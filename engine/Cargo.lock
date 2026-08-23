@@ -1639,11 +1639,11 @@ dependencies = [
 
 [[package]]
 name = "migo-alloc-probe"
-version = "0.9.3"
+version = "0.9.4"
 
 [[package]]
 name = "migo-android-jni"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "jni",
  "migo-platform",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "migo-audio"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "cpal",
  "futures-util",
@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "migo-c-host-example"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "cc",
  "migo-capi",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "migo-capi"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "migo-alloc-probe",
  "migo-capi-abi",
@@ -1693,18 +1693,18 @@ dependencies = [
 
 [[package]]
 name = "migo-capi-abi"
-version = "0.9.3"
+version = "0.9.4"
 
 [[package]]
 name = "migo-contention-probe"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "parking_lot",
 ]
 
 [[package]]
 name = "migo-core"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "crossbeam-channel",
  "futures",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "migo-executor-probe"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "parking_lot",
  "tokio",
@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "migo-graphics"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bytemuck",
  "crossbeam-channel",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "migo-io"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "base64",
  "brotli",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "migo-platform"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bytemuck",
  "crossbeam-channel",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "migo-player"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "migo-core",
  "migo-graphics",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "migo-runtime-v8"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "base64",
  "bytemuck",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "migo-shared"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "base64",
  "bitflags 2.10.0",
@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "migo-snapshot-gen"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "deno_core",
  "migo-runtime-v8",
