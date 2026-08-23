@@ -59,7 +59,7 @@
 //! use shared::protocol::host_cmd::HostCommand;
 //!
 //! // 1. Spawn the host thread
-//! let mut host = spawn_host_thread(surface, graphics_platform, platform, init_options)?;
+//! let mut host = spawn_host_thread(Some(surface), graphics_platform, platform, init_options)?;
 //! let host_id = host.id();
 //!
 //! // 2. Send commands to run a game

@@ -417,7 +417,8 @@ jobs:
             timeout 300 sudo apt-get install -y \
               cmake ninja-build g++ ripgrep xvfb xauth \
               qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
-              libx11-dev libxkbcommon-x11-dev libxcb-cursor0 || return 1
+              libx11-dev libxkbcommon-x11-dev libxcb-cursor0 \
+              libasound2-dev || return 1
           }
           install_pkgs || {
             echo "Qt/X11 package install failed; retrying once" >&2
@@ -430,6 +431,17 @@ jobs:
       # interposing malloc, so the combination breaks silently if nobody runs it.
       - name: Linux Qt Host Kit contract
         run: bash scripts/test-linux-qt-host-kit.sh --sanitize
+
+      # The Linux player is the conformance suite's *reference* runner: every
+      # other platform must produce the same verdict lines from the same
+      # bundles, so if it does not build, the cross-platform claim has no
+      # referee. It is a workspace member but not a default member (it links
+      # X11/GL, which headless jobs do not have), so `cargo build` never reaches
+      # it -- and a signature change in `migo-core` broke it while pr-ci stayed
+      # green on every job. This is the one Linux job that installs the desktop
+      # stack, so it is where the player can be type-checked at all.
+      - name: Linux player type-checks
+        run: cd engine && cargo check -p migo-player --locked
 
   # ── Job 4: Host engine tests — graphics, core, capi, platform, audio ─
   # These five crates' test suites ran in no release job: the AAR build cross-
