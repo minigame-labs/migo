@@ -689,7 +689,7 @@ mod tests {
 
     use shared::error::{EngineError, ErrorCode};
 
-    use super::{HostThread, create_runtime_before_ready, join_failed_start};
+    use super::{HostThread, create_basic_runtime, create_runtime_before_ready, join_failed_start};
 
     struct DropSentinel(Arc<AtomicBool>);
 
