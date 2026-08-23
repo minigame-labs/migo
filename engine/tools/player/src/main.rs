@@ -275,7 +275,9 @@ fn run(
     let host_kit: Arc<dyn PlatformServices> =
         Arc::new(HostPlatform::new().with_window(Arc::clone(&window_state)));
     tracing::info!("spawning host thread ({surface_w}x{surface_h} {mode})");
-    let host = spawn_host_thread(surface, graphics_platform, host_kit, opt)
+    // The player always has its window before it starts, so this is never the
+    // warm start `spawn_host_thread` also accepts.
+    let host = spawn_host_thread(Some(surface), graphics_platform, host_kit, opt)
         .map_err(|e| format!("spawn_host_thread: {e:?}"))?;
     let host_id = host.id();
     tracing::info!("host {host_id} spawned; loading game");
