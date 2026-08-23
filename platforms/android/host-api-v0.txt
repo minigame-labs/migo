@@ -281,6 +281,7 @@
   public static final java.lang.String VERSION;
   public static java.lang.String deviceAbi();
   public static java.lang.String getMessage(int);
+  public static java.lang.String prepare(android.content.Context, java.io.File);
   public static java.lang.Throwable lastError();
   public static void launch(android.content.Context, java.lang.String, java.lang.String);
   public static void launch(android.content.Context, java.lang.String, java.lang.String, com.migo.runtime.RuntimeConfig);

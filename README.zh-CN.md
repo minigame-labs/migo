@@ -75,7 +75,8 @@ MigoNativeLoader.setProvider(context, abi -> {
 
 文件在加载前会对 AAR 内嵌的 artifact manifest 做校验，所以下载不完整、或镜像还在发上一个版本，
 都会以可读的原因失败，而不是在引擎内部崩溃。`MigoNativeLoader.requiredArtifact(context)`
-返回需要比对的摘要。
+返回需要比对的摘要；`MigoNativeLoader.prepare(context, file)` 则在你调用它的线程上当场做这次校验——
+这样坏包在下载线程上就被发现，而不是等用户点开游戏时才表现为启动失败。
 
 从哪里取取决于你上哪个商店：Google Play 上唯一合规的来源是
 [Play Feature Delivery](https://developer.android.com/guide/playcore/feature-delivery)
