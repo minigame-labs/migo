@@ -1972,10 +1972,21 @@ fn validate_hashes(hashes: &ArtifactHashes) -> Result<(), ManifestError> {
         "hashes.rust_binding",
         require_option("hashes.rust_binding", &hashes.rust_binding)?,
     )?;
-    require_sha256(
-        "hashes.cxx_runtime",
-        require_option("hashes.cxx_runtime", &hashes.cxx_runtime)?,
-    )
+    // Optional, and optional in the direction that matters: the field describes
+    // a `libc++_shared.so` in the payload, and there is not always one. The
+    // Android packaging step ships the shared STL if and only if `libmigo.so`
+    // names it in DT_NEEDED, which today none of the four Android binaries
+    // does -- V8's archive carries Chromium's libc++ statically, so nothing
+    // ever loaded the ~1 MB per ABI that used to be shipped beside it.
+    //
+    // Still validated when present: an absent field means "no C++ runtime in
+    // this payload", while a malformed one means the producer is wrong about
+    // what it built. `verify-android-aar-manifests.py` is what refuses the
+    // remaining two mismatches -- a hash with no file, and a file with no hash.
+    match &hashes.cxx_runtime {
+        Some(value) => require_sha256("hashes.cxx_runtime", value),
+        None => Ok(()),
+    }
 }
 
 fn validate_provenance(provenance: &ProvenanceIdentity) -> Result<(), ManifestError> {

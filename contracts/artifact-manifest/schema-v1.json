@@ -97,7 +97,8 @@
    "additionalProperties": false,
    "properties": {
     "cxx_runtime": {
-     "$ref": "#/$defs/sha256"
+     "$ref": "#/$defs/sha256",
+     "description": "SHA-256 of the shipped libc++_shared.so. Optional: present only when the payload contains one. The Android packaging step ships the shared STL if and only if libmigo.so names it in DT_NEEDED, which today none of the Android binaries does -- V8's archive carries Chromium's libc++ statically. Provenance only; the Android SDK reads runtime_binary."
     },
     "runtime_binary": {
      "$ref": "#/$defs/sha256"
@@ -112,8 +113,7 @@
    "required": [
     "runtime_binary",
     "v8_archive",
-    "rust_binding",
-    "cxx_runtime"
+    "rust_binding"
    ],
    "type": "object"
   },

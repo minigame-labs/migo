@@ -604,6 +604,13 @@ jobs:
       - name: Android minimum-API symbol floor
         run: bash scripts/test-android-symbol-floor.sh
 
+      # An SDK that ships a runtime library picks that library's version for its
+      # host, and the published v0.9.3 AAR shipped ~2 MB of `libc++_shared.so`
+      # that no shipped .so ever named in DT_NEEDED. Needs the freshly built
+      # AARs from the step above.
+      - name: Android shipped natives are reachable
+        run: bash scripts/test-android-native-deps-contract.sh
+
       # The slice manifests record which snapshot each ABI embeds, but until here
       # nothing reads the .so. generate-android-artifact-manifests.py validates the
       # snapshot *file* and refuses to emit a slice without it, while

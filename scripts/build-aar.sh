@@ -396,12 +396,20 @@ validate_native_libraries() {
             print_error "Missing native libs for $arch"
             exit 1
         fi
-        for library in libmigo.so libc++_shared.so; do
-            if [[ ! -f "$src/$library" ]]; then
-                print_error "Missing $PRODUCT_PROFILE/$arch/$library"
-                exit 1
-            fi
-        done
+        if [[ ! -f "$src/libmigo.so" ]]; then
+            print_error "Missing $PRODUCT_PROFILE/$arch/libmigo.so"
+            exit 1
+        fi
+        # `libc++_shared.so` is required only when the engine asks for it.
+        # build-android-so.sh ships it if and only if `libmigo.so` names it in
+        # DT_NEEDED, which today it does not: V8's archive carries Chromium's
+        # libc++ statically. Demanding the file unconditionally here is what
+        # turned that into a build failure rather than a saved megabyte.
+        # test-android-native-deps-contract.sh holds the real invariant -- every
+        # shipped .so must be reachable -- from the other direction.
+        if [[ -f "$src/libc++_shared.so" ]]; then
+            print_info "$PRODUCT_PROFILE/$arch ships libc++_shared.so (engine declares it)"
+        fi
         print_success "$PRODUCT_PROFILE/$arch ready"
     done
 }

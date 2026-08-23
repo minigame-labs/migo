@@ -324,8 +324,24 @@ def migoArtifactManifestPackageRoot = layout.buildDirectory.dir(
                             "Package index artifact_id does not match ${abi} slice")
                 }
                 def nativeRoot = new File(releaseNativeRoot.asFile, abi)
-                if (identity.hashes?.runtime_binary != sha256(new File(nativeRoot, 'libmigo.so')) ||
-                        identity.hashes?.cxx_runtime != sha256(new File(nativeRoot, 'libc++_shared.so'))) {
+                if (identity.hashes?.runtime_binary != sha256(new File(nativeRoot, 'libmigo.so'))) {
+                    throw new GradleException(
+                            "Slice JNI hashes do not match the release inputs for ${abi}")
+                }
+                // `libc++_shared.so` is shipped only when `libmigo.so` names it
+                // in DT_NEEDED, which today none of the Android binaries does --
+                // V8's archive carries Chromium's libc++ statically. So the file
+                // and the hash must agree about whether they exist, and when both
+                // do they must match. Demanding it unconditionally here is what
+                // made "stop shipping a megabyte nobody loads" a build failure.
+                def cxxFile = new File(nativeRoot, 'libc++_shared.so')
+                def cxxHash = identity.hashes?.cxx_runtime
+                if (cxxFile.isFile() != (cxxHash != null)) {
+                    throw new GradleException(
+                            "${abi}: libc++_shared.so is " +
+                            (cxxFile.isFile() ? "present but unhashed" : "hashed but absent"))
+                }
+                if (cxxFile.isFile() && cxxHash != sha256(cxxFile)) {
                     throw new GradleException(
                             "Slice JNI hashes do not match the release inputs for ${abi}")
                 }

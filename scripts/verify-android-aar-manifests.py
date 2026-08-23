@@ -80,17 +80,37 @@ def main() -> int:
                     abi = ANDROID_ABIS.get(target_key)
                     if abi is None:
                         raise RuntimeError(f"unsupported Android target in slice: {target_key!r}")
-                    for library, hash_field in (
-                        ("libmigo.so", "runtime_binary"),
-                        ("libc++_shared.so", "cxx_runtime"),
+                    # `libmigo.so` is always there. `libc++_shared.so` is there
+                    # only when the engine names it in DT_NEEDED, so the check
+                    # runs in both directions: the manifest must claim a hash
+                    # for exactly the C++ runtime the package carries. Claiming
+                    # one for a file that is absent describes a different
+                    # artifact; shipping one nothing describes leaves a payload
+                    # outside the verified set.
+                    for library, hash_field, required in (
+                        ("libmigo.so", "runtime_binary", True),
+                        ("libc++_shared.so", "cxx_runtime", False),
                     ):
                         library_path = f"jni/{abi}/{library}"
+                        present = names.count(library_path)
+                        declared_hash = hashes.get(hash_field)
+                        if not required and present == 0 and declared_hash is None:
+                            continue
+                        if not required and present == 0:
+                            raise RuntimeError(
+                                f"slice declares {hash_field} but the AAR has no "
+                                f"{library_path}"
+                            )
+                        if not required and declared_hash is None:
+                            raise RuntimeError(
+                                f"AAR ships {library_path} but the slice declares "
+                                f"no {hash_field}"
+                            )
                         expected_jni_entries.add(library_path)
-                        if names.count(library_path) != 1:
+                        if present != 1:
                             raise RuntimeError(
                                 f"AAR must contain exactly one {library_path}"
                             )
-                        declared_hash = hashes.get(hash_field)
                         actual_hash = zip_entry_sha256(archive, library_path)
                         if declared_hash != actual_hash:
                             raise RuntimeError(
