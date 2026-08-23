@@ -339,7 +339,7 @@ impl Host {
         id: HostId,
         host_tx: HostTx,
         critical_host_tx: CriticalHostCommandSender,
-        surface: SurfaceLease,
+        surface: Option<SurfaceLease>,
         graphics_platform: graphics::egl_platform::GraphicsPlatform,
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,

@@ -1,3 +1,4 @@
+  protected boolean onWarmStartEngine();
   protected com.migo.runtime.GameSession getGameSession();
   protected com.migo.runtime.RuntimeConfig onCreateRuntimeConfig();
   protected com.migo.runtime.callback.GameSessionListener onCreateGameListener();
@@ -78,6 +79,7 @@
   public com.migo.runtime.GamePaths(com.migo.runtime.RuntimeConfig, java.lang.String, int);
   public com.migo.runtime.GameSession createSession(android.app.Activity, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
   public com.migo.runtime.GameSession createSession(android.content.Context, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.GameSession createSessionWarm(android.app.Activity, com.migo.runtime.RuntimeConfig, java.lang.String);
   public com.migo.runtime.GameSession getSession();
   public com.migo.runtime.MigoException(int, java.lang.String);
   public com.migo.runtime.MigoException(int, java.lang.String, java.lang.Throwable);
@@ -85,6 +87,7 @@
   public com.migo.runtime.MigoGameActivity();
   public com.migo.runtime.MigoGameView(android.content.Context);
   public com.migo.runtime.MigoRuntime$Result<com.migo.runtime.GameSession> createSessionSafe(android.app.Activity, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.MigoRuntime$Result<com.migo.runtime.GameSession> createSessionWarmSafe(android.app.Activity, com.migo.runtime.RuntimeConfig, java.lang.String);
   public com.migo.runtime.PerformanceSnapshot getPerformanceSnapshot();
   public com.migo.runtime.PerformanceSnapshot(float, float, int, int, int);
   public com.migo.runtime.PerformanceSnapshot(float, float, int, int, int, int, int, int);

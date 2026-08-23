@@ -321,11 +321,67 @@ public final class MigoRuntime {
         }
 
         // Create Java session wrapper with gameId
-        GameSession session = new GameSession(sessionId, gameId, config, activity);
+        GameSession session = new GameSession(sessionId, gameId, config, activity, true);
 
         // Register runtime context
         RuntimeRegistry.register(new RuntimeContext(sessionId, activity));
 
+        return session;
+    }
+
+    /**
+     * Create a session before its rendering Surface exists.
+     * <p>
+     * Everything the engine can do without a window happens immediately and in
+     * parallel with the host's own startup: the host thread and its V8 isolate,
+     * and on the render thread the EGL display and config, the resource
+     * context, the GLES dispatch table, capability detection, Skia and the
+     * system font scan. The session then waits. Call
+     * {@link GameSession#updateSurface(Surface, int, int)} when the Surface
+     * arrives, and {@link GameSession#startGame} after that.
+     * <p>
+     * The gain is not that any of that work got cheaper -- it is that an
+     * Activity spends real time between {@code onCreate} and
+     * {@code surfaceCreated} (~150 ms on a Mate 30 Pro, more when it rotates
+     * for a landscape game) during which the engine used to be doing nothing at
+     * all, because it had not been allowed to start yet.
+     * <p>
+     * A game must not be started before a Surface is attached: module
+     * evaluation waits on GPU capabilities, and the first thing an adapted
+     * browser game asks for is the window size.
+     *
+     * @param activity The host Activity
+     * @param config   Runtime configuration
+     * @param gameId   Unique game identifier (alphanumeric, underscore, hyphen, 1-64 chars)
+     * @return A new GameSession with no Surface attached yet
+     * @throws MigoException if creation fails or gameId is invalid
+     */
+    public GameSession createSessionWarm(Activity activity, RuntimeConfig config, String gameId) {
+        ThreadCheck.ensureMainThread();
+        validateCreateSession(activity, null, config, false);
+        validateGameId(gameId);
+
+        if (!ensureNative()) {
+            throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
+                    "Native library not loaded", nativeLoadError);
+        }
+
+        AppContext.init(activity);
+
+        if (config.isImmersiveMode()) {
+            enterImmersiveMode(activity);
+        }
+
+        // Null Surface is the warm start on the native side too; the engine
+        // brings up everything a window is not needed for and then parks.
+        int sessionId = NativeBridge.init(null, config);
+        if (sessionId < 0) {
+            throw new MigoException(ErrorCode.ERR_INIT_FAILED,
+                    ErrorCode.getMessage(ErrorCode.ERR_INIT_FAILED) + ": Native init returned " + sessionId);
+        }
+
+        GameSession session = new GameSession(sessionId, gameId, config, activity, false);
+        RuntimeRegistry.register(new RuntimeContext(sessionId, activity));
         return session;
     }
 
@@ -374,7 +430,7 @@ public final class MigoRuntime {
         }
 
         // Create Java session wrapper with gameId
-        GameSession session = new GameSession(sessionId, gameId, config, context);
+        GameSession session = new GameSession(sessionId, gameId, config, context, true);
 
         // Register without Activity
         RuntimeRegistry.register(new RuntimeContext(sessionId, null));
@@ -397,6 +453,27 @@ public final class MigoRuntime {
         ThreadCheck.ensureMainThread();
         try {
             return Result.success(createSession(activity, surface, config, gameId));
+        } catch (MigoException e) {
+            return Result.failure(e.getErrorCode(), e.getMessage());
+        } catch (Exception e) {
+            return Result.failure(ErrorCode.ERR_INIT_FAILED, e.getMessage());
+        }
+    }
+
+    /**
+     * Create a session before its Surface exists.
+     * <p>
+     * Non-throwing version of {@link #createSessionWarm}.
+     *
+     * @param activity The host Activity
+     * @param config   Runtime configuration
+     * @param gameId   Unique game identifier
+     * @return Result containing either the session or an error code
+     */
+    public Result<GameSession> createSessionWarmSafe(Activity activity, RuntimeConfig config, String gameId) {
+        ThreadCheck.ensureMainThread();
+        try {
+            return Result.success(createSessionWarm(activity, config, gameId));
         } catch (MigoException e) {
             return Result.failure(e.getErrorCode(), e.getMessage());
         } catch (Exception e) {
@@ -437,11 +514,16 @@ public final class MigoRuntime {
     // ==================== Private Methods ====================
 
     private void validateCreateSession(Activity activity, Surface surface, RuntimeConfig config) {
+        validateCreateSession(activity, surface, config, true);
+    }
+
+    private void validateCreateSession(Activity activity, Surface surface, RuntimeConfig config,
+                                       boolean surfaceRequired) {
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
             throw new MigoException(ErrorCode.ERR_INVALID_ACTIVITY,
                     ErrorCode.getMessage(ErrorCode.ERR_INVALID_ACTIVITY));
         }
-        if (surface == null) {
+        if (surfaceRequired && surface == null) {
             throw new MigoException(ErrorCode.ERR_INVALID_SURFACE,
                     ErrorCode.getMessage(ErrorCode.ERR_INVALID_SURFACE));
         }

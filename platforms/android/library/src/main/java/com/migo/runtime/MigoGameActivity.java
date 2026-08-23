@@ -76,6 +76,16 @@ public class MigoGameActivity extends Activity
             new ConcurrentHashMap<>();
 
     private GameSession session;
+    /**
+     * Whether {@code startGame} has already run for this activity.
+     * <p>
+     * Session existence used to stand in for this: the session was created at
+     * the same moment the game was started, so "session != null" answered both
+     * questions. A warm-started session exists from {@code onCreate}, long
+     * before a Surface has arrived, so the two questions came apart and the
+     * surface callbacks needed the one they actually meant.
+     */
+    private boolean gameStarted;
     private SurfaceView surfaceView;
     private final OrientationWaitHelper orientationHelper = new OrientationWaitHelper(TAG);
     private String lastOrientationEventValue;
@@ -218,6 +228,72 @@ public class MigoGameActivity extends Activity
 
         // Register for memory warnings
         registerComponentCallbacks(this);
+
+        if (onWarmStartEngine()) {
+            MigoRuntime.Result<GameSession> warm =
+                    runtime.createSessionWarmSafe(this, config, gameId);
+            if (warm.isFailure()) {
+                Log.w(TAG, "warm start unavailable (code=" + warm.getErrorCode() + ", msg="
+                        + warm.getErrorMessage() + "); starting at surfaceCreated instead");
+            } else {
+                session = warm.getValue();
+                publishSession();
+            }
+        }
+    }
+
+    /**
+     * Whether to start the engine here, in {@code onCreate}, instead of when the
+     * Surface arrives. Off by default, and the default is the measured one.
+     * <p>
+     * Starting it here was measured on a Mate 30 Pro and it lost, on both numbers
+     * it was meant to win: first frame 369 -> 401 ms and game-ready 788 -> 838 ms,
+     * interleaved, four rounds each. The ~150 ms between {@code onCreate} and
+     * {@code surfaceCreated} is idle on the main thread but not on the CPU -- it
+     * is process init, dex loading, layout and, for a landscape game, a window
+     * rotation. Three more engine threads in that window take more from Android's
+     * launch than the engine's head start gives back.
+     * <p>
+     * Override and return true only if your own measurement says otherwise on the
+     * devices you ship to. If you want the head start without the contention, the
+     * answer is not this flag but {@link MigoRuntime#createSessionWarm} called
+     * genuinely early -- while the user is still choosing a game, not while the
+     * activity that will run it is being laid out.
+     *
+     * @return false by default
+     */
+    protected boolean onWarmStartEngine() {
+        return false;
+    }
+
+    /**
+     * Hand a freshly created session to the subclass and its listener.
+     *
+     * <p>Shared by both routes to a session -- the warm start in
+     * {@code onCreate} and the fallback create in
+     * {@code attachSurfaceAndStart} -- so a subclass sees exactly the same
+     * callbacks in the same order either way.
+     *
+     * @return false if the subclass rejected the session, in which case the
+     *         launch has already been failed
+     */
+    private boolean publishSession() {
+        lastOrientationEventValue = DisplayCompat.mapDeviceOrientationValue(
+                this,
+                getResources().getConfiguration()
+        );
+        try {
+            onSessionCreated(session);
+        } catch (Throwable t) {
+            Log.e(TAG, "onSessionCreated failed", t);
+            onLaunchFailed(ErrorCode.ERR_INIT_FAILED, "onSessionCreated threw: " + t.getMessage());
+            return false;
+        }
+        GameSessionListener listener = onCreateGameListener();
+        if (listener != null) {
+            session.setListener(listener);
+        }
+        return true;
     }
 
     // ==================== SurfaceHolder.Callback ====================
@@ -225,7 +301,11 @@ public class MigoGameActivity extends Activity
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         Log.i(TAG, "surfaceCreated: frame=" + holder.getSurfaceFrame());
-        if (session != null && session.isValid()) {
+        // Once the game is running, a Surface callback is a recreate and nothing
+        // more. Before that it is the event the launch has been waiting for --
+        // including for a warm-started session, which exists here but has never
+        // been given a Surface.
+        if (gameStarted && session != null && session.isValid()) {
             orientationHelper.cancel();
             Rect frame = holder.getSurfaceFrame();
             session.updateSurface(holder.getSurface(), frame.width(), frame.height());
@@ -246,7 +326,7 @@ public class MigoGameActivity extends Activity
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Log.i(TAG, "surfaceChanged: format=" + format + ", size=" + width + "x" + height);
-        if (session != null && session.isValid()) {
+        if (gameStarted && session != null && session.isValid()) {
             orientationHelper.cancel();
             session.updateSurface(holder.getSurface(), width, height);
         } else {
@@ -405,36 +485,35 @@ public class MigoGameActivity extends Activity
     private void initializeGame(SurfaceHolder holder) {
         orientationHelper.cancel();
         Log.i(TAG, "initializeGame: gameId=" + gameId + ", entry=" + entryPoint);
-        MigoRuntime.Result<GameSession> result = MigoRuntime.getInstance()
-                .createSessionSafe(this, holder.getSurface(), config, gameId);
 
-        if (result.isFailure()) {
-            Log.e(TAG, "initializeGame failed: code=" + result.getErrorCode() + ", msg=" + result.getErrorMessage());
-            onLaunchFailed(result.getErrorCode(), result.getErrorMessage());
-            return;
-        }
-
-        session = result.getValue();
-        lastOrientationEventValue = DisplayCompat.mapDeviceOrientationValue(
-                this,
-                getResources().getConfiguration()
-        );
-
-        try {
-            onSessionCreated(session);
-        } catch (Throwable t) {
-            Log.e(TAG, "onSessionCreated failed", t);
-            onLaunchFailed(ErrorCode.ERR_INIT_FAILED, "onSessionCreated threw: " + t.getMessage());
-            return;
-        }
-
-        // Set up listener
-        GameSessionListener listener = onCreateGameListener();
-        if (listener != null) {
-            session.setListener(listener);
+        if (session == null || !session.isValid()) {
+            // No warm session: either the warm start failed above, or a
+            // subclass tore this one down. Create it the original way, with the
+            // Surface in hand.
+            MigoRuntime.Result<GameSession> result = MigoRuntime.getInstance()
+                    .createSessionSafe(this, holder.getSurface(), config, gameId);
+            if (result.isFailure()) {
+                Log.e(TAG, "initializeGame failed: code=" + result.getErrorCode()
+                        + ", msg=" + result.getErrorMessage());
+                onLaunchFailed(result.getErrorCode(), result.getErrorMessage());
+                return;
+            }
+            session = result.getValue();
+            if (!publishSession()) {
+                return;
+            }
+        } else {
+            // Warm session: it has been building its GPU stack since onCreate
+            // and is waiting for exactly this. `updateSurface` installs a first
+            // Surface by the same path it installs a replacement -- the engine
+            // distinguishes them by whether a live one is already bound, not by
+            // which call delivered it.
+            Rect frame = holder.getSurfaceFrame();
+            session.updateSurface(holder.getSurface(), frame.width(), frame.height());
         }
 
         // Start the game
+        gameStarted = true;
         int startResult = session.startGameSafe(entryPoint);
         Log.i(TAG, "startGameSafe result=" + startResult);
         if (startResult != ErrorCode.SUCCESS) {

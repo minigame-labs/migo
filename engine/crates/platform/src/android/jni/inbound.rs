@@ -310,56 +310,66 @@ pub(crate) extern "system" fn init(
     options: JObject<'_>,
 ) -> jint {
     jni_safe!("init", -1, {
-        // Convert Java Surface to ANativeWindow*.
-        let window = unsafe { ANativeWindow_fromSurface(env.get_native_interface(), surface) };
-        if window.is_null() {
-            error!("init failed: ANativeWindow_fromSurface returned null");
-            return -1;
-        }
+        // A null Surface is a warm start, not a failure: the caller is creating
+        // the session before its window exists so that GPU bring-up overlaps the
+        // host application's own layout. `updateSurface` delivers the Surface
+        // later, down the same path a recreate takes.
+        let android_surface = if surface.is_null() {
+            info!("init: warm start (no Surface yet); awaiting updateSurface");
+            None
+        } else {
+            // Convert Java Surface to ANativeWindow*.
+            let window = unsafe { ANativeWindow_fromSurface(env.get_native_interface(), surface) };
+            if window.is_null() {
+                error!("init failed: ANativeWindow_fromSurface returned null");
+                return -1;
+            }
 
-        let (raw_w, raw_h) = unsafe {
-            (
-                ANativeWindow_getWidth(window),
-                ANativeWindow_getHeight(window),
-            )
-        };
-        if raw_w <= 0 || raw_h <= 0 {
-            error!(
-                "init failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
-                raw_w, raw_h
-            );
-            unsafe { ANativeWindow_release(window) };
-            return -1;
-        }
-        let (w, h) = (raw_w as u32, raw_h as u32);
-
-        // Take ownership of the ANativeWindow ref (acquired by
-        // ANativeWindow_fromSurface) via RAII now, so every early return below
-        // releases it. Previously each error path between here and host spawn
-        // leaked the ref.
-        let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("init failed: create AndroidSurfaceWrapper error: {}", e);
-                    unsafe { ANativeWindow_release(window) };
-                    return -1;
-                }
+            let (raw_w, raw_h) = unsafe {
+                (
+                    ANativeWindow_getWidth(window),
+                    ANativeWindow_getHeight(window),
+                )
             };
+            if raw_w <= 0 || raw_h <= 0 {
+                error!(
+                    "init failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
+                    raw_w, raw_h
+                );
+                unsafe { ANativeWindow_release(window) };
+                return -1;
+            }
+            let (w, h) = (raw_w as u32, raw_h as u32);
 
-        // Normalize native window buffer geometry to the observed dimensions.
-        // This helps avoid stale rotated geometry during startup transitions.
-        let set_geo_rc = unsafe {
-            ANativeWindow_setBuffersGeometry(android_surface.native_handle(), raw_w, raw_h, 0)
+            // Take ownership of the ANativeWindow ref (acquired by
+            // ANativeWindow_fromSurface) via RAII now, so every early return below
+            // releases it. Previously each error path between here and host spawn
+            // leaked the ref.
+            let android_surface =
+                match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("init failed: create AndroidSurfaceWrapper error: {}", e);
+                        unsafe { ANativeWindow_release(window) };
+                        return -1;
+                    }
+                };
+
+            // Normalize native window buffer geometry to the observed dimensions.
+            // This helps avoid stale rotated geometry during startup transitions.
+            let set_geo_rc = unsafe {
+                ANativeWindow_setBuffersGeometry(android_surface.native_handle(), raw_w, raw_h, 0)
+            };
+            if set_geo_rc != 0 {
+                tracing::warn!(
+                    "init: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
+                    raw_w,
+                    raw_h,
+                    set_geo_rc
+                );
+            }
+            Some(android_surface)
         };
-        if set_geo_rc != 0 {
-            tracing::warn!(
-                "init: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
-                raw_w,
-                raw_h,
-                set_geo_rc
-            );
-        }
 
         // Read required fields from RuntimeConfig
         let cache_dir = match super::get_string_field(&mut env, "cacheDir", &options) {
@@ -472,7 +482,8 @@ pub(crate) extern "system" fn init(
 
         // `android_surface` already owns the ANativeWindow ref (wrapped above so
         // early returns release it); hand it to the host.
-        let surface_ref: SurfaceRef = Arc::new(android_surface);
+        let surface_ref: Option<SurfaceRef> =
+            android_surface.map(|surface| Arc::new(surface) as SurfaceRef);
 
         let host = spawn_host_thread(surface_ref, graphics_platform, platform, init_options);
         match host {
