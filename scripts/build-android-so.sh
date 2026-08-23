@@ -159,6 +159,44 @@ get_abi_name() {
 }
 
 # ------------------------------------------------------------
+# The rustflags `.cargo/config.toml` declares for a target.
+#
+# Cargo does not merge `RUSTFLAGS` with `[target.<triple>].rustflags` -- the
+# environment variable *replaces* them. This script sets `RUSTFLAGS` (it has to:
+# the clang builtins path is only known at build time), so for as long as it did
+# so blindly, every flag in the config was silently discarded on the AAR build
+# and on nothing else -- `build-android-sdk.sh` and `build-android-c-host.sh`
+# set no `RUSTFLAGS`, so the same config applied there.
+#
+# Measured on 2026-08-23, arm64-v8a release: carrying the config's flags forward
+# takes `libmigo.so` from 45,709,280 to 42,072,032 bytes -- 3.47 MiB, 8%, almost
+# all of it `.text` (31.30 -> 27.88 MB) from `--gc-sections` and `--icf=all`
+# never having run. Startup was measured too, interleaved and thermally gated:
+# first frame and game-ready came out slightly *better* on both bunnymark and
+# canvasmark, and steady fps identical at 59.8 -- a smaller image is friendlier
+# to the instruction cache, not less friendly.
+#
+# So the config stays the single source of truth and this reads it, rather than
+# the flags being copied here where the two would drift. The evidence that they
+# do drift is already in the file: `--allow-multiple-definition` had been copied
+# into this script, which is what someone does after finding that the config's
+# copy did not apply, without noticing the other twelve.
+#
+# test-android-rustflags-reach-the-linker.sh is the gate.
+# ------------------------------------------------------------
+config_rustflags() {
+    local triple="$1"
+    python3 - "$ENGINE_ROOT/.cargo/config.toml" "$triple" <<'PYEOF'
+import sys, tomllib
+config_path, triple = sys.argv[1], sys.argv[2]
+with open(config_path, "rb") as handle:
+    config = tomllib.load(handle)
+flags = config.get("target", {}).get(triple, {}).get("rustflags", [])
+print(" ".join(flags))
+PYEOF
+}
+
+# ------------------------------------------------------------
 # Find arm64 clang builtins
 # ------------------------------------------------------------
 find_arm64_builtins() {
@@ -372,7 +410,16 @@ build_platform() {
     # final link, so the NDK lld never sees a raw-bitcode object -- the failure
     # that once motivated embed-bitcode=no ("Invalid value Producer/Reader LLVM")
     # only happens without LTO, where cargo's default is already embed-bitcode=no.
-    local common_rustflags="-C link-arg=-Wl,--allow-multiple-definition"
+    # Everything static lives in `.cargo/config.toml`, including
+    # `--allow-multiple-definition`, whose long justification is there. This
+    # carries that list forward because setting RUSTFLAGS at all would otherwise
+    # drop it; only genuinely build-time-dependent flags are added below.
+    local common_rustflags
+    common_rustflags="$(config_rustflags "$target_triple")"
+    if [[ -z "$common_rustflags" ]]; then
+        print_error "no rustflags declared for $target_triple in .cargo/config.toml"
+        return 1
+    fi
 
     if [[ "$platform" == "arm64-v8a" ]]; then
         local builtins
