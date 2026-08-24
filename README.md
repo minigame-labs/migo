@@ -14,6 +14,8 @@
 
 The two touch disjoint globals and compose freely — pick zero, one, or both, matched to what your content actually needs. A future platform (a quick-game-alliance member, etc.) is the same recipe again: a new adapter package, no engine changes.
 
+**Wondering whether your own catalogue runs?** Don't take our word for it and don't send us anything — [PRESCREEN.md](PRESCREEN.md) is the tool we would run, for you to run yourself. It reports which APIs a bundle needs against what this build actually publishes, and whether it paints on a real device. Your content never leaves your machine.
+
 ## Why Migo
 
 | | Migo | Android System WebView |
