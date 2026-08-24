@@ -141,7 +141,7 @@ say "launching $ACTIVITY for ${SECS}s"
 # native host; without it a JS throw is a black screen and a clean log.
 # `am start` reports failure in its output, not always in its exit code, and
 # swallowing both leaves the caller with "exit 1" and nothing to act on.
-am_out="$("${ADB[@]}" shell "am start -n $ACTIVITY --es migoGameId $GAME_ID --es MIGO_CAPI_LOG info" 2>&1 | tr -d '\r')"
+am_out="$("${ADB[@]}" shell "am start -n $ACTIVITY --es gameId $GAME_ID --es migoGameId $GAME_ID --es MIGO_CAPI_LOG info" 2>&1 | tr -d '\r')"
 if grep -qiE "error|does not exist|not exported|permission denial" <<<"$am_out"; then
     echo "could not start $ACTIVITY:" >&2
     sed 's/^/  /' <<<"$am_out" >&2
@@ -363,9 +363,10 @@ elif not focus_in_pkg:
     out.append("")
 elif not focus_is_wanted:
     out.append(
-        f"> **The window in front is not the activity that was asked for** "
-        f"(`{wanted}`). It belongs to the host, so the host is running — but a "
-        "screenshot of a host's own UI says nothing about the bundle."
+        f"> The window in front is `{focus1}`, not the activity that was asked for "
+        f"(`{wanted}`) — normal when a host forwards its launch entry to its own "
+        "game activity. Whether content is actually on screen is settled below by "
+        "the session signal, not by this name."
     )
     out.append("")
 
@@ -427,14 +428,6 @@ if focus_known and not focus_in_pkg:
     why = (
         f"`{focus1}` held the foreground, not the host, so the screen and the log "
         "describe something else. Check that the activity exists and starts."
-    )
-elif focus_known and not focus_is_wanted:
-    verdict = "**Could not confirm the bundle was on screen**"
-    why = (
-        f"the host is in front, but showing `{focus1}` rather than the activity "
-        f"named (`{wanted}`) — a host's menu, most likely. Point --activity at the "
-        "window that hosts the game surface. Refusing here is deliberate: the "
-        "first version of this tool called that case \"Runs\"."
     )
 elif crashed or not running:
     verdict = "**Not runnable as-is**"
