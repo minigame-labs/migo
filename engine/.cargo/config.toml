@@ -88,27 +88,30 @@ rustflags = [
   # It is a load-time encoding and nothing else: no code is added, removed or
   # reordered, so nothing about *execution* speed can move.
   #
-  # Load time does move, and not in the direction this comment first claimed.
-  # It said the linker "reads a much smaller table", implying neutral-to-better.
-  # Measured instead, 2026-08-25, three interleaved temperature-gated rounds of
-  # endless-runner on a Mate 30 Pro, two builds differing only in this flag:
+  # Load time was tested rather than argued, twice, because the first test was
+  # wrong. Endless-runner on a Mate 30 Pro, three interleaved temperature-gated
+  # rounds per arm:
   #
-  #   first frame   packed 330 ms [320, 330, 331]   unpacked 314 ms [313, 314, 317]
-  #   game ready    packed 722 ms [645, 722, 735]   unpacked 706 ms [667, 706, 753]
+  #   confounded pair (the two builds also differed by four merged PRs)
+  #     first frame   packed 330 [320, 330, 331]   unpacked 314 [313, 314, 317]
+  #     -> "packed costs 16 ms, and the ranges do not overlap"
   #
-  # **Packed costs ~16 ms of first frame**, and the two ranges do not overlap, so
-  # it is not noise. Game-ready moves the same 16 ms but its ranges overlap
-  # heavily, so only the first-frame figure is worth quoting. The mechanism is
-  # plain in hindsight: APS2 is sequential sleb128 decoding of 90,430 entries,
-  # while a flat RELA table is a tight loop over fixed-width records that the
-  # CPU and the page cache both like.
+  #   clean pair (one tree, ± this flag, nothing else)
+  #     first frame   packed 322 [308, 322, 361]   unpacked 333 [320, 333, 356]
+  #     game ready    packed 660 [645, 660, 756]   unpacked 746 [660, 746, 752]
+  #     -> the effect flips sign and the ranges overlap almost entirely
   #
-  # Kept anyway, deliberately: 1.85 MiB off every installation, against 16 ms on
-  # a ~330 ms first frame. Package size is the barrier a host weighs before it
-  # will even try the engine; 5% of a first frame is below what anyone perceives.
-  # That is a trade, not a free win, and it is written here so the next person
-  # re-deciding it has the number rather than the earlier claim that there was
-  # nothing to decide.
+  # **It did not reproduce.** At n=3 on this device the flag has no startup
+  # effect this harness can resolve, in either direction. The tidy-looking
+  # non-overlap in the first pass came from comparing two different trees, which
+  # is a reminder that a clean-looking result from a dirty comparison is more
+  # dangerous than a noisy one.
+  #
+  # So the original claim stands, but as a tested one rather than a reasoned one:
+  # 1.85 MiB off every installation, with no startup cost that three rounds can
+  # find. If someone later needs certainty rather than "not resolvable at n=3",
+  # the arms are `scripts/build-aar.sh` ± this line and the driver is
+  # migo-bench's `jitless-ab.sh --label-a packed --label-b unpacked`.
   "-C", "link-arg=-Wl,--pack-dyn-relocs=android",
 
   # Version script: only export JNI symbols, hide everything else
