@@ -34,6 +34,10 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Manages image-related APIs for a session.
@@ -46,6 +50,48 @@ import java.util.List;
 public class ImageApiManager {
 
     private static final String TAG = "ImageApiManager";
+
+    /**
+     * Where image work runs. Two threads, named, daemon.
+     *
+     * <p>It used to be a fresh {@code new Thread(...)} per call — correctly
+     * named, but unbounded and non-daemon. The bound is what bites: compression
+     * is CPU-bound, so content that compresses a batch — a screenshot sheet, an
+     * avatar pipeline — got one OS thread per image, each with a 1 MB stack
+     * reservation, all competing with the render thread on a phone that has
+     * eight cores at best. More threads than cores does not compress anything
+     * faster; it only takes the CPU away from the frame.
+     *
+     * <p>Two, not {@code availableProcessors()}: this is background work behind
+     * a callback, and the thing it must never do is starve the frame. The rest
+     * of this SDK spends its threads the same way — see
+     * {@code AudioRecorderManager}, one named daemon thread per recording
+     * session, not one per buffer.
+     *
+     * <p>Still named, for the reason the old code was right to name it: this SDK
+     * runs inside someone else's app, and when their monitoring flags a busy
+     * thread, the name is the only thing that says whose it is. Daemon is the
+     * part that is new — a pool thread outlives any single call, and a pool
+     * thread must never be the reason a host process stays alive.
+     *
+     * <p>A bound means work can now wait behind other work, so a result can
+     * arrive after its session is gone — which was already possible with a
+     * thread per call, just less often. It settles the same way it did: the
+     * reply is addressed by host id, and a host that no longer resolves cannot
+     * be delivered to, so the send fails and is dropped.
+     */
+    private static final ExecutorService IMAGE_WORKERS =
+            Executors.newFixedThreadPool(2, new ThreadFactory() {
+                private final AtomicInteger counter = new AtomicInteger(1);
+
+                @Override
+                public Thread newThread(Runnable runnable) {
+                    Thread thread = new Thread(runnable,
+                            "Migo-Image-" + counter.getAndIncrement());
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            });
 
     private static final int REQUEST_CHOOSE_IMAGE = 9001;
     private static final int REQUEST_CAPTURE_IMAGE = 9002;
@@ -267,7 +313,7 @@ public class ImageApiManager {
         }
         final int requestId = CallbackCorrelation.requestIdOf(opts);
 
-        new Thread(new Runnable() {
+        IMAGE_WORKERS.execute(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -277,7 +323,7 @@ public class ImageApiManager {
                             CallbackCorrelation.failure(requestId, "compressImage", e.getMessage()));
                 }
             }
-        }, "migo-compress-image").start();
+        });
     }
 
     private String compressSync(JSONObject opts, int requestId) throws Exception {
