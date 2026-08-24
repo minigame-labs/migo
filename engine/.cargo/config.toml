@@ -85,9 +85,30 @@ rustflags = [
   # estimated -- but bionic only learned DT_RELR in API 30 and this library
   # still has to load on 26. Worth revisiting if that floor ever moves.
   #
-  # This is a load-time encoding and nothing else: no code is added, removed or
-  # reordered, so no execution path changes. The dynamic linker applies the same
-  # relocations, reading a much smaller table to find them.
+  # It is a load-time encoding and nothing else: no code is added, removed or
+  # reordered, so nothing about *execution* speed can move.
+  #
+  # Load time does move, and not in the direction this comment first claimed.
+  # It said the linker "reads a much smaller table", implying neutral-to-better.
+  # Measured instead, 2026-08-25, three interleaved temperature-gated rounds of
+  # endless-runner on a Mate 30 Pro, two builds differing only in this flag:
+  #
+  #   first frame   packed 330 ms [320, 330, 331]   unpacked 314 ms [313, 314, 317]
+  #   game ready    packed 722 ms [645, 722, 735]   unpacked 706 ms [667, 706, 753]
+  #
+  # **Packed costs ~16 ms of first frame**, and the two ranges do not overlap, so
+  # it is not noise. Game-ready moves the same 16 ms but its ranges overlap
+  # heavily, so only the first-frame figure is worth quoting. The mechanism is
+  # plain in hindsight: APS2 is sequential sleb128 decoding of 90,430 entries,
+  # while a flat RELA table is a tight loop over fixed-width records that the
+  # CPU and the page cache both like.
+  #
+  # Kept anyway, deliberately: 1.85 MiB off every installation, against 16 ms on
+  # a ~330 ms first frame. Package size is the barrier a host weighs before it
+  # will even try the engine; 5% of a first frame is below what anyone perceives.
+  # That is a trade, not a free win, and it is written here so the next person
+  # re-deciding it has the number rather than the earlier claim that there was
+  # nothing to decide.
   "-C", "link-arg=-Wl,--pack-dyn-relocs=android",
 
   # Version script: only export JNI symbols, hide everything else
