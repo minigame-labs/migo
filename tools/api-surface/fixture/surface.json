@@ -1,0 +1,20 @@
+{
+  "global": [],
+  "migo": [
+    "createCanvas",
+    "getGamepads",
+    "getSystemInfoSync",
+    "loadSubpackage"
+  ],
+  "wx": [
+    "createBannerAd",
+    "createCanvas",
+    "createInnerAudioContext",
+    "getLaunchOptionsSync",
+    "getSystemInfoSync",
+    "loadSubpackage",
+    "offTouchStart",
+    "onTouchStart",
+    "reportMonitor"
+  ]
+}
