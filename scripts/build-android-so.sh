@@ -93,7 +93,7 @@ show_help() {
     echo ""
     echo "Usage:"
     echo "  ./build-android-so.sh [arm64-v8a|x86_64|all] [release|debug]"
-    echo "  ./build-android-so.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--build-type release|debug] [--compile-only] [architectures...]"
+    echo "  ./build-android-so.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--jitless] [--build-type release|debug] [--compile-only] [architectures...]"
     echo ""
     echo "Examples:"
     echo "  ./build-android-so.sh"
@@ -315,6 +315,7 @@ build_platform() {
     local build_type="$2"
     local codegen_profile="$3"
     local worker_snapshot="$4"
+    local jitless="$5"
 
     if [[ "$platform" == "armv7" || "$platform" == "x86" ]]; then
         print_error "$platform is not supported"
@@ -352,6 +353,14 @@ build_platform() {
     if [[ "$worker_snapshot" == true ]]; then
         destination_suffix+="-worker-snapshot"
         cargo_features+=",worker-snapshot"
+    fi
+    # Measurement build: V8 with --jitless, the closest proxy on measurable
+    # hardware for HarmonyOS NEXT, where no third-party VM may JIT. The suffix is
+    # load-bearing -- it keeps the jitless natives in their own jniLibs tree, so
+    # an A/B pair cannot end up comparing a binary against itself.
+    if [[ "$jitless" == true ]]; then
+        destination_suffix+="-jitless"
+        cargo_features+=",v8-jitless"
     fi
 
     # --------------------------------------------------------
@@ -637,6 +646,7 @@ build_type="release"
 product_profile="full"
 codegen_profile="z"
 worker_snapshot=false
+jitless=false
 compile_only=false
 platforms=()
 use_all=false
@@ -682,6 +692,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --worker-snapshot)
             worker_snapshot=true
+            ;;
+        --jitless)
+            jitless=true
             ;;
         --compile-only)
             compile_only=true
@@ -757,7 +770,7 @@ slim_icu_data
 
 failed=()
 for p in "${platforms[@]}"; do
-    if ! build_platform "$p" "$build_type" "$codegen_profile" "$worker_snapshot"; then
+    if ! build_platform "$p" "$build_type" "$codegen_profile" "$worker_snapshot" "$jitless"; then
         failed+=("$p")
     fi
 done

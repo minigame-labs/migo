@@ -30,7 +30,7 @@ show_help() {
     echo ""
     echo "Usage:"
     echo "  ./build-aar.sh [release|debug] [architectures...]"
-    echo "  ./build-aar.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--artifact-manifest required|optional|off] [--build-type release|debug] [--output-dir dist] [--skip-rust] [architectures...]"
+    echo "  ./build-aar.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--jitless] [--artifact-manifest required|optional|off] [--build-type release|debug] [--output-dir dist] [--skip-rust] [architectures...]"
     echo ""
     echo "Options:"
     echo "  release|debug    Build type (default: release)"
@@ -38,6 +38,7 @@ show_help() {
     echo "  --product-profile Product surface (full|slim, default: full)"
     echo "  --codegen-profile Hot-crate optimization (z|2|3, default: z; 2/3 require release)"
     echo "  --worker-snapshot Build the isolated full-release Worker snapshot candidate"
+    echo "  --jitless         Measurement build: V8 with --jitless (HarmonyOS NEXT proxy). Never shippable."
     echo "  --artifact-manifest Manifest policy (release requires required; debug defaults optional)"
     echo "  --output-dir     Output directory under platforms/android (default: dist)"
     echo "  arm64-v8a        Build for ARM64"
@@ -121,6 +122,7 @@ BUILD_TYPE="release"
 PRODUCT_PROFILE="full"
 CODEGEN_PROFILE="z"
 WORKER_SNAPSHOT=false
+JITLESS=false
 SKIP_RUST=false
 UNVERIFIED_NATIVE_LIBS=false
 ARTIFACT_MANIFEST_MODE="${MIGO_ARTIFACT_MANIFEST_MODE:-}"
@@ -141,6 +143,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --worker-snapshot)
             WORKER_SNAPSHOT=true
+            ;;
+        --jitless)
+            JITLESS=true
             ;;
         --artifact-manifest)
             shift
@@ -304,7 +309,17 @@ if [[ "$WORKER_SNAPSHOT" == true ]]; then
     WORKER_SNAPSHOT_SUFFIX="-worker-snapshot"
     WORKER_SNAPSHOT_ARGS=(--worker-snapshot)
 fi
-ARTIFACT_SUFFIX="${CODEGEN_SUFFIX}${WORKER_SNAPSHOT_SUFFIX}"
+# A jitless AAR is a measurement artifact and must never be mistaken for a
+# shipping one. The suffix takes care of that on its own: the canonical release
+# name is only claimed when ARTIFACT_SUFFIX is empty, so this build always lands
+# under a descriptive name instead.
+JITLESS_SUFFIX=""
+JITLESS_ARGS=()
+if [[ "$JITLESS" == true ]]; then
+    JITLESS_SUFFIX="-jitless"
+    JITLESS_ARGS=(--jitless)
+fi
+ARTIFACT_SUFFIX="${CODEGEN_SUFFIX}${WORKER_SNAPSHOT_SUFFIX}${JITLESS_SUFFIX}"
 EXTERNAL_JNI_LIBS="$REPO_ROOT/engine/jniLibs/${PRODUCT_PROFILE}${ARTIFACT_SUFFIX}"
 
 if [[ ${#ARCHITECTURES[@]} -eq 0 ]]; then
@@ -345,7 +360,8 @@ build_rust_library() {
         "$RUST_BUILD_SCRIPT" "$arch" "$BUILD_TYPE" \
             --product-profile "$PRODUCT_PROFILE" \
             --codegen-profile "$CODEGEN_PROFILE" \
-            "${WORKER_SNAPSHOT_ARGS[@]}"
+            "${WORKER_SNAPSHOT_ARGS[@]}" \
+            ${JITLESS_ARGS[@]+"${JITLESS_ARGS[@]}"}
     done
 
     print_success "Rust build done"
@@ -469,6 +485,9 @@ generate_verified_artifact_manifests() {
     if [[ "$WORKER_SNAPSHOT" == true ]]; then
         generator_args+=(--worker-snapshot)
     fi
+    if [[ "$JITLESS" == true ]]; then
+        generator_args+=(--jitless)
+    fi
     local arch
     for arch in "${ARCHITECTURES[@]}"; do
         generator_args+=(--arch "$arch")
@@ -537,6 +556,7 @@ build_aar() {
     $gradle_cmd "-PmigoAbis=$gradle_abis" \
         "-PmigoCodegenProfile=$CODEGEN_PROFILE" \
         "-PmigoWorkerSnapshot=$WORKER_SNAPSHOT" \
+        "-PmigoJitless=$JITLESS" \
         "${verified_release_args[@]}" \
         "assemble${profile_task}${type_task}"
 

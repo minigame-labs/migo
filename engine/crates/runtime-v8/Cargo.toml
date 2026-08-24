@@ -14,6 +14,13 @@ profile-slim = ["v8-limits", "code-signing"]
 # Opt-in R9 A/B candidate. Android builds additionally require a validated,
 # kind-bound Worker snapshot; the shipping default keeps source bootstrap.
 worker-snapshot = []
+
+# Measurement build. HarmonyOS NEXT forbids executable anonymous memory for
+# third-party VMs, so V8 there runs interpreted whether we ask it to or not, and
+# PLAN.md gates every HarmonyOS performance claim on knowing what that costs.
+# `--jitless` is the closest faithful proxy on hardware we can actually measure.
+# Never in a shipping build: it is off by default and no release path selects it.
+v8-jitless = []
 v8-limits = ["shared/v8-limits"]
 code-signing = ["shared/code-signing"]
 # Gate the image crate behind a feature flag — runtime-v8 does not use it directly.
