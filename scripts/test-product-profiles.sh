@@ -56,12 +56,45 @@ grep -Eq '(^|[[:space:]])migo-audio v[0-9]' <<<"$FULL_TREE" \
   || fail "full must retain native audio"
 
 echo "[3/7] checking Gradle native artifacts are profile-exact"
-grep -Fq 'jniLibs.srcDirs = ["../../../engine/jniLibs/full${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}"]' \
-  "$ROOT/platforms/android/library/build.gradle" \
-  || fail "Gradle full flavor is not pinned to its product/codegen native artifacts"
-grep -Fq 'jniLibs.srcDirs = ["../../../engine/jniLibs/slim${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}"]' \
-  "$ROOT/platforms/android/library/build.gradle" \
-  || fail "Gradle slim flavor is not pinned to its product/codegen native artifacts"
+# The property is that each flavor's native root is *derived* -- the profile name
+# followed by nothing but variable interpolations -- so a build that varies the
+# natives (codegen profile, worker snapshot, jitless measurement build) can never
+# read another variant's directory.
+#
+# Asserted as a shape rather than as one exact string, deliberately. This used to
+# grep for the literal expression, which made it a fourth place the directory name
+# was written out: build-aar.sh, library/build.gradle,
+# generate-android-artifact-manifests.py, and this gate. Adding a variant then
+# turned this red for being *correct*, and the fix that presents itself in that
+# moment -- paste the new string in here too -- deepens the duplication instead of
+# testing the property. A literal that has to be edited whenever the thing it
+# guards changes is not guarding it.
+python3 - "$ROOT/platforms/android/library/build.gradle" <<'GRADLE_SRCDIRS' || fail "Gradle flavors are not pinned to their product/codegen native artifacts"
+import re, sys
+source = open(sys.argv[1], encoding="utf-8").read()
+required = {"migoNativeProfileSuffix", "migoWorkerSnapshotSuffix"}
+problems = []
+for profile in ("full", "slim"):
+    pattern = re.compile(
+        r'jniLibs\.srcDirs = \["\.\./\.\./\.\./engine/jniLibs/' + profile + r'((?:\$\{\w+\})*)"\]'
+    )
+    match = pattern.search(source)
+    if not match:
+        problems.append(
+            f"{profile}: no jniLibs.srcDirs of the form "
+            f'"../../../engine/jniLibs/{profile}${{...}}..." -- either the flavor is gone, '
+            f"or its native root now carries literal text, which is how a variant ends up "
+            f"reading another variant's binaries"
+        )
+        continue
+    seen = set(re.findall(r"\$\{(\w+)\}", match.group(1)))
+    missing = required - seen
+    if missing:
+        problems.append(f"{profile}: native root drops {sorted(missing)}")
+for problem in problems:
+    print(f"  {problem}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+GRADLE_SRCDIRS
 grep -Fq "supportedMigoCodegenProfiles = ['z', '2', '3']" \
   "$ROOT/platforms/android/library/build.gradle" \
   || fail "Gradle does not bound the Q14 codegen profile"

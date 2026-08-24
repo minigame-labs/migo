@@ -52,6 +52,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--build-type", required=True, choices=("debug", "release"))
     parser.add_argument("--codegen-profile", required=True, choices=("z", "2", "3"))
     parser.add_argument("--worker-snapshot", action="store_true")
+    # Measurement build (V8 --jitless). The third place the jniLibs directory
+    # name is recomputed rather than passed in -- build-aar.sh and
+    # library/build.gradle are the other two. Omitting it here does not fail
+    # loudly: the manifests describe the JIT natives while Gradle packages the
+    # jitless ones, and verifyMigoReleaseArtifactPackaging rejects the AAR with
+    # a hash mismatch that says nothing about the cause.
+    parser.add_argument("--jitless", action="store_true")
     parser.add_argument(
         "--arch", action="append", required=True, choices=tuple(ARCHITECTURES)
     )
@@ -364,8 +371,9 @@ def generate(arguments: argparse.Namespace) -> None:
             "" if arguments.codegen_profile == "z" else f"-opt{arguments.codegen_profile}"
         )
         worker_suffix = "-worker-snapshot" if arguments.worker_snapshot else ""
+        jitless_suffix = "-jitless" if arguments.jitless else ""
         native_root = repo_root / "engine/jniLibs" / (
-            f"{arguments.product_profile}{codegen_suffix}{worker_suffix}"
+            f"{arguments.product_profile}{codegen_suffix}{worker_suffix}{jitless_suffix}"
         )
 
         for abi in arguments.arch:

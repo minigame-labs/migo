@@ -184,6 +184,37 @@ impl HostJsRuntime {
         #[cfg(not(feature = "v8-limits"))]
         let create_params: Option<v8::CreateParams> = None;
 
+        // Jitless measurement build (`--features v8-jitless`, off by default).
+        //
+        // HarmonyOS 5.0.0(12) stopped letting anonymous memory become executable,
+        // so no third-party VM may JIT there; Migo bundles V8, so on NEXT it runs
+        // interpreted whether it asks to or not. `--jitless` is the closest proxy
+        // available on hardware we can actually measure, and the number it
+        // produces is what gates whether NEXT performance may be spoken about at
+        // all.
+        //
+        // A build feature rather than a runtime switch, for two reasons. The
+        // measurement has to run against a release build -- a debug build is
+        // opt-level 0, and a constant native overhead in both arms would flatter
+        // jitless, which is the dangerous direction to be wrong in -- and the
+        // debug-only file path below is compiled out of release on purpose.
+        // Adding a shipping runtime switch to answer a one-off question would be
+        // paying in permanent surface for a number.
+        //
+        // Worth knowing before reading any result: `--jitless` does not merely
+        // slow WebAssembly down, it removes it. V8 cannot instantiate a module
+        // without generating code. Content that ships `.wasm` does not run
+        // slower under this flag; it does not run.
+        #[cfg(feature = "v8-jitless")]
+        {
+            use std::sync::Once;
+            static V8_JITLESS: Once = Once::new();
+            V8_JITLESS.call_once(|| {
+                tracing::warn!("jitless measurement build: applying --jitless to V8");
+                deno_core::v8::V8::set_flags_from_string("--jitless");
+            });
+        }
+
         // Debug-only V8 flag injection for on-device profiling. On debug builds,
         // any V8 flags placed in /data/local/tmp/v8flags.txt are applied before
         // the isolate is created, e.g.:

@@ -11,6 +11,8 @@ default = ["profile-full"]
 profile-full = ["runtime-v8/profile-full", "v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "graphics/profile-full"]
 profile-slim = ["runtime-v8/profile-slim", "v8-limits", "code-signing", "graphics/profile-slim"]
 worker-snapshot = ["runtime-v8/worker-snapshot"]
+# Measurement build only; see runtime-v8's manifest for what it costs and why.
+v8-jitless = ["runtime-v8/v8-jitless"]
 test-support = []
 v8-limits = ["runtime-v8/v8-limits", "shared/v8-limits"]
 code-signing = ["runtime-v8/code-signing", "shared/code-signing"]
