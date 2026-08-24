@@ -150,6 +150,17 @@ jobs:
       - name: Example content namespace contract
         run: bash scripts/test-content-namespace-contract.sh
 
+      # The prescreen scanner is what a prospective customer runs against their own
+      # bundle, so its wrong answers are the expensive kind: a gap it invents gets
+      # checked, does not exist, and the rest of the report stops being believed.
+      # It went un-gated for a while because it was git-ignored, and in that time it
+      # learned to count string literals and assignments as API calls -- on one real
+      # bundle, four reported gaps were really one. Fixture-driven and hermetic: no
+      # player run, no device, so the scanner's logic is what is under test rather
+      # than whatever the runtime happens to publish today.
+      - name: Prescreen scanner contract
+        run: bash scripts/test-prescreen-scanner.sh
+
       # An input listener published to content must have native code that can
       # fire it. This caught `migo.onMouseDown` and friends being live on the
       # content surface with no producer anywhere -- registering them worked and
