@@ -631,6 +631,16 @@ jobs:
       - name: Android shipped natives are reachable
         run: bash scripts/test-android-native-deps-contract.sh
 
+      # Three separate size regressions -- a silently-skipped ICU swap, thirteen
+      # rustflags replaced out of the shipped link, and a libc++ nothing loaded --
+      # each shipped or nearly shipped with every test green, because the size of
+      # the binary was nobody's assertion. This puts a budget on it. It lives here
+      # rather than in pr-ci because pr-ci builds debug AARs, and a debug .so is
+      # ~340 MB: there is no meaningful ceiling to hold it to. Needs the release
+      # AARs from the step above.
+      - name: Android engine size budget
+        run: bash scripts/test-android-so-size-contract.sh
+
       # The slice manifests record which snapshot each ABI embeds, but until here
       # nothing reads the .so. generate-android-artifact-manifests.py validates the
       # snapshot *file* and refuses to emit a slice without it, while
