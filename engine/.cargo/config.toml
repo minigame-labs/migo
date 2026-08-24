@@ -71,6 +71,25 @@ rustflags = [
   "-C", "link-arg=-Wl,-z,relro",
   "-C", "link-arg=-Wl,-z,now",
 
+  # Pack the relative relocations.
+  #
+  # `.rela.dyn` was 2,173,992 bytes, and 90,430 of its 90,583 entries (99.8%)
+  # are R_AARCH64_RELATIVE: 24 bytes each to say "add the load bias to this
+  # word", one entry per word, for 2.07 MiB of table. Nothing in the file was
+  # wrong -- that is simply what an unpacked RELA section costs a library with
+  # this much pointer-bearing rodata. APS2 group-encodes the offsets instead,
+  # and bionic has decoded that format since API 23 (minSdk here is 26).
+  #
+  # `android` and not `relr` deliberately. SHT_RELR would encode the same
+  # 90,430 offsets in ~18 KB -- simulated exactly against this binary, not
+  # estimated -- but bionic only learned DT_RELR in API 30 and this library
+  # still has to load on 26. Worth revisiting if that floor ever moves.
+  #
+  # This is a load-time encoding and nothing else: no code is added, removed or
+  # reordered, so no execution path changes. The dynamic linker applies the same
+  # relocations, reading a much smaller table to find them.
+  "-C", "link-arg=-Wl,--pack-dyn-relocs=android",
+
   # Version script: only export JNI symbols, hide everything else
   "-C", "link-arg=-Wl,--version-script=version.script",
 ]
@@ -99,6 +118,10 @@ rustflags = [
   "-C", "link-arg=-Wl,-z,relro",
   "-C", "link-arg=-Wl,-z,now",
 
+  # Pack the relative relocations -- same reasoning as the aarch64 block above,
+  # where the measurement and the choice of APS2 over SHT_RELR are recorded.
+  "-C", "link-arg=-Wl,--pack-dyn-relocs=android",
+
   # Version script: only export JNI symbols, hide everything else
   "-C", "link-arg=-Wl,--version-script=version.script",
 ]
@@ -126,6 +149,13 @@ rustflags = [
   # Read-only relocations (security hardening)
   "-C", "link-arg=-Wl,-z,relro",
   "-C", "link-arg=-Wl,-z,now",
+
+  # Pack the relative relocations -- see the aarch64 block above. DT_ANDROID_REL
+  # is the 32-bit form and bionic decodes it from the same API level. Untested:
+  # armv7 is not in build-android-so.sh's PLATFORM_MAP, so nothing builds this
+  # target today. It is here so that whoever turns armv7 back on inherits the
+  # flag set the shipped ABIs use rather than a quietly different one.
+  "-C", "link-arg=-Wl,--pack-dyn-relocs=android",
 
   # Version script: only export JNI symbols, hide everything else
   "-C", "link-arg=-Wl,--version-script=version.script",
