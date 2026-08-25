@@ -257,8 +257,15 @@ for aar in "${aars[@]}"; do
 done
 
 if $JSON_MODE; then
+    # Two runs of one commit must produce one document, so the stamp comes from
+    # SOURCE_DATE_EPOCH when the caller sets one.
+    if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+        measured="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d)"
+    else
+        measured="$(date -u +%Y-%m-%d)"
+    fi
     printf '{\n  "measured": "%s",\n  "source": "scripts/test-android-so-size-contract.sh --json",\n  "note": "raw byte counts; every payload below passed the size gate",\n  "artifacts": [\n' \
-        "$(date -u +%Y-%m-%d)"
+        "$measured"
     for i in "${!json_rows[@]}"; do
         printf '    %s%s\n' "${json_rows[$i]}" "$([[ $i -lt $(( ${#json_rows[@]} - 1 )) ]] && echo ,)"
     done
