@@ -100,7 +100,7 @@ fi
 if [[ -z "$STUBS" ]]; then
     STUBS="$(mktemp)"
     trap 'rm -f "$STUBS"' EXIT
-    bash "$ROOT_DIR/scripts/dump-stub-surface.sh" --out "$STUBS" 2>/dev/null || : > "$STUBS"
+    bash "$ROOT_DIR/scripts/dump-stub-surface.sh" --json --out "$STUBS" 2>/dev/null || : > "$STUBS"
 fi
 
 python3 - "$ROOT_DIR" "$BUNDLE" "$SURFACE" "$WXREF" "$STUBS" <<'PY' > "${OUT:-/dev/stdout}"
@@ -138,8 +138,22 @@ if reference_path.exists():
 
 stub_path = pathlib.Path(sys.argv[5]) if len(sys.argv) > 5 else None
 stubbed: set[str] = set()
+# What each stub actually does, in the words of the marker beside it. The report
+# used to print bare names under one sentence covering all of them, and no single
+# sentence is true of all of them: "succeeds silently, so a bundle that depends
+# on it does not work" describes `reportEvent` exactly and libels
+# `getPrivacySetting`, which answers -- correctly -- that this build has no
+# privacy gate, letting content's flow proceed as designed.
+stub_describes: dict[str, str] = {}
 if stub_path and stub_path.exists():
-    stubbed = {line.strip() for line in stub_path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    raw = stub_path.read_text(encoding="utf-8").strip()
+    if raw.startswith("{"):
+        payload = json.loads(raw)
+        stubbed = set(payload.get("stubs", []))
+        stub_describes = payload.get("describes", {})
+    else:
+        # A hand-supplied --stubs list stays readable: one name per line.
+        stubbed = {line.strip() for line in raw.splitlines() if line.strip()}
 
 sources = sorted(p for p in bundle.rglob("*.js") if p.is_file())
 if not sources:
@@ -467,13 +481,21 @@ if stub_hits:
     out.append("")
     out.append(
         "These names exist on this build and this bundle calls them, so they do not "
-        "appear as gaps above — **and they are not implemented**. Some fail loudly; "
-        "the dangerous ones succeed silently, which means a bundle that depends on "
-        "them looks fine in every count on this page and still does not work."
+        "appear as gaps above — **and none of them is implemented**. What that "
+        "costs you differs per name, so each is quoted below in the words of the "
+        "marker beside it in the engine source. Some fail loudly and your code can "
+        "detect them. Some accept the call and drop it, which is invisible here and "
+        "in your logs. And some report, truthfully, that this build does not have a "
+        "capability — those are not breakage, and reading them as breakage is the "
+        "mistake this list is arranged to prevent."
     )
     out.append("")
     for name in stub_hits:
-        out.append(f"- `{name}`")
+        description = stub_describes.get(name, "").strip()
+        if description:
+            out.append(f"- `{name}` — {description}")
+        else:
+            out.append(f"- `{name}`")
     out.append("")
     out.append(
         "The list is derived from the engine sources by "

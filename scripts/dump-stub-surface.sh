@@ -60,10 +60,41 @@ fmt = sys.argv[2]
 #    "@stub All ..." / "@stub <Name>: ..." / "@stub <name> ..." / bare "@stub -".
 whole: set[str] = set()          # module path -> every published name is a stub
 partial: dict[str, set[str]] = {}  # module path -> just these names
+# The marker's own sentence, which says what the stub actually does. A report
+# that prints only names has to generalise over all of them, and the general
+# sentence is wrong for some: "silently succeeds and does not work" is true of
+# `reportEvent` and false of `getPrivacySetting`, which answers truthfully that
+# this build has no privacy gate. The specific sentence is already written; it
+# was simply being dropped on the floor.
+whole_text: dict[str, str] = {}
+partial_text: dict[str, dict[str, str]] = {}
 
 for path in sorted(src.rglob("*.js")):
     text = path.read_text(encoding="utf-8", errors="replace")
-    markers = re.findall(r"@stub\s+(.*)", text)
+    # A marker may wrap onto following comment lines, and reading only the first
+    # truncated two of them mid-clause in the customer-facing report. A
+    # continuation is a comment line that does not itself start a new `@stub` --
+    # `14_setting.js` has three markers stacked with no blank line between them,
+    # so without that guard the first would swallow the next two.
+    markers: list[str] = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.search(r"@stub\s+(.*)", line)
+        if not match:
+            continue
+        parts = [match.group(1).strip()]
+        for follow in lines[index + 1: index + 4]:
+            stripped = follow.strip()
+            if not re.match(r"^(//|\*)", stripped):
+                break
+            if "@stub" in stripped:
+                break
+            body = re.sub(r"^(//|\*)\s*", "", stripped)
+            if not body:
+                break
+            parts.append(body)
+        markers.append(" ".join(parts))
+
     if not markers:
         continue
     key = path.name
@@ -71,6 +102,7 @@ for path in sorted(src.rglob("*.js")):
         marker = marker.strip()
         if marker.lower().startswith("all"):
             whole.add(key)
+            whole_text.setdefault(key, marker)
             continue
         name = re.match(r"([A-Za-z_$][\w$]*)", marker)
         # A bare "@stub - ..." names nothing; it documents a callback the host
@@ -78,10 +110,12 @@ for path in sorted(src.rglob("*.js")):
         # attribute and nothing to report.
         if name:
             partial.setdefault(key, set()).add(name.group(1))
+            partial_text.setdefault(key, {}).setdefault(name.group(1), marker)
 
 # 2. What each 99_global_scope file publishes, and from which module.
 stubs: set[str] = set()
 attributed: dict[str, str] = {}
+describes: dict[str, str] = {}
 for scope in sorted(src.rglob("99_global_scope*.js")):
     text = scope.read_text(encoding="utf-8", errors="replace")
     alias_to_module = {
@@ -115,6 +149,15 @@ for scope in sorted(src.rglob("99_global_scope*.js")):
                 or any(published == "get" + marker for marker in named)):
             stubs.add(published)
             attributed[published] = module
+            # Most specific wins: a marker naming this entry point, then one
+            # naming the class it returns, then the module-wide sentence.
+            texts = partial_text.get(module, {})
+            describes[published] = (
+                texts.get(published)
+                or texts.get(member)
+                or next((texts[m] for m in texts if published == "get" + m), None)
+                or whole_text.get(module, "")
+            )
 
 # 3. A marker nobody can attribute is a marker that has stopped meaning
 #    anything -- a renamed module, a deleted export. Say so rather than
@@ -126,7 +169,8 @@ orphans = sorted(
 
 if fmt == "json":
     print(json.dumps(
-        {"stubs": sorted(stubs), "by_module": attributed, "orphan_markers": orphans},
+        {"stubs": sorted(stubs), "by_module": attributed,
+         "describes": describes, "orphan_markers": orphans},
         indent=2, sort_keys=True, ensure_ascii=False,
     ))
 else:
