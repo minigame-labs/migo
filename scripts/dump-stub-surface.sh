@@ -96,7 +96,23 @@ for scope in sorted(src.rglob("99_global_scope*.js")):
         module = alias_to_module.get(alias)
         if module is None:
             continue
-        if module in whole or member in partial.get(module, ()) or published in partial.get(module, ()):
+        named = partial.get(module, set())
+        # A marker may name the *class* a factory returns rather than the factory
+        # itself -- `19_log_manager.js` says `@stub RealtimeLogManager` while the
+        # published name is `getRealtimeLogManager`. Resolving `X` to a published
+        # `getX` from the same module is an explicit rule, not a fuzzy match: the
+        # module has to publish it, and the name has to be exactly `get` + the
+        # marker.
+        #
+        # The alternative was to edit the marker. That is a one-line comment in a
+        # file under `runtime-v8`, and every `.js` and `.rs` there is inside the
+        # V8 snapshot fingerprint -- so correcting a comment costs regenerating
+        # eight snapshots on real hardware. A convention that taxes documentation
+        # fixes that heavily is a convention people stop obeying.
+        if (module in whole
+                or member in named
+                or published in named
+                or any(published == "get" + marker for marker in named)):
             stubs.add(published)
             attributed[published] = module
 
