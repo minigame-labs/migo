@@ -50,7 +50,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-BUNDLE=""; PKG=""; SERIAL="${ANDROID_SERIAL:-}"; ACTIVITY=""; GAME_ID="demo"
+BUNDLE=""; PKG=""; SERIAL="${ANDROID_SERIAL:-}"; ACTIVITY=""; GAME_ID="demo"; ENTRY="game.js"
 SECS=20; OUT=""; KEEP=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -60,6 +60,8 @@ while [[ $# -gt 0 ]]; do
         --device=*) SERIAL="${1#*=}"; shift ;;
         --activity) ACTIVITY="${2:?--activity requires a value}"; shift 2 ;;
         --activity=*) ACTIVITY="${1#*=}"; shift ;;
+        --entry) ENTRY="${2:?--entry requires a value}"; shift 2 ;;
+        --entry=*) ENTRY="${1#*=}"; shift ;;
         --game-id) GAME_ID="${2:?--game-id requires a value}"; shift 2 ;;
         --game-id=*) GAME_ID="${1#*=}"; shift ;;
         --secs) SECS="${2:?--secs requires a number}"; shift 2 ;;
@@ -133,6 +135,37 @@ deployed="$("${ADB[@]}" shell "run-as $PKG sh -c 'ls $CODE_DIR/game.js 2>/dev/nu
     echo "  \`run-as\` needs a debuggable build of $PKG. A release host cannot be driven this way." >&2
     exit 1; }
 
+# ---- the screen has to be on, and this is not a nicety ------------------
+#
+# A launched activity on a sleeping phone resumes and pauses again within a
+# couple of hundred milliseconds, never gets a surface, and never starts an
+# engine session. The report then says "No engine session ran" -- which reads as
+# "your bundle is broken" and is really "the phone was asleep". Condemning
+# someone else's content for the tool's own environment is the one failure this
+# script is least allowed to have, and it is the same shape as the focus-probe
+# blind spot documented further down.
+#
+# So: wake it, dismiss the keyguard, and if it will not wake, refuse to produce a
+# verdict at all. A refusal is recoverable; a false negative published to a
+# customer is not.
+screen_state() {
+    "${ADB[@]}" shell "dumpsys power | grep -m1 mWakefulness=" 2>/dev/null \
+        | tr -d '\r' | sed 's/.*mWakefulness=//'
+}
+if [[ "$(screen_state)" != "Awake" ]]; then
+    say "screen is asleep -- waking it"
+    "${ADB[@]}" shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1 || true
+    "${ADB[@]}" shell wm dismiss-keyguard >/dev/null 2>&1 || true
+    sleep 2
+fi
+if [[ "$(screen_state)" != "Awake" ]]; then
+    echo "the device will not wake, so nothing this run reports would be about the bundle:" >&2
+    echo "  a launched activity on a sleeping phone pauses before it gets a surface, and" >&2
+    echo "  the verdict would read as a failure of your content. Unlock the phone (a" >&2
+    echo "  secured lockscreen cannot be dismissed from adb) and run this again." >&2
+    exit 2
+fi
+
 # ---- run ----------------------------------------------------------------
 "${ADB[@]}" logcat -c >/dev/null 2>&1 || true
 "${ADB[@]}" shell "am force-stop $PKG" >/dev/null 2>&1 || true
@@ -141,7 +174,24 @@ say "launching $ACTIVITY for ${SECS}s"
 # native host; without it a JS throw is a black screen and a clean log.
 # `am start` reports failure in its output, not always in its exit code, and
 # swallowing both leaves the caller with "exit 1" and nothing to act on.
-am_out="$("${ADB[@]}" shell "am start -n $ACTIVITY --es gameId $GAME_ID --es migoGameId $GAME_ID --es MIGO_CAPI_LOG info" 2>&1 | tr -d '\r')"
+# `|| true` is load-bearing, and the reason is the block right below.
+#
+# `am start` reports a refusal in its OUTPUT while adb exits 255, and this file
+# runs under `set -euo pipefail` -- so the assignment itself aborted the script
+# and every line of diagnosis below was unreachable. A host whose game activity
+# is not exported (the common case: `android:exported="false"` is the correct
+# default, and the Android example in migo-examples ships exactly that) produced
+# `EXIT=255`, no report, and not one word about why.
+#
+# The extras are also the SDK's real ones now. `MigoGameActivity` reads
+# `migo_game_id` / `migo_entry_point` and calls `onLaunchFailed(ERR_INVALID_GAME_ID)`
+# without them; this script had been sending `gameId` / `migoGameId`, which match
+# nothing, so a stock Migo-SDK host could not be driven by Migo's own prescreen
+# runner. The older spellings stay for third-party hosts that may read them.
+am_out="$("${ADB[@]}" shell "am start -n $ACTIVITY \
+    --es migo_game_id $GAME_ID --es migo_entry_point $ENTRY \
+    --es gameId $GAME_ID --es migoGameId $GAME_ID \
+    --es MIGO_CAPI_LOG info" 2>&1 | tr -d '\r')" || true
 if grep -qiE "error|does not exist|not exported|permission denial" <<<"$am_out"; then
     echo "could not start $ACTIVITY:" >&2
     sed 's/^/  /' <<<"$am_out" >&2
