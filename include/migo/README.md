@@ -234,7 +234,14 @@ The candidate cannot be declared stable until all of the following exist:
   on device, and rendering resumes after the app is backgrounded and returned to. Open:
   multi-pointer delivery has never run on device, because a real two-finger gesture cannot
   be synthesized there -- `sendevent` is refused by SELinux and `input motionevent` carries
-  one pointer. The ABI's batch conversion is covered by tests. **Windows attaches an
+  one pointer. The ABI's batch conversion is covered by tests. That refusal is current,
+  not inherited: on a Mate 30 Pro (API 31, SELinux enforcing) the shell account *is* in the
+  `input` group and `sendevent /dev/input/event2` still returns `Permission denied`, so the
+  policy blocks it, not the group. **The one path that does work is instrumentation** --
+  `UiAutomation.injectInputEvent`, reached through UiAutomator's
+  `UiDevice.performMultiPointerGesture`, injects at the input dispatcher and therefore reaches
+  a NativeActivity window like any other. This item is open for want of an instrumentation
+  APK, not for want of hardware, which is a much cheaper thing to be blocked on. **Windows attaches an
   `HWND`** through `engine/crates/capi/src/platform/windows.rs`. That file did not exist
   until 2026-07-29: `platform/win32.h` declared `MigoWin32HwndDescriptor` and the
   `tests/c_abi` lanes pinned its layout for both pointer widths, so every gate agreed with
