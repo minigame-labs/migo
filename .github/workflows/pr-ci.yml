@@ -161,6 +161,14 @@ jobs:
       - name: Prescreen scanner contract
         run: bash scripts/test-prescreen-scanner.sh
 
+      # The prescreen report tells a customer which published APIs their bundle
+      # calls are inert. That list is derived from `@stub` markers in the engine
+      # sources, and a marker that stops resolving -- a rename, a type name where
+      # an entry point belongs -- silently shortens it with nothing red. The
+      # report then quietly stops warning about a stub. Source-only, no device.
+      - name: Stub surface contract
+        run: bash scripts/test-stub-surface-contract.sh
+
       # An input listener published to content must have native code that can
       # fire it. This caught `migo.onMouseDown` and friends being live on the
       # content surface with no producer anywhere -- registering them worked and

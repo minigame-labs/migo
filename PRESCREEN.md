@@ -67,6 +67,14 @@ row is why the counts above it are a **lower bound rather than a promise**. A
 scanner that quietly under-reported would hand you "everything is supported",
 and that is the one wrong answer that costs you real money later.
 
+**And it now answers a question it used to leave open.** Some names this build
+publishes do nothing: `reportEvent` and its siblings are, in the engine's own
+words, "no-op stubs that **silently succeed**". A bundle that depends on them
+looks perfect in every count above and still does not work. The report has a
+bucket for exactly that — *referenced, published, but a stub* — derived from the
+engine sources rather than a hand-kept list, and gated so a rename cannot make a
+stub quietly disappear from it. If it says none, it means it checked.
+
 The report also separates two things people usually conflate: names your bundle
 **installs itself** (a polyfill or shim it carries — not a gap, we were never
 asked for them), and namespace-shaped text that only ever appears **inside
