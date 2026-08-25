@@ -6,6 +6,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 ABI="${ANDROID_ABI:-arm64-v8a}"
+# Which C++ runtime the *consumer* builds against. `c++_shared` is what the SDK
+# contract has always proven; the ABI freeze checklist lists the rest of the
+# matrix as open, and it is worth closing rather than assuming, because the
+# static library carries Chromium's own libc++ inside `librusty_v8.a` and
+# `libmigo.so` declares no DT_NEEDED on `libc++_shared.so` at all. A host that
+# picks a different setting is therefore not obviously fine or obviously broken.
+STL="${ANDROID_STL:-c++_shared}"
+# Extra linker flags a consumer might need. Empty by default: whatever a real
+# host has to add to make this package link is a property of the package, and
+# it belongs in the package's documentation rather than in this script's
+# defaults.
+EXTRA_LINK="${MIGO_CONSUMER_LINK_FLAGS:-}"
 PREFIX="${MIGO_ANDROID_PREFIX:-$REPO_ROOT/dist/migo-android-$ABI}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Ndk}"
 
@@ -23,7 +35,8 @@ rm -rf "$BUILD"
 # consumes a host-staged package.
 cmake -S "$HERE" -B "$BUILD" \
     -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-    -DANDROID_ABI="$ABI" -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_shared \
+    -DANDROID_ABI="$ABI" -DANDROID_PLATFORM=android-26 -DANDROID_STL="$STL" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LINK" \
     -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_FIND_ROOT_PATH="$PREFIX" >/dev/null
 cmake --build "$BUILD"
 echo "built: $(find "$BUILD" -name 'libconsumer.so')"

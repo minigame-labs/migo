@@ -151,7 +151,7 @@ CONSUMER="$REPO_ROOT/tests/c_host/android-package-consumer"
 if [[ -x "$NDK_BIN/$ARCH-linux-android26-clang" ]] && command -v cmake >/dev/null 2>&1 \
         && [[ -f "$CONSUMER/build.sh" ]]; then
     CONSUMER_LOG="$(mktemp)"
-    if ANDROID_ABI="$ABI" MIGO_ANDROID_PREFIX="$PREFIX" \
+    if ANDROID_ABI="$ABI" MIGO_ANDROID_PREFIX="$PREFIX" ANDROID_STL=c++_shared \
             bash "$CONSUMER/build.sh" >"$CONSUMER_LOG" 2>&1; then
         CONSUMER_SO="$(find "$CONSUMER/build" -name 'libconsumer.so' 2>/dev/null | head -1)"
         UNDEF="$(nm -D "$CONSUMER_SO" 2>/dev/null | grep -cE ' U migo_' || true)"
@@ -168,6 +168,37 @@ if [[ -x "$NDK_BIN/$ARCH-linux-android26-clang" ]] && command -v cmake >/dev/nul
         sed -e 's/^/    /' "$CONSUMER_LOG"
     fi
     rm -f "$CONSUMER_LOG"
+
+    # The other C++ runtime a real host picks. `c++_static` is the natural
+    # choice now that this SDK ships no `libc++_shared.so` of its own -- and it
+    # does not link without one flag: `librusty_v8.a` carries Chromium's libc++,
+    # the NDK's static libc++ brings its own, and exactly six symbols collide
+    # (`std::runtime_error` and `std::logic_error`'s char-const* constructor,
+    # copy constructor and copy assignment -- the ones libc++ explicitly
+    # instantiates in stdexcept.cpp). The engine's own link tolerates them with
+    # `--allow-multiple-definition`; a third-party consumer has no such flag
+    # until someone tells them, which is what this documents and holds.
+    #
+    # Asserted as "the documented matrix links", not as "the undocumented ones
+    # fail": a gate written the second way turns red the day someone makes
+    # `c++_static` work without the flag, which is a fix, not a regression.
+    STATIC_LOG="$(mktemp)"
+    if ANDROID_ABI="$ABI" MIGO_ANDROID_PREFIX="$PREFIX" ANDROID_STL=c++_static \
+            MIGO_CONSUMER_LINK_FLAGS="-Wl,--allow-multiple-definition" \
+            bash "$CONSUMER/build.sh" >"$STATIC_LOG" 2>&1; then
+        STATIC_SO="$(find "$CONSUMER/build" -name 'libconsumer.so' 2>/dev/null | head -1)"
+        STATIC_UNDEF="$(nm -D "$STATIC_SO" 2>/dev/null | grep -cE ' U migo_' || true)"
+        if [[ -n "$STATIC_SO" && "$STATIC_UNDEF" == "0" ]]; then
+            pass "c++_static consumer links with -Wl,--allow-multiple-definition"
+        else
+            fail "c++_static consumer linked but has $STATIC_UNDEF unresolved migo_* symbols"
+        fi
+    else
+        fail "c++_static consumer failed to link even with -Wl,--allow-multiple-definition;
+      the package README documents that combination as supported"
+        sed -e 's/^/    /' "$STATIC_LOG"
+    fi
+    rm -f "$STATIC_LOG"
 else
     skip "consumer link (no NDK clang, cmake, or consumer example)"
 fi
