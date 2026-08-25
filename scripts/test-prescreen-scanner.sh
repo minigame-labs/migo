@@ -144,6 +144,46 @@ check_degraded "warns the gap count is overstated" 'overstates them'
 refute_degraded "does not claim a classified gap count without a reference" \
     '\*\*not published, and wx has it\*\*'
 
+# ---------------------------------------------------------------------------
+# The surface dumper must not fail a run it completed.
+#
+# `dump-api-surface.sh` cleans up in an EXIT trap, and the trap's last command
+# used to be `[[ -n "$STAGE" ]] && rm -rf "$STAGE"`. With no --adapter, STAGE is
+# empty, that test is false, the function returns 1, and an EXIT trap's status
+# becomes the script's. So the dumper exited 1 on every successful run in its
+# default mode -- after printing `surface -> <path>` and a complete, correct
+# surface -- and `set -e` in prescreen-game.sh turned that into a prescreen that
+# produced no report and said nothing about why. The adapter path happened to
+# set STAGE and return 0, so the runs anyone tried worked.
+#
+# Checked by running the real trap body with STAGE unset, rather than by running
+# the dumper: the dumper needs a built player, and a check nobody can run on a
+# laptop is a check that stops being run.
+# Brace-counted, not line-ranged. A `sed '/^cleanup/,/^}/p'` works only while
+# the function is written across several lines; against the one-line form it
+# finds no closing line and swallows the rest of the file, so this check went red
+# for a completely different reason than the one it prints.
+trap_body="$(awk '
+    /^cleanup\(\)/ { collecting = 1 }
+    collecting {
+        print
+        n = gsub(/{/, "{"); depth += n
+        n = gsub(/}/, "}"); depth -= n
+        if (depth <= 0) exit
+    }
+' "$ROOT_DIR/scripts/dump-api-surface.sh")"
+if [[ -z "$trap_body" ]]; then
+    printf '  FAIL  %s\n' "cannot find cleanup() in dump-api-surface.sh -- this check is broken, not the script" >&2
+    failures=$((failures + 1))
+else
+    if ( eval "$trap_body"; raw=""; STAGE=""; cleanup ); then
+        printf '  ok    %s\n' "the surface dumper's EXIT trap returns 0 with no adapter staged"
+    else
+        printf '  FAIL  %s\n' "the surface dumper's EXIT trap returns non-zero with no adapter staged; every successful default-mode run will report failure" >&2
+        failures=$((failures + 1))
+    fi
+fi
+
 if [[ $failures -gt 0 ]]; then
     echo "FAIL: prescreen scanner contract ($failures check(s))" >&2
     exit 1

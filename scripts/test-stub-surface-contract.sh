@@ -23,13 +23,21 @@ ROOT_DIR="$(cd "$ROOT_DIR" && pwd)"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-json="$(bash "$ROOT_DIR/scripts/dump-stub-surface.sh" --json 2>/dev/null)" \
+# Via a file, and via a *quoted* heredoc. This used to interpolate the JSON into
+# an unquoted heredoc as `json.loads('''$json''')`, so the shell pasted it into a
+# Python string literal and Python then unescaped it a second time. The first
+# stub description containing a `"` -- `18_crypto.js` says its methods fail with
+# "not supported" -- turned the JSON into a syntax error, and the gate died on a
+# traceback instead of reporting anything about stubs.
+json_file="$(mktemp)"
+trap 'rm -f "$json_file"' EXIT
+bash "$ROOT_DIR/scripts/dump-stub-surface.sh" --json > "$json_file" 2>/dev/null \
     || fail "scripts/dump-stub-surface.sh could not run"
 
-python3 - "$ROOT_DIR" <<PY
+python3 - "$ROOT_DIR" "$json_file" <<'PY'
 import json, pathlib, sys, re
 
-data = json.loads('''$json''')
+data = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 root = pathlib.Path(sys.argv[1])
 
 orphans = data.get("orphan_markers") or []

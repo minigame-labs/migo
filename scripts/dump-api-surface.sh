@@ -52,7 +52,19 @@ done
 
 raw="$(mktemp)"
 STAGE=""
-cleanup() { rm -f "$raw"; [[ -n "$STAGE" ]] && rm -rf "$STAGE"; }
+# The `return 0` is load-bearing. Without it the function ended on
+# `[[ -n "$STAGE" ]] && rm -rf ...`, which is false whenever no --adapter was
+# given -- so the function returned 1, and as an EXIT trap that became the
+# script's exit status. This script therefore FAILED on every successful run in
+# its default mode, after printing every sign of success, and `set -e` in
+# prescreen-game.sh turned that into "the prescreen tool does not work" with no
+# message anywhere saying why. The adapter path set STAGE and returned 0, which
+# is why the runs that were tried worked.
+cleanup() {
+    rm -f "$raw"
+    [[ -n "$STAGE" ]] && rm -rf "$STAGE"
+    return 0
+}
 trap cleanup EXIT
 
 RUN_DIR="$PROBE_DIR"
