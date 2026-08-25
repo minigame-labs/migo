@@ -221,9 +221,30 @@ Two of those flags are not optional:
   `CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY`, which confines `find_package` to the
   find-root. Without it CMake reports the package as missing even though
   `CMAKE_PREFIX_PATH` points straight at it.
-- **`-DANDROID_STL=c++_shared`** — the library carries its own C++ runtime.
-  Linking it alongside the NDK's static libc++ produces duplicate `std::`
-  symbol errors that name neither Migo nor the STL setting.
+- **`-DANDROID_STL`** — this package needs an NDK libc++, and which one you pick
+  changes what you have to do. Measured on this package, arm64-v8a, NDK r26:
+
+  | `-DANDROID_STL` | result |
+  |---|---|
+  | `c++_shared` | links as-is |
+  | `c++_static` | links **with** `-Wl,--allow-multiple-definition` |
+  | `none` | does not link at all |
+
+  `c++_static` fails on its own with exactly six duplicate symbols —
+  `std::runtime_error` and `std::logic_error`'s `char const*` constructor, copy
+  constructor and copy assignment. Those are the ones libc++ explicitly
+  instantiates in `stdexcept.cpp`, and they collide because this library carries
+  Chromium's libc++ inside V8's archive while your build brings the NDK's. The
+  error names neither Migo nor the STL setting, which is why it is spelled out
+  here.
+
+  `none` leaves one symbol undefined
+  (`std::__ndk1::__vector_base_common<true>::__throw_length_error()`): parts of
+  this library were compiled against the NDK's libc++ headers, so an NDK libc++
+  has to be present in some form.
+
+  Both supported rows are held by `scripts/test-android-sdk-contract.sh`, so a
+  packaging change cannot quietly break either.
 
 `android-26` is the minimum supported platform level.
 
