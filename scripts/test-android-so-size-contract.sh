@@ -147,6 +147,23 @@ print(total)
 ' "$2"
 }
 
+# --json also emits the measurement this gate already takes, so the numbers a
+# customer-facing page shows come from the same readelf pass that gates them
+# rather than from someone retyping them. Enforcement is NOT skipped in this
+# mode: a measurement that could be produced by an over-budget build would be a
+# way to publish exactly the number nobody wanted to see.
+JSON_MODE=false
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        --json) JSON_MODE=true ;;
+        *) args+=("$arg") ;;
+    esac
+done
+set -- ${args[@]+"${args[@]}"}
+# In JSON mode the progress lines would corrupt the document, so they go to stderr.
+say() { if $JSON_MODE; then echo "$@" >&2; else echo "$@"; fi; }
+
 aars=("$@")
 if [[ ${#aars[@]} -eq 0 ]]; then
     while IFS= read -r f; do aars+=("$f"); done < <(
@@ -160,12 +177,13 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 checked=0
+json_rows=()
 for aar in "${aars[@]}"; do
     [[ -f "$aar" ]] || fail "not a file: $aar"
     name="$(basename "$aar")"
 
     if [[ "$name" == *-debug* ]]; then
-        echo "  $name: debug artifact; no size budget"
+        say "  $name: debug artifact; no size budget"
         continue
     fi
 
@@ -173,7 +191,7 @@ for aar in "${aars[@]}"; do
     if [[ ${#sos[@]} -eq 0 ]]; then
         # The derived -nojni AAR carries no engine; its own gate covers what it
         # must not contain.
-        echo "  $name: no engine payload (derived artifact); skipped"
+        say "  $name: no engine payload (derived artifact); skipped"
         continue
     fi
 
@@ -219,15 +237,37 @@ for aar in "${aars[@]}"; do
             exit 1
         fi
 
-        printf '  %s [%s]: %d bytes (.text %d, .rodata %d, reloc %d)\n' \
-            "$name" "$abi" "$file_size" "$text_size" "$rodata_size" "$reloc_size"
+        say "$(printf '  %s [%s]: %d bytes (.text %d, .rodata %d, reloc %d)' \
+            "$name" "$abi" "$file_size" "$text_size" "$rodata_size" "$reloc_size")"
+
+        if $JSON_MODE; then
+            # The rest of the .so, for anyone drawing the whole thing rather than
+            # gating three numbers of it.
+            data_size=$(( $(section_size "$so" .data) + $(section_size "$so" .data.rel.ro) ))
+            bss_size="$(section_size "$so" .bss)"
+            unwind_size=$(( $(section_size "$so" .eh_frame) + $(section_size "$so" .eh_frame_hdr) ))
+            jar_size="$(unzip -l "$aar" classes.jar 2>/dev/null | awk '/classes\.jar/{print $1; exit}')"
+            aar_uncompressed="$(unzip -l "$aar" 2>/dev/null | tail -1 | awk '{print $1}')"
+            json_rows+=("$(printf '{"aar":"%s","abi":"%s","file":%d,"text":%d,"rodata":%d,"reloc":%d,"data":%d,"bss":%d,"unwind":%d,"classes_jar":%d,"aar_uncompressed":%d,"aar_file":%d}' \
+                "$name" "$abi" "$file_size" "$text_size" "$rodata_size" "$reloc_size" \
+                "$data_size" "$bss_size" "$unwind_size" "${jar_size:-0}" "${aar_uncompressed:-0}" "$(stat -c %s "$aar")")")
+        fi
         checked=$((checked + 1))
     done
 done
+
+if $JSON_MODE; then
+    printf '{\n  "measured": "%s",\n  "source": "scripts/test-android-so-size-contract.sh --json",\n  "note": "raw byte counts; every payload below passed the size gate",\n  "artifacts": [\n' \
+        "$(date -u +%Y-%m-%d)"
+    for i in "${!json_rows[@]}"; do
+        printf '    %s%s\n' "${json_rows[$i]}" "$([[ $i -lt $(( ${#json_rows[@]} - 1 )) ]] && echo ,)"
+    done
+    printf '  ]\n}\n'
+fi
 
 (( checked > 0 )) || fail "checked no ABI payload.
       Every AAR given was skipped, and a gate that skips everything reports
       success without having looked at anything. Point this at a release AAR:
       bash scripts/build-aar.sh --product-profile full release"
 
-echo "PASS: every shipped libmigo.so is inside its size budget ($checked ABI payloads checked)"
+say "PASS: every shipped libmigo.so is inside its size budget ($checked ABI payloads checked)"
