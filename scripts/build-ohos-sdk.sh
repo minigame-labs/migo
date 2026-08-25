@@ -390,6 +390,13 @@ if [[ "$COMPILE_ONLY" == "1" ]]; then
     exit 0
 fi
 
+# The toolchain contract runs here for the reason the API floor gate below spells
+# out: it needs an OpenHarmony SDK to say anything, no CI runner has one, and so
+# it had no caller at all. It checks the toolchain this script is about to build
+# with, so it belongs before the packages are checked, not after.
+info "running the toolchain contract"
+bash "$SCRIPT_DIR/test-ohos-toolchain-contract.sh"
+
 info "running the package contract"
 for ARCH in "${ARCHES[@]}"; do
     bash "$SCRIPT_DIR/test-ohos-sdk-contract.sh" "$REPO_ROOT/dist/migo-ohos-$(public_ohos_arch "$ARCH")"

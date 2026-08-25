@@ -216,6 +216,29 @@ jobs:
       - name: Android rustflags reach the linker
         run: bash scripts/test-android-rustflags-reach-the-linker.sh
 
+      # Five host-only gates that nothing ran. They were written, committed, and
+      # then referenced by no workflow and no other script -- so whether they
+      # passed was never anyone's information. On 2026-08-25 an audit of
+      # `scripts/test-*.sh` against everything that invokes one turned up exactly
+      # these five, and `test-q14-codegen-profiles.sh` was red: an assertion that
+      # build-aar.sh rejects a malformed SOURCE_DATE_EPOCH had been shadowed by a
+      # `--skip-rust` guard added above it, so the command failed on a different
+      # message and the gate had been failing, unobserved, since. The other four
+      # passed -- which is the point: nobody knew that either. All five together
+      # run in under a second and build nothing.
+      - name: Host-only gates nothing else runs
+        run: |
+          bash scripts/test-q14-codegen-profiles.sh
+          bash scripts/test-gtk4-surface-capability.sh
+          bash scripts/test-r7-ahb-image-decode.sh
+          bash scripts/test-r8-install-receipt.sh
+          bash scripts/test-r9-worker-snapshot.sh
+          bash scripts/test-v8-gn-pin-contract.sh
+
+      # And the rule itself, so the list above cannot grow again in silence.
+      - name: Every contract gate is invoked by something
+        run: bash scripts/test-every-gate-is-invoked.sh
+
       # The host-bridge holder is reachable from content (`Symbol.for` reads the
       # global registry), and closing that is an all-or-nothing migration of
       # every call site -- one left behind evaluates against a deleted holder
@@ -572,6 +595,13 @@ jobs:
       # must point at it, not just ANDROID_NDK_HOME).
       - name: Install Android NDK + cargo-ndk
         uses: ./.github/actions/setup-android-ndk
+
+      # Runs here, not in the contract job, because here the NDK exists. The gate
+      # skips its resolution check on a machine without one, and a gate that
+      # always skips the check it is named for is the same silence in a different
+      # costume -- an ILP32 ABI lane skipped in CI that way for weeks.
+      - name: Android NDK pin contract
+        run: bash scripts/test-android-ndk-pin-contract.sh
 
       # Layout-only compatibility check. This does not publish or claim an
       # armeabi-v7a artifact; it exercises the 8-byte uint64_t alignment used

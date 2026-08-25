@@ -35,23 +35,24 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# `readelf` from the NDK if we can find it, otherwise whatever is on PATH.
-resolve_readelf() {
-    local ndk="${ANDROID_NDK_HOME:-}"
-    if [[ -n "$ndk" ]]; then
-        local candidate
-        candidate="$(find "$ndk/toolchains/llvm/prebuilt" -name llvm-readelf -type f 2>/dev/null | head -1)"
-        [[ -n "$candidate" ]] && { echo "$candidate"; return 0; }
-    fi
-    local found
-    found="$(find "$HOME/Android" -name llvm-readelf -type f 2>/dev/null | head -1)"
-    [[ -n "$found" ]] && { echo "$found"; return 0; }
-    command -v llvm-readelf 2>/dev/null && return 0
-    command -v readelf 2>/dev/null && return 0
-    return 1
-}
+# The ELF reader comes from the pinned NDK, via lib/android-ndk.sh.
+#
+# This used to be a four-step fallback of its own: ANDROID_NDK_HOME, then the
+# first llvm-readelf under $HOME/Android, then PATH's llvm-readelf, then PATH's
+# readelf. Both NDK searches passed `-type f`, and in NDK r23 llvm-readelf is a
+# symlink to llvm-readobj -- so both matched nothing and every run landed on
+# /usr/bin/readelf, GNU binutils, without saying so.
+#
+# Nothing here reads wrong today: the assertions were written against text both
+# vendors print the same way, which is why this went unnoticed. But the chain was
+# silent, and the next assertion someone adds may not be so lucky -- GNU renders
+# this file's packed-relocation section as `LOOS+0x2` where LLVM says
+# `ANDROID_RELA`. Resolve the pin, or stop.
 
-READELF="$(resolve_readelf)" || fail "no readelf found (set ANDROID_NDK_HOME, or install binutils)"
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$SCRIPT_DIR/lib/android-ndk.sh"
+READELF="$(android_ndk_readelf "${REPO_ROOT}/contracts/artifact-manifest/android-v8.lock.json")" \
+    || fail "cannot resolve llvm-readelf from the pinned Android NDK"
 
 aars=("$@")
 if [[ ${#aars[@]} -eq 0 ]]; then
