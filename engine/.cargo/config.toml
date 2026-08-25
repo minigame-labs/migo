@@ -85,9 +85,33 @@ rustflags = [
   # estimated -- but bionic only learned DT_RELR in API 30 and this library
   # still has to load on 26. Worth revisiting if that floor ever moves.
   #
-  # This is a load-time encoding and nothing else: no code is added, removed or
-  # reordered, so no execution path changes. The dynamic linker applies the same
-  # relocations, reading a much smaller table to find them.
+  # It is a load-time encoding and nothing else: no code is added, removed or
+  # reordered, so nothing about *execution* speed can move.
+  #
+  # Load time was tested rather than argued, twice, because the first test was
+  # wrong. Endless-runner on a Mate 30 Pro, three interleaved temperature-gated
+  # rounds per arm:
+  #
+  #   confounded pair (the two builds also differed by four merged PRs)
+  #     first frame   packed 330 [320, 330, 331]   unpacked 314 [313, 314, 317]
+  #     -> "packed costs 16 ms, and the ranges do not overlap"
+  #
+  #   clean pair (one tree, ± this flag, nothing else)
+  #     first frame   packed 322 [308, 322, 361]   unpacked 333 [320, 333, 356]
+  #     game ready    packed 660 [645, 660, 756]   unpacked 746 [660, 746, 752]
+  #     -> the effect flips sign and the ranges overlap almost entirely
+  #
+  # **It did not reproduce.** At n=3 on this device the flag has no startup
+  # effect this harness can resolve, in either direction. The tidy-looking
+  # non-overlap in the first pass came from comparing two different trees, which
+  # is a reminder that a clean-looking result from a dirty comparison is more
+  # dangerous than a noisy one.
+  #
+  # So the original claim stands, but as a tested one rather than a reasoned one:
+  # 1.85 MiB off every installation, with no startup cost that three rounds can
+  # find. If someone later needs certainty rather than "not resolvable at n=3",
+  # the arms are `scripts/build-aar.sh` ± this line and the driver is
+  # migo-bench's `jitless-ab.sh --label-a packed --label-b unpacked`.
   "-C", "link-arg=-Wl,--pack-dyn-relocs=android",
 
   # Version script: only export JNI symbols, hide everything else
