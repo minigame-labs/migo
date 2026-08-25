@@ -9,19 +9,19 @@ let _requireDirStack = [];
 function define(name, deps, factory) {
   if (typeof name === "function") {
     factory = name;
-    name = `__anon_${Date.now()}_${Math.random()}`;
+    name = `__anon_${Date.now()}_${Math.random()}`;  // @random-ok unique name for an anonymous module
     deps = [];
   } else if (Array.isArray(name) && typeof deps === "function") {
     factory = deps;
     deps = name;
-    name = `__anon_${Date.now()}_${Math.random()}`;
+    name = `__anon_${Date.now()}_${Math.random()}`;  // @random-ok unique name for an anonymous module
   } else if (typeof name === "string" && typeof deps === "function") {
     factory = deps;
     deps = [];
   } else if (typeof name !== "string") {
     factory = name;
     deps = [];
-    name = `__anon_${Date.now()}_${Math.random()}`;
+    name = `__anon_${Date.now()}_${Math.random()}`;  // @random-ok unique name for an anonymous module
   }
 
   let moduleObj = { exports: {} };
