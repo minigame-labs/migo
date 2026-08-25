@@ -207,9 +207,27 @@ debug = false
 # =============================================================================
 # Q14 Release Profiles - Hot workspace crates only
 # =============================================================================
-# Keep the shipping `release` profile as the size baseline. These profiles
-# vary only the audited hot workspace crates so Android device A/B results are
-# attributable to codegen level rather than dependency or linker changes.
+# These vary only the five audited hot workspace crates, so an Android device
+# A/B is attributable to codegen level rather than to dependency or linker
+# changes. `release` above stays the shipping build and the size baseline.
+#
+# hot2 has been measured, and the answer is no. On 2026-08-25, three interleaved
+# rounds x three games on a Mate 30 Pro, twelve cells (first frame / game-ready /
+# CPU / PSS): not one moved above the harness noise floor. What it costs is not
+# in doubt -- `.so` +1,294,336 bytes (+3.2%), `.text` +1,507,336 (+5.2%) -- and
+# that is 44,432 bytes past the `.text` budget in
+# scripts/test-android-so-size-contract.sh, so the size gate rejects a hot2 AAR
+# outright. Numbers, raw rows, and the two cells that cross the floor and then
+# dissolve under paired deltas: ../migo-bench/CODEGEN.md.
+#
+# hot3 has NOT been measured. Do not infer it from hot2's table -- re-run the
+# A/B (CODEGEN.md carries the invocation). The only thing hot3 inherits for free
+# is the size direction: `opt-level = 3` does not emit smaller code than `2`,
+# and `2` is already over budget.
+#
+# They are kept, rather than deleted with the question they answered, because
+# re-asking after the code changes should cost a build and not a reconstruction.
+# test-q14-codegen-profiles.sh keeps them wired; it does not endorse shipping one.
 [profile.release-hot2]
 inherits = "release"
 
