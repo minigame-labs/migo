@@ -219,6 +219,19 @@ jobs:
       - name: Android rustflags reach the linker
         run: bash scripts/test-android-rustflags-reach-the-linker.sh
 
+      # Mirrors pr-ci.yml; test-release-gate-parity-contract.sh requires it.
+      - name: Host-only gates nothing else runs
+        run: |
+          bash scripts/test-q14-codegen-profiles.sh
+          bash scripts/test-gtk4-surface-capability.sh
+          bash scripts/test-r7-ahb-image-decode.sh
+          bash scripts/test-r8-install-receipt.sh
+          bash scripts/test-r9-worker-snapshot.sh
+          bash scripts/test-v8-gn-pin-contract.sh
+
+      - name: Every contract gate is invoked by something
+        run: bash scripts/test-every-gate-is-invoked.sh
+
       # The host-bridge holder is reachable from content (`Symbol.for` reads the
       # global registry), and closing that is an all-or-nothing migration of
       # every call site -- one left behind evaluates against a deleted holder
