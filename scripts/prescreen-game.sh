@@ -49,12 +49,15 @@
 #                   answered at all
 #   --surface FILE  reuse a dump from scripts/dump-api-surface.sh instead of
 #                   producing one (the dump costs a player run)
+#   --stubs FILE    reuse a list from scripts/dump-stub-surface.sh instead of
+#                   deriving one (deriving is a source scan, not a player run)
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUNDLE=""
 SURFACE=""
 ADAPTER=""
+STUBS=""
 OUT=""
 # Defaults to a local reference dump, which is deliberately kept out of this
 # repository -- it is a record of a mainstream mini-game platform's global, not
@@ -66,6 +69,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --adapter) ADAPTER="${2:?--adapter requires a path}"; shift 2 ;;
         --adapter=*) ADAPTER="${1#*=}"; shift ;;
+        --stubs) STUBS="${2:?--stubs requires a path}"; shift 2 ;;
+        --stubs=*) STUBS="${1#*=}"; shift ;;
         --surface) SURFACE="${2:?--surface requires a path}"; shift 2 ;;
         --surface=*) SURFACE="${1#*=}"; shift ;;
         --out) OUT="${2:?--out requires a path}"; shift 2 ;;
@@ -89,7 +94,16 @@ if [[ -z "$SURFACE" ]]; then
     bash "$ROOT_DIR/scripts/dump-api-surface.sh" "${dump_args[@]}" >/dev/null
 fi
 
-python3 - "$ROOT_DIR" "$BUNDLE" "$SURFACE" "$WXREF" <<'PY' > "${OUT:-/dev/stdout}"
+# Some published names do nothing. `system/17_analytics.js` says so in its own
+# header -- "All functions are no-op stubs that silently succeed" -- so a report
+# that counts them as supported tells a customer their analytics will work.
+if [[ -z "$STUBS" ]]; then
+    STUBS="$(mktemp)"
+    trap 'rm -f "$STUBS"' EXIT
+    bash "$ROOT_DIR/scripts/dump-stub-surface.sh" --out "$STUBS" 2>/dev/null || : > "$STUBS"
+fi
+
+python3 - "$ROOT_DIR" "$BUNDLE" "$SURFACE" "$WXREF" "$STUBS" <<'PY' > "${OUT:-/dev/stdout}"
 from __future__ import annotations
 
 import json
@@ -121,6 +135,11 @@ reference_path = pathlib.Path(sys.argv[4])
 reference_wx: set[str] = set()
 if reference_path.exists():
     reference_wx = set(json.loads(reference_path.read_text(encoding="utf-8")).get("wx", {}).keys())
+
+stub_path = pathlib.Path(sys.argv[5]) if len(sys.argv) > 5 else None
+stubbed: set[str] = set()
+if stub_path and stub_path.exists():
+    stubbed = {line.strip() for line in stub_path.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 sources = sorted(p for p in bundle.rglob("*.js") if p.is_file())
 if not sources:
@@ -322,6 +341,8 @@ if wx_dumped and reference_wx:
 elif wx_dumped:
     out.append(f"| **not published by this build** | **{len(missing_but_wx_has)}** |")
     out.append("| of those, how many wx has | *unknown -- no reference table* |")
+stub_hits = sorted((wx_used | migo_used) & stubbed)
+out.append(f"| **referenced, published, but a stub** | **{len(stub_hits)}** |")
 out.append(f"| `migo.*` names not published | {len(migo_missing)} |")
 out.append(f"| **sites this scanner cannot resolve** | **{len(opaque)}** |")
 out.append("")
@@ -439,6 +460,34 @@ if installed["wx"] or installed["migo"]:
     for ns in ("wx", "migo"):
         for name in sorted(installed[ns]):
             out.append(f"- `{ns}.{name}`")
+    out.append("")
+
+if stub_hits:
+    out.append("## Published, but they do nothing")
+    out.append("")
+    out.append(
+        "These names exist on this build and this bundle calls them, so they do not "
+        "appear as gaps above — **and they are not implemented**. Some fail loudly; "
+        "the dangerous ones succeed silently, which means a bundle that depends on "
+        "them looks fine in every count on this page and still does not work."
+    )
+    out.append("")
+    for name in stub_hits:
+        out.append(f"- `{name}`")
+    out.append("")
+    out.append(
+        "The list is derived from the engine sources by "
+        "`scripts/dump-stub-surface.sh`, not maintained by hand, so it cannot drift "
+        "from what the build actually does."
+    )
+    out.append("")
+elif stubbed:
+    out.append("## Published, but they do nothing")
+    out.append("")
+    out.append(
+        f"None. This build has {len(stubbed)} published names that are stubs, and "
+        "this bundle references none of them."
+    )
     out.append("")
 
 out.append("## Sites this scanner cannot resolve")
