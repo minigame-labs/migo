@@ -22,12 +22,24 @@ rustflags = [
   # Garbage collection of unused sections
   "-C", "link-arg=-Wl,--gc-sections",
   
-  # Dynamically link libc++ (libc++_shared.so is shipped in jniLibs).
-  # Skia-bindings and rusty_v8 both embed parts of the C++ runtime;
-  # `-static-libstdc++` triggers duplicate-symbol errors for several
-  # std::* classes (`runtime_error`, `exception`, `locale::id`, ...).
-  # The dynamic path matches scripts/build-android-so.sh copying
-  # libc++_shared.so into jniLibs/.
+  # No `-static-libstdc++`, and no shared libc++ either -- the result has
+  # neither. The driver's default is `-lc++_shared`, but every C++ symbol this
+  # library needs is already inside the static archives it links (Chromium's
+  # libc++ inside `librusty_v8.a`, the NDK's inside skia-bindings), so nothing
+  # resolves against the shared object and the linker drops the DT_NEEDED. The
+  # shipped `libmigo.so` names exactly eight libraries and no libc++ is among
+  # them; `readelf --dynamic` says so on every ABI.
+  #
+  # That is why #116 could stop shipping `libc++_shared.so` without changing a
+  # single link flag: it had never been loaded. The comment here used to claim
+  # the opposite -- "dynamically link libc++, libc++_shared.so is shipped in
+  # jniLibs" -- and both halves were false by the time anyone read them.
+  #
+  # Passing `-static-libstdc++` instead is not a no-op: it makes the same
+  # duplicate symbols the flag below tolerates into errors the driver reports
+  # first. A third-party consumer meets the same six from the other side, which
+  # is what `-DANDROID_STL=c++_static` needs `--allow-multiple-definition` for
+  # (include/migo/README.md carries the matrix).
   #
   # Tolerate the duplicate std::* symbols V8 and Skia both define. The linker takes the
   # first definition, and what that tolerates was measured by removing the flag: exactly
