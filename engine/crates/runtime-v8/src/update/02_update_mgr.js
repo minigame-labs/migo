@@ -1,3 +1,23 @@
+// @stub getUpdateManager reports that no update exists, because this runtime has
+//       no update channel to find one on. Every listener is real; onUpdateReady
+//       and onUpdateFailed simply never fire, and applyUpdate has nothing to
+//       apply.
+//
+// It used to invent them. `Math.random() < 0.3` decided at construction whether
+// content was told an update was waiting; a random 2-5 s later, a second coin
+// flip fired onUpdateReady (90%) or onUpdateFailed (10%). So roughly a quarter
+// of launches showed the game's own "new version -- restart?" prompt, the player
+// accepted, applyUpdate() logged "Application restarted with new version", and
+// nothing restarted. Nondeterministically, which is the worst way for content to
+// meet a missing capability: it works in testing and fails in the field, in a
+// different place each time.
+//
+// The truthful answer was already in this file. `checkUpdate()` below -- the
+// callback-style API for the same question -- has always answered
+// `hasUpdate: false`. Two entry points to one question disagreed, and the one
+// that fabricated was the one with no test and no @stub marker, so the prescreen
+// report told customers it was supported.
+
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 class UpdateManager {
@@ -7,9 +27,12 @@ class UpdateManager {
         this.updateFailedListeners = createListenerGroup('UpdateManager onUpdateFailed');
         this.hasUpdate = false;
         this.isReady = false;
-        
+
+        // The real API reports the result of a launch-time check asynchronously,
+        // so the shape is kept: listeners registered during startup still hear
+        // an answer. The answer is the same one checkUpdate() gives.
         setTimeout(() => {
-            this._simulateUpdateCheck();
+            this._reportNoUpdate();
         }, 1000);
     }
     
@@ -26,52 +49,19 @@ class UpdateManager {
     }
     
     applyUpdate() {
-        if (!this.isReady) {
-            console.warn('UpdateManager.applyUpdate: No update is ready to apply');
-            return;
-        }
-        
-        console.log('UpdateManager.applyUpdate: Applying update and restarting...');
-        
-        setTimeout(() => {
-            console.log('UpdateManager: Application restarted with new version');
-            this.hasUpdate = false;
-            this.isReady = false;
-        }, 500);
+        // isReady can never become true, so this is the only branch. Saying so is
+        // the point: the previous version's other branch claimed a restart that
+        // never happened.
+        console.warn(
+            'UpdateManager.applyUpdate: no update is ready to apply. This build has ' +
+            'no update channel, so onUpdateReady never fires and there is nothing ' +
+            'to apply.'
+        );
     }
 
-    _simulateUpdateCheck() {
-        console.log('UpdateManager: Checking for updates...');
-        
-        const hasUpdate = Math.random() < 0.3;
-        this.hasUpdate = hasUpdate;
-        
-        this.checkForUpdateListeners.trigger({ hasUpdate });
-        
-        if (hasUpdate) {
-            this._simulateDownload();
-        }
-    }
-    
-    _simulateDownload() {
-        console.log('UpdateManager: Downloading update...');
-        
-        const downloadTime = 2000 + Math.random() * 3000;
-        
-        setTimeout(() => {
-            const success = Math.random() < 0.9;
-            
-            if (success) {
-                this.isReady = true;
-                console.log('UpdateManager: Update download completed');
-                
-                this.updateReadyListeners.trigger();
-            } else {
-                console.log('UpdateManager: Update download failed');
-
-                this.updateFailedListeners.trigger();
-            }
-        }, downloadTime);
+    _reportNoUpdate() {
+        this.hasUpdate = false;
+        this.checkForUpdateListeners.trigger({ hasUpdate: false });
     }
 }
 
