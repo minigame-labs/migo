@@ -1305,20 +1305,6 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::SetDisplayRefreshRate { period_nanos } => {
-                let hz = if period_nanos > 0 {
-                    1_000_000_000.0 / period_nanos as f64
-                } else {
-                    60.0
-                };
-                tracing::info!(
-                    "Display refresh rate: {:.1}Hz (period={}ns)",
-                    hz,
-                    period_nanos
-                );
-                Ok(())
-            }
-
             HostCommand::SendToHost { json } => {
                 self.platform.notify_host_message(self.id, &json);
                 Ok(())

@@ -68,7 +68,6 @@ const NATIVE_CORE: &[JniMethod] = methods![
     ("modMain", "(ILjava/lang/String;Ljava/lang/String;)I"),
     ("executeScript", "(ILjava/lang/String;)I"),
     ("onVsync", "(IJ)V"),
-    ("setDisplayRefreshRate", "(IJ)V"),
     ("getDebugStats", "(I)[B"),
     ("getConsoleLogs", "(IJ)Ljava/lang/String;"),
     (
@@ -438,7 +437,11 @@ mod tests {
         // (`onAuthorizeResult`, `updatePermission`) and +1 Java
         // (`permissionRequest`). Permission revocation adds +1 Java
         // (`revokePermissionResources`) for synchronous targeted teardown.
-        assert_eq!(native.len(), 69, "full NativeBridge surface changed");
+        // Deriving the display period from the vsync timestamps the scheduler
+        // already receives removes -1 native (`setDisplayRefreshRate`), which
+        // reported a rate once per session and never again when the display
+        // changed mode.
+        assert_eq!(native.len(), 68, "full NativeBridge surface changed");
         // Runtime-generation fencing adds +2 Java (`beginRuntimeRestart`,
         // `completeRuntimeRestart`), both Core: every profile restarts.
         // Concurrent-session correctness removes -1 Java (`getCacheDirPath`,

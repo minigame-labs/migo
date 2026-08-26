@@ -9,14 +9,64 @@ pub struct FrameScheduler {
     preferred_fps: u32,
     time_origin_ms: Option<f64>,
     next_deadline_ms: Option<f64>,
+    last_vsync_ms: Option<f64>,
+    /// The two most recent gaps between delivered vsyncs, newest first, from
+    /// which the tolerance in [`FrameScheduler::on_vsync`] is derived.
+    recent_gaps_ms: [Option<f64>; 2],
 }
 
 impl FrameScheduler {
     pub fn new(preferred_fps: u32) -> Self {
         Self {
-            preferred_fps: preferred_fps.clamp(1, 120),
+            preferred_fps: shared::frame_rate::clamp_fps(preferred_fps),
             time_origin_ms: None,
             next_deadline_ms: None,
+            last_vsync_ms: None,
+            recent_gaps_ms: [None; 2],
+        }
+    }
+
+    /// How early a vsync may be and still count as the one that owns the current
+    /// deadline: half the display period, so the frame is taken at the vsync
+    /// *nearest* the deadline rather than the first one strictly past it.
+    ///
+    /// Half a period rather than a fixed epsilon because every useful cadence
+    /// (60 on 60Hz, 30 on 60Hz, 60 on 120Hz) puts the deadline exactly on a
+    /// vsync, which makes the decision a coin flip on timing noise: the grid is
+    /// anchored to one sampled timestamp and never re-phased, so a host whose
+    /// timestamps jitter by more than the epsilon does not drop one frame, it
+    /// drops frames for the rest of the session. Half a period cannot cause the
+    /// opposite error, because presenting early still advances the deadline to
+    /// the same grid slot, so the long-run rate stays the requested one.
+    ///
+    /// The period is derived from the delivered timestamps rather than from the
+    /// host, which reports its refresh rate once per session and never again
+    /// when the display changes mode. Two gaps are required and the *smaller*
+    /// wins, because a single gap is not a period: the first gap after an idle
+    /// stall is the stall, and a host that misses a frame callback reports two
+    /// periods. Trusting either would let the next frame present a whole period
+    /// early. A tolerance above half a period is therefore only reachable when
+    /// two consecutive gaps both exceed the period -- the host is delivering at
+    /// under half the display rate, where every delivered vsync should present.
+    fn vsync_tolerance_ms(&self) -> f64 {
+        match self.recent_gaps_ms {
+            [Some(newest), Some(previous)] => newest.min(previous) / 2.0,
+            _ => 0.0,
+        }
+    }
+
+    /// Records the gap to the previous delivered vsync. Called after the
+    /// decision, not before: the tolerance then describes a cadence already
+    /// established rather than the interval this vsync just ended, which right
+    /// after an idle stall *is* the stall. Non-monotonic timestamps are dropped
+    /// rather than believed -- `migo_session_notify_vsync` takes whatever the
+    /// host's frame clock reports.
+    fn observe_gap(&mut self, raf_time_ms: f64) {
+        if let Some(previous) = self.last_vsync_ms.replace(raf_time_ms) {
+            let gap_ms = raf_time_ms - previous;
+            if gap_ms > 0.0 {
+                self.recent_gaps_ms = [Some(gap_ms), self.recent_gaps_ms[0]];
+            }
         }
     }
 
@@ -24,11 +74,13 @@ impl FrameScheduler {
         let origin = *self.time_origin_ms.get_or_insert(vsync_ts_ms);
         let raf_time_ms = vsync_ts_ms - origin;
         let frame_interval_ms = 1000.0 / self.preferred_fps as f64;
-        let deadline = self.next_deadline_ms.get_or_insert(0.0);
-        let should_render = raf_time_ms + 0.25 >= *deadline;
+        let tolerance_ms = self.vsync_tolerance_ms();
+        let deadline = self.next_deadline_ms.unwrap_or(0.0);
+        let should_render = raf_time_ms + tolerance_ms >= deadline;
 
+        let mut next_deadline_ms = deadline;
         if should_render {
-            let mut next_deadline_ms = *deadline + frame_interval_ms;
+            next_deadline_ms += frame_interval_ms;
 
             if next_deadline_ms <= raf_time_ms {
                 let skipped_slots =
@@ -39,9 +91,9 @@ impl FrameScheduler {
             while next_deadline_ms <= raf_time_ms {
                 next_deadline_ms += frame_interval_ms;
             }
-
-            *deadline = next_deadline_ms;
         }
+        self.next_deadline_ms = Some(next_deadline_ms);
+        self.observe_gap(raf_time_ms);
 
         FrameDecision {
             should_render,
@@ -50,7 +102,7 @@ impl FrameScheduler {
     }
 
     pub fn set_preferred_fps(&mut self, preferred_fps: u32) {
-        self.preferred_fps = preferred_fps.clamp(1, 120);
+        self.preferred_fps = shared::frame_rate::clamp_fps(preferred_fps);
     }
 }
 
@@ -130,7 +182,7 @@ impl SoftwareFrameClock {
     }
 
     fn interval_for(fps: u32) -> Duration {
-        Duration::from_secs(1) / fps.clamp(1, 120)
+        Duration::from_secs(1) / shared::frame_rate::clamp_fps(fps)
     }
 
     /// Change the frame interval. Deliberately does not arm: a frame rate is a
@@ -277,6 +329,78 @@ mod tests {
     #[test]
     fn does_not_present_when_surface_is_not_ready() {
         assert_does_not_present_when_surface_is_not_ready();
+    }
+
+    /// Present indices for a 60Hz stream whose first timestamp sits at the top
+    /// of the timing-noise band, so every later vsync looks slightly early
+    /// against a grid anchored to that one sample.
+    fn presents_for(target_fps: u32, timestamps: &[f64]) -> Vec<usize> {
+        use super::FrameScheduler;
+        let mut scheduler = FrameScheduler::new(target_fps);
+        timestamps
+            .iter()
+            .enumerate()
+            .filter(|(_, ts)| scheduler.on_vsync(**ts).should_render)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn jittered_60hz(count: usize) -> Vec<f64> {
+        let period_ms = 1000.0 / 60.0;
+        (0..count)
+            .map(|k| k as f64 * period_ms + if k % 2 == 0 { 0.4 } else { -0.4 })
+            .collect()
+    }
+
+    /// The defect a fixed tolerance had: sub-millisecond timestamp noise, which
+    /// every real frame clock has, made a 60fps request on a 60Hz panel render
+    /// 14 of 24 vsyncs (~35fps) and stay there, because the grid is anchored to
+    /// one sampled timestamp and never re-phased. Only the second vsync may be
+    /// skipped -- the bootstrap pair has no period to derive a tolerance from,
+    /// and one frame at session start is not a cadence.
+    #[test]
+    fn timestamp_jitter_does_not_halve_a_60fps_request_on_a_60hz_panel() {
+        let expected: Vec<usize> = (0..24).filter(|k| *k != 1).collect();
+        assert_eq!(
+            presents_for(60, &jittered_60hz(24)),
+            expected,
+            "every vsync after the bootstrap pair must own its deadline slot"
+        );
+    }
+
+    /// The error the widened tolerance could introduce instead: a tolerance of
+    /// half a period must not let a 30fps request take both vsyncs of its slot.
+    #[test]
+    fn tolerance_never_renders_faster_than_the_requested_rate() {
+        let presents = presents_for(30, &jittered_60hz(24));
+        assert_eq!(
+            presents.len(),
+            12,
+            "30fps on a 60Hz panel is every 2nd vsync"
+        );
+        assert!(
+            presents.windows(2).all(|pair| pair[1] - pair[0] == 2),
+            "cadence must be exactly 2 vsyncs, got {presents:?}"
+        );
+    }
+
+    /// Why the tolerance is half the *smaller* of the last two gaps. A host that
+    /// misses a frame callback reports a gap of two periods; deriving the
+    /// tolerance from that newest gap alone would let the next frame present a
+    /// whole period early, turning one missed callback into three off-cadence
+    /// frames (`[2, 1, 1, 3, ...]`) instead of the one the miss itself costs.
+    #[test]
+    fn a_missed_host_callback_does_not_widen_the_tolerance_to_a_whole_period() {
+        let period_ms = 1000.0 / 60.0;
+        let timestamps: Vec<f64> = (0..24)
+            .filter(|k| *k != 3)
+            .map(|k| k as f64 * period_ms)
+            .collect();
+        assert_eq!(
+            presents_for(30, &timestamps),
+            vec![0, 2, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21],
+            "the frame after the doubled gap must wait for its own slot"
+        );
     }
 
     #[test]
@@ -538,8 +662,8 @@ mod software_frame_clock_tests {
         clock.arm(t0);
         assert_eq!(
             clock.deadline(),
-            Some(t0 + interval(120)),
-            "1000 fps clamps to 120"
+            Some(t0 + interval(shared::frame_rate::MAX_FPS)),
+            "a request past the range clamps to the fastest panel the engine serves"
         );
     }
 }

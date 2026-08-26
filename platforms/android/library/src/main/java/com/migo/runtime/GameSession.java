@@ -149,14 +149,6 @@ public final class GameSession implements Closeable {
         this.vsyncScheduler = new VsyncScheduler(sessionId);
         this.mainHandler = new Handler(Looper.getMainLooper());
 
-        // Configure frame skip to match targetFps against the display refresh rate
-        float displayRefreshRate = 60f;
-        if (context instanceof Activity) {
-            displayRefreshRate = ((Activity) context).getWindowManager()
-                    .getDefaultDisplay().getRefreshRate();
-        }
-        this.vsyncScheduler.setTargetFps(config.getTargetFps(), displayRefreshRate);
-
         // Reclaim the temp directories of sessions that died without running their
         // own teardown, before this session's own directory exists. Ordering is
         // what makes it safe and what makes /tmp start empty: sessions are only

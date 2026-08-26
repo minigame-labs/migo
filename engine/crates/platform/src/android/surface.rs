@@ -2,7 +2,7 @@
 
 use jni::sys::jobject;
 use shared::surface::Surface;
-use std::{ffi::c_void, fmt, ptr::NonNull};
+use std::{ffi::c_void, fmt, ptr::NonNull, sync::OnceLock};
 
 #[repr(C)]
 pub struct ANativeWindow(c_void);
@@ -25,6 +25,64 @@ unsafe extern "C" {
 
     pub(crate) fn ANativeWindow_getHeight(window: *mut ANativeWindow) -> i32;
     pub(crate) fn ANativeWindow_getWidth(window: *mut ANativeWindow) -> i32;
+}
+
+/// `ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE`: content presenting at
+/// a fixed rate, which a game asking for N fps is. It is what tells
+/// SurfaceFlinger it may switch modes to serve the rate evenly; the `DEFAULT`
+/// value means the opposite ("this content can adapt"), and would leave a 60fps
+/// game on a 90Hz panel exactly where it is.
+const FRAME_RATE_COMPATIBILITY_FIXED_SOURCE: i8 = 1;
+
+type SetFrameRateFn = unsafe extern "C" fn(*mut ANativeWindow, f32, i8) -> i32;
+
+/// `ANativeWindow_setFrameRate` is API 30 and this library loads on API 26, so it
+/// is resolved at runtime rather than linked: the NDK stub for the compiled API
+/// level does not export it, and linking it anyway would make the whole `.so`
+/// fail to load on every device below Android 11 -- trading the engine for a
+/// frame-pacing hint.
+///
+/// `libandroid.so` is already a NEEDED dependency of this library (the externs
+/// above link it), so this resolves against the live image rather than mapping
+/// anything new.
+fn native_window_set_frame_rate() -> Option<SetFrameRateFn> {
+    static ENTRY_POINT: OnceLock<Option<SetFrameRateFn>> = OnceLock::new();
+    *ENTRY_POINT.get_or_init(|| {
+        let library = unsafe { libloading::Library::new("libandroid.so") }.ok()?;
+        let symbol =
+            unsafe { library.get::<SetFrameRateFn>(b"ANativeWindow_setFrameRate\0") }.ok()?;
+        let entry_point = *symbol;
+        // The resolved pointer outlives the borrow only because the library is
+        // never unloaded. Leaking the handle is the honest way to say that: the
+        // process needs libandroid.so for its whole life, so there is nothing to
+        // unload it for and nowhere to keep the handle that would not amount to
+        // the same leak with more moving parts.
+        std::mem::forget(library);
+        Some(entry_point)
+    })
+}
+
+/// Ask the display for a mode that presents `fps` frames per second evenly.
+///
+/// The two-argument form is deliberate: it behaves as
+/// `CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS`, so a switch the user would see as a
+/// flicker is declined instead of performed. When it is declined the frame
+/// scheduler decimates whatever the panel keeps delivering, which is correct --
+/// just not as even. Asking for the visible switch would be trading a permanent
+/// improvement for a visible cost at every rate change, including a mid-game
+/// `setPreferredFramesPerSecond`.
+pub fn request_frame_rate(window: *mut ANativeWindow, fps: u32) {
+    let Some(set_frame_rate) = native_window_set_frame_rate() else {
+        return;
+    };
+    let status =
+        unsafe { set_frame_rate(window, fps as f32, FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) };
+    if status != 0 {
+        tracing::debug!(
+            "ANativeWindow_setFrameRate({fps}) declined: status={status} (the frame \
+             scheduler keeps pacing against the delivered vsyncs)"
+        );
+    }
 }
 
 /// Android Surface wrapper:

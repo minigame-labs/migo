@@ -140,7 +140,6 @@ fn run(
         .with_cache_dir(cache_dir)
         .with_code_cache_dir(code_cache_dir)
         .with_pixel_ratio(1.0)
-        .with_target_fps(60)
         .with_debug_enabled(true)
         .with_code_signing_enabled(false);
 

@@ -14,7 +14,6 @@
     public static native *** modMain(...);
     public static native *** executeScript(...);
     public static native *** onVsync(...);
-    public static native *** setDisplayRefreshRate(...);
     public static native *** getDebugStats(...);
     public static native *** getConsoleLogs(...);
     public static native *** nativeAhbPointerFromHardwareBuffer(...);

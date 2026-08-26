@@ -98,14 +98,21 @@ pub(crate) fn raf_publish_demand_and_arm(
     ticket
 }
 
-/// Sync op to set the preferred frame rate (1-120 fps).
+/// Sync op to set the preferred frame rate.
 ///
-/// On Choreographer: adjusts the frame divisor (skip VSync signals).
+/// Takes the JS Number as it arrived so [`shared::frame_rate`] stays the one
+/// authority for what a rate is and which ones the engine serves.
+///
+/// On Choreographer: adjusts which vsyncs the frame scheduler takes, and asks
+/// the display for a mode that can present them.
 /// Engine-paced: widens or narrows the frame clock's pacing grid.
 #[op2(fast)]
-pub(crate) fn op_set_preferred_fps(state: &mut OpState, #[smi] fps: u32) {
+pub(crate) fn op_set_preferred_fps(state: &mut OpState, fps: f64) {
+    let Some(fps) = shared::frame_rate::requested_fps(fps) else {
+        return;
+    };
     let tx = state.borrow::<HostOpState>().render_tx.clone();
-    let _ = tx.send(RenderCommand::FrameRate(fps.clamp(1, 120)));
+    let _ = tx.send(RenderCommand::FrameRate(fps));
 }
 
 #[cfg(test)]
@@ -157,6 +164,27 @@ mod tests {
         assert!(
             src.contains("Object.keys(__raf_callbacks).length > 0"),
             "__migo_restart_raf_loop must only restart when a callback is queued"
+        );
+    }
+
+    /// The op must hand the Number to the one authority rather than deciding the
+    /// range itself: a second clamp here is how a range widened in `frame_rate`
+    /// keeps the old ceiling on the path content actually calls.
+    #[test]
+    fn the_op_defers_the_range_rule_to_shared_frame_rate() {
+        // Bounded at this module because `include_str!` includes the assertions
+        // below, and the needle would otherwise match itself.
+        let code = include_str!("raf.rs")
+            .split_once("mod tests")
+            .expect("this module bounds the production half of the file")
+            .0;
+        assert!(
+            code.contains("shared::frame_rate::requested_fps(fps)"),
+            "op_set_preferred_fps must route through shared::frame_rate"
+        );
+        assert!(
+            !code.contains("clamp(1, 120)"),
+            "no local frame-rate range may live beside the shared one"
         );
     }
 }

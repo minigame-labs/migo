@@ -99,7 +99,9 @@ impl RenderService {
         // so the first vsync tick already runs at the right cadence.
         let _ = thread
             .sender()
-            .send(RenderCommand::FrameRate(target_fps.clamp(1, 120) as u32));
+            .send(RenderCommand::FrameRate(shared::frame_rate::clamp_fps(
+                target_fps.max(0) as u32,
+            )));
         let mut surface_system = SurfaceSystem::new();
         surface_system.on_surface_available(surface_size);
         Ok(Self {

@@ -286,16 +286,6 @@ public final class NativeBridge {
      */
     public static native void onVsync(int sessionId, long frameTimeNanos);
 
-    /**
-     * Notify the native render thread of the display refresh period.
-     * Called once at session start and when the display refresh rate changes.
-     *
-     * @param sessionId          The session ID
-     * @param refreshPeriodNanos Display refresh period in nanoseconds
-     *                           (e.g., 16666667 for 60Hz, 8333333 for 120Hz)
-     */
-    public static native void setDisplayRefreshRate(int sessionId, long refreshPeriodNanos);
-
     // ==================== Recorder Callbacks ====================
 
     /**

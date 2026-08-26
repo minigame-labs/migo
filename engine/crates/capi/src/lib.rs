@@ -140,7 +140,6 @@ impl EngineInner {
             .with_cache_dir(self.cache_dir.clone())
             .with_code_cache_dir(self.code_cache_dir.clone())
             .with_pixel_ratio(pixel_ratio)
-            .with_target_fps(60)
             .with_code_signing_enabled(!self.allow_unsigned_content);
         // The session's level, not just the process default, because a session
         // binds its own level to its host thread and publishes it for the render

@@ -390,7 +390,8 @@ pub(crate) extern "system" fn init(
         let code_cache_dir = super::get_string_field(&mut env, "codeCacheDir", &options)
             .unwrap_or_else(|_| cache_dir.clone());
 
-        let target_fps = super::get_i32(&mut env, "targetFps", &options).unwrap_or(60);
+        let target_fps = super::get_i32(&mut env, "targetFps", &options)
+            .unwrap_or(shared::frame_rate::DEFAULT_FPS as i32);
 
         let debug_enabled = super::get_bool(&mut env, "debugEnabled", &options).unwrap_or(false);
 
@@ -1765,22 +1766,6 @@ pub(crate) extern "system" fn onVsync(
                 invalidate_hot_ingress(host_id);
             }
         }
-    });
-}
-
-pub(crate) extern "system" fn setDisplayRefreshRate(
-    _env: JNIEnv,
-    _class: JClass,
-    host_id: jint,
-    refresh_period_nanos: jlong,
-) {
-    jni_safe!("setDisplayRefreshRate", {
-        let _ = send_command_to_host(
-            host_id,
-            HostCommand::SetDisplayRefreshRate {
-                period_nanos: refresh_period_nanos as i64,
-            },
-        );
     });
 }
 

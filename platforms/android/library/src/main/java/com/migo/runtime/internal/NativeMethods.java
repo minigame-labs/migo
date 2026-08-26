@@ -787,22 +787,6 @@ public final class NativeMethods {
         }
     }
 
-    // ==================== Display Configuration ====================
-
-    /**
-     * Notify the native render thread of the display refresh period.
-     * Should be called once at session start and when the display refresh rate changes.
-     *
-     * @param sessionId          The session ID
-     * @param refreshPeriodNanos Display refresh period in nanoseconds
-     *                           (e.g., 16666667 for 60Hz, 8333333 for 120Hz)
-     */
-    public static void setDisplayRefreshRate(int sessionId, long refreshPeriodNanos) {
-        if (sessionId >= 0) {
-            NativeBridge.setDisplayRefreshRate(sessionId, refreshPeriodNanos);
-        }
-    }
-
     // ==================== Keyboard Callbacks ====================
 
     /**

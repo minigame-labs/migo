@@ -106,8 +106,12 @@ Object.defineProperty(globalThis, "__migo_restart_raf_loop", {
     configurable: true,
 });
 
+// The Number is forwarded as it arrived. `fps | 0` here used to be two silent
+// failures at once -- a non-finite argument became 0 and a value past 2^31
+// wrapped negative, so both ended up clamped to 1 fps, the opposite of what
+// either caller meant -- and it made the range rule live in two places.
 const setPreferredFramesPerSecond = (fps) => {
-    op_set_preferred_fps(Math.max(1, Math.min(120, fps | 0)));
+    op_set_preferred_fps(fps);
 };
 
 export { requestAnimationFrame, cancelAnimationFrame, setPreferredFramesPerSecond };

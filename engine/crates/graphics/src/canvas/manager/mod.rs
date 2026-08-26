@@ -331,6 +331,14 @@ pub(crate) struct CanvasManager {
     /// underlying native resource and is dropped after CanvasManager.
     installed_surface: Option<PreparedEglSurfaceRef>,
 
+    /// The frame rate content has asked for, kept here because it is a property
+    /// of the *window* that must survive the window being replaced. A fresh
+    /// native target has no rate requested, so a surface recreate would otherwise
+    /// silently drop the request and leave the display in whichever mode it
+    /// happened to be in -- the failure this exists to make unrepresentable, by
+    /// re-asserting the request at the one place an install commits.
+    frame_rate_request: u32,
+
     /// At most one partially-created onscreen EGL target.  This is a control
     /// path only; it adds no work to drawing or presentation.
     pending_onscreen: Option<PendingOnscreenEgl>,
@@ -788,6 +796,7 @@ impl CanvasManager {
             onscreen_content_backing: None,
             simulated_reset: false,
             installed_surface: None,
+            frame_rate_request: shared::frame_rate::DEFAULT_FPS,
             pending_onscreen: None,
             teardown_complete: false,
             native_release_confirmed: false,
@@ -910,6 +919,22 @@ impl CanvasManager {
     /// ANativeWindow even if the new window pointer/size compare equal).
     pub(crate) fn force_next_onscreen_recreate(&mut self) {
         self.force_onscreen_recreate = true;
+    }
+
+    /// Record the rate content is presenting at and ask the display to serve it.
+    ///
+    /// Filtered on change because the ask is a display transaction and the
+    /// startup path legitimately re-sends the rate that is already in effect
+    /// (the host applies its configured target to a thread already defaulting to
+    /// it).
+    pub(crate) fn set_frame_rate_request(&mut self, fps: u32) {
+        if self.frame_rate_request == fps {
+            return;
+        }
+        self.frame_rate_request = fps;
+        if let Some(installed) = self.installed_surface.as_ref() {
+            installed.request_frame_rate(fps);
+        }
     }
 
     /// Explicitly detach the installed window EGLSurface.
@@ -1346,7 +1371,13 @@ impl CanvasManager {
                 bypass_drawing_buffer: false, // evaluated after DrawingBuffer creation
             },
         );
-        self.installed_surface = Some(pending.target);
+        // A fresh native target carries no frame-rate request, so it is asserted
+        // here rather than by each caller: this is the one place an install
+        // commits, so every path through it -- first attach, resize, surface
+        // recreate, context recovery -- inherits the request instead of
+        // remembering to re-send it.
+        let installed = self.installed_surface.insert(pending.target);
+        installed.request_frame_rate(self.frame_rate_request);
 
         // Make current so GL calls work.
         if let Err(error) = self.make_current_needed(id) {
@@ -5748,6 +5779,42 @@ mod recovery_source_guards {
             }
         }
         panic!("function body must close");
+    }
+
+    /// A fresh native target carries no frame-rate request, so the install has to
+    /// re-assert it. Making that the *installer's* job rather than each caller's
+    /// is what keeps a new install path -- first attach, resize, surface
+    /// recreate, context recovery -- from silently leaving the display in
+    /// whichever mode it was in.
+    ///
+    /// Structural because installing a target needs a real EGL display, which no
+    /// host test has: the same reason `startup_ordering` checks this manager's
+    /// construction order by reading its source.
+    #[test]
+    fn every_onscreen_install_re_asserts_the_frame_rate_request() {
+        // The scan stops at this module, because `include_str!` includes the
+        // assertions below and they would match themselves.
+        let code = MGR
+            .split_once("mod recovery_source_guards")
+            .expect("this module bounds the production half of the file")
+            .0;
+        assert!(
+            !code.contains("installed_surface = Some("),
+            "an install that assigns the field directly bypasses the request"
+        );
+        let commits: Vec<_> = code
+            .match_indices("self.installed_surface.insert(")
+            .collect();
+        assert_eq!(
+            commits.len(),
+            1,
+            "one commit point, or checking the first one proves nothing about the rest"
+        );
+        let after_commit: String = code[commits[0].0..].lines().take(3).collect();
+        assert!(
+            after_commit.contains("request_frame_rate(self.frame_rate_request)"),
+            "the commit point must ask the display for the stored rate, got: {after_commit}"
+        );
     }
 
     #[test]

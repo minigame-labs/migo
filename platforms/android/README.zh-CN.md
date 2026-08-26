@@ -300,7 +300,7 @@ staging tree，再用可恢复的整树事务发布，恢复完成后才允许�
 ```java
 RuntimeConfig config = new RuntimeConfig.Builder(context)
     // 性能
-    .setTargetFps(60)              // 30-120, 默认: 60
+    .setTargetFps(60)              // 1-240, 默认: 60
     
     // 调试
     .setDebugEnabled(true)         // 启用调试功能
@@ -380,7 +380,7 @@ String message = ErrorCode.getMessage(code);
 
 | 方法 | 默认值 | 描述 |
 |------|--------|------|
-| `setTargetFps(int)` | 60 | 目标帧率 (30-120) |
+| `setTargetFps(int)` | 60 | 目标帧率 (1-240) |
 | `setDebugEnabled(boolean)` | false | 调试模式 |
 | `setLogLevel(LogLevel)` | WARN | 日志级别 |
 | `setCodeCacheDir(String)` | cacheDir | 代码缓存目录 |

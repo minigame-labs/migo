@@ -50,6 +50,7 @@ pub mod console_log;
 pub mod css_font;
 pub mod device;
 pub mod error;
+pub mod frame_rate;
 pub mod host_channel;
 pub mod image_id;
 pub mod js_escape;
