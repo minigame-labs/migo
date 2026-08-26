@@ -99,6 +99,41 @@ seconds, and writes what it saw plus two screenshots.
 Your host needs to be a **debuggable build** and needs an entry point that can
 be started with a game id. If it cannot, the script says so instead of guessing.
 
+### If you have not integrated Migo yet
+
+You do not need to. [`migo-examples`](https://github.com/minigame-labs/migo-examples)
+carries a host you can install as-is:
+
+```sh
+git clone https://github.com/minigame-labs/migo-examples
+cd migo-examples/android-java
+./gradlew :app:installDebug
+
+cd /path/to/migo
+bash scripts/prescreen-run.sh /path/to/your/bundle \
+    --package com.minigame.androiddemo \
+    --activity .PrescreenProbeActivity \
+    --device <adb serial> --secs 20 --out run-report.md
+```
+
+`PrescreenProbeActivity` exists **only in the debug build** and is the one
+activity there that adb is allowed to start. That boundary is deliberate:
+`android:exported="false"` is the right default for a game activity, and this
+example keeps teaching it rather than opening a surface any app on the phone
+could call. Deploying a bundle needs `run-as`, which needs a debuggable build
+anyway, so a probe that exists only in debug builds is present in exactly the
+situations where this half can work at all.
+
+It adds no behaviour of its own — config, host handlers and logging are all
+inherited from the example's own game activity, so what the probe runs is what a
+host built from the example runs. A probe that behaved differently would be
+measuring itself.
+
+**Unlock the phone first.** An activity launched on a sleeping device pauses
+before it ever gets a surface, and a report written from that would say "no
+engine session ran" about content that is fine. The script wakes the screen and
+refuses to produce a verdict if it cannot.
+
 ### What it will and will not claim
 
 It will not say "runs" unless all of these hold: your host held the foreground,
