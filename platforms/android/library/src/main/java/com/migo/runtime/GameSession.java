@@ -109,7 +109,12 @@ public final class GameSession implements Closeable {
 
     private final AtomicReference<SessionState> state = new AtomicReference<>(SessionState.CREATED);
     private volatile boolean showDispatched = false;
-    private volatile boolean hasLiveSurface = true;
+    /**
+     * Whether a Surface is currently attached. False from construction for a
+     * warm-started session -- one created before its window existed -- until
+     * {@link #updateSurface} delivers the first one.
+     */
+    private volatile boolean hasLiveSurface;
 
     private final long creationNanos = System.nanoTime();
     private volatile long startupTimeMs = -1;
@@ -132,8 +137,14 @@ public final class GameSession implements Closeable {
      * @param gameId    The unique game identifier
      * @param config    The runtime configuration
      * @param context   The context for system services
+     * @param hasLiveSurface Whether a Surface was handed to the native session
+     *                  at creation. False for a warm start, where the vsync
+     *                  scheduler must not treat the session as presentable
+     *                  until the first {@link #updateSurface}.
      */
-    GameSession(int sessionId, String gameId, RuntimeConfig config, Context context) {
+    GameSession(int sessionId, String gameId, RuntimeConfig config, Context context,
+                boolean hasLiveSurface) {
+        this.hasLiveSurface = hasLiveSurface;
         this.sessionId = sessionId;
         this.gameId = gameId;
         this.config = config;

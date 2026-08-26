@@ -1526,14 +1526,31 @@ pub fn op_set_stroke_style_pattern(
     }
 }
 
+/// Set the 2D context's font, or report that the value was not a font.
+///
+/// WHATWG: assigning an unparseable value to `ctx.font` is a no-op, and the
+/// previous font stays in effect. That rule was enforced on the render thread
+/// only -- it rejected the shorthand and kept the old state -- while the JS
+/// thread went on measuring with the best-effort parse of the same string. The
+/// result was the one divergence the two font parsers exist to prevent: for
+/// `64px ""`, `measureText` answered for 64 px and `fillText` painted at the
+/// font before it. The check moves here, ahead of both, so an invalid value
+/// never reaches either side and `ctx.font` never reports one.
+///
+/// @return whether the value was applied; the caller keeps its previous font
+///         when this is false.
 #[op2(fast)]
-pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: String) {
+pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: String) -> bool {
+    if shared::css_font_shorthand::parse_font_shorthand(&font).is_none() {
+        return false;
+    }
     if let Some(collector) =
         state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
     {
         collector.set_font(canvas_id, font);
     }
     crate::rendering::webgl::webgl::maybe_auto_flush(state);
+    true
 }
 
 #[op2(fast)]

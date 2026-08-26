@@ -500,4 +500,15 @@ python3 "$SCRIPT_DIR/write-windows-v8-component-manifest.py" \
     --sdk-version "$SDK_VERSION" \
     --rustc-version "$RUSTC_VERSION"
 ok "component manifest -> $OUT_DIR/component-manifest.json"
+# Producing a .dll and an import library only proves the link succeeded. This
+# links a C consumer against what was just built and runs it, so a DLL that
+# cannot load fails here rather than inside a Rust test binary much later.
+#
+# It runs from this script because nothing else can: the gate needs MSVC and a
+# Windows host, there is no Windows runner in CI, and for that reason it sat
+# referenced by nothing at all -- passing when someone remembered it, silent
+# otherwise.
+info "proving the DLL loads"
+bash "$SCRIPT_DIR/test-windows-v8-dll.sh"
+
 ok "V8 build complete for $TARGET"

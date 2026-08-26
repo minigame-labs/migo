@@ -7,6 +7,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `MigoGameActivity.onCreateRuntimeConfig()`. A config handed to
+  `buildLaunchIntent` travels through an in-process table keyed by a token in
+  the intent, so it reaches the activity only when whatever started it was in
+  the same process. A game opened from a deep link, a notification, a launcher
+  shortcut or `am start` is not: the token is absent and the launch silently ran
+  on a default config, whatever the host had configured everywhere else.
+  Overriding this describes how the app runs games once, and it applies however
+  the activity was reached. The default returns `null`, which is exactly the
+  previous behaviour.
+
+### Fixed
+- `test-android-host-api-contract.sh` froze nothing an embedder reaches by
+  subclassing. It read the surface with `javap -public`, so
+  `MigoGameActivity`'s `onCreateGameListener`, `onLaunchFailed`,
+  `onSessionCreated` and `getGameSession` -- the documented, "zero-boilerplate"
+  integration path -- were outside the freeze along with every other protected
+  member. R8 once marked exactly those methods `final` in the release AAR and
+  external subclasses stopped compiling; this gate could not have seen it. It
+  now reads `-protected`, and the baseline grew by the 13 members that were
+  never pinned.
+
+### Fixed
+- An unparseable `ctx.font` assignment is a no-op again, on both sides of the
+  engine. WHATWG says an invalid value leaves the previous font in effect, and
+  the render thread already did that -- it rejected the shorthand and kept its
+  state. The JS thread did not: it stored the string and `measureText` answered
+  from a best-effort parse of it. So a typo'd font string measured at one size
+  and painted at another, silently. `ctx.font = "definitely not a font"` after
+  `64px "..."` measured 36 px of text the engine painted 221 px of. The check
+  now happens once, in `op_set_font`, ahead of both -- so an invalid value never
+  reaches either side and `ctx.font` never reports one. The strict parser moved
+  to `shared` to make that possible, which is also what finally makes the
+  "one parser, one source of truth" comment in the 2D context true.
+
+### Added
+- `MigoNativeLoader.prepare(context, file)`, for hosts that deliver the engine
+  themselves. It runs the same verification the load already does, on the
+  thread the caller is on. It does not make the load safer -- what it changes
+  is when a bad file is found: a truncated download or a mirror serving the
+  previous release is otherwise discovered when a user opens a game, as a
+  launch failure, rather than by the download code that still has the network
+  connection. It also keeps the check off the main thread; verification is
+  41 ms for a 45 MB release engine on a Mate 30 Pro, and the load afterwards
+  finds the result recorded and hashes nothing.
+- The first `readPixels` on a WebGL context no longer returns an empty buffer.
+  While one canvas exists and nothing has read the default framebuffer, WebGL
+  renders straight to the window surface and the intermediate DrawingBuffer is
+  bypassed. The first readback ends that bypass -- a read needs a real FBO --
+  and the engine bound the DrawingBuffer without putting anything in it, so the
+  read returned `[0,0,0,0]` for pixels the game had just drawn. It happens once
+  per context, at startup, which is the hardest kind of bug to notice and the
+  easiest to blame on the content; content that builds textures by drawing and
+  reading back gets one empty texture. `signal_default_fbo_readback` has
+  documented this snapshot since the flag was introduced -- only the code was
+  missing. Found by a new WebGL bundle in migo-conformance on its first run.
+
+### Added
+- Android hosts can keep the engine out of their first install. `libmigo.so`
+  is ~17 MB of store download and ~45 MB installed per ABI, paid by every
+  user whether or not they ever open a mini-game. Two new release assets let
+  that cost move to the first game launch: `migo-<version>-android-nojni.aar`
+  (the published AAR with `jni/**` deleted) and
+  `migo-<version>-jni-android-<arch>.tar.gz` (the bytes it no longer carries).
+  A host installs a `NativeLibraryProvider` through the new `MigoNativeLoader`
+  and hands over the file; Migo verifies it against the artifact manifest the
+  AAR already embeds before loading it, so a partial download or a mirror
+  still serving the previous release fails with a readable reason instead of
+  crashing inside the engine. Migo downloads nothing itself: on Google Play
+  the only compliant source is Play Feature Delivery, and stores without it
+  expect the host to serve the file, so one built-in downloader would be
+  wrong for one of the two.
+- `scripts/test-android-nojni-aar-contract.sh`, which holds the engine-less
+  AAR to being a deletion rather than a second build -- identical
+  `classes.jar`, identical embedded artifact identities, and every removed
+  byte accounted for in exactly one engine archive.
+
+### Changed
+- The native library now loads on first use rather than in
+  `MigoRuntime.getInstance()`. Every accessor that needs native calls loads
+  first, so the packaged default behaves exactly as before; what changes is
+  that merely obtaining the singleton no longer pulls the engine into the
+  process.
+- `LEGAL.md` states that hosting the engine binary to deliver it into your
+  own app is covered by the Additional Use Grant and is not a Competitive
+  Offering.
+- Android cold start is materially faster, and now leads the system WebView on
+  both metrics for all three benchmark games. Five costs sat on that path and
+  none had to. Full-screen immersive mode was applied from `createSession` --
+  after the window had been laid out with the system bars and the surface
+  created at that smaller size -- so every launch resized the window and made
+  the engine rebuild its GPU-side surface mid-startup; it is now applied in
+  `MigoGameActivity.onCreate`, before the surface exists. And the session was
+  created inside the `surfaceCreated` callback, holding the main thread for
+  ~114 ms in the middle of the traversal that draws the window; it is now
+  posted so the traversal can finish and draw first. The three engine-side
+  costs are the entries below. Measured on a Mate 30 Pro against the device's
+  Android System WebView, medians of 3 cold runs: first frame 385→274 ms
+  (bunnymark), 384→258 (canvasmark), 523→344 (endless-runner); game-ready
+  523→400, 378→336, 804→605. Steady-state fps and memory are unchanged.
+- Session creation is ~38 ms cheaper. Building the Canvas2D text context
+  costs 35-41 ms on an arm64 device -- `SkFontMgr_Android` parses
+  `/system/etc/fonts.xml` and enumerates the system families, then the
+  bundled fallback face is parsed on top -- and it was being done on the host
+  thread inside `RenderThread::spawn`, before the render thread existed. Every
+  session therefore delayed the start of EGL/Skia initialization by that much
+  and then waited for it, whether or not the game ever drew a glyph. The
+  context is now built by the render thread once its GPU capabilities are
+  published: off the host's critical path, and still long before any game code
+  can ask for a glyph, so no first `fillText` pays for it either. `Host::new`
+  drops from 88-99 ms to 50-58 ms; game-ready improves by 16-53 ms across the
+  three benchmark games.
+- Creating a session no longer waits for the GPU. `Host::new` blocked on the
+  render thread publishing its capabilities -- 30-44 ms with the caller's
+  `createSession` blocked behind it -- although nothing between that point and
+  the first line of launch JS reads them. The wait moved to just before any
+  prelude or module runs, which is where the invariant it protects was always
+  written down: no untrusted JS may observe the provisional all-false
+  capability snapshot. A GPU failure is now reported from `startGame` rather
+  than from `createSession`. Game-ready improves a further 10-21 ms.
+- The dev player deploys a whole game bundle, not just `game.js` and
+  `game.json`. It copied those two files by name, so it could not run any
+  bundle carrying an asset -- a font, an image, a sub-package -- which made a
+  whole category of conformance test impossible to write.
+- The GLES dispatch table is built once per session instead of twice.
+  `glow::Context::from_loader_function` resolves 709 symbols through
+  `eglGetProcAddress`, which costs 41-50 ms on an arm64 device, and it was
+  being paid twice: once by `CanvasManager`, with the host thread waiting on
+  it, and again by the render thread immediately afterwards, delaying the
+  first frame by the same amount. Both were built on the render thread from
+  EGL contexts in one share group, so the manager's table now serves both.
+  Game-ready drops a further 40-53 ms.
+- The log level a host configures now takes effect. `tracing` caches what it
+  thinks of a callsite the first time it sees one, and the dynamic level filter
+  did not opt out of that: a callsite first reached while the process default
+  was `Warn` was cached as disabled and stayed dead, so a host that asked for
+  `Info` got silence -- including for the startup timings, which are emitted
+  while the host is being built and so could never be seen.
+- The host event loop no longer logs a warning when it parks with nothing
+  pending. It does that three times on every single launch, in the window
+  before the game registers its first `requestAnimationFrame`; a warning on
+  the guaranteed path is how a log teaches its reader to skip warnings.
+
 ---
 
 ## v0.9.3 (2026-08-15)

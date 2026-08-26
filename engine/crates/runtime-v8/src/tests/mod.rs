@@ -33,4 +33,7 @@ mod snapshot_fingerprint;
 mod storage_isolation;
 mod timers;
 mod two_session_identity;
+// `getUpdateManager` ships with host_v8_update, which api-system gates.
+#[cfg(feature = "api-system")]
+mod update_manager_reports_no_update;
 mod v8_limits;

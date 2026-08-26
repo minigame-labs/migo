@@ -93,7 +93,7 @@ show_help() {
     echo ""
     echo "Usage:"
     echo "  ./build-android-so.sh [arm64-v8a|x86_64|all] [release|debug]"
-    echo "  ./build-android-so.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--build-type release|debug] [--compile-only] [architectures...]"
+    echo "  ./build-android-so.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--jitless] [--build-type release|debug] [--compile-only] [architectures...]"
     echo ""
     echo "Examples:"
     echo "  ./build-android-so.sh"
@@ -156,6 +156,44 @@ get_abi_name() {
         x86_64)    echo "x86_64" ;;
         *)         echo "unknown" ;;
     esac
+}
+
+# ------------------------------------------------------------
+# The rustflags `.cargo/config.toml` declares for a target.
+#
+# Cargo does not merge `RUSTFLAGS` with `[target.<triple>].rustflags` -- the
+# environment variable *replaces* them. This script sets `RUSTFLAGS` (it has to:
+# the clang builtins path is only known at build time), so for as long as it did
+# so blindly, every flag in the config was silently discarded on the AAR build
+# and on nothing else -- `build-android-sdk.sh` and `build-android-c-host.sh`
+# set no `RUSTFLAGS`, so the same config applied there.
+#
+# Measured on 2026-08-23, arm64-v8a release: carrying the config's flags forward
+# takes `libmigo.so` from 45,709,280 to 42,072,032 bytes -- 3.47 MiB, 8%, almost
+# all of it `.text` (31.30 -> 27.88 MB) from `--gc-sections` and `--icf=all`
+# never having run. Startup was measured too, interleaved and thermally gated:
+# first frame and game-ready came out slightly *better* on both bunnymark and
+# canvasmark, and steady fps identical at 59.8 -- a smaller image is friendlier
+# to the instruction cache, not less friendly.
+#
+# So the config stays the single source of truth and this reads it, rather than
+# the flags being copied here where the two would drift. The evidence that they
+# do drift is already in the file: `--allow-multiple-definition` had been copied
+# into this script, which is what someone does after finding that the config's
+# copy did not apply, without noticing the other twelve.
+#
+# test-android-rustflags-reach-the-linker.sh is the gate.
+# ------------------------------------------------------------
+config_rustflags() {
+    local triple="$1"
+    python3 - "$ENGINE_ROOT/.cargo/config.toml" "$triple" <<'PYEOF'
+import sys, tomllib
+config_path, triple = sys.argv[1], sys.argv[2]
+with open(config_path, "rb") as handle:
+    config = tomllib.load(handle)
+flags = config.get("target", {}).get(triple, {}).get("rustflags", [])
+print(" ".join(flags))
+PYEOF
 }
 
 # ------------------------------------------------------------
@@ -282,6 +320,7 @@ build_platform() {
     local build_type="$2"
     local codegen_profile="$3"
     local worker_snapshot="$4"
+    local jitless="$5"
 
     if [[ "$platform" == "armv7" || "$platform" == "x86" ]]; then
         print_error "$platform is not supported"
@@ -319,6 +358,14 @@ build_platform() {
     if [[ "$worker_snapshot" == true ]]; then
         destination_suffix+="-worker-snapshot"
         cargo_features+=",worker-snapshot"
+    fi
+    # Measurement build: V8 with --jitless, the closest proxy on measurable
+    # hardware for HarmonyOS NEXT, where no third-party VM may JIT. The suffix is
+    # load-bearing -- it keeps the jitless natives in their own jniLibs tree, so
+    # an A/B pair cannot end up comparing a binary against itself.
+    if [[ "$jitless" == true ]]; then
+        destination_suffix+="-jitless"
+        cargo_features+=",v8-jitless"
     fi
 
     # --------------------------------------------------------
@@ -377,7 +424,16 @@ build_platform() {
     # final link, so the NDK lld never sees a raw-bitcode object -- the failure
     # that once motivated embed-bitcode=no ("Invalid value Producer/Reader LLVM")
     # only happens without LTO, where cargo's default is already embed-bitcode=no.
-    local common_rustflags="-C link-arg=-Wl,--allow-multiple-definition"
+    # Everything static lives in `.cargo/config.toml`, including
+    # `--allow-multiple-definition`, whose long justification is there. This
+    # carries that list forward because setting RUSTFLAGS at all would otherwise
+    # drop it; only genuinely build-time-dependent flags are added below.
+    local common_rustflags
+    common_rustflags="$(config_rustflags "$target_triple")"
+    if [[ -z "$common_rustflags" ]]; then
+        print_error "no rustflags declared for $target_triple in .cargo/config.toml"
+        return 1
+    fi
 
     if [[ "$platform" == "arm64-v8a" ]]; then
         local builtins
@@ -499,10 +555,48 @@ build_platform() {
     print_success "Copied -> $dst_so"
 
     # --------------------------------------------------------
-    # Copy libc++_shared.so (required by cpal/oboe shared STL)
-    # Note: cannot use static STL because V8's prebuilt librusty_v8.a
-    # already embeds static libc++ symbols — linking both causes duplicates.
+    # Ship libc++_shared.so only if libmigo.so actually asks for it.
+    #
+    # It used to be copied unconditionally, for cpal/oboe's shared STL. That
+    # stopped being true without anyone noticing: `librusty_v8.a` carries
+    # Chromium's own libc++ statically, the link resolves every C++ runtime
+    # symbol from it, and the produced `libmigo.so` has no DT_NEEDED entry for
+    # `libc++_shared.so` at all -- verified on arm64 full, arm64 slim, and the
+    # x86_64 binary inside the published v0.9.3 AAR. Its only two undefined
+    # C++-ish symbols, `__cxa_atexit` and `__cxa_finalize`, come from bionic's
+    # libc.
+    #
+    # So every integration carried ~1 MB per ABI that nothing loaded (~2 MB in
+    # the published dual-ABI AAR), and shipped a libc++ that could collide with
+    # the host's own -- when two AARs both provide `libc++_shared.so`, Gradle
+    # picks one, and the loser's libraries get an ABI they were not built
+    # against.
+    #
+    # Asking the binary is the whole point: this stays correct if a future
+    # dependency really does need the shared STL, and stays quiet when none
+    # does. Removed by hand it would come back the first time someone
+    # "restored" the copy. test-android-native-deps-contract.sh is the gate.
     # --------------------------------------------------------
+    local readelf_bin=""
+    if [[ -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$(get_host_platform 2>/dev/null)/bin/llvm-readelf" ]]; then
+        readelf_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$(get_host_platform)/bin/llvm-readelf"
+    elif command -v llvm-readelf &>/dev/null; then
+        readelf_bin="$(command -v llvm-readelf)"
+    elif command -v readelf &>/dev/null; then
+        readelf_bin="$(command -v readelf)"
+    fi
+    if [[ -z "$readelf_bin" ]]; then
+        print_error "no readelf available to read $dst_so's shared-library dependencies"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
+    fi
+    if ! "$readelf_bin" --dynamic "$dst_so" 2>/dev/null | grep -q 'NEEDED.*libc++_shared\.so'; then
+        print_info "libc++_shared.so not needed by $(basename "$dst_so"); not shipping it"
+        rm -f "$dst_dir/libc++_shared.so"
+        export RUSTFLAGS="$orig_rustflags"
+        return 0
+    fi
+
     local host_platform
     if ! host_platform=$(get_host_platform); then
         print_warning "Unable to detect NDK host platform under: $ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
@@ -557,6 +651,7 @@ build_type="release"
 product_profile="full"
 codegen_profile="z"
 worker_snapshot=false
+jitless=false
 compile_only=false
 platforms=()
 use_all=false
@@ -602,6 +697,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --worker-snapshot)
             worker_snapshot=true
+            ;;
+        --jitless)
+            jitless=true
             ;;
         --compile-only)
             compile_only=true
@@ -677,7 +775,7 @@ slim_icu_data
 
 failed=()
 for p in "${platforms[@]}"; do
-    if ! build_platform "$p" "$build_type" "$codegen_profile" "$worker_snapshot"; then
+    if ! build_platform "$p" "$build_type" "$codegen_profile" "$worker_snapshot" "$jitless"; then
         failed+=("$p")
     fi
 done

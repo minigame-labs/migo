@@ -52,6 +52,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--build-type", required=True, choices=("debug", "release"))
     parser.add_argument("--codegen-profile", required=True, choices=("z", "2", "3"))
     parser.add_argument("--worker-snapshot", action="store_true")
+    # Measurement build (V8 --jitless). The third place the jniLibs directory
+    # name is recomputed rather than passed in -- build-aar.sh and
+    # library/build.gradle are the other two. Omitting it here does not fail
+    # loudly: the manifests describe the JIT natives while Gradle packages the
+    # jitless ones, and verifyMigoReleaseArtifactPackaging rejects the AAR with
+    # a hash mismatch that says nothing about the cause.
+    parser.add_argument("--jitless", action="store_true")
     parser.add_argument(
         "--arch", action="append", required=True, choices=tuple(ARCHITECTURES)
     )
@@ -82,6 +89,30 @@ def require_sha256(value: Any, label: str) -> str:
     if not isinstance(value, str) or not SHA256.fullmatch(value):
         raise ContractError(f"{label} must be a lowercase SHA-256")
     return value
+
+
+def hashes_for_slice(abi, runtime_binary, archive_hash, binding_path, cxx_runtime):
+    """Hashes for what this slice actually ships.
+
+    `cxx_runtime` is recorded only when `libc++_shared.so` is in the payload.
+    It is not always: `build-android-so.sh` ships the shared STL if and only if
+    `libmigo.so` names it in DT_NEEDED, and today none of the four Android
+    binaries does -- V8's archive carries Chromium's libc++ statically. A
+    manifest that claimed a hash for a file the AAR does not contain would be
+    describing a different artifact, so the field follows the payload.
+
+    The Android SDK reads only `runtime_binary`; `cxx_runtime` is provenance.
+    `verify-android-aar-manifests.py` holds the two sides together: present in
+    one and absent in the other fails either way round.
+    """
+    hashes = {
+        "runtime_binary": sha256_file(runtime_binary, f"{abi} libmigo.so"),
+        "v8_archive": archive_hash,
+        "rust_binding": sha256_file(binding_path, f"{abi} V8 binding"),
+    }
+    if cxx_runtime.exists():
+        hashes["cxx_runtime"] = sha256_file(cxx_runtime, f"{abi} libc++ runtime")
+    return hashes
 
 
 def sha256_file(path: pathlib.Path, label: str) -> str:
@@ -340,8 +371,9 @@ def generate(arguments: argparse.Namespace) -> None:
             "" if arguments.codegen_profile == "z" else f"-opt{arguments.codegen_profile}"
         )
         worker_suffix = "-worker-snapshot" if arguments.worker_snapshot else ""
+        jitless_suffix = "-jitless" if arguments.jitless else ""
         native_root = repo_root / "engine/jniLibs" / (
-            f"{arguments.product_profile}{codegen_suffix}{worker_suffix}"
+            f"{arguments.product_profile}{codegen_suffix}{worker_suffix}{jitless_suffix}"
         )
 
         for abi in arguments.arch:
@@ -388,12 +420,9 @@ def generate(arguments: argparse.Namespace) -> None:
                     "backend_family": "gles-native",
                     "required_api": "OpenGL ES 3.0",
                 },
-                "hashes": {
-                    "runtime_binary": sha256_file(runtime_binary, f"{abi} libmigo.so"),
-                    "v8_archive": archive_hash,
-                    "rust_binding": sha256_file(binding_path, f"{abi} V8 binding"),
-                    "cxx_runtime": sha256_file(cxx_runtime, f"{abi} libc++ runtime"),
-                },
+                "hashes": hashes_for_slice(
+                    abi, runtime_binary, archive_hash, binding_path, cxx_runtime
+                ),
                 "provenance": metadata["provenance"],
             }
             draft_path = staging / f".{abi}.input.json"

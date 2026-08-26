@@ -123,8 +123,9 @@ public final class MigoRuntime {
     private static final Object LOCK = new Object();
     private static volatile MigoRuntime sInstance;
 
+    private final Object nativeLock = new Object();
     private volatile boolean nativeLoaded = false;
-    private String nativeVersion = "unknown";
+    private volatile String nativeVersion = "unknown";
     private volatile Throwable nativeLoadError;
 
     /**
@@ -144,21 +145,57 @@ public final class MigoRuntime {
     }
 
     private MigoRuntime() {
-        try {
-            System.loadLibrary("migo");
-            nativeLoaded = true;
-            nativeVersion = NativeMethods.getLoadedVersion();
-            if (nativeVersion == null) {
-                nativeVersion = "unknown";
+        // Deliberately empty. Obtaining the singleton must not pull ~45 MB of
+        // engine into the process: a host that delivers the binary itself
+        // (see MigoNativeLoader) needs to wire Migo up in Application.onCreate
+        // and only pay for the engine when a user actually opens a game. Every
+        // accessor below that needs native calls ensureNative() first, so the
+        // packaged default behaves exactly as it did when this constructor
+        // loaded the library.
+    }
+
+    /**
+     * Load the engine on first use.
+     *
+     * @return true when native calls may be made
+     */
+    private boolean ensureNative() {
+        if (nativeLoaded) {
+            return true;
+        }
+        synchronized (nativeLock) {
+            if (nativeLoaded) {
+                return true;
             }
+            if (!MigoNativeLoader.ensureLoaded()) {
+                nativeVersion = "load_failed";
+                nativeLoadError = MigoNativeLoader.lastError();
+                return false;
+            }
+            String reported;
+            try {
+                reported = NativeMethods.getLoadedVersion();
+            } catch (UnsatisfiedLinkError e) {
+                // The library is in the process but its JNI registration is
+                // not what this SDK expects -- a mismatched engine that
+                // dlopen() had no reason to reject.
+                nativeVersion = "load_failed";
+                nativeLoadError = e;
+                Log.e("MigoRuntime", "Native library loaded but unusable: " + e.getMessage());
+                return false;
+            }
+            nativeVersion = reported == null ? "unknown" : reported;
             if (!nativeVersion.equals(SDK_VERSION)) {
-                Log.w("MigoRuntime", "SDK/native version mismatch: SDK=" + SDK_VERSION + " native=" + nativeVersion);
+                // A host-delivered binary cannot reach here mismatched: it is
+                // checked against this build's artifact manifest before load.
+                // This remains a warning for the packaged case, where the AAR's
+                // own contents are gated at build time instead.
+                Log.w("MigoRuntime", "SDK/native version mismatch: SDK=" + SDK_VERSION
+                        + " native=" + nativeVersion);
             }
-        } catch (UnsatisfiedLinkError e) {
-            nativeLoaded = false;
-            nativeVersion = "load_failed";
-            nativeLoadError = e;
-            Log.e("MigoRuntime", "Failed to load native library: " + e.getMessage());
+            nativeLoadError = null;
+            nativeLoaded = true;
+            return true;
         }
     }
 
@@ -179,6 +216,7 @@ public final class MigoRuntime {
      * @return Native version (e.g., "0.1.0"), or "unknown" if not loaded
      */
     public String getNativeVersion() {
+        ensureNative();
         return nativeVersion;
     }
 
@@ -188,7 +226,7 @@ public final class MigoRuntime {
      * @return true if native library loaded successfully
      */
     public boolean isNativeLoaded() {
-        return nativeLoaded;
+        return ensureNative();
     }
 
     /**
@@ -198,6 +236,7 @@ public final class MigoRuntime {
      * @return The load error, or null if the native library loaded successfully
      */
     public Throwable getNativeLoadError() {
+        ensureNative();
         return nativeLoadError;
     }
 
@@ -207,7 +246,7 @@ public final class MigoRuntime {
      * @return Minimum API level required by the native engine
      */
     public int getMinSdkVersion() {
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             return FALLBACK_MIN_SDK;
         }
         try {
@@ -229,7 +268,7 @@ public final class MigoRuntime {
      * @return {@code true} if ICU data is ready for text layout
      */
     public boolean initIcuData(String icuDataPath) {
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             return false;
         }
         if (icuDataPath == null || icuDataPath.trim().isEmpty()) {
@@ -260,6 +299,15 @@ public final class MigoRuntime {
         validateCreateSession(activity, surface, config);
         validateGameId(gameId);
 
+        // The engine may not be in the process yet: it is loaded on first use,
+        // and a host that delivers the binary itself may not have delivered it.
+        // Without this the failure surfaces as an UnsatisfiedLinkError out of
+        // the JNI call below, naming a method rather than the real cause.
+        if (!ensureNative()) {
+            throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
+                    "Native library not loaded", nativeLoadError);
+        }
+
         // Initialize app context
         AppContext.init(activity);
 
@@ -276,11 +324,67 @@ public final class MigoRuntime {
         }
 
         // Create Java session wrapper with gameId
-        GameSession session = new GameSession(sessionId, gameId, config, activity);
+        GameSession session = new GameSession(sessionId, gameId, config, activity, true);
 
         // Register runtime context
         RuntimeRegistry.register(new RuntimeContext(sessionId, activity));
 
+        return session;
+    }
+
+    /**
+     * Create a session before its rendering Surface exists.
+     * <p>
+     * Everything the engine can do without a window happens immediately and in
+     * parallel with the host's own startup: the host thread and its V8 isolate,
+     * and on the render thread the EGL display and config, the resource
+     * context, the GLES dispatch table, capability detection, Skia and the
+     * system font scan. The session then waits. Call
+     * {@link GameSession#updateSurface(Surface, int, int)} when the Surface
+     * arrives, and {@link GameSession#startGame} after that.
+     * <p>
+     * The gain is not that any of that work got cheaper -- it is that an
+     * Activity spends real time between {@code onCreate} and
+     * {@code surfaceCreated} (~150 ms on a Mate 30 Pro, more when it rotates
+     * for a landscape game) during which the engine used to be doing nothing at
+     * all, because it had not been allowed to start yet.
+     * <p>
+     * A game must not be started before a Surface is attached: module
+     * evaluation waits on GPU capabilities, and the first thing an adapted
+     * browser game asks for is the window size.
+     *
+     * @param activity The host Activity
+     * @param config   Runtime configuration
+     * @param gameId   Unique game identifier (alphanumeric, underscore, hyphen, 1-64 chars)
+     * @return A new GameSession with no Surface attached yet
+     * @throws MigoException if creation fails or gameId is invalid
+     */
+    public GameSession createSessionWarm(Activity activity, RuntimeConfig config, String gameId) {
+        ThreadCheck.ensureMainThread();
+        validateCreateSession(activity, null, config, false);
+        validateGameId(gameId);
+
+        if (!ensureNative()) {
+            throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
+                    "Native library not loaded", nativeLoadError);
+        }
+
+        AppContext.init(activity);
+
+        if (config.isImmersiveMode()) {
+            enterImmersiveMode(activity);
+        }
+
+        // The warm start is a null Surface on the native side too; the engine
+        // brings up everything a window is not needed for and then parks.
+        int sessionId = NativeMethods.initWarm(config);
+        if (sessionId < 0) {
+            throw new MigoException(ErrorCode.ERR_INIT_FAILED,
+                    ErrorCode.getMessage(ErrorCode.ERR_INIT_FAILED) + ": Native init returned " + sessionId);
+        }
+
+        GameSession session = new GameSession(sessionId, gameId, config, activity, false);
+        RuntimeRegistry.register(new RuntimeContext(sessionId, activity));
         return session;
     }
 
@@ -313,7 +417,7 @@ public final class MigoRuntime {
         }
         validateGameId(gameId);
 
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
                     "Native library not loaded", nativeLoadError);
         }
@@ -329,7 +433,7 @@ public final class MigoRuntime {
         }
 
         // Create Java session wrapper with gameId
-        GameSession session = new GameSession(sessionId, gameId, config, context);
+        GameSession session = new GameSession(sessionId, gameId, config, context, true);
 
         // Register without Activity
         RuntimeRegistry.register(new RuntimeContext(sessionId, null));
@@ -366,6 +470,27 @@ public final class MigoRuntime {
         }
     }
 
+    /**
+     * Create a session before its Surface exists.
+     * <p>
+     * Non-throwing version of {@link #createSessionWarm}.
+     *
+     * @param activity The host Activity
+     * @param config   Runtime configuration
+     * @param gameId   Unique game identifier
+     * @return Result containing either the session or an error code
+     */
+    public Result<GameSession> createSessionWarmSafe(Activity activity, RuntimeConfig config, String gameId) {
+        ThreadCheck.ensureMainThread();
+        try {
+            return Result.success(createSessionWarm(activity, config, gameId));
+        } catch (MigoException e) {
+            return Result.failure(e.getErrorCode(), e.getMessage());
+        } catch (Exception e) {
+            return Result.failure(ErrorCode.ERR_INIT_FAILED, e.getMessage());
+        }
+    }
+
     // ==================== Utility Methods ====================
 
     /**
@@ -381,7 +506,7 @@ public final class MigoRuntime {
      * @return true if device is supported
      */
     public boolean isDeviceSupported() {
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             return false;
         }
         return Build.VERSION.SDK_INT >= getMinSdkVersion();
@@ -399,11 +524,16 @@ public final class MigoRuntime {
     // ==================== Private Methods ====================
 
     private void validateCreateSession(Activity activity, Surface surface, RuntimeConfig config) {
+        validateCreateSession(activity, surface, config, true);
+    }
+
+    private void validateCreateSession(Activity activity, Surface surface, RuntimeConfig config,
+                                       boolean surfaceRequired) {
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
             throw new MigoException(ErrorCode.ERR_INVALID_ACTIVITY,
                     ErrorCode.getMessage(ErrorCode.ERR_INVALID_ACTIVITY));
         }
-        if (surface == null) {
+        if (surfaceRequired && surface == null) {
             throw new MigoException(ErrorCode.ERR_INVALID_SURFACE,
                     ErrorCode.getMessage(ErrorCode.ERR_INVALID_SURFACE));
         }
@@ -411,7 +541,7 @@ public final class MigoRuntime {
             throw new MigoException(ErrorCode.ERR_INVALID_CONFIG,
                     ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG));
         }
-        if (!nativeLoaded) {
+        if (!ensureNative()) {
             throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
                     "Native library not loaded", nativeLoadError);
         }

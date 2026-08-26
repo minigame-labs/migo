@@ -78,9 +78,17 @@ if [[ ${#types[@]} -eq 0 ]]; then
 fi
 
 for type in "${types[@]}"; do
-    # `-public` keeps protected and private members out: an embedder cannot
-    # depend on those, so churn there is not a break.
-    javap -cp "$CLASSES" -public "$type" 2>/dev/null \
+    # `-protected` covers public AND protected, and both are the embedder's.
+    #
+    # This ran `-public` and so froze nothing an embedder reaches by subclassing
+    # -- which for `MigoGameActivity` is the documented integration path, the one
+    # the README calls "zero-boilerplate": `onCreateGameListener`,
+    # `onLaunchFailed`, `onSessionCreated`, `getGameSession` are all protected
+    # and were all outside the freeze. That is not a theoretical hole: R8 once
+    # marked those methods `final` in the release AAR and external subclasses
+    # stopped compiling, and this gate could not have seen it. Private members
+    # stay out, because nothing outside can name them.
+    javap -cp "$CLASSES" -protected "$type" 2>/dev/null \
         | grep -v '^Compiled from' \
         | sed 's/[[:space:]]*$//' \
         | grep -v '^$' \

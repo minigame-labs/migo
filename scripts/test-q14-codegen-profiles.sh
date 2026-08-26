@@ -242,8 +242,30 @@ expect_rejection "expected z|2|3" bash "$ANDROID_SO" --codegen-profile invalid
 expect_rejection "expected z|2|3" bash "$AAR" --codegen-profile invalid
 expect_rejection "requires a release build" bash "$ANDROID_SO" debug --codegen-profile 2
 expect_rejection "requires a release build" bash "$AAR" debug --codegen-profile 2
-expect_rejection "Invalid SOURCE_DATE_EPOCH" env SOURCE_DATE_EPOCH=not-a-time \
-    bash "$AAR" --skip-rust arm64-v8a
+# Two things about this line, both learned by breaking it.
+#
+# `--build-type debug` is load-bearing. It used to read `--skip-rust arm64-v8a`,
+# and it stopped testing anything the day build-aar.sh learned to refuse
+# `--skip-rust` for a *release* AAR: that guard sits ~10 lines above the
+# timestamp validation, so the command still failed, just never on the message
+# named here. The gate went red and stayed red, unnoticed, because nothing in
+# .github ran it.
+#
+# The full message is load-bearing too, and this is the subtler half. Three
+# guards reject a malformed SOURCE_DATE_EPOCH and their messages share a prefix:
+#
+#   build-aar.sh   Invalid SOURCE_DATE_EPOCH: expected non-negative Unix seconds
+#   build.gradle   Invalid SOURCE_DATE_EPOCH; expected ... that fit in milliseconds
+#   build-aar.ps1  Invalid SOURCE_DATE_EPOCH: expected ... that fit in milliseconds
+#
+# Match on the shared prefix and the assertion passes with build-aar.sh's own
+# check deleted, because Gradle rejects the same input a minute later and prints
+# a string starting the same way. Deleting the shell guard is a real regression:
+# the invariant is that the AAR builder refuses the timestamp *itself*, before
+# Gradle configures. Only the colon form proves that, so keep it whole.
+expect_rejection "Invalid SOURCE_DATE_EPOCH: expected non-negative Unix seconds" \
+    env SOURCE_DATE_EPOCH=not-a-time \
+    bash "$AAR" --build-type debug --skip-rust arm64-v8a
 
 echo "[5/5] checking shell syntax"
 bash -n "$ANDROID_SO" "$AAR" "$ROOT/scripts/test-product-profiles.sh" "$0"

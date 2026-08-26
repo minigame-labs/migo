@@ -168,11 +168,18 @@ platforms/windows/SPIKE-REPORT.md
 platforms/openharmony/entry/src/main/cpp/libs/
 platforms/openharmony/entry/src/main/cpp/migo-include/
 
-# Internal-only tooling that analyzes or compares against a specific named
-# third party's product, rather than anything migo itself publishes. Kept for
-# internal use, not published -- scripts/dump-api-surface.sh (this build's own
-# `migo` surface) stays public since it carries no third-party knowledge.
-scripts/prescreen-game.sh
-scripts/test-prescreen-scanner.sh
-tools/api-surface/fixture/
+# Records of a third party's product -- not tooling, data. A dump of another
+# runtime's global belongs to that runtime, so it stays out of a repository
+# whose sources are published.
+#
+# The line is drawn at the data, not at the tool. It used to sit at the tool:
+# scripts/prescreen-game.sh and its fixture were ignored wholesale because they
+# mention `wx`. But that scanner carries no third-party knowledge -- it reads a
+# bundle's identifiers and compares them against **this build's own** published
+# surface, with `wx` appearing only as a literal identifier, which is exactly
+# what the change that introduced this rule said it would keep. Ignoring it also
+# put it beyond CI, so nothing could hold it to a contract; the three ways it
+# over-reported gaps were found by hand on real bundles rather than by a gate.
+# The reference table below is the part that is genuinely someone else's.
+tools/wx-api-diff/
 scripts/perf_compare.ps1

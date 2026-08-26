@@ -19,7 +19,7 @@ fn host_new_body() -> &'static str {
 }
 
 #[test]
-fn render_starts_before_v8_and_gpu_join_follows_v8() {
+fn render_starts_before_v8_and_host_never_waits_for_the_gpu() {
     let body = host_new_body();
     let render = body
         .find("RenderService::new(")
@@ -27,9 +27,6 @@ fn render_starts_before_v8_and_gpu_join_follows_v8() {
     let js = body
         .find("HostJsRuntime::new(")
         .expect("Host::new must construct V8 on the host thread");
-    let join = body
-        .find("wait_ready_until(")
-        .expect("Host::new must join GPU init with the original deadline");
     let watchdog = body
         .find("install_watchdog")
         .expect("watchdog installation must remain present");
@@ -38,31 +35,88 @@ fn render_starts_before_v8_and_gpu_join_follows_v8() {
         .expect("Host must be assembled before publication");
 
     assert!(
-        render < js && js < join && join < watchdog && watchdog < assemble,
-        "required startup order is render -> V8 -> GPU join -> watchdog -> Host"
+        render < js && js < watchdog && watchdog < assemble,
+        "required startup order is render -> V8 -> watchdog -> Host"
     );
+
+    // `Host::new` runs on the host thread while the caller that asked for a
+    // session is blocked, so anything it waits for is time a host waits before
+    // it can start a game. It waited for GPU readiness here once, at a measured
+    // 30-44 ms; nothing between here and the first line of launch JS reads the
+    // capabilities, so the wait belongs at that point instead. See
+    // `gpu_readiness_is_joined_before_any_launch_js`.
     assert!(
-        !body[render..js].contains("wait_ready("),
-        "the host must not block on GPU readiness before V8 construction"
+        !body.contains("wait_ready("),
+        "Host::new must not block on GPU readiness; the wait belongs in ensure_gpu_ready"
     );
 }
 
 #[test]
-fn gpu_join_failure_drops_v8_before_render_shutdown() {
-    let body = host_new_body();
-    let join = body
-        .find("wait_ready_until(")
-        .expect("deadline-aware GPU join must remain present");
-    let tail = &body[join..];
-    let drop_js = tail
-        .find("drop(js);")
-        .expect("GPU init failure must explicitly drop V8");
-    let shutdown = tail
-        .find("render.shutdown_detached();")
-        .expect("GPU init failure must stop render");
+fn gpu_readiness_is_joined_before_any_launch_js() {
+    // The property: no JS supplied for a launch -- prelude or module -- may run
+    // against the provisional all-false capability snapshot, because image ops
+    // read it to choose upload paths. `on_eval_script` is deliberately not
+    // covered: it evaluates host-supplied source on a host-driven command, and
+    // is not part of launching a game.
+    let wait = HOST
+        .find("fn ensure_gpu_ready(")
+        .expect("the deferred GPU join must remain present");
+    let wait_body = &HOST[wait..];
+    let deadline = wait_body
+        .find("wait_ready_until(self.gpu_init_started, GPU_INIT_TIMEOUT)")
+        .expect("the join must use the budget that started when the render thread launched");
+    assert!(
+        deadline
+            < wait_body
+                .find("fn ")
+                .map(|_| wait_body.len())
+                .unwrap_or(wait_body.len()),
+        "deadline lookup must stay inside ensure_gpu_ready"
+    );
+
+    let start = HOST
+        .find("async fn on_evaluate_module(")
+        .expect("the launch path must remain present");
+    let end = HOST[start..]
+        .find("\n    fn ")
+        .map(|offset| start + offset)
+        .expect("on_evaluate_module must end");
+    let body = &HOST[start..end];
+
+    let ready = body
+        .find("self.ensure_gpu_ready()?")
+        .expect("the launch path must join GPU readiness");
+    let prelude = body
+        .find("exec_script_owned(")
+        .expect("prelude execution must remain present");
+    let module = body
+        .find(".evaluate_module(")
+        .expect("module evaluation must remain present");
+    assert!(
+        ready < prelude && ready < module,
+        "GPU capabilities must be published before any prelude or module JS runs"
+    );
+}
+
+#[test]
+fn host_drop_destroys_v8_before_stopping_render() {
+    // V8 must be destroyed on the thread that owns its isolate, and that thread
+    // is also the one that stops GL -- so the isolate has to go first. This used
+    // to be pinned only on `Host::new`'s GPU-failure path, which was one of the
+    // ways a host is torn down; `Drop` is all of them.
+    let body = HOST
+        .split("impl Drop for Host {")
+        .nth(1)
+        .expect("Host must implement Drop");
+    let drop_js = body
+        .find("self.js.take_and_drop();")
+        .expect("Host teardown must explicitly drop V8");
+    let shutdown = body
+        .find("self.render.shutdown();")
+        .expect("Host teardown must stop render");
     assert!(
         drop_js < shutdown,
-        "V8 must be destroyed before render shutdown on startup failure"
+        "V8 must be destroyed before render shutdown on every teardown path"
     );
 }
 

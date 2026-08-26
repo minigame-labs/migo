@@ -1265,10 +1265,54 @@ mod wiring_source_guards {
             !DB.contains("invalidate_framebuffer") && !DB.contains("invalidate_sub_framebuffer"),
             "must not invalidate the framebuffer — buffer-age repair needs persistent pixels"
         );
-        let restores = DB.matches("enable(glow::SCISSOR_TEST)").count();
-        assert_eq!(
-            restores, 1,
-            "scissor enable must be restored from exactly one cleanup epilogue (found {restores})"
+        // Per blitting function, not per file. Each disables the scissor test
+        // for its own blit -- `glBlitFramebuffer` writes through it, and games
+        // leave one enabled over a sub-window box -- and each must restore it
+        // from exactly one epilogue that every exit path reaches. Counting
+        // across the file made adding a second blit look like a second restore
+        // inside the first one, which is the thing this actually guards.
+        for signature in [
+            "pub(crate) fn blit_to_surface",
+            "pub(crate) fn blit_from_surface",
+        ] {
+            let body = function_body(DB, signature);
+            let restores = body.matches("enable(glow::SCISSOR_TEST)").count();
+            assert_eq!(
+                restores, 1,
+                "{signature}: scissor enable must be restored from exactly one cleanup \
+                 epilogue (found {restores})"
+            );
+            assert!(
+                body.contains("disable(glow::SCISSOR_TEST)"),
+                "{signature}: a blit must not write through the game's scissor box"
+            );
+        }
+    }
+
+    /// The snapshot the readback signal documents must actually be taken.
+    ///
+    /// `signal_default_fbo_readback` has described a reverse blit since the flag
+    /// was introduced, and for that whole time the function only set the flag:
+    /// the first `readPixels` on a context that had been bypassing the
+    /// DrawingBuffer returned an empty buffer for pixels the game had just
+    /// drawn. Pinned against the source because the effect needs a GL context.
+    #[test]
+    fn readback_signal_snapshots_the_surface_before_leaving_bypass() {
+        let body = function_body(MGR, "pub(crate) fn signal_default_fbo_readback");
+        let snapshot = body
+            .find("blit_from_surface")
+            .expect("leaving bypass for a readback must snapshot the surface");
+        let latch = body
+            .find("self.needs_default_fbo_readback = true;")
+            .expect("the readback latch must remain");
+        assert!(
+            snapshot < latch,
+            "the snapshot must be taken while bypass is still on, i.e. before the latch \
+             that turns it off"
+        );
+        assert!(
+            body.contains("record_default_framebuffer_bind"),
+            "the blit leaves FBO 0 bound; the state shadow must be told"
         );
     }
 }

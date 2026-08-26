@@ -234,7 +234,14 @@ The candidate cannot be declared stable until all of the following exist:
   on device, and rendering resumes after the app is backgrounded and returned to. Open:
   multi-pointer delivery has never run on device, because a real two-finger gesture cannot
   be synthesized there -- `sendevent` is refused by SELinux and `input motionevent` carries
-  one pointer. The ABI's batch conversion is covered by tests. **Windows attaches an
+  one pointer. The ABI's batch conversion is covered by tests. That refusal is current,
+  not inherited: on a Mate 30 Pro (API 31, SELinux enforcing) the shell account *is* in the
+  `input` group and `sendevent /dev/input/event2` still returns `Permission denied`, so the
+  policy blocks it, not the group. **The one path that does work is instrumentation** --
+  `UiAutomation.injectInputEvent`, reached through UiAutomator's
+  `UiDevice.performMultiPointerGesture`, injects at the input dispatcher and therefore reaches
+  a NativeActivity window like any other. This item is open for want of an instrumentation
+  APK, not for want of hardware, which is a much cheaper thing to be blocked on. **Windows attaches an
   `HWND`** through `engine/crates/capi/src/platform/windows.rs`. That file did not exist
   until 2026-07-29: `platform/win32.h` declared `MigoWin32HwndDescriptor` and the
   `tests/c_abi` lanes pinned its layout for both pointer widths, so every gate agreed with
@@ -282,8 +289,15 @@ The candidate cannot be declared stable until all of the following exist:
   identities (host full/slim and Worker full, both ABIs) regenerated fresh and
   `scripts/check-snapshot-freshness.sh` reports every one current. **Open before any
   release**: regenerate verified V8 component manifests for both ABIs, then rebuild and
-  run the minimum/latest device gates. The `-DANDROID_STL` matrix beyond the proven
-  `c++_shared` consumer also remains open.
+  run the minimum/latest device gates. The `-DANDROID_STL` matrix is measured rather than open: `c++_shared` links as-is,
+  `c++_static` links with `-Wl,--allow-multiple-definition` (without it exactly six
+  `std::runtime_error`/`std::logic_error` symbols collide — this library carries
+  Chromium's libc++ inside V8's archive while the consumer brings the NDK's), and `none`
+  does not link at all, because parts of the library were compiled against the NDK's
+  libc++ headers. Both supported rows are asserted by
+  `scripts/test-android-sdk-contract.sh`, and the shipped package README states the
+  matrix and the flag — which matters more since this SDK stopped shipping a
+  `libc++_shared.so` of its own, making `c++_static` the setting a host now reaches for.
 
 The Linux artifact contract that is in place is described by
 `dist/migo-linux-x86_64/share/migo/linux-x86_64-manifest.json`: target triple, CPU

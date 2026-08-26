@@ -815,15 +815,21 @@ class CanvasRenderingContext2D {
     get font() { return this._font; }
     set font(value) {
         if (this._font === value) return;
-        this._font = value;
-        // G-2: no JS-side parsing needed.  The measure op
-        // receives `this._font` verbatim and parses it on the
-        // Rust side via `shared::css_font::parse_css_font`, the
-        // same function the render thread uses for
-        // `Canvas2DCmd::SetFont`.  One parser, one source of
-        // truth.
+        // G-2: no JS-side parsing needed.  `op_set_font` parses on
+        // the Rust side via `shared::css_font_shorthand::
+        // parse_font_shorthand`, the same function the render
+        // thread uses for `Canvas2DCmd::SetFont`.  One parser, one
+        // source of truth.
+        //
+        // It also answers whether the value was a font at all.
+        // WHATWG makes an unparseable assignment a no-op, and this
+        // is where that has to be decided: `_font` is the string
+        // `measureText` is later measured from, so accepting one
+        // the render thread will reject is how the same `ctx.font`
+        // comes to measure at one size and paint at another.
         this._frameBegin();
-        op_set_font(this._canvasId, value);
+        if (!op_set_font(this._canvasId, value)) return;
+        this._font = value;
     }
 
     get textAlign() { return this._textAlign; }

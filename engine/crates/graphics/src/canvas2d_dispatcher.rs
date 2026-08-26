@@ -170,8 +170,8 @@ impl Renderer2d {
                             // Lock the shared TextContext only for the
                             // duration of the measurement call; JS side
                             // may contend but cache-hit paths are sub-μs.
-                            let text_ctx = self.text.lock();
-                            text_ctx.measure_text(&text, &ctx.renderer.state.text)
+                            let mut text_ctx = self.text.lock();
+                            text_ctx.get().measure_text(&text, &ctx.renderer.state.text)
                         }
                         Err(e) => {
                             resp.err(e);
@@ -203,8 +203,9 @@ impl Renderer2d {
                 // guard then covers exactly the `apply_with_images`/`apply_env`
                 // text execution; text state setters remain ordered commands but
                 // do not consult TextContext.
-                let text_guard = cmd.requires_text_context().then(|| self.text.lock());
-                Ok(ctx.apply_with_images(&cmd, text_guard.as_deref(), image_store))
+                let mut text_guard = cmd.requires_text_context().then(|| self.text.lock());
+                let text_ctx = text_guard.as_mut().map(|guard| &*guard.get());
+                Ok(ctx.apply_with_images(&cmd, text_ctx, image_store))
             }
         }
     }

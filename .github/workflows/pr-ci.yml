@@ -177,6 +177,33 @@ jobs:
       - name: Example content namespace contract
         run: bash scripts/test-content-namespace-contract.sh
 
+      # The prescreen scanner is what a prospective customer runs against their own
+      # bundle, so its wrong answers are the expensive kind: a gap it invents gets
+      # checked, does not exist, and the rest of the report stops being believed.
+      # It went un-gated for a while because it was git-ignored, and in that time it
+      # learned to count string literals and assignments as API calls -- on one real
+      # bundle, four reported gaps were really one. Fixture-driven and hermetic: no
+      # player run, no device, so the scanner's logic is what is under test rather
+      # than whatever the runtime happens to publish today.
+      - name: Prescreen scanner contract
+        run: bash scripts/test-prescreen-scanner.sh
+
+      # The prescreen report tells a customer which published APIs their bundle
+      # calls are inert. That list is derived from `@stub` markers in the engine
+      # sources, and a marker that stops resolving -- a rename, a type name where
+      # an entry point belongs -- silently shortens it with nothing red. The
+      # report then quietly stops warning about a stub. Source-only, no device.
+      - name: Stub surface contract
+        run: bash scripts/test-stub-surface-contract.sh
+
+      # The other half of the same promise. A stub that says nothing is one kind
+      # of wrong answer; an entry point that invents one is worse, because the
+      # failure moves. `getUpdateManager` decided with `Math.random() < 0.3`
+      # whether to tell content an update was waiting, so a quarter of launches
+      # showed the game's "restart?" prompt over an update that did not exist.
+      - name: Runtime answers are not invented
+        run: bash scripts/test-runtime-answers-are-not-invented.sh
+
       # An input listener published to content must have native code that can
       # fire it. This caught `migo.onMouseDown` and friends being live on the
       # content surface with no producer anywhere -- registering them worked and
@@ -215,6 +242,37 @@ jobs:
       # requests at API 26, 28 and 31.
       - name: Android merged manifest permission contract
         run: bash scripts/test-android-merged-manifest-permissions.sh
+
+      # Cargo's RUSTFLAGS replaces `[target.<triple>].rustflags` rather than
+      # merging, and the AAR build has to set RUSTFLAGS. For as long as it did
+      # that blindly, every flag in the config was dropped on the one build that
+      # ships: 3.47 MiB of `.text` that `--gc-sections` and `--icf=all` should
+      # have removed. Costs nothing to run; builds nothing.
+      - name: Android rustflags reach the linker
+        run: bash scripts/test-android-rustflags-reach-the-linker.sh
+
+      # Five host-only gates that nothing ran. They were written, committed, and
+      # then referenced by no workflow and no other script -- so whether they
+      # passed was never anyone's information. On 2026-08-25 an audit of
+      # `scripts/test-*.sh` against everything that invokes one turned up exactly
+      # these five, and `test-q14-codegen-profiles.sh` was red: an assertion that
+      # build-aar.sh rejects a malformed SOURCE_DATE_EPOCH had been shadowed by a
+      # `--skip-rust` guard added above it, so the command failed on a different
+      # message and the gate had been failing, unobserved, since. The other four
+      # passed -- which is the point: nobody knew that either. All five together
+      # run in under a second and build nothing.
+      - name: Host-only gates nothing else runs
+        run: |
+          bash scripts/test-q14-codegen-profiles.sh
+          bash scripts/test-gtk4-surface-capability.sh
+          bash scripts/test-r7-ahb-image-decode.sh
+          bash scripts/test-r8-install-receipt.sh
+          bash scripts/test-r9-worker-snapshot.sh
+          bash scripts/test-v8-gn-pin-contract.sh
+
+      # And the rule itself, so the list above cannot grow again in silence.
+      - name: Every contract gate is invoked by something
+        run: bash scripts/test-every-gate-is-invoked.sh
 
       # The host-bridge holder is reachable from content (`Symbol.for` reads the
       # global registry), and closing that is an all-or-nothing migration of
@@ -484,7 +542,12 @@ jobs:
             timeout 300 sudo apt-get install -y \
               cmake ninja-build g++ ripgrep xvfb xauth \
               qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
-              libx11-dev libxkbcommon-x11-dev libxcb-cursor0 || return 1
+              libx11-dev libxkbcommon-x11-dev libxcb-cursor0 \
+              libasound2-dev || return 1
+            # libasound2-dev is for the player, not for Qt: the player pulls
+            # cpal, which pulls alsa-sys, whose build script needs the ALSA
+            # headers. Without it `cargo check -p migo-player` fails in a way
+            # that reads like a code error and is not one.
           }
           install_pkgs || {
             echo "Qt/X11 package install failed; retrying once" >&2
@@ -497,6 +560,17 @@ jobs:
       # interposing malloc, so the combination breaks silently if nobody runs it.
       - name: Linux Qt Host Kit contract
         run: bash scripts/test-linux-qt-host-kit.sh --sanitize
+
+      # The Linux player is the conformance suite's *reference* runner: every
+      # other platform must produce the same verdict lines from the same
+      # bundles, so if it does not build, the cross-platform claim has no
+      # referee. It is a workspace member but not a default member (it links
+      # X11/GL, which headless jobs do not have), so `cargo build` never reaches
+      # it -- and a signature change in `migo-core` broke it while pr-ci stayed
+      # green on every job. This is the one Linux job that installs the desktop
+      # stack, so it is where the player can be type-checked at all.
+      - name: Linux player type-checks
+        run: cd engine && cargo check -p migo-player --locked
 
   # ── Job 4: Android AAR build — the real "does the whole project compile,
   # link, and embed the profile/ABI snapshot" gate (cross-compiles graphics/audio
@@ -559,6 +633,13 @@ jobs:
       # must point at it, not just ANDROID_NDK_HOME).
       - name: Install Android NDK + cargo-ndk
         uses: ./.github/actions/setup-android-ndk
+
+      # Runs here, not in the contract job, because here the NDK exists. The gate
+      # skips its resolution check on a machine without one, and a gate that
+      # always skips the check it is named for is the same silence in a different
+      # costume -- an ILP32 ABI lane skipped in CI that way for weeks.
+      - name: Android NDK pin contract
+        run: bash scripts/test-android-ndk-pin-contract.sh
 
       # Layout-only compatibility check. This does not publish or claim an
       # armeabi-v7a artifact; it exercises the 8-byte uint64_t alignment used
@@ -623,6 +704,14 @@ jobs:
       # clock rather than tracks it.
       - name: Android AAR reproducibility
         run: bash scripts/test-android-aar-reproducibility.sh
+
+      # An SDK that ships a runtime library picks that library's version for its
+      # host, and the published v0.9.3 AAR shipped ~2 MB of `libc++_shared.so`
+      # that no shipped .so ever named in DT_NEEDED. Needs the freshly built
+      # AARs from the step above.
+      - name: Android shipped natives are reachable
+        run: bash scripts/test-android-native-deps-contract.sh
+
 
       - name: Analyze AAR size report
         run: |

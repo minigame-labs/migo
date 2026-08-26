@@ -10,10 +10,17 @@
 # post-hardening truth.
 #
 # Output: JSON on stdout, or to --out.
-#   {"global":[...], "migo":[...]}
+#   {"global":[...], "migo":[...], "wx":[...] | null}
 #
 # Usage:
-#   bash scripts/dump-api-surface.sh [--out FILE] [--secs N]
+#   bash scripts/dump-api-surface.sh [--out FILE] [--secs N] [--adapter FILE]
+#
+# --adapter FILE evaluates an adapter bundle (e.g. migo-wx-adapter's IIFE) ahead
+# of the probe, in the same isolate, exactly as a host injects it -- so the `wx`
+# names in the output are the ones an adapter actually installed at runtime, not
+# the ones its source appears to assign. The engine publishes no `wx` of its own;
+# without --adapter the `wx` key is null, which is the honest answer rather than
+# an empty list that would read as "the adapter installs nothing".
 #
 # Note the surface is per **product profile** (api-commerce, api-media, ... are
 # cargo features), not per OS: the same profile publishes the same JS names on
@@ -26,6 +33,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROBE_DIR="$ROOT_DIR/tools/api-surface/probe"
 OUT=""
 SECS=3
+ADAPTER=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -33,6 +41,8 @@ while [[ $# -gt 0 ]]; do
         --out=*) OUT="${1#*=}"; shift ;;
         --secs) SECS="${2:?--secs requires a number}"; shift 2 ;;
         --secs=*) SECS="${1#*=}"; shift ;;
+        --adapter) ADAPTER="${2:?--adapter requires a path}"; shift 2 ;;
+        --adapter=*) ADAPTER="${1#*=}"; shift ;;
         -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -41,9 +51,37 @@ done
 [[ -d "$PROBE_DIR" ]] || { echo "probe bundle missing: $PROBE_DIR" >&2; exit 1; }
 
 raw="$(mktemp)"
-trap 'rm -f "$raw"' EXIT
+STAGE=""
+# The `return 0` is load-bearing. Without it the function ended on
+# `[[ -n "$STAGE" ]] && rm -rf ...`, which is false whenever no --adapter was
+# given -- so the function returned 1, and as an EXIT trap that became the
+# script's exit status. This script therefore FAILED on every successful run in
+# its default mode, after printing every sign of success, and `set -e` in
+# prescreen-game.sh turned that into "the prescreen tool does not work" with no
+# message anywhere saying why. The adapter path set STAGE and returned 0, which
+# is why the runs that were tried worked.
+cleanup() {
+    rm -f "$raw"
+    [[ -n "$STAGE" ]] && rm -rf "$STAGE"
+    return 0
+}
+trap cleanup EXIT
 
-if ! bash "$ROOT_DIR/scripts/dev-run-player.sh" "$PROBE_DIR" "$SECS" >"$raw" 2>&1; then
+RUN_DIR="$PROBE_DIR"
+if [[ -n "$ADAPTER" ]]; then
+    [[ -f "$ADAPTER" ]] || { echo "adapter bundle not found: $ADAPTER" >&2; exit 2; }
+    # Concatenated into one entry rather than loaded as a second module, because
+    # that is how a host injects an adapter: same isolate, same global, evaluated
+    # before any content. Loading it any other way would report a surface no game
+    # ever sees.
+    STAGE="$(mktemp -d)"
+    cp "$PROBE_DIR/game.json" "$STAGE/game.json"
+    { cat "$ADAPTER"; echo; cat "$PROBE_DIR/game.js"; } > "$STAGE/game.js"
+    RUN_DIR="$STAGE"
+    echo "[surface] adapter injected ahead of the probe: $ADAPTER" >&2
+fi
+
+if ! bash "$ROOT_DIR/scripts/dev-run-player.sh" "$RUN_DIR" "$SECS" >"$raw" 2>&1; then
     echo "player run failed; last lines:" >&2
     tail -20 "$raw" >&2
     exit 1
@@ -61,7 +99,7 @@ if [[ -z "$surface" ]]; then
     exit 1
 fi
 
-python3 - "$surface" <<'PY' > "${OUT:-/dev/stdout}"
+python3 - "$surface" "$([[ -n "$ADAPTER" ]] && echo with-adapter || echo bare)" <<'PY' > "${OUT:-/dev/stdout}"
 import json
 import sys
 
@@ -70,6 +108,11 @@ for key in ("global", "migo"):
     if not data.get(key):
         print(f"surface is missing or empty for `{key}`", file=sys.stderr)
         raise SystemExit(1)
+# `wx` may legitimately be null (no adapter). An adapter that was asked for and
+# installed nothing is a different thing, and must not pass silently.
+if len(sys.argv) > 2 and sys.argv[2] == "with-adapter" and not data.get("wx"):
+    print("an adapter was injected but no `wx` names appeared; it did not install", file=sys.stderr)
+    raise SystemExit(1)
 print(json.dumps(data, indent=2, sort_keys=True))
 PY
 

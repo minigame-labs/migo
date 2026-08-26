@@ -5,7 +5,7 @@ use std::{
 };
 
 use tokio::runtime::{Builder, Runtime};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use shared::{
     config::InitOptions,
@@ -142,8 +142,21 @@ impl Drop for HostThread {
     }
 }
 
+/// Start a Host, with or without the window Surface it will render into.
+///
+/// `surface` is `None` for a warm start: the host and render threads come up
+/// and do every part of GPU bring-up that does not name a window -- EGL display
+/// and config, the pbuffer resource context, the 709-entry GLES dispatch table,
+/// capability detection, Skia, the system font scan -- and then park. The
+/// Surface arrives later through the ordinary `UpdateSurface` path, which
+/// installs it exactly as an initial Surface would have been installed.
+///
+/// The point is not to make bring-up cheaper but to move it off a critical
+/// path. An Android Activity spends ~150 ms between `onCreate` and
+/// `surfaceCreated` -- more when it rotates for a landscape game -- and until
+/// this existed the engine could not start until the far end of it.
 pub fn spawn_host_thread(
-    surface: SurfaceRef,
+    surface: Option<SurfaceRef>,
     graphics_platform: graphics::egl_platform::GraphicsPlatform,
     platform: Arc<dyn PlatformServices>,
     opt: InitOptions,
@@ -162,38 +175,63 @@ pub fn spawn_host_thread_tracked(
     opt: InitOptions,
 ) -> EngineResult<SpawnedSurfaceHost> {
     spawn_host_thread_inner(
-        surface,
+        Some(surface),
         graphics_platform,
         platform,
         opt,
         Some(public_generation),
     )
+    .map(|started| SpawnedSurfaceHost {
+        host: started.host,
+        // Infallible by construction: this entry point always hands the inner
+        // one a Surface, and the inner one mints a resource lease for exactly
+        // the Surfaces it is given.
+        resource: started
+            .resource
+            .expect("tracked spawn passes a Surface, so a resource lease exists"),
+    })
 }
 
 fn spawn_host_thread_inner(
-    surface: SurfaceRef,
+    surface: Option<SurfaceRef>,
     graphics_platform: graphics::egl_platform::GraphicsPlatform,
     platform: Arc<dyn PlatformServices>,
     opt: InitOptions,
     public_generation: Option<PublicSurfaceGeneration>,
-) -> EngineResult<SpawnedSurfaceHost> {
+) -> EngineResult<StartedHost> {
     let id = registry::alloc_host_id();
 
     // Issue generation 1 before publishing the Host. A fresh gate cannot be
     // exhausted, but keep the failure path explicit so generation wrap always
     // fails closed rather than silently creating an untracked Surface.
     let surface_control = Arc::new(SurfaceControl::new());
-    let initial_token = surface_control.attach_or_update().map_err(|_| {
-        EngineError::new(ErrorCode::InvalidOperation)
-            .with_msg("initial Surface generation exhausted")
-    })?;
-    let initial_surface = match public_generation {
-        Some(public_generation) => {
-            SurfaceLease::new_tracked(surface, initial_token, public_generation)
+    // Deliberately not minted for a warm start. `attach_or_update` mints the
+    // *next* generation when the gate is detached and is idempotent when it is
+    // live, so a session that starts without a Surface has its first one issued
+    // generation 1 by the `UpdateSurface` that delivers it -- the same number,
+    // issued at the same point in the Surface's life, as if it had been passed
+    // here. Minting one now for a Surface that does not exist would spend a
+    // generation on nothing and put every later one off by one.
+    let initial_surface = match surface {
+        Some(surface) => {
+            let initial_token = surface_control.attach_or_update().map_err(|_| {
+                EngineError::new(ErrorCode::InvalidOperation)
+                    .with_msg("initial Surface generation exhausted")
+            })?;
+            Some(match public_generation {
+                Some(public_generation) => {
+                    SurfaceLease::new_tracked(surface, initial_token, public_generation)
+                }
+                None => SurfaceLease::new(surface, initial_token),
+            })
         }
-        None => SurfaceLease::new(surface, initial_token),
+        None => None,
     };
-    let initial_resource = initial_surface.resource_lease();
+    let initial_resource = initial_surface.as_ref().map(|lease| lease.resource_lease());
+    // Having a Surface and being on the caller's critical path are the same
+    // question asked twice: a caller that already holds the Surface is
+    // necessarily starting the engine at the point it needs to render.
+    let wait_for_ready = initial_surface.is_some();
 
     // Bound all normal/game-controlled traffic while allowing the four trusted
     // lifecycle/surface callbacks to share the same FIFO without consuming
@@ -359,12 +397,18 @@ fn spawn_host_thread_inner(
                                     break 'outer;
                                 }
                                 // Event loop returned Ok — no pending ops/timers/promises.
-                                // With op-based RAF this normally shouldn't happen (the pending
-                                // op_await_next_frame keeps the loop alive).  Safety fallback:
-                                // park on the command channel + render/audio signals (no polling
+                                // Ordinary once the game is running, because the pending
+                                // op_await_next_frame keeps the loop alive; ordinary *before* it
+                                // is running too, which is what this used to claim was abnormal.
+                                // It fires three times on every single launch, in the window
+                                // between the host thread coming up and the game registering its
+                                // first rAF -- a warning on the guaranteed path is how a log
+                                // teaches its reader to skip warnings.
+                                //
+                                // Park on the command channel + render/audio signals (no polling
                                 // timer) so a ContextLost or a first audio command during an idle
                                 // stretch is still handled promptly.
-                                warn!("[Host {}] event loop idle, parking on command/render/audio signals", id);
+                                debug!("[Host {}] event loop idle, parking on command/render/audio signals", id);
                                 loop {
                                     tokio::select! {
                                         biased;
@@ -488,6 +532,29 @@ fn spawn_host_thread_inner(
     };
     let host = HostThread::new(id, join);
 
+    // A warm start does not wait for the Host to finish constructing.
+    //
+    // The handshake below exists to turn a failed construction into a
+    // synchronous error for the caller, and for a cold start that is worth what
+    // it costs: the caller is on the path to first frame anyway. A warm start's
+    // entire purpose is to be off that path, and waiting here would put ~20 ms
+    // of V8 isolate construction back on the caller's thread -- which on
+    // Android is the main thread, mid-`onCreate`, with layout still to do.
+    // Measured on a Mate 30 Pro, waiting cost ~60 ms of `Displayed`: more than
+    // the warm start saved.
+    //
+    // Nothing is lost but the *timing* of the report. The id and its command
+    // senders are registered before the thread is spawned, so commands sent
+    // meanwhile queue rather than fail; and the thread unregisters itself and
+    // calls `notify_error` on every exit path, construction failure included,
+    // so a Host that dies on its way up still tells the embedder so.
+    if !wait_for_ready {
+        return Ok(StartedHost {
+            host,
+            resource: initial_resource,
+        });
+    }
+
     if ready_rx.recv().is_err() {
         error!("[Host {}] failed to start (init panic / early exit)", id);
         registry::unregister_sender(id);
@@ -497,10 +564,17 @@ fn spawn_host_thread_inner(
         return Err(join_failed_start(host, error));
     }
 
-    Ok(SpawnedSurfaceHost {
+    Ok(StartedHost {
         host,
         resource: initial_resource,
     })
+}
+
+/// What `spawn_host_thread_inner` returns: a Host, and a resource lease for the
+/// Surface it was given, if it was given one.
+struct StartedHost {
+    host: HostThread,
+    resource: Option<SurfaceResourceLease>,
 }
 
 fn join_failed_start(mut host: HostThread, startup_error: EngineError) -> EngineError {
@@ -520,16 +594,20 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("non-string panic payload")
 }
 
+/// Build the tokio runtime, and only then announce that startup succeeded.
+///
+/// The ordering is the point: a runtime that failed to build must never be
+/// reported ready. Whether anyone is *listening* is a separate question, and
+/// not this function's business -- a warm start deliberately stops listening,
+/// because the whole reason it exists is to get its caller's thread back. A
+/// dropped receiver used to abort the Host here, which turned every warm start
+/// into a Host that came up and immediately died.
 fn create_runtime_before_ready(
     ready_tx: crossbeam_channel::Sender<()>,
     create_runtime: impl FnOnce() -> EngineResult<Runtime>,
 ) -> EngineResult<Runtime> {
     let runtime = create_runtime()?;
-    ready_tx.send(()).map_err(|_| {
-        EngineError::new(ErrorCode::Internal)
-            .with_msg("failed to publish Host startup readiness")
-            .with_detail("startup receiver dropped before the runtime became ready")
-    })?;
+    let _ = ready_tx.send(());
     Ok(runtime)
 }
 
@@ -611,7 +689,7 @@ mod tests {
 
     use shared::error::{EngineError, ErrorCode};
 
-    use super::{HostThread, create_runtime_before_ready, join_failed_start};
+    use super::{HostThread, create_basic_runtime, create_runtime_before_ready, join_failed_start};
 
     struct DropSentinel(Arc<AtomicBool>);
 
@@ -694,6 +772,22 @@ mod tests {
             ready_rx.recv().is_err(),
             "startup readiness was published before runtime construction"
         );
+    }
+
+    /// A warm start returns before the Host is ready and drops the receiver as
+    /// it goes. That must leave the Host alive: the first cut of the warm start
+    /// treated the dropped receiver as a startup failure, so every warm-started
+    /// session built its runtime, failed to announce it, and exited -- the game
+    /// never ran, and the only symptom was a missing `Fully drawn`.
+    #[test]
+    fn nobody_waiting_for_readiness_is_not_a_startup_failure() {
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
+        drop(ready_rx);
+
+        let runtime = create_runtime_before_ready(ready_tx, create_basic_runtime)
+            .expect("a dropped readiness receiver must not fail Host startup");
+
+        drop(runtime);
     }
 
     #[test]

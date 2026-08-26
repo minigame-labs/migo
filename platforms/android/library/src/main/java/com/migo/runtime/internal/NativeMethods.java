@@ -154,6 +154,22 @@ public final class NativeMethods {
     }
 
     /**
+     * Initialize a session whose rendering Surface has not arrived yet.
+     *
+     * @param config Runtime configuration
+     * @return Session ID (>= 0) on success, negative error code on failure
+     * @throws IllegalArgumentException if config is null
+     */
+    public static int initWarm(RuntimeConfig config) {
+        if (config == null) {
+            throw new IllegalArgumentException("RuntimeConfig cannot be null");
+        }
+        // Separate entry point because in init() a null Surface is a caller
+        // bug, while here it is what asks the engine for a warm start.
+        return NativeBridge.init(null, config);
+    }
+
+    /**
      * Shut down a session.
      *
      * @param sessionId The session ID to shut down

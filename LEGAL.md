@@ -9,13 +9,37 @@ This document clarifies the legal and licensing position of the Migo runtime.
 
 Migo is **source-available** under the [Business Source License 1.1](LICENSE) (BSL 1.1).
 
-- **Change Date:** each release carries its own, stamped as **four years after that release was published**, and the currently stamped date is **2030-08-15** (four years after v0.9.3). Four years is the maximum BSL 1.1 allows: its Terms convert a version on the Change Date or on the fourth anniversary of that version's own publication, whichever comes first, so a later date would grant nothing. Every release re-stamps the date, which is checked by `scripts/test-license-change-date-contract.sh`.
+- **Change Date:** each release carries its own, stamped as **four years after that release was published**, and the currently stamped date is **2030-08-23** (four years after v0.9.4). Four years is the maximum BSL 1.1 allows: its Terms convert a version on the Change Date or on the fourth anniversary of that version's own publication, whichever comes first, so a later date would grant nothing. Every release re-stamps the date, which is checked by `scripts/test-license-change-date-contract.sh`.
 - Until a version's Change Date, use of that version is governed by the BSL 1.1 terms and the Additional Use Grant stated in [LICENSE](LICENSE).
 - **Production use is free for small entities.** The Additional Use Grant lets you ship Migo inside your own app at no cost while you are under USD 1,000,000 in annual gross revenue and under 3,000,000 monthly active users. Above either threshold, production use needs a commercial license — see [COMMERCIAL.md](COMMERCIAL.md).
 - **Non-production use is unrestricted at any scale.** Reading, auditing, building, testing, benchmarking, modifying and porting the source is granted to everyone by the BSL Terms, with no revenue or user thresholds.
 - "Source-available" is **not** the same as "open source under an OSI license" today; after a version's Change Date, that version becomes Apache-2.0.
 
 Please refer to [LICENSE](LICENSE) for the authoritative and binding terms. This document is a plain-language summary and does not override the license text.
+
+### Hosting the engine binary to deliver it into your own app
+
+Migo's Android SDK can be integrated without packaging `libmigo.so` in your APK,
+so that users who never open a mini-game never download it (see
+`MigoNativeLoader`). Doing that means putting the engine binary somewhere your
+app can fetch it — a Play Feature Delivery module, or, on stores that have no
+such mechanism, storage you control.
+
+**That is a permitted way to ship Migo inside Your App under the Additional Use
+Grant, not a Competitive Offering.** The Use Limitation's first example targets
+distributing Migo *as* a library or SDK to third parties; an endpoint that exists
+to deliver the engine into your own application is the opposite of that, even
+though the bytes travel separately from the rest of your app. Two things keep it
+on this side of the line, and both are conditions of this clarification:
+
+- the endpoint serves your app's own delivery, not third parties looking for a
+  mini-game engine to build on; and
+- you do not present the hosted file as an SDK, a library, or a general-purpose
+  runtime download.
+
+This paragraph states the licensor's intent. It is a clarification of the
+existing grant and does not enlarge it; where it and [LICENSE](LICENSE) differ,
+the license text governs.
 
 ## The Migo Name and Logo
 

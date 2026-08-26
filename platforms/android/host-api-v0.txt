@@ -1,5 +1,20 @@
+  protected boolean onWarmStartEngine();
+  protected com.migo.runtime.GameSession getGameSession();
+  protected com.migo.runtime.RuntimeConfig onCreateRuntimeConfig();
+  protected com.migo.runtime.callback.GameSessionListener onCreateGameListener();
+  protected static android.content.Intent buildLaunchIntent(android.content.Context, java.lang.Class<? extends com.migo.runtime.MigoGameActivity>, java.lang.String, java.lang.String, com.migo.runtime.RuntimeConfig);
+  protected void onAttachedToWindow();
+  protected void onCreate(android.os.Bundle);
+  protected void onDestroy();
+  protected void onDetachedFromWindow();
+  protected void onDetachedFromWindow();
+  protected void onLaunchFailed(int, java.lang.String);
+  protected void onPause();
+  protected void onResume();
+  protected void onSessionCreated(com.migo.runtime.GameSession);
   public T getOrThrow();
   public T getValue();
+  public abstract java.io.File resolve(java.lang.String);
   public abstract void checkSession(com.migo.runtime.callback.AuthHandler$CheckSessionCallback);
   public abstract void download(com.migo.runtime.callback.SubpackageHandler$SubpackageRequest, com.migo.runtime.callback.SubpackageHandler$DownloadCallback);
   public abstract void emitClose(int, boolean);
@@ -64,6 +79,7 @@
   public com.migo.runtime.GamePaths(com.migo.runtime.RuntimeConfig, java.lang.String, int);
   public com.migo.runtime.GameSession createSession(android.app.Activity, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
   public com.migo.runtime.GameSession createSession(android.content.Context, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.GameSession createSessionWarm(android.app.Activity, com.migo.runtime.RuntimeConfig, java.lang.String);
   public com.migo.runtime.GameSession getSession();
   public com.migo.runtime.MigoException(int, java.lang.String);
   public com.migo.runtime.MigoException(int, java.lang.String, java.lang.Throwable);
@@ -71,6 +87,7 @@
   public com.migo.runtime.MigoGameActivity();
   public com.migo.runtime.MigoGameView(android.content.Context);
   public com.migo.runtime.MigoRuntime$Result<com.migo.runtime.GameSession> createSessionSafe(android.app.Activity, android.view.Surface, com.migo.runtime.RuntimeConfig, java.lang.String);
+  public com.migo.runtime.MigoRuntime$Result<com.migo.runtime.GameSession> createSessionWarmSafe(android.app.Activity, com.migo.runtime.RuntimeConfig, java.lang.String);
   public com.migo.runtime.PerformanceSnapshot getPerformanceSnapshot();
   public com.migo.runtime.PerformanceSnapshot(float, float, int, int, int);
   public com.migo.runtime.PerformanceSnapshot(float, float, int, int, int, int, int, int);
@@ -135,7 +152,9 @@
   public final int inputReliableReserveUses;
   public final int inputSaturationEvents;
   public final int zoneId;
+  public final java.lang.String abi;
   public final java.lang.String appId;
+  public final java.lang.String artifactId;
   public final java.lang.String currencyType;
   public final java.lang.String envVersion;
   public final java.lang.String imageUrl;
@@ -149,10 +168,12 @@
   public final java.lang.String platform;
   public final java.lang.String query;
   public final java.lang.String root;
+  public final java.lang.String sdkVersion;
   public final java.lang.String sendMessageImg;
   public final java.lang.String sendMessagePath;
   public final java.lang.String sendMessageTitle;
   public final java.lang.String sessionFrom;
+  public final java.lang.String sha256;
   public final java.lang.String signData;
   public final java.lang.String signature;
   public final java.lang.String title;
@@ -199,6 +220,7 @@
   public java.lang.String toString();
   public java.lang.String toString();
   public java.lang.String toString();
+  public java.lang.String toString();
   public java.lang.Throwable getNativeLoadError();
   public java.util.List<java.lang.String[]> getPreludeScripts();
   public java.util.List<java.lang.String[]> getSubPackages();
@@ -207,6 +229,10 @@
   public static boolean isRecoverable(int);
   public static boolean isSuccess(int);
   public static boolean isValidGameId(java.lang.String);
+  public static com.migo.runtime.MigoNativeLoader$RequiredArtifact requiredArtifact(android.content.Context);
+  public static com.migo.runtime.MigoNativeLoader$State state();
+  public static com.migo.runtime.MigoNativeLoader$State valueOf(java.lang.String);
+  public static com.migo.runtime.MigoNativeLoader$State[] values();
   public static com.migo.runtime.MigoRuntime getInstance();
   public static com.migo.runtime.RuntimeConfig$LogLevel valueOf(java.lang.String);
   public static com.migo.runtime.RuntimeConfig$LogLevel[] values();
@@ -218,6 +244,9 @@
   public static final boolean MIGO_API_MEDIA;
   public static final boolean MIGO_API_SENSORS;
   public static final boolean MIGO_API_SYSTEM;
+  public static final com.migo.runtime.MigoNativeLoader$State FAILED;
+  public static final com.migo.runtime.MigoNativeLoader$State LOADED;
+  public static final com.migo.runtime.MigoNativeLoader$State NOT_LOADED;
   public static final com.migo.runtime.RuntimeConfig$LogLevel DEBUG;
   public static final com.migo.runtime.RuntimeConfig$LogLevel ERROR;
   public static final com.migo.runtime.RuntimeConfig$LogLevel INFO;
@@ -266,9 +295,13 @@
   public static final java.lang.String TYPE_INTERSTITIAL;
   public static final java.lang.String TYPE_REWARDED_VIDEO;
   public static final java.lang.String VERSION;
+  public static java.lang.String deviceAbi();
   public static java.lang.String getMessage(int);
+  public static java.lang.String prepare(android.content.Context, java.io.File);
+  public static java.lang.Throwable lastError();
   public static void launch(android.content.Context, java.lang.String, java.lang.String);
   public static void launch(android.content.Context, java.lang.String, java.lang.String, com.migo.runtime.RuntimeConfig);
+  public static void setProvider(android.content.Context, com.migo.runtime.NativeLibraryProvider);
   public void attachButton(android.view.View);
   public void attachToWindow(android.view.View);
   public void cleanupTemp();
@@ -339,6 +372,9 @@ public final class com.migo.runtime.BuildInfo {
 public final class com.migo.runtime.ErrorCode {
 public final class com.migo.runtime.GamePaths {
 public final class com.migo.runtime.GameSession implements java.io.Closeable {
+public final class com.migo.runtime.MigoNativeLoader {
+public final class com.migo.runtime.MigoNativeLoader$RequiredArtifact {
+public final class com.migo.runtime.MigoNativeLoader$State extends java.lang.Enum<com.migo.runtime.MigoNativeLoader$State> {
 public final class com.migo.runtime.MigoRuntime {
 public final class com.migo.runtime.MigoRuntime$Result<T> {
 public final class com.migo.runtime.PerformanceSnapshot {
@@ -356,6 +392,7 @@ public final class com.migo.runtime.callback.ShareHandler$ShareRequest {
 public final class com.migo.runtime.callback.SubpackageHandler$SubpackageRequest {
 public interface com.migo.runtime.GameSession$MessageHandler {
 public interface com.migo.runtime.MigoGameView$SessionCreatedListener {
+public interface com.migo.runtime.NativeLibraryProvider {
 public interface com.migo.runtime.OnStateChangeListener {
 public interface com.migo.runtime.callback.AdEventSink {
 public interface com.migo.runtime.callback.AdHandler {
@@ -378,6 +415,10 @@ public interface com.migo.runtime.callback.ShareHandler {
 public interface com.migo.runtime.callback.ShareSink {
 public interface com.migo.runtime.callback.SubpackageHandler {
 public interface com.migo.runtime.callback.SubpackageHandler$DownloadCallback {
+}
+}
+}
+}
 }
 }
 }

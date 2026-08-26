@@ -183,7 +183,15 @@ fn decide_async_upload_reject_action(
 pub(crate) struct CanvasManager {
     egl_provider: std::sync::Arc<dyn EglProvider>,
     egl: egl_ops::EglRuntime,
-    gl: glow::Context,
+    /// Shared so the render thread can reuse this table instead of building a
+    /// second one. `glow::Context::from_loader_function` resolves the whole
+    /// GLES dispatch table -- 709 symbols on this device -- and that measured
+    /// 41-50 ms. It was being paid twice per session: once here, blocking the
+    /// host thread's GPU join, and once again in `RenderThread` right after,
+    /// delaying the first frame by the same amount. Both contexts are built on
+    /// the render thread from EGL contexts in one share group, so one table
+    /// serves both.
+    gl: std::sync::Arc<glow::Context>,
     display: egl::Display,
     config: egl::Config,
     /// See `EglInitResult::surfaceless`.
@@ -542,6 +550,15 @@ impl CanvasManager {
         &self.text_cache
     }
 
+    /// The GL dispatch table this manager built, for the render thread to reuse.
+    ///
+    /// See the `gl` field: building a second one costs 41-50 ms of
+    /// `eglGetProcAddress` on the path to first frame, for a table identical to
+    /// this one.
+    pub(crate) fn gl_shared(&self) -> std::sync::Arc<glow::Context> {
+        std::sync::Arc::clone(&self.gl)
+    }
+
     /// Resolve a GL entry point from the exact EGL implementation injected for
     /// this manager. Used only while constructing render-thread dispatch tables.
     pub(crate) fn gl_proc_address(&self, symbol: &str) -> *const std::ffi::c_void {
@@ -775,7 +792,7 @@ impl CanvasManager {
         Ok(Self {
             egl_provider,
             egl,
-            gl,
+            gl: std::sync::Arc::new(gl),
             display,
             config,
             surfaceless,
@@ -2844,10 +2861,52 @@ impl CanvasManager {
     /// readback that triggered this signal sees valid content immediately,
     /// not just on subsequent frames.
     pub(crate) fn signal_default_fbo_readback(&mut self) {
-        if should_latch_default_fbo_readback(self.needs_default_fbo_readback) {
-            self.needs_default_fbo_readback = true;
-            self.evaluate_bypass();
+        if !should_latch_default_fbo_readback(self.needs_default_fbo_readback) {
+            return;
         }
+        // Take the snapshot while bypass is still on, so the surface is still
+        // the thing the game has been drawing into. Without it the mode change
+        // below binds a DrawingBuffer that has never been written, and the
+        // readback that asked for this returns an empty buffer for pixels the
+        // game just drew -- once, on the first read of a context, which is the
+        // hardest kind of bug to notice and the easiest to blame on content.
+        // The doc comment above has described this snapshot since the flag was
+        // introduced; only the code was missing.
+        let onscreen_id = CanvasId::from(1u32);
+        // `glBlitFramebuffer` is GLES 3.0+. On GLES 2 there is no snapshot to
+        // take and the first read after the mode change is empty, as before.
+        let mut snapshot_attempted = false;
+        if self.gles_major >= 3 {
+            if let Some(entry) = self.canvases.get(&onscreen_id) {
+                if entry.bypass_drawing_buffer {
+                    if let Some(db) = entry.drawing_buffer.as_ref() {
+                        snapshot_attempted = true;
+                        if !drawing_buffer::blit_from_surface(
+                            &self.gl,
+                            db,
+                            entry.physical_width,
+                            entry.physical_height,
+                        ) {
+                            tracing::warn!(
+                                "default-FBO readback: could not snapshot the surface into \
+                                 the DrawingBuffer; this read sees an empty buffer"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if snapshot_attempted {
+            // The blit leaves FBO 0 bound on every path, successful or not, so
+            // the shadow has to say so -- otherwise the next draw is issued
+            // against a binding the tracker believes is something else.
+            crate::backend::gl::state_tracker::record_default_framebuffer_bind(
+                self.gl_state.entry(onscreen_id).or_default(),
+            );
+        }
+
+        self.needs_default_fbo_readback = true;
+        self.evaluate_bypass();
     }
 
     pub(crate) fn evaluate_bypass(&mut self) {
@@ -3832,7 +3891,7 @@ impl CanvasManager {
         &mut self,
         canvas_id: CanvasId,
     ) -> context_2d_impl::Canvas2DGlScopeGuard {
-        let gl_ptr: *const glow::Context = &self.gl;
+        let gl_ptr: *const glow::Context = &*self.gl;
         let shadow = self.gl_state.entry(canvas_id).or_default() as *mut _;
         // SAFETY: `self.gl` is never mutated; `gl_state` is borrowed
         // only through this pointer until the guard drops.  The

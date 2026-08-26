@@ -12,6 +12,8 @@
 - **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** —— 浏览器风格的 BOM/DOM 层(`window`、`document`、`Image`、`XMLHttpRequest` 等)，给假设自己跑在浏览器环境里的引擎用(Cocos、Egret、Laya、Pixi、原生 Canvas/WebGL)。
 适配层只安装各自文档声明的全局对象，可以自由组合——按内容实际需要选用即可。以后再来一个平台（比如快游戏联盟成员），仍是同一个配方：增加一个新的适配层包，引擎不用改。
 
+**想知道你自己那几百款能不能跑？** 别信我们说的，也别把包发给任何人——[PRESCREEN.md](PRESCREEN.md) 就是我们会跑的那套工具，交给你自己跑：包引用了哪些接口、对上本构建实际发布的接口面求差集，以及它在真机上到底出不出帧。**内容一步不出你的机器。**
+
 ## 为什么用 Migo
 
 | | Migo | Android 系统 WebView |
@@ -55,6 +57,32 @@
 bash scripts/fetch-v8-archives.sh          # Android 目标（构建默认）
 bash scripts/fetch-v8-archives.sh --all    # 所有带 manifest 的目标
 ```
+
+### 让引擎不进首包（Android）
+
+`libmigo.so` 单 ABI 约占 17 MB 商店下载、45 MB 安装体积。如果小游戏只是你 app 的次要功能，
+可以发一个不含它的 APK，等用户第一次打开小游戏时再取——从不打开的用户就永远不用为它付费。
+
+依赖 `migo-<version>-android-nojni.aar` 而不是 `migo-<version>-android.aar`，
+引擎从 `migo-<version>-jni-android-<arch>.tar.gz` 取，然后交给 SDK：
+
+```java
+MigoNativeLoader.setProvider(context, abi -> {
+    File engine = new File(context.getNoBackupFilesDir(), abi + "/libmigo.so");
+    return engine.isFile() ? engine : null;   // null 表示"还没下载好"
+});
+```
+
+文件在加载前会对 AAR 内嵌的 artifact manifest 做校验，所以下载不完整、或镜像还在发上一个版本，
+都会以可读的原因失败，而不是在引擎内部崩溃。`MigoNativeLoader.requiredArtifact(context)`
+返回需要比对的摘要；`MigoNativeLoader.prepare(context, file)` 则在你调用它的线程上当场做这次校验——
+这样坏包在下载线程上就被发现，而不是等用户点开游戏时才表现为启动失败。
+
+从哪里取取决于你上哪个商店：Google Play 上唯一合规的来源是
+[Play Feature Delivery](https://developer.android.com/guide/playcore/feature-delivery)
+（从 Play 之外获取可执行代码违反 Device and Network Abuse 政策）；没有 Feature Delivery 的商店
+则预期你自己托管该文件，[LEGAL.md](LEGAL.md) 已明确这是被许可的。Migo 自己不下载任何东西——
+内置一个下载器必然对其中一种商店是错的。
 
 ## 架构
 
@@ -117,7 +145,7 @@ migo/
 
 ## 许可证
 
-Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BSL 1.1）。**每个发布版本在其发布满四年时转为 Apache 2.0** —— 具体日期就写在该版本随附的 `LICENSE` 里（当前为 2030-08-15）。
+Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BSL 1.1）。**每个发布版本在其发布满四年时转为 Apache 2.0** —— 具体日期就写在该版本随附的 `LICENSE` 里（当前为 2030-08-23）。
 
 - **阅读、审计、构建、测试、评测、修改、移植** —— 任何规模、任何主体，无条件授予。
 - **把 Migo 嵌进你自己的 App 上线** —— 年营收 ≤ USD 1,000,000 且月活 ≤ 3,000,000 时免费。

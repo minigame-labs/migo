@@ -183,6 +183,29 @@ pub fn init_logging() {
 struct DynamicLevelFilter;
 
 impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for DynamicLevelFilter {
+    /// Keep every callsite undecided, so [`Self::enabled`] runs per event.
+    ///
+    /// `tracing` asks each callsite once what to think of it and then caches
+    /// that answer for the life of the process. The default answer a `Layer`
+    /// gives is derived from `enabled` at that moment -- which is exactly wrong
+    /// for a filter whose level arrives later, from a session that does not
+    /// exist yet. A callsite first reached while the process default was `Warn`
+    /// was cached as `never` and stayed dead: a host that asked for `Info` got
+    /// silence, and the startup timings it asked to see were the ones it could
+    /// never get, because they are emitted while the host is being built. The
+    /// mirror case is as bad -- a callsite first reached under `Trace` is cached
+    /// as `always`, so a session asking for `Off` cannot silence it.
+    ///
+    /// `sometimes` is the answer for a filter that can change: it costs the
+    /// per-event `enabled` call this module's documentation already assumes is
+    /// happening.
+    fn register_callsite(
+        &self,
+        _meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
     fn enabled(
         &self,
         meta: &tracing::Metadata<'_>,

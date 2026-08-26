@@ -72,3 +72,36 @@ android_ndk_resolve() {
     _android_ndk_err "or set ANDROID_NDK_HOME to that NDK"
     return 1
 }
+
+# Path to the pinned NDK's llvm-readelf, or non-zero with a reason.
+#
+# Gates that read section sizes and dynamic entries out of a shipped .so must not
+# take whatever `readelf` is on PATH. GNU binutils and LLVM do not print the same
+# text for the same file -- GNU renders Android's DT tags as raw hex (`60000011`)
+# where LLVM names them -- so a gate matching on that output reads a different
+# answer on a machine with different tools installed, and reads it silently.
+#
+# Two size gates used to resolve their own: ANDROID_NDK_HOME if set, else the
+# first llvm-readelf found anywhere under $HOME/Android, else PATH. Each of the
+# three steps is a different toolchain, and the last is a different vendor.
+#
+# The search deliberately does not pass `-type f`. In NDK r23 `llvm-readelf` is a
+# symlink to `llvm-readobj`, so `-type f` matches nothing, and that one flag is
+# what sent both gates all the way down to `/usr/bin/readelf` on every machine
+# that has an NDK -- the fallback chain never reported that it had been used.
+#
+#   $1  path to the artifact-manifest lock that carries the NDK pin
+android_ndk_readelf() {
+    local lock="$1"
+    android_ndk_read_pin "$lock" || return 1
+    android_ndk_resolve || return 1
+
+    local candidate
+    candidate="$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" \
+        -name llvm-readelf 2>/dev/null | head -1)"
+    if [[ -z "$candidate" ]]; then
+        _android_ndk_err "no llvm-readelf under $ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
+        return 1
+    fi
+    printf '%s\n' "$candidate"
+}

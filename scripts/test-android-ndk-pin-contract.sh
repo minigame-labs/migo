@@ -139,12 +139,30 @@ mapfile -t ndk_users < <(
 if (( ${#ndk_users[@]} == 0 )); then
     fail "found no scripts using ANDROID_NDK_HOME -- the enumeration is broken"
 fi
+# Which library functions count as "resolves the pinned NDK" is read out of the
+# library, not written here. This check used to grep for the one literal name
+# `android_ndk_resolve`, and the day a second entry point appeared that resolves
+# on the caller's behalf -- `android_ndk_readelf`, which reads the pin, resolves,
+# and hands back a tool path -- every consumer of it was reported as using the
+# NDK without resolving it. The rule was a name, not the property it stood for.
+mapfile -t resolving_fns < <(
+    awk '
+        /^android_ndk_[a-z_]*\(\)/ { fn = substr($1, 1, index($1, "(") - 1); body = "" }
+        fn != "" { body = body $0 }
+        /^}/ { if (fn != "" && (fn == "android_ndk_resolve" || body ~ /android_ndk_resolve/)) print fn; fn = "" }
+    ' "$SCRIPT_DIR/lib/android-ndk.sh")
+if (( ${#resolving_fns[@]} == 0 )); then
+    fail "no resolving entry point found in lib/android-ndk.sh -- the derivation is broken"
+fi
+resolving_re="$(IFS='|'; echo "${resolving_fns[*]}")"
+info "resolving entry points derived from the library: ${resolving_fns[*]}"
+
 for f in "${ndk_users[@]}"; do
     name="$(basename "$f")"
     if offenders="$(grep -n 'ANDROID_NDK_HOME:-' "$f")"; then
         fail "$name still defaults ANDROID_NDK_HOME instead of resolving it:"
         echo "$offenders" >&2
-    elif grep -q 'android_ndk_resolve' "$f"; then
+    elif grep -qE "($resolving_re)" "$f"; then
         pass "$name resolves the pinned NDK"
     elif ! grep 'ANDROID_NDK_HOME' "$f" | grep -qv '^\s*unset '; then
         pass "$name only unsets it, refusing an ambient Android toolchain"

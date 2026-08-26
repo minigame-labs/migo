@@ -34,6 +34,21 @@ if (!supportedMigoWorkerSnapshotValues.contains(migoWorkerSnapshotValue)) {
 def migoWorkerSnapshot = migoWorkerSnapshotValue == 'true'
 def migoWorkerSnapshotSuffix = migoWorkerSnapshot ? '-worker-snapshot' : ''
 
+// Measurement build: V8 with --jitless (the HarmonyOS NEXT proxy). This suffix
+// has to be mirrored here because Gradle recomputes the jniLibs directory
+// rather than being handed the one build-aar.sh already resolved. Leaving it
+// out is not a build failure -- the AAR is still named "-jitless" and still
+// packages the JIT natives, so the A/B silently compares a build against
+// itself. That is exactly how it failed the first time.
+def supportedMigoJitlessValues = ['true', 'false']
+def migoJitlessValue = providers.gradleProperty('migoJitless').getOrElse('false')
+if (!supportedMigoJitlessValues.contains(migoJitlessValue)) {
+    throw new GradleException(
+            "Invalid -PmigoJitless=${migoJitlessValue}; expected true or false")
+}
+def migoJitless = migoJitlessValue == 'true'
+def migoJitlessSuffix = migoJitless ? '-jitless' : ''
+
 def supportedVerifiedReleasePackagingValues = ['true', 'false']
 def migoVerifiedReleasePackagingValue = providers.gradleProperty('migoVerifiedReleasePackaging')
         .getOrElse('false')
@@ -184,10 +199,10 @@ android {
             java.srcDirs += "$buildDir/generated/source/buildinfo"
         }
         full {
-            jniLibs.srcDirs = ["../../../engine/jniLibs/full${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}"]
+            jniLibs.srcDirs = ["../../../engine/jniLibs/full${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}${migoJitlessSuffix}"]
         }
         slim {
-            jniLibs.srcDirs = ["../../../engine/jniLibs/slim${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}"]
+            jniLibs.srcDirs = ["../../../engine/jniLibs/slim${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}${migoJitlessSuffix}"]
         }
     }
 }
@@ -203,7 +218,7 @@ def migoArtifactManifestPackageRoot = layout.buildDirectory.dir(
         'generated/migoArtifactManifest')
 ['Full': 'full', 'Slim': 'slim'].each { variantName, productProfile ->
     def releaseNativeRoot = layout.projectDirectory.dir(
-            "../../../engine/jniLibs/${productProfile}${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}")
+            "../../../engine/jniLibs/${productProfile}${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}${migoJitlessSuffix}")
     def gate = tasks.register("verifyMigoReleaseArtifactPackaging${variantName}") {
         group = 'verification'
         description = "Require verified Migo manifests before assembling ${productProfile} release"
@@ -324,8 +339,24 @@ def migoArtifactManifestPackageRoot = layout.buildDirectory.dir(
                             "Package index artifact_id does not match ${abi} slice")
                 }
                 def nativeRoot = new File(releaseNativeRoot.asFile, abi)
-                if (identity.hashes?.runtime_binary != sha256(new File(nativeRoot, 'libmigo.so')) ||
-                        identity.hashes?.cxx_runtime != sha256(new File(nativeRoot, 'libc++_shared.so'))) {
+                if (identity.hashes?.runtime_binary != sha256(new File(nativeRoot, 'libmigo.so'))) {
+                    throw new GradleException(
+                            "Slice JNI hashes do not match the release inputs for ${abi}")
+                }
+                // `libc++_shared.so` is shipped only when `libmigo.so` names it
+                // in DT_NEEDED, which today none of the Android binaries does --
+                // V8's archive carries Chromium's libc++ statically. So the file
+                // and the hash must agree about whether they exist, and when both
+                // do they must match. Demanding it unconditionally here is what
+                // made "stop shipping a megabyte nobody loads" a build failure.
+                def cxxFile = new File(nativeRoot, 'libc++_shared.so')
+                def cxxHash = identity.hashes?.cxx_runtime
+                if (cxxFile.isFile() != (cxxHash != null)) {
+                    throw new GradleException(
+                            "${abi}: libc++_shared.so is " +
+                            (cxxFile.isFile() ? "present but unhashed" : "hashed but absent"))
+                }
+                if (cxxFile.isFile() && cxxHash != sha256(cxxFile)) {
                     throw new GradleException(
                             "Slice JNI hashes do not match the release inputs for ${abi}")
                 }

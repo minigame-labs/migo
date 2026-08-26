@@ -28,6 +28,8 @@ path = "src/main.rs"
 default = ["profile-full"]
 profile-slim = ["migo-core/profile-slim", "platform/profile-slim"]
 profile-full = ["migo-core/profile-full", "platform/profile-full"]
+# Measurement build only; see runtime-v8's manifest.
+v8-jitless = ["migo-core/v8-jitless", "platform/v8-jitless"]
 
 [dependencies]
 migo-core = { path = "../../crates/core", default-features = false }

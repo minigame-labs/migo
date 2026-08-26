@@ -12,6 +12,8 @@
 - **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** — a browser-style BOM/DOM surface (`window`, `document`, `Image`, `XMLHttpRequest`, ...) for engines built assuming a browser environment (Cocos, Egret, Laya, Pixi, raw Canvas/WebGL).
 Adapters install only their documented globals and compose freely — pick only what your content actually needs. A future platform (a quick-game-alliance member, etc.) follows the same recipe: a new adapter package, no engine changes.
 
+**Wondering whether your own catalogue runs?** Don't take our word for it and don't send us anything — [PRESCREEN.md](PRESCREEN.md) is the tool we would run, for you to run yourself. It reports which APIs a bundle needs against what this build actually publishes, and whether it paints on a real device. Your content never leaves your machine.
+
 ## Why Migo
 
 | | Migo | Android System WebView |
@@ -54,6 +56,37 @@ Prebuilt V8 archives are fetched and verified against their component manifests 
 bash scripts/fetch-v8-archives.sh          # Android targets (the build default)
 bash scripts/fetch-v8-archives.sh --all    # every target that has a manifest
 ```
+
+### Keeping the engine out of your first install (Android)
+
+`libmigo.so` is about 17 MB of store download and 45 MB installed, per ABI. If a
+mini-game is a secondary feature of your app, you can ship an APK without it and
+fetch it the first time a user opens a game — users who never do never pay for it.
+
+Depend on `migo-<version>-android-nojni.aar` instead of `migo-<version>-android.aar`,
+take the engine from `migo-<version>-jni-android-<arch>.tar.gz`, and hand it over:
+
+```java
+MigoNativeLoader.setProvider(context, abi -> {
+    File engine = new File(context.getNoBackupFilesDir(), abi + "/libmigo.so");
+    return engine.isFile() ? engine : null;   // null means "not downloaded yet"
+});
+```
+
+The file is verified against the artifact manifest embedded in the AAR before it
+is loaded, so a partial download or a mirror serving the previous release fails
+with a readable reason instead of crashing inside the engine.
+`MigoNativeLoader.requiredArtifact(context)` returns the digest to check against,
+and `MigoNativeLoader.prepare(context, file)` runs that check on the thread you
+call it from — so your download code learns about a bad file immediately rather
+than a user meeting it as a launch failure later.
+
+Where you may fetch it from depends on your store: on Google Play the only
+compliant source is [Play Feature Delivery](https://developer.android.com/guide/playcore/feature-delivery)
+(fetching executable code from anywhere else violates the Device and Network Abuse
+policy); stores without Feature Delivery expect you to host the file yourself,
+which [LEGAL.md](LEGAL.md) confirms is permitted. Migo never downloads anything
+itself, because one built-in downloader would be wrong for one of the two.
 
 ## Architecture
 
@@ -116,7 +149,7 @@ migo/
 
 ## License
 
-Migo is **source-available** under the [Business Source License 1.1](LICENSE). **Each released version converts to Apache 2.0 four years after that version is published** — the date is stamped in the `LICENSE` each release ships with (currently 2030-08-15).
+Migo is **source-available** under the [Business Source License 1.1](LICENSE). **Each released version converts to Apache 2.0 four years after that version is published** — the date is stamped in the `LICENSE` each release ships with (currently 2030-08-23).
 
 - **Read, audit, build, test, benchmark, modify and port** — granted to everyone, at any scale, unconditionally.
 - **Ship Migo inside your own app** — free while under USD 1,000,000 annual revenue and 3,000,000 MAU.
