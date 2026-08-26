@@ -1351,7 +1351,7 @@ mod tests {
     const ONE_SESSION: i32 = 1;
     use std::sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     use shared::vfs::package::PackageWriter;
@@ -1387,6 +1387,17 @@ mod tests {
     }
 
     static PRELOAD_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn make_test_dir(name: &str) -> std::path::PathBuf {
+        let sequence = TEST_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "migo_image_ops_test_{name}_{}_{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     struct PreloadHookTestGuard {
         _guard: MutexGuard<'static, ()>,
@@ -1622,9 +1633,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let dir = std::env::temp_dir().join("migo_mixed_preload_parallelism");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = make_test_dir("mixed_preload_parallelism");
         let uncached_path = dir.join("tiny.png");
         std::fs::write(
             &uncached_path,
@@ -1732,9 +1741,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let dir = std::env::temp_dir().join("migo_cached_preload_fallback");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = make_test_dir("cached_preload_fallback");
         let path = dir.join("tiny.png");
         std::fs::write(
             &path,
@@ -1802,9 +1809,7 @@ mod tests {
     /// is why the key is the package identity alone.
     #[test]
     fn the_same_subpackage_shares_despite_a_different_mount_order() {
-        let dir = std::env::temp_dir().join("migo_pack_mount_order");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = make_test_dir("pack_mount_order");
         let stage = dir.join("stage.mpkg");
         let other = dir.join("other.mpkg");
         write_multi_entry_package(&stage, "stage", b"stage-pixels");
@@ -1860,9 +1865,7 @@ mod tests {
 
     #[test]
     fn a_pack_backed_key_uses_the_resolution_field_the_loader_pre_pins_on() {
-        let dir = std::env::temp_dir().join("migo_pack_key_agreement");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = make_test_dir("pack_key_agreement");
         let pkg = dir.join("game.mpkg");
         write_multi_entry_package(&pkg, "game", b"pixels");
 
@@ -1893,9 +1896,7 @@ mod tests {
 
     #[test]
     fn two_sessions_different_packages_do_not_share_a_cache_key() {
-        let dir = std::env::temp_dir().join("migo_pack_cross_session_key");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = make_test_dir("pack_cross_session_key");
 
         let game_a_pkg = dir.join("game_a.mpkg");
         let game_b_pkg = dir.join("game_b.mpkg");
@@ -1942,9 +1943,7 @@ mod tests {
     /// for. Guards against fixing the collision by making every mount unique.
     #[test]
     fn two_sessions_identical_packages_still_share_a_cache_key() {
-        let dir = std::env::temp_dir().join("migo_pack_cross_session_share");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = make_test_dir("pack_cross_session_share");
 
         // Multi-entry on purpose: the reader derives a package's identity from a
         // `HashMap` of its entries, and every `HashMap` instance iterates in its own
@@ -1978,9 +1977,7 @@ mod tests {
 
     #[test]
     fn pack_worker_source_refreshes_generation_after_remount() {
-        let dir = std::env::temp_dir().join("migo_pack_image_generation_refresh");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = make_test_dir("pack_image_generation_refresh");
 
         let pkg1 = dir.join("base_v1.mpkg");
         let pkg2 = dir.join("base_v2.mpkg");
@@ -2021,8 +2018,7 @@ mod tests {
 
     #[test]
     fn directory_mount_worker_source_refreshes_generation_after_remount() {
-        let dir = std::env::temp_dir().join("migo_dir_image_generation_refresh");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = make_test_dir("dir_image_generation_refresh");
         let v1 = dir.join("v1");
         let v2 = dir.join("v2");
         std::fs::create_dir_all(&v1).unwrap();
@@ -2066,8 +2062,7 @@ mod tests {
 
     #[test]
     fn directory_mount_worker_source_preserves_variant_token_without_remount() {
-        let dir = std::env::temp_dir().join("migo_dir_image_variant_identity");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = make_test_dir("dir_image_variant_identity");
         let base = dir.join("base");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("tex.png"), b"dir-v1").unwrap();
@@ -2100,8 +2095,7 @@ mod tests {
 
     #[test]
     fn directory_mount_worker_source_detects_in_place_variant_changes_without_remount() {
-        let dir = std::env::temp_dir().join("migo_dir_image_variant_change");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = make_test_dir("dir_image_variant_change");
         let base = dir.join("base");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("tex.png"), b"dir-v1").unwrap();
@@ -2140,8 +2134,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let dir = std::env::temp_dir().join("migo_dir_mount_cache_revalidate_read");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = make_test_dir("dir_mount_cache_revalidate_read");
         let v1 = dir.join("v1");
         let v2 = dir.join("v2");
         std::fs::create_dir_all(&v1).unwrap();
@@ -2203,8 +2196,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let dir = std::env::temp_dir().join("migo_dir_mount_cache_revalidate_preload");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = make_test_dir("dir_mount_cache_revalidate_preload");
         let v1 = dir.join("v1");
         let v2 = dir.join("v2");
         std::fs::create_dir_all(&v1).unwrap();
@@ -2261,8 +2253,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let dir = std::env::temp_dir().join("migo_dir_mount_cache_revalidate_cached_task");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = make_test_dir("dir_mount_cache_revalidate_cached_task");
         let v1 = dir.join("v1");
         let v2 = dir.join("v2");
         std::fs::create_dir_all(&v1).unwrap();

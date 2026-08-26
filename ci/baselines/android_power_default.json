@@ -4,6 +4,7 @@
   "metrics": {
     "cpu_avg_pct": {
       "description": "Average CPU usage during steady-state gameplay (from /proc/self/stat sampling)",
+      "required": true,
       "unit": "percent",
       "direction": "lower_is_better",
       "fail_above": 40.0,
@@ -11,6 +12,7 @@
     },
     "cpu_peak_pct": {
       "description": "Peak CPU usage observed during test run",
+      "required": true,
       "unit": "percent",
       "direction": "lower_is_better",
       "fail_above": 80.0,
@@ -18,6 +20,7 @@
     },
     "memory_native_mb": {
       "description": "Native heap allocation (Debug.getNativeHeapAllocatedSize) at steady state",
+      "required": true,
       "unit": "MB",
       "direction": "lower_is_better",
       "fail_above": 256.0,
@@ -25,6 +28,7 @@
     },
     "memory_java_mb": {
       "description": "Java heap usage (Runtime.totalMemory - freeMemory) at steady state",
+      "required": true,
       "unit": "MB",
       "direction": "lower_is_better",
       "fail_above": 128.0,
@@ -32,6 +36,7 @@
     },
     "memory_total_mb": {
       "description": "Total process memory (native + Java) at steady state",
+      "required": true,
       "unit": "MB",
       "direction": "lower_is_better",
       "fail_above": 350.0,
@@ -39,6 +44,7 @@
     },
     "battery_drain_pct_per_hour": {
       "description": "Estimated battery drain rate during active gameplay",
+      "required": true,
       "unit": "percent_per_hour",
       "direction": "lower_is_better",
       "fail_above": 15.0,
@@ -46,6 +52,7 @@
     },
     "audio_idle_cpu_pct": {
       "description": "CPU usage when audio thread is in Sleep/LowPower state (validates power state machine)",
+      "required": true,
       "unit": "percent",
       "direction": "lower_is_better",
       "fail_above": 5.0,
@@ -53,6 +60,7 @@
     },
     "thermal_throttle_events": {
       "description": "Number of thermal throttling events observed during test",
+      "required": true,
       "unit": "count",
       "direction": "lower_is_better",
       "fail_above": 3,

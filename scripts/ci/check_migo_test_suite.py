@@ -49,6 +49,14 @@ DEFAULT_REQUIRED_CATEGORIES = [
     "canvas", "webgl", "audio", "touch", "network",
     "storage", "timer", "lifecycle",
 ]
+REPORT_BINDING_FIELDS = (
+    "_source_revision",
+    "_artifact_sha256",
+    "_installed_native_sha256",
+    "_device_abi",
+    "_profile",
+    "_package",
+)
 
 
 def load_json(path):
@@ -76,6 +84,13 @@ def validate_report_structure(report):
     if "categories" not in report:
         errors.append("missing 'categories' field")
     return errors
+
+
+def validate_report_bindings(report, bindings):
+    """Require the external suite report to name the release it exercised."""
+    for field, expected in bindings.items():
+        if report.get(field) != expected:
+            raise ValueError(f"test-suite report binding mismatch: {field}")
 
 
 def check_pass_rate(summary, min_rate):
@@ -212,7 +227,7 @@ def print_report(report, gate_results, has_failures):
     print("=" * 70)
 
 
-def write_summary(path, report, gate_results, has_failures):
+def write_summary(path, report, gate_results, has_failures, bindings):
     """Write machine-readable summary."""
     summary_out = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -221,6 +236,7 @@ def write_summary(path, report, gate_results, has_failures):
         "gates": gate_results,
         "failure_count": len(report.get("failures", [])),
     }
+    summary_out.update(bindings)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -257,6 +273,12 @@ def main():
         "--gate", action="store_true",
         help="Enable CI gating (exit 1 on failure)",
     )
+    parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--artifact-sha256", required=True)
+    parser.add_argument("--installed-native-sha256", required=True)
+    parser.add_argument("--device-abi", required=True)
+    parser.add_argument("--profile", required=True)
+    parser.add_argument("--package", required=True)
 
     args = parser.parse_args()
 
@@ -267,6 +289,20 @@ def main():
     )
 
     report = load_json(args.report)
+    bindings = {
+        "_source_revision": args.source_revision,
+        "_artifact_sha256": args.artifact_sha256,
+        "_installed_native_sha256": args.installed_native_sha256,
+        "_device_abi": args.device_abi,
+        "_profile": args.profile,
+        "_package": args.package,
+    }
+
+    try:
+        validate_report_bindings(report, bindings)
+    except ValueError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(2)
 
     # Validate structure
     struct_errors = validate_report_structure(report)
@@ -290,7 +326,7 @@ def main():
     print_report(report, gate_results, has_failures)
 
     if args.summary_out:
-        write_summary(args.summary_out, report, gate_results, has_failures)
+        write_summary(args.summary_out, report, gate_results, has_failures, bindings)
 
     if has_failures and args.gate:
         sys.exit(1)

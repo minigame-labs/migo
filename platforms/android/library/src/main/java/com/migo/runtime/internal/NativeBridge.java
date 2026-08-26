@@ -12,7 +12,7 @@ import java.nio.ByteBuffer;
  *
  * @hide
  */
-public final class NativeBridge {
+final class NativeBridge {
 
     // Native library is loaded by MigoRuntime
 
@@ -25,7 +25,7 @@ public final class NativeBridge {
      *
      * @return Version string (e.g., "0.1.0")
      */
-    public static native String version();
+    static native String version();
 
     /**
      * Get the minimum Android API level the native engine was
@@ -39,7 +39,7 @@ public final class NativeBridge {
      *
      * @return The minimum API level (e.g., 26)
      */
-    public static native int getMinApiLevel();
+    static native int getMinApiLevel();
 
     /**
      * Load an external {@code icudtl.dat} file so SkParagraph can
@@ -64,7 +64,7 @@ public final class NativeBridge {
      * @return {@code true} if ICU data is ready (either embedded
      *         or successfully loaded), {@code false} on failure.
      */
-    public static native boolean initIcuData(String icuDataPath);
+    static native boolean initIcuData(String icuDataPath);
 
     /**
      * Initialize a new session with the given surface and options.
@@ -73,14 +73,14 @@ public final class NativeBridge {
      * @param config  Runtime configuration
      * @return Session ID (>= 0) on success, negative error code on failure
      */
-    public static native int init(Object surface, RuntimeConfig config);
+    static native int init(Object surface, RuntimeConfig config);
 
     /**
      * Shut down a session and release all resources.
      *
      * @param sessionId The session ID returned by init()
      */
-    public static native boolean shutdown(int sessionId);
+    static native boolean shutdown(int sessionId);
 
     // ==================== Surface Management ====================
 
@@ -93,7 +93,7 @@ public final class NativeBridge {
      * @param height    Surface buffer height in physical pixels
      * @param density   Current device-pixel ratio for this display
      */
-    public static native void updateSurface(
+    static native void updateSurface(
             int sessionId, Object surface, int width, int height, float density);
 
     /**
@@ -101,7 +101,7 @@ public final class NativeBridge {
      *
      * @param sessionId The session ID
      */
-    public static native void onSurfaceDestroyed(int sessionId);
+    static native void onSurfaceDestroyed(int sessionId);
 
     // ==================== Lifecycle Events ====================
 
@@ -111,35 +111,35 @@ public final class NativeBridge {
      * @param sessionId   The session ID
      * @param optionsJson Launch/enter options JSON (scene/query/referrerInfo/shareTicket)
      */
-    public static native void onShow(int sessionId, String optionsJson);
+    static native void onShow(int sessionId, String optionsJson);
 
     /**
      * Notify that the session should hide (pause rendering).
      *
      * @param sessionId The session ID
      */
-    public static native void onHide(int sessionId);
+    static native void onHide(int sessionId);
 
     /**
      * Restart the game session.
      *
      * @param sessionId The session ID
      */
-    public static native void onRestart(int sessionId);
+    static native void onRestart(int sessionId);
 
     /**
      * Notify that audio playback has been interrupted by the system.
      *
      * @param sessionId The session ID
      */
-    public static native void onAudioInterruptionBegin(int sessionId);
+    static native void onAudioInterruptionBegin(int sessionId);
 
     /**
      * Notify that audio interruption has ended.
      *
      * @param sessionId The session ID
      */
-    public static native void onAudioInterruptionEnd(int sessionId);
+    static native void onAudioInterruptionEnd(int sessionId);
 
     // ==================== Input Events ====================
 
@@ -152,7 +152,7 @@ public final class NativeBridge {
      * @param count     Number of touch points
      * @param buffer    DirectByteBuffer containing packed TouchPoint data
      */
-    public static native boolean onTouchEvent(int sessionId, int action, long time, int count,
+    static native boolean onTouchEvent(int sessionId, int action, long time, int count,
                                               ByteBuffer buffer);
 
     // ==================== Game Loading ====================
@@ -174,7 +174,7 @@ public final class NativeBridge {
      * @param entry     Entry point file name (e.g., "game.js")
      * @return 0 on success, negative error code on failure
      */
-    public static native int modMain(int sessionId, String gameId, String entry);
+    static native int modMain(int sessionId, String gameId, String entry);
 
     // ==================== System Callbacks ====================
 
@@ -184,7 +184,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param enabled   1 if Bluetooth was enabled, 0 otherwise
      */
-    public static native void onOpenSystemBluetoothSetting(int sessionId, int requestId, int enabled);
+    static native void onOpenSystemBluetoothSetting(int sessionId, int requestId, int enabled);
 
     /**
      * Callback when app authorization setting result is received.
@@ -192,7 +192,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param code      0 on success, negative on failure
      */
-    public static native void onOpenAppAuthorizeSetting(int sessionId, int requestId, int code);
+    static native void onOpenAppAuthorizeSetting(int sessionId, int requestId, int code);
 
     /**
      * Callback when modal dialog is dismissed.
@@ -201,7 +201,7 @@ public final class NativeBridge {
      * @param confirm   1 if user tapped confirm, 0 otherwise
      * @param cancel    1 if user tapped cancel, 0 otherwise
      */
-    public static native void onModalResult(int sessionId, int requestId, int confirm, int cancel);
+    static native void onModalResult(int sessionId, int requestId, int confirm, int cancel);
 
     /**
      * Callback when action sheet is dismissed.
@@ -209,7 +209,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
      */
-    public static native void onActionSheetResult(int sessionId, int requestId, int tapIndex);
+    static native void onActionSheetResult(int sessionId, int requestId, int tapIndex);
 
     // ==================== Device Sensor Callbacks ====================
 
@@ -221,7 +221,7 @@ public final class NativeBridge {
      * @param beta      Rotation around X axis in degrees (-180 to 180)
      * @param gamma     Rotation around Y axis in degrees (-90 to 90)
      */
-    public static native void onDeviceMotionChange(
+    static native void onDeviceMotionChange(
             int sessionId, long generation, double alpha, double beta, double gamma);
 
     /**
@@ -232,7 +232,7 @@ public final class NativeBridge {
      * @param y         Angular velocity around Y axis in rad/s
      * @param z         Angular velocity around Z axis in rad/s
      */
-    public static native void onGyroscopeChange(
+    static native void onGyroscopeChange(
             int sessionId, long generation, double x, double y, double z);
 
     /**
@@ -241,7 +241,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     One of: "portrait", "landscape", "landscapeReverse"
      */
-    public static native void onDeviceOrientationChange(int sessionId, String value);
+    static native void onDeviceOrientationChange(int sessionId, String value);
 
     /**
      * Callback when compass data is available.
@@ -250,7 +250,7 @@ public final class NativeBridge {
      * @param direction Direction in degrees (0-360, 0 = north)
      * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable"
      */
-    public static native void onCompassChange(
+    static native void onCompassChange(
             int sessionId, long generation, double direction, String accuracy);
 
     /**
@@ -261,7 +261,7 @@ public final class NativeBridge {
      * @param y         Acceleration along Y axis in m/s^2
      * @param z         Acceleration along Z axis in m/s^2
      */
-    public static native void onAccelerometerChange(
+    static native void onAccelerometerChange(
             int sessionId, long generation, double x, double y, double z);
 
     // ==================== Network Callbacks ====================
@@ -273,7 +273,7 @@ public final class NativeBridge {
      * @param isConnected Whether network is connected
      * @param networkType Network type: "wifi", "2g", "3g", "4g", "5g", "unknown", "none"
      */
-    public static native void onNetworkStatusChange(int sessionId, boolean isConnected, String networkType);
+    static native void onNetworkStatusChange(int sessionId, boolean isConnected, String networkType);
 
     // ==================== VSync (Choreographer) ====================
 
@@ -284,7 +284,7 @@ public final class NativeBridge {
      * @param sessionId      The session ID
      * @param frameTimeNanos Frame timestamp from Choreographer in nanoseconds
      */
-    public static native void onVsync(int sessionId, long frameTimeNanos);
+    static native void onVsync(int sessionId, long frameTimeNanos);
 
     // ==================== Recorder Callbacks ====================
 
@@ -295,7 +295,7 @@ public final class NativeBridge {
      * @param eventType   Event type string
      * @param jsonPayload JSON-encoded event data
      */
-    public static native void onRecorderEvent(
+    static native void onRecorderEvent(
             int sessionId, long generation, String eventType, String jsonPayload);
 
     /**
@@ -305,7 +305,7 @@ public final class NativeBridge {
      * @param frameData   Raw audio frame bytes
      * @param isLastFrame Whether this is the last frame before stop
      */
-    public static native void onRecorderFrameData(
+    static native void onRecorderFrameData(
             int sessionId, long generation, byte[] frameData, boolean isLastFrame);
 
     // ==================== Camera Callbacks ====================
@@ -318,7 +318,7 @@ public final class NativeBridge {
      * @param eventType   Event type string
      * @param jsonPayload JSON-encoded event data
      */
-    public static native void onCameraEvent(
+    static native void onCameraEvent(
             int sessionId, long generation, int cameraId, String eventType, String jsonPayload);
 
     /**
@@ -343,7 +343,7 @@ public final class NativeBridge {
      * @param width     Frame width in pixels
      * @param height    Frame height in pixels
      */
-    public static native void onCameraFrameData(int sessionId, long generation, int cameraId,
+    static native void onCameraFrameData(int sessionId, long generation, int cameraId,
             ByteBuffer yBuffer, int yOffset, int yLength,
             ByteBuffer uBuffer, int uOffset, int uLength,
             ByteBuffer vBuffer, int vOffset, int vLength,
@@ -358,7 +358,7 @@ public final class NativeBridge {
      * @param available   Whether the adapter is available
      * @param discovering Whether the adapter is discovering devices
      */
-    public static native void onBluetoothAdapterStateChange(int sessionId, boolean available, boolean discovering);
+    static native void onBluetoothAdapterStateChange(int sessionId, boolean available, boolean discovering);
 
     /**
      * Callback when Bluetooth devices are found during discovery.
@@ -366,7 +366,7 @@ public final class NativeBridge {
      * @param sessionId   The session ID
      * @param devicesJson JSON-encoded array of discovered devices
      */
-    public static native void onBluetoothDeviceFound(int sessionId, String devicesJson);
+    static native void onBluetoothDeviceFound(int sessionId, String devicesJson);
 
     /**
      * Callback when Beacon devices are updated during discovery.
@@ -374,7 +374,7 @@ public final class NativeBridge {
      * @param sessionId   The session ID
      * @param beaconsJson JSON-encoded array of beacon devices
      */
-    public static native void onBeaconUpdate(int sessionId, String beaconsJson);
+    static native void onBeaconUpdate(int sessionId, String beaconsJson);
 
     /**
      * Callback when Beacon service state changes.
@@ -383,16 +383,16 @@ public final class NativeBridge {
      * @param available   Whether the beacon service is available
      * @param discovering Whether the beacon service is discovering
      */
-    public static native void onBeaconServiceChange(int sessionId, boolean available, boolean discovering);
+    static native void onBeaconServiceChange(int sessionId, boolean available, boolean discovering);
 
     // ==================== BLE GATT Callbacks ====================
 
-    public static native void onBLEConnectionStateChange(int sessionId, String deviceId, boolean connected);
+    static native void onBLEConnectionStateChange(int sessionId, String deviceId, boolean connected);
 
-    public static native void onBLECharacteristicValueChange(int sessionId, String deviceId,
+    static native void onBLECharacteristicValueChange(int sessionId, String deviceId,
                                                               String serviceId, String characteristicId, byte[] value);
 
-    public static native void onBLEMTUChange(int sessionId, String deviceId, int mtu);
+    static native void onBLEMTUChange(int sessionId, String deviceId, int mtu);
 
     // ==================== Keyboard Callbacks ====================
 
@@ -402,7 +402,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardInput(int sessionId, long generation, String value);
+    static native void onKeyboardInput(int sessionId, long generation, String value);
 
     /**
      * Callback when user presses confirm on soft keyboard.
@@ -410,7 +410,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardConfirm(int sessionId, long generation, String value);
+    static native void onKeyboardConfirm(int sessionId, long generation, String value);
 
     /**
      * Callback when soft keyboard is dismissed/completed.
@@ -418,7 +418,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param value     Current text value
      */
-    public static native void onKeyboardComplete(int sessionId, long generation, String value);
+    static native void onKeyboardComplete(int sessionId, long generation, String value);
 
     /**
      * Callback when soft keyboard height changes.
@@ -426,7 +426,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param height    Keyboard height in CSS pixels (0 when hidden)
      */
-    public static native void onKeyboardHeightChange(int sessionId, long generation, double height);
+    static native void onKeyboardHeightChange(int sessionId, long generation, double height);
 
     // ==================== Screen Capture ====================
 
@@ -436,7 +436,7 @@ public final class NativeBridge {
      *
      * @param sessionId The session ID
      */
-    public static native void onUserCaptureScreen(int sessionId, long generation);
+    static native void onUserCaptureScreen(int sessionId, long generation);
 
     // ==================== Memory Warning ====================
 
@@ -448,7 +448,7 @@ public final class NativeBridge {
      * @param level     Memory warning level (Android TRIM_MEMORY_* constant):
      *                  5 = RUNNING_MODERATE, 10 = RUNNING_LOW, 15 = RUNNING_CRITICAL
      */
-    public static native void onMemoryWarning(int sessionId, int level);
+    static native void onMemoryWarning(int sessionId, int level);
 
     // ==================== ADPF Thermal ====================
 
@@ -459,7 +459,7 @@ public final class NativeBridge {
      * @param status    Thermal status level: 0=none, 1=light, 2=moderate,
      *                  3=severe, 4=critical, 5=emergency, 6=shutdown
      */
-    public static native void onThermalStatusChanged(int sessionId, int status);
+    static native void onThermalStatusChanged(int sessionId, int status);
 
     // ==================== Image API Callbacks ====================
 
@@ -469,7 +469,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON-encoded result with tempFilePath or error
      */
-    public static native void onCompressImageResult(int sessionId, String resultJson);
+    static native void onCompressImageResult(int sessionId, String resultJson);
 
     /**
      * Callback when chooseImage operation completes.
@@ -477,7 +477,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON-encoded result with tempFilePaths/tempFiles or error
      */
-    public static native void onChooseImageResult(int sessionId, String resultJson);
+    static native void onChooseImageResult(int sessionId, String resultJson);
 
     /**
      * Callback when chooseMessageFile operation completes.
@@ -485,7 +485,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON-encoded result with tempFiles or error
      */
-    public static native void onChooseMessageFileResult(int sessionId, String resultJson);
+    static native void onChooseMessageFileResult(int sessionId, String resultJson);
 
     // ==================== Location Callbacks ====================
 
@@ -495,7 +495,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON-encoded result with location data or error
      */
-    public static native void onLocationResult(int sessionId, String resultJson);
+    static native void onLocationResult(int sessionId, String resultJson);
 
     /**
      * Callback when getFuzzyLocation operation completes.
@@ -503,7 +503,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON-encoded result with location data or error
      */
-    public static native void onFuzzyLocationResult(int sessionId, String resultJson);
+    static native void onFuzzyLocationResult(int sessionId, String resultJson);
 
     // ==================== Scan Code Callbacks ====================
 
@@ -513,7 +513,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON-encoded result with scan data or error
      */
-    public static native void onScanCodeResult(int sessionId, String resultJson);
+    static native void onScanCodeResult(int sessionId, String resultJson);
 
     // ==================== Auth Callbacks ====================
 
@@ -523,7 +523,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with requestId/code or error
      */
-    public static native void onLoginResult(int sessionId, String resultJson);
+    static native void onLoginResult(int sessionId, String resultJson);
 
     /**
      * Deliver one ad event (load / error / close / resize / hide) to content.
@@ -531,7 +531,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @param eventJson JSON carrying adId, event name and event fields
      */
-    public static native void onAdEvent(int sessionId, String eventJson);
+    static native void onAdEvent(int sessionId, String eventJson);
 
     /**
      * Settle one pending {@code migo.authorize()} call.
@@ -539,7 +539,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON carrying requestId and granted, or an error
      */
-    public static native void onAuthorizeResult(int sessionId, String resultJson);
+    static native void onAuthorizeResult(int sessionId, String resultJson);
 
     /**
      * Record the host's standing decision for one scope.
@@ -548,7 +548,7 @@ public final class NativeBridge {
      * @param scope     platform scope name
      * @param granted   whether the game may use it
      */
-    public static native boolean updatePermission(int sessionId, String scope, boolean granted);
+    static native boolean updatePermission(int sessionId, String scope, boolean granted);
 
     /**
      * Callback when checkSession operation completes.
@@ -556,7 +556,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with requestId or error
      */
-    public static native void onCheckSessionResult(int sessionId, String resultJson);
+    static native void onCheckSessionResult(int sessionId, String resultJson);
 
     /**
      * Callback when getUserInfo operation completes.
@@ -564,7 +564,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with requestId/userInfo or error
      */
-    public static native void onGetUserInfoResult(int sessionId, String resultJson);
+    static native void onGetUserInfoResult(int sessionId, String resultJson);
 
     /**
      * Callback when getPhoneNumber operation completes.
@@ -572,7 +572,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with requestId/code or error
      */
-    public static native void onGetPhoneNumberResult(int sessionId, String resultJson);
+    static native void onGetPhoneNumberResult(int sessionId, String resultJson);
 
     // ==================== Subpackage Callbacks ====================
 
@@ -583,7 +583,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with requestId, progress, totalBytesWritten, totalBytesExpectedToWrite
      */
-    public static native void onSubpackageProgress(int sessionId, String resultJson);
+    static native void onSubpackageProgress(int sessionId, String resultJson);
 
     /**
      * Callback when subpackage download completes (success or failure).
@@ -592,7 +592,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with requestId (and optionally "error" on failure)
      */
-    public static native void onSubpackageResult(int sessionId, String resultJson);
+    static native void onSubpackageResult(int sessionId, String resultJson);
 
     // ==================== Debug Stats ====================
 
@@ -610,7 +610,7 @@ public final class NativeBridge {
      * @param sessionId The session ID
      * @return byte array with stats, or null if session not found
      */
-    public static native byte[] getDebugStats(int sessionId);
+    static native byte[] getDebugStats(int sessionId);
 
     // ==================== Setting Callback ====================
 
@@ -620,7 +620,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with authSetting, or error
      */
-    public static native void onOpenSettingResult(int sessionId, String resultJson);
+    static native void onOpenSettingResult(int sessionId, String resultJson);
 
     // ==================== Share Callback ====================
 
@@ -630,7 +630,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with result, or error
      */
-    public static native void onShareAppMessageResult(int sessionId, String resultJson);
+    static native void onShareAppMessageResult(int sessionId, String resultJson);
 
     // ==================== Navigate Callback ====================
 
@@ -640,7 +640,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with result, or error
      */
-    public static native void onNavigateToMiniProgramResult(int sessionId, String resultJson);
+    static native void onNavigateToMiniProgramResult(int sessionId, String resultJson);
 
     // ==================== Payment Callbacks ====================
 
@@ -650,7 +650,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with result (include requestId), or error
      */
-    public static native void onMidasPaymentResult(int sessionId, String resultJson);
+    static native void onMidasPaymentResult(int sessionId, String resultJson);
 
     /**
      * Callback with Midas payment game item result.
@@ -658,7 +658,7 @@ public final class NativeBridge {
      * @param sessionId  The session ID
      * @param resultJson JSON with result (include requestId), or error
      */
-    public static native void onMidasPaymentGameItemResult(int sessionId, String resultJson);
+    static native void onMidasPaymentGameItemResult(int sessionId, String resultJson);
 
     // ==================== Video Callbacks ====================
 
@@ -670,7 +670,7 @@ public final class NativeBridge {
      * @param eventType Event type string
      * @param dataJson  JSON-encoded event data
      */
-    public static native void onVideoEvent(
+    static native void onVideoEvent(
             int sessionId, long generation, int videoId, String eventType, String dataJson);
 
     // ==================== Script Execution ====================
@@ -684,7 +684,7 @@ public final class NativeBridge {
      * @param script    JavaScript source code to evaluate
      * @return 0 on success, -1 on failure
      */
-    public static native int executeScript(int sessionId, String script);
+    static native int executeScript(int sessionId, String script);
 
     // ==================== Console Logs ====================
 
@@ -701,7 +701,7 @@ public final class NativeBridge {
      * @param sinceCursor Cursor from the previous call (0 for first call)
      * @return JSON string with log entries, or null if session not found
      */
-    public static native String getConsoleLogs(int sessionId, long sinceCursor);
+    static native String getConsoleLogs(int sessionId, long sinceCursor);
 
     // ==================== AHardwareBuffer helpers ====================
 
@@ -720,6 +720,6 @@ public final class NativeBridge {
      * this method returns and transfer ownership of that native ref
      * to Rust.
      */
-    public static native long nativeAhbPointerFromHardwareBuffer(
+    static native long nativeAhbPointerFromHardwareBuffer(
             android.hardware.HardwareBuffer hb);
 }

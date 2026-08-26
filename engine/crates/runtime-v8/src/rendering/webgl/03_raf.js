@@ -4,6 +4,7 @@ import {
 } from "ext:core/ops";
 import { errorToString } from "ext:host_v8_base/02_async.js";
 import { core, primordials } from "ext:core/mod.js";
+import { frameEndAll } from "ext:host_v8_webgl/02_2d_context.js";
 
 // Registered for the reason `IOError` is (see 02_file_manager.js): the Rust side
 // names this class in `#[class("RafError")]`, and deno_core can only build the
@@ -19,7 +20,6 @@ class RafError extends _PrimErrorR {
   }
 }
 core.registerErrorClass("RafError", RafError);
-
 
 let __nextRafId = 0;
 let __raf_callbacks = Object.create(null);
@@ -75,9 +75,7 @@ async function _startRafLoop() {
                 }
             }
 
-            if (globalThis.__migo_frame_end_all) {
-                globalThis.__migo_frame_end_all();
-            }
+            frameEndAll();
         }
     } catch (e) {
         console.error(`RAF loop terminated: ${errorToString(e)}`);
@@ -92,19 +90,12 @@ async function _startRafLoop() {
 // on resume when idle). Mirrors browser engines kicking their compositor/RAF
 // scheduler on visibility changes. Exposed as a global so Host::enter_foreground
 // can call it once the render thread has a valid surface again.
-Object.defineProperty(globalThis, "__migo_restart_raf_loop", {
-    // Non-enumerable for the same reason as the frame-end hooks: the host
-    // reaches this by name, content should not meet it while enumerating.
-    value: function () {
-        if (!__rafLoopRunning && Object.keys(__raf_callbacks).length > 0) {
-            __rafLoopRunning = true;
-            _startRafLoop();
-        }
-    },
-    enumerable: false,
-    writable: true,
-    configurable: true,
-});
+globalThis._internalRestartRafLoop = function () {
+    if (!__rafLoopRunning && Object.keys(__raf_callbacks).length > 0) {
+        __rafLoopRunning = true;
+        _startRafLoop();
+    }
+};
 
 // The Number is forwarded as it arrived. `fps | 0` here used to be two silent
 // failures at once -- a non-finite argument became 0 and a value past 2^31

@@ -67,12 +67,13 @@ class SourceProofTest(unittest.TestCase):
 
     def apply_all(self, tree, patches):
         for patch in patches:
-            subprocess.run(
-                ["patch", "-p1", "-d", str(tree), "--batch", "--forward", "--fuzz=0"],
-                stdin=patch.open("rb"),
-                check=True,
-                capture_output=True,
-            )
+            with patch.open("rb") as patch_stream:
+                subprocess.run(
+                    ["patch", "-p1", "-d", str(tree), "--batch", "--forward", "--fuzz=0"],
+                    stdin=patch_stream,
+                    check=True,
+                    capture_output=True,
+                )
 
     def test_an_exactly_patched_tree_including_a_submodule_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:

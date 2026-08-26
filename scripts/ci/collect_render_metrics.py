@@ -41,11 +41,15 @@ def normalize_result(raw):
     ):
         if key in stats:
             normalized_stats[key] = _require_float(stats, key, "stats.")
-    return {
+    result = {
         "device": _require_field(raw, "device", ""),
         "workload": _require_field(raw, "workload", ""),
         "stats": normalized_stats,
     }
+    for field in ("_source_revision", "_artifact_sha256", "_profile"):
+        if field in raw:
+            result[field] = raw[field]
+    return result
 
 
 def main(src, dst):

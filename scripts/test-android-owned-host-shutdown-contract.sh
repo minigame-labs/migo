@@ -260,7 +260,7 @@ for anchor in ("self.take(host_id)", "self.insert(host)", "Err(error)"):
     if anchor not in shutdown_with:
         raise SystemExit(f"HostOwners retry ownership anchor missing: {anchor}")
 
-if "public static native boolean shutdown(int sessionId);" not in bridge:
+if "static native boolean shutdown(int sessionId);" not in bridge:
     raise SystemExit("NativeBridge.shutdown must expose a boolean retry contract")
 native_methods_shutdown = body_after(methods, "public static boolean shutdown(int sessionId)")
 if "sSessionShutdown.shutdown(sessionId)" not in native_methods_shutdown:

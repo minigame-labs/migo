@@ -93,6 +93,7 @@ pub mod texture_import;
 pub mod upload_policy;
 pub(crate) mod upload_server;
 pub mod upload_thread;
+mod webgl_gpu_budget;
 
 pub(crate) mod present_damage;
 pub(crate) use canvas::*;

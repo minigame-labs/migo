@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use parking_lot::Mutex;
@@ -61,16 +62,29 @@ impl From<KvInfo> for StorageInfo {
 // ---------------------------------------------------------------------------
 //
 // Opening SQLite is ~sub-ms but still involves syscalls and WAL
-// setup; we keep one handle per storage directory for the lifetime
-// of the process. The cache is keyed by absolute path so different
-// `HostOpState` instances (e.g. separate app ids in a test harness)
-// get separate DBs.
+// setup; we keep a bounded LRU of handles per storage directory. The
+// cache is keyed by absolute path so different `HostOpState` instances
+// (e.g. separate app ids in a test harness) get separate DBs.
 //
 // The per-handle `KvStore` is itself `Clone` + `Sync`, so `Mutex`
-// contention is limited to the *open* path.
+// contention is normally limited to cache bookkeeping. A cold SQLite open
+// intentionally keeps the lock: concurrent first opens race WAL setup and can
+// fail with `database is locked`.
+const MAX_CACHED_STORES: usize = 64;
 
-static STORES: LazyLock<Mutex<HashMap<PathBuf, KvStore>>> =
+struct StoreEntry {
+    store: KvStore,
+    last_used: u64,
+}
+
+static STORES: LazyLock<Mutex<HashMap<PathBuf, StoreEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static STORE_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn next_store_tick() -> u64 {
+    STORE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
 
 fn store_for(dir: &Path, quota_bytes: u64) -> Result<KvStore, EngineError> {
     let key = dir.to_path_buf();
@@ -88,11 +102,44 @@ fn store_for(dir: &Path, quota_bytes: u64) -> Result<KvStore, EngineError> {
     // Serialising here costs one brief hold per storage directory per process,
     // on a path that runs once.
     let mut map = STORES.lock();
-    if let Some(kv) = map.get(&key) {
-        return Ok(kv.clone());
+    if let Some(entry) = map.get_mut(&key) {
+        entry.last_used = next_store_tick();
+        return Ok(entry.store.clone());
     }
     let new_kv = KvStore::open(dir.join("storage.db"), quota_bytes)?;
-    Ok(map.entry(key).or_insert(new_kv).clone())
+
+    // Never evict an in-use handle. If every cached handle is active,
+    // leave this one uncached; its Arc is then released with the caller
+    // instead of growing the process-lifetime path/connection set.
+    let evicted = if map.len() >= MAX_CACHED_STORES {
+        let victim = map
+            .iter()
+            .filter(|(_, entry)| entry.store.strong_count() == 1)
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(path, _)| path.clone());
+        match victim {
+            Some(path) => map.remove(&path),
+            None => {
+                drop(map);
+                return Ok(new_kv);
+            }
+        }
+    } else {
+        None
+    };
+
+    map.insert(
+        key,
+        StoreEntry {
+            store: new_kv.clone(),
+            last_used: next_store_tick(),
+        },
+    );
+    drop(map);
+    // Closing an evicted SQLite handle must not happen while the global
+    // cache mutex is held. In the usual case this is just an Arc drop.
+    drop(evicted);
+    Ok(new_kv)
 }
 
 // No test-only cache reset exists on purpose. Every test keys off its own
@@ -401,6 +448,39 @@ mod tests {
             .filter(|p| p.as_path() == dir.path())
             .count();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn store_cache_has_a_hard_limit_and_never_evicts_an_active_store() {
+        let active_dir = fresh_dir();
+        let active = store_for(active_dir.path(), QUOTA).unwrap();
+        let mut dirs = Vec::with_capacity(MAX_CACHED_STORES + 1);
+        for index in 0..=MAX_CACHED_STORES {
+            let dir = fresh_dir();
+            storage_set(dir.path(), "k", &index.to_string(), QUOTA).unwrap();
+            dirs.push(dir);
+        }
+
+        let map = STORES.lock();
+        assert!(
+            map.len() <= MAX_CACHED_STORES,
+            "store cache exceeded hard limit: {}",
+            map.len()
+        );
+        let cached_test_dirs = dirs
+            .iter()
+            .filter(|dir| map.contains_key(dir.path()))
+            .count();
+        assert!(
+            cached_test_dirs <= MAX_CACHED_STORES,
+            "store cache exceeded hard limit: {cached_test_dirs}"
+        );
+        assert!(
+            map.contains_key(active_dir.path()),
+            "an active store was evicted"
+        );
+        drop(map);
+        drop(active);
     }
 
     #[test]

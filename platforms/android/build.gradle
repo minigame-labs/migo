@@ -1,16 +1,16 @@
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath 'com.android.tools.build:gradle:8.1.2'
-    }
-}
-
 plugins {
     id 'com.android.library' version '8.1.2' apply false
     id 'com.android.application' version '8.1.2' apply false
+}
+
+// Every external module resolved by any project/variant must be present in the
+// committed lock state. STRICT turns an unrecorded configuration into an error
+// instead of silently teaching a release machine a new dependency graph.
+allprojects {
+    dependencyLocking {
+        lockAllConfigurations()
+        lockMode = org.gradle.api.artifacts.dsl.LockMode.STRICT
+    }
 }
 
 task clean(type: Delete) {

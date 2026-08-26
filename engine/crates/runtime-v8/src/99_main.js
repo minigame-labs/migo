@@ -3,7 +3,6 @@ import { windowOrWorkerGlobalScope } from "ext:runtime/98_global_scope_shared.js
 import { WindowGlobalScope } from "ext:runtime/98_global_scope_window.js";
 import { installApiNamespaces } from "ext:runtime/97_migo_namespace.js";
 import { initializeEventHandlers } from "ext:host_v8_event/01_event.js";
-import { _perf, _perfEnable, _perfDisable } from "ext:host_v8_base/05_perf.js";
 
 const {
     ArrayIsArray,
@@ -30,19 +29,10 @@ globalThis.global = globalThis;
 
 initializeEventHandlers();
 
-// Perf profiler: only accessible via evaluateJavaScript from host app.
-// Not enumerable, not visible to game code via migo.* or globalThis iteration.
-Object.defineProperty(globalThis, '_perf', {
-    value: Object.freeze({ enable: _perfEnable, disable: _perfDisable }),
-    configurable: false,
-    enumerable: false,
-    writable: false,
-});
-
 // Install the engine's `migo` API projection from globalThis. Must run after
 // every feature's 99_global_scope.js has registered its APIs (the runtime
 // extension is loaded last in lib.rs, so by here all registrations are done)
-// and after the _perf install above (which is excluded from the projection).
+// and after internal modules have initialized.
 installApiNamespaces();
 
 // NOTE: `delete globalThis.Deno` / `delete globalThis.__bootstrap` are NOT done

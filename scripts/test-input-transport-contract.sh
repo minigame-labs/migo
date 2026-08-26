@@ -122,7 +122,7 @@ require_multiline_regex "$ANDROID_JNI/inbound.rs" \
     'fn onTouch\([^)]*buffer:[[:space:]]*JObject,[[:space:]]*\)[[:space:]]*->[[:space:]]*jboolean' \
     "Rust JNI touch entry does not return jboolean"
 require_literal "$ANDROID_JAVA/internal/NativeBridge.java" \
-    "public static native boolean onTouchEvent" \
+    "static native boolean onTouchEvent" \
     "Java native bridge does not return touch acceptance"
 require_literal "$ANDROID_JAVA/GameSession.java" \
     "return touchHandler.dispatch(sessionId, event);" \

@@ -15,8 +15,7 @@ class IIRFilterNode extends AudioNode {
   }
 
   async getFrequencyResponse(frequencyHz, magResponse, phaseResponse) {
-    const frequencies = Array.from(frequencyHz);
-    const [mag, phase] = await op_audio_get_frequency_response(this._nodeId, frequencies);
+    const [mag, phase] = await op_audio_get_frequency_response(this._nodeId, frequencyHz);
     const len = Math.min(frequencyHz.length, mag.length);
     for (let i = 0; i < len; i++) {
       magResponse[i] = mag[i];

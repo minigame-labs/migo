@@ -168,24 +168,24 @@ public final class HostDelegationTest {
     public void aShareHandlerReceivesTheParsedShareFields() {
         ShareHandler.ShareRequest request = HostDelegation.shareRequest(HostDelegation.options(
                 "{\"requestId\":91,\"title\":\"Beat my score\",\"imageUrl\":\"https://x/i.png\","
-                        + "\"query\":\"lvl=7&ref=a\",\"imageUrlId\":\"wxid-2\"}"));
+                        + "\"query\":\"lvl=7&ref=a\",\"imageUrlId\":\"image-2\"}"));
 
         assertEquals("Beat my score", request.title);
         assertEquals("https://x/i.png", request.imageUrl);
         assertEquals("lvl=7&ref=a", request.query);
-        assertEquals("wxid-2", request.imageUrlId);
+        assertEquals("image-2", request.imageUrlId);
     }
 
     @Test
     public void aNavigationHandlerReceivesTheParsedDestination() {
         NavigationHandler.NavigateRequest request =
                 HostDelegation.navigateRequest(HostDelegation.options(
-                        "{\"requestId\":91,\"appId\":\"wxOTHER\",\"path\":\"pages/x\","
+                        "{\"requestId\":91,\"appId\":\"other-app\",\"path\":\"pages/x\","
                                 + "\"extraData\":{\"from\":\"lobby\",\"score\":42,"
                                 + "\"tags\":[\"a\",\"b\"],\"nested\":{\"k\":true}},"
                                 + "\"envVersion\":\"trial\"}"));
 
-        assertEquals("wxOTHER", request.appId);
+        assertEquals("other-app", request.appId);
         assertEquals("pages/x", request.path);
         assertEquals("trial", request.envVersion);
         assertEquals("lobby", request.extraData.get("from"));
@@ -247,7 +247,7 @@ public final class HostDelegationTest {
      * the one the platform would have sent.
      */
     @Test
-    public void anOrderWithNothingSetCarriesTheWxDefaults() {
+    public void anOrderWithNothingSetCarriesThePlatformDefaults() {
         PaymentHandler.PaymentRequest request =
                 HostDelegation.paymentRequest(new JSONObject());
 

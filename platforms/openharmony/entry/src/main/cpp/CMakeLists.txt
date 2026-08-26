@@ -7,6 +7,16 @@
 cmake_minimum_required(VERSION 3.5.0)
 project(migo_ohos_host)
 
+# Signed content is the production default. The only opt-in is wired by the
+# explicit Debug build profile below; reject an accidental release/toolchain
+# override instead of silently shipping an unsigned-content host.
+option(MIGO_OHOS_ALLOW_UNSIGNED_CONTENT
+    "Allow unsigned content for the explicitly selected Debug profile" OFF)
+if(MIGO_OHOS_ALLOW_UNSIGNED_CONTENT AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(FATAL_ERROR
+        "MIGO_OHOS_ALLOW_UNSIGNED_CONTENT is permitted only for CMAKE_BUILD_TYPE=Debug")
+endif()
+
 set(NATIVERENDER_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Staged by scripts/build-ohos-host.sh next to this file, one directory per ABI.
@@ -26,6 +36,10 @@ include_directories(
 )
 
 add_library(migohost SHARED napi_init.cpp)
+
+if(MIGO_OHOS_ALLOW_UNSIGNED_CONTENT)
+    target_compile_definitions(migohost PRIVATE MIGO_OHOS_ALLOW_UNSIGNED_CONTENT=1)
+endif()
 
 # Two link options that are requirements, not tuning. Both were established by
 # a failing link, and both fail in ways that name neither Skia nor this file.

@@ -3,10 +3,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use shared::error::EngineResult;
+use shared::audio_resources::AudioSnapshot;
+use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::audio_cmd::{AudioBufferId, AudioContextId, AudioContextState, AudioNodeId};
 
 use crate::decoder::DecodedAudio;
+use crate::limits::{PcmBudget, RetainedAudio};
 use crate::nodes::{
     AudioNodeProcessor, BufferSourceNode, DestinationNode, GainNode, NodeConnection,
 };
@@ -26,8 +28,9 @@ pub struct AudioContext {
     channels: u32,
 
     // Resources
-    buffers: HashMap<AudioBufferId, Arc<DecodedAudio>>,
+    buffers: HashMap<AudioBufferId, Arc<RetainedAudio>>,
     next_buffer_id: AudioBufferId,
+    pcm_budget: PcmBudget,
 
     // Generic node storage
     nodes: HashMap<AudioNodeId, Box<dyn AudioNodeProcessor>>,
@@ -57,6 +60,15 @@ impl AudioContext {
     const DEFAULT_NODE_CAPACITY: usize = 16;
 
     pub fn new(id: AudioContextId, sample_rate: u32, channels: u32) -> Self {
+        Self::new_with_pcm_budget(id, sample_rate, channels, PcmBudget::for_context())
+    }
+
+    fn new_with_pcm_budget(
+        id: AudioContextId,
+        sample_rate: u32,
+        channels: u32,
+        pcm_budget: PcmBudget,
+    ) -> Self {
         let mut nodes: HashMap<AudioNodeId, Box<dyn AudioNodeProcessor>> =
             HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY);
 
@@ -73,6 +85,7 @@ impl AudioContext {
             channels,
             buffers: HashMap::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
             next_buffer_id: 1,
+            pcm_budget,
             nodes,
             connections: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             processing_order: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
@@ -143,19 +156,43 @@ impl AudioContext {
 
     // ==================== Buffer Management ====================
 
-    pub fn add_buffer(&mut self, audio: DecodedAudio) -> AudioBufferId {
-        let id = self.next_buffer_id;
-        self.next_buffer_id += 1;
-        self.buffers.insert(id, Arc::new(audio));
-        id
+    pub fn add_buffer(&mut self, audio: DecodedAudio) -> EngineResult<AudioBufferId> {
+        let (id, next_id) = self.buffer_id_candidate()?;
+        let retained = RetainedAudio::try_new(audio, &self.pcm_budget)?;
+        self.buffers.insert(id, Arc::new(retained));
+        self.next_buffer_id = next_id;
+        Ok(id)
     }
 
-    pub fn get_buffer(&self, id: AudioBufferId) -> Option<Arc<DecodedAudio>> {
+    pub fn get_buffer(&self, id: AudioBufferId) -> Option<Arc<RetainedAudio>> {
         self.buffers.get(&id).cloned()
     }
 
     pub fn remove_buffer(&mut self, id: AudioBufferId) -> bool {
         self.buffers.remove(&id).is_some()
+    }
+
+    fn buffer_id_candidate(&self) -> EngineResult<(AudioBufferId, AudioBufferId)> {
+        let id = self.next_buffer_id;
+        if id >= i32::MAX as AudioBufferId {
+            return Err(shared::error::EngineError::from_detail(
+                shared::error::ErrorCode::InputSaturated,
+                "AudioBuffer id space exhausted at the V8 Smi boundary",
+            ));
+        }
+        let next_id = id.checked_add(1).ok_or_else(|| {
+            shared::error::EngineError::from_detail(
+                shared::error::ErrorCode::InputSaturated,
+                "AudioBuffer id space exhausted",
+            )
+        })?;
+        if self.buffers.contains_key(&id) {
+            return Err(shared::error::EngineError::from_detail(
+                shared::error::ErrorCode::InputSaturated,
+                format!("AudioBuffer id {id} is still in use"),
+            ));
+        }
+        Ok((id, next_id))
     }
 
     /// Create an empty buffer with the given parameters.
@@ -169,18 +206,22 @@ impl AudioContext {
         length: u32,
         sample_rate: u32,
     ) -> EngineResult<AudioBufferId> {
-        crate::limits::validate_buffer_alloc(channels, length, sample_rate)?;
-
-        let id = self.next_buffer_id;
-        self.next_buffer_id += 1;
-        // Safe: validated above to fit and stay within the PCM budget.
-        let samples = vec![0.0f32; length as usize * channels as usize];
+        let bytes = crate::limits::validated_buffer_alloc_bytes(channels, length, sample_rate)?;
+        let (id, next_id) = self.buffer_id_candidate()?;
+        // Claim both aggregate budgets before asking the allocator for the Vec.
+        let mut permit = self.pcm_budget.reserve(bytes)?;
+        let sample_count = bytes / std::mem::size_of::<f32>();
+        let samples = crate::limits::try_allocate_zeroed_pcm(sample_count)?;
+        let capacity_bytes = crate::limits::pcm_bytes(samples.capacity())?;
+        permit.try_grow_to(capacity_bytes)?;
         let audio = DecodedAudio {
             samples,
             sample_rate,
             channels,
         };
-        self.buffers.insert(id, Arc::new(audio));
+        self.buffers
+            .insert(id, Arc::new(RetainedAudio::from_reserved(audio, permit)));
+        self.next_buffer_id = next_id;
         Ok(id)
     }
 
@@ -205,6 +246,58 @@ impl AudioContext {
         Some(data)
     }
 
+    /// Return all channels in one flat channel-major vector.
+    ///
+    /// The native buffer remains interleaved; this allocates exactly one
+    /// result vector and fills it without constructing one `Vec` per channel.
+    /// Reservation is fallible so malformed dimensions or allocator failure
+    /// become structured errors before any output is built.
+    pub fn take_decoded_buffer_data(
+        &mut self,
+        buffer_id: AudioBufferId,
+    ) -> EngineResult<Option<Vec<f32>>> {
+        let buffer = match self.buffers.remove(&buffer_id) {
+            Some(buffer) => buffer,
+            None => return Ok(None),
+        };
+        let channels = usize::try_from(buffer.channels).map_err(|_| {
+            EngineError::from_detail(
+                ErrorCode::InvalidArgument,
+                "channel count does not fit usize",
+            )
+        })?;
+        let frames = buffer.frame_count();
+        let sample_count = channels.checked_mul(frames).ok_or_else(|| {
+            EngineError::from_detail(
+                ErrorCode::InvalidArgument,
+                "audio channel data sample count overflow",
+            )
+        })?;
+
+        let mut output = Vec::new();
+        output.try_reserve_exact(sample_count).map_err(|_| {
+            EngineError::from_detail(
+                ErrorCode::OutOfMemory,
+                "audio channel data allocation failed",
+            )
+        })?;
+        for channel in 0..channels {
+            for frame in 0..frames {
+                let sample_index = frame
+                    .checked_mul(channels)
+                    .and_then(|base| base.checked_add(channel))
+                    .ok_or_else(|| {
+                        EngineError::from_detail(
+                            ErrorCode::InvalidArgument,
+                            "audio channel data index overflow",
+                        )
+                    })?;
+                output.push(buffer.samples[sample_index]);
+            }
+        }
+        Ok(Some(output))
+    }
+
     /// Copy data into a specific channel of a buffer (copy-on-write via Arc::make_mut).
     pub fn copy_to_channel(
         &mut self,
@@ -212,14 +305,15 @@ impl AudioContext {
         data: &[f32],
         channel: u32,
         start_frame: u32,
-    ) -> bool {
+    ) -> EngineResult<bool> {
+        let pcm_budget = self.pcm_budget.clone();
         let buffer = match self.buffers.get_mut(&buffer_id) {
             Some(b) => b,
-            None => return false,
+            None => return Ok(false),
         };
 
         if channel >= buffer.channels {
-            return false;
+            return Ok(false);
         }
 
         let channels = buffer.channels as usize;
@@ -230,11 +324,24 @@ impl AudioContext {
         // Clamp copy length to buffer bounds
         let copy_len = data.len().min(frame_count.saturating_sub(start));
         if copy_len == 0 {
-            return true; // Nothing to copy, but not an error
+            return Ok(true); // Nothing to copy, but not an error
         }
 
-        // Arc::make_mut clones the inner data only if there are other references
-        let audio = Arc::make_mut(buffer);
+        // A source may hold the old Arc. Reserve and allocate the COW copy
+        // fallibly before replacing the map entry, keeping the old PCM intact
+        // if either aggregate budget refuses the duplicate.
+        if Arc::get_mut(buffer).is_none() {
+            let cloned = buffer.try_clone_with_budget(&pcm_budget)?;
+            *buffer = Arc::new(cloned);
+        }
+        let audio = Arc::get_mut(buffer)
+            .ok_or_else(|| {
+                shared::error::EngineError::from_detail(
+                    shared::error::ErrorCode::Internal,
+                    "retained PCM did not become uniquely owned after copy-on-write",
+                )
+            })?
+            .audio_mut();
 
         for i in 0..copy_len {
             let sample_idx = (start + i) * channels + ch;
@@ -243,7 +350,7 @@ impl AudioContext {
             }
         }
 
-        true
+        Ok(true)
     }
 
     // ==================== Node Management ====================
@@ -251,8 +358,10 @@ impl AudioContext {
     /// Create a buffer source node with JS-provided node_id
     pub fn create_buffer_source(&mut self, node_id: AudioNodeId) {
         tracing::trace!("create_buffer_source: node_id={}", node_id);
-        self.nodes
-            .insert(node_id, Box::new(BufferSourceNode::new(node_id)));
+        self.nodes.insert(
+            node_id,
+            Box::new(BufferSourceNode::new(node_id, self.sample_rate)),
+        );
         self.graph_dirty = true;
     }
 
@@ -285,30 +394,44 @@ impl AudioContext {
         Some(f(typed))
     }
 
-    pub fn set_buffer(&mut self, node_id: AudioNodeId, buffer_id: AudioBufferId) -> bool {
-        tracing::trace!("set_buffer: node_id={}, buffer_id={}", node_id, buffer_id);
-        let buffer = match self.buffers.get(&buffer_id) {
-            Some(b) => b.clone(),
-            None => {
-                tracing::warn!("set_buffer: buffer {} not found", buffer_id);
-                return false;
-            }
+    pub fn set_buffer(&mut self, node_id: AudioNodeId, buffer_id: Option<AudioBufferId>) -> bool {
+        tracing::trace!("set_buffer: node_id={}, buffer_id={buffer_id:?}", node_id);
+        let buffer = match buffer_id {
+            Some(buffer_id) => match self.buffers.get(&buffer_id) {
+                Some(buffer) => Some(Arc::clone(buffer)),
+                None => {
+                    tracing::warn!("set_buffer: buffer {} not found", buffer_id);
+                    return false;
+                }
+            },
+            None => None,
         };
 
         if let Some(node) = self.nodes.get_mut(&node_id) {
             let any = node.as_any_mut();
             if let Some(source) = any.downcast_mut::<BufferSourceNode>() {
-                tracing::trace!(
-                    "set_buffer: found node and buffer, samples={}, channels={}, sample_rate={}",
-                    buffer.samples.len(),
-                    buffer.channels,
-                    buffer.sample_rate
-                );
                 source.set_buffer(buffer);
                 return true;
             }
         }
         tracing::warn!("set_buffer: source node {} not found", node_id);
+        false
+    }
+
+    /// Replace or clear the JS-owned snapshot on a source node without
+    /// copying its interleaved PCM.
+    pub fn set_started_buffer(
+        &mut self,
+        node_id: AudioNodeId,
+        buffer: Option<Arc<AudioSnapshot>>,
+    ) -> bool {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            let any = node.as_any_mut();
+            if let Some(source) = any.downcast_mut::<BufferSourceNode>() {
+                source.set_snapshot(buffer);
+                return true;
+            }
+        }
         false
     }
 
@@ -751,6 +874,262 @@ impl AudioContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::{PcmBudget, PcmUsage, PcmUsageSnapshot};
+
+    fn budgeted_context(
+        context_bytes: usize,
+        context_buffers: usize,
+        process: Arc<PcmUsage>,
+    ) -> (AudioContext, Arc<PcmUsage>) {
+        let context = Arc::new(PcmUsage::new(context_bytes, context_buffers));
+        let budget = PcmBudget::new(Arc::clone(&context), process);
+        (
+            AudioContext::new_with_pcm_budget(1, 48_000, 2, budget),
+            context,
+        )
+    }
+
+    #[test]
+    fn all_channel_data_is_one_channel_major_flat_buffer() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        let id = ctx
+            .add_buffer(DecodedAudio {
+                samples: vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
+                sample_rate: 48_000,
+                channels: 2,
+            })
+            .unwrap();
+
+        assert_eq!(
+            ctx.take_decoded_buffer_data(id).unwrap(),
+            Some(vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0])
+        );
+        assert!(ctx.get_buffer(id).is_none());
+        assert_eq!(ctx.take_decoded_buffer_data(id).unwrap(), None);
+    }
+
+    #[test]
+    fn retained_pcm_enforces_per_context_bytes_and_count() {
+        let process = Arc::new(PcmUsage::new(1024, 16));
+        let (mut ctx, usage) = budgeted_context(16, 1, process);
+        let id = ctx
+            .create_empty_buffer(1, 4, 48_000)
+            .expect("exact context byte and count budget");
+        assert_eq!(
+            usage.snapshot(),
+            PcmUsageSnapshot {
+                bytes: 16,
+                buffers: 1
+            }
+        );
+
+        let error = ctx
+            .create_empty_buffer(1, 1, 48_000)
+            .expect_err("second retained buffer exceeds count and bytes");
+        assert_eq!(error.code, shared::error::ErrorCode::InputSaturated);
+        assert_eq!(
+            usage.snapshot(),
+            PcmUsageSnapshot {
+                bytes: 16,
+                buffers: 1
+            }
+        );
+        assert!(ctx.get_buffer(id).is_some());
+    }
+
+    #[test]
+    fn retained_pcm_enforces_process_budget_across_contexts() {
+        let process = Arc::new(PcmUsage::new(16, 1));
+        let (mut first, first_usage) = budgeted_context(32, 2, Arc::clone(&process));
+        let (mut second, second_usage) = budgeted_context(32, 2, Arc::clone(&process));
+        first
+            .create_empty_buffer(1, 4, 48_000)
+            .expect("first context fills process budget");
+
+        let error = second
+            .create_empty_buffer(1, 1, 48_000)
+            .expect_err("second context exceeds process budget");
+        assert_eq!(error.code, shared::error::ErrorCode::InputSaturated);
+        assert_eq!(first_usage.snapshot().bytes, 16);
+        assert_eq!(second_usage.snapshot(), PcmUsageSnapshot::default());
+        assert_eq!(
+            process.snapshot(),
+            PcmUsageSnapshot {
+                bytes: 16,
+                buffers: 1
+            }
+        );
+    }
+
+    #[test]
+    fn decoded_pcm_is_charged_by_vector_capacity_not_logical_length() {
+        let mut samples = Vec::with_capacity(8);
+        samples.push(0.0);
+        let retained_bytes = samples.capacity() * std::mem::size_of::<f32>();
+        assert!(retained_bytes > samples.len() * std::mem::size_of::<f32>());
+
+        let process = Arc::new(PcmUsage::new(1024, 8));
+        let (mut rejected, rejected_usage) =
+            budgeted_context(retained_bytes - 1, 8, Arc::clone(&process));
+        let error = rejected
+            .add_buffer(DecodedAudio {
+                samples,
+                sample_rate: 48_000,
+                channels: 1,
+            })
+            .expect_err("spare Vec capacity is retained heap and must not bypass the budget");
+        assert_eq!(error.code, shared::error::ErrorCode::InputSaturated);
+        assert_eq!(rejected_usage.snapshot(), PcmUsageSnapshot::default());
+
+        let mut exact_samples = Vec::with_capacity(8);
+        exact_samples.push(0.0);
+        let exact_bytes = exact_samples.capacity() * std::mem::size_of::<f32>();
+        let (mut accepted, accepted_usage) =
+            budgeted_context(exact_bytes, 8, Arc::new(PcmUsage::new(1024, 8)));
+        accepted
+            .add_buffer(DecodedAudio {
+                samples: exact_samples,
+                sample_rate: 48_000,
+                channels: 1,
+            })
+            .expect("exact retained capacity must fit");
+        assert_eq!(accepted_usage.snapshot().bytes, exact_bytes);
+    }
+
+    #[test]
+    fn releasing_map_entry_keeps_budget_until_source_clears_last_arc() {
+        let process = Arc::new(PcmUsage::new(128, 8));
+        let (mut ctx, usage) = budgeted_context(128, 8, process);
+        let id = ctx.create_empty_buffer(1, 4, 48_000).unwrap();
+        ctx.create_buffer_source(10);
+        assert!(ctx.set_buffer(10, Some(id)));
+
+        assert!(ctx.remove_buffer(id));
+        assert_eq!(
+            usage.snapshot(),
+            PcmUsageSnapshot {
+                bytes: 16,
+                buffers: 1
+            }
+        );
+
+        assert!(ctx.set_buffer(10, None));
+        assert_eq!(usage.snapshot(), PcmUsageSnapshot::default());
+    }
+
+    #[test]
+    fn replacing_source_buffer_releases_the_replaced_last_arc() {
+        let process = Arc::new(PcmUsage::new(128, 8));
+        let (mut ctx, usage) = budgeted_context(128, 8, process);
+        let first = ctx.create_empty_buffer(1, 4, 48_000).unwrap();
+        let second = ctx.create_empty_buffer(1, 2, 48_000).unwrap();
+        ctx.create_buffer_source(10);
+        assert!(ctx.set_buffer(10, Some(first)));
+        assert!(ctx.remove_buffer(first));
+
+        assert!(ctx.set_buffer(10, Some(second)));
+        assert_eq!(
+            usage.snapshot(),
+            PcmUsageSnapshot {
+                bytes: 8,
+                buffers: 1
+            }
+        );
+    }
+
+    #[test]
+    fn copy_on_write_reserves_before_cloning_shared_pcm() {
+        let process = Arc::new(PcmUsage::new(16, 1));
+        let (mut ctx, usage) = budgeted_context(16, 1, process);
+        let id = ctx.create_empty_buffer(1, 4, 48_000).unwrap();
+        ctx.create_buffer_source(10);
+        assert!(ctx.set_buffer(10, Some(id)));
+
+        let error = ctx
+            .copy_to_channel(id, &[1.0], 0, 0)
+            .expect_err("COW clone must reserve another retained allocation first");
+        assert_eq!(error.code, shared::error::ErrorCode::InputSaturated);
+        assert_eq!(
+            usage.snapshot(),
+            PcmUsageSnapshot {
+                bytes: 16,
+                buffers: 1
+            }
+        );
+        assert_eq!(ctx.get_channel_data(id, 0).unwrap()[0], 0.0);
+
+        assert!(ctx.set_buffer(10, None));
+        assert!(ctx.copy_to_channel(id, &[1.0], 0, 0).unwrap());
+        assert_eq!(ctx.get_channel_data(id, 0).unwrap()[0], 1.0);
+    }
+
+    #[test]
+    fn copy_on_write_reserves_at_least_the_original_vector_capacity() {
+        let mut samples = Vec::with_capacity(8);
+        samples.push(0.0);
+        let retained_bytes = samples.capacity() * std::mem::size_of::<f32>();
+        let process = Arc::new(PcmUsage::new(retained_bytes * 2 - 1, 8));
+        let (mut ctx, usage) = budgeted_context(retained_bytes * 2 - 1, 8, Arc::clone(&process));
+        let id = ctx
+            .add_buffer(DecodedAudio {
+                samples,
+                sample_rate: 48_000,
+                channels: 1,
+            })
+            .unwrap();
+        ctx.create_buffer_source(10);
+        assert!(ctx.set_buffer(10, Some(id)));
+
+        let error = ctx
+            .copy_to_channel(id, &[1.0], 0, 0)
+            .expect_err("COW must conservatively reserve the original allocation capacity");
+        assert_eq!(error.code, shared::error::ErrorCode::InputSaturated);
+        assert_eq!(usage.snapshot().bytes, retained_bytes);
+        assert_eq!(process.snapshot().bytes, retained_bytes);
+        assert_eq!(ctx.get_channel_data(id, 0).unwrap()[0], 0.0);
+    }
+
+    #[test]
+    fn copy_on_write_shrinks_pre_reservation_to_the_clone_actual_capacity() {
+        let mut samples = Vec::with_capacity(8);
+        samples.push(0.0);
+        let original_bytes = samples.capacity() * std::mem::size_of::<f32>();
+        let process = Arc::new(PcmUsage::new(original_bytes * 2, 8));
+        let (mut ctx, usage) = budgeted_context(original_bytes * 2, 8, Arc::clone(&process));
+        let id = ctx
+            .add_buffer(DecodedAudio {
+                samples,
+                sample_rate: 48_000,
+                channels: 1,
+            })
+            .unwrap();
+        ctx.create_buffer_source(10);
+        assert!(ctx.set_buffer(10, Some(id)));
+
+        assert!(ctx.copy_to_channel(id, &[1.0], 0, 0).unwrap());
+
+        let clone_bytes =
+            ctx.get_buffer(id).unwrap().samples.capacity() * std::mem::size_of::<f32>();
+        assert!(
+            clone_bytes < original_bytes,
+            "fixture requires a smaller clone"
+        );
+        assert_eq!(usage.snapshot().bytes, original_bytes + clone_bytes);
+        assert_eq!(process.snapshot().bytes, original_bytes + clone_bytes);
+    }
+
+    #[test]
+    fn buffer_id_overflow_is_structured_and_does_not_collide() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        ctx.next_buffer_id = i32::MAX as AudioBufferId;
+
+        let error = ctx
+            .create_empty_buffer(1, 1, 48_000)
+            .expect_err("buffer ids must not silently wrap");
+        assert_eq!(error.code, shared::error::ErrorCode::InputSaturated);
+        assert!(ctx.buffers.is_empty());
+        assert_eq!(ctx.next_buffer_id, i32::MAX as AudioBufferId);
+    }
 
     #[test]
     fn process_fully_cleans_up_finished_nodes() {

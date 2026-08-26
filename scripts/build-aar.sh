@@ -250,6 +250,20 @@ if [[ "$BUILD_TYPE" == "release" && "$ARTIFACT_MANIFEST_MODE" != "required" ]]; 
     print_error "Release AARs require --artifact-manifest required"
     exit 1
 fi
+
+# Validate independent scalar inputs before checking combinations of options.
+# This keeps diagnostics deterministic: a malformed reproducibility timestamp is
+# invalid regardless of whether the remaining request would later be refused.
+SOURCE_DATE_EPOCH_VALUE="${SOURCE_DATE_EPOCH:-}"
+SOURCE_DATE_EPOCH_JSON="null"
+if [[ -n "$SOURCE_DATE_EPOCH_VALUE" ]]; then
+    if [[ ! "$SOURCE_DATE_EPOCH_VALUE" =~ ^[0-9]+$ ]]; then
+        print_error "Invalid SOURCE_DATE_EPOCH: expected non-negative Unix seconds"
+        exit 1
+    fi
+    SOURCE_DATE_EPOCH_JSON="\"$SOURCE_DATE_EPOCH_VALUE\""
+fi
+
 # A release AAR must carry native libraries built from this source. `--skip-rust`
 # packages whatever `.so` files happen to be on disk, and `validate_native_libraries`
 # only checks that they *exist* -- so a release built this way ships natives from
@@ -269,16 +283,6 @@ fi
 if [[ "$UNVERIFIED_NATIVE_LIBS" == true && "$SKIP_RUST" != true ]]; then
     print_error "--unverified-native-libs is only meaningful with --skip-rust"
     exit 1
-fi
-
-SOURCE_DATE_EPOCH_VALUE="${SOURCE_DATE_EPOCH:-}"
-SOURCE_DATE_EPOCH_JSON="null"
-if [[ -n "$SOURCE_DATE_EPOCH_VALUE" ]]; then
-    if [[ ! "$SOURCE_DATE_EPOCH_VALUE" =~ ^[0-9]+$ ]]; then
-        print_error "Invalid SOURCE_DATE_EPOCH: expected non-negative Unix seconds"
-        exit 1
-    fi
-    SOURCE_DATE_EPOCH_JSON="\"$SOURCE_DATE_EPOCH_VALUE\""
 fi
 
 CODEGEN_SUFFIX=""

@@ -184,8 +184,7 @@ public final class RuntimeConfig {
     @Override
     public String toString() {
         return "RuntimeConfig{" +
-                "cacheDir='" + cacheDir + '\'' +
-                ", filesDir='" + filesDir + '\'' +
+                "privateDirectories=redacted" +
                 ", targetFps=" + targetFps +
                 ", debugEnabled=" + debugEnabled +
                 ", logLevel=" + logLevel +

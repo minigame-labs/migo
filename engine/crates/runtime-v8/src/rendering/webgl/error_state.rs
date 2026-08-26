@@ -161,6 +161,7 @@ impl WebGLErrorState {
     }
 
     /// Per-context overflow counter (cumulative dropped pushes).
+    #[cfg(test)]
     #[inline]
     pub fn overflow_count(&self, canvas_id: u32) -> u64 {
         self.overflow.get(&canvas_id).copied().unwrap_or(0)
@@ -422,6 +423,31 @@ pub fn op_webgl_get_error(state: &mut OpState, #[smi] canvas_id: u32) -> u32 {
     q.drain_one(canvas_id)
 }
 
+/// Records a host-side allocation rejection performed by the JS facade before
+/// it passes a large payload through the op boundary.
+#[deno_core::op2(fast)]
+pub fn op_webgl_record_out_of_memory(state: &mut OpState, #[smi] canvas_id: u32) {
+    push_error(state, canvas_id, codes::OUT_OF_MEMORY);
+}
+
+#[inline]
+fn validated_external_error(code: u32) -> u32 {
+    match code {
+        codes::INVALID_ENUM
+        | codes::INVALID_VALUE
+        | codes::INVALID_OPERATION
+        | codes::OUT_OF_MEMORY => code,
+        _ => codes::INVALID_OPERATION,
+    }
+}
+
+/// Record a JS preflight rejection without allowing arbitrary values into the
+/// bounded WebGL error queue.
+#[deno_core::op2(fast)]
+pub fn op_webgl_record_error(state: &mut OpState, #[smi] canvas_id: u32, #[smi] code: u32) {
+    push_error(state, canvas_id, validated_external_error(code));
+}
+
 /// Snapshot the compressed-texture caps the render thread detected
 /// during GL context init.  Returned as a bitfield so a single fast
 /// op replaces multiple boolean round-trips:
@@ -577,6 +603,19 @@ mod tests {
         assert_eq!(q.drain_one(2), 0x0502);
         assert_eq!(q.drain_one(1), 0);
         assert_eq!(q.drain_one(2), 0);
+    }
+
+    #[test]
+    fn gpu_preflight_only_accepts_standard_webgl_error_codes() {
+        for code in [
+            codes::INVALID_ENUM,
+            codes::INVALID_VALUE,
+            codes::INVALID_OPERATION,
+            codes::OUT_OF_MEMORY,
+        ] {
+            assert_eq!(validated_external_error(code), code);
+        }
+        assert_eq!(validated_external_error(0xDEAD), codes::INVALID_OPERATION);
     }
 
     #[test]

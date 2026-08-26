@@ -11,7 +11,9 @@ use shared::{
     op_state::CanvasOpState,
     protocol::{
         render_cmd::{
-            GLCmd, RenderCmdResp, RenderCommand, ShaderType, UniformF32Values, UniformI32Values,
+            GLCmd, MAX_WEBGL_SHADER_SOURCE_BYTES, RenderCmdResp, RenderCommand, ShaderType,
+            UniformF32Values, UniformI32Values, checked_readback_byte_len,
+            webgl_readback_bytes_per_pixel, webgl_upload_is_within_limit,
         },
         send_gl_with_resp_sync,
     },
@@ -54,8 +56,9 @@ mod tests {
     use deno_core::OpState;
 
     use super::{
-        GlResourceIdAllocator, bind_buffer_base_impl, bind_buffer_range_impl, copy_f32_words,
-        copy_i32_words, gl_cmd_has_heap_payload, normalize_tex_upload_3d_source,
+        GlResourceIdAllocator, allow_webgl_upload_len, bind_buffer_base_impl,
+        bind_buffer_range_impl, copy_f32_words, copy_i32_words, gl_cmd_has_heap_payload,
+        normalize_tex_upload_3d_source, prepare_read_pixels,
     };
     use crate::HostJsRuntime;
     use crate::rendering::webgl::{
@@ -76,6 +79,76 @@ mod tests {
         state.put(UnifiedFrameCollector::new());
         state.put(WebGLErrorState::default());
         state
+    }
+
+    #[test]
+    fn read_pixels_rejects_invalid_or_unbounded_allocations_before_dispatch() {
+        let canvas_id = 7;
+        let mut state = new_webgl_op_state();
+
+        assert_eq!(
+            prepare_read_pixels(&mut state, canvas_id, -1, 1, 0x1908, 0x1401),
+            None
+        );
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(canvas_id),
+            codes::INVALID_VALUE
+        );
+
+        assert_eq!(
+            prepare_read_pixels(&mut state, canvas_id, 4097, 4096, 0x1908, 0x1401),
+            None
+        );
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(canvas_id),
+            codes::OUT_OF_MEMORY
+        );
+    }
+
+    #[test]
+    fn read_pixels_accepts_zero_and_exact_limit_without_recording_an_error() {
+        let canvas_id = 9;
+        let mut state = new_webgl_op_state();
+
+        assert_eq!(
+            prepare_read_pixels(&mut state, canvas_id, 0, i32::MAX, 0x1908, 0x1401),
+            Some(0)
+        );
+        assert_eq!(
+            prepare_read_pixels(&mut state, canvas_id, 4096, 4096, 0x1908, 0x1401),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(canvas_id),
+            codes::NO_ERROR
+        );
+    }
+
+    #[test]
+    fn webgl_upload_limit_rejects_before_queueing_and_records_oom() {
+        let canvas_id = 11;
+        let mut state = new_webgl_op_state();
+
+        assert!(allow_webgl_upload_len(
+            &mut state,
+            canvas_id,
+            shared::protocol::render_cmd::MAX_WEBGL_UPLOAD_BYTES,
+        ));
+        assert!(!allow_webgl_upload_len(
+            &mut state,
+            canvas_id,
+            shared::protocol::render_cmd::MAX_WEBGL_UPLOAD_BYTES + 1,
+        ));
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(canvas_id),
+            codes::OUT_OF_MEMORY
+        );
+        assert_eq!(
+            state
+                .borrow::<UnifiedFrameCollector>()
+                .approx_pending_bytes(),
+            0
+        );
     }
 
     fn new_test_host_state() -> (HostOpState, crossbeam_channel::Receiver<RenderCommand>) {
@@ -134,6 +207,10 @@ mod tests {
             None,
         );
         (runtime, render_rx)
+    }
+
+    fn end_test_frame(runtime: &mut HostJsRuntime) {
+        runtime.invoke_host_hook("_internalFrameEnd", "[]");
     }
 
     fn spawn_tf_varying_responder(
@@ -298,7 +375,9 @@ mod tests {
 
     #[test]
     fn tex_image_3d_source_applies_src_offset_in_elements() {
-        match normalize_tex_upload_3d_source(Some(&[0, 1, 2, 3, 4, 5, 6, 7]), 2, 2, None) {
+        match normalize_tex_upload_3d_source(Some(&[0, 1, 2, 3, 4, 5, 6, 7]), 2, 2, None)
+            .expect("small upload should fit")
+        {
             TexImage3DSource::Bytes(bytes) => assert_eq!(bytes.as_slice(), &[4, 5, 6, 7]),
             other => panic!("expected sliced byte source, got {other:?}"),
         }
@@ -306,7 +385,9 @@ mod tests {
 
     #[test]
     fn tex_sub_image_3d_source_uses_pbo_offset_when_requested() {
-        match normalize_tex_upload_3d_source(None, 0, 1, Some(24)) {
+        match normalize_tex_upload_3d_source(None, 0, 1, Some(24))
+            .expect("PBO offset has no CPU payload")
+        {
             TexImage3DSource::BufferOffset(offset) => assert_eq!(offset, 24),
             other => panic!("expected buffer offset source, got {other:?}"),
         }
@@ -389,6 +470,49 @@ mod tests {
         assert!(
             source.contains("ensureNonSharedTypedArray"),
             "uniform conversion must copy shared views before Rust borrows them"
+        );
+    }
+
+    #[test]
+    fn public_webgl_uploads_are_rejected_before_crossing_the_op_boundary() {
+        let source = include_str!("02_webgl_context.js");
+
+        assert!(
+            source.contains("const MAX_WEBGL_UPLOAD_BYTES = 64 * 1024 * 1024"),
+            "the public facade needs a stable single-upload ceiling"
+        );
+        assert!(
+            source.contains("function allowWebglUpload"),
+            "all byte upload overloads should share one preflight helper"
+        );
+        assert!(
+            source.contains("op_webgl_record_out_of_memory"),
+            "preflight rejection must remain observable through getError()"
+        );
+        assert!(
+            source
+                .matches("toBoundedUploadBytes(this._canvasId")
+                .count()
+                >= 8,
+            "buffer and 2D texture payloads must use the bounded conversion helper"
+        );
+        assert!(
+            source.matches("allowWebglUpload(this._canvasId").count() >= 3,
+            "numeric buffer allocation and public sequence inputs must preflight"
+        );
+        assert_eq!(
+            source.matches("prepare3DUploadView(").count(),
+            3,
+            "the helper definition and both 3D upload overloads must stay wired"
+        );
+        assert!(
+            source.contains("allowWebglUpload(canvasId, remainingBytes)")
+                && source.contains("isSharedArrayBuffer(TypedArrayPrototypeGetBuffer(view))"),
+            "3D uploads must bound the exact tail and freeze shared backing"
+        );
+        assert!(
+            source.contains("MAX_WEBGL_SHADER_SOURCE_CODE_UNITS"),
+            "shader strings need a pre-conversion ceiling"
         );
     }
 
@@ -2138,10 +2262,10 @@ mod tests {
                 // submit counter stays 0. With Task 6: flushGlCommandStream() is called
                 // first, submitting the stream to the collector (counter +1), then
                 // op_frame_end_unified builds a FramePacket with the GlBatch.
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("task6 GL stream frame-end ordering should not throw");
+        end_test_frame(&mut runtime);
 
         // RED: submit counter must be 0 (stream was NOT flushed by frame-end hook).
         // GREEN: submit counter must be ≥1 (stream WAS flushed before frame-end).
@@ -2205,10 +2329,10 @@ mod tests {
 
                 // Call frame-end. Without Task 6: no GL in FramePacket (stream unsubmitted).
                 // With Task 6: GL stream is flushed first → GlBatch in FramePacket.
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("task6 frame-end ordering test should not throw");
+        end_test_frame(&mut runtime);
 
         // RED: submit counter stays 0 (GL stream not flushed by frame-end hook).
         // GREEN: submit counter ≥1.
@@ -2265,10 +2389,10 @@ mod tests {
                 // Direct call to op_resize_canvas via Canvas width setter simulation.
                 // We call op_frame_end_hooks to materialize the frame.
                 // The GL segment must precede the ResizeCanvas segment in the FramePacket.
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("task6 GL before resize setup should not throw");
+        end_test_frame(&mut runtime);
 
         // Drain any packets from the frame-end.
         loop {
@@ -2290,11 +2414,11 @@ mod tests {
                 // We simulate this by getting the canvas and setting width.
                 const c = { _rid: 103 };
                 // The canvas width setter calls flushGlCommandStream() then op_resize_canvas.
-                // We call the __migo_frame_end_hooks to see the resulting FramePacket order.
-                globalThis.__migo_frame_end_hooks[0]();
+                // The private host bridge ends the frame after this script.
                 "#,
             )
             .expect("task6 GL before resize (actual) should not throw");
+        end_test_frame(&mut runtime);
     }
 
     // Context-lost discards the GL stream: submit counter unchanged, cursor reset.
@@ -2488,10 +2612,10 @@ mod tests {
                 // Frame end: flushGlCommandStream() + op_frame_end_unified().
                 // Bug:  GL#2 flushed here, AFTER 2D#2 → wrong order.
                 // Fix:  GL#2 already flushed before 2D#2 → correct order.
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("mid-frame interleave script should not throw");
+        end_test_frame(&mut runtime);
 
         handle.join().expect("helper thread should not panic");
 
@@ -2736,10 +2860,10 @@ mod tests {
                 ctx.beginPath();
                 gl.clear(0x4000);
                 ctx.lineTo(1, 1);
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("path interleave must execute");
+        end_test_frame(&mut runtime);
 
         handle.join().expect("canvas responder must not panic");
         let ops = packet_rx
@@ -2779,10 +2903,10 @@ mod tests {
                 const ctx = createCanvas().getContext("2d");
                 gl.clear(0x4000);
                 ctx.getImageData(0, 0, 1, 1);
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("snapshot interleave must execute");
+        end_test_frame(&mut runtime);
 
         handle.join().expect("canvas responder must not panic");
         let ops = packet_rx
@@ -2823,10 +2947,10 @@ mod tests {
                 if (!ctx._consumeTextCacheForTexImage(147, 0x0DE1, 0, 0x1908)) {
                     throw new Error("expected text-cache consume path");
                 }
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("text-cache consume interleave must execute");
+        end_test_frame(&mut runtime);
 
         handle.join().expect("canvas responder must not panic");
         let ops = packet_rx
@@ -2924,10 +3048,10 @@ mod tests {
                 const gl = new WebGLRenderingContext({ _rid: 149, width: 4, height: 4 }, {});
                 gl.clear(0x4000);
                 canvas.getContext("2d");
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("create-context ordering script must execute");
+        end_test_frame(&mut runtime);
 
         let order = handle.join().expect("render responder must not panic");
         assert_eq!(
@@ -2978,10 +3102,10 @@ mod tests {
                 const gl = new WebGLRenderingContext({ _rid: 150, width: 4, height: 4 }, {});
                 gl.clear(0x4000);
                 createCanvas();
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("canvas-info ordering script must execute");
+        end_test_frame(&mut runtime);
 
         let order = handle.join().expect("render responder must not panic");
         assert_eq!(
@@ -3042,10 +3166,10 @@ mod tests {
                 const gl = new WebGLRenderingContext({ _rid: 151, width: 4, height: 4 }, {});
                 gl.clear(0x4000);
                 createCanvas();
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("offscreen-register ordering script must execute");
+        end_test_frame(&mut runtime);
 
         let order = handle.join().expect("render responder must not panic");
         assert_eq!(
@@ -3116,10 +3240,10 @@ mod tests {
                 const gl = new WebGLRenderingContext({ _rid: 152, width: 4, height: 4 }, {});
                 gl.clear(0x4000);
                 ctx.measureText("x");
-                globalThis.__migo_frame_end_hooks[0]();
                 "#,
             )
             .expect("measureText ordering script must execute");
+        end_test_frame(&mut runtime);
 
         let order = handle.join().expect("render responder must not panic");
         assert_eq!(
@@ -3145,10 +3269,10 @@ mod tests {
                 const gl = new WebGLRenderingContext({ _rid: 153, width: 4, height: 4 }, {});
                 gl.clear(0x4000);
                 gradient._apply();
-                globalThis.__migo_frame_end_hooks[0]();
                 "##,
             )
             .expect("direct gradient ordering script must execute");
+        end_test_frame(&mut runtime);
 
         handle.join().expect("canvas responder must not panic");
         let ops = packet_rx
@@ -3477,6 +3601,52 @@ fn send_gl_sync_with_flush<T>(
     send_gl_with_resp_sync(ctx, build)
 }
 
+#[inline]
+fn record_webgl_upload_oom(state: &mut OpState, canvas_id: u32) {
+    crate::rendering::webgl::error_state::push_error(
+        state,
+        canvas_id,
+        crate::rendering::webgl::error_state::codes::OUT_OF_MEMORY,
+    );
+}
+
+#[inline]
+fn allow_webgl_upload_len(state: &mut OpState, canvas_id: u32, byte_len: usize) -> bool {
+    if webgl_upload_is_within_limit(byte_len) {
+        true
+    } else {
+        record_webgl_upload_oom(state, canvas_id);
+        false
+    }
+}
+
+fn bounded_webgl_upload_copy(state: &mut OpState, canvas_id: u32, data: &[u8]) -> Option<Vec<u8>> {
+    if !allow_webgl_upload_len(state, canvas_id, data.len()) {
+        return None;
+    }
+    let mut owned = Vec::new();
+    if owned.try_reserve_exact(data.len()).is_err() {
+        record_webgl_upload_oom(state, canvas_id);
+        return None;
+    }
+    owned.extend_from_slice(data);
+    Some(owned)
+}
+
+fn bounded_shader_source(state: &mut OpState, canvas_id: u32, source: &str) -> Option<String> {
+    if source.len() > MAX_WEBGL_SHADER_SOURCE_BYTES {
+        record_webgl_upload_oom(state, canvas_id);
+        return None;
+    }
+    let mut owned = String::new();
+    if owned.try_reserve_exact(source.len()).is_err() {
+        record_webgl_upload_oom(state, canvas_id);
+        return None;
+    }
+    owned.push_str(source);
+    Some(owned)
+}
+
 /// Result of trying to resolve RGBA bytes for a caller `image_id`.
 ///
 /// Encodes the distinction between "the caller is referencing an id
@@ -3742,7 +3912,15 @@ pub fn op_create_shader(
 }
 
 #[op2(fast)]
-pub fn op_shader_source(state: &mut OpState, #[smi] shader_id: u32, #[string] source: String) {
+pub fn op_shader_source(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] shader_id: u32,
+    #[string] source: &str,
+) {
+    let Some(source) = bounded_shader_source(state, canvas_id, source) else {
+        return;
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::ShaderSource {
@@ -4031,17 +4209,31 @@ pub fn op_buffer_data(
     #[smi] canvas_id: u32,
     #[smi] target: u32,
     #[smi] size: i32,
-    // #[buffer(copy)] gives us an owned Vec<u8> directly, avoiding an
-    // intermediate JsBuffer wrapper + separate .to_vec() heap allocation.
-    // The copy itself is unavoidable: V8 owns the ArrayBuffer backing store
-    // and we must send owned data to the render thread.
-    #[buffer(copy)] data: Option<Vec<u8>>,
+    #[buffer] data: Option<&[u8]>,
     #[smi] usage: u32,
 ) {
     if data.is_none() && size <= 0 {
         error!("op_buffer_data: size must > 0 when data is None");
         return;
     }
+
+    let data = match data {
+        Some(bytes) => {
+            let Some(owned) = bounded_webgl_upload_copy(state, canvas_id, bytes) else {
+                return;
+            };
+            Some(owned)
+        }
+        None => {
+            let Ok(size) = usize::try_from(size) else {
+                return;
+            };
+            if !allow_webgl_upload_len(state, canvas_id, size) {
+                return;
+            }
+            None
+        }
+    };
 
     queue_gl_fire_and_forget(
         state,
@@ -4243,9 +4435,17 @@ pub fn op_tex_image_2d(
     #[smi] border: i32,
     #[smi] format: u32,
     #[smi] type_: u32,
-    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
-    #[buffer(copy)] data: Option<Vec<u8>>,
+    #[buffer] data: Option<&[u8]>,
 ) {
+    let data = match data {
+        Some(bytes) => {
+            let Some(owned) = bounded_webgl_upload_copy(state, canvas_id, bytes) else {
+                return;
+            };
+            Some(Arc::new(owned))
+        }
+        None => None,
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::TexImage2D {
@@ -4258,7 +4458,7 @@ pub fn op_tex_image_2d(
             border,
             format,
             type_,
-            data: data.map(Arc::new),
+            data,
         },
     );
 }
@@ -4508,9 +4708,11 @@ pub fn op_tex_sub_image_2d(
     #[smi] height: i32,
     #[smi] format: u32,
     #[smi] type_: u32,
-    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
-    #[buffer(copy)] data: Vec<u8>,
+    #[buffer] data: &[u8],
 ) {
+    let Some(data) = bounded_webgl_upload_copy(state, canvas_id, data) else {
+        return;
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::TexSubImage2D {
@@ -4653,9 +4855,11 @@ pub fn op_compressed_tex_image_2d(
     #[smi] width: i32,
     #[smi] height: i32,
     #[smi] border: i32,
-    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
-    #[buffer(copy)] data: Vec<u8>,
+    #[buffer] data: &[u8],
 ) {
+    let Some(data) = bounded_webgl_upload_copy(state, canvas_id, data) else {
+        return;
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::CompressedTexImage2D {
@@ -4682,9 +4886,11 @@ pub fn op_compressed_tex_sub_image_2d(
     #[smi] width: i32,
     #[smi] height: i32,
     #[smi] format: u32,
-    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
-    #[buffer(copy)] data: Vec<u8>,
+    #[buffer] data: &[u8],
 ) {
+    let Some(data) = bounded_webgl_upload_copy(state, canvas_id, data) else {
+        return;
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::CompressedTexSubImage2D {
@@ -4711,9 +4917,11 @@ pub fn op_buffer_sub_data(
     #[smi] canvas_id: u32,
     #[smi] target: u32,
     #[smi] offset: i32,
-    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
-    #[buffer(copy)] data: Vec<u8>,
+    #[buffer] data: &[u8],
 ) {
+    let Some(data) = bounded_webgl_upload_copy(state, canvas_id, data) else {
+        return;
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::BufferSubData {
@@ -5519,6 +5727,32 @@ pub fn op_renderbuffer_storage(
 // Phase 3B: Misc
 // ---------------------------------------------------------------------------
 
+/// Validates the allocation implied by `readPixels` before a synchronous
+/// render command is published. Returning `None` means the caller must return
+/// an empty result without flushing or touching the render queue.
+fn prepare_read_pixels(
+    state: &mut OpState,
+    canvas_id: u32,
+    width: i32,
+    height: i32,
+    format: u32,
+    type_: u32,
+) -> Option<usize> {
+    let bytes_per_pixel = webgl_readback_bytes_per_pixel(format, type_);
+    match checked_readback_byte_len(width, height, bytes_per_pixel) {
+        Some(byte_len) => Some(byte_len),
+        None => {
+            let code = if width < 0 || height < 0 {
+                crate::rendering::webgl::error_state::codes::INVALID_VALUE
+            } else {
+                crate::rendering::webgl::error_state::codes::OUT_OF_MEMORY
+            };
+            crate::rendering::webgl::error_state::push_error(state, canvas_id, code);
+            None
+        }
+    }
+}
+
 #[op2]
 #[buffer]
 pub fn op_read_pixels(
@@ -5531,6 +5765,13 @@ pub fn op_read_pixels(
     #[smi] format: u32,
     #[smi] type_: u32,
 ) -> Vec<u8> {
+    let Some(byte_len) = prepare_read_pixels(state, canvas_id, width, height, format, type_) else {
+        return Vec::new();
+    };
+    if byte_len == 0 {
+        return Vec::new();
+    }
+
     send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::ReadPixels {
             canvas_id,
@@ -6187,17 +6428,25 @@ fn normalize_tex_upload_3d_source(
     src_offset: u32,
     bytes_per_element: u32,
     pbo_offset: Option<u32>,
-) -> shared::protocol::render_cmd::TexImage3DSource {
+) -> Result<shared::protocol::render_cmd::TexImage3DSource, ()> {
     if let Some(offset) = pbo_offset {
-        return shared::protocol::render_cmd::TexImage3DSource::BufferOffset(offset);
+        return Ok(shared::protocol::render_cmd::TexImage3DSource::BufferOffset(offset));
     }
     let Some(pixels) = pixels else {
-        return shared::protocol::render_cmd::TexImage3DSource::None;
+        return Ok(shared::protocol::render_cmd::TexImage3DSource::None);
     };
     let elem_bytes = usize::try_from(bytes_per_element.max(1)).unwrap_or(1);
     let start = elem_bytes.saturating_mul(src_offset as usize);
     let bytes = pixels.get(start..).unwrap_or(&[]);
-    shared::protocol::render_cmd::TexImage3DSource::Bytes(Arc::new(bytes.to_vec()))
+    if !webgl_upload_is_within_limit(bytes.len()) {
+        return Err(());
+    }
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(bytes.len()).map_err(|_| ())?;
+    owned.extend_from_slice(bytes);
+    Ok(shared::protocol::render_cmd::TexImage3DSource::Bytes(
+        Arc::new(owned),
+    ))
 }
 
 #[op2]
@@ -6220,12 +6469,15 @@ pub fn op_tex_image_3d(
     #[smi] bytes_per_element: u32,
     #[smi] pbo_offset: i32,
 ) {
-    let data = normalize_tex_upload_3d_source(
+    let Ok(data) = normalize_tex_upload_3d_source(
         pixels,
         src_offset,
         bytes_per_element,
         (pbo_offset >= 0).then_some(pbo_offset as u32),
-    );
+    ) else {
+        record_webgl_upload_oom(state, canvas_id);
+        return;
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::TexImage3D {
@@ -6264,12 +6516,15 @@ pub fn op_tex_sub_image_3d(
     #[smi] bytes_per_element: u32,
     #[smi] pbo_offset: i32,
 ) {
-    let data = normalize_tex_upload_3d_source(
+    let Ok(data) = normalize_tex_upload_3d_source(
         pixels,
         src_offset,
         bytes_per_element,
         (pbo_offset >= 0).then_some(pbo_offset as u32),
-    );
+    ) else {
+        record_webgl_upload_oom(state, canvas_id);
+        return;
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::TexSubImage3D {

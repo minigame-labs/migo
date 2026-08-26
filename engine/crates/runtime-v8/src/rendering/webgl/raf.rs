@@ -163,8 +163,11 @@ mod tests {
         );
         assert!(
             src.contains("Object.keys(__raf_callbacks).length > 0"),
-            "__migo_restart_raf_loop must only restart when a callback is queued"
+            "the internal RAF restart hook must only restart when a callback is queued"
         );
+        assert!(src.contains("import { frameEndAll }"));
+        assert!(!src.contains("globalThis.__migo_frame_end_all"));
+        assert!(src.contains("globalThis._internalRestartRafLoop"));
     }
 
     /// The op must hand the Number to the one authority rather than deciding the

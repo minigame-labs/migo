@@ -27,7 +27,7 @@ ok game_123
 ok a
 ok 0
 ok puzzlequest
-ok wx1234567890abcdef
+ok mg1234567890abcdef
 ok aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 # --- case is not part of the id space ---------------------------------------

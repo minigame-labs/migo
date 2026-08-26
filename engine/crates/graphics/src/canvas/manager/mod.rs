@@ -107,6 +107,7 @@ struct Canvas2DSnapshotEntry {
     tex: glow::NativeTexture,
     width: u32,
     height: u32,
+    bytes: usize,
     cache_key: Option<Box<shared::text_texture_cache::TextCacheKey>>,
 }
 
@@ -235,6 +236,8 @@ pub(crate) struct CanvasManager {
     /// never builds up across frames.  Bounded at
     /// [`MAX_LIVE_CANVAS2D_SNAPSHOTS`] entries; oldest evicted first.
     canvas2d_snapshots: HashMap<u32, Canvas2DSnapshotEntry>,
+    /// Aggregate RGBA bytes retained by the live snapshot textures.
+    canvas2d_snapshot_bytes: usize,
     /// Insertion order tracker for the per-frame drain.
     /// `VecDeque` for O(1) push/pop on both ends.  Snapshot ids are
     /// allocated JS-side and arrive on the wire with the capture
@@ -359,6 +362,9 @@ pub(crate) struct CanvasManager {
     pub(crate) framebuffers: HashMap<FramebufferId, FramebufferMeta>,
     pub(crate) renderbuffers: HashMap<RenderbufferId, RenderbufferMeta>,
     pub(crate) gl_state: HashMap<CanvasId, CanvasGLState>,
+    /// Ordered, authoritative accounting for WebGL-created texture and
+    /// renderbuffer storage. This excludes Canvas2D/internal renderer objects.
+    pub(crate) webgl_gpu_budget: crate::webgl_gpu_budget::WebGlGpuBudget,
 
     // WebGL 2 registries.  Kept separate from the WebGL 1 set because
     // lookup paths are distinct (VAOs are bound by the state tracker,
@@ -784,6 +790,7 @@ impl CanvasManager {
             image_registry: ImageRegistry::new(),
             image_copy_fbos: HashMap::with_capacity(4),
             canvas2d_snapshots: HashMap::with_capacity(8),
+            canvas2d_snapshot_bytes: 0,
             canvas2d_snapshot_order: std::collections::VecDeque::with_capacity(8),
             canvas2d_snapshot_blit_fbo: None,
             canvas2d_snapshot_read_fbo: None,
@@ -807,6 +814,7 @@ impl CanvasManager {
             framebuffers: HashMap::with_capacity(8),
             renderbuffers: HashMap::with_capacity(8),
             gl_state: HashMap::with_capacity(4),
+            webgl_gpu_budget: crate::webgl_gpu_budget::WebGlGpuBudget::new(),
             vaos: HashMap::with_capacity(16),
             samplers: HashMap::with_capacity(8),
             syncs: HashMap::with_capacity(4),
@@ -871,6 +879,12 @@ impl CanvasManager {
     /// (`CanvasCmd::RegisterOffscreen`) where JS owns the id range.
     /// Idempotent: if `id` already exists this is a no-op.
     pub(crate) fn register_offscreen(&mut self, id: CanvasId, w: u32, h: u32) -> EngineResult<()> {
+        if shared::protocol::render_cmd::checked_canvas_pixel_count(w, h).is_none() {
+            return Err(ee(
+                ErrorCode::InvalidArgument,
+                format!("offscreen canvas {w}x{h} exceeds the surface pixel cap"),
+            ));
+        }
         if self.canvases.contains_key(&id) {
             return Ok(());
         }
@@ -1800,6 +1814,7 @@ impl CanvasManager {
             }
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
+
             self.image_registry.remove_canvas_images(id);
 
             // Switch to the resource (pbuffer) context so the ANativeWindow is
@@ -2288,6 +2303,7 @@ impl CanvasManager {
         self.textures.clear();
         self.framebuffers.clear();
         self.renderbuffers.clear();
+        self.webgl_gpu_budget.clear();
         self.vaos.clear();
         self.queries.clear();
         self.transform_feedbacks.clear();
@@ -2425,6 +2441,41 @@ impl CanvasManager {
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
 
+            // This offscreen WebGL context is actually gone (unlike an
+            // onscreen surface detach, which preserves its context). Delete
+            // its share-group objects and return resident-byte charges.
+            let texture_ids = self
+                .textures
+                .iter()
+                .filter_map(|(texture_id, meta)| {
+                    (meta.owner_canvas == Some(id)).then_some(*texture_id)
+                })
+                .collect::<Vec<_>>();
+            for texture_id in texture_ids {
+                if let Some(meta) = self.textures.remove(&texture_id) {
+                    if let Some(handle) = meta.gl_handle {
+                        unsafe { self.gl.delete_texture(handle) };
+                    }
+                }
+                self.webgl_gpu_budget.delete_texture(texture_id);
+            }
+            let renderbuffer_ids = self
+                .renderbuffers
+                .iter()
+                .filter_map(|(renderbuffer_id, meta)| {
+                    (meta.owner_canvas == Some(id)).then_some(*renderbuffer_id)
+                })
+                .collect::<Vec<_>>();
+            for renderbuffer_id in renderbuffer_ids {
+                if let Some(meta) = self.renderbuffers.remove(&renderbuffer_id) {
+                    if let Some(handle) = meta.gl_handle {
+                        unsafe { self.gl.delete_renderbuffer(handle) };
+                    }
+                }
+                self.webgl_gpu_budget.delete_renderbuffer(renderbuffer_id);
+            }
+            self.webgl_gpu_budget.release_context(id);
+
             // Release the GPU-copy FBO for this canvas.  FBO names
             // are context-local, so it would be unusable after the
             // owning canvas is gone.
@@ -2474,7 +2525,7 @@ impl CanvasManager {
         }
 
         // Delete GL objects (best effort). Need a current context.
-        let _ = self.ensure_any_canvas_current();
+        let has_current_context = self.ensure_any_canvas_current().is_ok();
 
         unsafe {
             for (_id, p) in self.programs.drain() {
@@ -2505,10 +2556,13 @@ impl CanvasManager {
             for (_id, fbo) in self.image_copy_fbos.drain() {
                 self.gl.delete_framebuffer(fbo);
             }
-            for (_id, entry) in self.canvas2d_snapshots.drain() {
-                self.gl.delete_texture(entry.tex);
+            if has_current_context {
+                for (_id, entry) in self.canvas2d_snapshots.drain() {
+                    self.gl.delete_texture(entry.tex);
+                }
+                self.canvas2d_snapshot_order.clear();
+                self.canvas2d_snapshot_bytes = 0;
             }
-            self.canvas2d_snapshot_order.clear();
             if let Some(fbo) = self.canvas2d_snapshot_blit_fbo.take() {
                 self.gl.delete_framebuffer(fbo);
             }
@@ -2521,6 +2575,7 @@ impl CanvasManager {
                 }
             }
         }
+        self.webgl_gpu_budget.clear();
 
         // Images
         self.image_registry.destroy_all(&self.gl);
@@ -2557,6 +2612,13 @@ impl CanvasManager {
         let windows_explicitly_released =
             self.pending_onscreen.is_none() && self.installed_surface.is_none();
         let display_terminated = self.egl.shutdown();
+        if display_terminated {
+            // If no context was available above, EGL termination is the
+            // teardown proof that reclaims the retained snapshot textures.
+            self.canvas2d_snapshots.clear();
+            self.canvas2d_snapshot_order.clear();
+            self.canvas2d_snapshot_bytes = 0;
+        }
         self.native_release_confirmed = windows_explicitly_released || display_terminated;
         if self.native_release_confirmed {
             self.pending_onscreen = None;
@@ -3066,6 +3128,13 @@ impl CanvasManager {
 
         let new_w = w.unwrap_or(old_w);
         let new_h = h.unwrap_or(old_h);
+
+        if shared::protocol::render_cmd::checked_canvas_pixel_count(new_w, new_h).is_none() {
+            return Err(ee(
+                ErrorCode::InvalidArgument,
+                format!("canvas resize {new_w}x{new_h} exceeds the surface pixel cap"),
+            ));
+        }
 
         // Recorded before the no-op return below, because assigning the size it
         // already has still claims the canvas -- the JS setter sets its half of
@@ -3983,7 +4052,7 @@ impl CanvasManager {
     // are byte-identical because `0 * alpha == 0`.  Coloured AA
     // glyphs render with marginally darker fringes — acceptable for
     // the >10× perf win.  Games that need bit-exact unpremul bytes
-    // can call `migo._force_readback(imageData)` to fall back to the
+    // can read `imageData.data` to fall back to the
     // legacy `read_image_data` synchronous path.
 
     /// Maximum live snapshot textures kept in the pool at any time.
@@ -4004,6 +4073,12 @@ impl CanvasManager {
     /// cached JS), we silently drop the snapshot rather than
     /// blowing past the 200 MB native-heap target.
     const MAX_LIVE_CANVAS2D_SNAPSHOTS: usize = 1024;
+    /// Hard aggregate RGBA footprint for snapshots retained until frame-end.
+    /// Reuse the synchronous-pixel ceiling so one temporary optimization pool
+    /// cannot consume more GPU storage than the largest readback we otherwise
+    /// permit. Typical text snapshots are much smaller than this budget.
+    const MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES: usize =
+        shared::protocol::render_cmd::MAX_SYNC_READBACK_BYTES;
 
     /// Capture a Canvas2D sub-rectangle into a GL texture using a
     /// caller-supplied `snapshot_id`.  Powers the fire-and-forget
@@ -4031,6 +4106,45 @@ impl CanvasManager {
         snapshot_id: u32,
     ) -> EngineResult<u32> {
         if width == 0 || height == 0 {
+            return Ok(0);
+        }
+        let snapshot_bytes =
+            match shared::protocol::render_cmd::checked_canvas_rgba_byte_len(width, height) {
+                Some(bytes) => bytes,
+                None => {
+                    return Err(ee(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "canvas snapshot {width}x{height} exceeds the synchronous RGBA cap"
+                        ),
+                    ));
+                }
+            };
+        if self.canvas2d_snapshots.contains_key(&snapshot_id) {
+            return Ok(0);
+        }
+        let Some(next_snapshot_bytes) = self.canvas2d_snapshot_bytes.checked_add(snapshot_bytes)
+        else {
+            return Ok(0);
+        };
+        if next_snapshot_bytes > Self::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES {
+            return Ok(0);
+        }
+        let (w_i32, h_i32) = (width as i32, height as i32);
+        let Some((surface_width, surface_height)) = self
+            .contexts_2d
+            .get(&canvas_id)
+            .map(|ctx| (ctx.width as i32, ctx.height as i32))
+        else {
+            return Ok(0);
+        };
+        let Some(right) = x.checked_add(w_i32) else {
+            return Ok(0);
+        };
+        let Some(bottom) = y.checked_add(h_i32) else {
+            return Ok(0);
+        };
+        if x < 0 || y < 0 || right > surface_width || bottom > surface_height {
             return Ok(0);
         }
         // GLES 3.0+ required for glBlitFramebuffer.  On GLES 2 we
@@ -4113,8 +4227,6 @@ impl CanvasManager {
                     .with_detail(e)
             })?
         };
-
-        let (w_i32, h_i32) = (width as i32, height as i32);
 
         // Save GL state we're about to mutate so the surrounding
         // WebGL/Canvas2D batch sees no observable change.
@@ -4306,10 +4418,12 @@ impl CanvasManager {
                 tex: dest_tex,
                 width,
                 height,
+                bytes: snapshot_bytes,
                 cache_key: None,
             },
         );
         self.canvas2d_snapshot_order.push_back(snapshot_id);
+        self.canvas2d_snapshot_bytes = next_snapshot_bytes;
         Ok(snapshot_id)
     }
 
@@ -4327,6 +4441,27 @@ impl CanvasManager {
         if let Some(entry) = self.canvas2d_snapshots.get_mut(&snapshot_id) {
             entry.cache_key = Some(key);
         }
+    }
+
+    fn remove_canvas2d_snapshot(&mut self, snapshot_id: u32) -> Option<Canvas2DSnapshotEntry> {
+        let entry = self.canvas2d_snapshots.remove(&snapshot_id)?;
+        self.canvas2d_snapshot_order.retain(|&id| id != snapshot_id);
+        self.canvas2d_snapshot_bytes = match self.canvas2d_snapshot_bytes.checked_sub(entry.bytes) {
+            Some(remaining) => remaining,
+            None => {
+                // An accounting bug must fail closed in production: keeping the
+                // budget exhausted is safer than opening an unbounded allocation
+                // path, and unlike a panic it still lets the render thread tear
+                // down the already-created resources.
+                tracing::error!(
+                    live_bytes = self.canvas2d_snapshot_bytes,
+                    removed_bytes = entry.bytes,
+                    "Canvas2D snapshot byte accounting underflow"
+                );
+                Self::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES
+            }
+        };
+        Some(entry)
     }
 
     /// Helper used by [`Self::snapshot_canvas2d_region`] to roll
@@ -4629,8 +4764,7 @@ impl CanvasManager {
 
         // Defence: free any leftover entry from a prior direct call
         // that errored before the post-upload cleanup ran.
-        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
-            self.canvas2d_snapshot_order.retain(|&i| i != id);
+        if let Some(entry) = self.remove_canvas2d_snapshot(id) {
             unsafe {
                 self.gl.delete_texture(entry.tex);
             }
@@ -4651,8 +4785,7 @@ impl CanvasManager {
 
         // Free immediately.  The drain at frame end would clean it up
         // anyway, but we'd rather not pin the slot for a whole frame.
-        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
-            self.canvas2d_snapshot_order.retain(|&i| i != id);
+        if let Some(entry) = self.remove_canvas2d_snapshot(id) {
             unsafe {
                 self.gl.delete_texture(entry.tex);
             }
@@ -4679,8 +4812,7 @@ impl CanvasManager {
     ) -> EngineResult<()> {
         let id = Self::DIRECT_CANVAS2D_RESERVED_ID;
 
-        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
-            self.canvas2d_snapshot_order.retain(|&i| i != id);
+        if let Some(entry) = self.remove_canvas2d_snapshot(id) {
             unsafe {
                 self.gl.delete_texture(entry.tex);
             }
@@ -4696,8 +4828,7 @@ impl CanvasManager {
             canvas_id, target, level, xoffset, yoffset, id,
         )?;
 
-        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
-            self.canvas2d_snapshot_order.retain(|&i| i != id);
+        if let Some(entry) = self.remove_canvas2d_snapshot(id) {
             unsafe {
                 self.gl.delete_texture(entry.tex);
             }
@@ -4812,7 +4943,7 @@ impl CanvasManager {
     }
 
     /// Sync CPU readback of a snapshot texture, used by
-    /// `migo._force_readback(imageData)`.  Layout matches the
+    /// lazy `ImageData.data` getter. Layout matches the
     /// legacy CPU path: top-down RGBA8 rows, length `w * h * 4`.
     /// Empty `Vec` on failure.
     pub(crate) fn read_canvas2d_snapshot_pixels(
@@ -4917,11 +5048,10 @@ impl CanvasManager {
         }
         // Need a current GL context for `glDeleteTextures`.
         if self.ensure_any_canvas_current().is_err() {
-            // No live canvas → drop the entries; the textures will
-            // leak until the EGL context tears down.  This is
-            // acceptable because `destroy_all` re-runs the cleanup.
-            self.canvas2d_snapshots.clear();
-            self.canvas2d_snapshot_order.clear();
+            // No live canvas yet: retain the entries and their texture handles.
+            // A later canvas recreation can make a context current and delete
+            // them. Clearing the map here would leak the textures until EGL
+            // teardown and would also lose the aggregate-byte accounting.
             return;
         }
 
@@ -4931,6 +5061,7 @@ impl CanvasManager {
         // when many entries are being moved.
         let drained: Vec<(u32, Canvas2DSnapshotEntry)> = self.canvas2d_snapshots.drain().collect();
         self.canvas2d_snapshot_order.clear();
+        self.canvas2d_snapshot_bytes = 0;
 
         let mut to_delete: Vec<glow::NativeTexture> = Vec::new();
         let mut to_cache: Vec<Canvas2DSnapshotEntry> = Vec::new();
@@ -4946,14 +5077,11 @@ impl CanvasManager {
             let mut cache = self.text_cache.lock();
             for entry in to_cache {
                 let key = entry.cache_key.expect("cache_key checked above");
-                let size_bytes = (entry.width as usize)
-                    .saturating_mul(entry.height as usize)
-                    .saturating_mul(4);
                 let cached = shared::text_texture_cache::CachedTextEntry {
                     texture_id: entry.tex.0.get(),
                     width: entry.width,
                     height: entry.height,
-                    size_bytes,
+                    size_bytes: entry.bytes,
                 };
                 let evicted_ids = cache.insert(*key, cached);
                 for raw in evicted_ids {
@@ -6027,6 +6155,43 @@ mod recovery_source_guards {
         assert!(
             restore < clears_flag,
             "a half-restored share group must never report a recovered context"
+        );
+    }
+
+    #[test]
+    fn canvas_snapshot_creation_checks_an_aggregate_byte_budget() {
+        let body = function_body(MGR, "pub(crate) fn snapshot_canvas2d_region_with_id");
+        assert!(
+            body.contains("MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES"),
+            "snapshot creation must enforce an aggregate GPU byte budget"
+        );
+        assert!(
+            body.contains("checked_add"),
+            "aggregate snapshot bytes must use checked arithmetic"
+        );
+    }
+
+    #[test]
+    fn canvas_snapshot_drain_defers_when_no_context_is_current() {
+        let body = function_body(MGR, "pub(crate) fn drain_canvas2d_snapshots");
+        assert!(
+            body.contains("ensure_any_canvas_current().is_err()"),
+            "drain must detect that no context is available"
+        );
+        assert!(
+            !body.contains("canvas2d_snapshots.clear()"),
+            "drain must retain texture handles until a context can delete them"
+        );
+        let teardown = function_body(MGR, "pub(crate) fn destroy_all");
+        let shutdown = teardown
+            .find("let display_terminated = self.egl.shutdown()")
+            .expect("teardown must reach EGL shutdown");
+        let clear = teardown
+            .find("self.canvas2d_snapshots.clear()")
+            .expect("teardown must clear retained handles only after EGL shutdown");
+        assert!(
+            shutdown < clear,
+            "EGL teardown must precede dropping handles when no context was current"
         );
     }
 }

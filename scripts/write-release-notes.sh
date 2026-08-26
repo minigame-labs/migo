@@ -45,7 +45,7 @@ for path in sorted(staging.iterdir(), key=lambda p: p.name.lower()):
     name = path.name
     if not path.is_file() or name.endswith(".attestation.json"):
         continue
-    if name in ("SHA256SUMS.txt", "version.json") or name.endswith("-sbom.cdx.json"):
+    if name in ("SHA256SUMS.txt", "version.json") or name.endswith(".sbom.cdx.json"):
         continue
     size = f"{path.stat().st_size / 1048576:.0f} MB"
     if name.endswith(".aar"):
@@ -61,7 +61,7 @@ PY
 )"
 
 cat > "$OUTPUT" <<NOTES
-Runtime SDKs for Android, Linux and OpenHarmony.
+Runtime SDKs for Android, Linux, OpenHarmony and Windows.
 
 ## Assets
 
@@ -83,10 +83,11 @@ a choice an integrator can make.
 sha256sum -c SHA256SUMS.txt 2>/dev/null | grep -v ': OK$' || echo "all verified"
 \`\`\`
 
-A platform not yet built in CI carries its own \`<asset>.attestation.json\` instead,
-recording the package's sha256 and size. Every published asset is covered by one or
-the other; \`scripts/verify-release-assets.sh <tag>\` is what checks that nothing is
-covered by neither.
+Every runtime payload also has an artifact-bound \`<asset>.sbom.cdx.json\` recording
+its SHA-256, exact target/profile and reachable dependency graph. Provenance
+\`<asset>.attestation.json\` sidecars record package identity; the checksum manifest
+covers both payloads and sidecars. \`scripts/verify-release-assets.sh <tag>\` checks
+that no published asset escapes that coverage.
 
 ## Source code (zip / tar.gz)
 

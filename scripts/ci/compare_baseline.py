@@ -17,15 +17,25 @@ The current metrics JSON should have flat key-value pairs matching the
 metric names defined in the baseline file, e.g.:
     { "fps": 58.3, "frame_time_ms": 16.8, "startup_time_ms": 2100 }
 
-Metrics present in the baseline but missing from current are reported
-as "skipped" (not a failure).
+Metrics marked `required` in the baseline fail when missing or non-numeric.
+Only explicitly optional metrics may be skipped.
 """
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
+
+REPORT_BINDING_FIELDS = (
+    "_source_revision",
+    "_artifact_sha256",
+    "_installed_native_sha256",
+    "_device_abi",
+    "_profile",
+    "_package",
+)
 
 
 def load_json(path):
@@ -82,8 +92,9 @@ def evaluate_metric(name, value, spec):
             result["message"] = f"{name} = {value}{unit} OK"
             result["threshold"] = fail_threshold
     else:
-        result["status"] = "pass"
-        result["message"] = f"{name} = {value}{unit} (unknown direction, skipping check)"
+        result["status"] = "fail"
+        result["threshold"] = None
+        result["message"] = f"{name}: unknown comparison direction {direction!r}"
 
     return result
 
@@ -98,21 +109,39 @@ def compare(current, baseline):
     has_warnings = False
 
     for metric_name, spec in sorted(metrics_spec.items()):
+        required = spec.get("required") is True
         if metric_name not in current:
+            status = "fail" if required else "skipped"
             results.append({
                 "name": metric_name,
-                "status": "skipped",
-                "message": f"{metric_name}: not present in current metrics (skipped)",
+                "status": status,
+                "message": (
+                    f"{metric_name}: required metric is missing"
+                    if required
+                    else f"{metric_name}: optional metric is missing (skipped)"
+                ),
             })
+            has_failures = has_failures or required
             continue
 
         value = current[metric_name]
-        if not isinstance(value, (int, float)):
+        numeric = (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+        if not numeric:
+            status = "fail" if required else "skipped"
             results.append({
                 "name": metric_name,
-                "status": "skipped",
-                "message": f"{metric_name}: non-numeric value '{value}' (skipped)",
+                "status": status,
+                "message": (
+                    f"{metric_name}: required metric is not a finite number"
+                    if required
+                    else f"{metric_name}: optional metric is not numeric (skipped)"
+                ),
             })
+            has_failures = has_failures or required
             continue
 
         result = evaluate_metric(metric_name, value, spec)
@@ -157,7 +186,15 @@ def print_report(results, has_failures, has_warnings):
     print("=" * 70)
 
 
-def write_summary(path, results, has_failures, has_warnings, baseline_path, current_path):
+def write_summary(
+    path,
+    results,
+    has_failures,
+    has_warnings,
+    baseline_path,
+    current_path,
+    current,
+):
     """Write machine-readable summary JSON."""
     summary = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -166,6 +203,9 @@ def write_summary(path, results, has_failures, has_warnings, baseline_path, curr
         "overall": "fail" if has_failures else ("warn" if has_warnings else "pass"),
         "metrics": results,
     }
+    summary.update(
+        {field: current[field] for field in REPORT_BINDING_FIELDS if field in current}
+    )
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -204,8 +244,15 @@ def main():
     print_report(results, has_failures, has_warnings)
 
     if args.summary_out:
-        write_summary(args.summary_out, results, has_failures, has_warnings,
-                       args.baseline, args.current)
+        write_summary(
+            args.summary_out,
+            results,
+            has_failures,
+            has_warnings,
+            args.baseline,
+            args.current,
+            current,
+        )
 
     if has_failures:
         sys.exit(1)

@@ -35,10 +35,24 @@ mod callback_isolation_tests {
         esm = ["ext:callback_isolation_bridge/bridge.js" = {
             source = r#"
                 import { createDeferredApi } from "ext:host_v8_base/02_async.js";
+                globalThis.__createDeferredApi = createDeferredApi;
+            "#
+        },],
+    );
+
+    // These probes name ops that deliberately do not exist in the slim profile.
+    // Keeping them in a full-only extension lets the profile-independent callback
+    // tests boot against the exact slim surface instead of making test code widen it.
+    #[cfg(all(feature = "api-media", feature = "api-system"))]
+    deno_core::extension!(
+        callback_error_bridge,
+        deps = [callback_isolation_bridge],
+        esm_entry_point = "ext:callback_error_bridge/bridge.js",
+        esm = ["ext:callback_error_bridge/bridge.js" = {
+            source = r#"
                 import { op_audio_create_context, op_worker_terminate } from "ext:core/ops";
                 globalThis.__audioOp = function () { return op_audio_create_context(1, 44100); };
                 globalThis.__workerOp = function () { return op_worker_terminate(); };
-                globalThis.__createDeferredApi = createDeferredApi;
             "#
         },],
     );
@@ -95,6 +109,8 @@ mod callback_isolation_tests {
     fn boot() -> JsRuntime {
         let mut extensions = crate::main_extensions(test_host_state());
         extensions.push(callback_isolation_bridge::init());
+        #[cfg(all(feature = "api-media", feature = "api-system"))]
+        extensions.push(callback_error_bridge::init());
         let mut rt = JsRuntime::new(RuntimeOptions {
             extensions,
             ..Default::default()
@@ -181,6 +197,7 @@ mod callback_isolation_tests {
     /// THREW OUT OF setInnerAudioOption: TypeError: Cannot read properties of
     /// undefined (reading 'message')
     /// ```
+    #[cfg(feature = "api-media")]
     #[test]
     fn a_failing_op_reports_through_fail_rather_than_throwing() {
         let mut rt = boot();
@@ -219,6 +236,7 @@ mod callback_isolation_tests {
     ///
     /// Asserted per class rather than in one loop: each name is registered
     /// separately, so one that is missed has to fail on its own.
+    #[cfg(all(feature = "api-media", feature = "api-system"))]
     #[test]
     fn a_failing_op_error_is_constructible_in_js() {
         let mut rt = boot();
@@ -258,6 +276,7 @@ mod callback_isolation_tests {
     /// The assertion is the synchronous half -- that a thenable comes back at
     /// all -- because that is precisely what was missing; how it settles is the
     /// shared `_pending` machinery the other two already exercise.
+    #[cfg(feature = "api-connectivity")]
     #[test]
     fn the_login_apis_return_a_promise_like_every_other_api() {
         let mut rt = boot();

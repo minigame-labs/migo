@@ -1400,13 +1400,17 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     /// Create a unique temp directory for a test.
     fn make_test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("migo_integrity_test_{}", name));
-        #[cfg(unix)]
-        make_tree_writable_for_test(&dir);
-        let _ = fs::remove_dir_all(&dir);
+        let sequence = TEST_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "migo_integrity_test_{name}_{}_{sequence}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

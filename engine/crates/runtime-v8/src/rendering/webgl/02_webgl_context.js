@@ -34,6 +34,8 @@ import {
     op_uniform_matrix_3fv,
     op_alloc_gl_resource_id,
     op_webgl_get_error,
+    op_webgl_record_error,
+    op_webgl_record_out_of_memory,
     op_webgl_get_context_attributes,
     op_webgl_record_attributes,
     op_enable,
@@ -175,6 +177,8 @@ const {
     DataViewPrototypeGetByteLength,
     DataViewPrototypeGetByteOffset,
     ArrayBufferPrototypeGetByteLength,
+    NumberIsFinite,
+    NumberIsInteger,
     ReflectApply,
 } = primordials;
 
@@ -405,7 +409,188 @@ const _rawTexSubImage3D      = _makeOrderedRaw(op_tex_sub_image_3d);
 const _rawTexStorage3D       = _makeOrderedRaw(op_tex_storage_3d);
 
 const GL_CURRENT_QUERY = 0x8865;
+const GL_INVALID_ENUM = 0x0500;
+const GL_INVALID_VALUE = 0x0501;
 const GL_INVALID_OPERATION = 0x0502;
+const MAX_WEBGL_UPLOAD_BYTES = 64 * 1024 * 1024;
+const MAX_WEBGL_SHADER_SOURCE_CODE_UNITS = 1024 * 1024;
+const MAX_WEBGL_GPU_2D_DIMENSION = 16384;
+const MAX_WEBGL_GPU_3D_DIMENSION = 2048;
+const MAX_WEBGL_GPU_ARRAY_LAYERS = 2048;
+const MAX_WEBGL_GPU_SAMPLES = 16;
+
+function recordGpuPreflightError(canvasId, code) {
+    op_webgl_record_error(canvasId, code);
+    return false;
+}
+
+function isKnownUnsizedFormat(format) {
+    switch (format) {
+        case 0x1902: // DEPTH_COMPONENT
+        case 0x1903: // RED
+        case 0x1906: // ALPHA
+        case 0x1907: // RGB
+        case 0x1908: // RGBA
+        case 0x1909: // LUMINANCE
+        case 0x190A: // LUMINANCE_ALPHA
+        case 0x8227: // RG
+        case 0x84F9: // DEPTH_STENCIL
+        case 0x8D94: // RED_INTEGER
+        case 0x8228: // RG_INTEGER
+        case 0x8D98: // RGB_INTEGER
+        case 0x8D99: // RGBA_INTEGER
+            return true;
+        default:
+            return false;
+    }
+}
+
+function isKnownSizedFormat(format) {
+    switch (format) {
+        // R / RG
+        case 0x8229: case 0x8F94: case 0x822D: case 0x822E:
+        case 0x8231: case 0x8232: case 0x8233: case 0x8234:
+        case 0x8235: case 0x8236: case 0x822B: case 0x8F95:
+        case 0x822F: case 0x8230: case 0x8237: case 0x8238:
+        case 0x8239: case 0x823A: case 0x823B: case 0x823C:
+        // RGB / RGBA normalized, float and integer
+        case 0x8051: case 0x8056: case 0x8057: case 0x8058:
+        case 0x8059: case 0x8C40: case 0x8C41: case 0x8C42:
+        case 0x8C43: case 0x8C3A: case 0x8C3B: case 0x8C3C:
+        case 0x8C3D: case 0x8C3E: case 0x8C3F: case 0x8814:
+        case 0x8815: case 0x881A: case 0x881B: case 0x8D70:
+        case 0x8D71: case 0x8D76: case 0x8D77: case 0x8D7C:
+        case 0x8D7D: case 0x8D82: case 0x8D83: case 0x8D88:
+        case 0x8D89: case 0x8D8E: case 0x8D8F: case 0x8F96:
+        case 0x8F97: case 0x906F:
+        // Depth / stencil
+        case 0x81A5: case 0x81A6: case 0x8CAC: case 0x88F0:
+        case 0x8CAD: case 0x8D48: case 0x84F9:
+            return true;
+        default:
+            return false;
+    }
+}
+
+function isKnownPixelType(type) {
+    switch (type) {
+        case 0x1400: case 0x1401: case 0x1402: case 0x1403:
+        case 0x1404: case 0x1405: case 0x1406: case 0x140B:
+        case 0x8033: case 0x8034: case 0x8363: case 0x8368:
+        case 0x84FA: case 0x8D61: case 0x8DAD:
+            return true;
+        default:
+            return false;
+    }
+}
+
+function maxMipLevels(dimension) {
+    let levels = 0;
+    for (let value = dimension; value > 0; value >>>= 1) levels++;
+    return levels;
+}
+
+function preflightTexImage2D(canvasId, target, level, internalformat,
+                             width, height, border, format, type) {
+    const isCubeFace = target >= 0x8515 && target <= 0x851A;
+    if (target !== 0x0DE1 && !isCubeFace) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_ENUM);
+    }
+    if (!NumberIsInteger(level) || level < 0 || level >= 15 ||
+        !NumberIsInteger(width) || width < 0 ||
+        !NumberIsInteger(height) || height < 0 || border !== 0) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_VALUE);
+    }
+    const maxAtLevel = (MAX_WEBGL_GPU_2D_DIMENSION >>> level) || 1;
+    if (width > maxAtLevel || height > maxAtLevel || (isCubeFace && width !== height)) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_VALUE);
+    }
+    if ((!isKnownUnsizedFormat(internalformat) && !isKnownSizedFormat(internalformat)) ||
+        !isKnownUnsizedFormat(format) || !isKnownPixelType(type)) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_ENUM);
+    }
+    return true;
+}
+
+function preflightTexStorage2D(canvasId, target, levels, internalformat, width, height) {
+    if (target !== 0x0DE1 && target !== 0x8513) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_ENUM);
+    }
+    if (!isKnownSizedFormat(internalformat)) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_ENUM);
+    }
+    if (!NumberIsInteger(levels) || levels <= 0 ||
+        !NumberIsInteger(width) || width <= 0 || width > MAX_WEBGL_GPU_2D_DIMENSION ||
+        !NumberIsInteger(height) || height <= 0 || height > MAX_WEBGL_GPU_2D_DIMENSION ||
+        levels > maxMipLevels(width > height ? width : height)) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_VALUE);
+    }
+    return true;
+}
+
+function preflightTexStorage3D(canvasId, target, levels, internalformat, width, height, depth) {
+    if (target !== 0x806F && target !== 0x8C1A) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_ENUM);
+    }
+    if (!isKnownSizedFormat(internalformat)) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_ENUM);
+    }
+    const maxXY = target === 0x806F ? MAX_WEBGL_GPU_3D_DIMENSION : MAX_WEBGL_GPU_2D_DIMENSION;
+    const mipBasis = target === 0x806F
+        ? (width > height ? (width > depth ? width : depth) : (height > depth ? height : depth))
+        : (width > height ? width : height);
+    if (!NumberIsInteger(levels) || levels <= 0 ||
+        !NumberIsInteger(width) || width <= 0 || width > maxXY ||
+        !NumberIsInteger(height) || height <= 0 || height > maxXY ||
+        !NumberIsInteger(depth) || depth <= 0 ||
+        depth > (target === 0x806F ? MAX_WEBGL_GPU_3D_DIMENSION : MAX_WEBGL_GPU_ARRAY_LAYERS) ||
+        levels > maxMipLevels(mipBasis)) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_VALUE);
+    }
+    return true;
+}
+
+function preflightRenderbuffer(canvasId, target, internalformat, width, height, samples) {
+    if (target !== 0x8D41 || !isKnownSizedFormat(internalformat)) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_ENUM);
+    }
+    if (!NumberIsInteger(width) || width < 0 || width > MAX_WEBGL_GPU_2D_DIMENSION ||
+        !NumberIsInteger(height) || height < 0 || height > MAX_WEBGL_GPU_2D_DIMENSION ||
+        !NumberIsInteger(samples) || samples < 0 || samples > MAX_WEBGL_GPU_SAMPLES) {
+        return recordGpuPreflightError(canvasId, GL_INVALID_VALUE);
+    }
+    return true;
+}
+
+function allowWebglUpload(canvasId, byteLength) {
+    if (!NumberIsFinite(byteLength) || byteLength < 0 || byteLength > MAX_WEBGL_UPLOAD_BYTES) {
+        op_webgl_record_out_of_memory(canvasId);
+        return false;
+    }
+    return true;
+}
+
+function toBoundedUploadBytes(canvasId, input) {
+    // Plain sequences allocate while converting to Uint8Array, so reject their
+    // declared length before that allocation. Buffer views are zero-copy here.
+    if (ArrayIsArray(input) && !allowWebglUpload(canvasId, input.length)) {
+        return null;
+    }
+    let view = toUnit8Array(input);
+    const byteLength = TypedArrayPrototypeGetByteLength(view);
+    if (!allowWebglUpload(canvasId, byteLength)) return null;
+    // Rust's bounded ops borrow before making their owned command copy.
+    view = ensureNonSharedTypedArray(view, Uint8Array);
+    return view;
+}
+
+function allowWebglShaderSource(canvasId, source) {
+    if (typeof source === "string" && source.length > MAX_WEBGL_SHADER_SOURCE_CODE_UNITS) {
+        op_webgl_record_out_of_memory(canvasId);
+        return false;
+    }
+    return true;
+}
 
 function toTypedArray(input, Type) {
     if (isTypedArray(input)) {
@@ -448,6 +633,33 @@ function ensureNonSharedTypedArray(view, Type) {
     return isSharedArrayBuffer(TypedArrayPrototypeGetBuffer(view))
         ? new Type(view)
         : view;
+}
+
+function prepare3DUploadView(canvasId, view, elementOffset, bytesPerElement) {
+    const viewBytes = TypedArrayPrototypeGetByteLength(view);
+    const start = elementOffset > 0 ? elementOffset * bytesPerElement : 0;
+    const remainingBytes = start <= viewBytes ? viewBytes - start : 0;
+    if (!allowWebglUpload(canvasId, remainingBytes)) return null;
+
+    // The native op borrows the view until it has made its bounded owned copy.
+    // A SharedArrayBuffer may be mutated by another isolate during that borrow,
+    // so freeze only the tail that will actually be uploaded.  Copying the full
+    // source would let a large view with a small srcOffset tail bypass the cap.
+    if (isSharedArrayBuffer(TypedArrayPrototypeGetBuffer(view))) {
+        const source = remainingBytes === 0
+            ? new Uint8Array(0)
+            : new Uint8Array(
+                TypedArrayPrototypeGetBuffer(view),
+                TypedArrayPrototypeGetByteOffset(view) + start,
+                remainingBytes,
+            );
+        return {
+            view: new Uint8Array(source),
+            elementOffset: 0,
+            bytesPerElement: 1,
+        };
+    }
+    return { view, elementOffset, bytesPerElement };
 }
 
 function toFloat32AsUint32(input) {
@@ -837,7 +1049,8 @@ class WebGLRenderingContext {
     }
 
     shaderSource(shader, src) {
-        return _rawShaderSource(shader?.id, src);
+        if (!allowWebglShaderSource(this._canvasId, src)) return;
+        return _rawShaderSource(this._canvasId, shader?.id, src);
     }
 
     compileShader(shader) {
@@ -1029,9 +1242,11 @@ class WebGLRenderingContext {
     bufferData(target, srcOrSize, usage) {
         if (typeof srcOrSize === "number") {
             const size = srcOrSize >>> 0;
+            if (!allowWebglUpload(this._canvasId, size)) return;
             return _rawBufferData(this._canvasId, target, size, null, usage);
         } else {
-            const u8 = toUnit8Array(srcOrSize);
+            const u8 = toBoundedUploadBytes(this._canvasId, srcOrSize);
+            if (u8 === null) return;
             return _rawBufferData(this._canvasId, target, -1, u8, usage);
         }
     }
@@ -1461,6 +1676,10 @@ class WebGLRenderingContext {
         // 9-arg: (target, level, internalformat, width, height, border, format, type, pixels)
         // 6-arg: (target, level, internalformat, format, type, source)
         if (a7 !== undefined) {
+            if (!preflightTexImage2D(
+                this._canvasId, target, level, internalformat,
+                a4, a5, a6, a7, a8,
+            )) return;
             // Text texture cache hit takes precedence.
             if (_migoTexImageFromTextCache(this._canvasId, target, level, internalformat, a9)) {
                 return;
@@ -1490,7 +1709,8 @@ class WebGLRenderingContext {
                 );
                 return;
             }
-            const data = a9 != null ? toUnit8Array(a9) : null;
+            const data = a9 != null ? toBoundedUploadBytes(this._canvasId, a9) : null;
+            if (a9 != null && data === null) return;
             _rawTexImage2D(this._canvasId, target, level, internalformat, a4, a5, a6, a7, a8, data);
         } else {
             const source = a6;
@@ -1530,9 +1750,11 @@ class WebGLRenderingContext {
             } else {
                 const raw = sourceToRawRgba(source);
                 if (raw) {
+                    const data = toBoundedUploadBytes(this._canvasId, raw.data);
+                    if (data === null) return;
                     _rawTexImage2D(
                         this._canvasId, target, level, internalformat,
-                        raw.width, raw.height, 0, a4, a5, raw.data,
+                        raw.width, raw.height, 0, a4, a5, data,
                     );
                     return;
                 }
@@ -1563,7 +1785,8 @@ class WebGLRenderingContext {
                 );
                 return;
             }
-            const data = toUnit8Array(pixels);
+            const data = toBoundedUploadBytes(this._canvasId, pixels);
+            if (data === null) return;
             _rawTexSubImage2D(this._canvasId, target, level, xoffset, yoffset, width, height, format, type, data);
             return;
         }
@@ -1601,9 +1824,11 @@ class WebGLRenderingContext {
         } else {
             const raw = sourceToRawRgba(source);
             if (raw) {
+                const data = toBoundedUploadBytes(this._canvasId, raw.data);
+                if (data === null) return;
                 _rawTexSubImage2D(
                     this._canvasId, target, level, xoffset, yoffset,
-                    raw.width, raw.height, sourceFormat, sourceType, raw.data,
+                    raw.width, raw.height, sourceFormat, sourceType, data,
                 );
                 return;
             }
@@ -1663,19 +1888,22 @@ class WebGLRenderingContext {
     }
 
     compressedTexImage2D(target, level, internalformat, width, height, border, data) {
-        const u8 = toUnit8Array(data);
+        const u8 = toBoundedUploadBytes(this._canvasId, data);
+        if (u8 === null) return;
         _rawCompressedTexImage2D(this._canvasId, target, level, internalformat, width, height, border, u8);
     }
 
     compressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, data) {
-        const u8 = toUnit8Array(data);
+        const u8 = toBoundedUploadBytes(this._canvasId, data);
+        if (u8 === null) return;
         _rawCompressedTexSubImage2D(this._canvasId, target, level, xoffset, yoffset, width, height, format, u8);
     }
 
     // -- Phase 1C: Buffer & Vertex Extensions --
 
     bufferSubData(target, offset, data) {
-        const u8 = toUnit8Array(data);
+        const u8 = toBoundedUploadBytes(this._canvasId, data);
+        if (u8 === null) return;
         _rawBufferSubData(this._canvasId, target, offset, u8);
     }
 
@@ -2030,6 +2258,9 @@ class WebGLRenderingContext {
         _rawBindRenderbuffer(this._canvasId, target, rbId);
     }
     renderbufferStorage(target, internalformat, width, height) {
+        if (!preflightRenderbuffer(
+            this._canvasId, target, internalformat, width, height, 1,
+        )) return;
         _rawRenderbufferStorage(this._canvasId, target, internalformat, width, height);
     }
 
@@ -2162,6 +2393,9 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
 
     // ---- Immutable texture storage ------------------------------
     texStorage2D(target, levels, internalformat, width, height) {
+        if (!preflightTexStorage2D(
+            this._canvasId, target, levels, internalformat, width, height,
+        )) return;
         _rawTexStorage2D(this._canvasId, target, levels, internalformat, width, height);
     }
 
@@ -2179,6 +2413,9 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         _rawInvalidateFramebuffer(this._canvasId, target, buf);
     }
     renderbufferStorageMultisample(target, samples, internalformat, width, height) {
+        if (!preflightRenderbuffer(
+            this._canvasId, target, internalformat, width, height, samples,
+        )) return;
         _rawRenderbufferStorageMultisample(this._canvasId, target, samples,
                                             internalformat, width, height);
     }
@@ -2437,12 +2674,43 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         width, height, depth, border,
         format, type, pixelsOrOffset, srcOffset
     ) {
+        if (target !== 0x806F && target !== 0x8C1A) {
+            recordGpuPreflightError(this._canvasId, GL_INVALID_ENUM);
+            return;
+        }
+        const maxXY = target === 0x806F
+            ? MAX_WEBGL_GPU_3D_DIMENSION
+            : MAX_WEBGL_GPU_2D_DIMENSION;
+        const maxDepth = target === 0x806F
+            ? MAX_WEBGL_GPU_3D_DIMENSION
+            : MAX_WEBGL_GPU_ARRAY_LAYERS;
+        const maxLevel = maxMipLevels(maxXY);
+        const maxAtLevel = (maxXY >>> level) || 1;
+        const maxDepthAtLevel = target === 0x806F
+            ? ((maxDepth >>> level) || 1)
+            : maxDepth;
+        if (!NumberIsInteger(level) || level < 0 || level >= maxLevel ||
+            !NumberIsInteger(width) || width < 0 || width > maxAtLevel ||
+            !NumberIsInteger(height) || height < 0 || height > maxAtLevel ||
+            !NumberIsInteger(depth) || depth < 0 || depth > maxDepthAtLevel || border !== 0) {
+            recordGpuPreflightError(this._canvasId, GL_INVALID_VALUE);
+            return;
+        }
+        if ((!isKnownUnsizedFormat(internalformat) && !isKnownSizedFormat(internalformat)) ||
+            !isKnownUnsizedFormat(format) || !isKnownPixelType(type)) {
+            recordGpuPreflightError(this._canvasId, GL_INVALID_ENUM);
+            return;
+        }
         // WebGL 2 overloads: data may be ArrayBufferView + optional
         // srcOffset, a PBO offset integer, or null (reserve storage).
         let view = null;
         let bytesPerElement = 1;
         let elementOffset = Number(srcOffset) || 0;
         let pboOffset = -1;
+        if (ArrayIsArray(pixelsOrOffset)
+                && !allowWebglUpload(this._canvasId, pixelsOrOffset.length)) {
+            return;
+        }
         if (typeof pixelsOrOffset === 'number') {
             pboOffset = pixelsOrOffset | 0;
         } else if (pixelsOrOffset && pixelsOrOffset.buffer) {
@@ -2454,6 +2722,15 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             );
         } else if (pixelsOrOffset instanceof ArrayBuffer) {
             view = new Uint8Array(pixelsOrOffset);
+        }
+        if (view && pboOffset < 0) {
+            const prepared = prepare3DUploadView(
+                this._canvasId, view, elementOffset, bytesPerElement,
+            );
+            if (prepared === null) return;
+            view = prepared.view;
+            elementOffset = prepared.elementOffset;
+            bytesPerElement = prepared.bytesPerElement;
         }
         _rawTexImage3D(
             this._canvasId, target, level, internalformat,
@@ -2471,6 +2748,10 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         let bytesPerElement = 1;
         let elementOffset = Number(srcOffset) || 0;
         let pboOffset = -1;
+        if (ArrayIsArray(pixelsOrOffset)
+                && !allowWebglUpload(this._canvasId, pixelsOrOffset.length)) {
+            return;
+        }
         if (typeof pixelsOrOffset === 'number') {
             pboOffset = pixelsOrOffset | 0;
         } else if (pixelsOrOffset && pixelsOrOffset.buffer) {
@@ -2486,6 +2767,15 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         if (!view && pboOffset < 0) {
             return;
         }
+        if (view && pboOffset < 0) {
+            const prepared = prepare3DUploadView(
+                this._canvasId, view, elementOffset, bytesPerElement,
+            );
+            if (prepared === null) return;
+            view = prepared.view;
+            elementOffset = prepared.elementOffset;
+            bytesPerElement = prepared.bytesPerElement;
+        }
         _rawTexSubImage3D(
             this._canvasId, target, level,
             xoffset, yoffset, zoffset,
@@ -2494,6 +2784,9 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         );
     }
     texStorage3D(target, levels, internalformat, width, height, depth) {
+        if (!preflightTexStorage3D(
+            this._canvasId, target, levels, internalformat, width, height, depth,
+        )) return;
         _rawTexStorage3D(
             this._canvasId, target, levels, internalformat,
             width, height, depth,

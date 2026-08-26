@@ -184,8 +184,10 @@ typedef void(MIGO_CALL *MigoOnExitRequestedFn)(void *user_data,
  * synchronisation to offer, and the wrong one where the platform has a vsync
  * signal, because self-pacing cannot align to the display.
  *
- * Delivered through the host's dispatcher like every other callback, so it
- * never runs on an engine thread.
+ * Delivered through the host's dispatcher like every other callback. The
+ * callback runs on whatever execution context that dispatcher chooses; a host
+ * that accepts and invokes the task inline has explicitly chosen the calling
+ * engine worker, while a UI dispatcher normally queues it to its event loop.
  */
 typedef void(MIGO_CALL *MigoOnRequestFrameFn)(void *user_data,
                                               MigoSession *session);

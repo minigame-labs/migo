@@ -1,6 +1,7 @@
 [package]
 name = "migo-contention-probe"
 version.workspace = true
+license.workspace = true
 edition = "2024"
 publish = false
 description = "Holds a cross-session lock and requires a per-event path to run anyway. Test-only."

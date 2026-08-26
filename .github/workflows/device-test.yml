@@ -1,201 +1,105 @@
-name: Device Tests
+name: Android Release Device Evidence
 
-# Runs on a self-hosted runner with a connected Android device.
-# Triggered manually or on a schedule.
+# One job owns the physical device for the entire run. Splitting install,
+# performance, power, and conformance into parallel jobs lets them overwrite
+# each other's package/process state and cannot prove they exercised one AAR.
 on:
   workflow_dispatch:
     inputs:
       package:
-        description: "App package name to test"
+        description: "Host app package built by the external device suite"
         required: true
         default: "com.example.migo.demo"
       duration:
-        description: "Metric collection duration (seconds)"
+        description: "Steady-state power measurement duration in seconds"
         required: false
         default: "60"
       test_suite_path:
-        description: "Path to migo-test-suite (relative to runner home)"
+        description: "External device-suite path, relative to this checkout"
         required: false
         default: "../migo-test-suite"
-      fail_on_warn:
-        description: "Treat warnings as failures"
-        type: boolean
-        default: false
-  # Optional: uncomment to run nightly
-  # schedule:
-  #   - cron: "0 3 * * *"  # 03:00 UTC daily
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-device
+  cancel-in-progress: false
 
 jobs:
-  # ── Job 1: Build debug AAR + install on device ─────────────────────
-  prepare:
+  build-install-and-gate:
     runs-on: [self-hosted, android-device]
-    timeout-minutes: 90
-    outputs:
-      package: ${{ steps.vars.outputs.package }}
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          lfs: false
 
-      - name: Set variables
-        id: vars
-        run: |
-          echo "package=${{ github.event.inputs.package || 'com.example.migo.demo' }}" >> "$GITHUB_OUTPUT"
-          echo "duration=${{ github.event.inputs.duration || '60' }}" >> "$GITHUB_OUTPUT"
-
-      - name: Verify adb connection
-        run: |
-          adb devices | grep -q 'device$' || { echo "ERROR: no device connected"; exit 1; }
-          echo "Device: $(adb shell getprop ro.product.model)"
-          echo "Android: $(adb shell getprop ro.build.version.release)"
-
-      # The test app must be pre-installed on the device before this workflow
-      # is dispatched. build-aar.sh and adb install are not run here because
-      # the runner's NDK and Java setup is the responsibility of the caller who
-      # prepared the device for a test session.
-
-  # ── Job 2: Performance metrics ──────────────────────────────────────
-  perf-test:
-    needs: prepare
-    runs-on: [self-hosted, android-device]
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
-      - name: Collect performance metrics
-        run: |
-          bash scripts/ci/collect_metrics.sh \
-            --type perf \
-            --package "${{ github.event.inputs.package || 'com.example.migo.demo' }}" \
-            --duration "${{ github.event.inputs.duration || '60' }}" \
-            --interval 2 \
-            --output ci/metrics/current_metrics.json
-
-      - name: Compare against perf baseline
-        run: |
-          bash scripts/ci/run_perf.sh \
-            --current ci/metrics/current_metrics.json \
-            --baseline ci/baselines/android_perf_default.json \
-            --summary-out reports/perf-compare-summary.json \
-            ${{ github.event.inputs.fail_on_warn == 'true' && '--fail-on-warn' || '' }}
-
-      - name: Upload perf results
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
-          name: perf-results
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: Install pinned Android NDK and cargo-ndk
+        uses: ./.github/actions/setup-android-ndk
+
+      - name: Cache Gradle downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
           path: |
-            ci/metrics/current_metrics.json
-            reports/perf-compare-summary.json
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: device-gradle-${{ hashFiles('platforms/android/**/*.gradle*', 'platforms/android/gradle/verification-metadata.xml', 'platforms/android/**/gradle.lockfile') }}
 
-  # ── Job 3: Power / resource metrics ────────────────────────────────
-  power-test:
-    needs: prepare
-    runs-on: [self-hosted, android-device]
-    timeout-minutes: 30
+      - name: Fetch verified Android V8 inputs
+        run: bash scripts/fetch-v8-archives.sh
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - name: Collect power metrics
+      - name: Build current full release AAR
         run: |
-          bash scripts/ci/collect_metrics.sh \
-            --type power \
-            --package "${{ github.event.inputs.package || 'com.example.migo.demo' }}" \
-            --duration "${{ github.event.inputs.duration || '60' }}" \
-            --interval 2 \
-            --output ci/metrics/current_power_metrics.json
+          rm -rf platforms/android/dist
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          bash scripts/build-aar.sh --product-profile full release
 
-      - name: Compare against power baseline
+      - name: Install current bytes and produce device evidence
+        env:
+          DEVICE_PACKAGE: ${{ github.event.inputs.package || 'com.example.migo.demo' }}
+          DEVICE_DURATION: ${{ github.event.inputs.duration || '60' }}
+          DEVICE_SUITE: ${{ github.event.inputs.test_suite_path || '../migo-test-suite' }}
         run: |
-          bash scripts/ci/run_power.sh \
-            --current ci/metrics/current_power_metrics.json \
-            --baseline ci/baselines/android_power_default.json \
-            --summary-out reports/power-compare-summary.json \
-            ${{ github.event.inputs.fail_on_warn == 'true' && '--fail-on-warn' || '' }}
+          ARTIFACT="platforms/android/dist/migo-$(cat release/VERSION)-android.aar"
+          bash scripts/ci/run_android_device_evidence.sh \
+            --artifact "$ARTIFACT" \
+            --package "$DEVICE_PACKAGE" \
+            --test-suite "$DEVICE_SUITE" \
+            --source-revision "$GITHUB_SHA" \
+            --duration "$DEVICE_DURATION" \
+            --out-dir artifacts/android-release-evidence
 
-      - name: Upload power results
+      - name: Upload artifact-bound device evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: power-results
+          name: android-release-evidence-${{ github.sha }}
           path: |
-            ci/metrics/current_power_metrics.json
-            reports/power-compare-summary.json
-
-  # ── Job 4: migo-test-suite API compatibility ────────────────────────
-  test-suite:
-    needs: prepare
-    runs-on: [self-hosted, android-device]
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - name: Check test suite availability
-        id: suite
-        run: |
-          SUITE_PATH="${{ github.event.inputs.test_suite_path || '../migo-test-suite' }}"
-          # A dispatched device-test run that tests nothing and reports success is
-          # the worst possible outcome: it silently grants confidence it did not earn.
-          if [ ! -d "$SUITE_PATH" ]; then
-            echo "ERROR: migo-test-suite not found at '$SUITE_PATH'" >&2
-            echo "Override with the test_suite_path input." >&2
-            exit 1
-          fi
-          echo "path=$SUITE_PATH" >> "$GITHUB_OUTPUT"
-
-      # The test suite must be run manually (or via its own runner script)
-      # and produce a report.json. This step assumes the report already exists
-      # or the suite has its own run mechanism.
-      - name: Run test suite
-        run: |
-          SUITE_PATH="${{ steps.suite.outputs.path }}"
-          if [ -f "$SUITE_PATH/run.sh" ]; then
-            bash "$SUITE_PATH/run.sh" \
-              --package "${{ github.event.inputs.package || 'com.example.migo.demo' }}" \
-              --output "$SUITE_PATH/report.json"
-          else
-            echo "No run.sh found in test suite, expecting pre-existing report.json"
-          fi
-
-      - name: Validate test suite results
-        run: |
-          SUITE_PATH="${{ steps.suite.outputs.path }}"
-          if [ -f "$SUITE_PATH/report.json" ]; then
-            python3 scripts/ci/check_migo_test_suite.py \
-              --report "$SUITE_PATH/report.json" \
-              --summary-out reports/test-suite-summary.json \
-              --gate
-          else
-            echo "ERROR: no report.json found after running the suite" >&2
-            exit 1
-          fi
-
-      - name: Upload test suite results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-suite-results
-          path: |
-            reports/test-suite-summary.json
-          if-no-files-found: warn
+            artifacts/android-release-evidence
+            platforms/android/dist/migo-*-android.aar
+          if-no-files-found: error
+          retention-days: 30

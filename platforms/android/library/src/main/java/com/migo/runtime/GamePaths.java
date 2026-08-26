@@ -319,10 +319,6 @@ public final class GamePaths {
     public String toString() {
         return "GamePaths{" +
                 "gameId='" + gameId + '\'' +
-                ", userDataDir=" + userDataDir +
-                ", cacheDir=" + cacheDir +
-                ", codeDir=" + codeDir +
-                ", tempDir=" + tempDir +
                 '}';
     }
 }

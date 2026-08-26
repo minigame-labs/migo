@@ -29,7 +29,28 @@ Cargo.lock
 logs/
 
 .claude/
+.agents/
 .worktrees/
+
+# Local agent/tool output and mutation reports are never source inputs.
+**/mutants.out*/
+**/.mutants.out*/
+
+# Credentials, signing material, device captures and detached debug output.
+*.pem
+*.key
+*.keystore
+*.jks
+*.p12
+*.mobileprovision
+*.hprof
+*.profraw
+*.profdata
+*.pdb
+*.dwp
+*.debug
+*.dSYM/
+**/captures/
 
 # Environment
 .env
