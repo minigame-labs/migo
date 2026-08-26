@@ -4,7 +4,10 @@ import {
   op_audio_stop_oscillator,
 } from "ext:core/ops";
 import { AudioParam } from "ext:host_v8_audio/00_audio_param.js";
-import { AudioNode } from "ext:host_v8_audio/00_audio_node.js";
+import {
+  AudioNode,
+  validateScheduledTime,
+} from "ext:host_v8_audio/00_audio_node.js";
 
 class OscillatorNode extends AudioNode {
   #type = "sine";
@@ -55,16 +58,18 @@ class OscillatorNode extends AudioNode {
 
   start(when = 0) {
     if (this.#started) {
-      throw new Error("OscillatorNode can only be started once");
+      throw new DOMException("OscillatorNode can only be started once", "InvalidStateError");
     }
-    this.#started = true;
+    when = validateScheduledTime(when, "when");
     op_audio_start_oscillator(this._nodeId, when);
+    this.#started = true;
   }
 
   stop(when = 0) {
     if (!this.#started) {
-      throw new Error("OscillatorNode has not been started");
+      throw new DOMException("OscillatorNode has not been started", "InvalidStateError");
     }
+    when = validateScheduledTime(when, "when");
     op_audio_stop_oscillator(this._nodeId, when);
   }
 }

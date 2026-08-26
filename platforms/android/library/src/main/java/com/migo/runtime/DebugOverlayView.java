@@ -19,7 +19,7 @@ import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import com.migo.runtime.internal.NativeBridge;
+import com.migo.runtime.internal.NativeMethods;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -265,7 +265,7 @@ public class DebugOverlayView extends LinearLayout {
     }
 
     private void refreshStats() {
-        byte[] data = NativeBridge.getDebugStats(sessionId);
+        byte[] data = NativeMethods.getDebugStats(sessionId);
         if (data == null || data.length < STATS_HEADER_LEN + 12) return;
 
         ByteBuffer buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
@@ -380,7 +380,7 @@ public class DebugOverlayView extends LinearLayout {
         // Snap = snapshots taken (FBO blit succeeded);
         // Up   = snapshots consumed by texImage2D (the cocos hot path);
         // FB   = JS fell back to the legacy CPU getImageData;
-        // FR   = `migo._force_readback(imageData)` calls (slow CPU readback).
+        // FR   = lazy ImageData byte materializations (slow CPU readback).
         // Steady state for a Cocos text-heavy game: Snap≈Up, FB=0, FR=0.
         rowSnap.setText(String.format(
                 "Snap: %d  Up: %d  FB: %d  FR: %d",

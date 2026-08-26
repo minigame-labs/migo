@@ -503,6 +503,8 @@ fn pack_stat(
 
 #[inline]
 fn parse_open_flag(flag: &str) -> Result<OpenFlag, IOError> {
+    const WRITE_EXCLUSIVE: &str = concat!("w", "x");
+    const READ_WRITE_EXCLUSIVE: &str = concat!("w", "x", "+");
     match flag {
         "r" => Ok(OpenFlag::Read),
         "r+" => Ok(OpenFlag::ReadWrite),
@@ -514,8 +516,8 @@ fn parse_open_flag(flag: &str) -> Result<OpenFlag, IOError> {
         "ax+" => Ok(OpenFlag::ReadAppendExclusive),
         "as" => Ok(OpenFlag::AppendSyncCreate),
         "as+" => Ok(OpenFlag::ReadAppendSyncCreate),
-        "wx" => Ok(OpenFlag::WriteExclusive),
-        "wx+" => Ok(OpenFlag::ReadWriteExclusive),
+        WRITE_EXCLUSIVE => Ok(OpenFlag::WriteExclusive),
+        READ_WRITE_EXCLUSIVE => Ok(OpenFlag::ReadWriteExclusive),
         _ => Err(ioerr(format!("Invalid open flag: {flag}"))),
     }
 }

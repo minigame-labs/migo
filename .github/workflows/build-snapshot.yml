@@ -71,11 +71,8 @@ concurrency:
   group: build-snapshot-${{ github.ref }}
   cancel-in-progress: true
 
-# The x86_64 job (workflow_dispatch only) pushes the regenerated snapshot to a
-# branch, so it needs contents:write. It surfaces a PR link rather than calling
-# gh pr create (which would need the repo-wide "Actions can create PRs" toggle).
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Confirm all committed kind/profile/ABI snapshots match every schema-v3 input.
@@ -87,7 +84,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         # No LFS download: the gate validates large objects from pointer oid/size.
       - name: Check snapshot freshness
         run: |
@@ -104,6 +101,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # This manual job alone pushes the regenerated snapshot branch. The
+    # push-triggered freshness job remains read-only.
+    permissions:
+      contents: write
     env:
       SNAPSHOT_KIND: ${{ inputs.snapshot_kind }}
       SNAPSHOT_PREFIX: ${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}
@@ -111,7 +112,7 @@ jobs:
       # must link the android-x86_64 one so the snapshot's external-reference
       # table matches the .so's V8 exactly.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
@@ -266,7 +267,7 @@ jobs:
           echo "Open the PR: $url"
 
       - name: Upload snapshot artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: snapshot-${{ inputs.snapshot_kind }}-${{ inputs.product_profile }}-android-x86_64
           path: |

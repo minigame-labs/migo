@@ -18,6 +18,22 @@ class CollectRenderMetricsTest(unittest.TestCase):
         self.assertIn("avg_fps", normalized["stats"])
         self.assertIn("p95_ms", normalized["stats"])
 
+    def test_normalize_result_preserves_release_bindings(self):
+        raw = {
+            "device": "pixel-4",
+            "workload": "cocos-webgl-gameplay",
+            "stats": {"avg_fps": 58.7, "p95_ms": 22.4},
+            "_source_revision": "a" * 40,
+            "_artifact_sha256": "b" * 64,
+            "_profile": "full",
+        }
+
+        normalized = normalize_result(raw)
+
+        self.assertEqual(normalized["_source_revision"], "a" * 40)
+        self.assertEqual(normalized["_artifact_sha256"], "b" * 64)
+        self.assertEqual(normalized["_profile"], "full")
+
     def test_normalize_result_converts_metrics_to_float(self):
         raw = {
             "device": "pixel-4",

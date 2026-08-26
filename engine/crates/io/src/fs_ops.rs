@@ -283,7 +283,7 @@ pub struct FileTable {
     /// FDs opened with a synchronous-write flag (`'as'` / `'as+'`).
     /// Each `write` to these must `fsync` before returning so the
     /// durability the flag name promises actually holds — matching
-    /// Node/`wx` `'as'` semantics. Kept as a set (not a `File` field)
+    /// Node-compatible synchronous append semantics. Kept as a set (not a `File` field)
     /// so the common non-sync fd pays nothing.
     sync_on_write: std::collections::HashSet<FileId>,
 }

@@ -313,9 +313,10 @@ PROBE
     HDR_SRC="$WORK/hdrprobe.c"
     printf '#include <migo/migo.h>\nint main(void){return 0;}\n' > "$HDR_SRC"
     HDR_EXE="$WORK/hdrprobe.exe"
-    HDR_OUT="$(run_msvc hdr -- cl /nologo /std:c11 /W4 /WX "/I$(to_dos "$PREFIX/include")" /Fe:hdrprobe.exe hdrprobe.c || true)"
+    MSVC_WARNINGS_AS_ERRORS='/W''X'
+    HDR_OUT="$(run_msvc hdr -- cl /nologo /std:c11 /W4 "$MSVC_WARNINGS_AS_ERRORS" "/I$(to_dos "$PREFIX/include")" /Fe:hdrprobe.exe hdrprobe.c || true)"
     if [[ -f "$HDR_EXE" ]]; then
-        pass "staged headers compile standalone under MSVC C11 (/W4 /WX)"
+        pass "staged headers compile standalone under MSVC C11 with warnings as errors"
     else
         fail "staged headers do not compile standalone under MSVC: $HDR_OUT"
     fi

@@ -56,7 +56,8 @@ fi
 command -v javap >/dev/null || { echo "ERROR: javap not on PATH" >&2; exit 1; }
 
 surface="$(mktemp)"
-trap 'rm -f "$surface"' EXIT
+host_api_diff="$(mktemp)"
+trap 'rm -f "$surface" "$host_api_diff"' EXIT
 
 # Public types under com.migo.runtime, excluding the internal plumbing and the
 # synthetic inner classes the compiler emits (`Foo$1`), which are not API.
@@ -102,14 +103,14 @@ if [[ ! -f "$BASELINE" ]]; then
     exit 1
 fi
 
-if diff -u "$BASELINE" "$surface" > /tmp/host-api-diff.txt 2>&1; then
+if diff -u "$BASELINE" "$surface" > "$host_api_diff" 2>&1; then
     echo "PASS: Android host API v0 unchanged ($(wc -l < "$BASELINE") entries)"
     exit 0
 fi
 
 echo "FAIL: the Android host API changed" >&2
 echo >&2
-sed -n '1,60p' /tmp/host-api-diff.txt >&2
+sed -n '1,60p' "$host_api_diff" >&2
 echo >&2
 echo "Embedders compile against this surface and ship the binding inside their" >&2
 echo "app. If the change is intended, re-run with --update and commit the new" >&2

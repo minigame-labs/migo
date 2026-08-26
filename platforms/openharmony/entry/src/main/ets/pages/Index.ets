@@ -16,6 +16,7 @@
 import migohost from 'libmigohost.so';
 import { common } from '@kit.AbilityKit';
 import { fileIo } from '@kit.CoreFileKit';
+import { display } from '@kit.ArkUI';
 
 const CONTENT_ID: string = 'touchprobe';
 const CONTENT_FILES: string[] = ['game.js', 'game.json'];
@@ -49,7 +50,7 @@ struct Index {
       fileIo.writeSync(file.fd, bytes.buffer);
       fileIo.closeSync(file);
     }
-    console.info(`[migo] staged ${CONTENT_FILES.length} files into ${codeDir}`);
+    console.info(`[migo] staged ${CONTENT_FILES.length} content files`);
   }
 
   build() {
@@ -67,13 +68,22 @@ struct Index {
             const ctx = getContext(this) as common.UIAbilityContext;
             const filesDir: string = ctx.filesDir;
             const cacheDir: string = ctx.cacheDir;
+            const scaleFactor: number = display.getDefaultDisplaySync().densityPixels;
             this.stageContent(filesDir);
-            const rc: number = migohost.start(filesDir, cacheDir, CONTENT_ID);
+            const rc: number = migohost.start(filesDir, cacheDir, CONTENT_ID, scaleFactor);
             this.status = rc === 0 ? `engine started (${CONTENT_ID})` : `start failed: ${rc}`;
             console.info(`[migo] start -> ${rc}`);
-          } catch (e) {
-            this.status = `staging failed: ${e}`;
-            console.error(`[migo] ${e}`);
+          } catch (_e) {
+            this.status = 'content staging failed';
+            console.error('[migo] content staging failed');
+          }
+        })
+        .onDestroy(() => {
+          // Stop is release-aware: -12 means the native release observer is
+          // still pending and its callback will finish teardown asynchronously.
+          const rc: number = migohost.stop();
+          if (rc !== 0 && rc !== -12) {
+            console.error(`[migo] stop failed: ${rc}`);
           }
         })
         .width('100%')

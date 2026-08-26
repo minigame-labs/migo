@@ -6,18 +6,29 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # ── Job 1: Quality gate (same as PR CI, ensures tag is clean) ───────
   quality-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         # No LFS download: freshness reads committed pointer oid/size identities.
+
+      - name: Setup Python for contract gates
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Install hash-pinned Python contract dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check --no-deps
+          --only-binary=:all: --require-hashes
+          --requirement scripts/ci/requirements-contracts.txt
 
       # Block the release if any committed profile/ABI snapshot identity is
       # stale. Regenerate all affected products (see snapshots/README.md) before
@@ -64,6 +75,29 @@ jobs:
       - name: Populate the cargo registry for the offline gates
         working-directory: engine
         run: cargo fetch --locked
+
+      - name: Install the pinned RustSec scanner
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Dependency advisory, source and license gate
+        run: bash scripts/check-rust-supply-chain.sh
+
+      - name: Supply-chain mutation contract
+        run: bash scripts/test-supply-chain-contract.sh
+
+      - name: Repository hygiene mutation contract
+        run: bash scripts/test-repository-hygiene-contract.sh
+
+      - name: Tracked publication hygiene gate
+        run: python3 scripts/check-repository-hygiene.py --root .
+
+      - name: Immutable workflow input gate
+        run: python3 scripts/check-supply-chain.py actions --workflows-dir .github
+
+      - name: Gradle wrapper, lock and checksum gate
+        run: >-
+          python3 scripts/check-supply-chain.py gradle
+          --project-dir platforms/android --policy supply-chain.toml
 
       - name: C ABI and Surface candidate contract
         # gcc-multilib is what lets the ILP32 lane compile at all. Without it
@@ -113,17 +147,7 @@ jobs:
         run: bash scripts/test-platform-services-capability-contract.sh
 
       - name: Release asset ordering contract
-        # PyYAML is not guaranteed preinstalled on the runner image, so this
-        # mirrors the ripgrep fallback above rather than assuming it's there
-        # -- but a bare `pip install` is not enough: Ubuntu 24.04 runners
-        # enforce PEP 668 (an EXTERNALLY-MANAGED marker on the system
-        # Python), and pip refuses to touch it without an explicit override.
-        # --break-system-packages is that override, deliberately scoped to
-        # this disposable CI container rather than a shared machine, and is
-        # only reached at all if `import yaml` already fails.
-        run: |
-          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
-          bash scripts/test-release-asset-ordering-contract.sh
+        run: bash scripts/test-release-asset-ordering-contract.sh
 
       # A release version is a fact about a set of bytes, and it was stated
       # independently in four build systems. They drifted: the Android AAR said
@@ -212,7 +236,7 @@ jobs:
       # the download is reset mid-flight -- which it has been. Same cache the
       # Android build job already uses.
       - name: Gradle cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.gradle/caches
@@ -273,6 +297,11 @@ jobs:
       # directions checked load-bearing by injection.
       - name: OpenHarmony API floor declaration contract
         run: bash scripts/test-ohos-api-floor-declaration-contract.sh
+
+      - name: OpenHarmony host and package metadata contracts
+        run: |
+          bash scripts/test-ohos-host-contract.sh
+          bash scripts/test-ohos-package-metadata-contract.sh
 
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
@@ -380,9 +409,7 @@ jobs:
       # script syntax check. The three release-specific gates did not run on the
       # workflow that cuts releases. This step fails whenever that gap reopens.
       - name: Release gate parity contract
-        run: |
-          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
-          bash scripts/test-release-gate-parity-contract.sh
+        run: bash scripts/test-release-gate-parity-contract.sh
 
   # ── Job 2: Linux Qt Host Kit (isolated source contract; no V8/LFS) ──
   linux-qt-host-kit:
@@ -393,7 +420,7 @@ jobs:
 
     steps:
       - name: Checkout (without LFS)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
@@ -445,7 +472,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
@@ -509,7 +536,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
@@ -521,13 +548,13 @@ jobs:
         run: bash scripts/fetch-v8-archives.sh
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
@@ -566,7 +593,7 @@ jobs:
         run: bash scripts/test-capi-platform-contract.sh
 
       - name: Gradle cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.gradle/caches
@@ -592,11 +619,6 @@ jobs:
           # only re-run Gradle with abiFilters -- a host shipping arm64 alone
           # should not have to carry the x86_64 payload, and quoting the
           # multi-ABI size at an integrator overstates it by roughly double.
-          # Procurement asks what is inside the binary and under what licences.
-          # Generated from the resolved graph, so it describes the tree that was
-          # built rather than what the manifests permit.
-          bash scripts/generate-sbom.sh \
-            --out "platforms/android/dist/migo-$(cat release/VERSION)-sbom.cdx.json"
 
       # No release may ship a libmigo.so that cannot dlopen on the API 26 floor
       # Migo claims to support. Checks every strong import against the NDK's
@@ -674,7 +696,7 @@ jobs:
             > reports/size-report.txt || true
 
       - name: Upload the size report as a workflow artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: size-report
           path: reports/size-report.txt
@@ -706,8 +728,7 @@ jobs:
             "migo-$VERSION-capi-android-arm64.tar.gz" \
             "migo-$VERSION-capi-android-arm64.tar.gz.attestation.json" \
             "migo-$VERSION-capi-android-x86_64.tar.gz" \
-            "migo-$VERSION-capi-android-x86_64.tar.gz.attestation.json" \
-            "migo-$VERSION-sbom.cdx.json" \
+            "migo-$VERSION-capi-android-x86_64.tar.gz.attestation.json"
           ; do
             cp "platforms/android/dist/$asset" dist/release/
           done
@@ -722,33 +743,70 @@ jobs:
       # exactly why SHA256SUMS.txt used to cover only this job's output while its name
       # implied the release.
       - name: Upload the staged Android assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-assets-android
           path: dist/release
           if-no-files-found: error
           retention-days: 1
 
-      - name: Optional power baseline compare
-        run: |
-          if [ -f ci/metrics/current_power_metrics.json ]; then
-            bash scripts/ci/run_power.sh \
-              --current ci/metrics/current_power_metrics.json \
-              --baseline ci/baselines/android_power_default.json \
-              --summary-out reports/power-compare-summary.json
-          else
-            echo "skip power baseline compare: ci/metrics/current_power_metrics.json not found"
-          fi
+  # Release bytes are tested after the hosted builder uploads them. The physical
+  # runner never rebuilds the AAR: it installs the exact workflow artifact, pulls
+  # the installed APK back, and proves the embedded native hash before measuring.
+  release-android-device-evidence:
+    needs: [release-android]
+    runs-on: [self-hosted, android-device]
+    timeout-minutes: 150
 
-      # One glob over one directory, which the staging step above guarantees is
-      # populated (a missing source makes its `cp` fail) and the naming contract has
-      # already validated. That is what makes fail_on_unmatched_files usable at last:
-      # action-gh-release resolves it per pattern, so the previous 20-pattern list
-      # could not enable it -- size-report-*.txt was written with `|| true` and
-      # reports/*.json only existed when there were power metrics to compare, so a
-      # legitimately empty pattern would have failed every release. Those two are no
-      # longer published (the size report is a workflow artifact; power metrics are
-      # internal), leaving a single pattern that must match.
+    steps:
+      - name: Checkout exact release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          lfs: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Setup Java for the external host application
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK and adb
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: Download the hosted builder's Android release bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-assets-android
+          path: dist/device-input
+
+      - name: Install, measure, gate, and seal release evidence
+        env:
+          DEVICE_PACKAGE: ${{ vars.MIGO_DEVICE_TEST_PACKAGE || 'com.example.migo.demo' }}
+          DEVICE_DURATION: ${{ vars.MIGO_DEVICE_TEST_DURATION || '300' }}
+          DEVICE_SUITE: ${{ vars.MIGO_DEVICE_TEST_SUITE_PATH || '../migo-test-suite' }}
+        run: |
+          ARTIFACT="dist/device-input/migo-$(cat release/VERSION)-android.aar"
+          bash scripts/ci/run_android_device_evidence.sh \
+            --artifact "$ARTIFACT" \
+            --package "$DEVICE_PACKAGE" \
+            --test-suite "$DEVICE_SUITE" \
+            --source-revision "$GITHUB_SHA" \
+            --duration "$DEVICE_DURATION" \
+            --out-dir artifacts/android-release-evidence
+
+      - name: Upload sealed device evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-release-evidence-${{ github.sha }}
+          path: artifacts/android-release-evidence
+          if-no-files-found: error
+          retention-days: 30
 
   # ── Linux SDK ───────────────────────────────────────────────────────────
   # Every dependency is fetchable and hash-pinned, which is what made this the first
@@ -775,12 +833,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
@@ -836,7 +894,7 @@ jobs:
           bash scripts/package-sdk.sh dist/migo-linux-arm64 --output-dir dist/release
 
       - name: Upload the staged Linux assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-assets-linux
           path: dist/release
@@ -858,12 +916,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
@@ -914,7 +972,7 @@ jobs:
           done
 
       - name: Upload the staged OpenHarmony assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-assets-ohos
           path: dist/release
@@ -941,12 +999,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
@@ -1010,7 +1068,7 @@ jobs:
           bash scripts/package-sdk.sh dist/migo-windows-x86_64 --output-dir dist/release
 
       - name: Upload the staged Windows assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-assets-windows
           path: dist/release
@@ -1039,12 +1097,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
@@ -1091,7 +1149,7 @@ jobs:
           bash scripts/package-sdk.sh dist/migo-windows-arm64 --output-dir dist/release
 
       - name: Upload the staged Windows arm64 assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-assets-windows-arm64
           path: dist/release
@@ -1108,31 +1166,84 @@ jobs:
   #
   # Adding a platform is now additive: one job, one entry in `needs`.
   publish:
-    needs: [release-android, release-linux, release-ohos, release-windows, release-windows-arm64]
+    needs: [release-android, release-android-device-evidence, release-linux, release-ohos, release-windows, release-windows-arm64]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+
+      - name: Populate the locked Cargo graph for offline SBOM generation
+        working-directory: engine
+        run: cargo fetch --locked
 
       # merge-multiple puts every platform's staged assets in one directory, which is
       # the whole point: the published asset list exists once, as this directory's
       # contents, instead of in a pattern list that has to be kept in step with the
       # jobs.
       - name: Collect every platform's staged assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: release-assets-*
           merge-multiple: true
           path: dist/release
+
+      # Generated only after all platform jobs converge so the same audited
+      # implementation binds every payload. Cargo metadata needs no target
+      # linker or std component; --filter-platform selects each resolved graph,
+      # while the already-built file supplies the identity and SHA-256.
+      - name: Generate an artifact-bound SBOM for every runtime payload
+        run: |
+          VERSION="$(cat release/VERSION)"
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+
+          make_sbom() {
+            local artifact="$1" kind="$2" target_label="$3" cargo_target="$4" root_package="$5" manifest="$6"
+            bash scripts/generate-sbom.sh \
+              --artifact "dist/release/$artifact" \
+              --artifact-kind "$kind" \
+              --target "$target_label" \
+              --cargo-target "$cargo_target" \
+              --profile full \
+              --root-package "$root_package" \
+              --manifest "$manifest" \
+              --out "dist/release/$artifact.sbom.cdx.json"
+          }
+
+          make_sbom \
+            "migo-$VERSION-android.aar" android-aar android-arm64+x86_64 \
+            aarch64-linux-android migo-android-jni engine/crates/android-jni/Cargo.toml
+
+          for platform in android linux ohos windows; do
+            for arch in arm64 x86_64; do
+              case "$platform-$arch" in
+                android-arm64) triple=aarch64-linux-android ;;
+                android-x86_64) triple=x86_64-linux-android ;;
+                linux-arm64) triple=aarch64-unknown-linux-gnu ;;
+                linux-x86_64) triple=x86_64-unknown-linux-gnu ;;
+                ohos-arm64) triple=aarch64-unknown-linux-ohos ;;
+                ohos-x86_64) triple=x86_64-unknown-linux-ohos ;;
+                windows-arm64) triple=aarch64-pc-windows-msvc ;;
+                windows-x86_64) triple=x86_64-pc-windows-msvc ;;
+              esac
+              make_sbom \
+                "migo-$VERSION-capi-$platform-$arch.tar.gz" capi-sdk "$platform-$arch" \
+                "$triple" migo-capi engine/crates/capi/Cargo.toml
+            done
+          done
 
       # Release-level, so it belongs here rather than in whichever platform job
       # happened to run first.
@@ -1223,12 +1334,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 

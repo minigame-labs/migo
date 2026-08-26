@@ -26,7 +26,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.migo.runtime.internal.NativeBridge;
+import com.migo.runtime.internal.NativeMethods;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -403,7 +403,7 @@ public class ConsoleLogView {
     private void pollLogs() {
         String json = null;
         try {
-            json = NativeBridge.getConsoleLogs(sessionId, cursor);
+            json = NativeMethods.getConsoleLogs(sessionId, cursor);
         } catch (Exception ignored) {
         }
         if (json == null) return;

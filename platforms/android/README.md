@@ -210,7 +210,7 @@ session.setSubpackageHandler((request, callback) -> {
 });
 ```
 
-- `setAuthHandler(AuthHandler)`: backs `migo.login` / `migo.checkSession` / `migo.getUserInfo` / `migo.getPhoneNumber` (and the same calls made through a platform-compat adapter, e.g. `migo-wx-adapter`)
+- `setAuthHandler(AuthHandler)`: backs `migo.login` / `migo.checkSession` / `migo.getUserInfo` / `migo.getPhoneNumber`, including calls forwarded by an external compatibility adapter
 - `setGameLogHandler(GameLogHandler)`: receives game-reported logs (JSON string)
 - `setSubpackageHandler(SubpackageHandler)`: handles `loadSubpackage` / `preDownloadSubpackage` downloads
 

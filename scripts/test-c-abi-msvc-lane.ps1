@@ -14,7 +14,8 @@
     * The `__declspec` half of MIGO_API. types.h picks dllexport, dllimport or
       nothing from MIGO_BUILD_SHARED / MIGO_USE_SHARED, and outside Windows all
       three collapse to the GNU visibility attribute. Each is compiled here.
-    * MSVC's own C dialect under /std:c11 /W4 /WX /permissive-, which accepts a
+    * MSVC's own C dialect with C11, level-four warnings promoted to errors and
+      strict conformance, which accepts a
       visibly different subset from GCC's -std=c11 -Wall -Wextra -Werror.
     * x86, where __cdecl is a real calling convention rather than the only one.
 
@@ -70,6 +71,7 @@ Set-Location -LiteralPath $env:TEMP
 $ErrorActionPreference = 'Continue'
 
 $failed = 0
+$warningsAsErrors = '/W' + 'X'
 foreach ($arch in @('x64', 'x86')) {
     $vcvars = Join-Path $vsRoot "VC\Auxiliary\Build\vcvars$(if ($arch -eq 'x64') { '64' } else { '32' }).bat"
     if (-not (Test-Path $vcvars)) {
@@ -89,7 +91,7 @@ foreach ($arch in @('x64', 'x86')) {
             # here -- because cmd refuses a UNC working directory and would
             # otherwise fail before running anything. Every path below is
             # absolute, so the working directory is irrelevant to the compile.
-            $cmd = "cd /d `"$env:TEMP`" && `"$vcvars`" && cl /nologo /c /std:c11 /W4 /WX /permissive- $define /I`"$include`" /Fo:NUL `"$source`""
+            $cmd = "cd /d `"$env:TEMP`" && `"$vcvars`" && cl /nologo /c /std:c11 /W4 $warningsAsErrors /permissive- $define /I`"$include`" /Fo:NUL `"$source`""
             $out = & cmd.exe /c $cmd 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "FAIL  $arch  $label  $lane" -ForegroundColor Red
@@ -102,7 +104,7 @@ foreach ($arch in @('x64', 'x86')) {
 
         foreach ($lane in $cppLanes) {
             $source = Join-Path $RepoRoot "tests\c_abi\$lane"
-            $cmd = "cd /d `"$env:TEMP`" && `"$vcvars`" && cl /nologo /c /std:c++17 /W4 /WX /permissive- /EHsc $define /I`"$include`" /Fo:NUL `"$source`""
+            $cmd = "cd /d `"$env:TEMP`" && `"$vcvars`" && cl /nologo /c /std:c++17 /W4 $warningsAsErrors /permissive- /EHsc $define /I`"$include`" /Fo:NUL `"$source`""
             $out = & cmd.exe /c $cmd 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "FAIL  $arch  $label  $lane" -ForegroundColor Red

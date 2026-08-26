@@ -1,10 +1,10 @@
 {
   "name": "entry",
   "version": "1.0.0",
-  "description": "Please describe the basic information.",
+  "description": "OpenHarmony host application for the Migo runtime C SDK.",
   "main": "",
-  "author": "",
-  "license": "",
+  "author": "Migo contributors",
+  "license": "BSL-1.1",
   "dependencies": {}
 }
 

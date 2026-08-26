@@ -243,13 +243,13 @@ pub struct DebugStats {
     // `canvas2d_snapshot_uploads` rises every time a snapshot was
     // consumed by `texImage2D`.  In the steady-state cocos pattern we
     // expect taken ≈ uploads ≫ fallbacks; if uploads ≪ taken the
-    // game is reading bytes (or `_force_readback`-ing) instead of
+    // game is reading the lazy `.data` bytes instead of
     // routing into WebGL, and the snapshot work is wasted overhead.
     pub canvas2d_snapshots_taken: AtomicU32,
     pub canvas2d_snapshot_fallbacks: AtomicU32,
     pub canvas2d_snapshot_uploads: AtomicU32,
-    /// Cumulative `migo._force_readback(imageData)` calls.  A non-
-    /// zero value indicates a game on the slow path even after the
+    /// Cumulative lazy snapshot `ImageData.data` materializations. A non-zero
+    /// value indicates a game on the slow path even after the
     /// snapshot optimisation; investigate before assuming the perf
     /// win is universal.
     pub canvas2d_snapshot_forced_readbacks: AtomicU32,

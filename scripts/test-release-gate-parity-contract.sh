@@ -32,7 +32,8 @@ try:
     import yaml
 except ModuleNotFoundError:
     print(
-        "ERROR: PyYAML is not installed; run: pip install --break-system-packages pyyaml",
+        "ERROR: PyYAML is not installed; install scripts/ci/requirements-contracts.txt "
+        "with pip --require-hashes",
         file=sys.stderr,
     )
     sys.exit(1)

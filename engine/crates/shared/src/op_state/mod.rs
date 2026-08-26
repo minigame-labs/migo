@@ -3,8 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::audio_channel::AudioCommandSender;
+use crate::audio_channel::{
+    AudioCleanupTicket, AudioCommandPermit, AudioCommandReserveError, AudioCommandSendError,
+    AudioCommandSender,
+};
+use crate::audio_resources::AudioResourceRegistry;
 use crate::channel::ThreadWakeup;
+use crate::error::{EngineError, EngineResult, ErrorCode};
 use crate::protocol::audio_cmd::AudioCmd;
 use crate::services::DeviceServices;
 use crate::vfs::{GamePaths, MountTable, VirtualFS};
@@ -77,6 +82,10 @@ pub struct AudioSender {
     /// Optional coalescing lazy-audio host-start signal. Present only on the host
     /// `AudioSender`s built by `AudioService`; `None` for Workers and tests.
     host_start: Option<Arc<AudioHostStartSignal>>,
+    /// Host-owned Web Audio backing registry. Deliberately absent from Workers
+    /// and ad-hoc test senders so resource allocation fails closed unless a Host
+    /// lifecycle owns it.
+    resources: Option<AudioResourceRegistry>,
 }
 
 impl AudioSender {
@@ -87,6 +96,7 @@ impl AudioSender {
             tx,
             wakeup,
             host_start: None,
+            resources: None,
         }
     }
 
@@ -101,47 +111,108 @@ impl AudioSender {
             tx,
             wakeup,
             host_start: Some(host_start),
+            resources: None,
         }
+    }
+
+    /// Create the Host-owned sender used by the main isolate.
+    pub fn hosted(
+        tx: AudioCommandSender,
+        wakeup: ThreadWakeup,
+        host_start: Arc<AudioHostStartSignal>,
+        resources: AudioResourceRegistry,
+    ) -> Self {
+        Self {
+            tx,
+            wakeup,
+            host_start: Some(host_start),
+            resources: Some(resources),
+        }
+    }
+
+    /// Return the Host-owned Web Audio registry or fail closed for unhosted
+    /// senders whose lifecycle cannot guarantee isolate-drop cleanup.
+    #[inline]
+    pub fn resources(&self) -> EngineResult<&AudioResourceRegistry> {
+        self.resources.as_ref().ok_or_else(|| {
+            EngineError::from_detail(
+                ErrorCode::InvalidOperation,
+                "audio resource registry is unavailable for this runtime",
+            )
+        })
     }
 
     /// Send a command to the audio thread and signal its wakeup.
     ///
-    /// Waits when the transport is at capacity, which is backpressure rather
-    /// than loss: nothing in `AudioCmd` is replaceable, because the ids are
-    /// allocated on the JavaScript side and the creates are fire-and-forget, so
-    /// ordering is the protocol. See [`crate::audio_channel`].
-    ///
-    /// **The notification for a full queue happens before the wait, and that
-    /// ordering is the whole correctness of waiting here.** The audio thread
-    /// sleeps indefinitely once content has gone silent, and a send's own wakeup
-    /// is what brings it back — so a send that parked first and notified after
-    /// returning would be waiting for a drain that is waiting for it. Notifying
-    /// before the wait cannot race: the queue is full, so the woken drain must
-    /// free a slot, and `ThreadWakeup` latches its signal.
+    /// Never waits. A full queue returns the original command so V8 can report
+    /// deterministic saturation and request/response ops cannot hang.
     #[inline]
-    pub fn send(&self, value: AudioCmd) -> Result<(), crossbeam_channel::SendError<AudioCmd>> {
-        let result = match self.tx.try_send(value) {
-            Ok(()) => Ok(()),
-            Err(crossbeam_channel::TrySendError::Full(value)) => {
-                self.wakeup.notify();
-                self.tx.send(value)
-            }
-            Err(crossbeam_channel::TrySendError::Disconnected(value)) => {
-                Err(crossbeam_channel::SendError(value))
-            }
-        };
+    pub fn send(&self, value: AudioCmd) -> Result<(), AudioCommandSendError> {
+        let result = self.tx.try_send(value);
+        self.after_send(result.is_ok());
+        result
+    }
+
+    /// Request the host restart cleanup barrier on its reserved transport lane.
+    #[inline]
+    pub fn release_all_contexts(&self) -> Result<AudioCleanupTicket, AudioCommandSendError> {
+        let result = self.tx.request_release_all_contexts();
+        self.after_send(result.is_ok());
+        result
+    }
+
+    /// Reserve queue count and payload bytes before copying a V8 backing store.
+    #[inline]
+    pub fn try_reserve_data(
+        &self,
+        bytes: usize,
+    ) -> Result<AudioCommandPermit, AudioCommandReserveError> {
+        self.tx.try_reserve_data(bytes)
+    }
+
+    /// Publish a command with a reservation acquired before its payload copy.
+    #[inline]
+    pub fn send_reserved(
+        &self,
+        value: AudioCmd,
+        permit: AudioCommandPermit,
+    ) -> Result<(), AudioCommandSendError> {
+        let result = self.tx.try_send_reserved(value, permit);
+        self.after_send(result.is_ok());
+        result
+    }
+
+    /// Atomically commit an external ownership transfer with publication of an
+    /// already-reserved audio command. The closure is skipped if a restart
+    /// fence or receiver teardown happened after reservation.
+    #[inline]
+    pub fn send_reserved_committing<F>(
+        &self,
+        value: AudioCmd,
+        permit: AudioCommandPermit,
+        commit: F,
+    ) -> Result<(), AudioCommandSendError>
+    where
+        F: FnOnce(),
+    {
+        let result = self.tx.try_send_reserved_committing(value, permit, commit);
+        self.after_send(result.is_ok());
+        result
+    }
+
+    #[inline]
+    fn after_send(&self, accepted: bool) {
         // Always notify the audio thread — even if the send failed (the thread may
         // still be draining).
         self.wakeup.notify();
         // Lazy host-start: only a successful send while the real audio thread is
         // still absent nudges the host to start it. After start it is one relaxed
         // atomic load with no notification.
-        if result.is_ok() {
+        if accepted {
             if let Some(signal) = &self.host_start {
                 signal.notify_if_needed();
             }
         }
-        result
     }
 }
 
@@ -443,6 +514,23 @@ mod audio_host_start_tests {
     }
 
     #[test]
+    fn cleanup_barrier_uses_the_reserved_lane_and_notifies_the_host() {
+        let signal = AudioHostStartSignal::new();
+        let (tx, rx) = crate::audio_channel::channel();
+        let sender = AudioSender::with_host_start_signal(tx, ThreadWakeup::new(), signal.clone());
+
+        let ticket = sender
+            .release_all_contexts()
+            .expect("cleanup barrier is accepted");
+
+        assert!(took_permit(&signal), "pre-start cleanup must wake the host");
+        assert!(matches!(rx.try_recv(), Ok(AudioCmd::ReleaseAllContexts)));
+        assert!(!ticket.is_complete());
+        rx.complete_release_all_contexts();
+        assert!(ticket.is_complete());
+    }
+
+    #[test]
     fn failed_send_does_not_notify_host() {
         let signal = AudioHostStartSignal::new();
         let (tx, rx) = crate::audio_channel::channel();
@@ -493,5 +581,57 @@ mod audio_host_start_tests {
         let sender = AudioSender::new(tx, ThreadWakeup::new());
         assert!(sender.send(AudioCmd::PauseAll).is_ok());
         assert!(rx.try_recv().is_ok(), "the command must still be enqueued");
+    }
+
+    #[test]
+    fn unhosted_audio_senders_fail_closed_for_resource_operations() {
+        let (tx, _rx) = crate::audio_channel::channel();
+        let sender = AudioSender::new(tx, ThreadWakeup::new());
+
+        let error = sender
+            .resources()
+            .expect_err("Workers and ad-hoc harnesses have no host resource owner");
+
+        assert_eq!(error.code, crate::error::ErrorCode::InvalidOperation);
+    }
+
+    #[test]
+    fn hosted_audio_sender_clones_share_one_resource_registry() {
+        let signal = AudioHostStartSignal::new();
+        let (tx, _rx) = crate::audio_channel::channel();
+        let resources = crate::audio_resources::AudioResourceRegistry::new();
+        let sender = AudioSender::hosted(tx, ThreadWakeup::new(), signal, resources.clone());
+        let clone = sender.clone();
+        let lease = sender
+            .resources()
+            .unwrap()
+            .reserve_backing(
+                501,
+                crate::audio_resources::AudioBufferFormat {
+                    channels: 1,
+                    frames: 1,
+                    sample_rate: 48_000,
+                },
+            )
+            .unwrap();
+
+        assert!(clone.resources().unwrap().release_buffer(lease.key()));
+        resources.begin_retire(501);
+        assert_eq!(
+            sender
+                .resources()
+                .unwrap()
+                .reserve_backing(
+                    501,
+                    crate::audio_resources::AudioBufferFormat {
+                        channels: 1,
+                        frames: 1,
+                        sample_rate: 48_000,
+                    },
+                )
+                .unwrap_err()
+                .code,
+            crate::error::ErrorCode::InvalidOperation
+        );
     }
 }

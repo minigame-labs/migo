@@ -1,7 +1,7 @@
-use std::{cell::RefCell, future::Future, rc::Rc, sync::Arc};
+use std::{cell::RefCell, future::Future, rc::Rc, sync::Arc, time::Duration};
 
 use deno_core::{
-    Extension, ExtensionArguments, FsModuleLoader, JsRuntime, ModuleLoader, OpState,
+    Extension, ExtensionArguments, FsModuleLoader, JsBuffer, JsRuntime, ModuleLoader, OpState,
     PollEventLoopOptions, RuntimeOptions, SharedArrayBufferStore, op2, resolve_path, v8,
 };
 use tokio::sync::mpsc;
@@ -15,18 +15,391 @@ use crate::watchdog::{DeadlineWatchdog, DeadlineWatchdogConfig};
 /// Prevents large messages from bypassing V8 heap limits.
 const MAX_WORKER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// User messages allowed to wait in either Worker direction.
+const WORKER_MESSAGE_QUEUE_CAPACITY: usize = 64;
+/// Physical slots unavailable to user messages and reserved for termination.
+const WORKER_CONTROL_RESERVE: usize = 1;
+/// Aggregate queued payload budget per Worker message direction.
+const MAX_WORKER_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+const WORKER_ERROR_QUEUE_CAPACITY: usize = 16;
+const MAX_WORKER_ERROR_QUEUED_BYTES: usize = 1024 * 1024;
+
+const WORKER_MESSAGE_QUEUE_FULL: &str = "Worker message queue full";
+const WORKER_MESSAGE_BYTE_LIMIT: &str = "Worker message queue byte limit exceeded";
+
+trait WorkerQueuePayload {
+    fn queued_bytes(&self) -> usize;
+}
+
+struct WorkerQueueUsage {
+    max_items: usize,
+    max_bytes: usize,
+    closed: std::sync::atomic::AtomicBool,
+    items: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+    rejected: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Debug)]
+enum WorkerReserveError {
+    Full,
+    ByteLimit,
+    Closed,
+}
+
+impl WorkerQueueUsage {
+    fn try_reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<WorkerQueuePermit, WorkerReserveError> {
+        self.items
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |items| (items < self.max_items).then_some(items + 1),
+            )
+            .map_err(|_| WorkerReserveError::Full)?;
+
+        let reserved_bytes = self.bytes.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= self.max_bytes)
+            },
+        );
+        if reserved_bytes.is_err() {
+            self.items.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(WorkerReserveError::ByteLimit);
+        }
+
+        Ok(WorkerQueuePermit {
+            usage: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+struct WorkerQueuePermit {
+    usage: Arc<WorkerQueueUsage>,
+    bytes: usize,
+}
+
+impl Drop for WorkerQueuePermit {
+    fn drop(&mut self) {
+        self.usage
+            .bytes
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        self.usage
+            .items
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+struct WorkerQueueEntry<T> {
+    value: T,
+    _permit: Option<WorkerQueuePermit>,
+}
+
+impl<T> WorkerQueueEntry<T> {
+    fn into_value(self) -> T {
+        let Self { value, _permit } = self;
+        drop(_permit);
+        value
+    }
+}
+
+struct WorkerQueueSender<T> {
+    tx: mpsc::Sender<WorkerQueueEntry<T>>,
+    usage: Arc<WorkerQueueUsage>,
+}
+
+impl<T> Clone for WorkerQueueSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            usage: Arc::clone(&self.usage),
+        }
+    }
+}
+
+struct WorkerQueueReceiver<T> {
+    rx: mpsc::Receiver<WorkerQueueEntry<T>>,
+    usage: Arc<WorkerQueueUsage>,
+}
+
+impl<T> Drop for WorkerQueueReceiver<T> {
+    fn drop(&mut self) {
+        self.usage
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+enum WorkerQueueSendError<T> {
+    Full(T),
+    ByteLimit(T),
+    Closed(T),
+}
+
+impl<T: WorkerQueuePayload> WorkerQueueSender<T> {
+    /// Reserve a data slot and its queued byte budget before copying a V8
+    /// backing store into a worker message.
+    fn try_reserve(&self, bytes: usize) -> Result<WorkerQueuePermit, WorkerReserveError> {
+        if self.usage.closed.load(std::sync::atomic::Ordering::Acquire) {
+            self.usage
+                .rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(WorkerReserveError::Closed);
+        }
+        match self.usage.try_reserve(bytes) {
+            Ok(permit) => {
+                if self.usage.closed.load(std::sync::atomic::Ordering::Acquire) {
+                    drop(permit);
+                    self.usage
+                        .rejected
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(WorkerReserveError::Closed)
+                } else {
+                    Ok(permit)
+                }
+            }
+            Err(WorkerReserveError::Full) => {
+                self.usage
+                    .rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(WorkerReserveError::Full)
+            }
+            Err(WorkerReserveError::ByteLimit) => {
+                self.usage
+                    .rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(WorkerReserveError::ByteLimit)
+            }
+            Err(WorkerReserveError::Closed) => {
+                self.usage
+                    .rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(WorkerReserveError::Closed)
+            }
+        }
+    }
+
+    fn try_send_entry(&self, entry: WorkerQueueEntry<T>) -> Result<(), WorkerQueueSendError<T>> {
+        match self.tx.try_send(entry) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.usage
+                    .rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(match error {
+                    mpsc::error::TrySendError::Full(entry) => {
+                        WorkerQueueSendError::Full(entry.into_value())
+                    }
+                    mpsc::error::TrySendError::Closed(entry) => {
+                        WorkerQueueSendError::Closed(entry.into_value())
+                    }
+                })
+            }
+        }
+    }
+
+    fn send_reserved(
+        &self,
+        value: T,
+        permit: WorkerQueuePermit,
+    ) -> Result<(), WorkerQueueSendError<T>> {
+        if value.queued_bytes() > permit.bytes {
+            drop(permit);
+            return Err(WorkerQueueSendError::ByteLimit(value));
+        }
+        let entry = WorkerQueueEntry {
+            value,
+            _permit: Some(permit),
+        };
+        self.try_send_entry(entry)
+    }
+
+    fn send(&self, value: T) -> Result<(), WorkerQueueSendError<T>> {
+        let permit = match self.try_reserve(value.queued_bytes()) {
+            Ok(permit) => permit,
+            Err(WorkerReserveError::Full) => return Err(WorkerQueueSendError::Full(value)),
+            Err(WorkerReserveError::ByteLimit) => {
+                return Err(WorkerQueueSendError::ByteLimit(value));
+            }
+            Err(WorkerReserveError::Closed) => return Err(WorkerQueueSendError::Closed(value)),
+        };
+        self.send_reserved(value, permit)
+    }
+}
+
+impl<T> WorkerQueueReceiver<T> {
+    async fn recv(&mut self) -> Option<T> {
+        self.rx.recv().await.map(WorkerQueueEntry::into_value)
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        self.rx.try_recv().map(WorkerQueueEntry::into_value)
+    }
+}
+
+fn worker_queue<T>(
+    item_capacity: usize,
+    byte_capacity: usize,
+) -> (WorkerQueueSender<T>, WorkerQueueReceiver<T>) {
+    let (tx, rx) = mpsc::channel(item_capacity);
+    let usage = Arc::new(WorkerQueueUsage {
+        max_items: item_capacity,
+        max_bytes: byte_capacity,
+        closed: std::sync::atomic::AtomicBool::new(false),
+        items: std::sync::atomic::AtomicUsize::new(0),
+        bytes: std::sync::atomic::AtomicUsize::new(0),
+        rejected: std::sync::atomic::AtomicUsize::new(0),
+    });
+    (
+        WorkerQueueSender {
+            tx,
+            usage: Arc::clone(&usage),
+        },
+        WorkerQueueReceiver { rx, usage },
+    )
+}
+
+struct WorkerMessageSender {
+    data: WorkerQueueSender<WorkerMessage>,
+    control: mpsc::Sender<WorkerMessage>,
+}
+
+impl Clone for WorkerMessageSender {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            control: self.control.clone(),
+        }
+    }
+}
+
+impl WorkerMessageSender {
+    #[cfg(test)]
+    fn send(&self, value: WorkerMessage) -> Result<(), WorkerQueueSendError<WorkerMessage>> {
+        self.data.send(value)
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Result<WorkerQueuePermit, WorkerReserveError> {
+        self.data.try_reserve(bytes)
+    }
+
+    fn send_reserved(
+        &self,
+        value: WorkerMessage,
+        permit: WorkerQueuePermit,
+    ) -> Result<(), WorkerQueueSendError<WorkerMessage>> {
+        self.data.send_reserved(value, permit)
+    }
+
+    fn send_control(
+        &self,
+        value: WorkerMessage,
+    ) -> Result<(), WorkerQueueSendError<WorkerMessage>> {
+        debug_assert!(matches!(&value, WorkerMessage::Terminate));
+        self.control.try_send(value).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(value) => WorkerQueueSendError::Full(value),
+            mpsc::error::TrySendError::Closed(value) => WorkerQueueSendError::Closed(value),
+        })
+    }
+}
+
+struct WorkerMessageReceiver {
+    data: WorkerQueueReceiver<WorkerMessage>,
+    control: mpsc::Receiver<WorkerMessage>,
+}
+
+impl WorkerMessageReceiver {
+    async fn recv(&mut self) -> Option<WorkerMessage> {
+        if let Ok(control) = self.control.try_recv() {
+            return Some(control);
+        }
+        tokio::select! {
+            biased;
+            control = self.control.recv() => match control {
+                Some(control) => Some(control),
+                None => self.data.recv().await,
+            },
+            data = self.data.recv() => data,
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<WorkerMessage, mpsc::error::TryRecvError> {
+        match self.control.try_recv() {
+            Ok(control) => Ok(control),
+            Err(mpsc::error::TryRecvError::Empty)
+            | Err(mpsc::error::TryRecvError::Disconnected) => self.data.try_recv(),
+        }
+    }
+}
+
+fn worker_message_channel() -> (WorkerMessageSender, WorkerMessageReceiver) {
+    let (data, data_rx) = worker_queue(WORKER_MESSAGE_QUEUE_CAPACITY, MAX_WORKER_QUEUED_BYTES);
+    let (control, control_rx) = mpsc::channel(WORKER_CONTROL_RESERVE);
+    (
+        WorkerMessageSender { data, control },
+        WorkerMessageReceiver {
+            data: data_rx,
+            control: control_rx,
+        },
+    )
+}
+
+fn worker_outbound_channel() -> (WorkerQueueSender<String>, WorkerQueueReceiver<String>) {
+    worker_queue(WORKER_MESSAGE_QUEUE_CAPACITY, MAX_WORKER_QUEUED_BYTES)
+}
+
+fn worker_error_channel() -> (WorkerQueueSender<String>, WorkerQueueReceiver<String>) {
+    worker_queue(WORKER_ERROR_QUEUE_CAPACITY, MAX_WORKER_ERROR_QUEUED_BYTES)
+}
+
+fn worker_lifecycle_channel() -> (WorkerLifecycleSender, WorkerLifecycleReceiver) {
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    (
+        WorkerLifecycleSender { tx },
+        WorkerLifecycleReceiver {
+            rx,
+            delivered_background: Duration::ZERO,
+            delivered_state: None,
+            delivered_transition_at: None,
+            pending: [None, None],
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /// Messages flowing from the main thread to the worker thread.
+#[derive(Debug)]
 pub(crate) enum WorkerMessage {
     /// A postMessage payload (JSON-serialized string).
     Message(String),
-    /// A binary transfer (zero-copy ArrayBuffer ownership transfer).
+    /// A binary payload copied from the sender's ArrayBuffer backing store.
     Binary(Vec<u8>),
     /// Terminate the worker.
     Terminate,
+}
+
+impl WorkerQueuePayload for WorkerMessage {
+    fn queued_bytes(&self) -> usize {
+        match self {
+            WorkerMessage::Message(message) => message.len(),
+            WorkerMessage::Binary(data) => {
+                data.len().saturating_add(base64_encoded_len(data.len()))
+            }
+            WorkerMessage::Terminate => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +414,184 @@ impl WorkerTimerLifecycleTransition {
             backgrounded,
             occurred_at: tokio::time::Instant::now(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerTimerLifecycleSnapshot {
+    current: WorkerTimerLifecycleTransition,
+    completed_background: Duration,
+    active_background_started_at: Option<tokio::time::Instant>,
+}
+
+struct WorkerLifecycleSender {
+    tx: tokio::sync::watch::Sender<Option<WorkerTimerLifecycleSnapshot>>,
+}
+
+impl WorkerLifecycleSender {
+    fn send(&self, transition: WorkerTimerLifecycleTransition) {
+        let _ = self.tx.send_if_modified(|slot| match slot {
+            Some(snapshot) if snapshot.current.backgrounded == transition.backgrounded => false,
+            Some(snapshot) => {
+                if snapshot.current.backgrounded {
+                    let started_at = snapshot
+                        .active_background_started_at
+                        .take()
+                        .unwrap_or(snapshot.current.occurred_at);
+                    snapshot.completed_background = snapshot.completed_background.saturating_add(
+                        transition.occurred_at.saturating_duration_since(started_at),
+                    );
+                }
+                if transition.backgrounded {
+                    snapshot.active_background_started_at = Some(transition.occurred_at);
+                }
+                snapshot.current = transition;
+                true
+            }
+            None => {
+                *slot = Some(WorkerTimerLifecycleSnapshot {
+                    current: transition,
+                    completed_background: Duration::ZERO,
+                    active_background_started_at: transition
+                        .backgrounded
+                        .then_some(transition.occurred_at),
+                });
+                true
+            }
+        });
+    }
+}
+
+struct WorkerLifecycleReceiver {
+    rx: tokio::sync::watch::Receiver<Option<WorkerTimerLifecycleSnapshot>>,
+    delivered_background: Duration,
+    delivered_state: Option<bool>,
+    delivered_transition_at: Option<tokio::time::Instant>,
+    pending: [Option<WorkerTimerLifecycleTransition>; 2],
+}
+
+impl WorkerLifecycleReceiver {
+    fn pop_pending(&mut self) -> Option<WorkerTimerLifecycleTransition> {
+        let transition = self.pending[0].take();
+        if transition.is_some() {
+            self.pending[0] = self.pending[1].take();
+        }
+        transition
+    }
+
+    fn transition_from_snapshot(
+        &mut self,
+        snapshot: WorkerTimerLifecycleSnapshot,
+    ) -> Option<WorkerTimerLifecycleTransition> {
+        let completed_background = snapshot
+            .completed_background
+            .saturating_sub(self.delivered_background);
+        let previous_state = self.delivered_state;
+        let previous_transition_at = self.delivered_transition_at;
+        self.delivered_background = snapshot.completed_background;
+        self.delivered_state = Some(snapshot.current.backgrounded);
+        self.delivered_transition_at = Some(snapshot.current.occurred_at);
+        self.pending = [None, None];
+
+        if previous_state == Some(true) {
+            let wall_time = previous_transition_at
+                .map(|occurred_at| {
+                    snapshot
+                        .current
+                        .occurred_at
+                        .saturating_duration_since(occurred_at)
+                })
+                .unwrap_or_default();
+            let foreground_time = wall_time.saturating_sub(completed_background);
+            if foreground_time.is_zero() && snapshot.current.backgrounded {
+                return None;
+            }
+
+            // The JS timer pump is already frozen. Resume it far enough in the
+            // past to account for the aggregate foreground time that occurred
+            // between coalesced background intervals, then optionally re-freeze
+            // at the latest hide edge.
+            let resumed_at = snapshot
+                .current
+                .occurred_at
+                .checked_sub(foreground_time)
+                .unwrap_or(snapshot.current.occurred_at);
+            if snapshot.current.backgrounded {
+                self.pending[0] = Some(snapshot.current);
+            }
+            return Some(WorkerTimerLifecycleTransition {
+                backgrounded: false,
+                occurred_at: resumed_at,
+            });
+        }
+
+        if !completed_background.is_zero() {
+            // A watch channel intentionally coalesces bursts. Reconstruct the
+            // completed background time immediately before the latest state
+            // transition so the timer pump sees the exact aggregate frozen
+            // duration while the transport remains O(1).
+            let completed_at = snapshot.current.occurred_at;
+            let completed_started_at = completed_at
+                .checked_sub(completed_background)
+                .unwrap_or(completed_at);
+            self.pending[0] = Some(WorkerTimerLifecycleTransition {
+                backgrounded: false,
+                occurred_at: completed_at,
+            });
+            if snapshot.current.backgrounded {
+                self.pending[1] = Some(snapshot.current);
+            }
+            return Some(WorkerTimerLifecycleTransition {
+                backgrounded: true,
+                occurred_at: completed_started_at,
+            });
+        }
+
+        if previous_state == Some(snapshot.current.backgrounded) {
+            None
+        } else {
+            Some(snapshot.current)
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<WorkerTimerLifecycleTransition> {
+        loop {
+            if let Some(transition) = self.pop_pending() {
+                return Some(transition);
+            }
+            if !self.rx.has_changed().unwrap_or(false) {
+                return None;
+            }
+            let snapshot = *self.rx.borrow_and_update();
+            if let Some(transition) =
+                snapshot.and_then(|snapshot| self.transition_from_snapshot(snapshot))
+            {
+                return Some(transition);
+            }
+        }
+    }
+
+    async fn recv(
+        &mut self,
+    ) -> Result<WorkerTimerLifecycleTransition, tokio::sync::watch::error::RecvError> {
+        if let Some(transition) = self.pop_pending() {
+            return Ok(transition);
+        }
+        loop {
+            self.rx.changed().await?;
+            let snapshot = *self.rx.borrow_and_update();
+            if let Some(snapshot) = snapshot {
+                if let Some(transition) = self.transition_from_snapshot(snapshot) {
+                    return Ok(transition);
+                }
+            }
+        }
+    }
+}
+
+impl WorkerQueuePayload for String {
+    fn queued_bytes(&self) -> usize {
+        self.len()
     }
 }
 
@@ -60,11 +611,10 @@ pub(crate) enum WorkerInbound {
 
 /// Stored in the **main** thread's `OpState` when a worker is active.
 pub(crate) struct WorkerHandle {
-    tx_to_worker: mpsc::UnboundedSender<WorkerMessage>,
-    rx_from_worker: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
-    rx_errors: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
-    timer_backgrounded_tx: mpsc::UnboundedSender<WorkerTimerLifecycleTransition>,
-    #[allow(dead_code)]
+    tx_to_worker: WorkerMessageSender,
+    rx_from_worker: Arc<tokio::sync::Mutex<WorkerQueueReceiver<String>>>,
+    rx_errors: Arc<tokio::sync::Mutex<WorkerQueueReceiver<String>>>,
+    timer_backgrounded_tx: WorkerLifecycleSender,
     join_handle: Option<std::thread::JoinHandle<()>>,
     terminated: bool,
     /// Thread-safe handle to the worker's V8 isolate, published by the worker
@@ -88,28 +638,31 @@ impl WorkerHandle {
                 h.terminate_execution();
             }
         }
-        let _ = self.tx_to_worker.send(WorkerMessage::Terminate);
+        let _ = self.tx_to_worker.send_control(WorkerMessage::Terminate);
     }
 }
 
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
-        // Guarantees the worker thread + its V8 isolate are torn down when the
-        // main runtime is dropped (JS runtime restart / host shutdown), even if
-        // the game never called `terminate()`. Without the isolate interrupt a
-        // compute-bound worker would leak its OS thread and isolate for the rest
-        // of the process lifetime.
+        // Runtime drop is the ownership boundary for this nested V8 isolate.
+        // Interrupt first, then join: otherwise the Host worker can return to
+        // Engine teardown while this OS thread still retains V8, queues, and
+        // host state from the retired runtime generation.
         self.force_terminate();
+        if let Some(worker) = self.join_handle.take()
+            && worker.join().is_err()
+        {
+            error!("[Worker] worker thread panicked during teardown");
+        }
     }
 }
 
 /// Stored in the **worker** thread's `OpState`.
 pub(crate) struct WorkerCtx {
-    tx_to_main: mpsc::UnboundedSender<String>,
-    tx_errors: mpsc::UnboundedSender<String>,
-    rx_from_main: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WorkerMessage>>>,
-    timer_backgrounded_rx:
-        Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WorkerTimerLifecycleTransition>>>,
+    tx_to_main: WorkerQueueSender<String>,
+    tx_errors: WorkerQueueSender<String>,
+    rx_from_main: Arc<tokio::sync::Mutex<WorkerMessageReceiver>>,
+    timer_backgrounded_rx: Arc<tokio::sync::Mutex<WorkerLifecycleReceiver>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +674,32 @@ pub enum WorkerError {
     #[class("WorkerError")]
     #[error("{0}")]
     Message(String),
+}
+
+fn worker_queue_error<T>(error: WorkerQueueSendError<T>, closed: &'static str) -> WorkerError {
+    let message = match error {
+        WorkerQueueSendError::Full(_) => {
+            format!("{WORKER_MESSAGE_QUEUE_FULL} (max {WORKER_MESSAGE_QUEUE_CAPACITY} messages)")
+        }
+        WorkerQueueSendError::ByteLimit(_) => {
+            format!("{WORKER_MESSAGE_BYTE_LIMIT} (max {MAX_WORKER_QUEUED_BYTES} bytes)")
+        }
+        WorkerQueueSendError::Closed(_) => closed.to_string(),
+    };
+    WorkerError::Message(message)
+}
+
+fn worker_reserve_error(error: WorkerReserveError) -> WorkerError {
+    let message = match error {
+        WorkerReserveError::Full => {
+            format!("{WORKER_MESSAGE_QUEUE_FULL} (max {WORKER_MESSAGE_QUEUE_CAPACITY} messages)")
+        }
+        WorkerReserveError::ByteLimit => {
+            format!("{WORKER_MESSAGE_BYTE_LIMIT} (max {MAX_WORKER_QUEUED_BYTES} bytes)")
+        }
+        WorkerReserveError::Closed => "Worker channel closed".to_string(),
+    };
+    WorkerError::Message(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -413,10 +992,10 @@ async fn op_worker_create(
     };
 
     // Create bidirectional channels
-    let (tx_main_to_worker, rx_main_to_worker) = mpsc::unbounded_channel::<WorkerMessage>();
-    let (tx_worker_to_main, rx_worker_to_main) = mpsc::unbounded_channel::<String>();
-    let (tx_worker_errors, rx_worker_errors) = mpsc::unbounded_channel::<String>();
-    let (timer_backgrounded_tx, timer_backgrounded_rx) = mpsc::unbounded_channel();
+    let (tx_main_to_worker, rx_main_to_worker) = worker_message_channel();
+    let (tx_worker_to_main, rx_worker_to_main) = worker_outbound_channel();
+    let (tx_worker_errors, rx_worker_errors) = worker_error_channel();
+    let (timer_backgrounded_tx, timer_backgrounded_rx) = worker_lifecycle_channel();
 
     let worker_ctx = WorkerCtx {
         tx_to_main: tx_worker_to_main,
@@ -465,7 +1044,7 @@ async fn op_worker_create(
 #[op2(fast)]
 fn op_worker_post_message(
     state: &mut OpState,
-    #[string] json_message: String,
+    #[string] json_message: &str,
 ) -> Result<(), WorkerError> {
     if json_message.len() > MAX_WORKER_MESSAGE_BYTES {
         return Err(WorkerError::Message(format!(
@@ -487,10 +1066,15 @@ fn op_worker_post_message(
         "[Worker] main->worker postMessage: {} bytes",
         json_message.len()
     );
+    let permit = handle
+        .tx_to_worker
+        .try_reserve(json_message.len())
+        .map_err(worker_reserve_error)?;
+    let json_message = json_message.to_owned();
     handle
         .tx_to_worker
-        .send(WorkerMessage::Message(json_message))
-        .map_err(|_| WorkerError::Message("Worker channel closed".into()))
+        .send_reserved(WorkerMessage::Message(json_message), permit)
+        .map_err(|error| worker_queue_error(error, "Worker channel closed"))
 }
 
 /// Async op: wait for a message from the worker. Returns null when worker exits.
@@ -559,10 +1143,10 @@ fn op_worker_terminate(state: &mut OpState) -> Result<(), WorkerError> {
 /// transfer requires V8 ArrayBuffer::Detach + BackingStore sharing which is not
 /// yet wired). The JS-side ArrayBuffer is NOT detached/neutered.
 /// Still faster than JSON-serializing large typed arrays.
-#[op2(fast)]
+#[op2]
 fn op_worker_transfer_buffer(
     state: &mut OpState,
-    #[buffer(copy)] data: Vec<u8>,
+    #[buffer] data: JsBuffer,
 ) -> Result<(), WorkerError> {
     if data.len() > MAX_WORKER_MESSAGE_BYTES {
         return Err(WorkerError::Message(format!(
@@ -580,10 +1164,18 @@ fn op_worker_transfer_buffer(
         return Err(WorkerError::Message("Worker has been terminated".into()));
     }
 
+    // Admission is intentionally before `to_vec`: `[buffer]` borrows V8's
+    // backing store for this synchronous op, so a saturated Worker queue does
+    // not allocate a Rust copy or base64 staging input only to reject it.
+    let queued_bytes = data.len().saturating_add(base64_encoded_len(data.len()));
+    let permit = handle
+        .tx_to_worker
+        .try_reserve(queued_bytes)
+        .map_err(worker_reserve_error)?;
     handle
         .tx_to_worker
-        .send(WorkerMessage::Binary(data))
-        .map_err(|_| WorkerError::Message("Worker channel closed".into()))
+        .send_reserved(WorkerMessage::Binary(data.to_vec()), permit)
+        .map_err(|error| worker_queue_error(error, "Worker channel closed"))
 }
 
 // ---------------------------------------------------------------------------
@@ -594,7 +1186,7 @@ fn op_worker_transfer_buffer(
 #[op2(fast)]
 fn op_worker_inner_post_message(
     state: &mut OpState,
-    #[string] json_message: String,
+    #[string] json_message: &str,
 ) -> Result<(), WorkerError> {
     if json_message.len() > MAX_WORKER_MESSAGE_BYTES {
         return Err(WorkerError::Message(format!(
@@ -609,9 +1201,14 @@ fn op_worker_inner_post_message(
         json_message.len()
     );
     let ctx = state.borrow::<WorkerCtx>();
+    let permit = ctx
+        .tx_to_main
+        .try_reserve(json_message.len())
+        .map_err(worker_reserve_error)?;
+    let json_message = json_message.to_owned();
     ctx.tx_to_main
-        .send(json_message)
-        .map_err(|_| WorkerError::Message("Main thread channel closed".into()))
+        .send_reserved(json_message, permit)
+        .map_err(|error| worker_queue_error(error, "Main thread channel closed"))
 }
 
 fn worker_message_to_inbound(message: Option<WorkerMessage>) -> Option<WorkerInbound> {
@@ -647,7 +1244,7 @@ async fn recv_worker_inbound(ctx: &WorkerCtx) -> Result<Option<WorkerInbound>, W
     let mut lifecycle = ctx.timer_backgrounded_rx.lock().await;
     let mut messages = ctx.rx_from_main.lock().await;
 
-    if let Ok(transition) = lifecycle.try_recv() {
+    if let Some(transition) = lifecycle.try_recv() {
         return Ok(Some(worker_lifecycle_to_inbound(transition)));
     }
 
@@ -655,8 +1252,8 @@ async fn recv_worker_inbound(ctx: &WorkerCtx) -> Result<Option<WorkerInbound>, W
         biased;
         transition = lifecycle.recv() => {
             match transition {
-                Some(transition) => Ok(Some(worker_lifecycle_to_inbound(transition))),
-                None => Ok(worker_message_to_inbound(messages.recv().await)),
+                Ok(transition) => Ok(Some(worker_lifecycle_to_inbound(transition))),
+                Err(_) => Ok(worker_message_to_inbound(messages.recv().await)),
             }
         }
         message = messages.recv() => Ok(worker_message_to_inbound(message)),
@@ -720,6 +1317,13 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+fn base64_encoded_len(len: usize) -> usize {
+    len.checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .unwrap_or(usize::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -786,7 +1390,7 @@ pub(crate) fn set_timer_backgrounded(state: &mut OpState, backgrounded: bool) {
     if handle.terminated {
         return;
     }
-    let _ = handle
+    handle
         .timer_backgrounded_tx
         .send(WorkerTimerLifecycleTransition::now(backgrounded));
 }
@@ -924,13 +1528,24 @@ const WORKER_TIMEOUT_MSG: &str =
 /// resulting "execution terminated" error.
 fn report_worker_error(
     watchdog: Option<&DeadlineWatchdog>,
-    tx_errors: &mpsc::UnboundedSender<String>,
+    tx_errors: &WorkerQueueSender<String>,
     message: String,
 ) {
     if watchdog.is_some_and(DeadlineWatchdog::timed_out) {
         return;
     }
-    let _ = tx_errors.send(message);
+    send_worker_diagnostic(tx_errors, message);
+}
+
+fn send_worker_diagnostic(tx_errors: &WorkerQueueSender<String>, message: String) {
+    if let Err(error) = tx_errors.send(message) {
+        let reason = match error {
+            WorkerQueueSendError::Full(_) => "count limit",
+            WorkerQueueSendError::ByteLimit(_) => "byte limit",
+            WorkerQueueSendError::Closed(_) => "receiver closed",
+        };
+        warn!("[Worker] dropping diagnostic after {reason}");
+    }
 }
 
 fn worker_initialization_error(stage: &str, error: &dyn std::fmt::Display) -> String {
@@ -1100,7 +1715,7 @@ fn spawn_worker_thread(
                     if let Some(extension_args) = extension_args {
                         if let Err(error) = rt.lazy_init_extensions(extension_args) {
                             error!("[Worker] snapshot state initialization failed: {error}");
-                            let _ = tx_errors.send(worker_initialization_error(
+                            send_worker_diagnostic(&tx_errors, worker_initialization_error(
                                 "snapshot state initialization",
                                 &error,
                             ));
@@ -1110,8 +1725,10 @@ fn spawn_worker_thread(
 
                     if let Err(error) = initialize_worker_runtime(&mut rt) {
                         error!("[Worker] runtime bootstrap failed: {error}");
-                        let _ = tx_errors
-                            .send(worker_initialization_error("runtime bootstrap", &error));
+                        send_worker_diagnostic(
+                            &tx_errors,
+                            worker_initialization_error("runtime bootstrap", &error),
+                        );
                         return;
                     }
 
@@ -1143,7 +1760,7 @@ fn spawn_worker_thread(
                             if first {
                                 warn!("[Worker] V8 heap limit reached, terminating");
                                 oom_handle.terminate_execution();
-                                let _ = cb_tx.send(
+                                send_worker_diagnostic(&cb_tx,
                                     r#"{"message":"Worker terminated: V8 heap limit exceeded"}"#
                                         .to_string(),
                                 );
@@ -1165,7 +1782,7 @@ fn spawn_worker_thread(
                         let tx = tx_errors.clone();
                         let config = DeadlineWatchdogConfig::new(WORKER_TIMEOUT, "worker")
                             .with_observer(Arc::new(move |_| {
-                                let _ = tx.send(WORKER_TIMEOUT_MSG.to_string());
+                                send_worker_diagnostic(&tx, WORKER_TIMEOUT_MSG.to_string());
                             }));
                         match DeadlineWatchdog::register_isolate(handle, config) {
                             Ok(w) => Some(w),
@@ -1260,6 +1877,327 @@ fn spawn_worker_thread(
 }
 
 #[cfg(test)]
+mod worker_queue_boundary_tests {
+    use super::*;
+
+    const EXPECTED_MESSAGE_CAPACITY: usize = 64;
+
+    fn main_worker_handle() -> (WorkerHandle, WorkerMessageReceiver) {
+        let (tx_to_worker, rx_from_main) = worker_message_channel();
+        let (_tx_from_worker, rx_from_worker) = worker_outbound_channel();
+        let (_tx_errors, rx_errors) = worker_error_channel();
+        let (timer_backgrounded_tx, _timer_backgrounded_rx) = worker_lifecycle_channel();
+        (
+            WorkerHandle {
+                tx_to_worker,
+                rx_from_worker: Arc::new(tokio::sync::Mutex::new(rx_from_worker)),
+                rx_errors: Arc::new(tokio::sync::Mutex::new(rx_errors)),
+                timer_backgrounded_tx,
+                join_handle: None,
+                terminated: false,
+                isolate_handle: Arc::new(std::sync::Mutex::new(None)),
+            },
+            rx_from_main,
+        )
+    }
+
+    #[test]
+    fn worker_runtime_channels_are_explicitly_bounded() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("// Create bidirectional channels")
+            .expect("worker channel construction");
+        let end = source[start..]
+            .find("// Shared slot")
+            .map(|offset| start + offset)
+            .expect("end of worker channel construction");
+        let construction = &source[start..end];
+
+        assert!(
+            !construction.contains("mpsc::unbounded_channel"),
+            "worker data, error, and lifecycle transports must have explicit bounds"
+        );
+    }
+
+    #[test]
+    fn main_to_worker_rejects_limit_plus_one_without_blocking() {
+        let (handle, _rx) = main_worker_handle();
+        for _ in 0..EXPECTED_MESSAGE_CAPACITY {
+            handle
+                .tx_to_worker
+                .send(WorkerMessage::Message("x".into()))
+                .expect("at count limit");
+        }
+
+        let error = handle
+            .tx_to_worker
+            .send(WorkerMessage::Message("x".into()))
+            .map_err(|error| worker_queue_error(error, "Worker channel closed"))
+            .expect_err("limit + 1 must be refused");
+        assert!(error.to_string().contains("queue full"));
+    }
+
+    #[test]
+    fn terminate_uses_reserved_capacity_after_the_data_limit() {
+        let (handle, mut rx) = main_worker_handle();
+        for _ in 0..EXPECTED_MESSAGE_CAPACITY {
+            handle
+                .tx_to_worker
+                .send(WorkerMessage::Message("x".into()))
+                .expect("at count limit");
+        }
+
+        handle.force_terminate();
+
+        assert!(matches!(rx.try_recv(), Ok(WorkerMessage::Terminate)));
+        for _ in 0..EXPECTED_MESSAGE_CAPACITY {
+            assert!(matches!(rx.try_recv(), Ok(WorkerMessage::Message(_))));
+        }
+    }
+
+    #[test]
+    fn dropping_worker_handle_joins_the_terminated_thread() {
+        let (mut handle, mut rx) = main_worker_handle();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_on_worker = Arc::clone(&completed);
+        handle.join_handle = Some(std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("test runtime");
+            assert!(matches!(
+                runtime.block_on(rx.recv()),
+                Some(WorkerMessage::Terminate)
+            ));
+            // Make a detached implementation fail deterministically: it can
+            // enqueue Terminate quickly, but it cannot claim the worker has
+            // completed before this thread actually reaches its exit path.
+            std::thread::sleep(Duration::from_millis(50));
+            completed_on_worker.store(true, std::sync::atomic::Ordering::Release);
+        }));
+
+        drop(handle);
+
+        assert!(
+            completed.load(std::sync::atomic::Ordering::Acquire),
+            "dropping the main runtime must join its nested Worker"
+        );
+    }
+
+    #[test]
+    fn worker_byte_budget_accepts_limit_and_rejects_limit_plus_one() {
+        let (tx, mut rx) = worker_queue::<String>(2, 4);
+
+        tx.send("1234".into()).expect("the byte limit is inclusive");
+        assert!(matches!(
+            tx.send("x".into()),
+            Err(WorkerQueueSendError::ByteLimit(value)) if value == "x"
+        ));
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 4);
+
+        assert_eq!(rx.try_recv().unwrap(), "1234");
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(matches!(
+            tx.send("12345".into()),
+            Err(WorkerQueueSendError::ByteLimit(value)) if value == "12345"
+        ));
+    }
+
+    #[test]
+    fn receive_and_receiver_drop_release_every_worker_permit() {
+        let (tx, mut rx) = worker_queue::<String>(2, 8);
+        tx.send("aa".into()).unwrap();
+        tx.send("bbb".into()).unwrap();
+        assert_eq!(tx.usage.items.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 5);
+
+        assert_eq!(rx.try_recv().unwrap(), "aa");
+        assert_eq!(tx.usage.items.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 3);
+
+        drop(rx);
+        assert_eq!(tx.usage.items.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn stopped_worker_receiver_returns_payload_and_releases_permit() {
+        let (tx, rx) = worker_queue::<String>(1, 4);
+        drop(rx);
+
+        assert!(matches!(
+            tx.send("data".into()),
+            Err(WorkerQueueSendError::Closed(value)) if value == "data"
+        ));
+        assert_eq!(tx.usage.items.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn dropped_worker_receiver_rejects_reservation_before_copy() {
+        let (tx, rx) = worker_queue::<WorkerMessage>(1, 8);
+        drop(rx);
+
+        assert!(matches!(tx.try_reserve(7), Err(WorkerReserveError::Closed)));
+        assert_eq!(tx.usage.items.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn binary_admission_charges_raw_and_projected_base64_bytes() {
+        let message = WorkerMessage::Binary(vec![1, 2, 3]);
+        assert_eq!(message.queued_bytes(), 3 + 4);
+    }
+
+    #[test]
+    fn binary_reservation_accepts_the_byte_limit_and_refuses_limit_plus_one() {
+        let (tx, _rx) = worker_queue::<WorkerMessage>(2, 7);
+        let payload = vec![1, 2, 3]; // 3 raw bytes + 4 projected base64 bytes.
+        let permit = tx
+            .try_reserve(7)
+            .expect("the aggregate byte limit is inclusive");
+        tx.send_reserved(WorkerMessage::Binary(payload), permit)
+            .expect("the admitted payload must be queued");
+
+        assert!(matches!(
+            tx.try_reserve(1),
+            Err(WorkerReserveError::ByteLimit)
+        ));
+        assert_eq!(tx.usage.items.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(tx.usage.bytes.load(std::sync::atomic::Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn binary_transfer_reserves_queue_capacity_before_copying_the_v8_buffer() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn op_worker_transfer_buffer")
+            .expect("binary Worker op");
+        let body = &source[start..source[start..]
+            .find("// ---------------------------------------------------------------------------\n// Worker-thread ops")
+            .map(|offset| start + offset)
+            .expect("end of binary Worker op")];
+
+        let reserve = body
+            .find("try_reserve")
+            .expect("binary payload must reserve queue capacity");
+        let copy = body
+            .find("data.to_vec()")
+            .expect("binary payload must be copied only after admission");
+        assert!(
+            reserve < copy,
+            "Worker admission must happen before copying the V8 buffer"
+        );
+        assert!(
+            !body.contains("#[buffer(copy)]"),
+            "#[buffer(copy)] copies the V8 buffer before the op can reserve queue capacity"
+        );
+    }
+
+    #[test]
+    fn worker_string_ops_borrow_then_reserve_before_copying() {
+        let source = include_str!("mod.rs");
+        for (name, end_marker) in [
+            (
+                "fn op_worker_post_message",
+                "/// Async op: wait for a message",
+            ),
+            (
+                "fn op_worker_inner_post_message",
+                "fn worker_message_to_inbound",
+            ),
+        ] {
+            let start = source.find(name).expect("Worker string op");
+            let end = source[start..]
+                .find(end_marker)
+                .map(|offset| start + offset)
+                .expect("end of Worker string op");
+            let body = &source[start..end];
+
+            assert!(
+                body.contains("#[string] json_message: &str"),
+                "{name} must borrow the V8 string"
+            );
+            let reserve = body.find("try_reserve").expect("queue admission");
+            let copy = body.find("json_message.to_owned()").expect("owned payload");
+            assert!(reserve < copy, "{name} must reserve before copying");
+            assert!(body.contains("send_reserved"));
+        }
+    }
+
+    #[test]
+    fn pre_ready_js_messages_have_the_same_count_and_byte_bounds_as_rust() {
+        let source = include_str!("01_worker.js");
+
+        assert!(source.contains("const MAX_PENDING_MESSAGES = 64"));
+        assert!(source.contains("const MAX_PENDING_MESSAGE_BYTES = 64 * 1024 * 1024"));
+        assert!(source.contains("const MAX_WORKER_MESSAGE_BYTES = 16 * 1024 * 1024"));
+        assert!(source.contains("#pendingMessageBytes = 0"));
+        assert!(source.contains("utf8ByteLength(json)"));
+
+        let queue_branch = source
+            .split("if (!this.#ready)")
+            .nth(1)
+            .expect("pre-ready queue branch");
+        let push = queue_branch
+            .find("ArrayPrototypePush(this.#pendingMessages, json)")
+            .expect("pending queue insertion");
+        for guard in [
+            "MAX_WORKER_MESSAGE_BYTES",
+            "MAX_PENDING_MESSAGES",
+            "MAX_PENDING_MESSAGE_BYTES",
+        ] {
+            assert!(
+                queue_branch.find(guard).is_some_and(|offset| offset < push),
+                "{guard} must be enforced before retaining a pending message"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_ready_js_byte_accounting_matches_utf8() {
+        let source = include_str!("01_worker.js");
+        let start = source
+            .find("function utf8ByteLength")
+            .expect("UTF-8 byte counter");
+        let end = source[start..]
+            .find("\n\nlet currentWorker")
+            .map(|offset| start + offset)
+            .expect("end of byte counter");
+        let helper = &source[start..end];
+        let script = format!(
+            r#"const StringPrototypeCharCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+{helper}
+const cases = [["a", 1], ["é", 2], ["水", 3], ["😀", 4], ["aé水😀", 10]];
+for (const [value, expected] of cases) {{
+    const actual = utf8ByteLength(value);
+    if (actual !== expected) throw new Error(`${{value}}: ${{actual}} !== ${{expected}}`);
+}}"#
+        );
+        let mut runtime = JsRuntime::new(RuntimeOptions::default());
+        runtime
+            .execute_script(
+                "<test:worker-pending-utf8>",
+                deno_core::FastString::from(script),
+            )
+            .expect("UTF-8 byte accounting must execute and match Rust string bytes");
+    }
+
+    #[test]
+    fn error_queue_rejections_are_counted() {
+        let (tx, _rx) = worker_queue::<String>(1, 4);
+        tx.send("err!".into()).unwrap();
+        assert!(matches!(
+            tx.send("next".into()),
+            Err(WorkerQueueSendError::Full(_))
+        ));
+        assert_eq!(
+            tx.usage.rejected.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
 mod timer_lifecycle_tests {
     use super::*;
     use std::{path::PathBuf, sync::atomic::AtomicBool, time::Duration};
@@ -1324,11 +2262,11 @@ mod timer_lifecycle_tests {
     }
 
     fn test_worker_ctx(
-        rx_from_main: mpsc::UnboundedReceiver<WorkerMessage>,
-        timer_backgrounded_rx: mpsc::UnboundedReceiver<WorkerTimerLifecycleTransition>,
+        rx_from_main: WorkerMessageReceiver,
+        timer_backgrounded_rx: WorkerLifecycleReceiver,
     ) -> WorkerCtx {
-        let (tx_to_main, _rx_to_main) = mpsc::unbounded_channel();
-        let (tx_errors, _rx_errors) = mpsc::unbounded_channel();
+        let (tx_to_main, _rx_to_main) = worker_outbound_channel();
+        let (tx_errors, _rx_errors) = worker_error_channel();
         WorkerCtx {
             tx_to_main,
             tx_errors,
@@ -1376,14 +2314,12 @@ mod timer_lifecycle_tests {
 
     #[tokio::test(start_paused = true)]
     async fn lifecycle_change_preempts_a_queued_user_message() {
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (message_tx, message_rx) = worker_message_channel();
         message_tx
             .send(WorkerMessage::Message("user".into()))
             .unwrap();
-        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(true))
-            .unwrap();
+        let (lifecycle_tx, lifecycle_rx) = worker_lifecycle_channel();
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
         let ctx = test_worker_ctx(message_rx, lifecycle_rx);
 
         assert_eq!(
@@ -1402,18 +2338,12 @@ mod timer_lifecycle_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn lifecycle_changes_preserve_every_edge() {
-        let (_message_tx, message_rx) = mpsc::unbounded_channel();
-        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(true))
-            .unwrap();
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(false))
-            .unwrap();
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(true))
-            .unwrap();
+    async fn lifecycle_bursts_coalesce_to_the_latest_state() {
+        let (_message_tx, message_rx) = worker_message_channel();
+        let (lifecycle_tx, lifecycle_rx) = worker_lifecycle_channel();
+        for index in 0..101 {
+            lifecycle_tx.send(WorkerTimerLifecycleTransition::now(index % 2 == 0));
+        }
         let ctx = test_worker_ctx(message_rx, lifecycle_rx);
 
         assert_eq!(
@@ -1423,26 +2353,176 @@ mod timer_lifecycle_tests {
                 elapsed_micros: 0,
             })
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_hide_then_show_preserves_the_background_interval() {
+        let (_message_tx, message_rx) = worker_message_channel();
+        let (lifecycle_tx, lifecycle_rx) = worker_lifecycle_channel();
+        let ctx = test_worker_ctx(message_rx, lifecycle_rx);
+
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
+
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(10), recv_worker_inbound(&ctx))
-                .await
-                .expect("the foreground edge must not be coalesced")
-                .unwrap(),
+            recv_worker_inbound(&ctx).await.unwrap(),
+            Some(WorkerInbound::Lifecycle {
+                backgrounded: true,
+                elapsed_micros: 10_000_000,
+            })
+        );
+        assert_eq!(
+            recv_worker_inbound(&ctx).await.unwrap(),
             Some(WorkerInbound::Lifecycle {
                 backgrounded: false,
                 elapsed_micros: 0,
             })
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_hide_show_hide_preserves_completed_and_current_background_time() {
+        let (lifecycle_tx, mut lifecycle_rx) = worker_lifecycle_channel();
+
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let transitions = [
+            lifecycle_rx.try_recv().expect("completed hide"),
+            lifecycle_rx.try_recv().expect("synthetic show"),
+            lifecycle_rx.try_recv().expect("current hide"),
+        ];
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(10), recv_worker_inbound(&ctx))
-                .await
-                .expect("the second background edge must not be coalesced")
-                .unwrap(),
-            Some(WorkerInbound::Lifecycle {
-                backgrounded: true,
-                elapsed_micros: 0,
-            })
+            transitions.map(|transition| transition.backgrounded),
+            [true, false, true]
         );
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            transitions.map(|transition| now.duration_since(transition.occurred_at)),
+            [
+                Duration::from_secs(15),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ]
+        );
+        assert!(lifecycle_rx.try_recv().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_after_a_delivered_hide_preserves_the_foreground_interval() {
+        let (lifecycle_tx, mut lifecycle_rx) = worker_lifecycle_channel();
+
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        assert!(lifecycle_rx.try_recv().unwrap().backgrounded);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
+
+        let resumed = lifecycle_rx.try_recv().expect("compressed foreground");
+        assert!(!resumed.backgrounded);
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(resumed.occurred_at),
+            Duration::from_secs(5),
+            "five seconds of foreground time must advance Worker timers"
+        );
+        assert!(lifecycle_rx.try_recv().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_after_a_delivered_hide_can_end_hidden_without_losing_foreground_time() {
+        let (lifecycle_tx, mut lifecycle_rx) = worker_lifecycle_channel();
+
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        assert!(lifecycle_rx.try_recv().unwrap().backgrounded);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let transitions = [
+            lifecycle_rx.try_recv().expect("compressed foreground"),
+            lifecycle_rx.try_recv().expect("current hide"),
+        ];
+        assert_eq!(
+            transitions.map(|transition| transition.backgrounded),
+            [false, true]
+        );
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            transitions.map(|transition| now.duration_since(transition.occurred_at)),
+            [Duration::from_secs(15), Duration::from_secs(5)]
+        );
+        assert!(lifecycle_rx.try_recv().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_short_coalesced_lifecycle_sequence_preserves_total_foreground_time() {
+        for initial_backgrounded in [false, true] {
+            for transition_count in 1..=10 {
+                let (lifecycle_tx, mut lifecycle_rx) = worker_lifecycle_channel();
+                let started_at = tokio::time::Instant::now();
+                lifecycle_tx.send(WorkerTimerLifecycleTransition {
+                    backgrounded: initial_backgrounded,
+                    occurred_at: started_at,
+                });
+                assert_eq!(
+                    lifecycle_rx.try_recv().unwrap().backgrounded,
+                    initial_backgrounded
+                );
+
+                let mut expected_foreground = Duration::ZERO;
+                let mut state = initial_backgrounded;
+                let mut cursor = started_at;
+                for index in 0..transition_count {
+                    let occurred_at = cursor + Duration::from_secs((index % 3 + 1) as u64);
+                    if !state {
+                        expected_foreground += occurred_at.duration_since(cursor);
+                    }
+                    state = !state;
+                    lifecycle_tx.send(WorkerTimerLifecycleTransition {
+                        backgrounded: state,
+                        occurred_at,
+                    });
+                    cursor = occurred_at;
+                }
+                let ended_at = cursor;
+
+                let mut encoded_state = initial_backgrounded;
+                let mut encoded_cursor = started_at;
+                let mut encoded_foreground = Duration::ZERO;
+                while let Some(transition) = lifecycle_rx.try_recv() {
+                    assert!(transition.occurred_at >= encoded_cursor);
+                    assert!(transition.occurred_at <= ended_at);
+                    if !encoded_state {
+                        encoded_foreground += transition.occurred_at.duration_since(encoded_cursor);
+                    }
+                    encoded_state = transition.backgrounded;
+                    encoded_cursor = transition.occurred_at;
+                }
+                if !encoded_state {
+                    encoded_foreground += ended_at.duration_since(encoded_cursor);
+                }
+
+                assert_eq!(encoded_state, state);
+                assert_eq!(
+                    encoded_foreground, expected_foreground,
+                    "initial={initial_backgrounded}, transitions={transition_count}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1479,8 +2559,8 @@ mod timer_lifecycle_tests {
 
     #[test]
     fn worker_snapshot_extensions_match_eager_and_argument_order() {
-        let (_eager_message_tx, eager_message_rx) = mpsc::unbounded_channel();
-        let (_eager_lifecycle_tx, eager_lifecycle_rx) = mpsc::unbounded_channel();
+        let (_eager_message_tx, eager_message_rx) = worker_message_channel();
+        let (_eager_lifecycle_tx, eager_lifecycle_rx) = worker_lifecycle_channel();
         let eager_names: Vec<_> = create_worker_runtime_extensions(
             test_worker_ctx(eager_message_rx, eager_lifecycle_rx),
             test_host_state(Arc::new(AtomicBool::new(false))),
@@ -1494,8 +2574,8 @@ mod timer_lifecycle_tests {
             .map(|extension| extension.name)
             .collect();
 
-        let (_args_message_tx, args_message_rx) = mpsc::unbounded_channel();
-        let (_args_lifecycle_tx, args_lifecycle_rx) = mpsc::unbounded_channel();
+        let (_args_message_tx, args_message_rx) = worker_message_channel();
+        let (_args_lifecycle_tx, args_lifecycle_rx) = worker_lifecycle_channel();
         let argument_names: Vec<_> = create_worker_runtime_extension_args(
             test_worker_ctx(args_message_rx, args_lifecycle_rx),
             test_host_state(Arc::new(AtomicBool::new(false))),
@@ -1510,8 +2590,8 @@ mod timer_lifecycle_tests {
 
     #[tokio::test(start_paused = true)]
     async fn worker_pump_consumes_lifecycle_and_freezes_timer_remainder() {
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let (message_tx, message_rx) = worker_message_channel();
+        let (lifecycle_tx, lifecycle_rx) = worker_lifecycle_channel();
         let timer_backgrounded = Arc::new(AtomicBool::new(false));
         let ctx = test_worker_ctx(message_rx, lifecycle_rx);
         let mut rt = JsRuntime::new(RuntimeOptions {
@@ -1533,17 +2613,13 @@ mod timer_lifecycle_tests {
         advance_and_drain(&mut rt, Duration::from_millis(30)).await;
 
         timer_backgrounded.store(true, std::sync::atomic::Ordering::Release);
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(true))
-            .unwrap();
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
         drain_ready(&mut rt).await;
         advance_and_drain(&mut rt, Duration::from_secs(10)).await;
         assert_js(&mut rt, "__workerTimer === 0 && __workerMessages === 0");
 
         timer_backgrounded.store(false, std::sync::atomic::Ordering::Release);
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(false))
-            .unwrap();
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
         drain_ready(&mut rt).await;
         advance_and_drain(&mut rt, Duration::from_millis(69)).await;
         assert_js(&mut rt, "__workerTimer === 0 && __workerMessages === 0");
@@ -1555,8 +2631,8 @@ mod timer_lifecycle_tests {
 
     #[tokio::test(start_paused = true)]
     async fn worker_pump_uses_transition_time_when_lifecycle_delivery_is_delayed() {
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let (message_tx, message_rx) = worker_message_channel();
+        let (lifecycle_tx, lifecycle_rx) = worker_lifecycle_channel();
         let timer_backgrounded = Arc::new(AtomicBool::new(false));
         let ctx = test_worker_ctx(message_rx, lifecycle_rx);
         let mut rt = JsRuntime::new(RuntimeOptions {
@@ -1578,14 +2654,10 @@ mod timer_lifecycle_tests {
         advance_and_drain(&mut rt, Duration::from_millis(30)).await;
 
         timer_backgrounded.store(true, std::sync::atomic::Ordering::Release);
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(true))
-            .unwrap();
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(true));
         tokio::time::advance(Duration::from_secs(10)).await;
         timer_backgrounded.store(false, std::sync::atomic::Ordering::Release);
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(false))
-            .unwrap();
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
         drain_ready(&mut rt).await;
 
         assert_js(&mut rt, "__workerTimer === 0 && __workerMessages === 0");
@@ -1599,8 +2671,8 @@ mod timer_lifecycle_tests {
 
     #[tokio::test(start_paused = true)]
     async fn worker_created_hidden_keeps_its_first_timer_logical_until_show() {
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let (message_tx, message_rx) = worker_message_channel();
+        let (lifecycle_tx, lifecycle_rx) = worker_lifecycle_channel();
         let timer_backgrounded = Arc::new(AtomicBool::new(true));
         let ctx = test_worker_ctx(message_rx, lifecycle_rx);
         let mut rt = JsRuntime::new(RuntimeOptions {
@@ -1623,9 +2695,7 @@ mod timer_lifecycle_tests {
         // hide edge in its per-worker queue. The shared level initializes its
         // timer registry; the first queued edge is therefore show.
         timer_backgrounded.store(false, std::sync::atomic::Ordering::Release);
-        lifecycle_tx
-            .send(WorkerTimerLifecycleTransition::now(false))
-            .unwrap();
+        lifecycle_tx.send(WorkerTimerLifecycleTransition::now(false));
         drain_ready(&mut rt).await;
         advance_and_drain(&mut rt, Duration::from_millis(99)).await;
         assert_js(&mut rt, "__workerTimer === 0");
@@ -1688,10 +2758,10 @@ mod watchdog_worker_tests {
     }
 
     fn build_worker_rt(loader: Option<Rc<dyn ModuleLoader>>) -> JsRuntime {
-        let (_tx, rx_from_main) = mpsc::unbounded_channel::<WorkerMessage>();
-        let (_ltx, lifecycle_rx) = mpsc::unbounded_channel::<WorkerTimerLifecycleTransition>();
-        let (tx_to_main, _rx_to_main) = mpsc::unbounded_channel();
-        let (tx_errors, _rx_errors) = mpsc::unbounded_channel();
+        let (_tx, rx_from_main) = worker_message_channel();
+        let (_ltx, lifecycle_rx) = worker_lifecycle_channel();
+        let (tx_to_main, _rx_to_main) = worker_outbound_channel();
+        let (tx_errors, _rx_errors) = worker_error_channel();
         let ctx = WorkerCtx {
             tx_to_main,
             tx_errors,
@@ -1723,7 +2793,7 @@ mod watchdog_worker_tests {
 
         let mut rt = build_worker_rt(Some(Rc::new(FsModuleLoader)));
         let sched = Scheduler::new_test();
-        let (err_tx, mut err_rx) = mpsc::unbounded_channel::<String>();
+        let (err_tx, mut err_rx) = worker_error_channel();
         let obs_tx = err_tx.clone();
         let config = DeadlineWatchdogConfig::new(Duration::from_millis(200), "worker-test")
             .with_observer(Arc::new(move |_| {

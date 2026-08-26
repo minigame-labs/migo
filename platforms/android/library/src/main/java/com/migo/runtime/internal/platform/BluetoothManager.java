@@ -97,14 +97,20 @@ public class BluetoothManager {
             return gatt;
         }
 
+        /* Permission admission is performed by BluetoothManager immediately
+         * before this test seam is invoked. Framework calls still throw on a
+         * revoke race, and every caller catches that RuntimeException. */
+        @SuppressLint("MissingPermission")
         @Override public boolean discoverServices() {
             return gatt.discoverServices();
         }
 
+        @SuppressLint("MissingPermission")
         @Override public void disconnect() {
             gatt.disconnect();
         }
 
+        @SuppressLint("MissingPermission")
         @Override public void close() {
             gatt.close();
         }

@@ -27,6 +27,13 @@
 //!    symlinks and re-verify containment.  An optional *symlink policy* can
 //!    reject symlinks outright in read-only directories (`/code`).
 //!
+//! `resolve` returns a pathname, so another process can still replace a path
+//! component before a caller opens it. Security-sensitive reads must use
+//! [`VirtualFS::open_regular_for_read`], which anchors traversal to pinned
+//! directory handles and returns the already-open regular file. This protects
+//! path resolution; it does not snapshot file bytes or defend against a writer
+//! that already has access to the same inode.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -45,12 +52,18 @@ pub mod integrity;
 pub mod mount;
 pub mod package;
 
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
 pub use game_paths::{GamePathError, GamePathStrings, GamePaths, validate_game_id};
 pub use mount::{DirSource, MountBackend, MountTable, ResolvedCode, StagingArea};
 pub use package::{PackSource, PackageError, PackageIdentity, PackageReader, PackageWriter};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // FileOp & FilePermissions (unchanged)
@@ -114,6 +127,10 @@ pub struct PathMapping {
     /// Falls back to the textually-normalized `real_path` when the directory
     /// does not exist yet.
     canonical_base: PathBuf,
+    /// Root handle used by strict reads. Production constructs the VFS only
+    /// after creating all roots, so keeping this handle alive pins the mapping
+    /// even if an attacker later replaces its pathname.
+    strict_root: Option<Arc<std::fs::File>>,
     pub permissions: FilePermissions,
 }
 
@@ -204,6 +221,54 @@ impl std::fmt::Display for VfsError {
 
 impl std::error::Error for VfsError {}
 
+/// Error returned by descriptor-safe VFS reads.
+///
+/// The variants deliberately contain neither host paths nor operating-system
+/// error text, so they are safe to surface across the JavaScript boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VfsOpenError {
+    /// The virtual path or requested operation violates the VFS policy.
+    Policy(VfsError),
+    /// The requested file does not exist.
+    NotFound,
+    /// The target exists but is not a regular file.
+    NotRegularFile,
+    /// The operating system denied access to the target.
+    AccessDenied,
+    /// A link, reparse point, or unsafe path transition was detected.
+    UnsafePath,
+    /// The target could not be opened safely for another reason.
+    OpenFailed,
+}
+
+impl std::fmt::Display for VfsOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Policy(error) => error.fmt(f),
+            Self::NotFound => f.write_str("Sandbox file not found"),
+            Self::NotRegularFile => f.write_str("Sandbox path is not a regular file"),
+            Self::AccessDenied => f.write_str("Sandbox file access denied"),
+            Self::UnsafePath => f.write_str("Unsafe sandbox path"),
+            Self::OpenFailed => f.write_str("Failed to open sandbox file"),
+        }
+    }
+}
+
+impl std::error::Error for VfsOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Policy(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<VfsError> for VfsOpenError {
+    fn from(value: VfsError) -> Self {
+        Self::Policy(value)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VirtualFS
 // ---------------------------------------------------------------------------
@@ -225,6 +290,24 @@ impl VirtualFS {
             paths.temp_dir().to_path_buf(),
             VfsPolicy::default(),
         )
+    }
+
+    /// Create a production VFS and require every sandbox root to be pinned by
+    /// an already-open directory handle.
+    ///
+    /// Call this after [`GamePaths::ensure_directories`]. Unlike the legacy
+    /// infallible constructors used by path-only tooling and tests, this fails
+    /// closed when any root cannot support descriptor-safe reads.
+    pub fn try_from_game_paths(paths: &GamePaths) -> Result<Self, VfsOpenError> {
+        let vfs = Self::from_game_paths(paths);
+        if vfs
+            .mappings
+            .values()
+            .any(|mapping| mapping.strict_root.is_none())
+        {
+            return Err(VfsOpenError::OpenFailed);
+        }
+        Ok(vfs)
     }
 
     /// Create a VirtualFS from a [`GamePaths`] instance with a custom policy.
@@ -291,6 +374,7 @@ impl VirtualFS {
         real_path: PathBuf,
         permissions: FilePermissions,
     ) -> PathMapping {
+        let strict_root = Self::pin_strict_root(&real_path).ok().map(Arc::new);
         let canonical_base =
             std::fs::canonicalize(&real_path).unwrap_or_else(|_| normalize_path(&real_path));
         PathMapping {
@@ -298,7 +382,24 @@ impl VirtualFS {
             prefix_with_slash: format!("{}/", prefix),
             real_path,
             canonical_base,
+            strict_root,
             permissions,
+        }
+    }
+
+    fn pin_strict_root(path: &Path) -> Result<std::fs::File, VfsOpenError> {
+        #[cfg(unix)]
+        {
+            unix::pin_root(path)
+        }
+        #[cfg(windows)]
+        {
+            windows::pin_root(path)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Err(VfsOpenError::OpenFailed)
         }
     }
 
@@ -316,33 +417,13 @@ impl VirtualFS {
     /// # Returns
     /// The real filesystem path if allowed, or a [`VfsError`].
     pub fn resolve(&self, virtual_path: &str, op: FileOp) -> Result<PathBuf, VfsError> {
-        // ---- Phase 0: input sanitization ----
-        Self::validate_input(virtual_path)?;
+        let (mapping, relative) = self.resolve_textual(virtual_path, op)?;
 
-        // ---- Phase 1: find mapping & check permissions ----
-        let mapping = self
-            .mappings
-            .iter()
-            .find(|(prefix, m)| {
-                virtual_path == **prefix || virtual_path.starts_with(&m.prefix_with_slash)
-            })
-            .map(|(_, m)| m)
-            .ok_or(VfsError::PathNotAllowed)?;
-
-        if !mapping.permissions.allows(op) {
-            return Err(VfsError::PermissionDenied);
-        }
-
-        // ---- Phase 2: build real path & textual normalization ----
-        let relative = virtual_path
-            .strip_prefix(mapping.virtual_prefix)
-            .unwrap_or("")
-            .trim_start_matches('/');
-
-        let real_path = if relative.is_empty() {
+        // ---- Phase 2: build real path from the normalized relative path ----
+        let real_path = if relative.as_os_str().is_empty() {
             mapping.real_path.clone()
         } else {
-            mapping.real_path.join(relative)
+            mapping.real_path.join(&relative)
         };
 
         let normalized = normalize_path(&real_path);
@@ -364,9 +445,63 @@ impl VirtualFS {
         Ok(normalized)
     }
 
+    /// Open an existing regular file for reading without a pathname reopen.
+    ///
+    /// This is the preferred API for sandboxed reads. It always rejects
+    /// symbolic links (or Windows reparse points) in the root, ancestor, and
+    /// final components, independently of the legacy [`VfsPolicy`] settings.
+    /// The returned descriptor/handle has already been verified as a regular
+    /// file, closing the `resolve`-then-open race.
+    pub fn open_regular_for_read(&self, virtual_path: &str) -> Result<std::fs::File, VfsOpenError> {
+        let (mapping, relative) = self.resolve_textual(virtual_path, FileOp::Read)?;
+        if relative.as_os_str().is_empty() {
+            return Err(VfsOpenError::NotRegularFile);
+        }
+        let root = mapping
+            .strict_root
+            .as_deref()
+            .ok_or(VfsOpenError::OpenFailed)?;
+
+        #[cfg(unix)]
+        {
+            unix::open_regular_for_read(root, &relative)
+        }
+        #[cfg(windows)]
+        {
+            windows::open_regular_for_read(root, &mapping.real_path, &relative)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (mapping, relative);
+            Err(VfsOpenError::OpenFailed)
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn open_regular_for_read_with_hook<F>(
+        &self,
+        virtual_path: &str,
+        before_final: F,
+    ) -> Result<std::fs::File, VfsOpenError>
+    where
+        F: FnOnce(),
+    {
+        let (mapping, relative) = self.resolve_textual(virtual_path, FileOp::Read)?;
+        if relative.as_os_str().is_empty() {
+            return Err(VfsOpenError::NotRegularFile);
+        }
+        let root = mapping
+            .strict_root
+            .as_deref()
+            .ok_or(VfsOpenError::OpenFailed)?;
+        unix::open_regular_for_read_with_hook(root, &relative, before_final)
+    }
+
     /// Check if a path is within the VFS.
     pub fn is_virtual_path(&self, path: &str) -> bool {
-        self.mappings.keys().any(|prefix| path.starts_with(prefix))
+        self.mappings.values().any(|mapping| {
+            path == mapping.virtual_prefix || path.starts_with(&mapping.prefix_with_slash)
+        })
     }
 
     /// Get the virtual path prefixes (for env.js).
@@ -395,6 +530,59 @@ impl VirtualFS {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Validate a virtual path, enforce its operation permission, and return
+    /// a normalized path relative to the selected mapping. This helper is
+    /// intentionally syscall-free so descriptor-based open implementations do
+    /// not perform a racy canonicalize/lstat pass first.
+    fn resolve_textual(
+        &self,
+        virtual_path: &str,
+        op: FileOp,
+    ) -> Result<(&PathMapping, PathBuf), VfsError> {
+        Self::validate_input(virtual_path)?;
+
+        let mapping = self
+            .mappings
+            .values()
+            .find(|mapping| {
+                virtual_path == mapping.virtual_prefix
+                    || virtual_path.starts_with(&mapping.prefix_with_slash)
+            })
+            .ok_or(VfsError::PathNotAllowed)?;
+
+        if !mapping.permissions.allows(op) {
+            return Err(VfsError::PermissionDenied);
+        }
+
+        let relative = virtual_path
+            .strip_prefix(mapping.virtual_prefix)
+            .unwrap_or("")
+            .trim_start_matches('/');
+        let mut normalized = PathBuf::new();
+        for component in Path::new(relative).components() {
+            match component {
+                std::path::Component::Normal(value) => {
+                    let value = value.to_str().ok_or(VfsError::InvalidPath)?;
+                    if is_unsafe_windows_component(value) {
+                        return Err(VfsError::InvalidPath);
+                    }
+                    normalized.push(value);
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !normalized.pop() {
+                        return Err(VfsError::PathTraversal);
+                    }
+                }
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    return Err(VfsError::InvalidPath);
+                }
+            }
+        }
+
+        Ok((mapping, normalized))
+    }
+
     /// Reject paths that contain dangerous byte sequences.
     fn validate_input(virtual_path: &str) -> Result<(), VfsError> {
         // Must start with '/'
@@ -407,9 +595,10 @@ impl VirtualFS {
             if b < 0x20 {
                 return Err(VfsError::InvalidPath);
             }
-            // Reject backslashes — not valid in virtual paths and commonly
-            // used in cross-platform traversal attacks.
-            if b == b'\\' {
+            // Reject backslashes and colons. Virtual paths are portable across
+            // all targets; ':' would address an NTFS alternate data stream on
+            // Windows even when parsing occurs on another platform.
+            if b == b'\\' || b == b':' {
                 return Err(VfsError::InvalidPath);
             }
         }
@@ -585,6 +774,40 @@ impl VirtualFS {
         }
         Ok(())
     }
+}
+
+/// Reject names that Windows resolves outside the ordinary file namespace.
+///
+/// This runs on every platform because packages and virtual paths are portable:
+/// accepting one of these names on Linux would produce content that cannot be
+/// opened safely on Windows. Device aliases remain reserved even with an
+/// extension, and superscript 1/2/3 are historical COM/LPT digits.
+fn is_unsafe_windows_component(component: &str) -> bool {
+    if component.ends_with([' ', '.']) {
+        return true;
+    }
+
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches([' ', '.']);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+
+    ["COM", "LPT"].iter().any(|prefix| {
+        upper.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 /// Virtual path constants exposed to JavaScript.
@@ -796,6 +1019,29 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn production_constructor_requires_all_roots_and_pins_them() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "migo_vfs_production_roots-{}-{unique}",
+            std::process::id()
+        ));
+        let paths = GamePaths::new(base.join("files"), base.join("cache"), "game-a", 1).unwrap();
+
+        let error = VirtualFS::try_from_game_paths(&paths).unwrap_err();
+        assert_eq!(error, VfsOpenError::OpenFailed);
+        assert!(!error.to_string().contains(&base.to_string_lossy()[..]));
+
+        paths.ensure_directories().unwrap();
+        std::fs::create_dir_all(paths.code_dir()).unwrap();
+        VirtualFS::try_from_game_paths(&paths).expect("created roots must be pinned");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     // -----------------------------------------------------------------------
     // Original tests (kept for regression)
     // -----------------------------------------------------------------------
@@ -867,6 +1113,44 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_colon_for_cross_platform_ads_safety() {
+        let vfs = test_vfs();
+        let result = vfs.resolve("/user/save.json:secret", FileOp::Read);
+        assert_eq!(result.unwrap_err(), VfsError::InvalidPath);
+    }
+
+    #[test]
+    fn test_reject_windows_device_aliases_before_any_platform_open() {
+        let vfs = test_vfs();
+        for component in [
+            "NUL",
+            "nul.txt",
+            "NUL .log",
+            "CON",
+            "PRN.json",
+            "AUX",
+            "CLOCK$",
+            "CONIN$",
+            "CONOUT$",
+            "COM1",
+            "com9.bin",
+            "COM¹",
+            "LPT2",
+            "LPT³.txt",
+        ] {
+            assert_eq!(
+                vfs.resolve(&format!("/user/{component}"), FileOp::Read)
+                    .unwrap_err(),
+                VfsError::InvalidPath,
+                "{component} must be rejected before CreateFileW"
+            );
+        }
+
+        assert!(vfs.resolve("/user/COM10", FileOp::Read).is_ok());
+        assert!(vfs.resolve("/user/NULL.txt", FileOp::Read).is_ok());
+    }
+
+    #[test]
     fn test_reject_control_chars() {
         let vfs = test_vfs();
         // Tab character
@@ -883,6 +1167,15 @@ mod tests {
         let vfs = test_vfs();
         let result = vfs.resolve("user/save.json", FileOp::Read);
         assert_eq!(result.unwrap_err(), VfsError::InvalidPath);
+    }
+
+    #[test]
+    fn virtual_path_detection_requires_a_component_boundary() {
+        let vfs = test_vfs();
+        assert!(vfs.is_virtual_path("/user"));
+        assert!(vfs.is_virtual_path("/user/save.json"));
+        assert!(!vfs.is_virtual_path("/userland/save.json"));
+        assert!(!vfs.is_virtual_path("/codegen/main.js"));
     }
 
     // -----------------------------------------------------------------------
@@ -1338,6 +1631,151 @@ mod tests {
 
             let result = vfs.resolve("/user/normal.txt", FileOp::Read);
             assert!(result.is_ok());
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn strict_open_returns_an_already_open_regular_file() {
+            use std::io::Read;
+
+            let base = make_test_dir("strict_open_regular");
+            let vfs = make_real_vfs(&base);
+            fs::create_dir_all(base.join("user/audio")).unwrap();
+            fs::write(base.join("user/audio/clip.bin"), b"inside").unwrap();
+
+            let mut file = vfs
+                .open_regular_for_read("/user/audio/clip.bin")
+                .expect("ordinary sandbox file");
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"inside");
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn strict_open_anchors_the_parent_descriptor_across_name_replacement() {
+            use std::io::Read;
+
+            let base = make_test_dir("strict_open_parent_swap");
+            let vfs = make_real_vfs(&base);
+            let original = base.join("user/audio");
+            let anchored = base.join("user/audio-anchored");
+            let outside = base.join("outside");
+            fs::create_dir_all(&original).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(original.join("clip.bin"), b"inside").unwrap();
+            fs::write(outside.join("clip.bin"), b"outside").unwrap();
+
+            let mut swapped = false;
+            let mut file = vfs
+                .open_regular_for_read_with_hook("/user/audio/clip.bin", || {
+                    fs::rename(&original, &anchored).unwrap();
+                    std::os::unix::fs::symlink(&outside, &original).unwrap();
+                    swapped = true;
+                })
+                .expect("an opened parent fd must survive its pathname replacement");
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert!(swapped);
+            assert_eq!(bytes, b"inside");
+
+            let _ = fs::remove_file(&original);
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn strict_open_pins_the_mapping_root_for_the_vfs_lifetime() {
+            use std::io::Read;
+
+            let base = make_test_dir("strict_open_root_swap");
+            let vfs = make_real_vfs(&base);
+            let original = base.join("user");
+            let anchored = base.join("user-anchored");
+            let replacement = base.join("outside-root");
+            fs::write(original.join("clip.bin"), b"inside").unwrap();
+            fs::create_dir_all(&replacement).unwrap();
+            fs::write(replacement.join("clip.bin"), b"outside").unwrap();
+
+            fs::rename(&original, &anchored).unwrap();
+            fs::rename(&replacement, &original).unwrap();
+
+            let mut file = vfs
+                .open_regular_for_read("/user/clip.bin")
+                .expect("the VFS root descriptor must stay pinned");
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"inside");
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn strict_open_rejects_symlinks_directories_and_missing_files_without_paths_in_errors() {
+            let base = make_test_dir("strict_open_rejections");
+            let vfs = make_real_vfs(&base);
+            fs::create_dir_all(base.join("user/directory")).unwrap();
+            fs::write(base.join("outside.bin"), b"outside").unwrap();
+            std::os::unix::fs::symlink(base.join("outside.bin"), base.join("user/link.bin"))
+                .unwrap();
+
+            for virtual_path in ["/user/link.bin", "/user/directory", "/user/missing.bin"] {
+                let error = vfs.open_regular_for_read(virtual_path).unwrap_err();
+                assert!(
+                    !error.to_string().contains(&base.to_string_lossy()[..]),
+                    "VFS open errors must not disclose the sandbox's host path"
+                );
+            }
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn strict_open_rejects_ancestor_links_even_when_legacy_policy_allows_them() {
+            let base = make_test_dir("strict_open_ancestor_link");
+            let policy = VfsPolicy {
+                deny_symlinks_in_code_dir: false,
+                deny_symlinks_in_writable_dirs: false,
+            };
+            let vfs = make_real_vfs_with_policy(&base, policy);
+            let real = base.join("user/real");
+            fs::create_dir_all(&real).unwrap();
+            fs::write(real.join("clip.bin"), b"inside").unwrap();
+            std::os::unix::fs::symlink(&real, base.join("user/alias")).unwrap();
+
+            assert!(
+                vfs.resolve("/user/alias/clip.bin", FileOp::Read).is_ok(),
+                "the fixture must prove the legacy path API is relaxed"
+            );
+            assert!(
+                vfs.open_regular_for_read("/user/alias/clip.bin").is_err(),
+                "strict reads must reject every link regardless of legacy policy"
+            );
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn strict_open_rejects_a_fifo_without_waiting_for_a_writer() {
+            use std::os::unix::ffi::OsStrExt;
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let base = make_test_dir("strict_open_fifo");
+            let vfs = make_real_vfs(&base);
+            let fifo = base.join("user/audio.pipe");
+            let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+            let (result_tx, result_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = result_tx.send(vfs.open_regular_for_read("/user/audio.pipe"));
+            });
+            let result = result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("opening an attacker-controlled FIFO must never block");
+            assert!(result.is_err());
 
             let _ = fs::remove_dir_all(&base);
         }

@@ -106,7 +106,7 @@ impl Scope {
             Scope::Bluetooth => "scope.bluetooth",
             Scope::AddPhoneContact => "scope.addPhoneContact",
             Scope::AddPhoneCalendar => "scope.addPhoneCalendar",
-            Scope::FriendInteraction => "scope.WxFriendInteraction",
+            Scope::FriendInteraction => "scope.friendInteraction",
             Scope::GameClubData => "scope.gameClubData",
         }
     }
@@ -222,6 +222,14 @@ mod tests {
             );
             assert!(name.starts_with("scope."), "{name} is not a scope name");
         }
+    }
+
+    #[test]
+    fn friend_interaction_uses_a_neutral_scope_name() {
+        assert_eq!(
+            Scope::FriendInteraction.as_minigame_str(),
+            "scope.friendInteraction"
+        );
     }
 
     #[test]

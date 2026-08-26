@@ -208,7 +208,7 @@ session.setSubpackageHandler((request, callback) -> {
 });
 ```
 
-- `setAuthHandler(AuthHandler)`：处理 `migo.login` / `migo.checkSession` / `migo.getUserInfo` / `migo.getPhoneNumber`（以及通过平台兼容适配层，如 `migo-wx-adapter`，发起的同名调用）
+- `setAuthHandler(AuthHandler)`：处理 `migo.login` / `migo.checkSession` / `migo.getUserInfo` / `migo.getPhoneNumber`（包括外部兼容适配层转发的同名调用）
 - `setGameLogHandler(GameLogHandler)`：接收小游戏上报日志（JSON 字符串）
 - `setSubpackageHandler(SubpackageHandler)`：处理 `loadSubpackage` / `preDownloadSubpackage` 的下载过程
 

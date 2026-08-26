@@ -1,7 +1,9 @@
 use glow::{HasContext, NativeUniformLocation};
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
-    protocol::render_cmd::{CanvasId, GLCmd, ShaderType},
+    protocol::render_cmd::{
+        CanvasId, GLCmd, ShaderType, checked_readback_byte_len, webgl_readback_bytes_per_pixel,
+    },
 };
 use smallvec::SmallVec;
 
@@ -12,10 +14,23 @@ use crate::ScissorState;
 use crate::backend::gl::state_tracker as st;
 use crate::canvas::gl_object::GlObject;
 use crate::damage_effect::DamageEffect;
+use crate::webgl_gpu_budget::GpuAllocationError;
 
 #[inline]
 fn ee(code: ErrorCode, detail: impl Into<String>) -> EngineError {
     EngineError::from_detail(code, detail)
+}
+
+#[inline]
+fn gpu_allocation_error(error: GpuAllocationError) -> EngineError {
+    let code = match error {
+        GpuAllocationError::InvalidEnum | GpuAllocationError::InvalidValue => {
+            ErrorCode::InvalidArgument
+        }
+        GpuAllocationError::InvalidOperation => ErrorCode::InvalidOperation,
+        GpuAllocationError::OutOfMemory => ErrorCode::OutOfMemory,
+    };
+    ee(code, format!("WebGL GPU storage rejected: {error:?}"))
 }
 
 #[inline]
@@ -1167,11 +1182,22 @@ impl RendererGL {
                 unsafe {
                     match gl.create_texture() {
                         Ok(tex) => {
+                            let owner = owner.ok_or_else(|| {
+                                ee(
+                                    ErrorCode::InvalidOperation,
+                                    "WebGL texture has no owning context",
+                                )
+                            })?;
+                            if let Err(error) = cm.webgl_gpu_budget.create_texture(owner, client_id)
+                            {
+                                gl.delete_texture(tex);
+                                return Err(gpu_allocation_error(error));
+                            }
                             cm.textures.insert(
                                 client_id,
                                 crate::canvas::TextureMeta {
                                     gl_handle: Some(tex),
-                                    owner_canvas: owner,
+                                    owner_canvas: Some(owner),
                                     deleted: false,
                                 },
                             );
@@ -1198,6 +1224,7 @@ impl RendererGL {
                     if let Some(h) = meta.gl_handle {
                         cm.delete_gl_object(GlObject::Texture(h))?;
                     }
+                    cm.webgl_gpu_budget.delete_texture(texture_id);
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -1233,14 +1260,22 @@ impl RendererGL {
                 {
                     unsafe { gl.bind_texture(target, native) };
                 }
+                cm.webgl_gpu_budget.bind_texture(canvas_id, target, texture);
                 Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::ActiveTexture { canvas_id, unit } => {
                 cm.make_current_needed(canvas_id)?;
+                if !crate::webgl_gpu_budget::is_valid_texture_unit(unit) {
+                    // Preserve GL's INVALID_ENUM behavior without poisoning
+                    // either state mirror with a unit the driver rejected.
+                    unsafe { gl.active_texture(unit) };
+                    return Ok(DamageEffect::NoDamage);
+                }
                 if st::update_active_texture(cm.gl_state.entry(canvas_id).or_default(), unit) {
                     unsafe { gl.active_texture(unit) };
                 }
+                cm.webgl_gpu_budget.active_texture(canvas_id, unit);
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1257,13 +1292,27 @@ impl RendererGL {
                 data,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let prepared = cm
+                    .webgl_gpu_budget
+                    .prepare_tex_image_2d(
+                        canvas_id,
+                        target,
+                        level,
+                        internalformat,
+                        width,
+                        height,
+                        border,
+                        format,
+                        type_,
+                    )
+                    .map_err(gpu_allocation_error)?;
                 let slice = data.as_deref().map(|v| v.as_slice());
                 // Use PBO for large uploads (> 64 KB) to avoid GPU pipeline stalls.
                 if let Some(bytes) = slice {
                     if bytes.len() > 65536 {
                         if let Some(pool) = cm.pbo_pool_mut() {
                             if pool.is_pbo_supported() {
-                                return Self::tex_image_2d_pbo(
+                                let effect = Self::tex_image_2d_pbo(
                                     cm,
                                     gl,
                                     target,
@@ -1275,7 +1324,9 @@ impl RendererGL {
                                     format,
                                     type_,
                                     bytes,
-                                );
+                                )?;
+                                cm.webgl_gpu_budget.commit(prepared);
+                                return Ok(effect);
                             }
                         }
                     }
@@ -1293,6 +1344,7 @@ impl RendererGL {
                         glow::PixelUnpackData::Slice(slice),
                     );
                 }
+                cm.webgl_gpu_budget.commit(prepared);
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -2341,11 +2393,23 @@ impl RendererGL {
                 unsafe {
                     match gl.create_renderbuffer() {
                         Ok(rb) => {
+                            let owner = owner.ok_or_else(|| {
+                                ee(
+                                    ErrorCode::InvalidOperation,
+                                    "WebGL renderbuffer has no owning context",
+                                )
+                            })?;
+                            if let Err(error) =
+                                cm.webgl_gpu_budget.create_renderbuffer(owner, client_id)
+                            {
+                                gl.delete_renderbuffer(rb);
+                                return Err(gpu_allocation_error(error));
+                            }
                             cm.renderbuffers.insert(
                                 client_id,
                                 crate::canvas::RenderbufferMeta {
                                     gl_handle: Some(rb),
-                                    owner_canvas: owner,
+                                    owner_canvas: Some(owner),
                                     deleted: false,
                                 },
                             );
@@ -2363,6 +2427,7 @@ impl RendererGL {
                     if let Some(h) = meta.gl_handle {
                         cm.delete_gl_object(GlObject::Renderbuffer(h))?;
                     }
+                    cm.webgl_gpu_budget.delete_renderbuffer(renderbuffer_id);
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -2404,6 +2469,8 @@ impl RendererGL {
                 if st::update_bind_renderbuffer(state, shadow_val) {
                     unsafe { gl.bind_renderbuffer(target, native) };
                 }
+                cm.webgl_gpu_budget
+                    .bind_renderbuffer(canvas_id, target, renderbuffer);
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -2415,7 +2482,19 @@ impl RendererGL {
                 height,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let prepared = cm
+                    .webgl_gpu_budget
+                    .prepare_renderbuffer_storage(
+                        canvas_id,
+                        target,
+                        internalformat,
+                        width,
+                        height,
+                        1,
+                    )
+                    .map_err(gpu_allocation_error)?;
                 unsafe { gl.renderbuffer_storage(target, internalformat, width, height) };
+                cm.webgl_gpu_budget.commit(prepared);
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -2430,6 +2509,21 @@ impl RendererGL {
                 type_,
                 resp,
             } => {
+                let bytes_per_pixel = webgl_readback_bytes_per_pixel(format, type_);
+                if width < 0 || height < 0 {
+                    resp.err_code(ErrorCode::InvalidArgument);
+                    return Ok(DamageEffect::NoDamage);
+                }
+                let Some(byte_size) = checked_readback_byte_len(width, height, bytes_per_pixel)
+                else {
+                    resp.err_code(ErrorCode::OutOfMemory);
+                    return Ok(DamageEffect::NoDamage);
+                };
+                if byte_size == 0 {
+                    resp.ok(Vec::new());
+                    return Ok(DamageEffect::NoDamage);
+                }
+
                 cm.make_current_needed(canvas_id)?;
 
                 // Detect readback from the onscreen default framebuffer.
@@ -2447,24 +2541,6 @@ impl RendererGL {
                         cm.signal_default_fbo_readback();
                     }
                 }
-                // Calculate buffer size: width * height * bytes_per_pixel
-                // bpp depends on both format (component count) and type (bytes per component)
-                let components: i32 = match format {
-                    glow::RGBA => 4,
-                    glow::RGB => 3,
-                    glow::LUMINANCE_ALPHA => 2,
-                    glow::LUMINANCE | glow::ALPHA => 1,
-                    _ => 4,
-                };
-                let bytes_per_pixel: i32 = match type_ {
-                    glow::UNSIGNED_BYTE => components,
-                    glow::UNSIGNED_SHORT_5_6_5
-                    | glow::UNSIGNED_SHORT_4_4_4_4
-                    | glow::UNSIGNED_SHORT_5_5_5_1 => 2,
-                    glow::FLOAT => components * 4,
-                    _ => components,
-                };
-                let byte_size = (width * height * bytes_per_pixel) as usize;
                 let mut buf = vec![0u8; byte_size];
                 unsafe {
                     gl.read_pixels(
@@ -2477,7 +2553,7 @@ impl RendererGL {
                         glow::PixelPackData::Slice(Some(&mut buf)),
                     );
                 }
-                let _ = resp.send(Ok(buf));
+                resp.ok(buf);
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -2650,9 +2726,21 @@ impl RendererGL {
                 height,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let prepared = cm
+                    .webgl_gpu_budget
+                    .prepare_tex_storage_2d(
+                        canvas_id,
+                        target,
+                        levels,
+                        internal_format,
+                        width,
+                        height,
+                    )
+                    .map_err(gpu_allocation_error)?;
                 unsafe {
                     gl.tex_storage_2d(target, levels, internal_format, width, height);
                 }
+                cm.webgl_gpu_budget.commit(prepared);
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -2699,6 +2787,17 @@ impl RendererGL {
                 height,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let prepared = cm
+                    .webgl_gpu_budget
+                    .prepare_renderbuffer_storage(
+                        canvas_id,
+                        target,
+                        internal_format,
+                        width,
+                        height,
+                        samples,
+                    )
+                    .map_err(gpu_allocation_error)?;
                 unsafe {
                     gl.renderbuffer_storage_multisample(
                         target,
@@ -2708,6 +2807,7 @@ impl RendererGL {
                         height,
                     )
                 };
+                cm.webgl_gpu_budget.commit(prepared);
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -3020,6 +3120,21 @@ impl RendererGL {
                 data,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let prepared = cm
+                    .webgl_gpu_budget
+                    .prepare_tex_image_3d(
+                        canvas_id,
+                        target,
+                        level,
+                        internal_format,
+                        width,
+                        height,
+                        depth,
+                        border,
+                        format,
+                        ty,
+                    )
+                    .map_err(gpu_allocation_error)?;
                 let pixels = match &data {
                     shared::protocol::render_cmd::TexImage3DSource::None => {
                         glow::PixelUnpackData::Slice(None)
@@ -3045,6 +3160,7 @@ impl RendererGL {
                         pixels,
                     );
                 }
+                cm.webgl_gpu_budget.commit(prepared);
                 Ok(DamageEffect::NoDamage)
             }
             GLCmd::TexSubImage3D {
@@ -3091,9 +3207,22 @@ impl RendererGL {
                 depth,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let prepared = cm
+                    .webgl_gpu_budget
+                    .prepare_tex_storage_3d(
+                        canvas_id,
+                        target,
+                        levels,
+                        internal_format,
+                        width,
+                        height,
+                        depth,
+                    )
+                    .map_err(gpu_allocation_error)?;
                 unsafe {
                     gl.tex_storage_3d(target, levels, internal_format, width, height, depth);
                 }
+                cm.webgl_gpu_budget.commit(prepared);
                 Ok(DamageEffect::NoDamage)
             }
 

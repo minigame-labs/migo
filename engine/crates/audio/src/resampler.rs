@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn resample_rejects_over_budget_upsampling() {
         // 600k mono frames (~2.4 MB) upsampled 256x (3kHz -> 768kHz) => ~153M
-        // output samples, above the 512 MiB / 4 = 134M-sample budget.
+        // output samples, above the 64 MiB / 4 = 16M-sample budget.
         let input_frames = 600_000usize;
         let audio = DecodedAudio {
             samples: vec![0.0f32; input_frames],

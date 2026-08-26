@@ -23,8 +23,8 @@
 //   - GameGlobal, global remain aliases of globalThis (matches the
 //     mini-game-platform content model this engine is compatible with).
 //   - JS built-ins (Object/Array/Promise/...), self-references
-//     (globalThis/migo/GameGlobal/global), and runtime internals (_perf,
-//     console) are NOT mirrored onto `migo`.
+//     (globalThis/migo/GameGlobal/global), and runtime internals are NOT
+//     mirrored onto `migo`.
 
 import { primordials } from "ext:core/mod.js";
 const { ObjectDefineProperty } = primordials;
@@ -95,7 +95,6 @@ const _RUNTIME_INTERNALS = new Set([
 
 const _NON_API = new Set([
     "GameGlobal", "global", "migo",     // self-references (added below or by 99_main.js)
-    "_perf",                             // host-only profiler hook
     "console",                           // standard JS, not namespaced
     "_CCSettings",                       // engine-compat shim (Cocos)
     ..._RUNTIME_INTERNALS,

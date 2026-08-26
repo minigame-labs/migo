@@ -1,2 +1,0 @@
-crates/shared/src/payload_pool.rs:113:9: replace <impl fmt::Debug for Pooled<T>>::fmt -> fmt::Result with Ok(Default::default())
-crates/shared/src/payload_pool.rs:289:9: replace <impl fmt::Debug for Recycled<T>>::fmt -> fmt::Result with Ok(Default::default())

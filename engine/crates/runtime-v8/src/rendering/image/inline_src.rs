@@ -11,7 +11,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use deno_core::OpState;
 use deno_core::url::Url;
-use deno_error::JsErrorBox;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::io_cmd::NormalizedImage;
 use tracing::{debug, warn};
@@ -385,17 +384,6 @@ pub fn decode_inline_bytes_any(
     })?;
     enforce_pixel_budget(decoded.width(), decoded.height())?;
     Ok(decoded)
-}
-
-/// Quick `Err` builder for unsupported src prefixes routed to this
-/// module incorrectly — kept behind a helper so the op path stays
-/// readable.
-#[inline]
-pub fn unsupported_scheme_err(src: &str) -> JsErrorBox {
-    JsErrorBox::generic(format!(
-        "unsupported image src scheme: {}",
-        src.split_once(':').map(|(s, _)| s).unwrap_or(src)
-    ))
 }
 
 #[cfg(test)]

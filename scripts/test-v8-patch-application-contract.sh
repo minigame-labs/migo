@@ -536,8 +536,8 @@ else
 fi
 
 info "no script hardcodes a machine-specific absolute path"
-# build-v8-android.sh really did default RUSTY_V8_SRC to /home/wkspace/rusty_v8_src,
-# a path present on no current machine, while build-v8-linux.sh and build-v8-ohos.sh
+# build-v8-android.sh once defaulted RUSTY_V8_SRC to a developer-specific path,
+# while build-v8-linux.sh and build-v8-ohos.sh
 # derived theirs from the repository location. Verified load-bearing against commit
 # 8a15ae6, where this check fires on line 37.
 #

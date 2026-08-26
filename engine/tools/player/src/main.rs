@@ -6,10 +6,11 @@
 //! proves rendering, exactly like the on-device bench harness.
 //!
 //! Usage:
-//!   migo-player [GAME_BUNDLE_DIR] [SECONDS] [--window]
+//!   migo-player GAME_BUNDLE_DIR [SECONDS] [--window]
 //!
 //! GAME_BUNDLE_DIR must contain `game.json` + `game.js` (a mini-game-shaped
-//! bundle). Defaults to the sibling migo-bench bunnymark bundle.
+//! bundle). It is required so the player never depends on a developer-local
+//! checkout layout.
 //!
 //! `--window` (or `MIGO_PLAYER_WINDOW=1`) exercises the onscreen X11 presenter.
 //! Headless stays the default so CI and the PNG capture path are unaffected.
@@ -70,6 +71,10 @@ fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                return;
+            }
             "--window" => windowed = true,
             "--offscreen" => windowed = false,
             "--resize" => match args.next().as_deref().and_then(parse_extent) {
@@ -82,19 +87,32 @@ fn main() {
             _ => positional.push(arg),
         }
     }
-    let bundle_dir = positional
-        .first()
-        .filter(|arg| !arg.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/home/xg/wkspace/migo-bench/shells/migo-shell/app/src/main/assets/game")
-        });
+    let bundle_dir = match resolve_bundle_dir(&positional) {
+        Ok(path) => path,
+        Err(message) => {
+            tracing::error!("{message}");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
     let secs: u64 = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
 
     if let Err(err) = run(&bundle_dir, secs, windowed, resize) {
         tracing::error!("player failed: {err}");
         std::process::exit(1);
     }
+}
+
+fn print_usage() {
+    eprintln!("usage: migo-player GAME_BUNDLE_DIR [SECONDS] [--window|--offscreen]");
+}
+
+fn resolve_bundle_dir(positional: &[String]) -> Result<PathBuf, &'static str> {
+    positional
+        .first()
+        .filter(|arg| !arg.is_empty())
+        .map(PathBuf::from)
+        .ok_or("GAME_BUNDLE_DIR is required; see --help")
 }
 
 /// `WIDTHxHEIGHT`, rejecting a zero extent because no surface may carry one.
@@ -605,7 +623,15 @@ mod tests {
         thread,
     };
 
-    use super::shutdown_before_drop;
+    use super::{resolve_bundle_dir, shutdown_before_drop};
+
+    #[test]
+    fn player_requires_explicit_bundle_directory() {
+        assert_eq!(
+            resolve_bundle_dir(&[]),
+            Err("GAME_BUNDLE_DIR is required; see --help")
+        );
+    }
 
     struct DropRecorder {
         events: Arc<Mutex<Vec<&'static str>>>,

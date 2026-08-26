@@ -14,6 +14,20 @@
 //! padding / pixel-stride bytes inside a window are copied verbatim — this does
 //! not repack, convert, or reinterpret the layout.
 
+/// Largest width or height accepted from a camera callback. This matches the
+/// largest Canvas surface dimension and bounds every subsequent pixel-count
+/// calculation before host-side copies occur.
+pub const MAX_CAMERA_FRAME_DIMENSION: u32 = 8192;
+
+/// Largest number of pixels accepted from a camera callback.
+pub const MAX_CAMERA_FRAME_PIXELS: u64 =
+    (MAX_CAMERA_FRAME_DIMENSION as u64) * (MAX_CAMERA_FRAME_DIMENSION as u64);
+
+/// Largest synchronously materialized Y/U/V payload. A camera callback copies
+/// its three direct-buffer windows into one owned host message, so it has the
+/// same 64 MiB cap as other synchronous pixel readbacks.
+pub const MAX_CAMERA_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// One plane's contribution: a validated `[offset, offset + len)` window of
 /// `buffer`, where `buffer` is the plane's full direct-buffer capacity slice
 /// and `offset`/`len` are the buffer's `position`/`remaining` (signed, exactly
@@ -31,6 +45,9 @@ pub struct PlaneWindow<'a> {
 /// malformed frame from the platform is dropped, never crashing the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraFramePackError {
+    /// Frame dimensions were non-positive or exceeded the supported surface
+    /// dimensions/pixel count.
+    DimensionsOutOfBounds,
     /// A plane's offset was negative.
     NegativeOffset,
     /// A plane's length was negative.
@@ -39,6 +56,8 @@ pub enum CameraFramePackError {
     WindowOutOfBounds,
     /// The summed length of the three windows overflowed `usize`.
     TotalOverflow,
+    /// The summed Y/U/V payload is larger than the synchronous frame budget.
+    FrameTooLarge,
     /// Allocation of the exact output buffer failed.
     AllocFailed,
 }
@@ -52,7 +71,7 @@ pub fn pack_yuv_planes(planes: [PlaneWindow<'_>; 3]) -> Result<Vec<u8>, CameraFr
     let u = validate_window(&planes[1])?;
     let v = validate_window(&planes[2])?;
 
-    let total = checked_total(y.len(), u.len(), v.len())?;
+    let total = validate_camera_frame_byte_lengths([y.len(), u.len(), v.len()])?;
 
     let mut out = Vec::new();
     out.try_reserve_exact(total)
@@ -61,6 +80,55 @@ pub fn pack_yuv_planes(planes: [PlaneWindow<'_>; 3]) -> Result<Vec<u8>, CameraFr
     out.extend_from_slice(u);
     out.extend_from_slice(v);
     Ok(out)
+}
+
+/// Validate JNI camera dimensions before they are converted to unsigned
+/// protocol fields or any direct-buffer address is borrowed. The input remains
+/// signed because it is received directly from Java/JNI.
+pub fn validate_camera_frame_dimensions(
+    width: i32,
+    height: i32,
+) -> Result<(u32, u32), CameraFramePackError> {
+    let width = u32::try_from(width).map_err(|_| CameraFramePackError::DimensionsOutOfBounds)?;
+    let height = u32::try_from(height).map_err(|_| CameraFramePackError::DimensionsOutOfBounds)?;
+
+    if width == 0
+        || height == 0
+        || width > MAX_CAMERA_FRAME_DIMENSION
+        || height > MAX_CAMERA_FRAME_DIMENSION
+    {
+        return Err(CameraFramePackError::DimensionsOutOfBounds);
+    }
+
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(CameraFramePackError::DimensionsOutOfBounds)?;
+    if pixels > MAX_CAMERA_FRAME_PIXELS {
+        return Err(CameraFramePackError::DimensionsOutOfBounds);
+    }
+
+    Ok((width, height))
+}
+
+/// Validate signed JNI plane window lengths before resolving or borrowing
+/// their direct buffers. The packing function repeats the total-byte guard
+/// after it has validated the individual buffer windows, so neither entrance
+/// can reserve/copy an oversized payload.
+pub fn validate_camera_frame_payload_lengths(
+    lengths: [i32; 3],
+) -> Result<usize, CameraFramePackError> {
+    let y_len = usize::try_from(lengths[0]).map_err(|_| CameraFramePackError::NegativeLength)?;
+    let u_len = usize::try_from(lengths[1]).map_err(|_| CameraFramePackError::NegativeLength)?;
+    let v_len = usize::try_from(lengths[2]).map_err(|_| CameraFramePackError::NegativeLength)?;
+    validate_camera_frame_byte_lengths([y_len, u_len, v_len])
+}
+
+fn validate_camera_frame_byte_lengths(lengths: [usize; 3]) -> Result<usize, CameraFramePackError> {
+    let total = checked_total(lengths[0], lengths[1], lengths[2])?;
+    if total > MAX_CAMERA_FRAME_BYTES {
+        return Err(CameraFramePackError::FrameTooLarge);
+    }
+    Ok(total)
 }
 
 /// Checked sum of the three plane window lengths, mapping overflow directly to
@@ -144,6 +212,45 @@ mod tests {
         let y = [1u8, 2, 3];
         let out = pack_yuv_planes([win(&y, 0, 0), win(&y, 3, 0), win(&y, 1, 0)]).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_frame_larger_than_the_sync_camera_byte_budget_before_copying() {
+        let oversized = vec![0u8; 64 * 1024 * 1024 + 1];
+
+        assert!(
+            pack_yuv_planes([
+                win(&oversized, 0, oversized.len() as i32),
+                win(&[], 0, 0),
+                win(&[], 0, 0),
+            ])
+            .is_err(),
+            "a camera callback must not duplicate more than 64 MiB into the host queue"
+        );
+    }
+
+    #[test]
+    fn rejects_dimensions_or_plane_lengths_outside_camera_limits() {
+        assert_eq!(
+            validate_camera_frame_dimensions(8192, 8192),
+            Ok((8192, 8192))
+        );
+        assert_eq!(
+            validate_camera_frame_dimensions(8193, 1),
+            Err(CameraFramePackError::DimensionsOutOfBounds)
+        );
+        assert_eq!(
+            validate_camera_frame_dimensions(1, -1),
+            Err(CameraFramePackError::DimensionsOutOfBounds)
+        );
+        assert_eq!(
+            validate_camera_frame_payload_lengths([(MAX_CAMERA_FRAME_BYTES + 1) as i32, 0, 0]),
+            Err(CameraFramePackError::FrameTooLarge)
+        );
+        assert_eq!(
+            validate_camera_frame_payload_lengths([-1, 0, 0]),
+            Err(CameraFramePackError::NegativeLength)
+        );
     }
 
     #[test]

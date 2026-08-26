@@ -89,10 +89,10 @@ fi
 echo "[5/7] running full/slim game-visible surface tests"
 (cd "$ENGINE" && cargo test -j1 -p migo-runtime-v8 --lib --no-default-features \
   --features profile-slim --locked --offline \
-  tests_global_surface::global_surface_tests::product_profile_surface_matches_features -- --exact)
+  tests::global_surface::global_surface_tests::product_profile_surface_matches_features -- --exact)
 (cd "$ENGINE" && cargo test -j1 -p migo-runtime-v8 --lib --no-default-features \
   --features profile-full --locked --offline \
-  tests_global_surface::global_surface_tests::product_profile_surface_matches_features -- --exact)
+  tests::global_surface::global_surface_tests::product_profile_surface_matches_features -- --exact)
 
 echo "[6/7] checking build entrypoints select an exact product"
 for script in "$ROOT/scripts/build-android-so.sh" "$ROOT/scripts/build-aar.sh"; do

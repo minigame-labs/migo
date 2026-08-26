@@ -1,7 +1,5 @@
 import { op_audio_connect, op_audio_disconnect } from "ext:core/ops";
 
-const NODE_REGISTRY = new Map();
-
 class AudioNode {
   #context;
   #nodeId;
@@ -20,7 +18,6 @@ class AudioNode {
     this.#channelCount = options.channelCount ?? 2;
     this.#channelCountMode = options.channelCountMode ?? "max";
     this.#channelInterpretation = options.channelInterpretation ?? "speakers";
-    NODE_REGISTRY.set(nodeId, this);
   }
 
   get context() {
@@ -101,4 +98,25 @@ class AudioDestinationNode extends AudioNode {
   }
 }
 
-export { AudioNode, AudioDestinationNode, NODE_REGISTRY };
+function validateScheduledTime(value, name = "when") {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new RangeError(`${name} must be a finite, non-negative number`);
+  }
+  return number;
+}
+
+function validateFiniteDouble(value, name) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    throw new TypeError(`${name} must be a finite number`);
+  }
+  return number;
+}
+
+export {
+  AudioNode,
+  AudioDestinationNode,
+  validateScheduledTime,
+  validateFiniteDouble,
+};

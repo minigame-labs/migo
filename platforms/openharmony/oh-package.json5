@@ -1,6 +1,6 @@
 {
   "modelVersion": "6.0.1",
-  "description": "Please describe the basic information.",
+  "description": "Migo OpenHarmony C SDK integration host.",
   "dependencies": {
   },
   "devDependencies": {

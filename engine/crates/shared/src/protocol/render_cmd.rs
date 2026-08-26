@@ -31,6 +31,90 @@ pub type SamplerId = u32;
 /// `GLSyncRegistry`; the JS side never sees the underlying `GLsync`.
 pub type SyncId = u32;
 
+/// Maximum payload returned by a single synchronous GPU readback.
+///
+/// Synchronous readbacks block both the JavaScript and render threads while
+/// allocating the destination buffer, so they need a hard per-call ceiling in
+/// addition to the frame collector's aggregate budget.
+pub const MAX_SYNC_READBACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cross-platform surface dimension supported by the lowest target tier.
+/// A pixel-count limit alone still permits pathological 67-million-by-1
+/// surfaces which GPU APIs cannot represent safely.
+pub const MAX_CANVAS_DIMENSION: u32 = 8192;
+
+/// Maximum entries accepted by one non-standard Canvas draw batch.
+pub const MAX_DRAW_IMAGE_BATCH_ENTRIES: usize = 65_536;
+
+/// Checked Canvas surface pixel count. Zero-sized canvases are valid and do
+/// not allocate backing pixels; non-zero surfaces share the decoder's cap.
+#[inline]
+pub fn checked_canvas_pixel_count(width: u32, height: u32) -> Option<usize> {
+    if width > MAX_CANVAS_DIMENSION || height > MAX_CANVAS_DIMENSION {
+        return None;
+    }
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    (pixels <= crate::protocol::io_cmd::MAX_IMAGE_PIXELS)
+        .then(|| usize::try_from(pixels).ok())
+        .flatten()
+}
+
+/// Checked synchronous Canvas RGBA8 materialization size.
+#[inline]
+pub fn checked_canvas_rgba_byte_len(width: u32, height: u32) -> Option<usize> {
+    checked_canvas_pixel_count(width, height)?
+        .checked_mul(4)
+        .filter(|bytes| *bytes <= MAX_SYNC_READBACK_BYTES)
+}
+
+/// Maximum CPU payload accepted by one WebGL upload command. This is a hard
+/// safety ceiling; the frame collector's smaller soft budget still controls
+/// batching and latency.
+pub const MAX_WEBGL_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum UTF-8 shader source retained by one render command.
+pub const MAX_WEBGL_SHADER_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+
+#[inline]
+pub fn webgl_upload_is_within_limit(byte_len: usize) -> bool {
+    byte_len <= MAX_WEBGL_UPLOAD_BYTES
+}
+
+/// Computes a bounded readback allocation size without signed or integer
+/// overflow. A zero-sized dimension is valid and produces an empty result.
+#[inline]
+pub fn checked_readback_byte_len(width: i32, height: i32, bytes_per_pixel: usize) -> Option<usize> {
+    if width < 0 || height < 0 || bytes_per_pixel == 0 {
+        return None;
+    }
+
+    let byte_len = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(bytes_per_pixel)?;
+    (byte_len <= MAX_SYNC_READBACK_BYTES).then_some(byte_len)
+}
+
+/// Returns the byte width used by the renderer's supported WebGL readback
+/// format/type combinations. WebGL enum validation happens in the JS facade;
+/// unknown values retain the renderer's historical RGBA/U8-compatible
+/// fallback so both ends of the protocol always calculate the same bound.
+#[inline]
+pub fn webgl_readback_bytes_per_pixel(format: u32, type_: u32) -> usize {
+    let components = match format {
+        0x1908 => 4,          // RGBA
+        0x1907 => 3,          // RGB
+        0x190A => 2,          // LUMINANCE_ALPHA
+        0x1909 | 0x1906 => 1, // LUMINANCE | ALPHA
+        _ => 4,
+    };
+    match type_ {
+        0x1401 => components,                   // UNSIGNED_BYTE
+        0x8363 | 0x8033 | 0x8034 => 2,          // packed UNSIGNED_SHORT formats
+        0x1406 => components.saturating_mul(4), // FLOAT
+        _ => components,
+    }
+}
+
 /// Protocol-wide Render result type.
 pub type RenderResult<T> = Result<T, EngineError>;
 
@@ -1870,8 +1954,8 @@ pub enum Canvas2DCmd {
     },
 
     /// Force a synchronous CPU readback of a previously created
-    /// snapshot texture.  Backs `migo._force_readback(imageData)`
-    /// for the rare cocos-incompatible game that actually inspects
+    /// snapshot texture. Backs lazy `ImageData.data` materialization for the
+    /// rare content path that actually inspects
     /// `ImageData.data` bytes after `getImageData`.
     ///
     /// Returns `Vec<u8>` of length `width * height * 4` (RGBA8
@@ -2823,5 +2907,60 @@ mod text_context_tests {
                 "unexpected text lock requirement for {command:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod readback_limit_tests {
+    use super::{
+        MAX_SYNC_READBACK_BYTES, MAX_WEBGL_SHADER_SOURCE_BYTES, MAX_WEBGL_UPLOAD_BYTES,
+        checked_canvas_pixel_count, checked_canvas_rgba_byte_len, checked_readback_byte_len,
+        webgl_readback_bytes_per_pixel, webgl_upload_is_within_limit,
+    };
+
+    #[test]
+    fn readback_size_rejects_negative_zero_bpp_and_overflowing_geometry() {
+        assert_eq!(checked_readback_byte_len(-1, 1, 4), None);
+        assert_eq!(checked_readback_byte_len(1, -1, 4), None);
+        assert_eq!(checked_readback_byte_len(1, 1, 0), None);
+        assert_eq!(checked_readback_byte_len(i32::MAX, i32::MAX, 4), None);
+    }
+
+    #[test]
+    fn readback_size_accepts_the_limit_and_rejects_the_next_rgba_row() {
+        assert_eq!(
+            checked_readback_byte_len(4096, 4096, 4),
+            Some(MAX_SYNC_READBACK_BYTES)
+        );
+        assert_eq!(checked_readback_byte_len(4097, 4096, 4), None);
+        assert_eq!(checked_readback_byte_len(0, i32::MAX, 4), Some(0));
+    }
+
+    #[test]
+    fn canvas_dimensions_share_the_pixel_and_sync_rgba_caps() {
+        assert_eq!(checked_canvas_pixel_count(0, 8192), Some(0));
+        assert_eq!(checked_canvas_pixel_count(0, u32::MAX), None);
+        assert_eq!(checked_canvas_pixel_count(8192, 8192), Some(8192 * 8192));
+        assert_eq!(checked_canvas_pixel_count(8193, 8192), None);
+        assert_eq!(checked_canvas_pixel_count(8193, 1), None);
+        assert_eq!(
+            checked_canvas_rgba_byte_len(4096, 4096),
+            Some(MAX_SYNC_READBACK_BYTES)
+        );
+        assert_eq!(checked_canvas_rgba_byte_len(4097, 4096), None);
+    }
+
+    #[test]
+    fn readback_pixel_width_matches_supported_scalar_and_packed_types() {
+        assert_eq!(webgl_readback_bytes_per_pixel(0x1908, 0x1401), 4);
+        assert_eq!(webgl_readback_bytes_per_pixel(0x1907, 0x1406), 12);
+        assert_eq!(webgl_readback_bytes_per_pixel(0x1908, 0x8033), 2);
+    }
+
+    #[test]
+    fn webgl_upload_limit_is_inclusive_and_shader_limit_is_stricter() {
+        assert!(webgl_upload_is_within_limit(MAX_WEBGL_UPLOAD_BYTES));
+        assert!(!webgl_upload_is_within_limit(MAX_WEBGL_UPLOAD_BYTES + 1));
+        assert!(MAX_WEBGL_SHADER_SOURCE_BYTES < MAX_WEBGL_UPLOAD_BYTES);
     }
 }

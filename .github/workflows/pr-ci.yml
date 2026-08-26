@@ -14,15 +14,29 @@ concurrency:
   group: pr-ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # ── Job 1: Quality gates (fast, no NDK needed) ──────────────────────
   quality-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Python for contract gates
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Install hash-pinned Python contract dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check --no-deps
+          --only-binary=:all: --require-hashes
+          --requirement scripts/ci/requirements-contracts.txt
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
@@ -51,6 +65,29 @@ jobs:
       - name: Populate the cargo registry for the offline gates
         working-directory: engine
         run: cargo fetch --locked
+
+      - name: Install the pinned RustSec scanner
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Dependency advisory, source and license gate
+        run: bash scripts/check-rust-supply-chain.sh
+
+      - name: Supply-chain mutation contract
+        run: bash scripts/test-supply-chain-contract.sh
+
+      - name: Repository hygiene mutation contract
+        run: bash scripts/test-repository-hygiene-contract.sh
+
+      - name: Tracked publication hygiene gate
+        run: python3 scripts/check-repository-hygiene.py --root .
+
+      - name: Immutable workflow input gate
+        run: python3 scripts/check-supply-chain.py actions --workflows-dir .github
+
+      - name: Gradle wrapper, lock and checksum gate
+        run: >-
+          python3 scripts/check-supply-chain.py gradle
+          --project-dir platforms/android --policy supply-chain.toml
 
       - name: C ABI and Surface candidate contract
         # gcc-multilib is what lets the ILP32 lane compile at all. Without it
@@ -106,17 +143,7 @@ jobs:
         run: bash scripts/test-platform-services-capability-contract.sh
 
       - name: Release asset ordering contract
-        # PyYAML is not guaranteed preinstalled on the runner image, so this
-        # mirrors the ripgrep fallback above rather than assuming it's there
-        # -- but a bare `pip install` is not enough: Ubuntu 24.04 runners
-        # enforce PEP 668 (an EXTERNALLY-MANAGED marker on the system
-        # Python), and pip refuses to touch it without an explicit override.
-        # --break-system-packages is that override, deliberately scoped to
-        # this disposable CI container rather than a shared machine, and is
-        # only reached at all if `import yaml` already fails.
-        run: |
-          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
-          bash scripts/test-release-asset-ordering-contract.sh
+        run: bash scripts/test-release-asset-ordering-contract.sh
 
       # A release version is a fact about a set of bytes, and it was stated
       # independently in four build systems. They drifted: the Android AAR said
@@ -209,7 +236,7 @@ jobs:
       # the download is reset mid-flight -- which it has been. Same cache the
       # Android build job already uses.
       - name: Gradle cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.gradle/caches
@@ -270,6 +297,11 @@ jobs:
       # directions checked load-bearing by injection.
       - name: OpenHarmony API floor declaration contract
         run: bash scripts/test-ohos-api-floor-declaration-contract.sh
+
+      - name: OpenHarmony host and package metadata contracts
+        run: |
+          bash scripts/test-ohos-host-contract.sh
+          bash scripts/test-ohos-package-metadata-contract.sh
 
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
@@ -416,9 +448,7 @@ jobs:
       # script syntax check. The three release-specific gates did not run on the
       # workflow that cuts releases. This step fails whenever that gap reopens.
       - name: Release gate parity contract
-        run: |
-          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
-          bash scripts/test-release-gate-parity-contract.sh
+        run: bash scripts/test-release-gate-parity-contract.sh
 
   # ── Job 2: Linux Qt Host Kit (isolated source contract; no V8/LFS) ──
   linux-qt-host-kit:
@@ -429,7 +459,7 @@ jobs:
 
     steps:
       - name: Checkout (without LFS)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
@@ -481,7 +511,7 @@ jobs:
       # blobs, and the V8 archives are fetched from a release asset by the step
       # below -- see .gitattributes for why.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 
@@ -496,13 +526,13 @@ jobs:
         run: bash scripts/fetch-v8-archives.sh
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
@@ -547,7 +577,7 @@ jobs:
         run: bash scripts/test-capi-platform-contract.sh
 
       - name: Gradle cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.gradle/caches
@@ -601,19 +631,8 @@ jobs:
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-slim-debug.aar \
             > platforms/android/dist/size-report-slim.txt || true
 
-      - name: Optional perf baseline compare
-        run: |
-          if [ -f ci/metrics/current_metrics.json ]; then
-            bash scripts/ci/run_perf.sh \
-              --current ci/metrics/current_metrics.json \
-              --baseline ci/baselines/android_perf_default.json \
-              --summary-out reports/perf-compare-summary.json
-          else
-            echo "skip perf baseline compare: ci/metrics/current_metrics.json not found"
-          fi
-
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: migo-android-debug
           path: |
@@ -650,7 +669,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: false
 

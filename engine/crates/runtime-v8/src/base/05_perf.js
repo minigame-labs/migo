@@ -1,13 +1,10 @@
 // ---------------------------------------------------------------------------
-// MigoPerf: Unified performance profiling for the Migo runtime.
+// Internal performance thresholds used by the async wrappers. Profiling is
+// disabled in the content runtime; enabling it belongs to a native diagnostic
+// build rather than a game-visible global API.
 //
 // All logging uses the [MigoPerf] prefix for easy logcat filtering:
 //   adb logcat | grep "\[MigoPerf\]"
-//
-// Enable:  migo._perf.enable()          // default thresholds
-//          migo._perf.enable({ sync: 3, async: 100, deferred: 200, frame: 10 })
-// Disable: migo._perf.disable()
-// Check:   migo._perf.enabled            // boolean
 //
 // When enabled, logs:
 //   [MigoPerf][Sync]     apiName: 8.3ms            - sync op blocked V8
@@ -27,21 +24,4 @@ const _perf = {
     frameMs: 8,       // per-frame total (RAF loop)
 };
 
-function _perfEnable(options) {
-    _perf.enabled = true;
-    if (options && typeof options === 'object') {
-        if (typeof options.sync === 'number') _perf.syncMs = options.sync;
-        if (typeof options.async === 'number') _perf.asyncMs = options.async;
-        if (typeof options.deferred === 'number') _perf.deferredMs = options.deferred;
-        if (typeof options.frame === 'number') _perf.frameMs = options.frame;
-    }
-    console.log('[MigoPerf] enabled: sync>' + _perf.syncMs + 'ms async>' +
-        _perf.asyncMs + 'ms deferred>' + _perf.deferredMs + 'ms frame>' + _perf.frameMs + 'ms');
-}
-
-function _perfDisable() {
-    _perf.enabled = false;
-    console.log('[MigoPerf] disabled');
-}
-
-export { _perf, _perfEnable, _perfDisable };
+export { _perf };

@@ -12,7 +12,7 @@
 #
 # 前置:
 #   - RUSTY_V8_SRC 指向已 clone + submodule 完成的 rusty_v8 源码树
-#     (默认 /home/wkspace/rusty_v8_src)
+#     （没有机器相关的默认值，必须显式设置）
 #   - ANDROID_NDK_HOME 指向 NDK
 #   - patch 目录:engine/third_party/v8-patches/
 #

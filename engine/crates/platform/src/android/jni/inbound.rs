@@ -139,7 +139,10 @@ use migo_core::{
     send_command_to_host, send_critical_command_to_host, send_reliable_command_to_host,
     spawn_host_thread,
 };
-use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
+use shared::protocol::camera_frame::{
+    PlaneWindow, pack_yuv_planes, validate_camera_frame_dimensions,
+    validate_camera_frame_payload_lengths,
+};
 use shared::protocol::host_cmd::{HostCommand, TouchData, TouchPoint, TouchType};
 use shared::surface::{PixelRatio, SurfaceRef};
 
@@ -1222,13 +1225,19 @@ pub(crate) extern "system" fn onCameraFrameData<'local>(
     height: jint,
 ) {
     jni_safe!("onCameraFrameData", {
-        // Validate dimensions before the signed -> unsigned cast below.
-        if width <= 0 || height <= 0 {
-            tracing::warn!(
-                "onCameraFrameData: non-positive dimensions {}x{}",
-                width,
-                height
-            );
+        // Reject oversized dimensions and byte windows before converting signed
+        // values or borrowing a Java direct-buffer address. `pack_yuv_planes`
+        // repeats the byte cap after capacity-window validation, so both JNI
+        // ingress and the shared copy boundary are independently bounded.
+        let (width, height) = match validate_camera_frame_dimensions(width, height) {
+            Ok(dimensions) => dimensions,
+            Err(error) => {
+                tracing::warn!("onCameraFrameData: invalid dimensions: {:?}", error);
+                return;
+            }
+        };
+        if let Err(error) = validate_camera_frame_payload_lengths([y_len, u_len, v_len]) {
+            tracing::warn!("onCameraFrameData: invalid payload lengths: {:?}", error);
             return;
         }
 
@@ -1299,8 +1308,8 @@ pub(crate) extern "system" fn onCameraFrameData<'local>(
             HostCommand::CameraFrameData {
                 camera_id: camera_id as u32,
                 data: packed,
-                width: width as u32,
-                height: height as u32,
+                width,
+                height,
                 runtime_generation: captured_generation(generation),
             },
         );

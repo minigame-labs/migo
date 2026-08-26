@@ -7,7 +7,9 @@ use deno_error::JsErrorBox;
 use shared::{
     error::{EngineError, ErrorCode},
     op_state::CanvasOpState,
-    protocol::render_cmd::{Canvas2DCmd, CanvasCmd, CanvasId, RenderCmdResp, RenderCommand},
+    protocol::render_cmd::{
+        Canvas2DCmd, CanvasCmd, CanvasId, RenderCmdResp, RenderCommand, checked_canvas_pixel_count,
+    },
     render_command_sender::SendError,
 };
 
@@ -83,6 +85,12 @@ pub fn op_create_offscreen_canvas(
     #[smi] width: u32,
     #[smi] height: u32,
 ) -> Result<u32, JsErrorBox> {
+    if checked_canvas_pixel_count(width, height).is_none() {
+        return Err(js_err_from_engine(
+            EngineError::new(ErrorCode::InvalidArgument)
+                .with_msg("offscreen canvas dimensions exceed the surface pixel cap"),
+        ));
+    }
     crate::rendering::webgl::frame_collector::flush_unified_barrier(state)
         .map_err(|e| js_err_from_engine(from_send_err(e)))?;
     let ctx = state.borrow::<CanvasOpState>();
@@ -128,6 +136,16 @@ pub fn op_resize_canvas(
     w: Option<u32>,
     h: Option<u32>,
 ) -> Result<(), JsErrorBox> {
+    // JS changes width and height in separate operations. Preflight each
+    // supplied dimension (the manager validates the final pair atomically).
+    if w.is_some_and(|width| checked_canvas_pixel_count(width, 1).is_none())
+        || h.is_some_and(|height| checked_canvas_pixel_count(1, height).is_none())
+    {
+        return Err(js_err_from_engine(
+            EngineError::new(ErrorCode::InvalidArgument)
+                .with_msg("canvas resize dimension exceeds the surface pixel cap"),
+        ));
+    }
     // Route resize through the UnifiedFrameCollector so it interleaves
     // with `FillText` / `TexImage2DFromCanvas2D` in JS-issue order on
     // the render thread.  Previously this went through `ctx.tx` as an
@@ -442,5 +460,27 @@ mod tests {
             gl_pos < destroy_pos,
             "GL barrier must come before DestroyCanvas; got order: {order:?}"
         );
+    }
+
+    #[test]
+    fn canvas_entrypoints_and_2d_batching_keep_the_allocation_caps() {
+        let canvas = include_str!("canvas.rs");
+        let context2d = include_str!("../rendering/webgl/context2d.rs");
+        let js = include_str!("../rendering/webgl/02_2d_context.js");
+        let manager = include_str!("../../../graphics/src/canvas/manager/mod.rs");
+        let surface = include_str!("../../../graphics/src/backend/gl/surface.rs");
+
+        assert!(canvas.contains("checked_canvas_pixel_count(width, height)"));
+        assert!(context2d.contains("checked_canvas_rgba_byte_len(width, height)"));
+        assert!(manager.contains("checked_canvas_pixel_count(w, h)"));
+        assert!(manager.contains("checked_canvas_pixel_count(new_w, new_h)"));
+        assert!(surface.contains("checked_canvas_rgba_byte_len(width, height)"));
+        assert!(context2d.contains("entry_count > MAX_DRAW_IMAGE_BATCH_ENTRIES"));
+        assert!(js.contains("MAX_DRAW_IMAGE_BATCH_ENTRIES = 65_536"));
+        assert!(js.contains("checkedImageDataDimensions"));
+        assert!(js.contains("\"IndexSizeError\""));
+        assert!(js.contains("Math.abs(width)"));
+        assert!(js.contains("x += rawWidth"));
+        assert!(js.contains("y += rawHeight"));
     }
 }

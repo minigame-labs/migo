@@ -24,11 +24,13 @@
 //! ## Thread Model
 //!
 //! Commands are sent from the JS runtime thread to the dedicated audio thread
-//! via an unbounded channel. Responses (where needed) use oneshot channels.
+//! via a bounded, non-blocking channel. Saturated sends are returned to the
+//! caller, and responses (where needed) use oneshot channels.
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use crate::audio_resources::AudioSnapshot;
 use crate::error::EngineResult;
 
 /// Unique identifier for an AudioContext instance.
@@ -121,6 +123,14 @@ pub enum AudioCmd {
         sample_rate: Option<u32>,
     },
 
+    /// Idempotently release an AudioContext from a GC finalizer.
+    ReleaseContext { ctx_id: AudioContextId },
+
+    /// Host restart barrier: discard older WebAudio work and release every
+    /// native WebAudio context. Delivery and acknowledgement use the audio
+    /// transport's reserved cleanup lane, not an in-band response.
+    ReleaseAllContexts,
+
     /// Close an AudioContext and release resources
     CloseContext {
         ctx_id: AudioContextId,
@@ -155,10 +165,12 @@ pub enum AudioCmd {
         resp: AudioResp<AudioBufferInfo>,
     },
 
-    /// Release an AudioBuffer
+    /// Idempotently release this context's map reference to an AudioBuffer.
+    /// BufferSource nodes may retain the underlying PCM until they clear,
+    /// replace, or finish. Fire-and-forget so it is safe from a GC finalizer.
     ReleaseBuffer {
+        ctx_id: AudioContextId,
         buffer_id: AudioBufferId,
-        resp: AudioResp<()>,
     },
 
     // ==================== Nodes ====================
@@ -168,11 +180,33 @@ pub enum AudioCmd {
         node_id: AudioNodeId,
     },
 
-    /// Set the buffer for an AudioBufferSourceNode
+    /// Set or clear the buffer for an AudioBufferSourceNode (fire-and-forget).
+    /// `ctx_id` is the claimed owner and is validated on the audio thread.
     SetBuffer {
+        ctx_id: AudioContextId,
         node_id: AudioNodeId,
-        buffer_id: AudioBufferId,
-        resp: AudioResp<()>,
+        buffer_id: Option<AudioBufferId>,
+    },
+
+    /// Atomically replace the native snapshot held by a source node.
+    ///
+    /// The snapshot is Arc-backed and already owns its PCM accounting permit;
+    /// this command only transfers a reference to the audio thread.
+    SetStartedBuffer {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+        buffer: Option<std::sync::Arc<AudioSnapshot>>,
+    },
+
+    /// Set a native snapshot and start the source in one FIFO command.
+    /// Fire-and-forget so a queued command carries no PCM byte charge.
+    StartBuffer {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+        buffer: Option<std::sync::Arc<AudioSnapshot>>,
+        when: f64,
+        offset: f64,
+        duration: Option<f64>,
     },
 
     /// Start playback of an AudioBufferSourceNode
@@ -461,11 +495,13 @@ pub enum AudioCmd {
         resp: AudioResp<Vec<f32>>,
     },
 
-    /// Get all channel data in one round-trip (eliminates per-channel await).
-    GetAllChannelData {
+    /// Move a decoded buffer out of its temporary context entry and return one
+    /// planar, channel-major vector. The temporary native allocation is
+    /// released whether conversion succeeds or fails.
+    TakeDecodedBufferData {
         ctx_id: AudioContextId,
         buffer_id: AudioBufferId,
-        resp: AudioResp<Vec<Vec<f32>>>,
+        resp: AudioResp<Vec<f32>>,
     },
 
     /// Copy data to a buffer channel
@@ -579,6 +615,107 @@ pub enum AudioCmd {
     },
 }
 
+impl AudioCmd {
+    /// Heap payload retained while this command waits in the audio queue.
+    /// Fixed-size command metadata is bounded by the queue's item limit.
+    pub fn queued_payload_bytes(&self) -> usize {
+        fn vector_bytes<T>(values: &Vec<T>) -> usize {
+            values.capacity().saturating_mul(std::mem::size_of::<T>())
+        }
+
+        match self {
+            Self::DecodeAudioData { data, .. } => data.capacity(),
+            Self::SetNodeParam { param_name, .. }
+            | Self::AudioParamSetValueAtTime { param_name, .. }
+            | Self::AudioParamLinearRamp { param_name, .. }
+            | Self::AudioParamExponentialRamp { param_name, .. }
+            | Self::AudioParamSetTarget { param_name, .. }
+            | Self::AudioParamCancelScheduled { param_name, .. } => param_name.capacity(),
+            Self::SetOscillatorType { osc_type, .. } => osc_type.capacity(),
+            Self::SetBiquadFilterType { filter_type, .. } => filter_type.capacity(),
+            Self::SetWaveShaperCurve { curve, .. } => curve.as_ref().map_or(0, vector_bytes),
+            Self::SetWaveShaperOversample { oversample, .. } => oversample.capacity(),
+            Self::SetPanningModel { model, .. } | Self::SetDistanceModel { model, .. } => {
+                model.capacity()
+            }
+            Self::SetPannerScalar { prop, .. } => prop.capacity(),
+            Self::CreateIIRFilter {
+                feedforward,
+                feedback,
+                ..
+            } => vector_bytes(feedforward).saturating_add(vector_bytes(feedback)),
+            Self::GetFrequencyResponse { frequencies, .. } => vector_bytes(frequencies),
+            Self::CopyToChannel { data, .. } => vector_bytes(data),
+            Self::InnerAudioLoad { data, .. } => data.capacity(),
+            Self::InnerAudioLoadUrl { url, .. } => url.capacity(),
+            Self::CreateContext { .. }
+            | Self::ReleaseContext { .. }
+            | Self::ReleaseAllContexts
+            | Self::CloseContext { .. }
+            | Self::GetContextState { .. }
+            | Self::ResumeContext { .. }
+            | Self::SuspendContext { .. }
+            | Self::ReleaseBuffer { .. }
+            | Self::CreateBufferSource { .. }
+            | Self::SetBuffer { .. }
+            | Self::SetStartedBuffer { .. }
+            | Self::StartBuffer { .. }
+            | Self::Start { .. }
+            | Self::Stop { .. }
+            | Self::SetLoop { .. }
+            | Self::SetPlaybackRate { .. }
+            | Self::CreateGain { .. }
+            | Self::SetGainValue { .. }
+            | Self::Connect { .. }
+            | Self::Disconnect { .. }
+            | Self::CreateOscillator { .. }
+            | Self::StartOscillator { .. }
+            | Self::StopOscillator { .. }
+            | Self::CreateDelay { .. }
+            | Self::CreateBiquadFilter { .. }
+            | Self::CreateWaveShaper { .. }
+            | Self::CreateAnalyser { .. }
+            | Self::SetAnalyserFftSize { .. }
+            | Self::GetAnalyserByteTimeDomainData { .. }
+            | Self::GetAnalyserFloatTimeDomainData { .. }
+            | Self::CreateDynamicsCompressor { .. }
+            | Self::CreatePanner { .. }
+            | Self::CreateChannelMerger { .. }
+            | Self::CreateChannelSplitter { .. }
+            | Self::CreateConstantSource { .. }
+            | Self::StartConstantSource { .. }
+            | Self::StopConstantSource { .. }
+            | Self::GetReduction { .. }
+            | Self::GetAnalyserByteFrequencyData { .. }
+            | Self::GetAnalyserFloatFrequencyData { .. }
+            | Self::CreateBuffer { .. }
+            | Self::GetChannelData { .. }
+            | Self::TakeDecodedBufferData { .. }
+            | Self::CreateMediaAudioPlayer { .. }
+            | Self::MediaAudioPlayerAddSource { .. }
+            | Self::MediaAudioPlayerRemoveSource { .. }
+            | Self::MediaAudioPlayerStart { .. }
+            | Self::MediaAudioPlayerStop { .. }
+            | Self::MediaAudioPlayerDestroy { .. }
+            | Self::Shutdown
+            | Self::PauseAll
+            | Self::ResumeAll
+            | Self::CreateInnerAudio { .. }
+            | Self::DestroyInnerAudio { .. }
+            | Self::InnerAudioPlay { .. }
+            | Self::InnerAudioPause { .. }
+            | Self::InnerAudioStop { .. }
+            | Self::InnerAudioSeek { .. }
+            | Self::InnerAudioSetVolume { .. }
+            | Self::InnerAudioSetLoop { .. }
+            | Self::InnerAudioSetPlaybackRate { .. }
+            | Self::InnerAudioSetAutoplay { .. }
+            | Self::InnerAudioGetState { .. }
+            | Self::InnerAudioPollEvents { .. } => 0,
+        }
+    }
+}
+
 /// Information about loaded InnerAudioContext
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InnerAudioInfo {
@@ -618,4 +755,66 @@ pub struct InnerAudioEvent {
     pub event_type: InnerAudioEventType,
     /// Current playback time when event occurred
     pub current_time: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_lifecycle_commands_are_context_scoped_and_fire_and_forget() {
+        let release_context = AudioCmd::ReleaseContext { ctx_id: 7 };
+        let release_all_contexts = AudioCmd::ReleaseAllContexts;
+        let release = AudioCmd::ReleaseBuffer {
+            ctx_id: 7,
+            buffer_id: 11,
+        };
+        let bind = AudioCmd::SetBuffer {
+            ctx_id: 7,
+            node_id: 13,
+            buffer_id: Some(11),
+        };
+        let clear = AudioCmd::SetBuffer {
+            ctx_id: 7,
+            node_id: 13,
+            buffer_id: None,
+        };
+
+        assert_eq!(release_context.queued_payload_bytes(), 0);
+        assert_eq!(release_all_contexts.queued_payload_bytes(), 0);
+        assert_eq!(release.queued_payload_bytes(), 0);
+        assert_eq!(bind.queued_payload_bytes(), 0);
+        assert_eq!(clear.queued_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn snapshot_commands_are_fire_and_forget_and_unmetered() {
+        let start = AudioCmd::StartBuffer {
+            ctx_id: 7,
+            node_id: 13,
+            buffer: None,
+            when: 0.0,
+            offset: 0.0,
+            duration: None,
+        };
+        let replace = AudioCmd::SetStartedBuffer {
+            ctx_id: 7,
+            node_id: 13,
+            buffer: None,
+        };
+
+        assert_eq!(start.queued_payload_bytes(), 0);
+        assert_eq!(replace.queued_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn all_channel_data_response_is_flat() {
+        let (resp, _receiver) = oneshot::channel::<EngineResult<Vec<f32>>>();
+        let command = AudioCmd::TakeDecodedBufferData {
+            ctx_id: 7,
+            buffer_id: 11,
+            resp,
+        };
+        assert_eq!(command.queued_payload_bytes(), 0);
+    }
 }

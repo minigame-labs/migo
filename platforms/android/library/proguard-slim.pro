@@ -1,30 +1,30 @@
 # Core Java -> Rust calls registered by platform/profile-slim.
 -keepclassmembers,allowoptimization class com.migo.runtime.internal.NativeBridge {
-    public static native *** version(...);
-    public static native *** getMinApiLevel(...);
-    public static native *** initIcuData(...);
-    public static native *** init(...);
-    public static native *** shutdown(...);
-    public static native *** onShow(...);
-    public static native *** onHide(...);
-    public static native *** onRestart(...);
-    public static native *** updateSurface(...);
-    public static native *** onSurfaceDestroyed(...);
-    public static native *** onTouchEvent(...);
-    public static native *** modMain(...);
-    public static native *** executeScript(...);
-    public static native *** onVsync(...);
-    public static native *** getDebugStats(...);
-    public static native *** getConsoleLogs(...);
-    public static native *** nativeAhbPointerFromHardwareBuffer(...);
-    public static native *** onKeyboardInput(...);
-    public static native *** onKeyboardConfirm(...);
-    public static native *** onKeyboardComplete(...);
-    public static native *** onKeyboardHeightChange(...);
-    public static native *** onMemoryWarning(...);
-    public static native *** onThermalStatusChanged(...);
-    public static native *** onSubpackageProgress(...);
-    public static native *** onSubpackageResult(...);
+    static native *** version(...);
+    static native *** getMinApiLevel(...);
+    static native *** initIcuData(...);
+    static native *** init(...);
+    static native *** shutdown(...);
+    static native *** onShow(...);
+    static native *** onHide(...);
+    static native *** onRestart(...);
+    static native *** updateSurface(...);
+    static native *** onSurfaceDestroyed(...);
+    static native *** onTouchEvent(...);
+    static native *** modMain(...);
+    static native *** executeScript(...);
+    static native *** onVsync(...);
+    static native *** getDebugStats(...);
+    static native *** getConsoleLogs(...);
+    static native *** nativeAhbPointerFromHardwareBuffer(...);
+    static native *** onKeyboardInput(...);
+    static native *** onKeyboardConfirm(...);
+    static native *** onKeyboardComplete(...);
+    static native *** onKeyboardHeightChange(...);
+    static native *** onMemoryWarning(...);
+    static native *** onThermalStatusChanged(...);
+    static native *** onSubpackageProgress(...);
+    static native *** onSubpackageResult(...);
 }
 
 # Core Rust -> Java calls cached by platform/profile-slim.

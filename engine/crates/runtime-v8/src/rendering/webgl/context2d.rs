@@ -20,7 +20,8 @@ use shared::{
     protocol::{
         color::Color,
         render_cmd::{
-            Canvas2DCmd, GradientType, RenderCommand, TextAlign, TextBaseline, TextMetrics,
+            Canvas2DCmd, GradientType, MAX_DRAW_IMAGE_BATCH_ENTRIES, RenderCommand, TextAlign,
+            TextBaseline, TextMetrics, checked_canvas_rgba_byte_len,
         },
         send_render_with_resp_sync,
     },
@@ -522,6 +523,10 @@ pub fn op_get_image_data(
     width: u32,
     height: u32,
 ) -> Vec<u8> {
+    if checked_canvas_rgba_byte_len(width, height).is_none() {
+        error!("{OP_GET_IMAGE_DATA}: dimensions exceed the synchronous RGBA cap");
+        return vec![];
+    }
     // Flush only dirty Canvas2D work before sync readback. If the barrier
     // can't be delivered, refuse to read stale/un-materialized pixels.
     if flush_pending_commands_for_readback_sync(state, canvas_id).is_err() {
@@ -561,7 +566,7 @@ pub fn op_capture_canvas2d_snapshot(
     #[smi] height: u32,
     #[smi] snapshot_id: u32,
 ) {
-    if snapshot_id == 0 {
+    if snapshot_id == 0 || checked_canvas_rgba_byte_len(width, height).is_none() {
         return;
     }
     if let Some(collector) =
@@ -582,8 +587,8 @@ pub fn op_capture_canvas2d_snapshot(
 }
 
 const OP_FORCE_READBACK_SNAPSHOT: &str = "canvas2d force_readback_snapshot";
-/// Backs `migo._force_readback(imageData)`.  Returns a tightly
-/// packed RGBA8 byte buffer (top-down rows, length `w * h * 4`),
+/// Backs the lazy `ImageData.data` getter. Returns a tightly packed RGBA8 byte
+/// buffer (top-down rows, length `w * h * 4`),
 /// matching the legacy `op_get_image_data` layout.  Empty `Vec` on
 /// failure (snapshot already drained, FBO incomplete, …).
 #[op2]
@@ -806,7 +811,7 @@ pub fn op_capture_canvas2d_snapshot_for_cache(
     #[smi] canvas_w: u32,
     #[smi] canvas_h: u32,
 ) {
-    if snapshot_id == 0 {
+    if snapshot_id == 0 || checked_canvas_rgba_byte_len(width, height).is_none() {
         return;
     }
     let font_generation = state.borrow::<CanvasOpState>().text_cache.font_generation();
@@ -1683,8 +1688,16 @@ pub fn op_draw_image_batch(state: &mut OpState, #[smi] canvas_id: u32, #[buffer]
     if entry_count == 0 {
         return;
     }
+    if entry_count > MAX_DRAW_IMAGE_BATCH_ENTRIES {
+        error!("op_draw_image_batch: entry count exceeds {MAX_DRAW_IMAGE_BATCH_ENTRIES}");
+        return;
+    }
 
-    let mut draws = Vec::with_capacity(entry_count);
+    let mut draws = Vec::new();
+    if draws.try_reserve_exact(entry_count).is_err() {
+        error!("op_draw_image_batch: allocation failed for {entry_count} entries");
+        return;
+    }
 
     for i in 0..entry_count {
         let offset = i * ENTRY_SIZE;
