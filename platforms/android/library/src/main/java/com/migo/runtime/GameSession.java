@@ -22,7 +22,6 @@ import com.migo.runtime.callback.GameSessionListener;
 import com.migo.runtime.callback.SubpackageHandler;
 import com.migo.runtime.internal.ExclusiveDeviceArbiter;
 import com.migo.runtime.internal.NativeExports;
-import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeContext;
 import com.migo.runtime.internal.RuntimeRegistry;
@@ -159,14 +158,6 @@ public final class GameSession implements Closeable {
         this.audioFocusManager = BuildConfig.MIGO_API_MEDIA ? new AudioFocusManager(sessionId, context) : null;
         this.vsyncScheduler = new VsyncScheduler(sessionId);
         this.mainHandler = new Handler(Looper.getMainLooper());
-
-        // Configure frame skip to match targetFps against the display refresh rate
-        float displayRefreshRate = 60f;
-        if (context instanceof Activity) {
-            displayRefreshRate = ((Activity) context).getWindowManager()
-                    .getDefaultDisplay().getRefreshRate();
-        }
-        this.vsyncScheduler.setTargetFps(config.getTargetFps(), displayRefreshRate);
 
         // Reclaim the temp directories of sessions that died without running their
         // own teardown, before this session's own directory exists. Ordering is
@@ -315,7 +306,7 @@ public final class GameSession implements Closeable {
      */
     public PerformanceSnapshot getPerformanceSnapshot() {
         if (state.get() == SessionState.DESTROYED) return null;
-        byte[] data = NativeBridge.getDebugStats(sessionId);
+        byte[] data = NativeMethods.getDebugStats(sessionId);
         return PerformanceSnapshot.fromStatsPacket(data);
     }
 
@@ -359,13 +350,13 @@ public final class GameSession implements Closeable {
         File codeDir = paths.getCodeDir();
         if (!codeDir.exists() || !codeDir.isDirectory()) {
             throw new MigoException(ErrorCode.ERR_CODE_DIR_NOT_FOUND,
-                    ErrorCode.getMessage(ErrorCode.ERR_CODE_DIR_NOT_FOUND) + ": Code directory not found: " + codeDir.getAbsolutePath());
+                    ErrorCode.getMessage(ErrorCode.ERR_CODE_DIR_NOT_FOUND) + ": Code directory not found");
         }
 
         File entry = new File(codeDir, entryPoint);
         if (!entry.exists() || !entry.isFile()) {
             throw new MigoException(ErrorCode.ERR_ENTRY_NOT_FOUND,
-                    ErrorCode.getMessage(ErrorCode.ERR_ENTRY_NOT_FOUND) + ": Entry point not found: " + entry.getAbsolutePath());
+                    ErrorCode.getMessage(ErrorCode.ERR_ENTRY_NOT_FOUND) + ": Entry point not found");
         }
 
         // Ensure launch options are available before entry execution.

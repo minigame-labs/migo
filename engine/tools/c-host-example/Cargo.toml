@@ -1,6 +1,7 @@
 [package]
 name = "migo-c-host-example"
 version.workspace = true
+license.workspace = true
 edition = "2024"
 
 # Builds `tests/c_host/main.c` — a host written in C against the public

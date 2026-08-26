@@ -1,12 +1,13 @@
 import {
   op_audio_create_context,
   op_audio_close_context,
+  op_audio_release_context,
   op_audio_decode_audio_data,
+  op_audio_reserve_buffer,
+  op_audio_abort_buffer,
   op_audio_create_buffer_source,
   op_audio_create_gain,
-  op_audio_create_buffer,
-  op_audio_get_channel_data,
-  op_audio_get_all_channel_data,
+  op_audio_take_decoded_buffer_data,
   op_audio_create_oscillator,
   op_audio_create_delay,
   op_audio_create_biquad_filter,
@@ -22,7 +23,7 @@ import {
   op_audio_suspend_context,
 } from "ext:core/ops";
 import { AudioParam } from "ext:host_v8_audio/00_audio_param.js";
-import { AudioBuffer } from "ext:host_v8_audio/00_audio_buffer.js";
+import { AudioBuffer, createDecodedAudioBuffer } from "ext:host_v8_audio/00_audio_buffer.js";
 import { AudioNode, AudioDestinationNode } from "ext:host_v8_audio/00_audio_node.js";
 import { AudioBufferSourceNode } from "ext:host_v8_audio/00_buffer_source_node.js";
 import { GainNode } from "ext:host_v8_audio/00_gain_node.js";
@@ -41,28 +42,69 @@ import { ScriptProcessorNode } from "ext:host_v8_audio/00_script_processor_node.
 import { PeriodicWave } from "ext:host_v8_audio/00_periodic_wave.js";
 import { AudioListener } from "ext:host_v8_audio/00_audio_listener.js";
 import { onHide, onShow } from "ext:host_v8_lifecycle/01_lifecycle.js";
+import { allocateHostCallbackId } from "ext:host_v8_base/02_async.js";
 
 const CONTEXT_REGISTRY = new Map();
-const BUFFER_REGISTRY = new Map();
+const PENDING_CONTEXT_RELEASES = new Set();
+const INITIAL_CONTEXT_RELEASE_RETRY_MS = 4;
+const MAX_CONTEXT_RELEASE_RETRY_MS = 1000;
+let contextReleaseRetryTimer = null;
+let contextReleaseRetryMs = INITIAL_CONTEXT_RELEASE_RETRY_MS;
 
-// JS-side node ID generator (starting from 1000 to avoid collision with native IDs)
-let nextNodeId = 1000;
+function schedulePendingContextReleases() {
+  if (contextReleaseRetryTimer !== null || PENDING_CONTEXT_RELEASES.size === 0) {
+    return;
+  }
+  contextReleaseRetryTimer = setTimeout(flushPendingContextReleases, contextReleaseRetryMs);
+}
 
-// JS-side AudioContext ID generator. Allocated synchronously so a freshly
-// constructed context is usable on the very next line (browser semantics -
-// games do `new AudioContext().createGain()`), instead of racing an async
-// round-trip to the audio thread that leaves `#nativeId` null. Contexts and
-// nodes live in separate registries on the audio thread, so this range only
-// needs to be internally unique.
-let nextContextId = 1;
+function flushPendingContextReleases() {
+  contextReleaseRetryTimer = null;
+  for (const ctxId of PENDING_CONTEXT_RELEASES) {
+    try {
+      op_audio_release_context(ctxId);
+      PENDING_CONTEXT_RELEASES.delete(ctxId);
+    } catch {
+      // Queue saturation is transient; retain only the numeric id and retry.
+    }
+  }
 
-// PCM allocation limits - mirror of `audio::limits` (the Rust side is the
-// authoritative source of truth; native validates again). Kept here so invalid
-// createBuffer args fail synchronously with a clear error and never allocate.
-const MAX_AUDIO_PCM_BYTES = 512 * 1024 * 1024;
-const MAX_AUDIO_CHANNELS = 32;
-const MIN_SAMPLE_RATE = 3000;
-const MAX_SAMPLE_RATE = 768000;
+  if (PENDING_CONTEXT_RELEASES.size === 0) {
+    contextReleaseRetryMs = INITIAL_CONTEXT_RELEASE_RETRY_MS;
+    return;
+  }
+  contextReleaseRetryMs = Math.min(
+    contextReleaseRetryMs * 2,
+    MAX_CONTEXT_RELEASE_RETRY_MS,
+  );
+  schedulePendingContextReleases();
+}
+
+function releaseNativeAudioContext(ctxId) {
+  if (PENDING_CONTEXT_RELEASES.has(ctxId)) return;
+  try {
+    op_audio_release_context(ctxId);
+  } catch {
+    PENDING_CONTEXT_RELEASES.add(ctxId);
+    schedulePendingContextReleases();
+  }
+}
+
+const CONTEXT_FINALIZER = new FinalizationRegistry((ctxId) => {
+  CONTEXT_REGISTRY.delete(ctxId);
+  releaseNativeAudioContext(ctxId);
+});
+
+function forEachLiveContext(callback) {
+  for (const [ctxId, reference] of CONTEXT_REGISTRY) {
+    const context = reference.deref();
+    if (context) {
+      callback(context);
+    } else {
+      CONTEXT_REGISTRY.delete(ctxId);
+    }
+  }
+}
 
 // While the app is hidden the audio thread is paused (OnHide -> PauseAll), so
 // native currentTime freezes. Freeze every context's JS clock to match, and
@@ -85,11 +127,11 @@ const MAX_SAMPLE_RATE = 768000;
 let _appBackgrounded = false;
 onHide(() => {
   _appBackgrounded = true;
-  for (const ctx of CONTEXT_REGISTRY.values()) ctx._setBackgrounded(true);
+  forEachLiveContext((ctx) => ctx._setBackgrounded(true));
 });
 onShow(() => {
   _appBackgrounded = false;
-  for (const ctx of CONTEXT_REGISTRY.values()) ctx._setBackgrounded(false);
+  forEachLiveContext((ctx) => ctx._setBackgrounded(false));
 });
 
 class BaseAudioContext {
@@ -106,6 +148,7 @@ class BaseAudioContext {
   #accumulated = 0; // running seconds banked before the current segment
   #backgrounded = false; // app hidden -> audio thread paused
   #clockRunning = false; // whether the epoch is currently counting
+  #finalizerToken = {};
 
   constructor(sampleRate) {
     this.#sampleRate = sampleRate;
@@ -137,7 +180,7 @@ class BaseAudioContext {
   // always creates the context before any node that references it. This keeps
   // `new AudioContext()` synchronously usable, matching the browser.
   _initNative(sampleRate) {
-    this.#nativeId = nextContextId++;
+    this.#nativeId = allocateHostCallbackId();
     op_audio_create_context(this.#nativeId, sampleRate || 0);
     this.#destination = new AudioDestinationNode(this, 0, 2);
     // Anchor the clock origin at creation, matching native frames_processed=0.
@@ -146,7 +189,13 @@ class BaseAudioContext {
     this.#backgrounded = _appBackgrounded;
     this.#state = "running";
     this.#reconcileClock(); // start counting only if running + foreground
-    CONTEXT_REGISTRY.set(this.#nativeId, this);
+    CONTEXT_REGISTRY.set(this.#nativeId, new WeakRef(this));
+    CONTEXT_FINALIZER.register(this, this.#nativeId, this.#finalizerToken);
+  }
+
+  _forgetNativeRegistration() {
+    CONTEXT_FINALIZER.unregister(this.#finalizerToken);
+    CONTEXT_REGISTRY.delete(this.#nativeId);
   }
 
   get _nativeId() {
@@ -175,99 +224,82 @@ class BaseAudioContext {
   }
 
   async decodeAudioData(audioData, successCallback, errorCallback) {
+    if (!(audioData instanceof ArrayBuffer)) {
+      throw new TypeError("audioData must be an ArrayBuffer");
+    }
+    // Constructing even a zero-length view rejects an already-detached input.
+    // Translate that engine-specific TypeError to the Web Audio exception.
     try {
-      if (!(audioData instanceof ArrayBuffer)) {
-        throw new TypeError("audioData must be an ArrayBuffer");
-      }
+      new Uint8Array(audioData, 0, 0);
+    } catch (_) {
+      throw new DOMException("audioData is already detached", "DataCloneError");
+    }
 
+    const decodePromise = (async () => {
       const info = await op_audio_decode_audio_data(
         this.#nativeId,
-        new Uint8Array(audioData)
+        audioData
       );
 
-      // Fetch all channel data in one round-trip (eliminates per-channel await).
-      // Layout: [u32le chCount | u32le framesPerCh | ch0 f32s | ch1 f32s ...]
-      const flat = await op_audio_get_all_channel_data(this.#nativeId, info.id);
-      const hdr = new DataView(flat.buffer, flat.byteOffset, 8);
-      const chCount = hdr.getUint32(0, true);
-      const framesPerCh = hdr.getUint32(4, true);
-      const dataOffset = flat.byteOffset + 8;
-      const bytesPerCh = framesPerCh * 4;
-      const channelData = [];
-      for (let ch = 0; ch < chCount; ch++) {
-        channelData.push(new Float32Array(flat.buffer, dataOffset + ch * bytesPerCh, framesPerCh));
+      let buffer;
+      let globalBufferId = 0;
+      try {
+        globalBufferId = op_audio_reserve_buffer(
+          info.channels,
+          info.length,
+          info.sample_rate,
+        );
+        // Atomically move the temporary native decode into one exact,
+        // channel-major planar ArrayBuffer. The audio thread drops its
+        // interleaved allocation before this promise resumes.
+        const flat = await op_audio_take_decoded_buffer_data(this.#nativeId, info.id);
+        buffer = createDecodedAudioBuffer(globalBufferId, info, flat);
+      } catch (error) {
+        if (globalBufferId !== 0) op_audio_abort_buffer(globalBufferId);
+        throw error;
       }
 
-      const buffer = new AudioBuffer(info.id, this.#nativeId, info, channelData);
-      BUFFER_REGISTRY.set(info.id, buffer);
-
-      if (successCallback) {
-        successCallback(buffer);
-      }
       return buffer;
-    } catch (error) {
-      if (errorCallback) {
-        errorCallback(error);
-        return;
-      }
-      throw error;
+    })();
+
+    // Legacy callbacks observe the same settlement but are deliberately
+    // scheduled separately: their return value or exception cannot resolve or
+    // reject the Promise returned by decodeAudioData.
+    if (typeof successCallback === "function") {
+      void decodePromise.then(
+        (buffer) => setTimeout(() => successCallback(buffer), 0),
+        () => {},
+      );
     }
+    if (typeof errorCallback === "function") {
+      void decodePromise.then(
+        () => {},
+        (error) => setTimeout(() => errorCallback(error), 0),
+      );
+    }
+    return decodePromise;
   }
 
-  async createBuffer(numberOfChannels, length, sampleRate) {
-    numberOfChannels = Math.trunc(numberOfChannels);
-    length = Math.trunc(length);
-    sampleRate = Math.trunc(sampleRate);
-
-    if (!Number.isFinite(numberOfChannels) || numberOfChannels < 1 || numberOfChannels > MAX_AUDIO_CHANNELS) {
-      throw new Error(
-        `createBuffer: numberOfChannels ${numberOfChannels} out of range [1, ${MAX_AUDIO_CHANNELS}]`
-      );
-    }
-    if (!Number.isFinite(length) || length < 1) {
-      throw new Error(`createBuffer: length must be a positive integer`);
-    }
-    if (!Number.isFinite(sampleRate) || sampleRate < MIN_SAMPLE_RATE || sampleRate > MAX_SAMPLE_RATE) {
-      throw new Error(
-        `createBuffer: sampleRate ${sampleRate} out of range [${MIN_SAMPLE_RATE}, ${MAX_SAMPLE_RATE}]`
-      );
-    }
-    // f32 PCM: length * channels * 4 bytes. Exact in f64 for any valid input.
-    const bytes = length * numberOfChannels * 4;
-    if (bytes > MAX_AUDIO_PCM_BYTES) {
-      throw new Error(
-        `createBuffer: ${bytes} bytes exceeds the PCM budget of ${MAX_AUDIO_PCM_BYTES}`
-      );
-    }
-
-    const info = await op_audio_create_buffer(
-      this.#nativeId,
-      numberOfChannels,
-      length,
-      sampleRate
-    );
-    // createBuffer: zero-filled arrays allocated on JS side (channelData = null)
-    const buffer = new AudioBuffer(info.id, this.#nativeId, info);
-    BUFFER_REGISTRY.set(info.id, buffer);
-    return buffer;
+  createBuffer(numberOfChannels, length, sampleRate) {
+    return new AudioBuffer({ numberOfChannels, length, sampleRate });
   }
 
   createBufferSource() {
     // Generate ID in JS, notify native asynchronously
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     // Fire and forget - native will create the node
     op_audio_create_buffer_source(this.#nativeId, nodeId);
     return new AudioBufferSourceNode(this, nodeId);
   }
 
   createGain() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_gain(this.#nativeId, nodeId);
     return new GainNode(this, nodeId);
   }
 
   createOscillator() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_oscillator(this.#nativeId, nodeId);
     return new OscillatorNode(this, nodeId);
   }
@@ -278,55 +310,55 @@ class BaseAudioContext {
     const MAX_DELAY_BYTES = 16 * 1024 * 1024;
     const budgetSecs = MAX_DELAY_BYTES / (this.sampleRate * 2 * 4);
     maxDelayTime = Math.min(Math.max(0.001, maxDelayTime), Math.min(180, budgetSecs));
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_delay(this.#nativeId, nodeId, maxDelayTime);
     return new DelayNode(this, nodeId, maxDelayTime);
   }
 
   createBiquadFilter() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_biquad_filter(this.#nativeId, nodeId);
     return new BiquadFilterNode(this, nodeId);
   }
 
   createWaveShaper() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_wave_shaper(this.#nativeId, nodeId);
     return new WaveShaperNode(this, nodeId);
   }
 
   createAnalyser() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_analyser(this.#nativeId, nodeId);
     return new AnalyserNode(this, nodeId);
   }
 
   createDynamicsCompressor() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_dynamics_compressor(this.#nativeId, nodeId);
     return new DynamicsCompressorNode(this, nodeId);
   }
 
   createPanner() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_panner(this.#nativeId, nodeId);
     return new PannerNode(this, nodeId);
   }
 
   createChannelMerger(numberOfInputs = 6) {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_channel_merger(this.#nativeId, nodeId, numberOfInputs);
     return new ChannelMergerNode(this, nodeId, numberOfInputs);
   }
 
   createChannelSplitter(numberOfOutputs = 6) {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_channel_splitter(this.#nativeId, nodeId, numberOfOutputs);
     return new ChannelSplitterNode(this, nodeId, numberOfOutputs);
   }
 
   createConstantSource() {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_constant_source(this.#nativeId, nodeId);
     return new ConstantSourceNode(this, nodeId);
   }
@@ -347,13 +379,13 @@ class BaseAudioContext {
     if (!ff.every(Number.isFinite) || !fb.every(Number.isFinite)) {
       throw new Error("createIIRFilter: coefficients must be finite numbers");
     }
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     op_audio_create_iir_filter(this.#nativeId, nodeId, ff, fb);
     return new IIRFilterNode(this, nodeId, ff, fb);
   }
 
   createScriptProcessor(bufferSize = 0, numberOfInputChannels = 2, numberOfOutputChannels = 2) {
-    const nodeId = nextNodeId++;
+    const nodeId = allocateHostCallbackId();
     return new ScriptProcessorNode(this, nodeId, bufferSize, numberOfInputChannels, numberOfOutputChannels);
   }
 
@@ -415,8 +447,9 @@ class AudioContext extends BaseAudioContext {
       return;
     }
     await op_audio_close_context(this._nativeId);
+    PENDING_CONTEXT_RELEASES.delete(this._nativeId);
     this._setState("closed");
-    CONTEXT_REGISTRY.delete(this._nativeId);
+    this._forgetNativeRegistration();
   }
 
   async resume() {

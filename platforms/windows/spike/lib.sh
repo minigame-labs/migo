@@ -49,17 +49,23 @@ discover_win_extra_path() {
         printf '%s' "$MIGO_WIN_EXTRA_PATH"
         return
     fi
-    local parts=() dir
+    local parts=() dir finder python_win python_unix
     for dir in "/mnt/c/Program Files/Git/cmd" "/mnt/c/Program Files/Git/bin"; do
         [[ -x "$dir/git.exe" ]] && parts+=("$(wslpath -w "$dir")")
     done
-    # Python is installed per-user by default on Windows; take whatever the
-    # launcher directory reveals rather than pinning a version.
-    for dir in /mnt/c/Users/*/AppData/Local/Programs/Python/Python3*; do
-        [[ -x "$dir/python.exe" ]] || continue
-        parts+=("$(wslpath -w "$dir")")
-        [[ -d "$dir/Scripts" ]] && parts+=("$(wslpath -w "$dir/Scripts")")
-    done
+    # Ask Windows to resolve Python through its configured PATH. This supports
+    # per-user and system installs without publishing a user-profile path.
+    finder="/mnt/c/Windows/System32/where.exe"
+    if [[ -f "$finder" ]]; then
+        while IFS= read -r python_win; do
+            python_win="${python_win%$'\r'}"
+            [[ -n "$python_win" && "$python_win" == *\\* ]] || continue
+            dir="${python_win%\\*}"
+            parts+=("$dir")
+            python_unix="$(wslpath -u "$dir" 2>/dev/null || true)"
+            [[ -n "$python_unix" && -d "$python_unix/Scripts" ]] && parts+=("$dir\\Scripts")
+        done < <("$finder" python.exe 2>/dev/null || true)
+    fi
     local IFS=';'
     printf '%s' "${parts[*]}"
 }

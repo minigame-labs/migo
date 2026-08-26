@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use shared::audio_channel::{
     AUDIO_COMMANDS_PER_DRAIN, AudioCommandReceiver, AudioCommandSender, channel as audio_channel,
 };
+use shared::audio_resources::AudioSnapshot;
 use shared::channel::ThreadWakeup;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::op_state::HostTx;
@@ -90,18 +91,384 @@ enum DecodeJob {
     },
 }
 
-/// Internal message sent through the pool's work channel.
-enum PoolMsg {
-    Job(DecodeJob),
-    Shutdown,
-}
-
 /// Number of persistent decode worker threads.
 ///
 /// 2 is a good default for mobile: enough parallelism for startup bursts
 /// (30 sound effects decode in ~225 ms instead of ~450 ms with 1 worker)
 /// without hogging CPU cores needed for rendering and JS.
 const DECODE_POOL_SIZE: usize = 2;
+
+/// Maximum number of encoded decode jobs waiting behind the workers.
+const DECODE_JOB_QUEUE_CAPACITY: usize = 16;
+
+/// Maximum number of completed decodes waiting for the audio thread.
+const DECODE_RESULT_QUEUE_CAPACITY: usize = 8;
+
+/// Encoded bytes retained by jobs waiting behind the decode workers.
+const MAX_DECODE_JOB_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Decoded PCM bytes retained while the audio thread is catching up.
+const MAX_DECODE_RESULT_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+/// One decode may retain up to 16 MiB encoded input and two 64 MiB PCM-sized
+/// allocations while decoding/resampling.  This process-wide budget permits
+/// two such jobs, regardless of how many runtimes create audio pools.
+const MAX_DECODE_IN_FLIGHT_BYTES: usize = 288 * 1024 * 1024;
+const DECODE_IN_FLIGHT_RESERVATION_BYTES: usize = 144 * 1024 * 1024;
+
+const DECODE_JOB_QUEUE_FULL_DETAIL: &str = "audio decode job queue is full";
+const DECODE_JOB_BYTE_LIMIT_DETAIL: &str = "audio decode job queue byte limit exceeded";
+const DECODE_RESULT_QUEUE_FULL_DETAIL: &str = "audio decode result queue is full";
+const DECODE_RESULT_BYTE_LIMIT_DETAIL: &str = "audio decode result queue byte limit exceeded";
+const DECODE_QUEUE_DISCONNECTED_DETAIL: &str = "audio decode queue is disconnected";
+
+trait DecodeQueuePayload {
+    fn queued_bytes(&self) -> usize;
+}
+
+struct DecodeInFlightUsage {
+    bytes: std::sync::atomic::AtomicUsize,
+    max_bytes: usize,
+    reservation_bytes: usize,
+}
+
+struct DecodeInFlightPermit {
+    usage: Arc<DecodeInFlightUsage>,
+    bytes: usize,
+}
+
+impl Drop for DecodeInFlightPermit {
+    fn drop(&mut self) {
+        self.usage
+            .bytes
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl DecodeInFlightUsage {
+    fn new(max_bytes: usize, reservation_bytes: usize) -> Self {
+        assert!(reservation_bytes > 0, "decode reservation must be non-zero");
+        Self {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            max_bytes,
+            reservation_bytes,
+        }
+    }
+
+    fn try_reserve(self: &Arc<Self>) -> Option<DecodeInFlightPermit> {
+        self.bytes
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |used| {
+                    used.checked_add(self.reservation_bytes)
+                        .filter(|total| *total <= self.max_bytes)
+                },
+            )
+            .ok()?;
+        Some(DecodeInFlightPermit {
+            usage: Arc::clone(self),
+            bytes: self.reservation_bytes,
+        })
+    }
+}
+
+fn process_decode_in_flight_budget() -> Arc<DecodeInFlightUsage> {
+    static PROCESS_DECODE_IN_FLIGHT_BUDGET: OnceLock<Arc<DecodeInFlightUsage>> = OnceLock::new();
+
+    Arc::clone(PROCESS_DECODE_IN_FLIGHT_BUDGET.get_or_init(|| {
+        Arc::new(DecodeInFlightUsage::new(
+            MAX_DECODE_IN_FLIGHT_BYTES,
+            DECODE_IN_FLIGHT_RESERVATION_BYTES,
+        ))
+    }))
+}
+
+impl DecodeQueuePayload for DecodeJob {
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Self::AudioBuffer { data, .. } => data.capacity(),
+            Self::InnerAudio { data, .. } => data.capacity(),
+        }
+    }
+}
+
+impl DecodeQueuePayload for DecodeResult {
+    fn queued_bytes(&self) -> usize {
+        let result = match self {
+            Self::AudioBuffer { result, .. } | Self::InnerAudio { result, .. } => result,
+        };
+        result.as_ref().map_or(0, |decoded| {
+            decoded
+                .samples
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f32>())
+        })
+    }
+}
+
+struct DecodeQueueUsage {
+    max_items: usize,
+    max_bytes: usize,
+    closed: std::sync::atomic::AtomicBool,
+    items: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+}
+
+struct DecodeQueuePermit {
+    usage: Arc<DecodeQueueUsage>,
+    bytes: usize,
+}
+
+impl Drop for DecodeQueuePermit {
+    fn drop(&mut self) {
+        self.usage
+            .bytes
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |used| Some(used.saturating_sub(self.bytes)),
+            )
+            .ok();
+        self.usage
+            .items
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |items| Some(items.saturating_sub(1)),
+            )
+            .ok();
+    }
+}
+
+enum DecodeQueueReserveError {
+    Full,
+    ByteLimit,
+    Disconnected,
+}
+
+impl DecodeQueueUsage {
+    fn try_reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<DecodeQueuePermit, DecodeQueueReserveError> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(DecodeQueueReserveError::Disconnected);
+        }
+        self.items
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |items| (items < self.max_items).then_some(items + 1),
+            )
+            .map_err(|_| DecodeQueueReserveError::Full)?;
+
+        if self
+            .bytes
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |used| {
+                    used.checked_add(bytes)
+                        .filter(|total| *total <= self.max_bytes)
+                },
+            )
+            .is_err()
+        {
+            self.items
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |items| Some(items.saturating_sub(1)),
+                )
+                .ok();
+            return Err(DecodeQueueReserveError::ByteLimit);
+        }
+
+        let permit = DecodeQueuePermit {
+            usage: Arc::clone(self),
+            bytes,
+        };
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            drop(permit);
+            return Err(DecodeQueueReserveError::Disconnected);
+        }
+        Ok(permit)
+    }
+}
+
+struct DecodeQueueEntry<T> {
+    value: T,
+    _permit: DecodeQueuePermit,
+}
+
+impl<T> DecodeQueueEntry<T> {
+    fn into_value(self) -> T {
+        let Self { value, _permit } = self;
+        drop(_permit);
+        value
+    }
+}
+
+struct DecodeQueueSender<T> {
+    tx: std_mpsc::SyncSender<DecodeQueueEntry<T>>,
+    usage: Arc<DecodeQueueUsage>,
+}
+
+impl<T> Clone for DecodeQueueSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            usage: Arc::clone(&self.usage),
+        }
+    }
+}
+
+struct DecodeQueueReceiver<T> {
+    rx: std_mpsc::Receiver<DecodeQueueEntry<T>>,
+    usage: Arc<DecodeQueueUsage>,
+}
+
+impl<T> Drop for DecodeQueueReceiver<T> {
+    fn drop(&mut self) {
+        self.usage
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.usage
+            .items
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.usage
+            .bytes
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+enum DecodeQueueSendError<T> {
+    Full(T),
+    ByteLimit(T),
+    Disconnected(T),
+}
+
+impl<T> std::fmt::Debug for DecodeQueueSendError<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Full(_) => "Full(..)",
+            Self::ByteLimit(_) => "ByteLimit(..)",
+            Self::Disconnected(_) => "Disconnected(..)",
+        })
+    }
+}
+
+impl<T: DecodeQueuePayload> DecodeQueueSender<T> {
+    fn try_send(&self, value: T) -> Result<(), DecodeQueueSendError<T>> {
+        let permit = match self.usage.try_reserve(value.queued_bytes()) {
+            Ok(permit) => permit,
+            Err(DecodeQueueReserveError::Full) => {
+                return Err(DecodeQueueSendError::Full(value));
+            }
+            Err(DecodeQueueReserveError::ByteLimit) => {
+                return Err(DecodeQueueSendError::ByteLimit(value));
+            }
+            Err(DecodeQueueReserveError::Disconnected) => {
+                return Err(DecodeQueueSendError::Disconnected(value));
+            }
+        };
+        match self.tx.try_send(DecodeQueueEntry {
+            value,
+            _permit: permit,
+        }) {
+            Ok(()) => Ok(()),
+            Err(std_mpsc::TrySendError::Full(entry)) => {
+                Err(DecodeQueueSendError::Full(entry.into_value()))
+            }
+            Err(std_mpsc::TrySendError::Disconnected(entry)) => {
+                Err(DecodeQueueSendError::Disconnected(entry.into_value()))
+            }
+        }
+    }
+}
+
+impl<T> DecodeQueueReceiver<T> {
+    fn recv(&self) -> Result<T, std_mpsc::RecvError> {
+        self.rx.recv().map(DecodeQueueEntry::into_value)
+    }
+
+    fn try_recv(&self) -> Result<T, std_mpsc::TryRecvError> {
+        self.rx.try_recv().map(DecodeQueueEntry::into_value)
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(&self, timeout: Duration) -> Result<T, std_mpsc::RecvTimeoutError> {
+        self.rx
+            .recv_timeout(timeout)
+            .map(DecodeQueueEntry::into_value)
+    }
+}
+
+fn decode_queue<T>(
+    item_capacity: usize,
+    byte_capacity: usize,
+) -> (DecodeQueueSender<T>, DecodeQueueReceiver<T>) {
+    let (tx, rx) = std_mpsc::sync_channel(item_capacity);
+    let usage = Arc::new(DecodeQueueUsage {
+        max_items: item_capacity,
+        max_bytes: byte_capacity,
+        closed: std::sync::atomic::AtomicBool::new(false),
+        items: std::sync::atomic::AtomicUsize::new(0),
+        bytes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    (
+        DecodeQueueSender {
+            tx,
+            usage: Arc::clone(&usage),
+        },
+        DecodeQueueReceiver { rx, usage },
+    )
+}
+
+fn reject_decode_job(job: DecodeJob, code: ErrorCode, detail: &'static str) {
+    let error = EngineError::from_detail(code, detail);
+    match job {
+        DecodeJob::AudioBuffer { resp, .. } => {
+            let _ = resp.send(Err(error));
+        }
+        DecodeJob::InnerAudio { resp, .. } => {
+            let _ = resp.send(Err(error));
+        }
+    }
+}
+
+fn reject_decode_result(result: DecodeResult, code: ErrorCode, detail: &'static str) {
+    let error = EngineError::from_detail(code, detail);
+    match result {
+        DecodeResult::AudioBuffer { resp, .. } => {
+            let _ = resp.send(Err(error));
+        }
+        DecodeResult::InnerAudio { resp, .. } => {
+            let _ = resp.send(Err(error));
+        }
+    }
+}
+
+fn publish_decode_result(result_tx: &DecodeQueueSender<DecodeResult>, result: DecodeResult) {
+    match result_tx.try_send(result) {
+        Ok(()) => {}
+        Err(DecodeQueueSendError::Full(result)) => reject_decode_result(
+            result,
+            ErrorCode::InputSaturated,
+            DECODE_RESULT_QUEUE_FULL_DETAIL,
+        ),
+        Err(DecodeQueueSendError::ByteLimit(result)) => reject_decode_result(
+            result,
+            ErrorCode::InputSaturated,
+            DECODE_RESULT_BYTE_LIMIT_DETAIL,
+        ),
+        Err(DecodeQueueSendError::Disconnected(result)) => reject_decode_result(
+            result,
+            ErrorCode::Disconnected,
+            DECODE_QUEUE_DISCONNECTED_DETAIL,
+        ),
+    }
+}
 
 /// A fixed-size thread pool for audio decode + resample work.
 ///
@@ -110,7 +477,9 @@ const DECODE_POOL_SIZE: usize = 2;
 /// Completed results are sent back via `result_tx` and the audio thread is
 /// woken immediately via `wakeup.notify()`.
 struct DecodePool {
-    job_tx: std_mpsc::Sender<PoolMsg>,
+    job_tx: Option<DecodeQueueSender<DecodeJob>>,
+    #[cfg(test)]
+    in_flight: Arc<DecodeInFlightUsage>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -118,14 +487,14 @@ struct DecodePool {
 /// the first decode job arrives.
 struct LazyDecodePool {
     pool: Option<DecodePool>,
-    result_tx: std_mpsc::Sender<DecodeResult>,
+    result_tx: DecodeQueueSender<DecodeResult>,
     sample_rate: u32,
     wakeup: ThreadWakeup,
 }
 
 impl LazyDecodePool {
     fn new(
-        result_tx: std_mpsc::Sender<DecodeResult>,
+        result_tx: DecodeQueueSender<DecodeResult>,
         sample_rate: u32,
         wakeup: ThreadWakeup,
     ) -> Self {
@@ -158,26 +527,44 @@ impl LazyDecodePool {
 impl DecodePool {
     fn new(
         num_workers: usize,
-        result_tx: std_mpsc::Sender<DecodeResult>,
+        result_tx: DecodeQueueSender<DecodeResult>,
         sample_rate: u32,
         wakeup: shared::channel::ThreadWakeup,
     ) -> Self {
-        let (job_tx, job_rx) = std_mpsc::channel::<PoolMsg>();
+        Self::new_with_in_flight(
+            num_workers,
+            result_tx,
+            process_decode_in_flight_budget(),
+            sample_rate,
+            wakeup,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn new_with_in_flight(
+        num_workers: usize,
+        result_tx: DecodeQueueSender<DecodeResult>,
+        in_flight: Arc<DecodeInFlightUsage>,
+        sample_rate: u32,
+        wakeup: shared::channel::ThreadWakeup,
+    ) -> Self {
+        let (job_tx, job_rx) =
+            decode_queue::<DecodeJob>(DECODE_JOB_QUEUE_CAPACITY, MAX_DECODE_JOB_QUEUED_BYTES);
         // Workers share the receiver via Mutex (contention is minimal since
         // workers spend most time decoding, not waiting on the lock).
         let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
-
         let mut workers = Vec::with_capacity(num_workers);
         for i in 0..num_workers {
             let rx = job_rx.clone();
             let tx = result_tx.clone();
+            let in_flight = Arc::clone(&in_flight);
             let wake = wakeup.clone();
             let sr = sample_rate;
             let handle = thread::Builder::new()
                 .name(format!("audio-decode-{}", i))
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        decode_worker(rx, tx, sr, wake);
+                        decode_worker(rx, tx, in_flight, sr, wake);
                     }));
                     if let Err(panic_info) = result {
                         let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
@@ -194,21 +581,46 @@ impl DecodePool {
             workers.push(handle);
         }
 
-        Self { job_tx, workers }
+        Self {
+            job_tx: Some(job_tx),
+            #[cfg(test)]
+            in_flight,
+            workers,
+        }
     }
 
-    /// Submit a decode job.  Never blocks — the channel is unbounded.
+    /// Submit a decode job without ever blocking the audio thread.
     fn submit(&self, job: DecodeJob) {
-        let _ = self.job_tx.send(PoolMsg::Job(job));
+        let Some(job_tx) = &self.job_tx else {
+            reject_decode_job(
+                job,
+                ErrorCode::Disconnected,
+                DECODE_QUEUE_DISCONNECTED_DETAIL,
+            );
+            return;
+        };
+        match job_tx.try_send(job) {
+            Ok(()) => {}
+            Err(DecodeQueueSendError::Full(job)) => {
+                reject_decode_job(job, ErrorCode::InputSaturated, DECODE_JOB_QUEUE_FULL_DETAIL)
+            }
+            Err(DecodeQueueSendError::ByteLimit(job)) => {
+                reject_decode_job(job, ErrorCode::InputSaturated, DECODE_JOB_BYTE_LIMIT_DETAIL)
+            }
+            Err(DecodeQueueSendError::Disconnected(job)) => reject_decode_job(
+                job,
+                ErrorCode::Disconnected,
+                DECODE_QUEUE_DISCONNECTED_DETAIL,
+            ),
+        }
     }
 }
 
 impl Drop for DecodePool {
     fn drop(&mut self) {
-        // Signal all workers to exit.
-        for _ in &self.workers {
-            let _ = self.job_tx.send(PoolMsg::Shutdown);
-        }
+        // Closing the only sender lets every worker exit after already accepted
+        // jobs, without needing a shutdown message to compete for queue space.
+        drop(self.job_tx.take());
         // All workers share one deadline so audio-thread shutdown stays within
         // its own three-second join budget.
         join_all_with_timeout(
@@ -219,10 +631,34 @@ impl Drop for DecodePool {
     }
 }
 
+/// Keep malformed media from killing a persistent worker and orphaning every
+/// response queued behind it. Decoder panics are isolated to the current job;
+/// the worker publishes a normal internal error and continues draining.
+fn run_decode_with_panic_boundary(
+    decode: impl FnOnce() -> EngineResult<DecodedAudio>,
+) -> EngineResult<DecodedAudio> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode)) {
+        Ok(result) => result,
+        Err(panic_info) => {
+            let detail = panic_info
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown decoder panic");
+            tracing::error!("audio decoder panicked: {detail}");
+            Err(EngineError::from_detail(
+                ErrorCode::Internal,
+                "audio decoder failed internally",
+            ))
+        }
+    }
+}
+
 /// Worker loop: wait for jobs, decode, send result, wake audio thread.
 fn decode_worker(
-    job_rx: Arc<std::sync::Mutex<std_mpsc::Receiver<PoolMsg>>>,
-    result_tx: std_mpsc::Sender<DecodeResult>,
+    job_rx: Arc<std::sync::Mutex<DecodeQueueReceiver<DecodeJob>>>,
+    result_tx: DecodeQueueSender<DecodeResult>,
+    in_flight: Arc<DecodeInFlightUsage>,
     sample_rate: u32,
     wakeup: shared::channel::ThreadWakeup,
 ) {
@@ -238,28 +674,55 @@ fn decode_worker(
         };
 
         match msg {
-            Ok(PoolMsg::Job(job)) => {
+            Ok(job) => {
+                // A decode can transiently retain its 16 MiB encoded input and
+                // both an input and resampled 64 MiB PCM allocation. Claim a
+                // conservative 144 MiB before invoking it so all pools together
+                // cannot run more than two jobs inside the process-wide 288 MiB
+                // allowance (codec-internal scratch remains separately bounded
+                // by the input and decoded-sample limits).
+                let Some(_in_flight_permit) = in_flight.try_reserve() else {
+                    reject_decode_job(
+                        job,
+                        ErrorCode::InputSaturated,
+                        "audio decode in-flight memory budget exceeded",
+                    );
+                    wakeup.notify();
+                    continue;
+                };
                 match job {
                     DecodeJob::AudioBuffer { ctx_id, data, resp } => {
-                        let result = crate::decoder::decode(&data)
-                            .and_then(|d| crate::resampler::resample_if_needed(d, sample_rate));
-                        let _ = result_tx.send(DecodeResult::AudioBuffer {
-                            ctx_id,
-                            result,
-                            resp,
+                        let result = run_decode_with_panic_boundary(|| {
+                            crate::decoder::decode(&data).and_then(|decoded| {
+                                crate::resampler::resample_if_needed(decoded, sample_rate)
+                            })
                         });
+                        publish_decode_result(
+                            &result_tx,
+                            DecodeResult::AudioBuffer {
+                                ctx_id,
+                                result,
+                                resp,
+                            },
+                        );
                     }
                     DecodeJob::InnerAudio { id, data, resp } => {
-                        let result = crate::decoder::decode(&data)
-                            .and_then(|d| crate::resampler::resample_if_needed(d, sample_rate));
-                        let _ = result_tx.send(DecodeResult::InnerAudio { id, result, resp });
+                        let result = run_decode_with_panic_boundary(|| {
+                            crate::decoder::decode(&data).and_then(|decoded| {
+                                crate::resampler::resample_if_needed(decoded, sample_rate)
+                            })
+                        });
+                        publish_decode_result(
+                            &result_tx,
+                            DecodeResult::InnerAudio { id, result, resp },
+                        );
                     }
                 }
                 // Wake the audio thread so it processes the result immediately,
                 // rather than waiting for the next management-loop tick.
                 wakeup.notify();
             }
-            Ok(PoolMsg::Shutdown) | Err(_) => break,
+            Err(_) => break,
         }
     }
 }
@@ -309,6 +772,187 @@ impl NodeContextIndex {
 
     fn clear_context(&mut self, ctx_id: AudioContextId) {
         self.node_to_ctx.retain(|_, &mut v| v != ctx_id);
+    }
+
+    fn clear_all(&mut self) {
+        self.node_to_ctx.clear();
+    }
+}
+
+/// Insert a new context without ever replacing a live context that happens to
+/// have the same externally allocated id.
+fn create_context_scoped(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    ctx_id: AudioContextId,
+    sample_rate: u32,
+    channels: u32,
+) -> bool {
+    match contexts.entry(ctx_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(AudioContext::new(ctx_id, sample_rate, channels));
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(_) => false,
+    }
+}
+
+/// Shared context cleanup for explicit close and GC finalization. The index is
+/// cleared even when the context is already gone so repeated finalizer commands
+/// also purge any stale node ownership entries.
+fn release_context_scoped(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    node_index: &mut NodeContextIndex,
+    ctx_id: AudioContextId,
+) -> bool {
+    let found = if let Some(mut context) = contexts.remove(&ctx_id) {
+        context.close();
+        true
+    } else {
+        false
+    };
+    node_index.clear_context(ctx_id);
+    found
+}
+
+/// Restart barrier for WebAudio state. All work accepted before the barrier but
+/// not yet executed is dropped first, then every retained WebAudio context is
+/// closed and the ownership index is cleared. The acknowledgement is published
+/// last so a replacement isolate cannot race any of those old commands.
+fn handle_release_all_contexts(
+    startup_backlog: &mut std::vec::IntoIter<AudioCmd>,
+    rx: &AudioCommandReceiver,
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    node_index: &mut NodeContextIndex,
+) {
+    *startup_backlog = Vec::new().into_iter();
+    rx.discard_data_queue();
+    for (_, mut context) in contexts.drain() {
+        context.close();
+    }
+    node_index.clear_all();
+    rx.complete_release_all_contexts();
+}
+
+/// Remove only the claimed context's map reference. Missing contexts/buffers
+/// are deliberately a no-op so GC finalizers can issue duplicate releases.
+fn release_buffer_scoped(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    ctx_id: AudioContextId,
+    buffer_id: shared::protocol::audio_cmd::AudioBufferId,
+) {
+    if let Some(context) = contexts.get_mut(&ctx_id) {
+        context.remove_buffer(buffer_id);
+    }
+}
+
+/// Native ownership boundary for binding and clearing a source buffer.
+/// Node ids and buffer ids are context-local, so both are resolved only after
+/// the claimed owner matches the node index.
+fn set_buffer_scoped(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    node_index: &NodeContextIndex,
+    ctx_id: AudioContextId,
+    node_id: AudioNodeId,
+    buffer_id: Option<shared::protocol::audio_cmd::AudioBufferId>,
+) -> bool {
+    if node_index.get_context(node_id) != Some(ctx_id) {
+        return false;
+    }
+    contexts
+        .get_mut(&ctx_id)
+        .map(|context| context.set_buffer(node_id, buffer_id))
+        .unwrap_or(false)
+}
+
+fn set_started_buffer_scoped(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    node_index: &NodeContextIndex,
+    ctx_id: AudioContextId,
+    node_id: AudioNodeId,
+    buffer: Option<Arc<AudioSnapshot>>,
+) -> bool {
+    if node_index.get_context(node_id) != Some(ctx_id) {
+        return false;
+    }
+    contexts
+        .get_mut(&ctx_id)
+        .map(|context| context.set_started_buffer(node_id, buffer))
+        .unwrap_or(false)
+}
+
+fn start_buffer_scoped(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    node_index: &NodeContextIndex,
+    ctx_id: AudioContextId,
+    node_id: AudioNodeId,
+    buffer: Option<Arc<AudioSnapshot>>,
+    when: f64,
+    offset: f64,
+    duration: Option<f64>,
+) -> bool {
+    if node_index.get_context(node_id) != Some(ctx_id) {
+        return false;
+    }
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return false;
+    };
+    // Keep the replacement and start in one audio-thread operation, so the
+    // source can never render a block from the previous snapshot after this
+    // command has been accepted.
+    context.set_started_buffer(node_id, buffer)
+        && context.start_source(node_id, when, offset, duration)
+}
+
+/// Integrate one completed WebAudio decode only while its originating runtime
+/// still owns the response receiver. A closed receiver identifies stale work
+/// from a dropped/restarted runtime; its decoded PCM is dropped immediately,
+/// even if a newer context has since reused the same numeric id.
+fn integrate_audio_buffer_decode_result(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    ctx_id: AudioContextId,
+    result: EngineResult<DecodedAudio>,
+    resp: AudioResp<AudioBufferInfo>,
+) {
+    if resp.is_closed() {
+        return;
+    }
+
+    match result {
+        Ok(resampled) => {
+            let Some(context) = contexts.get_mut(&ctx_id) else {
+                let _ = resp.send(Err(EngineError::from_detail(
+                    ErrorCode::NotFound,
+                    format!("AudioContext {} closed during decode", ctx_id),
+                )));
+                return;
+            };
+            let duration = resampled.duration();
+            let sample_rate = resampled.sample_rate;
+            let channels = resampled.channels;
+            let length = resampled.frame_count() as u32;
+            match context.add_buffer(resampled) {
+                Ok(id) => {
+                    let response = AudioBufferInfo {
+                        id,
+                        duration,
+                        sample_rate,
+                        channels,
+                        length,
+                    };
+                    if resp.send(Ok(response)).is_err() {
+                        // The receiver closed between the liveness check and
+                        // send. No caller learned the id, so roll insertion back.
+                        context.remove_buffer(id);
+                    }
+                }
+                Err(error) => {
+                    let _ = resp.send(Err(error));
+                }
+            }
+        }
+        Err(error) => {
+            let _ = resp.send(Err(error));
+        }
     }
 }
 
@@ -500,7 +1144,7 @@ impl AudioThread {
     }
 
     pub fn shutdown(&mut self) {
-        let _ = self.tx.send(AudioCmd::Shutdown);
+        let _ = self.tx.try_send(AudioCmd::Shutdown);
         self.wakeup.notify();
         if let Some(h) = self.handle.take() {
             join_with_timeout(h, Duration::from_secs(3), "audio-thread");
@@ -510,7 +1154,7 @@ impl AudioThread {
 
 impl Drop for AudioThread {
     fn drop(&mut self) {
-        let _ = self.tx.send(AudioCmd::Shutdown);
+        let _ = self.tx.try_send(AudioCmd::Shutdown);
         self.wakeup.notify();
 
         // Never join from inside the audio thread itself
@@ -600,7 +1244,13 @@ fn next_command(
     startup_backlog: &mut std::vec::IntoIter<AudioCmd>,
     rx: &AudioCommandReceiver,
 ) -> Option<AudioCmd> {
-    startup_backlog.next().or_else(|| rx.try_recv().ok())
+    if startup_backlog.len() != 0 {
+        if let Ok(urgent) = rx.try_recv_urgent() {
+            return Some(urgent);
+        }
+        return startup_backlog.next();
+    }
+    rx.try_recv().ok()
 }
 
 /// Audio thread main loop — 3-level power management.
@@ -650,7 +1300,8 @@ fn run_audio_thread(
     let mut streaming_client = LazyStreamingClient::new(http_client_factory);
 
     // Channel for receiving decode+resample results from worker threads.
-    let (decode_tx, decode_rx) = std_mpsc::channel::<DecodeResult>();
+    let (decode_tx, decode_rx) =
+        decode_queue::<DecodeResult>(DECODE_RESULT_QUEUE_CAPACITY, MAX_DECODE_RESULT_QUEUED_BYTES);
 
     // The fixed-size pool starts only if a decode job arrives. Once started,
     // its two workers persist for the audio thread's lifetime.
@@ -717,14 +1368,26 @@ fn run_audio_thread(
                     sample_rate: req_rate,
                 } => {
                     let rate = req_rate.unwrap_or(sample_rate);
-                    contexts.insert(ctx_id, AudioContext::new(ctx_id, rate, channels));
+                    if !create_context_scoped(&mut contexts, ctx_id, rate, channels) {
+                        warn!("CreateContext ignored duplicate AudioContext id {ctx_id}");
+                    }
+                }
+
+                AudioCmd::ReleaseContext { ctx_id } => {
+                    release_context_scoped(&mut contexts, &mut node_index, ctx_id);
+                }
+
+                AudioCmd::ReleaseAllContexts => {
+                    handle_release_all_contexts(
+                        &mut startup_backlog,
+                        &rx,
+                        &mut contexts,
+                        &mut node_index,
+                    );
                 }
 
                 AudioCmd::CloseContext { ctx_id, resp } => {
-                    if let Some(mut ctx) = contexts.remove(&ctx_id) {
-                        ctx.close();
-                        // Clear all nodes belonging to this context from the index
-                        node_index.clear_context(ctx_id);
+                    if release_context_scoped(&mut contexts, &mut node_index, ctx_id) {
                         let _ = resp.send(Ok(()));
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -780,23 +1443,8 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::ReleaseBuffer { buffer_id, resp } => {
-                    // Find and remove buffer from any context
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        if ctx.remove_buffer(buffer_id) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if found {
-                        let _ = resp.send(Ok(()));
-                    } else {
-                        let _ = resp.send(Err(EngineError::from_detail(
-                            ErrorCode::NotFound,
-                            format!("AudioBuffer {} not found", buffer_id),
-                        )));
-                    }
+                AudioCmd::ReleaseBuffer { ctx_id, buffer_id } => {
+                    release_buffer_scoped(&mut contexts, ctx_id, buffer_id);
                 }
 
                 AudioCmd::CreateBufferSource { ctx_id, node_id } => {
@@ -810,24 +1458,54 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::SetBuffer {
+                    ctx_id,
                     node_id,
                     buffer_id,
-                    resp,
                 } => {
-                    // Use index for O(1) context lookup
-                    let found = node_index
-                        .get_context(node_id)
-                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
-                        .map(|ctx| ctx.set_buffer(node_id, buffer_id))
-                        .unwrap_or(false);
+                    if !set_buffer_scoped(&mut contexts, &node_index, ctx_id, node_id, buffer_id) {
+                        warn!(
+                            "SetBuffer rejected: context {ctx_id} does not own node {node_id} or buffer {buffer_id:?}"
+                        );
+                    }
+                }
 
-                    if found {
-                        let _ = resp.send(Ok(()));
-                    } else {
-                        let _ = resp.send(Err(EngineError::from_detail(
-                            ErrorCode::NotFound,
-                            "Node or buffer not found",
-                        )));
+                AudioCmd::SetStartedBuffer {
+                    ctx_id,
+                    node_id,
+                    buffer,
+                } => {
+                    if !set_started_buffer_scoped(
+                        &mut contexts,
+                        &node_index,
+                        ctx_id,
+                        node_id,
+                        buffer,
+                    ) {
+                        warn!(
+                            "SetStartedBuffer rejected: context {ctx_id} does not own node {node_id}"
+                        );
+                    }
+                }
+
+                AudioCmd::StartBuffer {
+                    ctx_id,
+                    node_id,
+                    buffer,
+                    when,
+                    offset,
+                    duration,
+                } => {
+                    if !start_buffer_scoped(
+                        &mut contexts,
+                        &node_index,
+                        ctx_id,
+                        node_id,
+                        buffer,
+                        when,
+                        offset,
+                        duration,
+                    ) {
+                        warn!("StartBuffer rejected: context {ctx_id} does not own node {node_id}");
                     }
                 }
 
@@ -1536,36 +2214,25 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::GetAllChannelData {
+                AudioCmd::TakeDecodedBufferData {
                     ctx_id,
                     buffer_id,
                     resp,
                 } => {
-                    if let Some(ctx) = contexts.get(&ctx_id) {
-                        let Some(ch_count) = ctx.buffer_channels(buffer_id) else {
-                            let _ = resp.send(Err(EngineError::from_detail(
-                                ErrorCode::NotFound,
-                                format!("Buffer {} not found in context {}", buffer_id, ctx_id),
-                            )));
-                            continue;
-                        };
-                        let mut channels = Vec::with_capacity(ch_count as usize);
-                        let mut ok = true;
-                        for ch in 0..ch_count {
-                            if let Some(data) = ctx.get_channel_data(buffer_id, ch) {
-                                channels.push(data);
-                            } else {
-                                ok = false;
-                                break;
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        match ctx.take_decoded_buffer_data(buffer_id) {
+                            Ok(Some(data)) => {
+                                let _ = resp.send(Ok(data));
                             }
-                        }
-                        if ok {
-                            let _ = resp.send(Ok(channels));
-                        } else {
-                            let _ = resp.send(Err(EngineError::from_detail(
-                                ErrorCode::NotFound,
-                                format!("Buffer {} channel data incomplete", buffer_id),
-                            )));
+                            Ok(None) => {
+                                let _ = resp.send(Err(EngineError::from_detail(
+                                    ErrorCode::NotFound,
+                                    format!("Buffer {} not found in context {}", buffer_id, ctx_id),
+                                )));
+                            }
+                            Err(error) => {
+                                let _ = resp.send(Err(error));
+                            }
                         }
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -1584,13 +2251,19 @@ fn run_audio_thread(
                     resp,
                 } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
-                        if ctx.copy_to_channel(buffer_id, &data, channel, start) {
-                            let _ = resp.send(Ok(()));
-                        } else {
-                            let _ = resp.send(Err(EngineError::from_detail(
-                                ErrorCode::NotFound,
-                                format!("Buffer {} channel {} not found", buffer_id, channel),
-                            )));
+                        match ctx.copy_to_channel(buffer_id, &data, channel, start) {
+                            Ok(true) => {
+                                let _ = resp.send(Ok(()));
+                            }
+                            Ok(false) => {
+                                let _ = resp.send(Err(EngineError::from_detail(
+                                    ErrorCode::NotFound,
+                                    format!("Buffer {} channel {} not found", buffer_id, channel),
+                                )));
+                            }
+                            Err(error) => {
+                                let _ = resp.send(Err(error));
+                            }
                         }
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -1817,33 +2490,7 @@ fn run_audio_thread(
                     result,
                     resp,
                 } => {
-                    match result {
-                        Ok(resampled) => {
-                            if let Some(ctx) = contexts.get_mut(&ctx_id) {
-                                let duration = resampled.duration();
-                                let sr = resampled.sample_rate;
-                                let ch = resampled.channels;
-                                let length = resampled.frame_count() as u32;
-                                let id = ctx.add_buffer(resampled);
-                                let _ = resp.send(Ok(AudioBufferInfo {
-                                    id,
-                                    duration,
-                                    sample_rate: sr,
-                                    channels: ch,
-                                    length,
-                                }));
-                            } else {
-                                // Context was closed while decode was in flight.
-                                let _ = resp.send(Err(EngineError::from_detail(
-                                    ErrorCode::NotFound,
-                                    format!("AudioContext {} closed during decode", ctx_id),
-                                )));
-                            }
-                        }
-                        Err(e) => {
-                            let _ = resp.send(Err(e));
-                        }
-                    }
+                    integrate_audio_buffer_decode_result(&mut contexts, ctx_id, result, resp);
                 }
                 DecodeResult::InnerAudio { id, result, resp } => {
                     match result {
@@ -2072,11 +2719,648 @@ mod tests {
     use super::*;
     use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
 
+    fn inner_decode_job(
+        id: InnerAudioId,
+    ) -> (
+        DecodeJob,
+        tokio::sync::oneshot::Receiver<EngineResult<InnerAudioInfo>>,
+    ) {
+        let (resp, rx) = tokio::sync::oneshot::channel();
+        (
+            DecodeJob::InnerAudio {
+                id,
+                data: vec![0],
+                resp,
+            },
+            rx,
+        )
+    }
+
+    fn audio_buffer_decode_job(
+        ctx_id: AudioContextId,
+        data: Arc<Vec<u8>>,
+    ) -> (
+        DecodeJob,
+        tokio::sync::oneshot::Receiver<EngineResult<AudioBufferInfo>>,
+    ) {
+        let (resp, rx) = tokio::sync::oneshot::channel();
+        (DecodeJob::AudioBuffer { ctx_id, data, resp }, rx)
+    }
+
+    fn failed_decode_result(id: InnerAudioId) -> DecodeResult {
+        let (resp, _rx) = tokio::sync::oneshot::channel();
+        DecodeResult::InnerAudio {
+            id,
+            result: Err(EngineError::new(ErrorCode::InvalidArgument)),
+            resp,
+        }
+    }
+
+    fn successful_decode_result(
+        id: InnerAudioId,
+        samples: Vec<f32>,
+    ) -> (
+        DecodeResult,
+        tokio::sync::oneshot::Receiver<EngineResult<InnerAudioInfo>>,
+    ) {
+        let (resp, response) = tokio::sync::oneshot::channel();
+        (
+            DecodeResult::InnerAudio {
+                id,
+                result: Ok(DecodedAudio {
+                    samples,
+                    sample_rate: 48_000,
+                    channels: 1,
+                }),
+                resp,
+            },
+            response,
+        )
+    }
+
+    fn small_in_flight_budget(
+        max_bytes: usize,
+        reservation_bytes: usize,
+    ) -> Arc<DecodeInFlightUsage> {
+        Arc::new(DecodeInFlightUsage::new(max_bytes, reservation_bytes))
+    }
+
+    #[test]
+    fn in_flight_budget_rejects_the_first_reservation_over_its_limit() {
+        let budget = small_in_flight_budget(2, 1);
+        let first = budget.try_reserve().expect("first reservation");
+        let second = budget.try_reserve().expect("exact limit reservation");
+        assert!(budget.try_reserve().is_none(), "limit + 1 must be rejected");
+        drop(first);
+        drop(second);
+        assert_eq!(budget.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn in_flight_budget_allows_only_the_configured_concurrent_workers() {
+        let budget = small_in_flight_budget(2, 1);
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..3 {
+            let budget = Arc::clone(&budget);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                let permit = budget.try_reserve();
+                barrier.wait();
+                permit.is_some()
+            }));
+        }
+        barrier.wait();
+        barrier.wait();
+        let admitted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap() as usize)
+            .sum::<usize>();
+        assert_eq!(admitted, 2, "the third concurrent worker must be refused");
+        assert_eq!(budget.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn in_flight_budget_is_returned_after_error_panic_and_drop() {
+        let budget = small_in_flight_budget(1, 1);
+        let error_result: Result<(), ()> = {
+            let _permit = budget.try_reserve().expect("error path reservation");
+            Err(())
+        };
+        assert!(error_result.is_err());
+        assert_eq!(budget.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let budget = Arc::clone(&budget);
+            move || {
+                let _permit = budget.try_reserve().expect("panic path reservation");
+                panic!("simulated decoder panic");
+            }
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(budget.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        let permit = budget.try_reserve().expect("drop path reservation");
+        drop(permit);
+        assert_eq!(budget.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn decoder_panic_is_converted_to_an_internal_error_instead_of_exiting_the_worker() {
+        let result = run_decode_with_panic_boundary(|| -> EngineResult<DecodedAudio> {
+            panic!("simulated malicious decoder panic")
+        });
+
+        let error = result.expect_err("decoder panic must become a normal result");
+        assert_eq!(error.code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn separately_constructed_decode_pools_share_the_process_in_flight_budget() {
+        let (result_tx, _result_rx) = decode_queue(1, MAX_DECODE_RESULT_QUEUED_BYTES);
+        let first = DecodePool::new(0, result_tx.clone(), 48_000, ThreadWakeup::new());
+        let second = DecodePool::new(0, result_tx, 48_000, ThreadWakeup::new());
+
+        assert!(
+            Arc::ptr_eq(&first.in_flight, &second.in_flight),
+            "all production decode pools must use one process-wide budget"
+        );
+    }
+
+    #[test]
+    fn shared_decode_budget_rejects_a_third_job_and_raii_releases_it_for_another_pool() {
+        let budget = small_in_flight_budget(2, 1);
+        let first_pool_budget = Arc::clone(&budget);
+        let second_pool_budget = Arc::clone(&budget);
+        let first = first_pool_budget.try_reserve().unwrap();
+        let second = second_pool_budget.try_reserve().unwrap();
+
+        assert!(
+            budget.try_reserve().is_none(),
+            "two pools together must share the limit"
+        );
+        drop(first);
+        assert!(
+            second_pool_budget.try_reserve().is_some(),
+            "dropping one pool's permit must return capacity to the other"
+        );
+        drop(second);
+        assert_eq!(budget.bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn decode_job_and_result_transports_are_bounded_and_nonblocking() {
+        let source = include_str!("audio_thread.rs");
+
+        assert!(
+            !source.contains(concat!("std_mpsc::", "channel::<PoolMsg>()")),
+            "decode jobs must not accumulate in an unbounded queue"
+        );
+        assert!(
+            !source.contains(concat!("std_mpsc::", "channel::<DecodeResult>()")),
+            "decode results must not accumulate in an unbounded queue"
+        );
+        assert!(
+            source.contains(concat!("job_tx.", "try_send"))
+                && source.contains(concat!("result_tx.", "try_send")),
+            "both producers must report Full without blocking the audio thread"
+        );
+    }
+
+    #[test]
+    fn every_decode_reserves_the_shared_in_flight_peak_budget_before_decoding() {
+        let source = include_str!("audio_thread.rs");
+        let worker = source
+            .find("fn decode_worker(")
+            .expect("decode worker implementation");
+        let worker_body = &source[worker..source.find("use crate::cache").unwrap()];
+        let reserve = worker_body.find("in_flight.try_reserve()");
+        let decode = worker_body.find("crate::decoder::decode");
+
+        assert!(
+            reserve.is_some(),
+            "worker must reserve the shared peak budget"
+        );
+        assert!(
+            reserve.unwrap() < decode.unwrap(),
+            "peak admission must happen before the decoder allocates"
+        );
+        assert!(
+            source.contains("process_decode_in_flight_budget()"),
+            "the pool must use the process-wide in-flight budget"
+        );
+    }
+
+    #[test]
+    fn a_full_decode_job_queue_replies_with_input_saturated() {
+        let (job_tx, _job_rx) = decode_queue(1, MAX_DECODE_JOB_QUEUED_BYTES);
+        job_tx
+            .try_send(inner_decode_job(1).0)
+            .expect("fixture fills the only job slot");
+        let pool = DecodePool {
+            job_tx: Some(job_tx),
+            in_flight: small_in_flight_budget(
+                MAX_DECODE_IN_FLIGHT_BYTES,
+                DECODE_IN_FLIGHT_RESERVATION_BYTES,
+            ),
+            workers: Vec::new(),
+        };
+        let (job, mut response) = inner_decode_job(2);
+
+        pool.submit(job);
+
+        let error = response
+            .try_recv()
+            .expect("full admission must resolve the response immediately")
+            .expect_err("the full queue must reject the decode");
+        assert_eq!(error.code, ErrorCode::InputSaturated);
+    }
+
+    #[test]
+    fn decode_job_queue_rejects_limit_plus_one_encoded_byte() {
+        const EXPECTED_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+        const CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+        let (job_tx, _job_rx) =
+            decode_queue(DECODE_JOB_QUEUE_CAPACITY, MAX_DECODE_JOB_QUEUED_BYTES);
+        let pool = DecodePool {
+            job_tx: Some(job_tx),
+            in_flight: small_in_flight_budget(
+                MAX_DECODE_IN_FLIGHT_BYTES,
+                DECODE_IN_FLIGHT_RESERVATION_BYTES,
+            ),
+            workers: Vec::new(),
+        };
+        let data = Arc::new(vec![0; CHUNK_BYTES]);
+        for ctx_id in 0..(EXPECTED_BYTE_LIMIT / CHUNK_BYTES) as u32 {
+            pool.submit(audio_buffer_decode_job(ctx_id, data.clone()).0);
+        }
+        let (job, mut response) = audio_buffer_decode_job(99, Arc::new(vec![0]));
+
+        pool.submit(job);
+
+        let error = response
+            .try_recv()
+            .expect("limit + 1 byte must be refused immediately")
+            .expect_err("the encoded byte backlog must be bounded");
+        assert_eq!(error.code, ErrorCode::InputSaturated);
+    }
+
+    #[test]
+    fn a_stopped_decode_job_receiver_replies_with_disconnected() {
+        let (job_tx, job_rx) = decode_queue(1, MAX_DECODE_JOB_QUEUED_BYTES);
+        drop(job_rx);
+        let pool = DecodePool {
+            job_tx: Some(job_tx),
+            in_flight: small_in_flight_budget(
+                MAX_DECODE_IN_FLIGHT_BYTES,
+                DECODE_IN_FLIGHT_RESERVATION_BYTES,
+            ),
+            workers: Vec::new(),
+        };
+        let (job, mut response) = inner_decode_job(3);
+
+        pool.submit(job);
+
+        let error = response
+            .try_recv()
+            .expect("disconnection must resolve the response immediately")
+            .expect_err("the stopped receiver must reject the decode");
+        assert_eq!(error.code, ErrorCode::Disconnected);
+    }
+
+    #[test]
+    fn a_full_decode_result_queue_replies_without_blocking_the_worker() {
+        let (result_tx, _result_rx) = decode_queue(1, MAX_DECODE_RESULT_QUEUED_BYTES);
+        result_tx
+            .try_send(failed_decode_result(10))
+            .expect("fixture fills the only result slot");
+        let (job_tx, job_rx) = decode_queue(1, MAX_DECODE_JOB_QUEUED_BYTES);
+        let (job, mut response) = inner_decode_job(11);
+        job_tx.try_send(job).unwrap();
+        drop(job_tx);
+
+        decode_worker(
+            Arc::new(std::sync::Mutex::new(job_rx)),
+            result_tx,
+            small_in_flight_budget(
+                MAX_DECODE_IN_FLIGHT_BYTES,
+                DECODE_IN_FLIGHT_RESERVATION_BYTES,
+            ),
+            48_000,
+            ThreadWakeup::new(),
+        );
+
+        let error = response
+            .try_recv()
+            .expect("full publication must resolve the response immediately")
+            .expect_err("the full result queue must reject the decode");
+        assert_eq!(error.code, ErrorCode::InputSaturated);
+    }
+
+    #[test]
+    fn a_stopped_decode_result_receiver_replies_with_disconnected() {
+        let (result_tx, result_rx) = decode_queue(1, MAX_DECODE_RESULT_QUEUED_BYTES);
+        drop(result_rx);
+        let (job_tx, job_rx) = decode_queue(1, MAX_DECODE_JOB_QUEUED_BYTES);
+        let (job, mut response) = inner_decode_job(12);
+        job_tx.try_send(job).unwrap();
+        drop(job_tx);
+
+        decode_worker(
+            Arc::new(std::sync::Mutex::new(job_rx)),
+            result_tx,
+            small_in_flight_budget(
+                MAX_DECODE_IN_FLIGHT_BYTES,
+                DECODE_IN_FLIGHT_RESERVATION_BYTES,
+            ),
+            48_000,
+            ThreadWakeup::new(),
+        );
+
+        let error = response
+            .try_recv()
+            .expect("disconnection must resolve the response immediately")
+            .expect_err("the stopped result receiver must reject the decode");
+        assert_eq!(error.code, ErrorCode::Disconnected);
+    }
+
+    #[test]
+    fn decode_result_queue_rejects_limit_plus_one_pcm_byte_and_releases_on_receive() {
+        let (result_tx, result_rx) = decode_queue(2, std::mem::size_of::<f32>());
+        let (at_limit, _first_response) = successful_decode_result(20, vec![0.0]);
+        publish_decode_result(&result_tx, at_limit);
+
+        let (over_limit, mut response) = successful_decode_result(21, vec![1.0]);
+        publish_decode_result(&result_tx, over_limit);
+
+        let error = response
+            .try_recv()
+            .expect("limit + 1 PCM payload must be refused immediately")
+            .expect_err("the result byte backlog must be bounded");
+        assert_eq!(error.code, ErrorCode::InputSaturated);
+        assert_eq!(
+            result_tx
+                .usage
+                .bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::mem::size_of::<f32>()
+        );
+
+        assert!(matches!(
+            result_rx.try_recv(),
+            Ok(DecodeResult::InnerAudio { id: 20, .. })
+        ));
+        assert_eq!(
+            result_tx
+                .usage
+                .bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn decode_receiver_exit_releases_queued_permits() {
+        let (job_tx, job_rx) = decode_queue(2, 8);
+        job_tx.try_send(inner_decode_job(30).0).unwrap();
+        assert_eq!(
+            job_tx
+                .usage
+                .bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        let stopped = thread::spawn(move || {
+            drop(job_rx);
+            panic!("simulated decode worker exit");
+        });
+        assert!(stopped.join().is_err());
+        assert_eq!(
+            job_tx
+                .usage
+                .items
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            job_tx
+                .usage
+                .bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
     fn create_context(ctx_id: u32) -> AudioCmd {
         AudioCmd::CreateContext {
             ctx_id,
             sample_rate: None,
         }
+    }
+
+    #[test]
+    fn release_buffer_is_idempotent_and_never_scans_other_contexts() {
+        let mut contexts = HashMap::new();
+        let mut first = AudioContext::new(1, 48_000, 2);
+        let mut second = AudioContext::new(2, 48_000, 2);
+        let first_id = first.create_empty_buffer(1, 1, 48_000).unwrap();
+        let second_id = second.create_empty_buffer(1, 1, 48_000).unwrap();
+        assert_eq!(first_id, second_id, "fixture requires colliding local ids");
+        contexts.insert(1, first);
+        contexts.insert(2, second);
+
+        release_buffer_scoped(&mut contexts, 1, first_id);
+        release_buffer_scoped(&mut contexts, 1, first_id);
+
+        assert!(contexts.get(&1).unwrap().get_buffer(first_id).is_none());
+        assert!(contexts.get(&2).unwrap().get_buffer(second_id).is_some());
+    }
+
+    #[test]
+    fn release_context_is_idempotent_and_clears_the_node_index() {
+        let mut contexts = HashMap::new();
+        let mut context = AudioContext::new(7, 48_000, 2);
+        context.create_buffer_source(70);
+        contexts.insert(7, context);
+        let mut node_index = NodeContextIndex::new();
+        node_index.register(70, 7);
+
+        assert!(release_context_scoped(&mut contexts, &mut node_index, 7));
+        assert!(!contexts.contains_key(&7));
+        assert_eq!(node_index.get_context(70), None);
+
+        node_index.register(71, 7);
+        assert!(!release_context_scoped(&mut contexts, &mut node_index, 7));
+        assert_eq!(node_index.get_context(71), None);
+    }
+
+    #[test]
+    fn release_all_barrier_discards_old_backlog_and_full_queue_before_ack() {
+        let (tx, rx) = shared::audio_channel::channel();
+        for ctx_id in 100..100 + shared::audio_channel::AUDIO_COMMAND_CAPACITY as u32 {
+            tx.try_send(create_context(ctx_id))
+                .expect("fixture fills the ordinary data queue");
+        }
+        let ticket = tx
+            .request_release_all_contexts()
+            .expect("cleanup bypasses the full data queue");
+
+        let (close_resp, mut close_rx) = tokio::sync::oneshot::channel();
+        let mut startup_backlog = vec![
+            create_context(1),
+            AudioCmd::CloseContext {
+                ctx_id: 1,
+                resp: close_resp,
+            },
+        ]
+        .into_iter();
+        let mut contexts = HashMap::new();
+        let mut first = AudioContext::new(1, 48_000, 2);
+        first.create_buffer_source(11);
+        contexts.insert(1, first);
+        contexts.insert(2, AudioContext::new(2, 48_000, 2));
+        let mut node_index = NodeContextIndex::new();
+        node_index.register(11, 1);
+        node_index.register(22, 2);
+
+        let barrier = next_command(&mut startup_backlog, &rx)
+            .expect("cleanup must interrupt old startup data");
+        assert!(matches!(barrier, AudioCmd::ReleaseAllContexts));
+        handle_release_all_contexts(&mut startup_backlog, &rx, &mut contexts, &mut node_index);
+
+        assert!(contexts.is_empty());
+        assert_eq!(node_index.get_context(11), None);
+        assert_eq!(node_index.get_context(22), None);
+        assert!(startup_backlog.next().is_none());
+        assert!(rx.is_empty(), "all old ordinary commands must be discarded");
+        assert!(matches!(
+            close_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(ticket.is_complete(), "ack is last");
+
+        while let Some(cmd) = next_command(&mut startup_backlog, &rx) {
+            if let AudioCmd::CreateContext {
+                ctx_id,
+                sample_rate,
+            } = cmd
+            {
+                create_context_scoped(&mut contexts, ctx_id, sample_rate.unwrap_or(48_000), 2);
+            }
+        }
+        assert!(
+            contexts.is_empty(),
+            "discarded pre-barrier creates must never rebuild contexts after ack"
+        );
+    }
+
+    #[test]
+    fn duplicate_create_context_is_a_no_op_that_preserves_the_original() {
+        let mut contexts = HashMap::new();
+
+        assert!(create_context_scoped(&mut contexts, 9, 44_100, 2));
+        assert!(!create_context_scoped(&mut contexts, 9, 48_000, 1));
+
+        let context = contexts.get(&9).unwrap();
+        assert_eq!(context.sample_rate(), 44_100);
+        assert_eq!(context.channels(), 2);
+    }
+
+    #[test]
+    fn abandoned_audio_buffer_decode_result_never_enters_same_numeric_context() {
+        let mut contexts = HashMap::new();
+        contexts.insert(12, AudioContext::new(12, 48_000, 2));
+        let (resp, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        let decoded = DecodedAudio {
+            samples: vec![0.25, -0.25],
+            sample_rate: 48_000,
+            channels: 2,
+        };
+
+        integrate_audio_buffer_decode_result(&mut contexts, 12, Ok(decoded), resp);
+
+        assert_eq!(contexts.get(&12).unwrap().buffer_channels(1), None);
+    }
+
+    #[test]
+    fn live_audio_buffer_decode_result_is_inserted_and_replied() {
+        let mut contexts = HashMap::new();
+        contexts.insert(13, AudioContext::new(13, 48_000, 2));
+        let (resp, mut receiver) = tokio::sync::oneshot::channel();
+        let decoded = DecodedAudio {
+            samples: vec![0.25, -0.25],
+            sample_rate: 48_000,
+            channels: 2,
+        };
+
+        integrate_audio_buffer_decode_result(&mut contexts, 13, Ok(decoded), resp);
+
+        let info = receiver
+            .try_recv()
+            .expect("live receiver gets completion")
+            .expect("decode insertion succeeds");
+        assert_eq!(info.id, 1);
+        assert_eq!(contexts.get(&13).unwrap().buffer_channels(info.id), Some(2));
+    }
+
+    #[test]
+    fn set_buffer_rejects_claimed_context_that_does_not_own_node() {
+        let mut contexts = HashMap::new();
+        let mut first = AudioContext::new(1, 48_000, 2);
+        let mut second = AudioContext::new(2, 48_000, 2);
+        first.create_buffer_source(10);
+        let first_buffer = first.create_empty_buffer(1, 1, 48_000).unwrap();
+        let second_buffer = second.create_empty_buffer(1, 1, 48_000).unwrap();
+        assert_eq!(
+            first_buffer, second_buffer,
+            "fixture requires colliding local ids"
+        );
+        contexts.insert(1, first);
+        contexts.insert(2, second);
+        let mut node_index = NodeContextIndex::new();
+        node_index.register(10, 1);
+
+        assert!(!set_buffer_scoped(
+            &mut contexts,
+            &node_index,
+            2,
+            10,
+            Some(second_buffer),
+        ));
+        assert!(set_buffer_scoped(
+            &mut contexts,
+            &node_index,
+            1,
+            10,
+            Some(first_buffer),
+        ));
+        assert!(set_buffer_scoped(&mut contexts, &node_index, 1, 10, None,));
+    }
+
+    #[test]
+    fn snapshot_buffer_commands_validate_context_and_node_ownership() {
+        let mut contexts = HashMap::new();
+        let mut first = AudioContext::new(1, 48_000, 2);
+        first.create_buffer_source(10);
+        contexts.insert(1, first);
+        let mut node_index = NodeContextIndex::new();
+        node_index.register(10, 1);
+
+        assert!(!set_started_buffer_scoped(
+            &mut contexts,
+            &node_index,
+            2,
+            10,
+            None,
+        ));
+        assert!(set_started_buffer_scoped(
+            &mut contexts,
+            &node_index,
+            1,
+            10,
+            None,
+        ));
+
+        let mut contexts = HashMap::new();
+        let mut context = AudioContext::new(3, 48_000, 2);
+        context.create_buffer_source(30);
+        contexts.insert(3, context);
+        let mut node_index = NodeContextIndex::new();
+        node_index.register(30, 3);
+        assert!(start_buffer_scoped(
+            &mut contexts,
+            &node_index,
+            3,
+            30,
+            None,
+            0.0,
+            0.0,
+            None,
+        ));
     }
 
     fn context_id(cmd: &AudioCmd) -> u32 {
@@ -2134,7 +3418,8 @@ mod tests {
 
     #[test]
     fn decode_pool_starts_only_when_first_job_is_submitted() {
-        let (result_tx, result_rx) = std_mpsc::channel();
+        let (result_tx, result_rx) =
+            decode_queue(DECODE_RESULT_QUEUE_CAPACITY, MAX_DECODE_RESULT_QUEUED_BYTES);
         let mut pool = LazyDecodePool::new(result_tx, 48_000, ThreadWakeup::new());
 
         assert!(!pool.is_started());

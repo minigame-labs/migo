@@ -1830,7 +1830,7 @@ impl RenderThread {
                 let frame_demand: Receiver<()> =
                     frame_demand_rx.unwrap_or_else(crossbeam_channel::never);
 
-                let mut fps: u32 = 60;
+                let mut fps: u32 = shared::frame_rate::DEFAULT_FPS;
                 let mut frame_clock = SoftwareFrameClock::new(fps);
                 let mut frame_scheduler = FrameScheduler::new(fps);
 
@@ -1931,15 +1931,18 @@ impl RenderThread {
                         }
 
                         RenderCommand::FrameRate(new_fps) => {
-                            let new_fps = new_fps.clamp(1, 120);
-                            if has_vsync {
-                                frame_scheduler.set_preferred_fps(new_fps);
-                                info!("RenderThread target fps changed to {} (scheduler)", new_fps);
-                            } else if new_fps != *fps {
+                            let new_fps = shared::frame_rate::clamp_fps(new_fps);
+                            if new_fps != *fps {
                                 *fps = new_fps;
-                                frame_clock.set_fps(new_fps);
-                                info!("RenderThread fps changed to {}", fps);
+                                info!("RenderThread target fps changed to {}", new_fps);
                             }
+                            // Both clocks and the display are told
+                            // unconditionally: only one clock is live per
+                            // platform, and which one that is must not decide
+                            // whether the other is left holding a stale rate.
+                            frame_scheduler.set_preferred_fps(new_fps);
+                            frame_clock.set_fps(new_fps);
+                            cm.set_frame_rate_request(new_fps);
                         }
 
                         RenderCommand::Canvas(canvas_cmd) => match canvas_cmd {

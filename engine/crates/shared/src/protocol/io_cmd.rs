@@ -22,9 +22,9 @@ pub enum OpenFlag {
     AppendSyncCreate,
     /// 'as+' – read+append (sync I/O hint)
     ReadAppendSyncCreate,
-    /// 'wx' – write+truncate, fail if path already exists
+    /// Write-exclusive mode – write+truncate, fail if path already exists
     WriteExclusive,
-    /// 'wx+' – read+write+truncate, fail if path already exists
+    /// Read/write-exclusive mode – read+write+truncate, fail if path already exists
     ReadWriteExclusive,
 }
 

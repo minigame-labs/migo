@@ -654,6 +654,7 @@ impl ImageCache {
     /// every live game may be depending on, which is why the game-visible
     /// `ImageCache.clear()` routes through [`Self::clear_for_session`] instead.
     /// Retained at crate visibility for the cache's own tests.
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         // Fast path: no pins → full clear as before. Reservations are counts for
         // keys that are *not* resident, so they never keep an entry here.
@@ -1566,7 +1567,6 @@ mod tests {
     /// map keyed beside the entry needs an owned key to record the pin and drops it
     /// again when the count reaches zero, so the allocation and the free are one
     /// round trip rather than growth.
-    #[test]
     /// Section 7.3's steady-state *growth* requirement, on the reservation table.
     ///
     /// This is the pin path's other half. The resident case above must not reach the

@@ -120,6 +120,32 @@ const _COMPOSITE_OPS = [
 // Gradient object returned by createLinearGradient / createRadialGradient.
 // Collects color stops and sends them to the render thread when assigned
 // to fillStyle.
+const MAX_CANVAS_SURFACE_PIXELS = 8192 * 8192;
+const MAX_SYNC_CANVAS_RGBA_BYTES = 64 * 1024 * 1024;
+const MAX_DRAW_IMAGE_BATCH_ENTRIES = 65_536;
+
+function checkedImageDataDimensions(width, height) {
+    // These parameters are WebIDL `long`s. Bitwise conversion implements the
+    // required signed 32-bit conversion, including NaN/Infinity -> 0.
+    width |= 0;
+    height |= 0;
+    if (width === 0 || height === 0) {
+        throw new DOMException(
+            "ImageData width and height must be non-zero",
+            "IndexSizeError",
+        );
+    }
+    width = Math.abs(width);
+    height = Math.abs(height);
+    const pixels = width * height;
+    const bytes = pixels * 4;
+    if (!Number.isSafeInteger(pixels) || pixels > MAX_CANVAS_SURFACE_PIXELS
+            || !Number.isSafeInteger(bytes) || bytes > MAX_SYNC_CANVAS_RGBA_BYTES) {
+        throw new RangeError("Canvas ImageData dimensions exceed the implementation limit");
+    }
+    return { width, height, bytes };
+}
+
 class CanvasGradient {
     constructor(type, canvasId, x0, y0, r0, x1, y1, r1) {
         this._type = type;
@@ -1011,6 +1037,9 @@ class CanvasRenderingContext2D {
 
     drawImageBatch(draws) {
         if (!Array.isArray(draws) || draws.length === 0) return;
+        if (draws.length > MAX_DRAW_IMAGE_BATCH_ENTRIES) {
+            throw new RangeError("drawImageBatch exceeds the implementation limit");
+        }
 
         this._frameBegin();
 
@@ -1053,11 +1082,21 @@ class CanvasRenderingContext2D {
         // legacy CPU path so a pathological scene (thousands of
         // distinct text sprites in one frame) stays correct rather
         // than silently dropping snapshots.  Counter resets on
-        // frame-end (see `__migo_frame_end_hooks` registration).
-        const x = sx | 0;
-        const y = sy | 0;
-        const w = Math.max(0, sw | 0);
-        const h = Math.max(0, sh | 0);
+        // frame-end (see the module-private frame-end hook registry below).
+        let x = sx | 0;
+        let y = sy | 0;
+        const rawWidth = sw | 0;
+        const rawHeight = sh | 0;
+        const dimensions = checkedImageDataDimensions(rawWidth, rawHeight);
+        const w = dimensions.width;
+        const h = dimensions.height;
+        // Negative source dimensions grow the rectangle in the opposite
+        // direction; the returned pixels themselves are never flipped.
+        if (rawWidth < 0) x += rawWidth;
+        if (rawHeight < 0) y += rawHeight;
+        const snapshotInBounds = x >= 0 && y >= 0
+            && x + w <= this._canvas.width
+            && y + h <= this._canvas.height;
         flushGlCommandStream();
 
         // Text texture cache: only a full-canvas read participates
@@ -1075,7 +1114,7 @@ class CanvasRenderingContext2D {
                 this._tcKey = null;
                 return _migoMakeTextCacheImageData(this, k, w, h);
             }
-            if (fullCanvas && this._tcState === 1
+            if (fullCanvas && snapshotInBounds && this._tcState === 1
                     && w > 0 && h > 0
                     && _migoSnapshotFrameCount < MAX_LIVE_CANVAS2D_SNAPSHOTS_JS) {
                 // MISS: capture + record.  for_cache op tags the
@@ -1099,7 +1138,7 @@ class CanvasRenderingContext2D {
             this._abandonPendingTextCache();
         }
 
-        if (w > 0 && h > 0
+        if (snapshotInBounds && w > 0 && h > 0
                 && _migoSnapshotFrameCount < MAX_LIVE_CANVAS2D_SNAPSHOTS_JS) {
             const snapshotId = _migoNextSnapshotId();
             op_capture_canvas2d_snapshot(this._canvasId, x, y, w, h, snapshotId);
@@ -1113,7 +1152,12 @@ class CanvasRenderingContext2D {
     }
 
     createImageData(sw, sh) {
-        return { width: sw, height: sh, data: new Uint8ClampedArray(sw * sh * 4) };
+        const dimensions = checkedImageDataDimensions(sw, sh);
+        return {
+            width: dimensions.width,
+            height: dimensions.height,
+            data: new Uint8ClampedArray(dimensions.bytes),
+        };
     }
 
     putImageData(imageData, dx, dy) {
@@ -1334,61 +1378,16 @@ function _migoMakeTextCacheImageData(ctx, k, w, h) {
     return imageData;
 }
 
-// `migo._force_readback(imageData)` -- opt-in escape hatch for the
-// rare game that genuinely needs to inspect the bytes of a synthetic
-// snapshot ImageData.  Issues a synchronous render-thread readback
-// of the snapshot texture, fills `imageData.data` in place, and
-// returns it.  No-op (returns the same object) when the input is a
-// regular ImageData (no `__migo_snapshot_id__`) or the snapshot has
-// already been drained.
-function _migoForceReadback(imageData) {
-    if (!imageData || typeof imageData !== 'object') return imageData;
-    if ((imageData.__migo_snapshot_id__ | 0) === 0) return imageData;
-    // Reading `.data` triggers the lazy getter installed by
-    // _migoMakeSnapshotImageData, which fires the readback, fills the
-    // buffer in place, and clears `__migo_snapshot_id__`.
-    void imageData.data;
-    return imageData;
-}
-if (!globalThis._force_readback) {
-    Object.defineProperty(globalThis, '_force_readback', {
-        value: _migoForceReadback,
-        enumerable: false,
-        writable: true,
-        configurable: true,
-    });
-}
-
 // Frame-end callback registry. The unified frame-end op builds a single
 // interleaved FramePacket from both Canvas2D and GL segments, with
 // Materialize barriers at 2D->GL transitions.
-if (!globalThis.__migo_frame_end_hooks) {
-    // Non-enumerable, like `_perf` in 99_main.js and `_force_readback`: these
-    // are engine internals the host bridge reaches by name, not published API,
-    // so content walking `Object.keys(globalThis)` or `for...in` should not
-    // find them. They stay writable and configurable -- the array is pushed
-    // into below, and 03_raf.js assigns its own hook the same way -- so this
-    // changes what content *enumerates*, not what it could reach if it looked
-    // them up directly by name.
-    Object.defineProperty(globalThis, "__migo_frame_end_hooks", {
-        value: [],
-        enumerable: false,
-        writable: true,
-        configurable: true,
-    });
-    Object.defineProperty(globalThis, "__migo_frame_end_all", {
-        value: () => {
-            const hooks = globalThis.__migo_frame_end_hooks;
-            for (let i = 0; i < hooks.length; i++) {
-                hooks[i]();
-            }
-        },
-        enumerable: false,
-        writable: true,
-        configurable: true,
-    });
+const frameEndHooks = [];
+function frameEndAll() {
+    for (let i = 0; i < frameEndHooks.length; i++) {
+        frameEndHooks[i]();
+    }
 }
-globalThis.__migo_frame_end_hooks.push(() => {
+frameEndHooks.push(() => {
     // Flush any pending GL stream BEFORE building the frame packet so that
     // GL commands encoded in the JS buffer arrive at the render thread in the
     // same FramePacket as the Canvas2D work (design S8 ordering invariant).
@@ -1401,8 +1400,14 @@ globalThis.__migo_frame_end_hooks.push(() => {
 // before we clear the count).  The render-thread pool drains in
 // the same present_and_raf step, so the next frame starts clean
 // on both sides.
-globalThis.__migo_frame_end_hooks.push(() => {
+frameEndHooks.push(() => {
     _migoSnapshotFrameCount = 0;
 });
 
-export { CanvasRenderingContext2D, CanvasGradient };
+// The native test/host side may need to terminate a synthetic frame without
+// evaluating source that names an internal. `99_main.js` moves every
+// `_internal*` hook onto the private, handle-retained host bridge before any
+// game script can run.
+globalThis._internalFrameEnd = frameEndAll;
+
+export { CanvasRenderingContext2D, CanvasGradient, frameEndAll };

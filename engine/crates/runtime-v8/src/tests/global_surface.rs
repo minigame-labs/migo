@@ -105,11 +105,23 @@ mod global_surface_tests {
     /// `scripts/dump-api-surface.sh`, which runs the real player.
     ///
     /// To change the surface on purpose:
-    ///   MIGO_UPDATE_SURFACE_BASELINE=1 cargo test -p migo-runtime-v8 --lib published_surface
-    /// and commit the regenerated baseline with the change.
+    ///   MIGO_UPDATE_SURFACE_BASELINE=1 cargo test -p migo-runtime-v8 --lib \
+    ///     --no-default-features --features profile-full published_surface
+    ///   MIGO_UPDATE_SURFACE_BASELINE=1 cargo test -p migo-runtime-v8 --lib \
+    ///     --no-default-features --features profile-slim published_surface
+    /// and commit both profile-specific baselines with the change.
     #[test]
     fn published_surface_matches_the_committed_baseline() {
-        const BASELINE: &str = include_str!("published_surface_v0.txt");
+        #[cfg(feature = "profile-full")]
+        let (baseline, baseline_name) = (
+            include_str!("published_surface_full_v0.txt"),
+            "published_surface_full_v0.txt",
+        );
+        #[cfg(feature = "profile-slim")]
+        let (baseline, baseline_name) = (
+            include_str!("published_surface_slim_v0.txt"),
+            "published_surface_slim_v0.txt",
+        );
 
         let mut rt = boot_runtime();
         let src = "JSON.stringify({g:Object.getOwnPropertyNames(globalThis).sort(), \
@@ -143,23 +155,19 @@ mod global_surface_tests {
         actual.extend(names("m"));
 
         if std::env::var("MIGO_UPDATE_SURFACE_BASELINE").is_ok() {
-            let header: Vec<&str> = BASELINE
+            let header: Vec<&str> = baseline
                 .lines()
                 .take_while(|l| l.starts_with('#'))
                 .collect();
             let body = format!("{}\n{}\n", header.join("\n"), actual.join("\n"));
-            std::fs::write(
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/src/tests/published_surface_v0.txt"
-                ),
-                body,
-            )
-            .expect("rewrite baseline");
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/tests")
+                .join(baseline_name);
+            std::fs::write(path, body).expect("rewrite profile-specific baseline");
             return;
         }
 
-        let expected: Vec<&str> = BASELINE
+        let expected: Vec<&str> = baseline
             .lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())
             .collect();
@@ -174,7 +182,7 @@ mod global_surface_tests {
                 .filter(|n| !actual_ref.contains(n))
                 .collect();
             panic!(
-                "published JS surface changed.\n  added:   {added:?}\n  removed: {removed:?}\n\
+                "published JS surface changed for {baseline_name}.\n  added:   {added:?}\n  removed: {removed:?}\n\
                  If this is intended, regenerate with \
                  MIGO_UPDATE_SURFACE_BASELINE=1 and commit the diff."
             );
@@ -191,6 +199,8 @@ mod global_surface_tests {
             &mut rt,
             "const keys = Object.getOwnPropertyNames(globalThis); \
              const bad = keys.filter(k => k === 'Deno' || k === '__bootstrap' \
+                 || k === '_perf' || k === '_force_readback' \
+                 || k === '__migo_frame_end_hooks' || k === '__migo_frame_end_all' \
                  || k.startsWith('_internal')); \
              let __ok = bad.length === 0; \
              let __msg = 'leaked global keys: ' + JSON.stringify(bad)",

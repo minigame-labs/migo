@@ -1,9 +1,29 @@
 import unittest
 
-from scripts.ci.compare_render_results import compare_result, compare_results
+from scripts.ci.compare_render_results import (
+    compare_result,
+    compare_results,
+    validate_result_bindings,
+)
 
 
 class CompareRenderResultsTest(unittest.TestCase):
+    def test_render_rows_must_match_release_binding(self):
+        rows = [{
+            "_source_revision": "a" * 40,
+            "_artifact_sha256": "b" * 64,
+            "_profile": "full",
+        }]
+        with self.assertRaisesRegex(ValueError, "_artifact_sha256"):
+            validate_result_bindings(
+                rows,
+                {
+                    "_source_revision": "a" * 40,
+                    "_artifact_sha256": "c" * 64,
+                    "_profile": "full",
+                },
+            )
+
     def test_compare_result_flags_regression(self):
         baseline = {"avg_fps": 58.0, "p95_ms": 22.0}
         current = {"avg_fps": 52.0, "p95_ms": 30.0}

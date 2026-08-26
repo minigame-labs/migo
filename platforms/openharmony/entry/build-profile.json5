@@ -21,7 +21,16 @@
   },
   "buildOptionSet": [
     {
+      "name": "debug",
+      "externalNativeOptions": {
+        "arguments": "-DMIGO_OHOS_ALLOW_UNSIGNED_CONTENT=1"
+      }
+    },
+    {
       "name": "release",
+      "externalNativeOptions": {
+        "arguments": ""
+      },
       "arkOptions": {
         "obfuscation": {
           "ruleOptions": {

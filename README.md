@@ -7,12 +7,10 @@
 
 **A WebView replacement built for games.** Embed Migo in your app to run HTML5 and mini-game content natively — no browser, no DOM, no CSS, no compositor. Faster startup, lower memory, and a runtime version you pin yourself instead of one that drifts across OEMs and OS updates.
 
-`migo.*` is the one native capability surface this engine ever installs — nothing else, at any scale. This repository stays that: a pure runtime, no adapter code mixed in. Everything else existing content expects is an independent, composable adapter, published as its own package:
+`migo.*` is the one native capability surface this engine ever installs — nothing else, at any scale. This repository stays that: a pure runtime, no adapter code mixed in. Everything else existing content expects belongs in an independent, composable adapter published as its own package:
 
 - **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** — a browser-style BOM/DOM surface (`window`, `document`, `Image`, `XMLHttpRequest`, ...) for engines built assuming a browser environment (Cocos, Egret, Laya, Pixi, raw Canvas/WebGL).
-- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** — publishes `globalThis.wx`, aliased to `migo.*`, for content written against a mainstream mini-game-shaped global (unmodified mini-game source, or a similarly-shaped platform).
-
-The two touch disjoint globals and compose freely — pick zero, one, or both, matched to what your content actually needs. A future platform (a quick-game-alliance member, etc.) is the same recipe again: a new adapter package, no engine changes.
+Adapters install only their documented globals and compose freely — pick only what your content actually needs. A future platform (a quick-game-alliance member, etc.) follows the same recipe: a new adapter package, no engine changes.
 
 **Wondering whether your own catalogue runs?** Don't take our word for it and don't send us anything — [PRESCREEN.md](PRESCREEN.md) is the tool we would run, for you to run yourself. It reports which APIs a bundle needs against what this build actually publishes, and whether it paints on a real device. Your content never leaves your machine.
 
@@ -148,7 +146,6 @@ migo/
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | Host integration examples, one directory per platform |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Reproducible Migo-vs-WebView benchmarks |
 | [migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter) | Browser-style BOM/DOM compat adapter |
-| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | mainstream mini-game-shaped compat adapter |
 
 ## License
 

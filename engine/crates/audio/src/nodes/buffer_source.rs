@@ -1,9 +1,10 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use shared::audio_resources::{AudioBufferFormat, AudioSnapshot};
 use shared::protocol::audio_cmd::AudioNodeId;
 
-use crate::decoder::DecodedAudio;
+use crate::limits::RetainedAudio;
 use crate::param::AudioParamTimeline;
 
 use super::{AudioNodeProcessor, AudioNodeType};
@@ -21,9 +22,49 @@ pub enum BufferSourceState {
     Finished,
 }
 
+/// A source may still be backed by the legacy decoded-buffer registry, or by
+/// the JS-owned snapshot path. Both variants retain the original Arc and
+/// expose the same interleaved sample view; no PCM copy is made on binding.
+enum SourceBuffer {
+    Legacy(Arc<RetainedAudio>),
+    Snapshot(Arc<AudioSnapshot>),
+}
+
+impl Clone for SourceBuffer {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Legacy(buffer) => Self::Legacy(Arc::clone(buffer)),
+            Self::Snapshot(buffer) => Self::Snapshot(Arc::clone(buffer)),
+        }
+    }
+}
+
+impl SourceBuffer {
+    #[inline]
+    fn format(&self) -> AudioBufferFormat {
+        match self {
+            Self::Legacy(buffer) => AudioBufferFormat {
+                channels: buffer.channels,
+                frames: buffer.frame_count() as u32,
+                sample_rate: buffer.sample_rate,
+            },
+            Self::Snapshot(buffer) => buffer.format(),
+        }
+    }
+
+    #[inline]
+    fn samples(&self) -> &[f32] {
+        match self {
+            Self::Legacy(buffer) => &buffer.samples,
+            Self::Snapshot(buffer) => buffer.samples(),
+        }
+    }
+}
+
 pub struct BufferSourceNode {
     id: AudioNodeId,
-    buffer: Option<Arc<DecodedAudio>>,
+    buffer: Option<SourceBuffer>,
+    context_sample_rate: f64,
     state: BufferSourceState,
 
     // Playback position (in sample frames)
@@ -53,10 +94,11 @@ pub struct BufferSourceNode {
 }
 
 impl BufferSourceNode {
-    pub fn new(id: AudioNodeId) -> Self {
+    pub fn new(id: AudioNodeId, context_sample_rate: u32) -> Self {
         Self {
             id,
             buffer: None,
+            context_sample_rate: context_sample_rate.max(1) as f64,
             state: BufferSourceState::Pending,
             position: 0.0,
             start_when: 0.0,
@@ -72,8 +114,12 @@ impl BufferSourceNode {
         }
     }
 
-    pub fn set_buffer(&mut self, buffer: Arc<DecodedAudio>) {
-        self.buffer = Some(buffer);
+    pub fn set_buffer(&mut self, buffer: Option<Arc<RetainedAudio>>) {
+        self.buffer = buffer.map(SourceBuffer::Legacy);
+    }
+
+    pub fn set_snapshot(&mut self, buffer: Option<Arc<AudioSnapshot>>) {
+        self.buffer = buffer.map(SourceBuffer::Snapshot);
     }
 
     pub fn start(&mut self, when: f64, offset: f64, duration: Option<f64>, current_time: f64) {
@@ -141,6 +187,18 @@ impl BufferSourceNode {
         self.playback_rate.set_value(rate.max(0.0));
     }
 
+    /// Compute the source-frame increment once per render block. Web Audio's
+    /// intrinsic rate is playbackRate × detune pitch ratio, then converted
+    /// from buffer frames to context frames for buffers at another rate.
+    #[inline]
+    fn block_playback_rate(&self, current_time: f64, buffer_sample_rate: f64) -> f64 {
+        let playback_rate = self.playback_rate.compute_value(current_time).max(0.0) as f64;
+        let detune = self.detune.compute_value(current_time) as f64;
+        playback_rate
+            * (2.0f64).powf(detune / 1200.0)
+            * (buffer_sample_rate / self.context_sample_rate)
+    }
+
     #[allow(dead_code)]
     pub fn state(&self) -> BufferSourceState {
         self.state
@@ -162,12 +220,13 @@ impl BufferSourceNode {
             None => return 0,
         };
 
-        let src_channels = buffer.channels as usize;
+        let format = buffer.format();
+        let src_channels = format.channels as usize;
         let dst_channels = output_channels as usize;
-        let buffer_frames = buffer.frame_count();
+        let buffer_frames = format.frames as usize;
         let output_frames = output.len() / dst_channels.max(1);
-        let samples = &buffer.samples;
-        let sample_rate = buffer.sample_rate as f64;
+        let samples = buffer.samples();
+        let sample_rate = format.sample_rate as f64;
 
         // Dispatch to optimized path based on channel configuration
         match (src_channels, dst_channels) {
@@ -212,7 +271,7 @@ impl BufferSourceNode {
         current_time: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate.compute_value(current_time).max(0.0) as f64;
+        let playback_rate = self.block_playback_rate(current_time, sample_rate);
 
         for frame_idx in 0..output_frames {
             let mut src_frame = self.position as usize;
@@ -269,7 +328,7 @@ impl BufferSourceNode {
         current_time: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate.compute_value(current_time).max(0.0) as f64;
+        let playback_rate = self.block_playback_rate(current_time, sample_rate);
 
         for frame_idx in 0..output_frames {
             let mut src_frame = self.position as usize;
@@ -327,7 +386,7 @@ impl BufferSourceNode {
         current_time: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate.compute_value(current_time).max(0.0) as f64;
+        let playback_rate = self.block_playback_rate(current_time, sample_rate);
 
         for frame_idx in 0..output_frames {
             let mut src_frame = self.position as usize;
@@ -435,7 +494,10 @@ impl AudioNodeProcessor for BufferSourceNode {
     }
 
     fn output_channels(&self) -> u32 {
-        self.buffer.as_ref().map(|b| b.channels).unwrap_or(2)
+        self.buffer
+            .as_ref()
+            .map(|buffer| buffer.format().channels)
+            .unwrap_or(2)
     }
 
     fn get_param_mut(&mut self, name: &str) -> Option<&mut AudioParamTimeline> {
@@ -444,5 +506,21 @@ impl AudioNodeProcessor for BufferSourceNode {
             "detune" => Some(&mut self.detune),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_rate_includes_detune_and_sample_rate_conversion() {
+        let mut node = BufferSourceNode::new(1, 48_000);
+        node.set_playback_rate(2.0);
+        node.detune.set_value(1_200.0);
+
+        let actual = node.block_playback_rate(0.0, 44_100.0);
+        let expected = 2.0 * 2.0 * 44_100.0 / 48_000.0;
+        assert!((actual - expected).abs() < f64::EPSILON * 32.0);
     }
 }

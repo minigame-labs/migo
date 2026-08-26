@@ -1,6 +1,7 @@
 [package]
 name = "migo-shared"
 version.workspace = true
+license.workspace = true
 edition = "2024"
 
 [lib]
@@ -43,6 +44,13 @@ tokio = { workspace = true, features = ["net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt"] }

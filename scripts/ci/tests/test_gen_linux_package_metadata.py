@@ -129,7 +129,10 @@ class RenderManifestTest(unittest.TestCase):
         self.assertIn('--sysroot "$MIGO_SYSROOT_IDENTITY"', script)
         self.assertNotIn('--sysroot "$MIGO_SYSROOT"', script)
         self.assertIn("sysroots.json sha256=", sysroot_helper)
-        self.assertNotIn("/home/xg/", sysroot_helper)
+        former_machine_path = bytes.fromhex(
+            "2f 68 6f 6d 65 2f 78 67 2f"
+        ).decode("ascii")
+        self.assertNotIn(former_machine_path, sysroot_helper)
         self.assertIn("V8 component sysroot identity does not match", script)
         self.assertLess(
             script.index("V8 component sysroot identity does not match"),

@@ -7,12 +7,10 @@
 
 **为游戏而生的 WebView 替代方案。** 把 Migo 嵌进你的 App，就能原生运行 HTML5 与小游戏内容——没有浏览器、DOM、CSS 与合成层。启动更快、内存更低，运行时版本由你自己钉死，不随 OEM 与系统版本漂移。
 
-`migo.*` 是这个引擎唯一安装的原生能力面——不多不少，任何规模都一样。这个仓库就保持这一点：一个纯粹的运行时，不掺任何适配层代码。现有内容期望的其他一切，都是独立发布、可组合的适配层包：
+`migo.*` 是这个引擎唯一安装的原生能力面——不多不少，任何规模都一样。这个仓库就保持这一点：一个纯粹的运行时，不掺任何适配层代码。现有内容期望的其他一切，都应由独立发布、可组合的适配层包提供：
 
 - **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** —— 浏览器风格的 BOM/DOM 层(`window`、`document`、`Image`、`XMLHttpRequest` 等)，给假设自己跑在浏览器环境里的引擎用(Cocos、Egret、Laya、Pixi、原生 Canvas/WebGL)。
-- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** —— 发布 `globalThis.wx`，映射到 `migo.*`，给按主流小游戏全局对象写的内容用(未经改动的小游戏源码，或形态类似的小游戏平台)。
-
-这两层各自只碰互不重叠的全局对象，可以自由组合——按内容实际需要，选零个、一个或两个都要。以后再来一个平台(比如快游戏联盟成员)，还是同一个配方:加一个新的适配层包，引擎不用改。
+适配层只安装各自文档声明的全局对象，可以自由组合——按内容实际需要选用即可。以后再来一个平台（比如快游戏联盟成员），仍是同一个配方：增加一个新的适配层包，引擎不用改。
 
 **想知道你自己那几百款能不能跑？** 别信我们说的，也别把包发给任何人——[PRESCREEN.md](PRESCREEN.md) 就是我们会跑的那套工具，交给你自己跑：包引用了哪些接口、对上本构建实际发布的接口面求差集，以及它在真机上到底出不出帧。**内容一步不出你的机器。**
 
@@ -144,7 +142,6 @@ migo/
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | 各平台宿主集成示例，一个平台一个目录 |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Migo 与 WebView 的可复现对比测试 |
 | [migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter) | 浏览器风格 BOM/DOM 兼容适配层 |
-| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | 主流小游戏形态兼容适配层 |
 
 ## 许可证
 

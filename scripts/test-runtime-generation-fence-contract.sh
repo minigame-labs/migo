@@ -17,13 +17,13 @@
 # session behind its back. That is why the property is checked structurally.
 #
 # The fenced set is DERIVED, and from the handler rather than from the JNI
-# signature. A signature is not the authority it looks like: `onVsync(IJ)V`,
-# `setDisplayRefreshRate(IJ)V` and `getConsoleLogs(IJ)Ljava/lang/String;` all put
-# a plain payload long in the slot a generation would occupy -- a frame
-# timestamp, a refresh period, a log cursor. Selecting on `^\(IJ` would demand a
-# captured token where a frame timestamp belongs, and the fix for that failure
-# would be to break vsync. What declares the intent is the JNI handler's own
-# parameter list in `inbound.rs`: `host_id: jint, generation: jlong`.
+# signature. A signature is not the authority it looks like: `onVsync(IJ)V` and
+# `getConsoleLogs(IJ)Ljava/lang/String;` both put a plain payload long in the
+# slot a generation would occupy -- a frame timestamp, a log cursor. Selecting on
+# `^\(IJ` would demand a captured token where a frame timestamp belongs, and the
+# fix for that failure would be to break vsync. What declares the intent is the
+# JNI handler's own parameter list in `inbound.rs`:
+# `host_id: jint, generation: jlong`.
 #
 # So three engine facts are cross-checked against each other rather than one
 # being trusted:

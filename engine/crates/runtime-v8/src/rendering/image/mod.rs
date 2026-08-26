@@ -1624,4 +1624,14 @@ mod tests {
         assert_ne!(stale, refreshed);
         assert_eq!(refreshed.1, 20);
     }
+
+    #[test]
+    fn public_image_data_factory_has_html_dimension_semantics_and_allocation_caps() {
+        let source = include_str!("01_image_data.js");
+        assert!(source.contains("MAX_IMAGE_DATA_BYTES = 64 * 1024 * 1024"));
+        assert!(source.contains("Math.abs(width)"));
+        assert!(source.contains("\"IndexSizeError\""));
+        assert!(source.contains("sourceLength !== dimensions.bytes"));
+        assert!(!source.contains("Array.from(srcData)"));
+    }
 }

@@ -18,6 +18,12 @@ import android.view.Choreographer;
  * All methods run on the UI thread (Choreographer requires a Looper). The
  * scheduling decisions live in the Android-free {@link VsyncSchedulerState} so
  * they are unit-testable on a host JVM.
+ * <p>
+ * The target frame rate is not this class's concern. The native {@code
+ * FrameScheduler} is its single authority: it decimates the vsyncs delivered
+ * here and derives the display period from their timestamps, so nothing about
+ * the display has to be reported from Java (R1 removed the Java-side {@code
+ * frameSkipInterval}/{@code frameCounter} second FPS authority).
  *
  * @hide
  */
@@ -25,7 +31,6 @@ public final class VsyncScheduler implements Choreographer.FrameCallback {
 
     private final int sessionId;
     private final VsyncSchedulerState state = new VsyncSchedulerState();
-    private long refreshPeriodNanos = 16_666_667L; // default 60Hz
 
     public VsyncScheduler(int sessionId) {
         this.sessionId = sessionId;
@@ -46,22 +51,6 @@ public final class VsyncScheduler implements Choreographer.FrameCallback {
      */
     public void stop() {
         applyScheduleAction(state.onStop());
-    }
-
-    /**
-     * Publish the display refresh period to the native render thread. The native
-     * {@code FrameScheduler} is the single authority for the target frame rate;
-     * this scheduler no longer skips frames itself (R1 removed the Java-side
-     * {@code frameSkipInterval}/{@code frameCounter} second FPS authority).
-     *
-     * @param targetFps          desired frame rate (authoritative on the native side)
-     * @param displayRefreshRate actual display refresh rate (e.g., 120)
-     */
-    public void setTargetFps(int targetFps, float displayRefreshRate) {
-        if (displayRefreshRate > 0) {
-            this.refreshPeriodNanos = Math.round(1_000_000_000.0 / displayRefreshRate);
-        }
-        NativeMethods.setDisplayRefreshRate(sessionId, this.refreshPeriodNanos);
     }
 
     /**

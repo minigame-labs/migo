@@ -32,8 +32,8 @@
 #                                                    take an arch segment -- same reason the
 #                                                    capi packages do
 #   migo-<version>-capi-<platform>-<arch>.tar.gz     C ABI
-#   migo-<version>-sbom.cdx.json
-#   <any of the above>.attestation.json
+#   <payload>.sbom.cdx.json                        artifact-bound dependency inventory
+#   <payload>.attestation.json                     provenance sidecar
 #
 # plus exactly two clerical files, `version.json` and `SHA256SUMS.txt`, which carry no
 # version segment on purpose: a consumer must be able to fetch
@@ -76,7 +76,6 @@ JNI = re.compile(rf"^migo-{re.escape(version)}-jni-android-({'|'.join(ARCHES)})\
 CAPI = re.compile(
     rf"^migo-{re.escape(version)}-capi-({'|'.join(PLATFORMS)})-({'|'.join(ARCHES)})\.tar\.gz$"
 )
-SBOM = re.compile(rf"^migo-{re.escape(version)}-sbom\.cdx\.json$")
 
 
 def payload_ok(name: str) -> bool:
@@ -85,7 +84,6 @@ def payload_ok(name: str) -> bool:
         or NOJNI_AAR.match(name)
         or JNI.match(name)
         or CAPI.match(name)
-        or SBOM.match(name)
     )
 
 
@@ -99,6 +97,14 @@ def why_rejected(name: str) -> str:
             f"attests `{covered}`, which is not itself a published asset name. A sidecar "
             "without its payload is a promise about a file nobody receives"
         )
+    if name.endswith(".sbom.cdx.json"):
+        covered = name[: -len(".sbom.cdx.json")]
+        if payload_ok(covered):
+            return ""
+        return (
+            f"describes `{covered}`, which is not itself a published asset name. An SBOM "
+            "must bind one concrete payload rather than a release-shaped guess"
+        )
     if name in CLERICAL:
         return ""
     if payload_ok(name):
@@ -107,7 +113,7 @@ def why_rejected(name: str) -> str:
     # Shape is right but the version is not: the failure a shape-only check would miss,
     # and the one a copied-forward asset from the previous release produces.
     loose = re.match(
-        rf"^migo-(\d+\.\d+\.\d+[^-]*)-(capi-|jni-)?({'|'.join(PLATFORMS)}|android|sbom)",
+        rf"^migo-(\d+\.\d+\.\d+[^-]*)-(capi-|jni-)?({'|'.join(PLATFORMS)}|android)",
         name,
     )
     if loose and loose.group(1) != version:

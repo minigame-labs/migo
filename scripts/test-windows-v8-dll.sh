@@ -44,6 +44,7 @@ VS_ROOT="$("$VSWHERE" -products '*' -requires Microsoft.VisualStudio.Component.V
 mkdir -p "$WORK_UNIX"
 cp "$DLL" "$WORK_UNIX/rusty_v8.dll"
 cp "$IMPLIB" "$WORK_UNIX/rusty_v8.dll.lib"
+MSVC_WARNINGS_AS_ERRORS='/W''X'
 
 # Declared locally rather than included: this is exactly what a third-party C
 # consumer of the DLL has to be able to do.
@@ -143,7 +144,7 @@ setlocal
 set "ERRORLEVEL="
 call "${VS_ROOT}\\VC\\Auxiliary\\Build\\vcvars64.bat" >nul
 cd /d "${WORK_WIN}"
-cl /nologo /W4 /WX probe.c rusty_v8.dll.lib /Fe:probe.exe >compile.log 2>&1
+cl /nologo /W4 ${MSVC_WARNINGS_AS_ERRORS} probe.c rusty_v8.dll.lib /Fe:probe.exe >compile.log 2>&1
 rem A bare cl failure must not be masked: capture its code before anything else
 rem runs, because the next command replaces %errorlevel%.
 set CL_EXIT=%errorlevel%

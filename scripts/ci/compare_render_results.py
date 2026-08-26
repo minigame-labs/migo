@@ -13,6 +13,20 @@ DEFAULT_THRESHOLDS = {
     "full_surface_frames_max_delta": 50.0,
     "upload_frame_rejections_max_delta": 20.0,
 }
+RENDER_BINDING_FIELDS = (
+    "_source_revision",
+    "_artifact_sha256",
+    "_profile",
+)
+
+
+def validate_result_bindings(results, expected):
+    for index, result in enumerate(results):
+        if not isinstance(result, dict):
+            raise ValueError(f"render result {index} is not an object")
+        for field, value in expected.items():
+            if result.get(field) != value:
+                raise ValueError(f"render result {index} binding mismatch: {field}")
 
 
 def compare_result(baseline, current, thresholds=None):
@@ -174,17 +188,30 @@ def main(argv=None):
     parser.add_argument("--current", required=True)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--summary-out")
+    parser.add_argument("--source-revision")
+    parser.add_argument("--artifact-sha256")
+    parser.add_argument("--profile")
     args = parser.parse_args(argv)
 
     current = load_json(args.current)
     if not isinstance(current, list):
         raise ValueError("current render results must be a JSON array")
 
+    binding_values = (args.source_revision, args.artifact_sha256, args.profile)
+    if any(value is not None for value in binding_values):
+        if not all(value is not None for value in binding_values):
+            raise ValueError("render release bindings must be supplied together")
+        bindings = dict(zip(RENDER_BINDING_FIELDS, binding_values))
+        validate_result_bindings(current, bindings)
+    else:
+        bindings = {}
+
     baseline_doc = load_json(args.baseline)
     if not isinstance(baseline_doc, dict):
         raise ValueError("baseline render results must be a JSON object")
 
     report = compare_results(current, baseline_doc)
+    report.update(bindings)
 
     if args.summary_out:
         summary_path = Path(args.summary_out)

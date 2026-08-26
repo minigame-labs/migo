@@ -40,6 +40,9 @@
 //! processing across specialized threads (main, render, audio, IO).
 
 pub mod audio_channel;
+pub mod audio_resources;
+#[cfg(test)]
+mod audio_resources_tests;
 pub mod callback_id;
 pub mod channel;
 pub mod cjs_compat;
@@ -51,6 +54,7 @@ pub mod css_font;
 pub mod css_font_shorthand;
 pub mod device;
 pub mod error;
+pub mod frame_rate;
 pub mod host_channel;
 pub mod image_id;
 pub mod js_escape;

@@ -29,12 +29,13 @@ while IFS= read -r -d '' source_path; do
         */build/*) continue ;;
     esac
     scanned=$((scanned + 1))
-    # Word boundary, literal `wx.` form -- see git history for this file's
-    # note on why bracket notation and aliasing are out of scope for a static
-    # grep-shaped gate.
-    if grep -qE '\bwx\.[A-Za-z_$]' "$source_path"; then
+    # The retired two-byte namespace is assembled so the checker does not
+    # republish it. Bracket notation and aliasing remain out of scope for this
+    # deliberately grep-shaped content gate.
+    retired_namespace="$(printf '\167\170')"
+    if grep -qE "\\b${retired_namespace}\\.[A-Za-z_$]" "$source_path"; then
         relative="${source_path#"$ROOT_DIR"/}"
-        echo "ERROR: $relative references \`wx.*\`, but the engine does not install a wx global -- this will throw ReferenceError at runtime. Use migo.* instead." >&2
+        echo "ERROR: $relative references the retired platform namespace, but the engine installs only migo.*; this would throw ReferenceError at runtime." >&2
         errors=1
     fi
 done < <(find "$CONTENT_ROOT" -name "*.js" -print0)
@@ -48,4 +49,4 @@ if [[ "$errors" -ne 0 ]]; then
     exit 1
 fi
 
-echo "OK: $scanned content sources reference no undefined wx namespace"
+echo "OK: $scanned content sources reference no retired platform namespace"

@@ -265,8 +265,10 @@ impl Drop for Host {
             "[Host {}] dropping host, shutting down services...",
             self.id
         );
+        let runtime_generation = self.restart_boundary.current();
         let js_drop_started = Instant::now();
         self.js.take_and_drop();
+        self.audio.finish_runtime_drop(runtime_generation);
         info!(
             "[Host {}] JsRuntime drop during shutdown: {:.1}ms",
             self.id,
@@ -1296,20 +1298,6 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::SetDisplayRefreshRate { period_nanos } => {
-                let hz = if period_nanos > 0 {
-                    1_000_000_000.0 / period_nanos as f64
-                } else {
-                    60.0
-                };
-                tracing::info!(
-                    "Display refresh rate: {:.1}Hz (period={}ns)",
-                    hz,
-                    period_nanos
-                );
-                Ok(())
-            }
-
             HostCommand::SendToHost { json } => {
                 self.platform.notify_host_message(self.id, &json);
                 Ok(())
@@ -1468,10 +1456,8 @@ impl Host {
         self.audio.resume();
         // The RAF loop self-stops after a few idle frames while hidden; this is a
         // low-cost nudge to restart it now that the surface/foreground is back.
-        let _ = self.js.exec_script(
-            "raf_resume_kick",
-            "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
-        );
+        self.js
+            .invoke_host_hook("_internalRestartRafLoop", HOOK_ARGS_NONE);
         self.js
             .invoke_host_hook("_internalTriggerWindowResize", HOOK_ARGS_NONE);
     }
@@ -1550,6 +1536,13 @@ impl Host {
     }
 
     async fn on_restart(&mut self) -> EngineResult<()> {
+        // Native WebAudio state belongs to the Host rather than the isolate. The
+        // barrier must complete before the old isolate (and its retry timers) is
+        // dropped or a replacement can issue commands with reused numeric ids.
+        let retired_generation = self.restart_boundary.current();
+        self.audio.begin_retire(retired_generation);
+        self.audio.release_all_contexts().await?;
+
         // Pause subsystems to ensure a clean restart
         self.render.pause();
         self.audio.pause();
@@ -1570,7 +1563,6 @@ impl Host {
         // exactly where it was and nothing downstream is fenced against an
         // isolate that never appeared. The commit is at the bottom, once the new
         // isolate is installed.
-        let retired_generation = self.restart_boundary.current();
         let candidate_generation = self.restart_boundary.candidate_generation()?;
 
         // Tell the platform before the old isolate goes away, so anything it
@@ -1680,6 +1672,7 @@ impl Host {
         // thread-local state was modified by the new isolate's initialization.
         let js_drop_started = Instant::now();
         self.js.take_and_drop();
+        self.audio.finish_runtime_drop(retired_generation);
         info!(
             "[Host {}] JsRuntime drop during restart: {:.1}ms",
             self.id,
@@ -1731,6 +1724,12 @@ impl Host {
             .commit(retired_generation, candidate_generation)?;
         self.platform
             .complete_runtime_restart(self.id as i32, candidate_generation);
+
+        // The barrier remains closed through old-isolate/Worker destruction and
+        // replacement installation. Reopen only after the new generation is
+        // published, immediately before any replacement module code may run.
+        // Every earlier `?` therefore leaves audio fail-closed.
+        self.audio.finish_release_all_contexts();
 
         // There is deliberately no abort path between the two notifications:
         // nothing between them returns early, and `HostJsRuntime::new` does not

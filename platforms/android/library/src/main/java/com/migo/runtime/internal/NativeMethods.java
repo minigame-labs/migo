@@ -47,6 +47,16 @@ public final class NativeMethods {
      */
     private static final int MAX_TOUCH_POINTS = 10;
 
+    /** Maximum accepted camera frame width or height, in physical pixels. */
+    private static final int MAX_CAMERA_FRAME_DIMENSION = 8192;
+
+    /** Maximum accepted camera frame pixel count. */
+    private static final long MAX_CAMERA_FRAME_PIXELS =
+            (long) MAX_CAMERA_FRAME_DIMENSION * MAX_CAMERA_FRAME_DIMENSION;
+
+    /** Maximum synchronous Y/U/V payload copied from a camera callback. */
+    private static final long MAX_CAMERA_FRAME_BYTES = 64L * 1024L * 1024L;
+
     private static final int DEFAULT_LAUNCH_SCENE = 1001;
 
     private static final String EXTRA_LAUNCH_OPTIONS_JSON = "migo_launch_options_json";
@@ -89,6 +99,43 @@ public final class NativeMethods {
     }
 
     /**
+     * Return the loaded native version without converting a linkage failure to
+     * a value. Runtime initialization uses this to preserve its existing
+     * native-load failure state machine while staying behind this facade.
+     */
+    public static String getLoadedVersion() {
+        return NativeBridge.version();
+    }
+
+    /** Return the native ABI's minimum supported Android API level. */
+    public static int getMinApiLevel() {
+        return NativeBridge.getMinApiLevel();
+    }
+
+    /**
+     * Load externally supplied ICU data. Empty paths are rejected before
+     * crossing JNI; the public runtime API retains its descriptive exception.
+     */
+    public static boolean initIcuData(String icuDataPath) {
+        if (icuDataPath == null || icuDataPath.trim().isEmpty()) {
+            return false;
+        }
+        return NativeBridge.initIcuData(icuDataPath);
+    }
+
+    /** Get a session's debug statistics without exposing the raw JNI method. */
+    public static byte[] getDebugStats(int sessionId) {
+        return sessionId >= 0 ? NativeBridge.getDebugStats(sessionId) : null;
+    }
+
+    /** Get console records after a non-negative cursor through the checked facade. */
+    public static String getConsoleLogs(int sessionId, long sinceCursor) {
+        return sessionId >= 0 && sinceCursor >= 0
+                ? NativeBridge.getConsoleLogs(sessionId, sinceCursor)
+                : null;
+    }
+
+    /**
      * Initialize a new session.
      *
      * @param surface Android Surface for rendering
@@ -104,6 +151,22 @@ public final class NativeMethods {
             throw new IllegalArgumentException("RuntimeConfig cannot be null");
         }
         return NativeBridge.init(surface, config);
+    }
+
+    /**
+     * Initialize a session whose rendering Surface has not arrived yet.
+     *
+     * @param config Runtime configuration
+     * @return Session ID (>= 0) on success, negative error code on failure
+     * @throws IllegalArgumentException if config is null
+     */
+    public static int initWarm(RuntimeConfig config) {
+        if (config == null) {
+            throw new IllegalArgumentException("RuntimeConfig cannot be null");
+        }
+        // Separate entry point because in init() a null Surface is a caller
+        // bug, while here it is what asks the engine for a warm start.
+        return NativeBridge.init(null, config);
     }
 
     /**
@@ -643,10 +706,12 @@ public final class NativeMethods {
             ByteBuffer uBuffer, int uOffset, int uLength,
             ByteBuffer vBuffer, int vOffset, int vLength,
             int width, int height) {
-        // Native code reads each plane via its direct address; only direct,
-        // non-null buffers with positive dimensions are forwarded.
+        // Native code reads each plane via its direct address. Reject malformed
+        // or oversized metadata before crossing JNI; the Rust entry point and
+        // shared packing boundary repeat their own checks.
         if (sessionId >= 0
-                && width > 0 && height > 0
+                && isCameraFrameMetadataWithinLimits(
+                        width, height, yLength, uLength, vLength)
                 && yBuffer != null && yBuffer.isDirect()
                 && uBuffer != null && uBuffer.isDirect()
                 && vBuffer != null && vBuffer.isDirect()) {
@@ -656,6 +721,27 @@ public final class NativeMethods {
                     vBuffer, vOffset, vLength,
                     width, height);
         }
+    }
+
+    private static boolean isCameraFrameMetadataWithinLimits(
+            int width, int height, int yLength, int uLength, int vLength) {
+        if (width <= 0 || height <= 0
+                || width > MAX_CAMERA_FRAME_DIMENSION
+                || height > MAX_CAMERA_FRAME_DIMENSION
+                || yLength < 0 || uLength < 0 || vLength < 0) {
+            return false;
+        }
+
+        final long pixels;
+        final long totalBytes;
+        try {
+            pixels = Math.multiplyExact((long) width, (long) height);
+            totalBytes = Math.addExact(
+                    Math.addExact((long) yLength, (long) uLength), (long) vLength);
+        } catch (ArithmeticException ignored) {
+            return false;
+        }
+        return pixels <= MAX_CAMERA_FRAME_PIXELS && totalBytes <= MAX_CAMERA_FRAME_BYTES;
     }
 
     // ==================== Bluetooth Callbacks ====================
@@ -784,22 +870,6 @@ public final class NativeMethods {
     public static void onThermalStatusChanged(int sessionId, int status) {
         if (sessionId >= 0) {
             NativeBridge.onThermalStatusChanged(sessionId, status);
-        }
-    }
-
-    // ==================== Display Configuration ====================
-
-    /**
-     * Notify the native render thread of the display refresh period.
-     * Should be called once at session start and when the display refresh rate changes.
-     *
-     * @param sessionId          The session ID
-     * @param refreshPeriodNanos Display refresh period in nanoseconds
-     *                           (e.g., 16666667 for 60Hz, 8333333 for 120Hz)
-     */
-    public static void setDisplayRefreshRate(int sessionId, long refreshPeriodNanos) {
-        if (sessionId >= 0) {
-            NativeBridge.setDisplayRefreshRate(sessionId, refreshPeriodNanos);
         }
     }
 

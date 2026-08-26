@@ -103,6 +103,15 @@ struct Inner {
 const META_TOTAL_BYTES: &str = "total_bytes";
 
 impl KvStore {
+    /// Number of strong handles, including the cache's own handle.
+    ///
+    /// This is crate-visible so the storage cache can distinguish an
+    /// idle entry from one still held by an operation/session without
+    /// exposing `Arc` internals in the public API.
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
     /// Open (creating if missing) the KV DB at `path`.
     ///
     /// * `path` — absolute file path, typically `<app_files>/kv_storage/storage.db`.

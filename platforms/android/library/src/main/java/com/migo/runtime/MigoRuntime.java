@@ -7,7 +7,6 @@ import android.util.Log;
 import android.view.Surface;
 
 import com.migo.runtime.internal.AppContext;
-import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeContext;
 import com.migo.runtime.internal.RuntimeRegistry;
@@ -108,7 +107,10 @@ import com.migo.runtime.internal.platform.DisplayCompat;
  *
  * <h3>Thread Safety</h3>
  * <p>
- * This class is thread-safe. All public methods can be called from any thread.
+ * This class is thread-safe except for the Activity-bound session creation
+ * overload, which must run on the main thread because it configures Android UI
+ * state. {@link #createSessionSafe(Activity, Surface, RuntimeConfig, String)}
+ * reports a caller-thread violation as a failure result instead of throwing it.
  *
  */
 public final class MigoRuntime {
@@ -172,7 +174,7 @@ public final class MigoRuntime {
             }
             String reported;
             try {
-                reported = NativeBridge.version();
+                reported = NativeMethods.getLoadedVersion();
             } catch (UnsatisfiedLinkError e) {
                 // The library is in the process but its JNI registration is
                 // not what this SDK expects -- a mismatched engine that
@@ -248,7 +250,7 @@ public final class MigoRuntime {
             return FALLBACK_MIN_SDK;
         }
         try {
-            return NativeBridge.getMinApiLevel();
+            return NativeMethods.getMinApiLevel();
         } catch (Throwable t) {
             return FALLBACK_MIN_SDK;
         }
@@ -272,7 +274,7 @@ public final class MigoRuntime {
         if (icuDataPath == null || icuDataPath.trim().isEmpty()) {
             throw new IllegalArgumentException("icuDataPath cannot be null or empty");
         }
-        return NativeBridge.initIcuData(icuDataPath);
+        return NativeMethods.initIcuData(icuDataPath);
     }
 
     // ==================== Session Creation ====================
@@ -290,6 +292,7 @@ public final class MigoRuntime {
      * @param gameId   Unique game identifier (alphanumeric, underscore, hyphen, 1-64 chars)
      * @return A new GameSession
      * @throws MigoException if creation fails or gameId is invalid
+     * @throws IllegalStateException if called off the main thread
      */
     public GameSession createSession(Activity activity, Surface surface, RuntimeConfig config, String gameId) {
         ThreadCheck.ensureMainThread();
@@ -372,9 +375,9 @@ public final class MigoRuntime {
             enterImmersiveMode(activity);
         }
 
-        // Null Surface is the warm start on the native side too; the engine
+        // The warm start is a null Surface on the native side too; the engine
         // brings up everything a window is not needed for and then parks.
-        int sessionId = NativeBridge.init(null, config);
+        int sessionId = NativeMethods.initWarm(config);
         if (sessionId < 0) {
             throw new MigoException(ErrorCode.ERR_INIT_FAILED,
                     ErrorCode.getMessage(ErrorCode.ERR_INIT_FAILED) + ": Native init returned " + sessionId);
@@ -441,7 +444,8 @@ public final class MigoRuntime {
     /**
      * Create a new game session with isolated file system.
      * <p>
-     * Non-throwing version that returns a result wrapper.
+     * Non-throwing version that returns a result wrapper, including when it is
+     * called off the Android main thread.
      *
      * @param activity The host Activity
      * @param surface  The rendering Surface
@@ -450,13 +454,19 @@ public final class MigoRuntime {
      * @return Result containing either the session or an error code
      */
     public Result<GameSession> createSessionSafe(Activity activity, Surface surface, RuntimeConfig config, String gameId) {
-        ThreadCheck.ensureMainThread();
         try {
+            ThreadCheck.ensureMainThread();
             return Result.success(createSession(activity, surface, config, gameId));
         } catch (MigoException e) {
             return Result.failure(e.getErrorCode(), e.getMessage());
         } catch (Exception e) {
-            return Result.failure(ErrorCode.ERR_INIT_FAILED, e.getMessage());
+            // Framework exceptions may embed app-private filesystem paths or
+            // Activity implementation details. The non-throwing public API
+            // exposes a stable code/message pair, while callers that need the
+            // original failure can use the throwing overload under a debugger.
+            return Result.failure(
+                    ErrorCode.ERR_INIT_FAILED,
+                    ErrorCode.getMessage(ErrorCode.ERR_INIT_FAILED));
         }
     }
 
@@ -487,7 +497,7 @@ public final class MigoRuntime {
      * Check if the current device meets minimum requirements.
      * <p>
      * The minimum API level is sourced from the native engine
-     * (see {@link NativeBridge#getMinApiLevel()}), so this method
+     * (queried through the internal checked bridge), so this method
      * stays in sync with the build script's {@code ANDROID_API}
      * without requiring a Java-side constant update on every
      * NDK preset change.  Returns {@code false} if the native

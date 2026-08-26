@@ -147,6 +147,10 @@ impl PreparedEglSurface for AndroidPreparedSurface {
             },
         )
     }
+
+    fn request_frame_rate(&self, fps: u32) {
+        super::surface::request_frame_rate(self.handle.as_ptr(), fps);
+    }
 }
 
 pub fn android_graphics_platform() -> EngineResult<GraphicsPlatform> {

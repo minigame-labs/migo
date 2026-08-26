@@ -1022,14 +1022,15 @@ pub(crate) fn read_surface_rgba_unpremul(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
+    let byte_len = shared::protocol::render_cmd::checked_canvas_rgba_byte_len(width, height)?;
     let info = skia_safe::ImageInfo::new(
         skia_safe::ISize::new(width as i32, height as i32),
         skia_safe::ColorType::RGBA8888,
         skia_safe::AlphaType::Unpremul,
         None,
     );
-    let row_bytes = width as usize * 4;
-    let mut out = vec![0u8; row_bytes * height as usize];
+    let row_bytes = usize::try_from(width).ok()?.checked_mul(4)?;
+    let mut out = vec![0u8; byte_len];
     surface
         .read_pixels(&info, &mut out, row_bytes, (x, y))
         .then_some(out)

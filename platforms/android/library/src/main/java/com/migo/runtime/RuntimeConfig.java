@@ -184,8 +184,7 @@ public final class RuntimeConfig {
     @Override
     public String toString() {
         return "RuntimeConfig{" +
-                "cacheDir='" + cacheDir + '\'' +
-                ", filesDir='" + filesDir + '\'' +
+                "privateDirectories=redacted" +
                 ", targetFps=" + targetFps +
                 ", debugEnabled=" + debugEnabled +
                 ", logLevel=" + logLevel +
@@ -351,13 +350,16 @@ public final class RuntimeConfig {
         /**
          * Set the target frame rate.
          * <p>
-         * Default: 60 FPS. Valid range: 30-120.
+         * Default: 60 FPS. The engine serves 1-240 and is the single authority on
+         * that range, so the value is carried through as given rather than clamped
+         * again here: a second copy of the rule is how a builder ends up silently
+         * raising a 24 FPS request to 30, or capping a 144 Hz panel at 120.
          *
          * @param fps Target frames per second
          * @return this builder
          */
         public Builder setTargetFps(int fps) {
-            this.targetFps = Math.max(30, Math.min(120, fps));
+            this.targetFps = fps;
             return this;
         }
 

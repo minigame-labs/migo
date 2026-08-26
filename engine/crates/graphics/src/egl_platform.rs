@@ -115,6 +115,21 @@ pub trait PreparedEglSurface: Debug + Send + Sync {
         display: egl::Display,
         config: egl::Config,
     ) -> EngineResult<egl::Surface>;
+
+    /// Tell the display what frame rate content is presenting at, so it can pick
+    /// a mode that serves it without decimation.
+    ///
+    /// This is the difference between absorbing a display mismatch and removing
+    /// it. A 60fps request on a 90Hz panel can only be decimated as 1,2,1,2
+    /// vsyncs -- no scheduler tolerance makes that even, because two thirds of 90
+    /// is not a whole number of frames. Asking the display for 60 instead makes
+    /// the vsyncs themselves arrive at 60, which is both even and cheaper: a
+    /// faster mode nobody is using still costs composition passes and panel power.
+    ///
+    /// Advisory, and a no-op by default: most platforms expose no way to ask, and
+    /// one that does may decline. The frame scheduler remains the authority on
+    /// what to present and stays correct for whatever the display delivers.
+    fn request_frame_rate(&self, _fps: u32) {}
 }
 
 pub type PreparedEglSurfaceRef = Arc<dyn PreparedEglSurface>;

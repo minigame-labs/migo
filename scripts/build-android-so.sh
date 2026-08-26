@@ -273,8 +273,13 @@ get_host_platform() {
 # regenerate icudtl_dat.S from the smaller blob. Set MIGO_FULL_ICU=1 to
 # restore the full android data.
 slim_icu_data() {
+    local cargo_registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
     local skia_src
-    skia_src="$(find "$HOME/.cargo/registry/src" -maxdepth 2 -type d -name 'skia-bindings-*' 2>/dev/null | sort | tail -1)"
+    # A missing registry is a supported cold-build state, and CARGO_HOME may be
+    # isolated in CI. `find` must not trip `set -euo pipefail` before the
+    # function can take its documented skip path.
+    skia_src="$(find "$cargo_registry" -maxdepth 2 -type d -name 'skia-bindings-*' \
+        2>/dev/null | sort | tail -1 || true)"
     if [[ -z "$skia_src" ]]; then
         print_warning "skia-bindings src not found; skipping ICU slim"
         return 0

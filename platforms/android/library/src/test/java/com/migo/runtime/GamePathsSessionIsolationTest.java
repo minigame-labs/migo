@@ -166,4 +166,16 @@ public final class GamePathsSessionIsolationTest {
         assertTrue("the sweep reached the per-game cache root",
                 new File(starting.getCacheDir(), "install-record.json").isFile());
     }
+
+    @Test
+    public void diagnosticStringsDoNotExposeTheHostPrivateDirectory() throws IOException {
+        RuntimeConfig config = config();
+        GamePaths paths = new GamePaths(config, "same-game", 1);
+        String privateRoot = folder.getRoot().getAbsolutePath();
+
+        assertFalse("RuntimeConfig diagnostics must not disclose app-private paths",
+                config.toString().contains(privateRoot));
+        assertFalse("GamePaths diagnostics must not disclose app-private paths",
+                paths.toString().contains(privateRoot));
+    }
 }

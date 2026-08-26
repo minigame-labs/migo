@@ -91,16 +91,15 @@ esac
 OUT_DIR="$ENGINE_ROOT/third_party/rusty_v8/$ARCH-linux-ohos"
 
 if [[ $CHECK_ONLY -eq 1 ]]; then
-    for archive in "$OUT_DIR/librusty_v8.a"; do
-        if [[ -f "$archive" ]]; then
-            echo "=== $archive"
-            echo "  size: $(du -h "$archive" | cut -f1)"
-            echo "  PartitionAlloc hijack symbols: \
+    archive="$OUT_DIR/librusty_v8.a"
+    if [[ -f "$archive" ]]; then
+        echo "=== $archive"
+        echo "  size: $(du -h "$archive" | cut -f1)"
+        echo "  PartitionAlloc hijack symbols: \
 $(nm --defined-only "$archive" 2>/dev/null | grep -c 'PartitionAllocFunctionsInternal' || true)"
-        else
-            echo "missing: $archive"
-        fi
-    done
+    else
+        echo "missing: $archive"
+    fi
     exit 0
 fi
 

@@ -881,11 +881,6 @@ pub enum HostCommand {
     /// Level 0=none, 1=light, 2=moderate, 3=severe, 4=critical, 5=emergency, 6=shutdown.
     OnThermalStatusChanged { status: i32 },
 
-    // ---- Display Configuration ----
-    /// Display refresh period in nanoseconds (e.g., 16666667 for 60Hz, 8333333 for 120Hz).
-    /// Sent once at session start and when display mode changes.
-    SetDisplayRefreshRate { period_nanos: i64 },
-
     // ---- Host Message Channel ----
     /// Message from game JS to host app via migo.sendToHost(type, payload).
     ///
@@ -1031,7 +1026,6 @@ impl HostCommand {
             | Self::OnBeaconServiceChange { .. }
             | Self::OnMemoryWarning { .. }
             | Self::OnThermalStatusChanged { .. }
-            | Self::SetDisplayRefreshRate { .. }
             | Self::SendToHost { .. } => None,
         }
     }

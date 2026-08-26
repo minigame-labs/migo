@@ -210,7 +210,7 @@ session.setSubpackageHandler((request, callback) -> {
 });
 ```
 
-- `setAuthHandler(AuthHandler)`: backs `migo.login` / `migo.checkSession` / `migo.getUserInfo` / `migo.getPhoneNumber` (and the same calls made through a platform-compat adapter, e.g. `migo-wx-adapter`)
+- `setAuthHandler(AuthHandler)`: backs `migo.login` / `migo.checkSession` / `migo.getUserInfo` / `migo.getPhoneNumber`, including calls forwarded by an external compatibility adapter
 - `setGameLogHandler(GameLogHandler)`: receives game-reported logs (JSON string)
 - `setSubpackageHandler(SubpackageHandler)`: handles `loadSubpackage` / `preDownloadSubpackage` downloads
 
@@ -219,7 +219,7 @@ session.setSubpackageHandler((request, callback) -> {
 ```java
 RuntimeConfig config = new RuntimeConfig.Builder(context)
     // Performance
-    .setTargetFps(60)              // 30-120, default: 60
+    .setTargetFps(60)              // 1-240, default: 60
     
     // Debugging
     .setDebugEnabled(true)         // Enable debug features
@@ -299,7 +299,7 @@ Configuration builder:
 
 | Method | Default | Description |
 |--------|---------|-------------|
-| `setTargetFps(int)` | 60 | Target frame rate (30-120) |
+| `setTargetFps(int)` | 60 | Target frame rate (1-240) |
 | `setDebugEnabled(boolean)` | false | Debug mode |
 | `setLogLevel(LogLevel)` | WARN | Log verbosity |
 | `setCodeCacheDir(String)` | cacheDir | Compiled code directory |

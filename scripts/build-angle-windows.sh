@@ -94,6 +94,13 @@ err()  { printf '\033[0;31m[angle-win] %s\033[0m\n' "$*" >&2; }
 win_to_unix() { printf '/mnt/%s' "$(printf '%s' "$1" | sed 's|\\|/|g; s|^\(.\):|\L\1|')"; }
 # bash's own dirname expects forward slashes; every path here is DOS-form.
 win_dirname() { printf '%s' "${1%\\*}"; }
+find_windows_python() {
+    local finder="/mnt/c/Windows/System32/where.exe" candidate
+    [[ -f "$finder" ]] || return 1
+    candidate="$("$finder" python.exe 2>/dev/null | tr -d '\r' | head -n 1)"
+    [[ -n "$candidate" ]] || return 1
+    printf '%s' "$candidate"
+}
 SRC_UNIX="$(win_to_unix "$ANGLE_SRC_WIN")"
 
 # ------------------------------------------------------------
@@ -108,9 +115,8 @@ check_ready() {
 
     if [[ -z "$PYTHON_WIN" ]]; then
         local candidate
-        candidate="$(ls -d /mnt/c/Users/*/AppData/Local/Programs/Python/Python3*/python.exe 2>/dev/null | sort -V | tail -1 || true)"
-        if [[ -n "$candidate" ]]; then
-            PYTHON_WIN="$(printf '%s' "$candidate" | sed 's|^/mnt/\(.\)/|\U\1:\\\\|; s|/|\\\\|g')"
+        if candidate="$(find_windows_python)"; then
+            PYTHON_WIN="$candidate"
         else
             err "no Windows python found; set MIGO_WIN_PYTHON"; failures=$((failures + 1))
         fi

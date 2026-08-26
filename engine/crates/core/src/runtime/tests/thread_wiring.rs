@@ -76,6 +76,120 @@ fn host_installs_the_process_watchdog_on_new_and_restart() {
 }
 
 #[test]
+fn restart_awaits_audio_cleanup_before_dropping_or_creating_an_isolate() {
+    let restart_start = HOST
+        .find("async fn on_restart")
+        .expect("Host::on_restart exists");
+    let restart = &HOST[restart_start..];
+    let cleanup = restart
+        .find("self.audio.release_all_contexts().await")
+        .expect("restart must await the host-owned native audio cleanup barrier");
+    let old_drop = restart
+        .find("self.js.take_and_drop()")
+        .expect("restart drops the old isolate");
+    let reopen = restart
+        .find("self.audio.finish_release_all_contexts()")
+        .expect("audio data remains fenced until the retired isolate is gone");
+    let new_runtime = restart
+        .find("HostJsRuntime::new")
+        .expect("restart creates the replacement isolate");
+    let runtime_install = restart
+        .find("self.js.set(new_js)")
+        .expect("restart installs the replacement isolate");
+    let module_evaluate = restart
+        .find("self.on_evaluate_module")
+        .expect("restart may evaluate the replacement module");
+
+    assert!(
+        cleanup < old_drop,
+        "audio ack must precede old isolate drop"
+    );
+    assert!(
+        old_drop < reopen,
+        "old isolate must be gone before reopening audio data"
+    );
+    assert!(
+        new_runtime < runtime_install,
+        "replacement is built before installation"
+    );
+    assert!(
+        runtime_install < reopen,
+        "replacement must be installed before reopening audio"
+    );
+    assert!(
+        reopen < module_evaluate,
+        "audio reopens before replacement module code runs"
+    );
+}
+
+#[test]
+fn restart_fences_and_reclaims_js_audio_backing_at_the_isolate_boundary() {
+    let restart_start = HOST
+        .find("async fn on_restart")
+        .expect("Host::on_restart exists");
+    let restart = &HOST[restart_start..];
+    let generation = restart
+        .find("let retired_generation = self.restart_boundary.current()")
+        .expect("restart captures the retiring generation");
+    let retire = restart
+        .find("self.audio.begin_retire(retired_generation)")
+        .expect("restart fences JS-owned audio backing");
+    let native_barrier = restart
+        .find("self.audio.release_all_contexts().await")
+        .expect("restart awaits native WebAudio cleanup");
+    let old_drop = restart
+        .find("self.js.take_and_drop()")
+        .expect("restart destroys the old isolate");
+    let backing_drop = restart
+        .find("self.audio.finish_runtime_drop(retired_generation)")
+        .expect("restart releases backing permits after isolate destruction");
+    let new_runtime = restart
+        .find("HostJsRuntime::new")
+        .expect("restart constructs the replacement isolate");
+
+    assert!(generation < retire);
+    assert!(
+        retire < native_barrier,
+        "resource admission closes before cleanup"
+    );
+    assert!(
+        native_barrier < old_drop,
+        "native cleanup is acknowledged first"
+    );
+    assert!(
+        old_drop < backing_drop,
+        "V8 owns the backing until isolate drop"
+    );
+    assert!(
+        backing_drop < new_runtime,
+        "old accounting is gone before replacement"
+    );
+}
+
+#[test]
+fn host_drop_reclaims_audio_backing_only_after_dropping_the_isolate() {
+    let drop_start = HOST
+        .find("impl Drop for Host")
+        .expect("Host has deterministic teardown");
+    let drop_body = &HOST[drop_start..HOST.find("impl Host {").unwrap()];
+    let generation = drop_body
+        .find("self.restart_boundary.current()")
+        .expect("teardown captures the live runtime generation");
+    let js_drop = drop_body
+        .find("self.js.take_and_drop()")
+        .expect("teardown destroys V8");
+    let backing_drop = drop_body
+        .find("self.audio.finish_runtime_drop(")
+        .expect("teardown releases JS audio backing");
+
+    assert!(generation < js_drop);
+    assert!(
+        js_drop < backing_drop,
+        "backing permits outlive the isolate"
+    );
+}
+
+#[test]
 fn oom_classification_wins_before_watchdog_timeout() {
     assert!(
         THREAD.contains("was_oom_terminated"),

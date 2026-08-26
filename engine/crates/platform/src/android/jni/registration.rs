@@ -20,8 +20,8 @@ use crate::{
         onOpenAppAuthorizeSetting, onOpenSettingResult, onOpenSystemBluetoothSetting,
         onRecorderEvent, onRecorderFrameData, onRestart, onScanCodeResult, onShareAppMessageResult,
         onShow, onSubpackageProgress, onSubpackageResult, onSurfaceDestroyed,
-        onThermalStatusChanged, onTouch, onUserCaptureScreen, onVideoEvent, onVsync,
-        setDisplayRefreshRate, shutdown, updatePermission, updateSurface, version,
+        onThermalStatusChanged, onTouch, onUserCaptureScreen, onVideoEvent, onVsync, shutdown,
+        updatePermission, updateSurface, version,
     },
     jni_profile_contract::{self, JniMethod, MethodDirection},
 };
@@ -42,7 +42,6 @@ fn native_fn_ptr(name: &str) -> Option<*mut c_void> {
         "modMain" => mod_main as *mut c_void,
         "executeScript" => executeScript as *mut c_void,
         "onVsync" => onVsync as *mut c_void,
-        "setDisplayRefreshRate" => setDisplayRefreshRate as *mut c_void,
         "getDebugStats" => getDebugStats as *mut c_void,
         "getConsoleLogs" => getConsoleLogs as *mut c_void,
         "nativeAhbPointerFromHardwareBuffer" => nativeAhbPointerFromHardwareBuffer as *mut c_void,

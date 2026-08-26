@@ -515,6 +515,7 @@ impl HostJsRuntime {
     /// hand-built `OpState` that agrees with it by construction. That is the
     /// difference between "the resolver separates two `GamePaths`" — already
     /// covered — and "two live isolates hold two different ones".
+    #[cfg(test)]
     pub(crate) fn op_state(&self) -> Rc<RefCell<deno_core::OpState>> {
         self.rt.op_state()
     }
@@ -911,8 +912,14 @@ impl HostJsRuntime {
                 .with_detail(e.to_string())
         })?;
 
-        // Create VFS from game paths
-        let vfs = VirtualFS::from_game_paths(&game_paths);
+        // Pin every sandbox root before exposing the VFS to untrusted code.
+        // A path-only VFS would allow the mapping root itself to be replaced
+        // between construction and a later read.
+        let vfs = VirtualFS::try_from_game_paths(&game_paths).map_err(|_| {
+            EngineError::new(ErrorCode::IoError)
+                .with_msg("initialize sandbox filesystem")
+                .with_detail("failed to pin sandbox roots")
+        })?;
         let code_dir = game_paths.code_dir().to_path_buf();
         let code_dir_str = code_dir.to_string_lossy().into_owned();
         let game_paths = Arc::new(game_paths);

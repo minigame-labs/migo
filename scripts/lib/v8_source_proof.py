@@ -321,12 +321,13 @@ def assert_tree_is_exactly_patched(
             target.chmod(0o755 if executable else 0o644)
 
         for patch in patch_files:
-            applied = subprocess.run(
-                ["patch", "-p1", "-d", str(scratch), "--batch", "--forward", "--fuzz=0"],
-                stdin=patch.open("rb"),
-                check=False,
-                capture_output=True,
-            )
+            with patch.open("rb") as patch_stream:
+                applied = subprocess.run(
+                    ["patch", "-p1", "-d", str(scratch), "--batch", "--forward", "--fuzz=0"],
+                    stdin=patch_stream,
+                    check=False,
+                    capture_output=True,
+                )
             if applied.returncode != 0:
                 raise SourceProofError(
                     f"cannot replay {patch.name} onto the pristine sources: "

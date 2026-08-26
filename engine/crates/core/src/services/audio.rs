@@ -2,7 +2,12 @@
 use audio::AudioThread;
 
 #[cfg(feature = "api-media")]
-use shared::audio_channel::{AudioCommandReceiver, AudioCommandSender};
+use shared::audio_channel::{
+    AudioCleanupTicket, AudioCleanupWaitError, AudioCommandReceiver, AudioCommandSendError,
+    AudioCommandSender,
+};
+#[cfg(feature = "api-media")]
+use shared::audio_resources::AudioResourceRegistry;
 #[cfg(feature = "api-media")]
 use shared::channel::ThreadWakeup;
 #[cfg(feature = "api-media")]
@@ -13,6 +18,8 @@ use shared::op_state::{AudioHostStartSignal, AudioSender, HostTx};
 use shared::protocol::audio_cmd::AudioCmd;
 #[cfg(feature = "api-media")]
 use std::sync::Arc;
+#[cfg(feature = "api-media")]
+use std::time::Duration;
 #[cfg(feature = "api-media")]
 use tracing::info;
 
@@ -61,6 +68,9 @@ pub(crate) struct AudioService {
     /// `check_and_start()`, and disabled (`mark_started`) once the thread runs.
     /// Replaces the lazy-audio poll that the deleted 3-second heartbeat did.
     host_start: Arc<AudioHostStartSignal>,
+    /// Host-lifetime owner of JS `AudioBuffer` backing accounting. Every
+    /// `AudioSender` cloned into an isolate points at this same registry.
+    resources: AudioResourceRegistry,
     /// Per-host factory. The audio thread invokes it only on the first remote
     /// cache miss, then keeps the resulting reqwest pool for its lifetime.
     http_client_factory: audio::streaming::StreamingHttpClientFactory,
@@ -90,6 +100,44 @@ fn take_startup_backlog(pending: &mut Vec<AudioCmd>, is_paused: bool) -> Vec<Aud
 }
 
 #[cfg(feature = "api-media")]
+fn complete_prestart_release_all_contexts(rx: &AudioCommandReceiver, pending: &mut Vec<AudioCmd>) {
+    pending.clear();
+    rx.discard_prestart_commands();
+    rx.complete_release_all_contexts();
+}
+
+#[cfg(feature = "api-media")]
+fn cleanup_send_error(error: AudioCommandSendError) -> EngineError {
+    match error {
+        AudioCommandSendError::Full(_) | AudioCommandSendError::ByteLimit(_) => {
+            EngineError::from_detail(
+                ErrorCode::InputSaturated,
+                "audio restart cleanup lane is saturated",
+            )
+        }
+        AudioCommandSendError::Disconnected(_) => EngineError::from_detail(
+            ErrorCode::Disconnected,
+            "audio restart cleanup lane is disconnected",
+        ),
+    }
+}
+
+#[cfg(feature = "api-media")]
+async fn await_cleanup_ticket(ticket: AudioCleanupTicket, timeout: Duration) -> EngineResult<()> {
+    match tokio::time::timeout(timeout, ticket.wait()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(AudioCleanupWaitError::Disconnected)) => Err(EngineError::from_detail(
+            ErrorCode::Disconnected,
+            "audio thread disconnected before restart cleanup completed",
+        )),
+        Err(_) => Err(EngineError::from_detail(
+            ErrorCode::Timeout,
+            "audio restart cleanup timed out",
+        )),
+    }
+}
+
+#[cfg(feature = "api-media")]
 impl AudioService {
     /// Create a lazy audio service. **No thread or HTTP client is created.**
     pub(crate) fn new(host_tx: HostTx, network_policy: shared::op_state::NetworkPolicy) -> Self {
@@ -113,6 +161,7 @@ impl AudioService {
             host_tx,
             is_paused: false,
             host_start: AudioHostStartSignal::new(),
+            resources: AudioResourceRegistry::new(),
             http_client_factory,
         }
     }
@@ -123,10 +172,11 @@ impl AudioService {
     /// host-start signal so a pre-start send nudges the host loop.
     #[inline]
     pub(crate) fn sender(&self) -> AudioSender {
-        AudioSender::with_host_start_signal(
+        AudioSender::hosted(
             self.tx.clone(),
             self.wakeup.clone(),
             self.host_start.clone(),
+            self.resources.clone(),
         )
     }
 
@@ -148,6 +198,10 @@ impl AudioService {
 
         if let Some(ref mut rx) = self.rx {
             while let Ok(cmd) = rx.try_recv() {
+                if matches!(cmd, AudioCmd::ReleaseAllContexts) {
+                    complete_prestart_release_all_contexts(rx, &mut self.pending);
+                    continue;
+                }
                 let is_lifecycle = matches!(
                     cmd,
                     AudioCmd::PauseAll | AudioCmd::ResumeAll | AudioCmd::Shutdown
@@ -209,7 +263,7 @@ impl AudioService {
     pub(crate) fn pause(&mut self) {
         self.is_paused = true;
         if self.thread.is_some() {
-            let _ = self.tx.send(AudioCmd::PauseAll);
+            let _ = self.tx.try_send(AudioCmd::PauseAll);
             self.wakeup.notify();
         }
         // If thread not started, no-op — nothing to pause.
@@ -221,9 +275,50 @@ impl AudioService {
     pub(crate) fn resume(&mut self) {
         self.is_paused = false;
         if self.thread.is_some() {
-            let _ = self.tx.send(AudioCmd::ResumeAll);
+            let _ = self.tx.try_send(AudioCmd::ResumeAll);
             self.wakeup.notify();
         }
+    }
+
+    /// Must-deliver restart barrier. A running audio thread acknowledges only
+    /// after discarding older WebAudio commands and releasing every WebAudio
+    /// context. Before lazy start there can be no native contexts, so the
+    /// service drops the old backlog/channel itself and completes immediately.
+    pub(crate) async fn release_all_contexts(&mut self) -> EngineResult<()> {
+        const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+        let ticket = self
+            .sender()
+            .release_all_contexts()
+            .map_err(cleanup_send_error)?;
+        if self.thread.is_none() {
+            let rx = self.rx.as_ref().ok_or_else(|| {
+                EngineError::from_detail(
+                    ErrorCode::Disconnected,
+                    "audio receiver is unavailable before startup cleanup",
+                )
+            })?;
+            complete_prestart_release_all_contexts(rx, &mut self.pending);
+        }
+
+        self.wakeup.notify();
+        await_cleanup_ticket(ticket, CLEANUP_TIMEOUT).await
+    }
+
+    /// End the restart fence only after the old isolate and all of its senders
+    /// have been retired. A failed/timed-out barrier deliberately cannot reopen.
+    pub(crate) fn finish_release_all_contexts(&mut self) {
+        self.tx.finish_release_all_contexts();
+    }
+
+    /// Fence JS backing admission before the native cleanup barrier begins.
+    pub(crate) fn begin_retire(&self, runtime_generation: i64) {
+        self.resources.begin_retire(runtime_generation);
+    }
+
+    /// Return JS backing permits only after the owning isolate is destroyed.
+    pub(crate) fn finish_runtime_drop(&self, runtime_generation: i64) {
+        self.resources.finish_runtime_drop(runtime_generation);
     }
 
     pub(crate) fn shutdown(&mut self) {
@@ -283,6 +378,20 @@ impl AudioService {
 
     #[inline]
     pub(crate) fn resume(&mut self) {}
+
+    #[inline]
+    pub(crate) async fn release_all_contexts(&mut self) -> shared::error::EngineResult<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn finish_release_all_contexts(&mut self) {}
+
+    #[inline]
+    pub(crate) fn begin_retire(&self, _runtime_generation: i64) {}
+
+    #[inline]
+    pub(crate) fn finish_runtime_drop(&self, _runtime_generation: i64) {}
 
     #[inline]
     pub(crate) fn shutdown(&mut self) {}
@@ -351,5 +460,99 @@ mod tests {
             backlog.iter().map(label).collect::<Vec<_>>(),
             vec!["create(1)"]
         );
+    }
+
+    #[test]
+    fn prestart_release_barrier_discards_pending_and_full_channel_before_ack() {
+        let (tx, rx) = shared::audio_channel::channel();
+        for ctx_id in 100..100 + shared::audio_channel::AUDIO_COMMAND_CAPACITY as u32 {
+            tx.try_send(create_context(ctx_id))
+                .expect("fixture fills the ordinary data queue");
+        }
+        let ticket = tx
+            .request_release_all_contexts()
+            .expect("cleanup bypasses full data");
+        let (resp, mut response) = tokio::sync::oneshot::channel();
+        let mut pending = vec![AudioCmd::CloseContext { ctx_id: 9, resp }];
+
+        complete_prestart_release_all_contexts(&rx, &mut pending);
+
+        assert!(pending.is_empty());
+        assert!(rx.is_empty());
+        assert!(matches!(
+            response.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(ticket.is_complete(), "pre-start cleanup completes directly");
+    }
+
+    #[tokio::test]
+    async fn cleanup_timeout_is_fail_closed_and_keeps_late_data_fenced() {
+        let (tx, _rx) = shared::audio_channel::channel();
+        let ticket = tx.request_release_all_contexts().unwrap();
+
+        let error = await_cleanup_ticket(ticket, Duration::ZERO)
+            .await
+            .expect_err("an unacknowledged barrier must time out");
+
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert!(matches!(
+            tx.try_send(create_context(77)),
+            Err(AudioCommandSendError::Full(AudioCmd::CreateContext {
+                ctx_id: 77,
+                ..
+            }))
+        ));
+    }
+
+    fn service() -> AudioService {
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
+        AudioService::new(host_tx, shared::op_state::NetworkPolicy::default())
+    }
+
+    fn one_frame() -> shared::audio_resources::AudioBufferFormat {
+        shared::audio_resources::AudioBufferFormat {
+            channels: 1,
+            frames: 1,
+            sample_rate: 48_000,
+        }
+    }
+
+    #[test]
+    fn every_service_sender_shares_the_host_resource_registry() {
+        let service = service();
+        let first = service.sender();
+        let second = service.sender();
+        let lease = first
+            .resources()
+            .expect("host sender carries resources")
+            .reserve_backing(701, one_frame())
+            .unwrap();
+
+        assert!(second.resources().unwrap().release_buffer(lease.key()));
+    }
+
+    #[test]
+    fn service_retire_and_drop_forward_to_the_shared_registry() {
+        let service = service();
+        let sender = service.sender();
+        let lease = sender
+            .resources()
+            .unwrap()
+            .reserve_backing(702, one_frame())
+            .unwrap();
+
+        service.begin_retire(702);
+        assert_eq!(
+            sender
+                .resources()
+                .unwrap()
+                .reserve_backing(702, one_frame())
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidOperation
+        );
+        service.finish_runtime_drop(702);
+        assert!(!sender.resources().unwrap().release_buffer(lease.key()));
     }
 }

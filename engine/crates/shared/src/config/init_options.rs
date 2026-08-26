@@ -95,7 +95,7 @@ pub struct InitOptions {
     files_dir: PathBuf,
     /// Code cache directory for compiled scripts (V8 bytecode).
     code_cache_dir: PathBuf,
-    /// Target frames per second (1-120).
+    /// Target frames per second; see [`crate::frame_rate`] for the range.
     target_fps: i32,
     /// Whether debug mode is enabled.
     debug_enabled: bool,
@@ -151,7 +151,7 @@ impl Default for InitOptions {
             cache_dir: temp.clone(),
             files_dir: temp.clone(),
             code_cache_dir: temp,
-            target_fps: 60,
+            target_fps: crate::frame_rate::DEFAULT_FPS as i32,
             debug_enabled: false,
             log_level: LogLevel::Warn,
             max_memory_mb: 512,
@@ -369,14 +369,14 @@ impl InitOptions {
 
     /// Sets the target FPS (builder pattern).
     ///
-    /// Values are clamped to the range [1, 120].
+    /// Values are clamped to the range [`crate::frame_rate`] serves.
     ///
     /// # Arguments
     ///
     /// * `fps` - Target frames per second
     #[must_use]
     pub fn with_target_fps(mut self, fps: i32) -> Self {
-        self.target_fps = fps.clamp(1, 120);
+        self.target_fps = crate::frame_rate::clamp_fps(fps.max(0) as u32) as i32;
         self
     }
 

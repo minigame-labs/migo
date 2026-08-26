@@ -14,7 +14,7 @@ fail() {
 
 echo "[1/5] checking full/slim flavor constants"
 for flavor in full slim; do
-  grep -q "^[[:space:]]*$flavor[[:space:]]*{" "$GRADLE" \
+  grep -q "^[[:space:]]*${flavor}[[:space:]]*{" "$GRADLE" \
     || fail "missing Gradle $flavor flavor"
 done
 for field in MIGO_API_SENSORS MIGO_API_MEDIA MIGO_API_CONNECTIVITY \
