@@ -415,9 +415,10 @@ impl TextContext {
         )
     }
 
-    fn effective_families(&self, attrs: &TextAttrs) -> Vec<String> {
-        self.effective_families_for_text(attrs, None)
-    }
+    /// Inline capacity of the family chain. A CSS `font-family` list of three
+    /// or four names plus this engine's two fallbacks is the widest shape seen
+    /// in practice; a longer list spills to the heap and still works.
+    const FAMILY_CHAIN_INLINE: usize = 8;
 
     /// Compute the family fallback chain used when building a
     /// [`ParagraphStyle`] / [`TextStyle`].  R-1: the chain is
@@ -439,27 +440,37 @@ impl TextContext {
     /// the strategy Slint (parley + fontique) and Flutter (txt +
     /// `FontCollection::defaultFallback`) use.
     ///
-    /// The `text` parameter is retained (and ignored) so
-    /// callers that still pass the live paint text can be
-    /// rewritten to drop the argument incrementally without
-    /// breaking the build.
-    fn effective_families_for_text(&self, attrs: &TextAttrs, _text: Option<&str>) -> Vec<String> {
-        let mut families: Vec<String> = if attrs.families.is_empty() {
-            Vec::new()
-        } else {
-            attrs.families.iter().cloned().collect()
-        };
+    /// **Borrows the names rather than cloning them.** This runs once per
+    /// `fillText` / `strokeText` and once per measure miss, and it used to
+    /// return `Vec<String>`: one allocation for the vector plus one per author
+    /// family plus one per fallback appended — four heap events for the
+    /// ordinary `font-family: Arial`, every text draw, on the render thread.
+    /// Both consumers only ever read the names (`SkTextStyle::set_font_families`
+    /// takes `&[impl AsRef<str>]`, `SkFontMgr::match_family_style` takes
+    /// `&str`), so nothing needed to own them.
+    ///
+    /// The chain outlives neither `self` nor `attrs`, which is what makes the
+    /// borrow sound and is why the signature ties it to both.
+    ///
+    /// The `text` parameter this once took, retained-and-ignored so callers
+    /// could drop it incrementally, is gone with the last caller that passed it.
+    fn effective_families<'a>(
+        &'a self,
+        attrs: &'a TextAttrs,
+    ) -> smallvec::SmallVec<[&'a str; Self::FAMILY_CHAIN_INLINE]> {
+        let mut families: smallvec::SmallVec<[&'a str; Self::FAMILY_CHAIN_INLINE]> =
+            attrs.families.iter().map(String::as_str).collect();
         if !families
             .iter()
             .any(|f| f.eq_ignore_ascii_case(&self.system_fallback_family))
         {
-            families.push(self.system_fallback_family.clone());
+            families.push(&self.system_fallback_family);
         }
         if !families
             .iter()
             .any(|f| f.eq_ignore_ascii_case(&self.bundled_fallback_family))
         {
-            families.push(self.bundled_fallback_family.clone());
+            families.push(&self.bundled_fallback_family);
         }
         families
     }
@@ -1197,6 +1208,58 @@ mod tests {
             },
             |_| ctx.measure_text(label, &attrs).width,
         );
+    }
+
+    /// Section 7.3 on the family chain, which every text draw builds.
+    ///
+    /// Four heap events for `font-family: Arial` before this: the vector, the
+    /// author family's clone, and one per appended fallback. Borrowed, it is
+    /// zero — and the widest realistic chain still fits inline.
+    #[test]
+    fn building_the_family_chain_never_reaches_the_heap() {
+        let ctx = TextContext::new();
+        let mut attrs = test_attrs(16.0);
+        // A four-name CSS chain plus the two fallbacks: six of the eight
+        // inline slots, so the burst covers the shape that would spill first.
+        attrs.families = std::sync::Arc::new(vec![
+            "Helvetica Neue".to_string(),
+            "Helvetica".to_string(),
+            "Arial".to_string(),
+            "Liberation Sans".to_string(),
+        ]);
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "text: family fallback chain for one text draw",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| ctx.effective_families(&attrs).len(),
+        );
+    }
+
+    /// The chain's contents, since the burst above only proves it is cheap.
+    /// Both fallbacks appended, in order, and neither duplicated when the
+    /// author already named it.
+    #[test]
+    fn the_family_chain_appends_each_fallback_exactly_once() {
+        let ctx = TextContext::new();
+        let mut attrs = test_attrs(16.0);
+
+        attrs.families = std::sync::Arc::new(vec!["Arial".to_string()]);
+        let chain: Vec<&str> = ctx.effective_families(&attrs).to_vec();
+        assert_eq!(chain, vec!["Arial", "sans-serif", "migo-default-sans"]);
+
+        // Author already asked for the generic; it must not appear twice, and
+        // the match is case-insensitive.
+        attrs.families = std::sync::Arc::new(vec!["SANS-SERIF".to_string()]);
+        let chain: Vec<&str> = ctx.effective_families(&attrs).to_vec();
+        assert_eq!(chain, vec!["SANS-SERIF", "migo-default-sans"]);
+
+        // No author families at all: the fallbacks alone, still in order.
+        attrs.families = std::sync::Arc::new(Vec::new());
+        let chain: Vec<&str> = ctx.effective_families(&attrs).to_vec();
+        assert_eq!(chain, vec!["sans-serif", "migo-default-sans"]);
     }
 
     /// The obligation a hashed key takes on: two different strings that landed

@@ -142,7 +142,7 @@ pub(crate) struct CanvasGLState {
     /// (see `glBindBufferBase` / `glBindBufferRange`).  Value is
     /// `(buffer_id, offset, size)` so range-bindings dedup
     /// separately from full-buffer bindings.
-    pub bound_uniform_buffer_indexed: HashMap<u32, (Option<u32>, i32, i32)>,
+    pub bound_uniform_buffer_indexed: IndexedUniformBufferShadow,
     /// Active texture unit.
     pub active_texture_unit: Option<u32>,
     /// True when the DRAW_FRAMEBUFFER binding is the default framebuffer
@@ -223,7 +223,7 @@ pub(crate) struct CanvasGLState {
     /// `unpack_alignment`) where stricter typing helps — but
     /// the open-coded HashMap reliably dedups ANY `pixelStorei`
     /// pname without per-pname wiring.
-    pub pixel_store_i32: HashMap<u32, i32>,
+    pub pixel_store_i32: PixelStoreShadow,
 }
 
 // ============================================================================
@@ -451,6 +451,135 @@ impl<T: Copy + PartialEq> PerFace<T> {
     pub(crate) fn forget_all(&mut self) {
         self.front = None;
         self.back = None;
+    }
+}
+
+/// The `pixelStorei` parameters WebGL 1 and 2 let content set, in slot order.
+///
+/// Fixed by the spec: WebGL 1.0 §5.14.3 has the five alignment and conversion
+/// parameters, WebGL 2.0 adds the eight row/skip parameters. Anything else is a
+/// `GL_INVALID_ENUM` the driver rejects.
+const PIXEL_STORE_PNAMES: [u32; 13] = [
+    glow::PACK_ALIGNMENT,
+    glow::UNPACK_ALIGNMENT,
+    // The two WebGL-only pnames have no `glow` constant: they exist in the
+    // WebGL IDL, not in GL ES, and the engine forwards them to Skia's upload
+    // path rather than to `glPixelStorei`.
+    UNPACK_FLIP_Y_WEBGL,
+    UNPACK_PREMULTIPLY_ALPHA_WEBGL,
+    UNPACK_COLORSPACE_CONVERSION_WEBGL,
+    glow::UNPACK_ROW_LENGTH,
+    glow::UNPACK_SKIP_PIXELS,
+    glow::UNPACK_SKIP_ROWS,
+    glow::UNPACK_IMAGE_HEIGHT,
+    glow::UNPACK_SKIP_IMAGES,
+    glow::PACK_ROW_LENGTH,
+    glow::PACK_SKIP_PIXELS,
+    glow::PACK_SKIP_ROWS,
+];
+
+/// `UNPACK_FLIP_Y_WEBGL` — WebGL 1.0 §5.14.3, no GL ES equivalent.
+const UNPACK_FLIP_Y_WEBGL: u32 = 0x9240;
+/// `UNPACK_PREMULTIPLY_ALPHA_WEBGL` — WebGL 1.0 §5.14.3.
+const UNPACK_PREMULTIPLY_ALPHA_WEBGL: u32 = 0x9241;
+/// `UNPACK_COLORSPACE_CONVERSION_WEBGL` — WebGL 1.0 §5.14.3.
+const UNPACK_COLORSPACE_CONVERSION_WEBGL: u32 = 0x9243;
+
+/// `glPixelStorei(pname, param)` shadow.
+///
+/// Engines flip `UNPACK_FLIP_Y_WEBGL` and `UNPACK_PREMULTIPLY_ALPHA_WEBGL` in
+/// pairs around every texture upload, and content that uploads a video frame or
+/// a canvas snapshot does that per frame — so this is not only a load-time path.
+/// The key space is thirteen spec-fixed values, which an array addresses
+/// directly; it was a `HashMap<u32, i32>`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PixelStoreShadow {
+    params: [i32; PIXEL_STORE_PNAMES.len()],
+    /// Bit `i` set once `PIXEL_STORE_PNAMES[i]` has been observed. Needed
+    /// separately from the value because zero is a legal `param` and also the
+    /// array's initial content.
+    observed: u16,
+}
+
+impl PixelStoreShadow {
+    #[inline]
+    fn slot(pname: u32) -> Option<usize> {
+        let mut i = 0;
+        while i < PIXEL_STORE_PNAMES.len() {
+            if PIXEL_STORE_PNAMES[i] == pname {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Record `glPixelStorei(pname, param)`; `true` when the driver call must
+    /// be issued. An unrecognised pname forwards untracked.
+    #[inline]
+    pub(crate) fn update(&mut self, pname: u32, param: i32) -> bool {
+        let Some(i) = Self::slot(pname) else {
+            return true;
+        };
+        let bit = 1u16 << i;
+        if self.observed & bit != 0 && self.params[i] == param {
+            return false;
+        }
+        self.observed |= bit;
+        self.params[i] = param;
+        true
+    }
+
+    #[inline]
+    pub(crate) fn forget_all(&mut self) {
+        self.observed = 0;
+    }
+}
+
+/// Indexed `UNIFORM_BUFFER` bindings, one slot per binding index.
+///
+/// `glBindBufferBase` / `glBindBufferRange` take an index bounded by
+/// `MAX_UNIFORM_BUFFER_BINDINGS`, which WebGL 2 guarantees to be at least 24
+/// and GLES 3 hardware reports as 24 to 72. A UBO-driven renderer rebinds per
+/// draw, so this sat on the per-command path as a `HashMap<u32, _>` keyed by a
+/// small dense integer.
+///
+/// The value is `(buffer, offset, size)` so a `bindBufferRange` with a
+/// different window never coalesces with a `bindBufferBase`, which records
+/// `(buffer, 0, 0)` — the same distinction the map made.
+const MAX_TRACKED_UNIFORM_BUFFER_BINDINGS: usize = 32;
+
+#[derive(Clone, Debug)]
+pub(crate) struct IndexedUniformBufferShadow {
+    slots: [Option<(Option<u32>, i32, i32)>; MAX_TRACKED_UNIFORM_BUFFER_BINDINGS],
+}
+
+impl Default for IndexedUniformBufferShadow {
+    fn default() -> Self {
+        Self {
+            slots: [None; MAX_TRACKED_UNIFORM_BUFFER_BINDINGS],
+        }
+    }
+}
+
+impl IndexedUniformBufferShadow {
+    /// Record a binding at `index`; `true` when the driver call must be issued.
+    /// An index past the tracked range forwards untracked.
+    #[inline]
+    pub(crate) fn update(&mut self, index: u32, entry: (Option<u32>, i32, i32)) -> bool {
+        let Some(slot) = self.slots.get_mut(index as usize) else {
+            return true;
+        };
+        if *slot == Some(entry) {
+            return false;
+        }
+        *slot = Some(entry);
+        true
+    }
+
+    #[inline]
+    pub(crate) fn forget_all(&mut self) {
+        self.slots = [None; MAX_TRACKED_UNIFORM_BUFFER_BINDINGS];
     }
 }
 
@@ -803,7 +932,7 @@ impl Default for CanvasGLState {
             bound_copy_read_buffer: None,
             bound_copy_write_buffer: None,
             bound_transform_feedback_buffer: None,
-            bound_uniform_buffer_indexed: HashMap::new(),
+            bound_uniform_buffer_indexed: IndexedUniformBufferShadow::default(),
             active_texture_unit: None,
             // Initial GL state: default framebuffer is bound.
             draws_to_default_fbo: true,
@@ -830,7 +959,7 @@ impl Default for CanvasGLState {
             stencil_func: PerFace::default(),
             stencil_op: PerFace::default(),
             stencil_mask: PerFace::default(),
-            pixel_store_i32: HashMap::new(),
+            pixel_store_i32: PixelStoreShadow::default(),
         }
     }
 }
@@ -876,7 +1005,7 @@ impl CanvasGLState {
         self.stencil_func.forget_all();
         self.stencil_op.forget_all();
         self.stencil_mask.forget_all();
-        self.pixel_store_i32.clear();
+        self.pixel_store_i32.forget_all();
     }
 
     pub fn invalidate_after_external_gl_use(&mut self) {
@@ -891,7 +1020,7 @@ impl CanvasGLState {
         self.bound_copy_read_buffer = None;
         self.bound_copy_write_buffer = None;
         self.bound_transform_feedback_buffer = None;
-        self.bound_uniform_buffer_indexed.clear();
+        self.bound_uniform_buffer_indexed.forget_all();
         self.active_texture_unit = None;
         // Scissor: Skia typically leaves it disabled after its draw
         // batch completes.  Reset to the conservative "don't know

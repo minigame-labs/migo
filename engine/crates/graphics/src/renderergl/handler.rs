@@ -1908,6 +1908,30 @@ impl RendererGL {
                 let py = logical_to_physical_i32(cm, y);
                 let pw = logical_to_physical_i32(cm, width);
                 let ph = logical_to_physical_i32(cm, height);
+                // NOT deduped, and the reason is not that nobody looked.
+                //
+                // `last_scissor_rect` below would serve as the shadow, and the
+                // damage bookkeeping that follows is already separable from the
+                // driver call — so the dedup looks like three lines. It is not,
+                // because the engine re-points the driver's scissor rect behind
+                // this tracker's back: `dirty_region::apply_scissor` sets it on
+                // the present path for every partial-damage Canvas2D batch, and
+                // `drawing_buffer` toggles `SCISSOR_TEST` around the blit.
+                //
+                // That is precisely the shape of the defect
+                // `state_tracker::record_default_framebuffer_bind` exists to
+                // prevent: shadow says A, engine set B, content re-asserts A,
+                // dedup eats it, and every subsequent draw is clipped to B.
+                // Silent, and wrong pixels rather than a slow frame.
+                //
+                // Landing it safely means giving scissor the same treatment the
+                // framebuffer binding got — a `record_engine_scissor_change()`
+                // at `dirty_region::apply_scissor`, at `clear_scissor`, and at
+                // each `drawing_buffer` site that touches the rect — and missing
+                // one of them is the bug. Worth doing when a profile shows
+                // `glScissor` volume that justifies it; there is no such data
+                // today, and a UI that sets scissor once per clip is not
+                // obviously a problem.
                 unsafe { gl.scissor(px, py, pw, ph) };
                 let s = cm.gl_state.entry(canvas_id).or_default();
                 s.last_scissor_rect = Some((px, py, pw, ph));

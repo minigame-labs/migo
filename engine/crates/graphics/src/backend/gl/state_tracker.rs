@@ -25,6 +25,43 @@ use glow::{self};
 use crate::canvas::{BlendEquation, BlendFactors, CanvasGLState, MAX_UNIFORM_CACHE};
 use shared::protocol::render_cmd::{BufferId, ProgramId, VaoId};
 
+/// Pass a "must issue" decision through the `state_changes` diagnostic.
+///
+/// **Every `update_*` in this module returns through here, and that is what
+/// makes the counter mean something.** `state_changes` was plumbed end to end —
+/// accumulator field, forwarder, atomic aggregation, debug overlay — and never
+/// incremented from anywhere, so it read zero on every frame of every build.
+/// Zero is the opposite of the truth on this path: state calls outnumber draws
+/// by an order of magnitude, which is why this whole module exists.
+///
+/// A `true` from an `update_*` means the caller issues the driver call —
+/// checked at all 37 call sites in [`crate::renderergl`], including the four
+/// that bind the result to a local first — so this counts driver state calls,
+/// not merely shadow mutations. It rides along with a `gl.*` call that costs
+/// hundreds of nanoseconds, so a thread-local increment on that branch is
+/// noise; the deduped branch, which is the hot one, does not touch it.
+///
+/// With it live, `state_changes / draw_calls` is readable per frame, which is
+/// what any question about dedup effectiveness or draw-call batching needs and
+/// nobody could ask before.
+///
+/// **The counter cannot over-count, structurally.** Every `update_*` leaves by
+/// `return false` on its deduped path, before reaching here, so this is
+/// unreachable for a call that does not issue — the `must_issue` branch is
+/// belt-and-braces rather than the thing doing the work. Found while trying to
+/// mutate the counter into over-counting and failing: making this increment
+/// unconditionally changed no test, because the dedup path never arrives. The
+/// one shape that *can* over-count is wrapping a convenience setter alongside
+/// the `_separate` form it delegates to, and
+/// `a_delegating_setter_is_counted_once_not_twice` covers that.
+#[inline]
+fn issue_if(must_issue: bool) -> bool {
+    if must_issue {
+        crate::render_diagnostics::bump_state_change();
+    }
+    must_issue
+}
+
 // ============================================================================
 // Program / uniforms
 // ============================================================================
@@ -49,7 +86,7 @@ pub(crate) fn update_use_program(state: &mut CanvasGLState, new: ProgramId) -> b
         return false;
     }
     state.current_program = Some(new);
-    true
+    issue_if(true)
 }
 
 /// Forget every cached uniform value for `program`.
@@ -104,13 +141,13 @@ pub(crate) fn update_uniform(
     location: u32,
     value_bytes: &[u8],
 ) -> bool {
-    super::uniform_cache::update(
+    issue_if(super::uniform_cache::update(
         &mut state.uniform_cache,
         MAX_UNIFORM_CACHE,
         program,
         location,
         value_bytes,
-    )
+    ))
 }
 
 // ============================================================================
@@ -150,7 +187,7 @@ pub(crate) fn update_bind_buffer(
                 false
             } else {
                 state.$slot = new_opt;
-                true
+                issue_if(true)
             }
         }};
     }
@@ -163,7 +200,7 @@ pub(crate) fn update_bind_buffer(
         GL_COPY_READ_BUFFER => dedup_slot!(bound_copy_read_buffer),
         GL_COPY_WRITE_BUFFER => dedup_slot!(bound_copy_write_buffer),
         GL_TRANSFORM_FEEDBACK_BUFFER => dedup_slot!(bound_transform_feedback_buffer),
-        _ => true,
+        _ => issue_if(true),
     }
 }
 
@@ -186,14 +223,13 @@ pub(crate) fn update_bind_buffer_base(
     // and re-binding it mid-feedback is already guarded by the GL
     // driver; we stay conservative and don't dedup it here.
     if target != GL_UNIFORM_BUFFER {
-        return true;
+        return issue_if(true);
     }
-    let entry = (buffer, 0, 0);
-    if state.bound_uniform_buffer_indexed.get(&index) == Some(&entry) {
-        return false;
-    }
-    state.bound_uniform_buffer_indexed.insert(index, entry);
-    true
+    issue_if(
+        state
+            .bound_uniform_buffer_indexed
+            .update(index, (buffer, 0, 0)),
+    )
 }
 
 /// Track `glBindBufferRange(target, index, buf, offset, size)`
@@ -209,14 +245,13 @@ pub(crate) fn update_bind_buffer_range(
 ) -> bool {
     const GL_UNIFORM_BUFFER: u32 = 0x8A11;
     if target != GL_UNIFORM_BUFFER {
-        return true;
+        return issue_if(true);
     }
-    let entry = (buffer, offset, size);
-    if state.bound_uniform_buffer_indexed.get(&index) == Some(&entry) {
-        return false;
-    }
-    state.bound_uniform_buffer_indexed.insert(index, entry);
-    true
+    issue_if(
+        state
+            .bound_uniform_buffer_indexed
+            .update(index, (buffer, offset, size)),
+    )
 }
 
 pub(crate) fn update_bind_vertex_array(state: &mut CanvasGLState, new: Option<VaoId>) -> bool {
@@ -230,7 +265,7 @@ pub(crate) fn update_bind_vertex_array(state: &mut CanvasGLState, new: Option<Va
     // forget our cached values to stay correct.
     state.bound_array_buffer = None;
     state.bound_element_array_buffer = None;
-    true
+    issue_if(true)
 }
 
 // ============================================================================
@@ -242,7 +277,7 @@ pub(crate) fn update_active_texture(state: &mut CanvasGLState, unit: u32) -> boo
         return false;
     }
     state.active_texture_unit = Some(unit);
-    true
+    issue_if(true)
 }
 
 /// Dedup `glBindTexture(TEXTURE_2D, tex)` scoped to the currently
@@ -251,9 +286,9 @@ pub(crate) fn update_active_texture(state: &mut CanvasGLState, unit: u32) -> boo
 pub(crate) fn update_bind_texture_2d(state: &mut CanvasGLState, tex: Option<u32>) -> bool {
     let unit = match state.active_texture_unit {
         Some(u) => u,
-        None => return true,
+        None => return issue_if(true),
     };
-    state.bound_texture_2d.bind(unit, tex)
+    issue_if(state.bound_texture_2d.bind(unit, tex))
 }
 
 // ============================================================================
@@ -277,13 +312,15 @@ pub(crate) fn update_viewport(
         return false;
     }
     state.viewport = Some(new);
-    true
+    issue_if(true)
 }
 
 // ============================================================================
 // Blend state
 // ============================================================================
 
+/// No [`issue_if`] here on purpose: the `_separate` form it delegates to
+/// already counts. Wrapping both would report two driver calls for one.
 pub(crate) fn update_blend_func(state: &mut CanvasGLState, src: u32, dst: u32) -> bool {
     update_blend_func_separate(state, src, dst, src, dst)
 }
@@ -305,9 +342,11 @@ pub(crate) fn update_blend_func_separate(
         return false;
     }
     state.blend_factors = Some(new);
-    true
+    issue_if(true)
 }
 
+/// Counted by the `_separate` form it delegates to; see
+/// [`update_blend_func`].
 pub(crate) fn update_blend_equation(state: &mut CanvasGLState, mode: u32) -> bool {
     update_blend_equation_separate(state, mode, mode)
 }
@@ -325,7 +364,7 @@ pub(crate) fn update_blend_equation_separate(
         return false;
     }
     state.blend_equation = Some(new);
-    true
+    issue_if(true)
 }
 
 pub(crate) fn update_blend_color(
@@ -340,7 +379,7 @@ pub(crate) fn update_blend_color(
         return false;
     }
     state.blend_color = Some(new);
-    true
+    issue_if(true)
 }
 
 // ============================================================================
@@ -352,7 +391,7 @@ pub(crate) fn update_depth_func(state: &mut CanvasGLState, func: u32) -> bool {
         return false;
     }
     state.depth_func = Some(func);
-    true
+    issue_if(true)
 }
 
 pub(crate) fn update_depth_mask(state: &mut CanvasGLState, flag: bool) -> bool {
@@ -360,7 +399,7 @@ pub(crate) fn update_depth_mask(state: &mut CanvasGLState, flag: bool) -> bool {
         return false;
     }
     state.depth_mask = Some(flag);
-    true
+    issue_if(true)
 }
 
 pub(crate) fn update_depth_range(state: &mut CanvasGLState, near: f32, far: f32) -> bool {
@@ -369,7 +408,7 @@ pub(crate) fn update_depth_range(state: &mut CanvasGLState, near: f32, far: f32)
         return false;
     }
     state.depth_range = Some(new);
-    true
+    issue_if(true)
 }
 
 // ============================================================================
@@ -389,7 +428,7 @@ pub(crate) fn update_stencil_func(
     ref_: i32,
     mask: u32,
 ) -> bool {
-    state.stencil_func.update(face, (func, ref_, mask))
+    issue_if(state.stencil_func.update(face, (func, ref_, mask)))
 }
 
 #[inline]
@@ -400,12 +439,12 @@ pub(crate) fn update_stencil_op(
     dpfail: u32,
     dppass: u32,
 ) -> bool {
-    state.stencil_op.update(face, (sfail, dpfail, dppass))
+    issue_if(state.stencil_op.update(face, (sfail, dpfail, dppass)))
 }
 
 #[inline]
 pub(crate) fn update_stencil_mask(state: &mut CanvasGLState, face: u32, mask: u32) -> bool {
-    state.stencil_mask.update(face, mask)
+    issue_if(state.stencil_mask.update(face, mask))
 }
 
 // ============================================================================
@@ -418,11 +457,7 @@ pub(crate) fn update_stencil_mask(state: &mut CanvasGLState, face: u32, mask: u3
 /// back to "update and issue" every call (same as before).
 #[inline]
 pub(crate) fn update_pixel_store_i32(state: &mut CanvasGLState, pname: u32, param: i32) -> bool {
-    if state.pixel_store_i32.get(&pname) == Some(&param) {
-        return false;
-    }
-    state.pixel_store_i32.insert(pname, param);
-    true
+    issue_if(state.pixel_store_i32.update(pname, param))
 }
 
 pub(crate) fn update_cull_face(state: &mut CanvasGLState, mode: u32) -> bool {
@@ -430,7 +465,7 @@ pub(crate) fn update_cull_face(state: &mut CanvasGLState, mode: u32) -> bool {
         return false;
     }
     state.cull_face = Some(mode);
-    true
+    issue_if(true)
 }
 
 pub(crate) fn update_front_face(state: &mut CanvasGLState, mode: u32) -> bool {
@@ -438,7 +473,7 @@ pub(crate) fn update_front_face(state: &mut CanvasGLState, mode: u32) -> bool {
         return false;
     }
     state.front_face = Some(mode);
-    true
+    issue_if(true)
 }
 
 pub(crate) fn update_line_width(state: &mut CanvasGLState, width: f32) -> bool {
@@ -446,7 +481,7 @@ pub(crate) fn update_line_width(state: &mut CanvasGLState, width: f32) -> bool {
         return false;
     }
     state.line_width = Some(width);
-    true
+    issue_if(true)
 }
 
 pub(crate) fn update_polygon_offset(state: &mut CanvasGLState, factor: f32, units: f32) -> bool {
@@ -455,7 +490,7 @@ pub(crate) fn update_polygon_offset(state: &mut CanvasGLState, factor: f32, unit
         return false;
     }
     state.polygon_offset = Some(new);
-    true
+    issue_if(true)
 }
 
 // ============================================================================
@@ -472,14 +507,14 @@ pub(crate) fn update_polygon_offset(state: &mut CanvasGLState, factor: f32, unit
 #[inline]
 pub(crate) fn update_enable(state: &mut CanvasGLState, cap: u32) -> bool {
     let changed = state.capabilities.enable(cap);
-    changed || cap == glow::STENCIL_TEST
+    issue_if(changed || cap == glow::STENCIL_TEST)
 }
 
 /// `glDisable(cap)` — returns true if a real call is required.
 #[inline]
 pub(crate) fn update_disable(state: &mut CanvasGLState, cap: u32) -> bool {
     let changed = state.capabilities.disable(cap);
-    changed || cap == glow::STENCIL_TEST
+    issue_if(changed || cap == glow::STENCIL_TEST)
 }
 
 // ============================================================================
@@ -497,7 +532,7 @@ pub(crate) fn update_bind_framebuffer(
     target: u32,
     fb: Option<u32>,
 ) -> bool {
-    state.bound_framebuffer.update(target, fb)
+    issue_if(state.bound_framebuffer.update(target, fb))
 }
 
 /// Record that the *engine* re-pointed this canvas at its default framebuffer,
@@ -532,7 +567,7 @@ pub(crate) fn update_bind_renderbuffer(state: &mut CanvasGLState, rb: Option<u32
         Some(shadow) if shadow == rb => false,
         _ => {
             state.bound_renderbuffer = Some(rb);
-            true
+            issue_if(true)
         }
     }
 }
@@ -550,7 +585,7 @@ pub(crate) fn update_color_mask(
         return false;
     }
     state.color_mask = new;
-    true
+    issue_if(true)
 }
 
 // ============================================================================
@@ -563,14 +598,14 @@ pub(crate) fn update_enable_vertex_attrib(state: &mut CanvasGLState, index: u32)
     // Enable state is per-VAO: scope the shadow by the bound VAO so that
     // re-enabling the same index on a different VAO still hits the driver.
     let vao = state.bound_vao.unwrap_or(0);
-    state.vertex_attribs.enable(vao, index)
+    issue_if(state.vertex_attribs.enable(vao, index))
 }
 
 /// `glDisableVertexAttribArray(index)`.  Returns `true` when the index
 /// was previously tracked as enabled *for the currently bound VAO*.
 pub(crate) fn update_disable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
     let vao = state.bound_vao.unwrap_or(0);
-    state.vertex_attribs.disable(vao, index)
+    issue_if(state.vertex_attribs.disable(vao, index))
 }
 
 /// `glVertexAttribPointer(index, size, type, normalized, stride, offset)`.
@@ -612,7 +647,7 @@ pub(crate) fn update_vertex_attrib_pointer(
         // state by tracking None explicitly in the fingerprint.
         array_buffer: state.bound_array_buffer.and_then(|b| b),
     };
-    state.vertex_attribs.update_pointer(vao, index, fp)
+    issue_if(state.vertex_attribs.update_pointer(vao, index, fp))
 }
 
 /// `glVertexAttribDivisor(index, divisor)` dedup for WebGL 2 /
@@ -624,7 +659,7 @@ pub(crate) fn update_vertex_attrib_divisor(
 ) -> bool {
     // Divisor is per-VAO: scope the shadow by the bound VAO.
     let vao = state.bound_vao.unwrap_or(0);
-    state.vertex_attribs.update_divisor(vao, index, divisor)
+    issue_if(state.vertex_attribs.update_divisor(vao, index, divisor))
 }
 
 /// Test-only helper: construct a fresh state as the baseline for tests.
@@ -1071,6 +1106,125 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // The `state_changes` diagnostic
+    //
+    // It was plumbed end to end and incremented from nowhere, so it read zero
+    // on every frame of every build — on a path where state calls outnumber
+    // draws by an order of magnitude. These pin that it now equals the number
+    // of driver state calls the tracker admits, which is what makes
+    // `state_changes / draw_calls` readable and any question about dedup
+    // effectiveness or draw-call batching answerable.
+    //
+    // Serialised on one lock: the diagnostics sink is a process-wide
+    // thread-local and `install` replaces it, so two of these running
+    // concurrently in the same test binary would each see the other's bumps.
+    // That is the mistake a previous round made with a shared executor, and it
+    // reads as a flaky count rather than as a shared-state bug.
+    // ---------------------------------------------------------------------
+
+    static DIAGNOSTICS_SINK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `body` against a fresh diagnostics sink and return the
+    /// `state_changes` it published.
+    fn state_changes_during(body: impl FnOnce()) -> u32 {
+        use std::sync::atomic::Ordering;
+        let _serialise = DIAGNOSTICS_SINK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::render_diagnostics::uninstall_for_tests();
+        let stats = std::sync::Arc::new(shared::stats::DebugStats::default());
+        crate::render_diagnostics::install(stats.clone());
+        body();
+        crate::render_diagnostics::flush_frame();
+        let observed = stats.state_changes.load(Ordering::Relaxed);
+        crate::render_diagnostics::uninstall_for_tests();
+        observed
+    }
+
+    /// The counter equals the calls that reach the driver, not the calls the
+    /// content made. Deduped calls must not appear or the number says nothing
+    /// about what the driver saw.
+    #[test]
+    fn the_state_change_counter_counts_driver_calls_not_content_calls() {
+        let observed = state_changes_during(|| {
+            let mut s = fresh_state();
+            // Six content calls; three distinct states. `update_viewport`,
+            // `update_depth_func` and `update_cull_face` each issue once and
+            // dedup once.
+            for _ in 0..2 {
+                update_viewport(&mut s, 0, 0, 1080, 1920);
+                update_depth_func(&mut s, glow::LESS);
+                update_cull_face(&mut s, glow::BACK);
+            }
+        });
+
+        assert_eq!(
+            observed, 3,
+            "expected 3 driver calls for 6 content calls; a counter that reads \
+             6 is counting content calls, and one that reads 0 is not wired up"
+        );
+    }
+
+    /// A fully-deduped frame must report zero — that is the claim the dedup
+    /// layer exists to make, and the counter is how anyone sees it.
+    #[test]
+    fn a_fully_deduped_frame_reports_no_state_changes() {
+        let mut s = fresh_state();
+        // Establish every shadow outside the measurement.
+        update_viewport(&mut s, 0, 0, 1080, 1920);
+        update_use_program(&mut s, 1);
+        update_enable(&mut s, glow::BLEND);
+        update_bind_buffer(&mut s, glow::ARRAY_BUFFER, Some(7));
+
+        let observed = state_changes_during(|| {
+            for _ in 0..50 {
+                update_viewport(&mut s, 0, 0, 1080, 1920);
+                update_use_program(&mut s, 1);
+                update_bind_buffer(&mut s, glow::ARRAY_BUFFER, Some(7));
+            }
+        });
+
+        assert_eq!(
+            observed, 0,
+            "a frame that changed nothing reported {observed} driver state calls"
+        );
+    }
+
+    /// `glEnable(STENCIL_TEST)` is deliberately never deduped — Skia toggles it
+    /// outside this tracker. So it issues every time, and the counter has to say
+    /// so rather than report the shadow's opinion.
+    #[test]
+    fn the_never_deduped_capability_is_counted_every_time() {
+        let observed = state_changes_during(|| {
+            let mut s = fresh_state();
+            for _ in 0..4 {
+                update_enable(&mut s, glow::STENCIL_TEST);
+            }
+        });
+
+        assert_eq!(
+            observed, 4,
+            "STENCIL_TEST reaches the driver on every call, so all four must be \
+             counted"
+        );
+    }
+
+    /// The convenience forms delegate to their `_separate` counterparts, which
+    /// already count. One content call must not report two driver calls.
+    #[test]
+    fn a_delegating_setter_is_counted_once_not_twice() {
+        let observed = state_changes_during(|| {
+            let mut s = fresh_state();
+            update_blend_func(&mut s, glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            update_blend_equation(&mut s, glow::FUNC_ADD);
+        });
+
+        assert_eq!(
+            observed, 2,
+            "two content calls reported {observed} driver calls — the delegating \
+             form is counting alongside the one it delegates to"
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // The per-VAO vertex-attribute shadow
     //
     // The ten tests above pin the dedup semantics and passed unchanged across
@@ -1454,6 +1608,134 @@ mod tests {
         const NOT_A_TARGET: u32 = 0x4321;
         assert!(update_bind_framebuffer(&mut s, NOT_A_TARGET, Some(3)));
         assert!(update_bind_framebuffer(&mut s, NOT_A_TARGET, Some(3)));
+    }
+
+    /// Every `pixelStorei` parameter WebGL exposes has to be tracked, or a real
+    /// upload knob goes undeduped. Enumerated rather than spot-checked, so
+    /// adding one to the spec list without adding it to the shadow shows up.
+    #[test]
+    fn every_webgl_pixel_store_parameter_is_tracked() {
+        // The two WebGL-only pnames have no `glow` constant.
+        const UNPACK_FLIP_Y_WEBGL: u32 = 0x9240;
+        const UNPACK_PREMULTIPLY_ALPHA_WEBGL: u32 = 0x9241;
+        const UNPACK_COLORSPACE_CONVERSION_WEBGL: u32 = 0x9243;
+        for pname in [
+            glow::PACK_ALIGNMENT,
+            glow::UNPACK_ALIGNMENT,
+            UNPACK_FLIP_Y_WEBGL,
+            UNPACK_PREMULTIPLY_ALPHA_WEBGL,
+            UNPACK_COLORSPACE_CONVERSION_WEBGL,
+            glow::UNPACK_ROW_LENGTH,
+            glow::UNPACK_SKIP_PIXELS,
+            glow::UNPACK_SKIP_ROWS,
+            glow::UNPACK_IMAGE_HEIGHT,
+            glow::UNPACK_SKIP_IMAGES,
+            glow::PACK_ROW_LENGTH,
+            glow::PACK_SKIP_PIXELS,
+            glow::PACK_SKIP_ROWS,
+        ] {
+            let mut s = fresh_state();
+            assert!(
+                update_pixel_store_i32(&mut s, pname, 4),
+                "pname {pname:#x} first set"
+            );
+            assert!(
+                !update_pixel_store_i32(&mut s, pname, 4),
+                "pname {pname:#x} is not being tracked, so every redundant \
+                 pixelStorei reaches the driver"
+            );
+            assert!(
+                update_pixel_store_i32(&mut s, pname, 1),
+                "pname {pname:#x} value change"
+            );
+        }
+    }
+
+    /// Zero is a legal `param` *and* the array's initial content, so the shadow
+    /// needs an observed bit rather than a value comparison alone. Without it,
+    /// the first `pixelStorei(pname, 0)` a game issues to undo an earlier
+    /// setting would be deduped and the driver would keep the old value.
+    #[test]
+    fn a_first_pixel_store_of_zero_still_reaches_the_driver() {
+        let mut s = fresh_state();
+        assert!(
+            update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 0),
+            "an unobserved pname was deduped against the array's zero initialiser"
+        );
+        assert!(!update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 0));
+    }
+
+    #[test]
+    fn an_unknown_pixel_store_parameter_is_forwarded_every_time() {
+        let mut s = fresh_state();
+        const NOT_A_PNAME: u32 = 0x4323;
+        assert!(update_pixel_store_i32(&mut s, NOT_A_PNAME, 1));
+        assert!(update_pixel_store_i32(&mut s, NOT_A_PNAME, 1));
+    }
+
+    /// Indexed UBO bindings: each index is its own slot, and a
+    /// `bindBufferRange` window must never coalesce with the
+    /// `bindBufferBase` that records `(buffer, 0, 0)`.
+    #[test]
+    fn indexed_uniform_buffer_bindings_are_tracked_per_index_and_window() {
+        const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+        let mut s = fresh_state();
+
+        assert!(update_bind_buffer_base(&mut s, GL_UNIFORM_BUFFER, 0, Some(7)));
+        assert!(!update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            0,
+            Some(7)
+        ));
+        // A different index is a different slot.
+        assert!(update_bind_buffer_base(&mut s, GL_UNIFORM_BUFFER, 5, Some(7)));
+        // Same buffer and index, but a window rather than the whole buffer.
+        assert!(
+            update_bind_buffer_range(&mut s, GL_UNIFORM_BUFFER, 0, Some(7), 256, 64),
+            "a range binding was deduped against a base binding of the same buffer"
+        );
+        assert!(!update_bind_buffer_range(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            0,
+            Some(7),
+            256,
+            64
+        ));
+        // And back to the whole buffer must re-issue.
+        assert!(update_bind_buffer_base(&mut s, GL_UNIFORM_BUFFER, 0, Some(7)));
+    }
+
+    #[test]
+    fn the_last_tracked_uniform_buffer_binding_dedups_and_past_it_forwards() {
+        const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+        let mut s = fresh_state();
+        assert!(update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            31,
+            Some(1)
+        ));
+        assert!(!update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            31,
+            Some(1)
+        ));
+        // Past the tracked range: forwarded, never deduped.
+        assert!(update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            32,
+            Some(1)
+        ));
+        assert!(update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            32,
+            Some(1)
+        ));
     }
 
     #[test]

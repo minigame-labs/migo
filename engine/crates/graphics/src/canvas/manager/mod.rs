@@ -164,6 +164,42 @@ fn should_latch_default_fbo_readback(needs_default_fbo_readback: bool) -> bool {
     !needs_default_fbo_readback
 }
 
+/// Gather one frame's worth of upload completions into a reusable buffer:
+/// whatever was deferred from earlier frames, then whatever `fill` produces.
+///
+/// **Both vectors keep their allocations.** The shape this replaced —
+/// `let mut v = Vec::new(); fill(&mut v); let mut d = mem::take(&mut pending);
+/// d.extend(v); for x in d { … pending.push(x) }` — gave one back and bought
+/// another every frame that had an upload in flight, because consuming `d` by
+/// value frees its buffer while `mem::take` has already reduced `pending` to
+/// capacity zero. During a level load or texture streaming that is a `malloc`
+/// and a `free` per frame on the render thread.
+///
+/// `Vec::append` is what makes it free: it moves the elements out of `pending`
+/// and leaves it empty *with its capacity intact*, so the caller's re-defer
+/// pushes land in the buffer that is already there. `fill` drains straight into
+/// the scratch, which removes the intermediate vector entirely.
+///
+/// Element order is preserved — deferred first, newly arrived after — because
+/// the caller's fence check is order-sensitive in one direction: an upload
+/// deferred N frames ago is the one most likely to be ready now, and putting it
+/// first keeps the common case at the front of the scan.
+///
+/// A free function rather than a method so the allocation claim can be gated
+/// without a GL context: [`CanvasManager::drain_upload_completed`] calls
+/// `glClientWaitSync`, and reaching it needs a live context.
+fn stage_upload_drain<T>(
+    scratch: &mut Vec<T>,
+    pending: &mut Vec<T>,
+    fill: impl FnOnce(&mut Vec<T>),
+) -> Vec<T> {
+    let mut staged = std::mem::take(scratch);
+    staged.clear();
+    staged.append(pending);
+    fill(&mut staged);
+    staged
+}
+
 fn decide_async_upload_reject_action(
     upload_thread_healthy: bool,
     upload_server: Option<&crate::upload_server::UploadServer>,
@@ -481,6 +517,12 @@ pub(crate) struct CanvasManager {
     /// Uploads whose GPU fence has not yet signaled.
     /// Re-checked each frame in `drain_upload_completed()`.
     pending_uploads: Vec<crate::upload_thread::CompletedUpload>,
+    /// Working buffer for [`Self::drain_upload_completed`], held across frames
+    /// so neither it nor `pending_uploads` ever hands its allocation back.
+    /// See [`stage_upload_drain`].
+    upload_drain_scratch: Vec<crate::upload_thread::CompletedUpload>,
+    /// Working buffer for the dropped-upload half of the same drain.
+    upload_dropped_scratch: Vec<crate::upload_thread::DroppedUpload>,
 
     /// Deferred LoadImage responses — sent only after the async upload
     /// thread has completed and the texture is registered.
@@ -851,6 +893,8 @@ impl CanvasManager {
             upload_thread,
             shader_cache,
             pending_uploads: Vec::new(),
+            upload_drain_scratch: Vec::new(),
+            upload_dropped_scratch: Vec::new(),
             pending_load_responses: HashMap::new(),
             deferred_uploads: std::collections::VecDeque::new(),
             cancelled_uploads: HashSet::new(),
@@ -2665,6 +2709,28 @@ impl CanvasManager {
 
     // ==================== Context Binding ====================
 
+    /// Make the resource context current.
+    ///
+    /// **Unconditionally, unlike [`Self::make_current_needed`], and that
+    /// asymmetry is load-bearing.** The obvious symmetry fix — an
+    /// `if self.bound == BoundContext::Resource { return Ok(()) }` guard —
+    /// introduces a use-after-destroy.
+    ///
+    /// The caller that forbids it is context recreation after a GPU reset
+    /// (`recreate_contexts_after_loss`, the `bind_resource()` a few dozen lines
+    /// below the new `self.resource = …`): at that point `self.bound` can still
+    /// read `Resource` from *before* the recreation, naming the context that was
+    /// just destroyed. The shadow is stale by construction there, so a guard
+    /// that trusted it would skip the `eglMakeCurrent` and leave the thread
+    /// current on a dead context — every GL call after it undefined.
+    ///
+    /// The cost of not guarding is a redundant `eglMakeCurrent` on the paths
+    /// where the shadow *is* accurate. Those are the canvas-destroy sweep and
+    /// `restore_bound` with a saved `Resource`, neither of which is the
+    /// steady-state frame path: a rendering frame is bound to a canvas, and
+    /// `restore_bound` reaches the canvas arm, which does short-circuit through
+    /// `make_current_needed`. So the redundancy is off the hot path and the
+    /// hazard it would trade for is not.
     pub(super) fn bind_resource(&mut self) -> EngineResult<()> {
         self.egl
             .make_current(
@@ -2738,19 +2804,28 @@ impl CanvasManager {
     ///
     /// Called once per frame from the render thread (non-blocking).
     /// Returns the number of dropped upload recoveries processed this call.
+    ///
+    /// Allocation-free in steady state; see [`stage_upload_drain`].
     pub(crate) fn drain_upload_completed(&mut self) -> u32 {
         let upload = match self.upload_thread.as_mut() {
             Some(u) => u,
             None => return 0,
         };
 
-        let mut completed = Vec::new();
-        upload.drain_completed(&mut completed);
+        // Both halves stage into scratch buffers that outlive the frame. See
+        // `stage_upload_drain` for why the obvious `Vec::new()` + `for x in v`
+        // shape was an allocation round trip per frame.
+        let mut deferred = stage_upload_drain(
+            &mut self.upload_drain_scratch,
+            &mut self.pending_uploads,
+            |sink| upload.drain_completed(sink),
+        );
 
         // Process uploads that completed but whose results could not be
         // delivered (result channel full/disconnected).  Each item carries
         // image_id + byte_len for consistent per-item recovery.
-        let mut dropped = Vec::new();
+        let mut dropped = std::mem::take(&mut self.upload_dropped_scratch);
+        dropped.clear();
         upload.drain_dropped(&mut dropped);
         let dropped_recovery_count = dropped.len() as u32;
         for d in &dropped {
@@ -2774,41 +2849,9 @@ impl CanvasManager {
             self.cancelled_uploads.remove(&d.image_id);
         }
 
-        // Also re-check any previously deferred uploads.
-        //
-        // MEASURED, NOT DONE — one allocation round trip per frame while any
-        // upload is in flight.
-        //
-        // `for c in deferred` consumes the vector, so its buffer is freed at the
-        // end of the loop; `std::mem::take` above left `pending_uploads` at
-        // capacity zero, so the re-defer push below has to buy a new one. During
-        // a level load or texture streaming that is a `malloc` and a `free` per
-        // frame on the render thread, which is what Section 7.3 forbids.
-        //
-        // The fix is `Vec::append`, which moves the elements and leaves the
-        // source empty *with its capacity intact*, plus a scratch vector held in
-        // a field so it survives the frame:
-        //
-        //     let mut scratch = std::mem::take(&mut self.upload_drain_scratch);
-        //     scratch.append(&mut self.pending_uploads);
-        //     upload.drain_completed(&mut scratch);
-        //     for c in scratch.drain(..) { … self.pending_uploads.push(c) … }
-        //     self.upload_drain_scratch = scratch;
-        //
-        // which also removes the `completed` vector entirely by draining
-        // straight into the scratch. Element order is unchanged: deferred first,
-        // newly completed after.
-        //
-        // Left undone because it cannot be gated from here. The claim is about
-        // the heap, so the instrument has to be `assert_no_steady_state_
-        // allocation`, and this function calls `self.gl.client_wait_sync`, so
-        // reaching it needs a live GL context. Landing this wants an
-        // `UploadThread` fixture first — otherwise the change is an untested
-        // edit to a path that decides whether a texture is registered or leaked.
-        let mut deferred = std::mem::take(&mut self.pending_uploads);
-        deferred.extend(completed);
-
-        for c in deferred {
+        // Deferred first, newly completed after — the order `stage_upload_drain`
+        // preserves and the order this loop has always seen.
+        for c in deferred.drain(..) {
             // Non-blocking fence check (timeout = 0).
             let status = unsafe { self.gl.client_wait_sync(c.fence, 0, 0) };
 
@@ -2851,10 +2894,16 @@ impl CanvasManager {
                     c.height
                 );
             } else {
-                // Not ready yet — defer to next frame.
+                // Not ready yet — defer to next frame. `stage_upload_drain`
+                // left `pending_uploads` empty but with its capacity, so this
+                // does not go to the heap.
                 self.pending_uploads.push(c);
             }
         }
+        // Both scratch buffers go home empty, keeping their capacity for the
+        // next frame.
+        self.upload_drain_scratch = deferred;
+        self.upload_dropped_scratch = dropped;
         dropped_recovery_count
     }
 
@@ -6290,6 +6339,110 @@ mod recovery_source_guards {
 mod tests {
     use super::*;
     use crate::damage_effect::{DamageEffect, FrameDamageAccumulator};
+
+    // ── Upload drain staging ─────────────────────────────────────────────
+
+    /// One frame of the drain: some completions arrive, some are deferred to
+    /// the next frame. Modelled the way `drain_upload_completed` runs it, with
+    /// the fence verdict standing in for the real `glClientWaitSync`.
+    fn one_drain_frame(
+        scratch: &mut Vec<u32>,
+        pending: &mut Vec<u32>,
+        arriving: &[u32],
+        ready: impl Fn(u32) -> bool,
+    ) -> Vec<u32> {
+        let mut staged = stage_upload_drain(scratch, pending, |sink| sink.extend_from_slice(arriving));
+        let mut registered = Vec::new();
+        for item in staged.drain(..) {
+            if ready(item) {
+                registered.push(item);
+            } else {
+                pending.push(item);
+            }
+        }
+        *scratch = staged;
+        registered
+    }
+
+    /// Section 7.3 on the once-per-frame upload drain.
+    ///
+    /// **This is the assertion the previous shape could not have passed.** It
+    /// consumed the staging vector by value — freeing its buffer — after
+    /// `mem::take` had already reduced `pending_uploads` to capacity zero, so
+    /// every frame with an upload still in flight bought a fresh buffer for the
+    /// re-defer. A level load runs that for as many frames as it takes.
+    ///
+    /// The fixture keeps one item permanently unready, which is what makes the
+    /// re-defer happen on every measured iteration.
+    #[test]
+    fn a_steady_state_upload_drain_never_reaches_the_heap() {
+        let mut scratch = Vec::new();
+        let mut pending = Vec::new();
+        // Item 0 never becomes ready; items 1..4 always do.
+        let arriving = [1u32, 2, 3, 4];
+        let ready = |item: u32| item != 0;
+        // Seed the deferred item and let both buffers reach their steady size.
+        pending.push(0);
+        for _ in 0..4 {
+            one_drain_frame(&mut scratch, &mut pending, &arriving, ready);
+        }
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "canvas manager: per-frame upload completion drain",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                let mut staged =
+                    stage_upload_drain(&mut scratch, &mut pending, |sink| {
+                        sink.extend_from_slice(&arriving)
+                    });
+                let mut n = 0u32;
+                for item in staged.drain(..) {
+                    if ready(item) {
+                        n += 1;
+                    } else {
+                        pending.push(item);
+                    }
+                }
+                scratch = staged;
+                n
+            },
+        );
+        assert_eq!(pending, vec![0], "the unready item must stay deferred");
+    }
+
+    /// Order is load-bearing: an upload deferred from an earlier frame is the
+    /// one most likely to be ready now, so it has to stay ahead of the
+    /// completions that only just arrived.
+    #[test]
+    fn staging_keeps_deferred_uploads_ahead_of_newly_arrived_ones() {
+        let mut scratch = Vec::new();
+        let mut pending = vec![10u32, 11];
+        let staged = stage_upload_drain(&mut scratch, &mut pending, |sink| {
+            sink.extend_from_slice(&[20, 21])
+        });
+        assert_eq!(staged, vec![10, 11, 20, 21]);
+        assert!(
+            pending.is_empty(),
+            "the deferred list must be emptied, or its items are staged twice"
+        );
+    }
+
+    /// The scratch comes back reusable, not carrying last frame's contents into
+    /// this one — which would register the same upload twice.
+    #[test]
+    fn staging_starts_from_an_empty_buffer_even_if_the_scratch_was_dirty() {
+        let mut scratch = vec![99u32, 98];
+        let mut pending = vec![1u32];
+        let staged = stage_upload_drain(&mut scratch, &mut pending, |sink| sink.push(2));
+        assert_eq!(
+            staged,
+            vec![1, 2],
+            "a dirty scratch leaked last frame's uploads into this frame"
+        );
+    }
 
     #[test]
     fn egl_swap_failures_distinguish_context_surface_and_retryable_errors() {
