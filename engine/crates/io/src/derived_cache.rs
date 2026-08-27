@@ -24,6 +24,9 @@ use std::time::SystemTime;
 
 use shared::protocol::io_cmd::{CompressedImage, DecodedImage, NormalizedImage};
 
+use crate::scheduler::IoScheduler;
+use crate::task::{PoolKind, PriorityClass};
+
 /// Derived cache key components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedKey {
@@ -341,9 +344,9 @@ pub struct PruneReport {
 /// evicting least-recently-modified files (proxying LRU as explained
 /// in the module-level doc) until the total is under `budget_bytes`.
 ///
-/// Safe to call repeatedly: it re-reads the directory each time. The
-/// runtime is expected to invoke this at session-start with
-/// [`DEFAULT_DERIVED_CACHE_MAX_BYTES`] as a background task.
+/// Safe to call repeatedly: it re-reads the directory each time. Callers
+/// should go through [`schedule_derived_cache_prune`] rather than invoking
+/// this on a latency-sensitive thread — it is a full directory scan.
 ///
 /// Returns a [`PruneReport`] suitable for structured logging.
 pub fn prune_derived_cache(game_cache_dir: &Path, budget_bytes: u64) -> PruneReport {
@@ -411,6 +414,60 @@ pub fn prune_derived_cache(game_cache_dir: &Path, budget_bytes: u64) -> PruneRep
         bytes_kept: running,
         bytes_removed,
         scan_capped,
+    }
+}
+
+/// Schedule this game's derived-cache prune on the background IO lane.
+///
+/// [`save_derived`] writes a sidecar on every decode miss and nothing else
+/// bounds the directory, so across sessions it grows until the device runs
+/// out of space. This is the call that makes
+/// [`DEFAULT_DERIVED_CACHE_MAX_BYTES`] mean something; the budget existed
+/// before it did, but no caller enforced it.
+///
+/// Fire-and-forget by construction. Dropping the receiver does not cancel the
+/// job — the worker runs it and discards the result — which is what a
+/// best-effort reclaim wants: its only failure mode is "try again next
+/// session", and session startup must not wait on a directory scan.
+pub fn schedule_derived_cache_prune(scheduler: &IoScheduler, game_cache_dir: &Path) {
+    schedule_derived_cache_prune_with_budget(
+        scheduler,
+        game_cache_dir,
+        DEFAULT_DERIVED_CACHE_MAX_BYTES,
+    )
+}
+
+/// [`schedule_derived_cache_prune`] against an explicit budget.
+pub fn schedule_derived_cache_prune_with_budget(
+    scheduler: &IoScheduler,
+    game_cache_dir: &Path,
+    budget_bytes: u64,
+) {
+    if scheduler.ensure_open().is_err() {
+        return;
+    }
+
+    let dir = game_cache_dir.to_path_buf();
+    // Background priority on the FS lane: this competes with the very asset
+    // loads the cache exists to accelerate, so it yields to all of them.
+    let submitted = scheduler
+        .pools()
+        .submit_async(PoolKind::Fs, PriorityClass::Background, move || {
+            let report = prune_derived_cache(&dir, budget_bytes);
+            if report.files_removed > 0 || report.scan_capped {
+                tracing::info!(
+                    files_kept = report.files_kept,
+                    files_removed = report.files_removed,
+                    bytes_kept = report.bytes_kept,
+                    bytes_removed = report.bytes_removed,
+                    scan_capped = report.scan_capped,
+                    "derived cache pruned"
+                );
+            }
+        });
+
+    if submitted.is_err() {
+        tracing::debug!("derived cache prune not scheduled: IO pool closed");
     }
 }
 
@@ -736,6 +793,66 @@ mod tests {
         // Oldest files removed first.
         assert!(!cache_dir.join("f_00.bin").exists());
         assert!(cache_dir.join("f_05.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The prune existed and worked before anything called it, so a test that
+    /// only drove `prune_derived_cache` directly would have stayed green
+    /// through the entire period the disk cache was unbounded. This one fails
+    /// if the scheduling half is removed again.
+    #[test]
+    fn scheduled_prune_enforces_the_budget_on_a_worker() {
+        let dir = tmp("prune_scheduled");
+        let cache_dir = derived_cache_dir(&dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for i in 0..6u32 {
+            let path = cache_dir.join(format!("f_{i:02}.bin"));
+            std::fs::write(&path, vec![0u8; 1024]).unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(base + std::time::Duration::from_secs(u64::from(i))),
+            )
+            .unwrap();
+        }
+
+        let scheduler = IoScheduler::local_for_test(311, 2);
+        schedule_derived_cache_prune_with_budget(&scheduler, &dir, 3 * 1024);
+
+        // Fire-and-forget, so there is no handle to join: poll for the effect
+        // under a deadline rather than sleeping a guessed interval.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache_dir.join("f_00.bin").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            !cache_dir.join("f_00.bin").exists(),
+            "the scheduled prune never ran: the oldest file is still on disk"
+        );
+        assert!(
+            cache_dir.join("f_05.bin").exists(),
+            "the prune ran but evicted newest-first"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A closed scheduler must not start worker threads for a best-effort
+    /// reclaim on a session that is already going away.
+    #[test]
+    fn scheduled_prune_is_dropped_when_the_scheduler_is_closed() {
+        let dir = tmp("prune_scheduled_closed");
+        let cache_dir = derived_cache_dir(&dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("a.bin"), vec![0u8; 4096]).unwrap();
+
+        let scheduler = IoScheduler::local_for_test(313, 2);
+        scheduler.close();
+        schedule_derived_cache_prune_with_budget(&scheduler, &dir, 1);
+
+        assert!(cache_dir.join("a.bin").exists());
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1552,6 +1552,179 @@ mod tests {
         d
     }
 
+    // ---------------------------------------------------------------------
+    // readZipEntry
+    //
+    // These pin the JS-visible contract of a public API that had no coverage:
+    // binary entries arrive base64-encoded, entries with an encoding arrive
+    // decoded, and a missing entry reports rather than fails the batch. The
+    // base64 transport is a known cost -- 1.33x inflation plus a per-byte
+    // decode loop in `02_file_manager.js` -- and these are what a change to
+    // binary transport has to keep true.
+    // ---------------------------------------------------------------------
+
+    #[cfg(feature = "zip-extract")]
+    fn write_test_zip(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+        use std::io::Write;
+
+        let zip_path = dir.join("entries.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        zip_path
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_without_encoding_is_base64() {
+        use base64::Engine;
+
+        let dir = tmp_dir("zip_entry_binary");
+        // Bytes that are not valid UTF-8, so only a binary-safe transport can
+        // carry them intact.
+        let payload: Vec<u8> = vec![0x00, 0xFF, 0x89, 0x50, 0x4E, 0x47, 0x80, 0x01];
+        let zip_path = write_test_zip(&dir, &[("img/bg.png", &payload)]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"entries":[{"path":"img/bg.png"}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "img/bg.png");
+        assert_eq!(results[0].err_msg, "");
+        let encoded = results[0].data.as_deref().expect("entry data");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            payload,
+            "binary entries must survive the transport byte-for-byte"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_with_utf8_encoding_is_decoded_text() {
+        let dir = tmp_dir("zip_entry_text");
+        let zip_path = write_test_zip(&dir, &[("cfg.json", b"{\"a\":1}")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":[{"path":"cfg.json"}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results[0].data.as_deref(), Some("{\"a\":1}"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn missing_zip_entry_reports_without_failing_the_batch() {
+        let dir = tmp_dir("zip_entry_missing");
+        let zip_path = write_test_zip(&dir, &[("present.txt", b"here")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":[{"path":"absent.txt"},{"path":"present.txt"}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 2, "a missing entry must not drop its sibling");
+        assert_eq!(results[0].path, "absent.txt");
+        assert!(results[0].data.is_none());
+        assert!(
+            results[0].err_msg.contains("not found"),
+            "unexpected error: {}",
+            results[0].err_msg
+        );
+        assert_eq!(results[1].data.as_deref(), Some("here"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entries_all_reads_every_file_and_skips_directories() {
+        let dir = tmp_dir("zip_entry_all");
+        let zip_path = write_test_zip(&dir, &[("a.txt", b"one"), ("sub/b.txt", b"two")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":"all"}"#,
+            None,
+        )
+        .unwrap();
+
+        let mut seen: Vec<(String, String)> = results
+            .into_iter()
+            .map(|r| (r.path, r.data.unwrap_or_default()))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("a.txt".to_string(), "one".to_string()),
+                ("sub/b.txt".to_string(), "two".to_string()),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_honours_position_and_length() {
+        let dir = tmp_dir("zip_entry_range");
+        let zip_path = write_test_zip(&dir, &[("data.txt", b"0123456789")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":[{"path":"data.txt","position":3,"length":4}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results[0].data.as_deref(), Some("3456"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_reads_from_in_memory_pack_data() {
+        let dir = tmp_dir("zip_entry_packdata");
+        let zip_path = write_test_zip(&dir, &[("in_pack.txt", b"from memory")]);
+        let bytes = std::fs::read(&zip_path).unwrap();
+
+        // The pack-backed path parses the archive out of a buffer rather than
+        // a file, and must produce the same results.
+        let results = read_zip_entry(
+            "/nonexistent/ignored.zip",
+            r#"{"encoding":"utf8","entries":[{"path":"in_pack.txt"}]}"#,
+            Some(bytes),
+        )
+        .unwrap();
+
+        assert_eq!(results[0].data.as_deref(), Some("from memory"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[derive(Debug)]
     struct WriterOnlyBackend {
         data: Vec<u8>,

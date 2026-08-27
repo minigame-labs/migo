@@ -532,7 +532,6 @@ impl HostJsRuntime {
             .close();
     }
 
-    #[cfg(feature = "code-signing")]
     fn io_scheduler(&self) -> Arc<migo_io::scheduler::IoScheduler> {
         let op_state_rc = self.rt.op_state();
         let op_state = op_state_rc.borrow();
@@ -1008,6 +1007,12 @@ impl HostJsRuntime {
             game_paths.cache_dir(),
             cs_enabled,
         );
+
+        // Bound the derived texture cache. It gains a sidecar on every decode
+        // miss and nothing else caps the directory, so its budget only holds
+        // if someone prunes at session start. Fire-and-forget on the
+        // background lane — launch does not wait on a directory scan.
+        migo_io::schedule_derived_cache_prune(&self.io_scheduler(), game_paths.cache_dir());
 
         // Store paths, VFS, and mount table in op state.
         self.set_game_paths(Some(game_paths));

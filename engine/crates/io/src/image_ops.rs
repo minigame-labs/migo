@@ -612,12 +612,21 @@ pub async fn read_image_rgba8(
     // repeatedly draw the same sprite at the same resized dimensions
     // no longer re-decode every frame.
     let io_cache_key = compose_lru_key(&pg_key, target_width, target_height);
-    if let Some(cached) = image_cache::global_cache().get(&io_cache_key, scheduler.host_id()) {
+    // Scoped so the guard is released before the `.await` below. In Rust 2024
+    // an `if let` scrutinee temporary still lives across the success body, so
+    // holding the lookup inline would keep the process-global cache mutex --
+    // a `parking_lot::Mutex`, not async-aware and not reentrant -- locked
+    // across a suspension point. Any other task resumed on this thread that
+    // reached for the cache would deadlock against it.
+    let cached = {
+        let mut cache = image_cache::global_cache();
+        cache.get(&io_cache_key, session)
+    };
+    if let Some(cached_image) = cached {
         debug!(
             "read_image_rgba8 cache hit: {} g{} resize={}x{}",
             io_cache_key.0, io_cache_key.1, io_cache_key.2, io_cache_key.3
         );
-        let cached_image = cached;
         let encoded_bytes = cached_image.rgba.len();
         return run_image_job_with_scheduler(scheduler, encoded_bytes, true, source, move || {
             ReadImageResult {
@@ -922,53 +931,61 @@ pub async fn preload_images(
 
     let mut slots: Vec<Option<PreloadResult>> = vec![None; total];
     let mut handles: Vec<(usize, String, tokio::task::JoinHandle<PreloadResult>)> = Vec::new();
-    {
-        let cache = image_cache::global_cache();
-        for (i, (path, generation, source)) in entries.into_iter().enumerate() {
-            let key =
-                match current_image_cache_key(&path, generation, &source, mount_table.as_deref())
-                    .map(|pg| image_cache::full_res_key(pg.0, pg.1))
-                {
-                    Ok(key) => key,
-                    Err(_) => {
-                        handles.push((
-                            i,
-                            path.clone(),
-                            tokio::spawn(decode_preload_result_with_scheduler(
-                                Arc::clone(&scheduler),
-                                path,
-                                generation,
-                                source,
-                                game_cache_dir.clone(),
-                                gpu_caps.clone(),
-                                mount_table.clone(),
-                            )),
-                        ));
-                        continue;
-                    }
-                };
-            let scheduler = Arc::clone(&scheduler);
-            let path_for_error = path.clone();
-            let gcd = game_cache_dir.clone();
-            let gpu = gpu_caps.clone();
-            let mt = mount_table.clone();
-            let handle = if cache.contains(&key) {
-                tokio::spawn(async move {
-                    #[cfg(test)]
-                    pause_after_preload_cache_classification().await;
 
-                    cached_preload_result_with_scheduler(
-                        scheduler, path, key.1, source, gcd, gpu, mt,
-                    )
+    // Resolve keys first, then take the cache lock only for the residency
+    // lookups, then spawn.
+    //
+    // The lock is process-global and sits on the `texImage2D` path. Held
+    // across key resolution and `tokio::spawn` for a whole batch — hundreds of
+    // images at scene load — it stalls every draw needing a cache lookup for
+    // as long as the batch takes to classify. Split this way it is held for a
+    // run of hashmap probes that allocate nothing.
+    let resolved: Vec<(
+        usize,
+        String,
+        u64,
+        ImageSource,
+        Option<image_cache::ImageCacheKey>,
+    )> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (path, generation, source))| {
+            let key = current_image_cache_key(&path, generation, &source, mount_table.as_deref())
+                .map(|pg| image_cache::full_res_key(pg.0, pg.1))
+                .ok();
+            (i, path, generation, source, key)
+        })
+        .collect();
+
+    let residency: Vec<bool> = {
+        let cache = image_cache::global_cache();
+        resolved
+            .iter()
+            .map(|(_, _, _, _, key)| key.as_ref().is_some_and(|key| cache.contains(key)))
+            .collect()
+    };
+
+    for ((i, path, generation, source, key), resident) in resolved.into_iter().zip(residency) {
+        let scheduler = Arc::clone(&scheduler);
+        let path_for_error = path.clone();
+        let gcd = game_cache_dir.clone();
+        let gpu = gpu_caps.clone();
+        let mt = mount_table.clone();
+        // A key that failed to resolve has no cache slot to hit, so it decodes
+        // under the generation the caller asked for.
+        let handle = match key.filter(|_| resident) {
+            Some(key) => tokio::spawn(async move {
+                #[cfg(test)]
+                pause_after_preload_cache_classification().await;
+
+                cached_preload_result_with_scheduler(scheduler, path, key.1, source, gcd, gpu, mt)
                     .await
-                })
-            } else {
-                tokio::spawn(decode_preload_result_with_scheduler(
-                    scheduler, path, generation, source, gcd, gpu, mt,
-                ))
-            };
-            handles.push((i, path_for_error, handle));
-        }
+            }),
+            None => tokio::spawn(decode_preload_result_with_scheduler(
+                scheduler, path, generation, source, gcd, gpu, mt,
+            )),
+        };
+        handles.push((i, path_for_error, handle));
     }
 
     for (idx, fallback_path, handle) in handles {

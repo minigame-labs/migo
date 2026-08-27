@@ -7,6 +7,7 @@
 //! - Resource budget (entry count, total uncompressed bytes, per-entry size,
 //!   compression ratio) to defend against zip bombs
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -253,6 +254,11 @@ pub fn extract_zip_with_budget(
     let dest_canonical = dest_dir.canonicalize()?;
 
     let mut written_total: u64 = 0;
+    // Directories already materialised by this extraction. Archives are
+    // overwhelmingly many files under few directories, so without this every
+    // entry pays a `stat` on its parent to answer a question the previous
+    // entry already answered.
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
 
     for i in 0..total_files {
         let mut file = archive.by_index(i)?;
@@ -325,11 +331,17 @@ pub fn extract_zip_with_budget(
         if file.is_dir() {
             trace!("extract_zip: creating directory {}", outpath.display());
             fs::create_dir_all(&outpath)?;
+            created_dirs.insert(outpath.clone());
         } else {
             if let Some(parent) = outpath.parent() {
-                if !parent.exists() {
+                // `create_dir_all` is already a no-op on an existing directory,
+                // so the set replaces the `exists()` probe rather than the
+                // creation: the syscall saved is the `stat`, on every entry
+                // after the first in a given directory.
+                if !created_dirs.contains(parent) {
                     trace!("extract_zip: creating parent dir {}", parent.display());
                     fs::create_dir_all(parent)?;
+                    created_dirs.insert(parent.to_path_buf());
                 }
             }
 

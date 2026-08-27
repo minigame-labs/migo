@@ -589,7 +589,6 @@ impl ImageCache {
         // over-budget state is the least-bad option, since the
         // alternative is dropping bytes the app is actively
         // using.
-        let was_over_budget = self.current_size + new_size > self.max_size;
         while self.current_size + new_size > self.max_size {
             if self.pop_unpinned_lru().is_none() {
                 // All remaining entries are pinned; we must
@@ -612,7 +611,6 @@ impl ImageCache {
                 break;
             }
         }
-        let _ = was_over_budget;
 
         // `push` returns a displaced pair in two different situations, and they are
         // not interchangeable: the previous value under *this* key, whose pins were

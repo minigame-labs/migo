@@ -46,6 +46,7 @@
 //! `WITHOUT ROWID` cuts the per-row overhead by one btree and is the
 //! idiomatic shape for a string-keyed KV table.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -276,18 +277,32 @@ impl KvStore {
         // Project the new total against the cached value. We must
         // look up each incoming key's old size to handle overwrites
         // correctly, but we never run `SUM(size)`.
+        //
+        // A key repeated inside one batch is projected against what the
+        // *previous item in this batch* will leave behind, not against the
+        // row still on disk. Re-reading the DB size for the second occurrence
+        // would deduct the same old row twice and credit both new values, and
+        // since the result is persisted to `_meta.total_bytes` — which is only
+        // ever reconciled against `SUM(size)` when it is missing — the drift
+        // would be permanent.
         let mut projected: i128 = current_total as i128;
         {
             let mut q = tx
                 .prepare_cached("SELECT size FROM kv WHERE k = ?1")
                 .map_err(sql_err("kv: batch: prep size"))?;
+            let mut pending: HashMap<&str, i64> = HashMap::with_capacity(items.len());
             for (k, v) in items {
-                let old: i64 = q
-                    .query_row([k], |r| r.get(0))
-                    .optional()
-                    .map_err(sql_err("kv: batch: size"))?
-                    .unwrap_or(0);
-                projected = projected - old as i128 + v.len() as i128;
+                let old: i64 = match pending.get(k) {
+                    Some(&staged) => staged,
+                    None => q
+                        .query_row([k], |r| r.get(0))
+                        .optional()
+                        .map_err(sql_err("kv: batch: size"))?
+                        .unwrap_or(0),
+                };
+                let new = v.len() as i64;
+                projected = projected - old as i128 + new as i128;
+                pending.insert(k, new);
             }
         }
 
@@ -659,6 +674,41 @@ mod tests {
         assert_eq!(kv.get("c").unwrap().as_deref(), Some("333"));
         let info = kv.info().unwrap();
         assert_eq!(info.current_bytes, 6);
+    }
+
+    #[test]
+    fn batch_repeating_a_key_keeps_the_total_exact() {
+        let dir = tempdir().unwrap();
+        let kv = open(dir.path());
+        kv.set("k", "0123456789").unwrap();
+        assert_eq!(kv.info().unwrap().current_bytes, 10);
+
+        // Last write wins, so the row ends at 5 bytes. Projecting each
+        // occurrence against the row still on disk would deduct the 10-byte
+        // original twice and credit both new values, leaving the cached total
+        // 3 bytes short of the truth.
+        kv.set_batch(&[("k", "abc"), ("k", "de456")]).unwrap();
+
+        assert_eq!(kv.get("k").unwrap().as_deref(), Some("de456"));
+        assert_eq!(kv.info().unwrap().current_bytes, 5);
+    }
+
+    #[test]
+    fn repeated_key_total_survives_reopen() {
+        // The drift is persisted to `_meta.total_bytes`, which is only ever
+        // reconciled against `SUM(size)` when it is missing -- so a wrong value
+        // here would outlive the process rather than self-heal.
+        let dir = tempdir().unwrap();
+        {
+            let kv = open(dir.path());
+            kv.set_batch(&[("dup", "aaaa"), ("dup", "b"), ("other", "cc")])
+                .unwrap();
+            kv.checkpoint().unwrap();
+        }
+
+        let kv = open(dir.path());
+        assert_eq!(kv.get("dup").unwrap().as_deref(), Some("b"));
+        assert_eq!(kv.info().unwrap().current_bytes, 3);
     }
 
     #[test]

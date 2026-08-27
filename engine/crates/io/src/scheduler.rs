@@ -55,7 +55,11 @@ pub enum RouteDecision {
     Delegated(PoolKind),
 }
 
-#[derive(Clone)]
+/// Deliberately **not** `Clone`. `Drop` closes the shared `Arc<IoDomain>`, so
+/// a second owner dropping first would shut down IO for every other holder —
+/// a struct-level clone and an `Arc::clone` would read identically at the call
+/// site and mean opposite things. Share one scheduler through `Arc`, which is
+/// what every caller already does.
 pub struct IoScheduler {
     host_id: i32,
     pools: IoPools,
