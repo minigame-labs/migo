@@ -41,17 +41,42 @@ pub struct DerivedKey {
     pub target_height: u32,
 }
 
+/// Namespaces every derived filename by the SDK build that produced it.
+///
+/// A sidecar's validity depends on decoder behaviour, not just on the key
+/// fields: change how an image decodes, how it resizes, or which colour space
+/// it lands in, and every existing sidecar is now wrong while still matching
+/// its key perfectly. [`DERIVED_VERSION`] guards the *file format*, so it does
+/// not catch this, and relying on someone remembering to bump it for a
+/// semantic change is how you ship corrupted textures that vanish the moment a
+/// user clears their cache — the least diagnosable bug shape there is.
+///
+/// Folding the version into the filename makes it automatic: a new build looks
+/// for names the old build never wrote, so it re-transcodes once and
+/// [`prune_derived_cache`] reclaims what it orphaned.
+const DERIVED_CACHE_NAMESPACE: &str = env!("CARGO_PKG_VERSION");
+
 impl DerivedKey {
     /// SHA-256 based hex hash for the filename (collision-resistant).
     pub fn hash(&self) -> String {
+        self.hash_in_namespace(DERIVED_CACHE_NAMESPACE)
+    }
+
+    /// [`Self::hash`] against an explicit namespace, so a test can show two
+    /// builds disagree without being two builds.
+    fn hash_in_namespace(&self, namespace: &str) -> String {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();
+        // Length-prefixed: without it a namespace/path pair could be split
+        // differently and collide with another pair that concatenates the same.
+        h.update((namespace.len() as u32).to_le_bytes());
+        h.update(namespace.as_bytes());
         h.update(self.asset_path.as_bytes());
-        h.update(&self.source_generation.to_le_bytes());
-        h.update(&self.gpu_format.to_le_bytes());
-        h.update(&[self.variant_kind]);
-        h.update(&self.target_width.to_le_bytes());
-        h.update(&self.target_height.to_le_bytes());
+        h.update(self.source_generation.to_le_bytes());
+        h.update(self.gpu_format.to_le_bytes());
+        h.update([self.variant_kind]);
+        h.update(self.target_width.to_le_bytes());
+        h.update(self.target_height.to_le_bytes());
         // Use first 16 bytes (128 bits) of SHA-256 for filename.
         let result = h.finalize();
         hex::encode(&result[..16])
@@ -866,6 +891,60 @@ mod tests {
         assert_eq!(report.files_removed, 0);
         assert!(cache_dir.join("a.bin").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two SDK builds must not read each other's sidecars. The key fields are
+    /// identical here — that is the point: what changed is the decoder, and
+    /// nothing in the key can see that.
+    #[test]
+    fn a_different_sdk_build_does_not_reuse_the_same_sidecar() {
+        let key = DerivedKey {
+            asset_path: "sprites/hero.png".into(),
+            source_generation: 7,
+            gpu_format: 0,
+            variant_kind: 0,
+            target_width: 0,
+            target_height: 0,
+        };
+
+        assert_ne!(
+            key.hash_in_namespace("0.9.4"),
+            key.hash_in_namespace("0.9.5"),
+            "an SDK upgrade must land in a fresh derived-cache namespace"
+        );
+        assert_eq!(
+            key.hash_in_namespace("0.9.4"),
+            key.hash_in_namespace("0.9.4"),
+            "the same build must keep hitting its own cache"
+        );
+        assert_eq!(
+            key.hash(),
+            key.hash_in_namespace(env!("CARGO_PKG_VERSION")),
+            "the shipped hash must be the one namespaced by this build"
+        );
+    }
+
+    /// The namespace is length-prefixed so it cannot be re-split against the
+    /// asset path into a different pair with the same digest.
+    #[test]
+    fn namespace_and_path_cannot_be_confused_for_each_other() {
+        let split_one = DerivedKey {
+            asset_path: "b/c.png".into(),
+            source_generation: 1,
+            gpu_format: 0,
+            variant_kind: 0,
+            target_width: 0,
+            target_height: 0,
+        };
+        let split_two = DerivedKey {
+            asset_path: "c.png".into(),
+            ..split_one.clone()
+        };
+
+        assert_ne!(
+            split_one.hash_in_namespace("a"),
+            split_two.hash_in_namespace("ab/"),
+        );
     }
 
     #[test]

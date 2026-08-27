@@ -1,6 +1,6 @@
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
-use deno_core::{JsBuffer, OpState, ToJsBuffer, op2, serde_json};
+use deno_core::{JsBuffer, OpState, ToJsBuffer, op2};
 use migo_io::fs_ops;
 use shared::{
     codec,
@@ -19,6 +19,7 @@ use migo_io::{
     scheduler::IoScheduler,
     task::{BackendKind, IoRequest, PriorityClass, ReadSpec, RequestKind},
 };
+use shared::protocol::io_cmd::ZipEntryData;
 
 const MAX_MATERIALIZE_LENGTH: u64 = 512 * 1024 * 1024;
 
@@ -1709,13 +1710,32 @@ pub fn op_read_compressed_file_sync(
 
 // ============================ ReadZipEntry ============================
 
+/// One entry's result on its way to JS.
+///
+/// `text` and `bytes` are mutually exclusive, expressed as two optional
+/// fields rather than an enum on purpose: `serde(untagged)` routes through
+/// serde's content-buffering serializer, which loses the marker serde_v8 uses
+/// to turn a [`ToJsBuffer`] into a `Uint8Array` — the bytes would arrive in JS
+/// as a plain array of numbers. Two fields keep the buffer on serde_v8's fast
+/// path, and the JS shim picks whichever is present.
+#[derive(serde::Serialize)]
+struct ZipEntryPayload {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<ToJsBuffer>,
+    #[serde(rename = "errMsg")]
+    err_msg: String,
+}
+
 #[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_read_zip_entry(
     state: Rc<RefCell<OpState>>,
     #[string] zip_path: String,
     #[string] entries_json: String,
-) -> Result<serde_json::Value, IOError> {
+) -> Result<Vec<ZipEntryPayload>, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
     let scheduler = {
         let st = state.borrow();
@@ -1756,20 +1776,26 @@ pub async fn op_read_zip_entry(
 
     let results = results.map_err(pool_err)?.map_err(IOError::from)?;
 
-    // Build serde_json::Value — serde_v8 serializes this directly to a V8 object
-    // (no JSON stringify/parse round-trip).
-    let mut entries_map = serde_json::Map::with_capacity(results.len());
-    for entry in results {
-        let data_val = match entry.data {
-            Some(s) => serde_json::Value::String(s),
-            None => serde_json::Value::Null,
-        };
-        entries_map.insert(
-            entry.path,
-            serde_json::json!({ "data": data_val, "errMsg": entry.err_msg }),
-        );
-    }
-    Ok(serde_json::json!({ "entries": entries_map }))
+    // A list, not a map: the shim builds the keyed object, and a list keeps the
+    // archive's own entry order instead of `serde_json::Map`'s sorted one.
+    // Binary payloads ride out as `ToJsBuffer`, which serde_v8 adopts as a
+    // `Uint8Array` backing store rather than copying.
+    Ok(results
+        .into_iter()
+        .map(|entry| {
+            let (text, bytes) = match entry.data {
+                Some(ZipEntryData::Text(s)) => (Some(s), None),
+                Some(ZipEntryData::Binary(b)) => (None, Some(b.into())),
+                None => (None, None),
+            };
+            ZipEntryPayload {
+                path: entry.path,
+                text,
+                bytes,
+                err_msg: entry.err_msg,
+            }
+        })
+        .collect())
 }
 
 // ============================ Unzip ============================
@@ -2065,6 +2091,186 @@ mod tests {
             scheduler.classify(&request),
             RouteDecision::Delegated(PoolKind::Fs)
         );
+    }
+
+    /// The one thing about the zip-entry payload that cannot be reasoned out
+    /// from the type: what serde_v8 actually hands JS for a `ToJsBuffer` that
+    /// sits inside a struct inside a `Vec`.
+    ///
+    /// If it degrades to a plain array of numbers, the whole point of moving
+    /// off base64 is lost and the JS shim would silently produce garbage. This
+    /// runs the real serializer through a real isolate and asks JS.
+    #[test]
+    fn zip_entry_bytes_reach_js_as_a_uint8array() {
+        use deno_core::{FastString, JsRuntime, RuntimeOptions, op2};
+
+        #[op2]
+        #[serde]
+        fn op_zip_payload_fixture() -> Vec<super::ZipEntryPayload> {
+            vec![
+                super::ZipEntryPayload {
+                    path: "img/bg.png".to_string(),
+                    text: None,
+                    bytes: Some(vec![0x00, 0xFF, 0x80, 0x01].into()),
+                    err_msg: String::new(),
+                },
+                super::ZipEntryPayload {
+                    path: "cfg.json".to_string(),
+                    text: Some("{\"a\":1}".to_string()),
+                    bytes: None,
+                    err_msg: String::new(),
+                },
+                super::ZipEntryPayload {
+                    path: "gone.txt".to_string(),
+                    text: None,
+                    bytes: None,
+                    err_msg: "entry not found".to_string(),
+                },
+            ]
+        }
+
+        deno_core::extension!(zip_payload_fixture, ops = [op_zip_payload_fixture]);
+
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions: vec![zip_payload_fixture::init()],
+            ..Default::default()
+        });
+
+        // Assertions as `throw`s: `execute_script` surfaces them as `Err`.
+        let script = r#"
+            const r = Deno.core.ops.op_zip_payload_fixture();
+            if (r.length !== 3) throw new Error("length " + r.length);
+
+            const bin = r[0];
+            if (bin.path !== "img/bg.png") throw new Error("path " + bin.path);
+            if (!(bin.bytes instanceof Uint8Array)) {
+                throw new Error("bytes is " + Object.prototype.toString.call(bin.bytes)
+                    + " -- serde_v8 did not produce a typed array");
+            }
+            if (bin.bytes.length !== 4) throw new Error("byte length " + bin.bytes.length);
+            if (bin.bytes[0] !== 0 || bin.bytes[1] !== 255 || bin.bytes[2] !== 128 || bin.bytes[3] !== 1) {
+                throw new Error("bytes " + Array.from(bin.bytes).join(","));
+            }
+            // The shim hands `.buffer` to callers, so the view must cover it exactly.
+            if (bin.bytes.byteOffset !== 0 || bin.bytes.byteLength !== bin.bytes.buffer.byteLength) {
+                throw new Error("view is not exact: offset=" + bin.bytes.byteOffset
+                    + " len=" + bin.bytes.byteLength + " buf=" + bin.bytes.buffer.byteLength);
+            }
+            if (bin.text !== undefined) throw new Error("text should be absent");
+
+            const txt = r[1];
+            if (txt.text !== '{"a":1}') throw new Error("text " + txt.text);
+            if (txt.bytes !== undefined) throw new Error("bytes should be absent");
+
+            const err = r[2];
+            if (err.errMsg !== "entry not found") throw new Error("errMsg " + err.errMsg);
+            if (err.text !== undefined || err.bytes !== undefined) {
+                throw new Error("a failed entry must carry no payload");
+            }
+        "#;
+
+        rt.execute_script("<test:zip-payload>", FastString::from_static(script))
+            .expect("zip entry payload shape");
+    }
+
+    /// The other half of the zip-entry path: the shim that turns the op's list
+    /// into the `{entries: {...}}` object callers actually see. Driven through
+    /// the real ESM export in a live runtime, so it is the shipped function
+    /// under test rather than a copy of it.
+    #[test]
+    fn zip_entries_shim_maps_bytes_text_and_failures() {
+        use deno_core::{FastString, JsRuntime, RuntimeOptions};
+
+        deno_core::extension!(
+            zip_shim_bridge,
+            deps = [host_v8_file],
+            esm_entry_point = "ext:zip_shim_bridge/bridge.js",
+            esm = ["ext:zip_shim_bridge/bridge.js" = {
+                source = r#"
+                    import { zipEntriesFromOpResult } from "ext:host_v8_file/02_file_manager.js";
+                    globalThis.__zipEntriesFromOpResult = zipEntriesFromOpResult;
+                "#
+            },],
+        );
+
+        let mut extensions = crate::main_extensions(zip_test_host_state());
+        extensions.push(zip_shim_bridge::init());
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions,
+            ..Default::default()
+        });
+
+        let script = r#"
+            const shape = globalThis.__zipEntriesFromOpResult([
+                { path: "img/bg.png", bytes: new Uint8Array([0, 255, 128, 1]), errMsg: "" },
+                { path: "cfg.json",   text: '{"a":1}',                          errMsg: "" },
+                { path: "gone.txt",                                             errMsg: "entry not found" },
+            ]);
+
+            const bin = shape.entries["img/bg.png"];
+            if (!(bin.data instanceof ArrayBuffer)) {
+                throw new Error("binary data is " + Object.prototype.toString.call(bin.data));
+            }
+            const view = new Uint8Array(bin.data);
+            if (view.length !== 4 || view[1] !== 255 || view[2] !== 128) {
+                throw new Error("bytes " + Array.from(view).join(","));
+            }
+            if (bin.errMsg !== "") throw new Error("errMsg " + bin.errMsg);
+
+            const txt = shape.entries["cfg.json"];
+            if (txt.data !== '{"a":1}') throw new Error("text " + txt.data);
+
+            const gone = shape.entries["gone.txt"];
+            if (gone.data !== null) throw new Error("a failed entry must carry null data");
+            if (gone.errMsg !== "entry not found") throw new Error("errMsg " + gone.errMsg);
+
+            // Archive order, not sorted order -- the op returns a list for this reason.
+            const keys = Object.keys(shape.entries).join(",");
+            if (keys !== "img/bg.png,cfg.json,gone.txt") throw new Error("order " + keys);
+        "#;
+
+        rt.execute_script("<test:zip-shim>", FastString::from_static(script))
+            .expect("zip entries shim");
+    }
+
+    fn zip_test_host_state() -> shared::op_state::HostOpState {
+        use shared::channel::ThreadWakeup;
+        use shared::device::gpu_caps::GpuCaps;
+        use shared::op_state::{AudioSender, HostOpState, NetworkPolicy};
+        use shared::render_command_sender::CommandSender;
+        use std::sync::atomic::AtomicBool;
+
+        let (render_tx, _render_rx) = CommandSender::new();
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
+
+        HostOpState {
+            callback_ids: Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
+            id: 1,
+            app_cache_dir: PathBuf::from("/tmp/cache"),
+            app_files_dir: PathBuf::from("/tmp/files"),
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            mount_table: None,
+            render_tx,
+            text_measurer: None,
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
+            host_tx,
+            device_services: None,
+            raf_rx: None,
+            raf_demand: Arc::new(shared::raf_signal::RafDemand::new()),
+            request_vsync: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
+            network_policy: NetworkPolicy::default(),
+            backgrounded: Arc::new(AtomicBool::new(false)),
+            timer_backgrounded: Arc::new(AtomicBool::new(false)),
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: Arc::new(shared::op_state::ContextLostState::default()),
+            code_signing_enabled: false,
+            gpu_caps: GpuCaps::new(),
+        }
     }
 
     #[test]

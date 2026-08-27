@@ -1058,6 +1058,108 @@ mod tests {
         assert_eq!(message, "pack worker panic");
     }
 
+    /// What the inline fast path is actually worth, in the shape
+    /// `readFileSync` hits it.
+    ///
+    /// Both requests describe the same 200-byte whole-file read. The hinted
+    /// one carries the size the backend already knew and classifies `Inline`;
+    /// the unhinted one has to assume `MAX_READ_LENGTH`, classifies
+    /// `Delegated`, and pays a worker round-trip for a read that would have
+    /// finished in the time the handoff takes.
+    ///
+    /// `#[ignore]` and reported rather than bounded: the absolute numbers are
+    /// hardware-dependent. The assertion is only on the direction, which is
+    /// the part that must never regress.
+    #[test]
+    #[ignore]
+    fn bench_inline_vs_delegated_dispatch() {
+        const ITERATIONS: u32 = 2000;
+        let scheduler = IoScheduler::new(401);
+
+        let hinted = IoRequest::ReadFile {
+            backend: BackendKind::Pack,
+            request: RequestKind::Sync,
+            priority: PriorityClass::ForegroundBlocking,
+            spec: ReadSpec::Whole,
+            estimated_bytes: 200,
+        };
+        let unhinted = IoRequest::ReadFile {
+            backend: BackendKind::Pack,
+            request: RequestKind::Sync,
+            priority: PriorityClass::ForegroundBlocking,
+            spec: ReadSpec::Whole,
+            estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
+        };
+
+        assert_eq!(scheduler.classify(&hinted), RouteDecision::Inline);
+        assert_eq!(
+            scheduler.classify(&unhinted),
+            RouteDecision::Delegated(PoolKind::Pack)
+        );
+
+        // Spawn the worker threads before timing, or the first delegated call
+        // absorbs the pool's one-time startup and overstates the gap.
+        scheduler.run_sync(&unhinted, || 0_u8).unwrap();
+
+        // A trivial job, so what is being timed is dispatch overhead and
+        // nothing else -- which is the whole difference between the two paths
+        // for a read this small.
+        let inline = {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                scheduler.run_sync(&hinted, || 7_u8).unwrap();
+            }
+            started.elapsed()
+        };
+        let delegated = {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                scheduler.run_sync(&unhinted, || 7_u8).unwrap();
+            }
+            started.elapsed()
+        };
+
+        eprintln!(
+            "inline    {:>10?} total  {:>10?}/call",
+            inline,
+            inline / ITERATIONS
+        );
+        eprintln!(
+            "delegated {:>10?} total  {:>10?}/call",
+            delegated,
+            delegated / ITERATIONS
+        );
+        eprintln!(
+            "worker round-trip costs {:.1}x an inline dispatch",
+            delegated.as_secs_f64() / inline.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+
+        // The filesystem sync path buys its hint with one `stat`. Pack reads
+        // get theirs free from the mount table, so this is the only case that
+        // pays, and the number it pays against is `delegated` above.
+        let probe = std::env::temp_dir().join(format!("migo-stat-probe-{}", std::process::id()));
+        std::fs::write(&probe, b"x").unwrap();
+        let stat = {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(std::fs::metadata(&probe).map(|m| m.len()).unwrap_or(0));
+            }
+            started.elapsed()
+        };
+        let _ = std::fs::remove_file(&probe);
+        eprintln!(
+            "size-hint stat {:>10?}/call  -- {:.1}% of the round-trip it avoids",
+            stat / ITERATIONS,
+            100.0 * stat.as_secs_f64() / delegated.as_secs_f64()
+        );
+
+        assert!(
+            inline < delegated,
+            "the inline path is no longer cheaper than a worker round-trip \
+             (inline {inline:?}, delegated {delegated:?})"
+        );
+    }
+
     #[test]
     fn run_async_completes_without_tokio_blocking_threads() {
         let scheduler = IoScheduler::new(201);
