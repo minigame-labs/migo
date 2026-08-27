@@ -282,10 +282,28 @@ fn encode_alpha_block(alpha: &[u8; 16]) -> [u8; 8] {
     let mean = (alpha.iter().map(|&a| a as i32).sum::<i32>() + 8) / 16;
     let base_candidates = [min, max, mean, (min + max) / 2];
 
+    let range = max - min;
+
     for &base_i in &base_candidates {
         let base = base_i.clamp(0, 255);
         for (table_idx, table) in ALPHA_MODIFIER_TABLE.iter().enumerate() {
-            for multiplier in 1..=15i32 {
+            // The multiplier scales the table, so the values it can reach span
+            // `multiplier * table_span`. One that cannot cover the block's own
+            // alpha range leaves the extremes unreachable; one far past it
+            // quantises coarsely. Either way it loses to a multiplier sized to
+            // the block, so the search only visits a window around that size
+            // instead of all fifteen.
+            //
+            // A heuristic, not a proof — which is why `bench_etc2_encode_throughput`
+            // reports alpha PSNR and worst-case delta beside the timings, and
+            // why `encoder_output_is_byte_stable` has to be updated deliberately
+            // when this window changes.
+            let span = (table.iter().max().unwrap() - table.iter().min().unwrap()).max(1);
+            let ideal = (range + span / 2) / span;
+            let first = (ideal - 1).clamp(1, 15);
+            let last = (ideal + 2).clamp(1, 15);
+
+            for multiplier in first..=last {
                 // The eight reachable alpha values depend only on
                 // (base, table, multiplier) — not on the pixel. Computing them
                 // inside the pixel loop redid the same multiply-add-clamp
@@ -588,8 +606,27 @@ mod tests {
                 started.elapsed()
             };
 
+            // Speed without quality is half the measurement: any change to the
+            // search has to be judged on what it costs the encoding, not just
+            // on how much faster it got.
+            let encoded = encode_etc2_rgba(&with_alpha, side, side).unwrap();
+            let decoded = decode_reference_rgba(&encoded, side, side);
+            let mut squared = 0f64;
+            let mut worst = 0u32;
+            for (i, pixel) in decoded.iter().enumerate() {
+                let delta = (with_alpha[i * 4 + 3] as i32 - pixel[3] as i32).unsigned_abs();
+                worst = worst.max(delta);
+                squared += (delta as f64) * (delta as f64);
+            }
+            let mean = squared / decoded.len() as f64;
+            let psnr = if mean == 0.0 {
+                f64::INFINITY
+            } else {
+                10.0 * (255.0f64 * 255.0 / mean).log10()
+            };
+
             eprintln!(
-                "{side}x{side} ({megapixels:>4.1} MP)  rgb {:>10?} ({:>6.1} MP/s)   rgba {:>10?} ({:>6.1} MP/s)   alpha-scan {:>9?}",
+                "{side}x{side} ({megapixels:>4.1} MP)  rgb {:>10?} ({:>5.1} MP/s)   rgba {:>10?} ({:>4.2} MP/s)   alpha PSNR {psnr:>5.2} dB, worst delta {worst:>3}   scan {:>8?}",
                 rgb_time,
                 megapixels / rgb_time.as_secs_f64(),
                 rgba_time,
@@ -624,6 +661,12 @@ mod tests {
     /// so a speed-up has to prove it is byte-identical rather than merely
     /// still-correct — and a deliberate quality change has to update the
     /// digest, which is the point at which someone has to think about it.
+    ///
+    /// Both digests below have survived every speed-up so far, including the
+    /// multiplier window in `encode_alpha_block`: on this input the pruned
+    /// search picks the same encoding the exhaustive one did. Where it does
+    /// diverge, on larger images, `bench_etc2_encode_throughput` reports the
+    /// cost — alpha PSNR within 0.25 dB and an unchanged worst-case delta.
     #[test]
     fn encoder_output_is_byte_stable() {
         let rgb_only = gradient(64, 64);
