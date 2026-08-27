@@ -110,11 +110,11 @@ pub fn encode_etc2_rgb(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
 
     let blocks_x = (width / 4) as usize;
     let blocks_y = (height / 4) as usize;
-    let mut out = Vec::with_capacity(blocks_x * blocks_y * ETC2_RGB_BLOCK_BYTES);
+    let mut out = vec![0u8; blocks_x * blocks_y * ETC2_RGB_BLOCK_BYTES];
 
-    let mut block = [[0u8; 3]; 16];
-    for by in 0..blocks_y {
-        for bx in 0..blocks_x {
+    encode_block_rows(blocks_x, blocks_y, ETC2_RGB_BLOCK_BYTES, &mut out, |by, row| {
+        let mut block = [[0u8; 3]; 16];
+        for (bx, dst) in row.chunks_mut(ETC2_RGB_BLOCK_BYTES).enumerate() {
             for y in 0..4 {
                 for x in 0..4 {
                     let px = (by * 4 + y) * width as usize + (bx * 4 + x);
@@ -122,11 +122,72 @@ pub fn encode_etc2_rgb(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
                     block[y * 4 + x] = [rgba[base], rgba[base + 1], rgba[base + 2]];
                 }
             }
-            out.extend_from_slice(&encode_block(&block));
+            dst.copy_from_slice(&encode_block(&block));
         }
-    }
+    });
 
     Ok(out)
+}
+
+/// Encode rows of blocks across a bounded set of threads.
+///
+/// Each 4x4 block is independent and produces a fixed-size output, so the work
+/// splits by rows with no coordination, no per-chunk allocation, and output
+/// identical to encoding them in order.
+///
+/// This is data parallelism *inside* one ingest job, not extra jobs, so it does
+/// not reopen what `PoolKind::Ingest`'s cap of 1 protects: that bounds how many
+/// images are decoded at once, each holding its own RGBA, and that memory does
+/// not change with how many cores encode one of them.
+///
+/// Capped at four lanes rather than every core. Ingest runs while the user
+/// waits on an install, but on a phone it shares the SoC with whatever else is
+/// running, and the returns past four are small next to the cost of pinning
+/// every core to one background job.
+fn encode_block_rows(
+    blocks_x: usize,
+    blocks_y: usize,
+    block_bytes: usize,
+    out: &mut [u8],
+    encode_row: impl Fn(usize, &mut [u8]) + Sync,
+) {
+    let row_bytes = blocks_x * block_bytes;
+    if row_bytes == 0 || blocks_y == 0 {
+        return;
+    }
+
+    // Below this the encode is shorter than the threads would take to start,
+    // and a package of small icons would pay that per image. 1024 blocks is a
+    // 128x128 image.
+    const MIN_BLOCKS_TO_SPLIT: usize = 1024;
+
+    let lanes = if blocks_x * blocks_y < MIN_BLOCKS_TO_SPLIT {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 4)
+            .min(blocks_y)
+    };
+    if lanes == 1 {
+        for (by, row) in out.chunks_mut(row_bytes).enumerate() {
+            encode_row(by, row);
+        }
+        return;
+    }
+
+    let rows_per_lane = blocks_y.div_ceil(lanes);
+    std::thread::scope(|scope| {
+        for (lane, chunk) in out.chunks_mut(rows_per_lane * row_bytes).enumerate() {
+            let encode_row = &encode_row;
+            scope.spawn(move || {
+                for (offset, row) in chunk.chunks_mut(row_bytes).enumerate() {
+                    encode_row(lane * rows_per_lane + offset, row);
+                }
+            });
+        }
+    });
 }
 
 /// Encode RGBA8 pixels as ETC2 RGBA blocks (EAC alpha + ETC2 RGB), 16 bytes
@@ -155,26 +216,32 @@ pub fn encode_etc2_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>,
 
     let blocks_x = (width / 4) as usize;
     let blocks_y = (height / 4) as usize;
-    let mut out = Vec::with_capacity(blocks_x * blocks_y * ETC2_RGBA_BLOCK_BYTES);
+    let mut out = vec![0u8; blocks_x * blocks_y * ETC2_RGBA_BLOCK_BYTES];
 
-    let mut rgb = [[0u8; 3]; 16];
-    let mut alpha = [0u8; 16];
-    for by in 0..blocks_y {
-        for bx in 0..blocks_x {
-            for y in 0..4 {
-                for x in 0..4 {
-                    let px = (by * 4 + y) * width as usize + (bx * 4 + x);
-                    let base = px * 4;
-                    rgb[y * 4 + x] = [rgba[base], rgba[base + 1], rgba[base + 2]];
-                    alpha[y * 4 + x] = rgba[base + 3];
+    encode_block_rows(
+        blocks_x,
+        blocks_y,
+        ETC2_RGBA_BLOCK_BYTES,
+        &mut out,
+        |by, row| {
+            let mut rgb = [[0u8; 3]; 16];
+            let mut alpha = [0u8; 16];
+            for (bx, dst) in row.chunks_mut(ETC2_RGBA_BLOCK_BYTES).enumerate() {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let px = (by * 4 + y) * width as usize + (bx * 4 + x);
+                        let base = px * 4;
+                        rgb[y * 4 + x] = [rgba[base], rgba[base + 1], rgba[base + 2]];
+                        alpha[y * 4 + x] = rgba[base + 3];
+                    }
                 }
+                // Order matters: the GPU (and the reference decoder) read the
+                // alpha block first, then the colour block.
+                dst[..8].copy_from_slice(&encode_alpha_block(&alpha));
+                dst[8..].copy_from_slice(&encode_block(&rgb));
             }
-            // Order matters: the GPU (and the reference decoder) read the alpha
-            // block first, then the colour block.
-            out.extend_from_slice(&encode_alpha_block(&alpha));
-            out.extend_from_slice(&encode_block(&rgb));
-        }
-    }
+        },
+    );
 
     Ok(out)
 }
@@ -219,13 +286,22 @@ fn encode_alpha_block(alpha: &[u8; 16]) -> [u8; 8] {
         let base = base_i.clamp(0, 255);
         for (table_idx, table) in ALPHA_MODIFIER_TABLE.iter().enumerate() {
             for multiplier in 1..=15i32 {
+                // The eight reachable alpha values depend only on
+                // (base, table, multiplier) — not on the pixel. Computing them
+                // inside the pixel loop redid the same multiply-add-clamp
+                // sixteen times per combination, which is most of why the
+                // alpha path measured 33x the colour path.
+                let mut reachable = [0i32; 8];
+                for (idx, &modifier) in table.iter().enumerate() {
+                    reachable[idx] = (base + multiplier * modifier).clamp(0, 255);
+                }
+
                 let mut error = 0u64;
                 let mut indices = [0u8; 16];
                 for (pixel, &target) in alpha.iter().enumerate() {
                     let mut pixel_best = u64::MAX;
                     let mut pixel_index = 0u8;
-                    for (idx, &modifier) in table.iter().enumerate() {
-                        let value = (base + multiplier * modifier).clamp(0, 255);
+                    for (idx, &value) in reachable.iter().enumerate() {
                         let delta = value - target as i32;
                         let cost = (delta * delta) as u64;
                         if cost < pixel_best {
@@ -466,6 +542,103 @@ mod tests {
             }
         }
         rgba
+    }
+
+    /// What ETC2 encoding actually costs at install time.
+    ///
+    /// The encoder is scalar and serial, and package ingest now runs on a
+    /// class capped at 1, so this is the whole transcode budget for a package:
+    /// every image, one after another, on one thread. Before optimising it —
+    /// blocks are independent, so this parallelises trivially — the number has
+    /// to justify the work.
+    ///
+    /// `gradient` rather than flat colour on purpose: `encode_alpha_block`
+    /// short-circuits on constant alpha and a flat image would measure the
+    /// fast path a real sprite never takes.
+    #[test]
+    #[ignore]
+    fn bench_etc2_encode_throughput() {
+        for side in [256u32, 512, 1024, 2048] {
+            let rgba = gradient(side, side);
+            let megapixels = (side as f64 * side as f64) / 1_000_000.0;
+
+            let rgb_time = {
+                let started = std::time::Instant::now();
+                std::hint::black_box(encode_etc2_rgb(&rgba, side, side).unwrap());
+                started.elapsed()
+            };
+
+            // Real sprites carry alpha, which adds the EAC block: an exhaustive
+            // search over 16 tables x 15 multipliers per 4x4 tile.
+            let mut with_alpha = rgba.clone();
+            for (i, px) in with_alpha.chunks_exact_mut(4).enumerate() {
+                px[3] = (i % 251) as u8;
+            }
+            let rgba_time = {
+                let started = std::time::Instant::now();
+                std::hint::black_box(encode_etc2_rgba(&with_alpha, side, side).unwrap());
+                started.elapsed()
+            };
+
+            // The opacity probe that decides between the two formats reads
+            // every pixel; worth knowing whether it is noise or not.
+            let scan_time = {
+                let started = std::time::Instant::now();
+                std::hint::black_box(with_alpha.chunks_exact(4).any(|px| px[3] != 0xFF));
+                started.elapsed()
+            };
+
+            eprintln!(
+                "{side}x{side} ({megapixels:>4.1} MP)  rgb {:>10?} ({:>6.1} MP/s)   rgba {:>10?} ({:>6.1} MP/s)   alpha-scan {:>9?}",
+                rgb_time,
+                megapixels / rgb_time.as_secs_f64(),
+                rgba_time,
+                megapixels / rgba_time.as_secs_f64(),
+                scan_time,
+            );
+        }
+    }
+
+    /// Deterministic input with alpha that varies inside every block, so the
+    /// exhaustive search actually runs.
+    fn alpha_gradient(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = gradient(width, height);
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            px[3] = (i % 251) as u8;
+        }
+        rgba
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        hex::encode(&hasher.finalize()[..16])
+    }
+
+    /// Pins the encoder's exact output.
+    ///
+    /// The round-trip tests prove the blocks decode to something close enough
+    /// to the source; they would not notice an "optimisation" that changed
+    /// which block encoding was chosen. This makes any such change fail loudly,
+    /// so a speed-up has to prove it is byte-identical rather than merely
+    /// still-correct — and a deliberate quality change has to update the
+    /// digest, which is the point at which someone has to think about it.
+    #[test]
+    fn encoder_output_is_byte_stable() {
+        let rgb_only = gradient(64, 64);
+        assert_eq!(
+            digest(&encode_etc2_rgb(&rgb_only, 64, 64).unwrap()),
+            "92e7b3a2005b5324985c32bc2132a095",
+            "ETC2 RGB output changed"
+        );
+
+        let with_alpha = alpha_gradient(64, 64);
+        assert_eq!(
+            digest(&encode_etc2_rgba(&with_alpha, 64, 64).unwrap()),
+            "8ccec2312d9be05e9a7767e3f2f8576f",
+            "ETC2 RGBA output changed"
+        );
     }
 
     #[test]
