@@ -2,7 +2,7 @@ use crate::{
     cost::CheapPolicy,
     domain::IoDomain,
     pools::{IoPools, PoolError},
-    task::{BackendKind, IoRequest, PoolKind, PriorityClass, ReadSpec, RequestKind},
+    task::{BackendKind, IoRequest, PoolKind, PriorityClass, RequestKind},
 };
 use std::{
     collections::HashMap,
@@ -346,9 +346,8 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
             backend,
             request: _,
             priority,
-            spec,
             estimated_bytes,
-        } => classify_read(*backend, *priority, *spec, *estimated_bytes, policy),
+        } => classify_read(*backend, *priority, *estimated_bytes, policy),
         IoRequest::GetFileInfo {
             backend, priority, ..
         } => classify_metadata(*backend, *priority),
@@ -360,7 +359,10 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
             }
         }
         IoRequest::Unzip { .. } => RouteDecision::Delegated(PoolKind::Archive),
-        IoRequest::PackageIngest { .. } => RouteDecision::Delegated(PoolKind::Archive),
+        // Not `Archive`: ingest holds an image's encoded bytes, its decoded
+        // RGBA, its ETC2 blocks and its KTX2 container simultaneously, so it
+        // stays serial while extraction runs several at a time.
+        IoRequest::PackageIngest { .. } => RouteDecision::Delegated(PoolKind::Ingest),
         IoRequest::VerifyPackage { .. } => RouteDecision::Delegated(PoolKind::Fs),
         IoRequest::StorageGet {
             request,
@@ -388,7 +390,6 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
 fn classify_read(
     backend: BackendKind,
     priority: PriorityClass,
-    spec: ReadSpec,
     estimated_bytes: usize,
     policy: &CheapPolicy,
 ) -> RouteDecision {
@@ -399,7 +400,7 @@ fn classify_read(
         // pool hop just adds a thread handoff to a sub-millisecond
         // operation. Everything else still fans out to the pack pool.
         BackendKind::Pack => {
-            if is_foreground(priority) && estimated_bytes <= inline_read_bytes(spec, policy) {
+            if is_foreground(priority) && estimated_bytes <= policy.small_read_bytes {
                 RouteDecision::Inline
             } else {
                 RouteDecision::Delegated(PoolKind::Pack)
@@ -407,7 +408,7 @@ fn classify_read(
         }
         BackendKind::Archive => RouteDecision::Delegated(PoolKind::Archive),
         BackendKind::Filesystem => {
-            if is_foreground(priority) && estimated_bytes <= inline_read_bytes(spec, policy) {
+            if is_foreground(priority) && estimated_bytes <= policy.small_read_bytes {
                 RouteDecision::Inline
             } else {
                 RouteDecision::Delegated(PoolKind::Fs)
@@ -444,13 +445,6 @@ fn classify_storage_get(
     }
 }
 
-fn inline_read_bytes(spec: ReadSpec, policy: &CheapPolicy) -> usize {
-    match spec {
-        ReadSpec::Whole => policy.small_read_bytes,
-        ReadSpec::Range { length, .. } => policy.small_read_bytes.min(length),
-    }
-}
-
 fn is_foreground(priority: PriorityClass) -> bool {
     matches!(
         priority,
@@ -473,7 +467,7 @@ mod tests {
     use crate::{
         cost::CheapPolicy,
         scheduler::{IoScheduler, RouteDecision, classify_request},
-        task::{BackendKind, IoRequest, PoolKind, PriorityClass, ReadSpec, RequestKind},
+        task::{BackendKind, IoRequest, PoolKind, PriorityClass, RequestKind},
     };
 
     #[test]
@@ -485,7 +479,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 
@@ -511,7 +504,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 
@@ -527,17 +519,12 @@ mod tests {
             backend: BackendKind::Filesystem,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Range {
-                position: 0,
-                length: 32,
-            },
             estimated_bytes: 32,
         };
         let delegated_req = IoRequest::ReadFile {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 
@@ -667,7 +654,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
         assert_eq!(scheduler_b.run_sync(&pack_req, || 3_u32).unwrap(), 3);
@@ -687,7 +673,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Whole,
             estimated_bytes: 128 * 1024,
         };
 
@@ -703,10 +688,6 @@ mod tests {
             backend: BackendKind::Filesystem,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Range {
-                position: 0,
-                length: 1024,
-            },
             estimated_bytes: 1024,
         };
 
@@ -724,10 +705,6 @@ mod tests {
             backend: BackendKind::Filesystem,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Range {
-                position: 0,
-                length: 1024,
-            },
             estimated_bytes: 1024,
         };
 
@@ -994,6 +971,36 @@ mod tests {
         );
     }
 
+    /// Extraction and ingest must not share a class.
+    ///
+    /// They ran on one before, which forced a single cap onto two opposite
+    /// profiles: ingest holds tens to hundreds of MB per job and has to stay
+    /// serial, extraction holds tens of KB and measures 3.5-3.8x on four
+    /// threads. One cap could only serve the dangerous one, so extraction was
+    /// pinned at 1 for a constraint that was never its own.
+    #[test]
+    fn extraction_and_ingest_are_scheduled_as_separate_classes() {
+        let unzip = IoRequest::Unzip {
+            backend: BackendKind::Filesystem,
+            priority: PriorityClass::Background,
+            compressed_bytes: 4 * 1024 * 1024,
+        };
+        let ingest = IoRequest::PackageIngest {
+            priority: PriorityClass::Background,
+            compressed_bytes: 4 * 1024 * 1024,
+        };
+        let policy = CheapPolicy::default();
+
+        assert_eq!(
+            classify_request(&unzip, &policy),
+            RouteDecision::Delegated(PoolKind::Archive)
+        );
+        assert_eq!(
+            classify_request(&ingest, &policy),
+            RouteDecision::Delegated(PoolKind::Ingest)
+        );
+    }
+
     #[test]
     fn scheduler_routes_uncached_image_decode_requests_to_image_pool() {
         let req = IoRequest::DecodeImage {
@@ -1033,7 +1040,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1080,14 +1086,12 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 200,
         };
         let unhinted = IoRequest::ReadFile {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
         };
 
@@ -1167,7 +1171,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 

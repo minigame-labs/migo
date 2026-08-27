@@ -507,6 +507,140 @@ mod tests {
 
     use crate::scheduler::IoScheduler;
 
+    /// Is the Archive class cap of 1 leaving anything on the table?
+    ///
+    /// `ExecutorConfig::for_workers` pins that class to a single worker, so
+    /// every unzip and package ingest in the process runs one at a time. That
+    /// is either correct (extraction is I/O bound, so concurrency buys nothing
+    /// and costs memory) or it is throughput being discarded. Which one is a
+    /// property of the workload, not of the pool — so this measures the
+    /// workload directly, extracting the same archives sequentially and then
+    /// one thread each.
+    ///
+    /// Entries are Deflated, not Stored: a Stored archive makes this a
+    /// file-copy benchmark and would answer a different question.
+    #[test]
+    #[ignore]
+    fn bench_parallel_extraction_speedup() {
+        const ARCHIVES: usize = 4;
+        const ENTRIES_PER_ARCHIVE: usize = 8;
+        const ENTRY_BYTES: usize = 512 * 1024;
+
+        let root = std::env::temp_dir().join(format!(
+            "migo_zip_parallel_bench_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Two payload profiles, because the answer must not depend on which
+        // one a game happens to ship: `text` stands for JSON/atlas descriptors
+        // that deflate crushes, `binary` for PNG/audio that is already
+        // compressed and passes through nearly as-is.
+        let profile = std::env::var("MIGO_BENCH_PAYLOAD").unwrap_or_else(|_| "text".to_string());
+        let payload: Vec<u8> = match profile.as_str() {
+            // splitmix64 finalizer: uniform bytes, so deflate finds nothing and
+            // the archive is the same size as its contents. A linear generator
+            // will not do here — its high bits change slowly and compress by
+            // tens to one, which is the opposite of what this profile is for.
+            "binary" => (0..ENTRY_BYTES)
+                .map(|i| {
+                    let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    (z ^ (z >> 31)) as u8
+                })
+                .collect(),
+            _ => (0..ENTRY_BYTES)
+                .map(|i| (((i as u64).wrapping_mul(2654435761) >> 16) & 0x3F) as u8)
+                .collect(),
+        };
+
+        let mut archives = Vec::new();
+        for a in 0..ARCHIVES {
+            let zip_path = root.join(format!("input_{a}.zip"));
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for e in 0..ENTRIES_PER_ARCHIVE {
+                zip.start_file(format!("dir/entry_{e}.bin"), options).unwrap();
+                zip.write_all(&payload).unwrap();
+            }
+            zip.finish().unwrap();
+            archives.push(zip_path);
+        }
+
+        let uncompressed = (ARCHIVES * ENTRIES_PER_ARCHIVE * ENTRY_BYTES) as f64 / (1024.0 * 1024.0);
+        let compressed: u64 = archives
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+
+        let extract_all = |label: &str| {
+            let out_root = root.join(label);
+            for (i, zip_path) in archives.iter().enumerate() {
+                extract_zip_with_budget(
+                    zip_path,
+                    &out_root.join(format!("a{i}")),
+                    None,
+                    ExtractBudget::default(),
+                )
+                .unwrap();
+            }
+            let _ = std::fs::remove_dir_all(&out_root);
+        };
+
+        // Warm the page cache and any allocator arenas so the first timed run
+        // is not paying for both.
+        extract_all("warm");
+
+        let sequential = {
+            let started = std::time::Instant::now();
+            extract_all("seq");
+            started.elapsed()
+        };
+
+        let parallel = {
+            let out_root = root.join("par");
+            let started = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for (i, zip_path) in archives.iter().enumerate() {
+                    let out = out_root.join(format!("a{i}"));
+                    scope.spawn(move || {
+                        extract_zip_with_budget(zip_path, &out, None, ExtractBudget::default())
+                            .unwrap();
+                    });
+                }
+            });
+            let elapsed = started.elapsed();
+            let _ = std::fs::remove_dir_all(&out_root);
+            elapsed
+        };
+
+        eprintln!(
+            "payload={profile}  {ARCHIVES} archives x {ENTRIES_PER_ARCHIVE} entries x {} KiB = {uncompressed:.0} MiB uncompressed ({:.1} MiB on disk, {:.1}:1)",
+            ENTRY_BYTES / 1024,
+            compressed as f64 / (1024.0 * 1024.0),
+            uncompressed / (compressed as f64 / (1024.0 * 1024.0)).max(f64::MIN_POSITIVE)
+        );
+        eprintln!(
+            "cores available   {}",
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        );
+        eprintln!("sequential (cap=1 equivalent)  {sequential:>12?}");
+        eprintln!("parallel   ({ARCHIVES} threads)          {parallel:>12?}");
+        eprintln!(
+            "speedup {:.2}x  -- the Archive cap of 1 forfeits this",
+            sequential.as_secs_f64() / parallel.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn test_normalize_path() {
         let p = normalize_path(Path::new("/a/b/../c/./d"));

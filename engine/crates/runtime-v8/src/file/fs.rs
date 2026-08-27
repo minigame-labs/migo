@@ -17,7 +17,7 @@ use migo_io::{
     domain::DomainError,
     pools::PoolError,
     scheduler::IoScheduler,
-    task::{BackendKind, IoRequest, PriorityClass, ReadSpec, RequestKind},
+    task::{BackendKind, IoRequest, PriorityClass, RequestKind},
 };
 use shared::protocol::io_cmd::ZipEntryData;
 
@@ -122,19 +122,11 @@ fn read_request(
         (None, Some(hint)) => hint,
         (None, None) => shared::protocol::io_cmd::MAX_READ_LENGTH,
     } as usize;
-    let spec = match length {
-        Some(length) => ReadSpec::Range {
-            position: 0,
-            length: length as usize,
-        },
-        None => ReadSpec::Whole,
-    };
 
     IoRequest::ReadFile {
         backend,
         request,
         priority: PriorityClass::from(request),
-        spec,
         estimated_bytes,
     }
 }
@@ -163,7 +155,6 @@ fn copy_request(backend: BackendKind, request: RequestKind) -> IoRequest {
         backend,
         request,
         priority: PriorityClass::from(request),
-        spec: ReadSpec::Whole,
         estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
     }
 }

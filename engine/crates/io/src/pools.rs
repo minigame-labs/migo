@@ -107,7 +107,7 @@ impl<T> FairLane<T> {
     }
 }
 
-const POOL_COUNT: usize = 4;
+const POOL_COUNT: usize = 5;
 const PRIORITY_COUNT: usize = 3;
 const LANE_COUNT: usize = POOL_COUNT * PRIORITY_COUNT;
 
@@ -117,6 +117,7 @@ const fn pool_index(pool: PoolKind) -> usize {
         PoolKind::Pack => 1,
         PoolKind::Image => 2,
         PoolKind::Archive => 3,
+        PoolKind::Ingest => 4,
     }
 }
 
@@ -126,6 +127,7 @@ const fn pool_from_index(index: usize) -> PoolKind {
         1 => PoolKind::Pack,
         2 => PoolKind::Image,
         3 => PoolKind::Archive,
+        4 => PoolKind::Ingest,
         _ => panic!("invalid pool index"),
     }
 }
@@ -156,7 +158,16 @@ impl ExecutorConfig {
         let cpu_heavy_cap = worker_count.saturating_sub(1).clamp(1, 2);
         Self {
             worker_count,
-            class_caps: [worker_count, cpu_heavy_cap, cpu_heavy_cap, 1],
+            // Fs, Pack, Image, Archive, Ingest.
+            //
+            // Archive gets the CPU-heavy cap rather than 1: extraction is
+            // inflate-bound with a working set of tens of kilobytes, and
+            // measures 3.5-3.8x on four threads (`bench_parallel_extraction_speedup`,
+            // both a 78:1-compressible and an incompressible payload). It used
+            // to be pinned at 1 because it shared a class with ingest, whose
+            // per-job memory runs to tens or hundreds of MB; that constraint
+            // now lives on `Ingest`, where it belongs.
+            class_caps: [worker_count, cpu_heavy_cap, cpu_heavy_cap, cpu_heavy_cap, 1],
             host_cap_when_contended: worker_count.div_ceil(2),
             aging_interval: 16,
         }
@@ -988,7 +999,10 @@ mod r5_queue_tests {
         for (pool, cap) in [
             (PoolKind::Image, 2_usize),
             (PoolKind::Pack, 2),
-            (PoolKind::Archive, 1),
+            (PoolKind::Archive, 2),
+            // The one class that must stay serial: a single ingest can hold
+            // an image's RGBA, its ETC2 blocks and its KTX2 container at once.
+            (PoolKind::Ingest, 1),
         ] {
             let mut state = QueueState::default();
             for id in 0_u32..4 {
@@ -1333,7 +1347,8 @@ mod r5_executor_tests {
             (PoolKind::Fs, 4),
             (PoolKind::Pack, 2),
             (PoolKind::Image, 2),
-            (PoolKind::Archive, 1),
+            (PoolKind::Archive, 2),
+            (PoolKind::Ingest, 1),
         ] {
             assert_runtime_class_cap(pool, expected_cap);
         }
