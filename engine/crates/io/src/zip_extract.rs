@@ -7,6 +7,9 @@
 //! - Resource budget (entry count, total uncompressed bytes, per-entry size,
 //!   compression ratio) to defend against zip bombs
 
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(not(unix))]
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
@@ -141,6 +144,220 @@ impl From<PoolError> for ZipError {
 /// Progress callback type
 pub type ProgressCallback = Box<dyn Fn(f32, usize, usize) + Send>;
 
+/// Resolving an entry's path exactly once, in the kernel.
+///
+/// The path-based checks elsewhere in this file answer "does this name point
+/// inside `dest`?" — but they answer it about a *name*, and then a separate
+/// syscall resolves that name again. Between the two, any component can become
+/// a symlink. No amount of re-checking closes that; the resolution has to
+/// happen once.
+///
+/// So every component below `dest` is reached with `openat` from a held
+/// directory descriptor, under `O_NOFOLLOW`. A component that is a symlink
+/// fails with `ELOOP` at the moment of use rather than passing a check and
+/// being swapped afterwards. `dest` itself is opened once, up front.
+#[cfg(unix)]
+mod dirfd {
+    use std::ffi::{CString, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path};
+
+    /// Directories are opened read-only; we only ever use them as a resolution
+    /// base for `openat`/`mkdirat`.
+    const DIR_FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    fn component_cstring(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zip entry path component contains a NUL byte",
+            )
+        })
+    }
+
+    /// Open `path` as the resolution base. Unlike every call below this one
+    /// takes a full path, because it is the trusted root the caller already
+    /// canonicalised.
+    pub(super) fn open_root(path: &Path) -> io::Result<OwnedFd> {
+        let c_path = component_cstring(path.as_os_str())?;
+        // SAFETY: `c_path` is NUL-terminated and outlives the call; the flags
+        // are valid for a directory open.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor, checked non-negative, owned by us.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Create `name` under `parent` if absent, then open it. An existing
+    /// *symlink* named `name` makes the open fail rather than be followed.
+    fn open_or_create_child_dir(parent: &OwnedFd, name: &CString) -> io::Result<OwnedFd> {
+        // SAFETY: `name` is NUL-terminated and outlives the call; `parent` is
+        // a live directory descriptor.
+        let made = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+        if made < 0 {
+            let err = io::Error::last_os_error();
+            // Already there is the common case — every entry after the first
+            // in a given directory. Anything else is real.
+            if err.kind() != io::ErrorKind::AlreadyExists {
+                return Err(err);
+            }
+        }
+
+        // SAFETY: same contract as above; `DIR_FLAGS` carries `O_NOFOLLOW`, so
+        // a symlink here is refused instead of traversed.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), DIR_FLAGS) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fresh descriptor, checked non-negative, owned by us.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Reject anything that is not a plain name. `.`, `..`, a root, or a
+    /// prefix reaching this far would mean the caller's normalisation let
+    /// something through, and resolving it here would undo the containment the
+    /// descriptor walk exists to provide.
+    fn plain_components(relative: &Path) -> io::Result<Vec<CString>> {
+        relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => component_cstring(name),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "zip entry path component is not a plain name",
+                )),
+            })
+            .collect()
+    }
+
+    /// Walk `relative` from `root`, creating each directory along the way, and
+    /// return a descriptor for the last one.
+    pub(super) fn create_dir_chain(root: &OwnedFd, relative: &Path) -> io::Result<OwnedFd> {
+        let mut current = root.try_clone()?;
+        for name in plain_components(relative)? {
+            current = open_or_create_child_dir(&current, &name)?;
+        }
+        Ok(current)
+    }
+
+    /// Create (or truncate) `name` directly under `dir`.
+    ///
+    /// `O_NOFOLLOW` without `O_EXCL`: overwriting a plain file left by an
+    /// earlier extraction is expected, following a symlink is not.
+    pub(super) fn create_file(dir: &OwnedFd, name: &OsStr) -> io::Result<File> {
+        let c_name = component_cstring(name)?;
+        // SAFETY: `c_name` is NUL-terminated and outlives the call; `dir` is a
+        // live directory descriptor; `O_CREAT` is paired with a mode argument.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fresh descriptor, checked non-negative, owned by us.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+/// The destination tree an extraction writes into.
+///
+/// One abstraction with two implementations so the extraction loop does not
+/// carry platform branches. On Unix it holds descriptors and resolves every
+/// component through `openat`; elsewhere it falls back to path operations,
+/// which is what the whole file used to do.
+struct OutputTree {
+    #[cfg(unix)]
+    root: std::os::fd::OwnedFd,
+    #[cfg(not(unix))]
+    root: PathBuf,
+    /// Directories this extraction has already made, keyed by their path
+    /// relative to the root. Archives are many files under few directories, so
+    /// without this every entry re-walks (and on Unix re-opens) its ancestry.
+    #[cfg(unix)]
+    dirs: HashMap<PathBuf, std::os::fd::OwnedFd>,
+    #[cfg(not(unix))]
+    dirs: HashSet<PathBuf>,
+}
+
+impl OutputTree {
+    #[cfg(unix)]
+    fn new(dest_canonical: &Path) -> io::Result<Self> {
+        Ok(Self {
+            root: dirfd::open_root(dest_canonical)?,
+            dirs: HashMap::new(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn new(dest_canonical: &Path) -> io::Result<Self> {
+        Ok(Self {
+            root: dest_canonical.to_path_buf(),
+            dirs: HashSet::new(),
+        })
+    }
+
+    /// Materialise `relative` as a directory, creating every level.
+    #[cfg(unix)]
+    fn ensure_dir(&mut self, relative: &Path) -> io::Result<()> {
+        if !self.dirs.contains_key(relative) {
+            let fd = dirfd::create_dir_chain(&self.root, relative)?;
+            self.dirs.insert(relative.to_path_buf(), fd);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_dir(&mut self, relative: &Path) -> io::Result<()> {
+        if !self.dirs.contains(relative) {
+            fs::create_dir_all(self.root.join(relative))?;
+            self.dirs.insert(relative.to_path_buf());
+        }
+        Ok(())
+    }
+
+    /// Create (or truncate) the file at `relative`, making its parents first.
+    #[cfg(unix)]
+    fn create_file(&mut self, relative: &Path) -> io::Result<File> {
+        let name = relative.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "zip entry has no file name")
+        })?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        self.ensure_dir(parent)?;
+        dirfd::create_file(&self.dirs[parent], name)
+    }
+
+    #[cfg(not(unix))]
+    fn create_file(&mut self, relative: &Path) -> io::Result<File> {
+        if relative.file_name().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zip entry has no file name",
+            ));
+        }
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        self.ensure_dir(parent)?;
+        // No `O_NOFOLLOW` counterpart here, so this platform keeps the weaker
+        // guarantee the path-based checks above provide.
+        File::create(self.root.join(relative))
+    }
+}
+
 /// Reader wrapper that caps the number of bytes that can be read from
 /// the underlying stream. Used for streaming decompression so a single
 /// entry cannot exceed `max_entry_uncompressed` even if its zip header
@@ -254,11 +471,7 @@ pub fn extract_zip_with_budget(
     let dest_canonical = dest_dir.canonicalize()?;
 
     let mut written_total: u64 = 0;
-    // Directories already materialised by this extraction. Archives are
-    // overwhelmingly many files under few directories, so without this every
-    // entry pays a `stat` on its parent to answer a question the previous
-    // entry already answered.
-    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut tree = OutputTree::new(&dest_canonical)?;
 
     for i in 0..total_files {
         let mut file = archive.by_index(i)?;
@@ -296,54 +509,62 @@ pub fn extract_zip_with_budget(
             return Err(ZipError::PathTraversal(file_name));
         }
 
+        // Verify the deepest ancestor that already exists, not just the
+        // immediate parent.
+        //
+        // Checking `parent` alone and skipping when it does not exist left a
+        // hole: an attacker who pre-planted a symlink further up gets it
+        // followed by the `create_dir_all` below, and nothing ever looked at
+        // it. Walking up to the first existing component means the check
+        // always runs against something real.
         if let Some(parent) = outpath_normalized.parent() {
-            if parent.exists() {
-                match std::fs::canonicalize(parent) {
-                    Ok(canonical_parent) => {
-                        if !canonical_parent.starts_with(&dest_canonical) {
-                            error!(
-                                "extract_zip: ancestor symlink escape detected: {} -> {}",
-                                parent.display(),
-                                canonical_parent.display()
-                            );
-                            return Err(ZipError::PathTraversal(format!(
-                                "ancestor directory escapes target via symlink: {}",
-                                file_name
-                            )));
-                        }
-                    }
-                    Err(e) => {
+            let mut existing = parent;
+            while !existing.exists() {
+                match existing.parent() {
+                    // `dest_canonical` itself exists, so this terminates.
+                    Some(up) => existing = up,
+                    None => break,
+                }
+            }
+            match std::fs::canonicalize(existing) {
+                Ok(canonical_ancestor) => {
+                    if !canonical_ancestor.starts_with(&dest_canonical) {
                         error!(
-                            "extract_zip: cannot canonicalize parent {}: {} — rejecting entry {}",
-                            parent.display(),
-                            e,
-                            file_name
+                            "extract_zip: ancestor symlink escape detected: {} -> {}",
+                            existing.display(),
+                            canonical_ancestor.display()
                         );
                         return Err(ZipError::PathTraversal(format!(
-                            "cannot verify ancestor directory: {}",
+                            "ancestor directory escapes target via symlink: {}",
                             file_name
                         )));
                     }
                 }
+                Err(e) => {
+                    error!(
+                        "extract_zip: cannot canonicalize ancestor {}: {} — rejecting entry {}",
+                        existing.display(),
+                        e,
+                        file_name
+                    );
+                    return Err(ZipError::PathTraversal(format!(
+                        "cannot verify ancestor directory: {}",
+                        file_name
+                    )));
+                }
             }
         }
 
+        // Everything below is addressed relative to the root the tree holds,
+        // so a component can no longer be re-resolved between check and use.
+        let relative = outpath_normalized
+            .strip_prefix(&dest_canonical)
+            .map_err(|_| ZipError::PathTraversal(file_name.clone()))?;
+
         if file.is_dir() {
             trace!("extract_zip: creating directory {}", outpath.display());
-            fs::create_dir_all(&outpath)?;
-            created_dirs.insert(outpath.clone());
+            tree.ensure_dir(relative)?;
         } else {
-            if let Some(parent) = outpath.parent() {
-                // `create_dir_all` is already a no-op on an existing directory,
-                // so the set replaces the `exists()` probe rather than the
-                // creation: the syscall saved is the `stat`, on every entry
-                // after the first in a given directory.
-                if !created_dirs.contains(parent) {
-                    trace!("extract_zip: creating parent dir {}", parent.display());
-                    fs::create_dir_all(parent)?;
-                    created_dirs.insert(parent.to_path_buf());
-                }
-            }
 
             // Per-entry ratio check: uncompressed / compressed.
             let compressed = file.compressed_size();
@@ -365,7 +586,7 @@ pub fn extract_zip_with_budget(
             let cap = std::cmp::min(budget.max_entry_uncompressed, remaining_total);
             let mut limited = LimitedEntryReader::new(&mut file, cap + 1);
 
-            let mut outfile = File::create(&outpath)?;
+            let mut outfile = tree.create_file(relative)?;
             let actually_written = match io::copy(&mut limited, &mut outfile) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -639,6 +860,175 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An entry whose own path was pre-planted as a symlink must not be
+    /// followed.
+    ///
+    /// This is the reachable half of the extraction TOCTOU: the entry name
+    /// comes from the archive, so its final component is what an attacker aims
+    /// somewhere else. The containment check passes — the path really is
+    /// inside `dest` — and only the open refusing to traverse the link stops
+    /// the write from landing outside.
+    #[cfg(unix)]
+    #[test]
+    fn entry_whose_path_is_a_symlink_is_refused() {
+        let base = std::env::temp_dir().join(format!(
+            "migo_zip_symlink_leaf_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = base.join("dest");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+
+        // The archive writes `loot.txt`; that name already exists inside dest
+        // as a link pointing out of it.
+        std::os::unix::fs::symlink(&victim, dest.join("loot.txt")).unwrap();
+
+        let zip_path = base.join("evil.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("loot.txt", options).unwrap();
+        zip.write_all(b"OVERWRITTEN").unwrap();
+        zip.finish().unwrap();
+
+        let result = extract_zip_with_budget(&zip_path, &dest, None, ExtractBudget::default());
+
+        assert!(
+            result.is_err(),
+            "extraction through a symlinked entry path must fail"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "the file outside dest was overwritten through the symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A symlinked directory is refused even when it points back *inside*
+    /// `dest`.
+    ///
+    /// This is the case that isolates what the descriptor walk adds. The
+    /// path-based checks pass it: canonicalising `dest/assets` yields
+    /// `dest/real`, which is contained, so containment has nothing to object
+    /// to. Only `openat` with `O_NOFOLLOW` refuses to traverse it.
+    ///
+    /// Refusing is the point rather than an over-reach: a link the extraction
+    /// is willing to walk is a link an attacker can re-aim afterwards, and an
+    /// app's own sandbox directory has no legitimate reason to contain one.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_is_refused_even_when_it_stays_inside_dest() {
+        let base = std::env::temp_dir().join(format!(
+            "migo_zip_symlink_inside_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = base.join("dest");
+        std::fs::create_dir_all(dest.join("real")).unwrap();
+        std::os::unix::fs::symlink(dest.join("real"), dest.join("assets")).unwrap();
+
+        let zip_path = base.join("input.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("assets/x.txt", options).unwrap();
+        zip.write_all(b"payload").unwrap();
+        zip.finish().unwrap();
+
+        let result = extract_zip_with_budget(&zip_path, &dest, None, ExtractBudget::default());
+
+        // Which defence fired is the assertion, not just that one did. A
+        // `PathTraversal` here would mean containment rejected it and this test
+        // proves nothing about `openat`; `ELOOP` from the kernel is the
+        // descriptor walk refusing to traverse the link.
+        match result {
+            Err(ZipError::Io(err)) => {
+                // `O_DIRECTORY | O_NOFOLLOW` meeting a symlink reports ENOTDIR
+                // on Linux ("that is not a directory") and ELOOP on the BSDs
+                // ("that is a link"). Both mean the kernel refused to traverse
+                // it, which is the property under test; neither is a fallback
+                // for the other.
+                let code = err.raw_os_error();
+                assert!(
+                    code == Some(libc::ENOTDIR) || code == Some(libc::ELOOP),
+                    "expected the open to be refused as a symlink, got {err:?}"
+                );
+            }
+            other => panic!("expected the descriptor walk to refuse the link, got {other:?}"),
+        }
+        assert!(
+            !dest.join("real").join("x.txt").exists(),
+            "the entry was written through the link"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The containment check must not be skipped just because the immediate
+    /// parent has not been created yet.
+    ///
+    /// A symlinked directory further up used to go unexamined: the check only
+    /// ran when `parent.exists()`, and for a nested entry it does not until
+    /// `create_dir_all` runs — which would have followed the link first.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ancestor_is_caught_before_its_child_is_created() {
+        let base = std::env::temp_dir().join(format!(
+            "migo_zip_symlink_ancestor_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = base.join("dest");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // `dest/assets` is a link out of the tree. The entry lands two levels
+        // below it, so its immediate parent (`dest/assets/img`) does not exist
+        // and the old check had nothing to look at.
+        std::os::unix::fs::symlink(&outside, dest.join("assets")).unwrap();
+
+        let zip_path = base.join("evil.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("assets/img/planted.bin", options).unwrap();
+        zip.write_all(b"PLANTED").unwrap();
+        zip.finish().unwrap();
+
+        let result = extract_zip_with_budget(&zip_path, &dest, None, ExtractBudget::default());
+
+        assert!(
+            result.is_err(),
+            "an entry under a symlinked ancestor must be rejected"
+        );
+        assert!(
+            !outside.join("img").exists(),
+            "directories were created outside dest through the symlinked ancestor"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

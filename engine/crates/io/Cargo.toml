@@ -57,6 +57,13 @@ zip = { version = "2.2", optional = true, default-features = false, features = [
 # variable set by `scripts/build-android-so.sh`.
 rusqlite = { version = "0.32", default-features = false, features = ["bundled", "blob"] }
 
+# `O_NOFOLLOW` when creating a zip entry's output file, so the one path
+# component a malicious archive controls cannot be redirected through a
+# symlink. Already in the tree via memmap2 / tokio / parking_lot, so making it
+# direct costs no binary size. Unix-only: the flag has no Windows counterpart.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 texture2ddecoder = "0.1.2"
