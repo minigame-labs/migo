@@ -81,9 +81,10 @@ mod pbo_upload;
 mod types;
 
 pub(crate) use types::{
-    BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta,
-    MAX_UNIFORM_CACHE, ProgramMeta, QueryMeta, RenderbufferMeta, SamplerMeta, ScissorState,
-    ShaderMeta, SyncMeta, TextureMeta, TransformFeedbackMeta, VaoMeta, VertexAttribPointerFp, ee,
+    BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, CanvasStateTable,
+    FramebufferMeta, MAX_UNIFORM_CACHE, ProgramMeta, QueryMeta, RenderbufferMeta, SamplerMeta,
+    ScissorState, ShaderMeta, SyncMeta, TextureMeta, TransformFeedbackMeta, VaoMeta,
+    VertexAttribPointerFp, ee,
 };
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
@@ -369,7 +370,7 @@ pub(crate) struct CanvasManager {
     pub(crate) textures: HashMap<TextureId, TextureMeta>,
     pub(crate) framebuffers: HashMap<FramebufferId, FramebufferMeta>,
     pub(crate) renderbuffers: HashMap<RenderbufferId, RenderbufferMeta>,
-    pub(crate) gl_state: HashMap<CanvasId, CanvasGLState>,
+    pub(crate) gl_state: CanvasStateTable,
     /// Ordered, authoritative accounting for WebGL-created texture and
     /// renderbuffer storage. This excludes Canvas2D/internal renderer objects.
     pub(crate) webgl_gpu_budget: crate::webgl_gpu_budget::WebGlGpuBudget,
@@ -830,7 +831,7 @@ impl CanvasManager {
             textures: HashMap::with_capacity(64),
             framebuffers: HashMap::with_capacity(8),
             renderbuffers: HashMap::with_capacity(8),
-            gl_state: HashMap::with_capacity(4),
+            gl_state: CanvasStateTable::default(),
             webgl_gpu_budget: crate::webgl_gpu_budget::WebGlGpuBudget::new(),
             vaos: HashMap::with_capacity(16),
             samplers: HashMap::with_capacity(8),
@@ -3995,7 +3996,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {
@@ -4590,7 +4591,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {
@@ -4717,7 +4718,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {
@@ -4927,7 +4928,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {

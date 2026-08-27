@@ -656,6 +656,21 @@ impl RendererGL {
                         }
                     }
                 }
+                // The link reset this program's uniforms driver-side, so drop
+                // what we shadowed for it — see
+                // `state_tracker::invalidate_program_uniforms`. Both branches
+                // above reset them: GLES 3.0 §2.11.4 defines `ProgramBinary` to
+                // behave as a successful link, and a *failed* re-link discards
+                // the previous executable rather than restoring it, so there is
+                // no outcome where the old values survive.
+                //
+                // Every canvas, because programs are shared across the EGL
+                // share group (ES 3.0 Appendix C.1) — the canvas that re-links
+                // need not be the one that cached the uniform. Same reasoning
+                // as the `DeleteTexture` sweep below.
+                for state in cm.gl_state.values_mut() {
+                    st::invalidate_program_uniforms(state, program_id);
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -748,14 +763,17 @@ impl RendererGL {
 
             GLCmd::DeleteProgram { program_id } => {
                 if let Some(mut meta) = cm.programs.remove(&program_id) {
-                    // Invalidate dedup state: if this program was current, clear it
-                    // so the next UseProgram with the same ID isn't skipped.
-                    if let Some(owner) = meta.owner_canvas {
-                        if let Some(state) = cm.gl_state.get_mut(&owner) {
-                            if state.current_program == Some(program_id) {
-                                state.current_program = None;
-                            }
-                        }
+                    // Drop the binding shadow and this program's cached uniform
+                    // values, so a client that reuses the name does not inherit
+                    // the dead program's dedup state.
+                    //
+                    // Every canvas, not `meta.owner_canvas`: a program created
+                    // on the resource context has `owner_canvas == None`, which
+                    // reached no canvas at all, and programs are shared across
+                    // the EGL share group anyway so any canvas in the group may
+                    // have made this one current.
+                    for state in cm.gl_state.values_mut() {
+                        st::forget_deleted_program(state, program_id);
                     }
                     meta.deleted = true;
                     if let Some(ph) = meta.gl_handle {
@@ -1217,9 +1235,7 @@ impl RendererGL {
                     // entries so the next BindTexture with the same ID isn't
                     // incorrectly deduped.
                     for state in cm.gl_state.values_mut() {
-                        state
-                            .bound_texture_2d
-                            .retain(|_, tid| *tid != Some(texture_id));
+                        state.bound_texture_2d.forget_texture(texture_id);
                     }
                     if let Some(h) = meta.gl_handle {
                         cm.delete_gl_object(GlObject::Texture(h))?;

@@ -116,8 +116,8 @@ pub(crate) const MAX_UNIFORM_CACHE: usize = 256;
 pub(crate) struct CanvasGLState {
     pub current_program: Option<ProgramId>,
     pub viewport: Option<(i32, i32, i32, i32)>,
-    /// TEXTURE_2D binding per texture unit.  Key = GL enum (TEXTURE0..TEXTURE31).
-    pub bound_texture_2d: HashMap<u32, Option<u32>>,
+    /// TEXTURE_2D binding per texture unit, indexed by `unit - TEXTURE0`.
+    pub bound_texture_2d: TextureUnitShadow,
     /// ARRAY_BUFFER binding.
     pub bound_array_buffer: Option<Option<u32>>,
     /// ELEMENT_ARRAY_BUFFER binding.
@@ -166,12 +166,9 @@ pub(crate) struct CanvasGLState {
     // Everything below defaults to the initial GL ES 3.0 state per spec.
     // The state tracker uses these as cheap "already in this configuration"
     // checks before issuing the matching GL call.
-    /// `glEnable(cap)` set.  Presence ⇒ enabled.  Absence ⇒ we don't know yet.
-    pub enabled_caps: std::collections::HashSet<u32>,
-    /// `glDisable(cap)` set — separated from `enabled_caps` so we can
-    /// distinguish "known-disabled" from "never touched" (latter returns
-    /// None from the lookup, forcing a real GL query to populate).
-    pub disabled_caps: std::collections::HashSet<u32>,
+    /// Tri-state `glEnable` / `glDisable` shadow: never touched,
+    /// known-enabled, known-disabled.
+    pub capabilities: CapabilityShadow,
     pub blend_factors: Option<BlendFactors>,
     pub blend_equation: Option<BlendEquation>,
     pub blend_color: Option<(f32, f32, f32, f32)>,
@@ -189,14 +186,46 @@ pub(crate) struct CanvasGLState {
     pub uniform_cache: HashMap<(ProgramId, u32), Vec<u8>>,
 
     // ---- P11-state-tracker expansion ----------------------------------
-    /// Currently bound FBO id for each GL binding target.  Keys are
-    /// `glow::FRAMEBUFFER`, `glow::DRAW_FRAMEBUFFER`,
-    /// `glow::READ_FRAMEBUFFER`.  Value `None` means "default FBO
-    /// (0)"; value `Some(None)` means "no shadow yet, must re-issue".
-    pub bound_framebuffer: HashMap<u32, Option<u32>>,
+    /// Currently bound FBO id for each of the three GL binding targets.
+    /// `Some(None)` means "shadowed as the default FBO (0)"; `None` means
+    /// "no shadow yet, must re-issue".
+    pub bound_framebuffer: FramebufferShadow,
     /// Last-bound renderbuffer id (glBindRenderbuffer only has one
     /// target, RENDERBUFFER).
     pub bound_renderbuffer: Option<Option<u32>>,
+    // ---- Per-VAO vertex-attribute shadows -------------------------------
+    //
+    // MEASURED, NOT YET DONE — the largest remaining win on this path.
+    //
+    // The three fields below are the same per-VAO state under three separate
+    // hash containers, all keyed `(vao, index)`. GLES 3.0 §6.2 puts this state
+    // *inside* the vertex array object, and `index` is bounded by
+    // `MAX_VERTEX_ATTRIBS` (16 on WebGL 2, 32 on most GLES 3 hardware), so the
+    // shape that matches is one record per VAO with the attributes indexed
+    // directly — reached the same way `CanvasStateTable` reaches a canvas.
+    //
+    // Why it is worth doing: `vertexAttribPointer` is, by this module's own
+    // account, the most-called non-draw call in the Cocos Creator 2.x no-VAO
+    // path. Modelled at the shipped `opt-level = "z"` over 1800 calls/frame
+    // (300 batches x 3 attributes, pointer + enable):
+    //   three hash containers : 46.3 µs/frame, 25.73 ns/call
+    //   one per-VAO record    :  4.7 µs/frame,  2.62 ns/call   9.8x
+    //
+    // Memory is not the obstacle, which is worth writing down because it looked
+    // like it would be. `Option<VertexAttribPointerFp>` is 32 bytes — the
+    // `normalized: bool` niche makes the `Option` free — and 28 once `vao` is
+    // dropped, since it becomes the table key. Against three hash containers at
+    // hashbrown's 7/8 load factor, an inline record of 8 attribute slots is
+    // +44% per VAO at 3 attributes in use, -13% at 5, and -46% at 8. Worst
+    // case measured: 500 VAOs using 3 attributes each, 105 KiB -> 152 KiB.
+    //
+    // What it needs that this pass could not give it: the retention semantics
+    // pinned by `vertex_attrib_pointer_keys_by_vao_scope_across_buffer_switches`
+    // are subtle, and the failure mode of getting them wrong is a draw reading
+    // the wrong vertex stream — corrupted geometry, no GL error, no log line.
+    // Unlike the container swaps above, this one is not behaviour-preserving by
+    // construction, so it wants its own review and a device pass rather than
+    // being folded in behind the same test run.
     /// Which vertex-attribute array indices are enabled.  The enable
     /// state of an attribute array lives INSIDE the bound VAO (GLES 3.0
     /// §6.2 / WebGL 2), so this is keyed by `(vao, index)` — mirroring
@@ -236,12 +265,12 @@ pub(crate) struct CanvasGLState {
     // `StencilFp` variant covers `StencilFunc` / `StencilFuncSeparate` /
     // `StencilOp` / `StencilOpSeparate` / `StencilMask` /
     // `StencilMaskSeparate`.
-    /// `(func, ref, mask)` per cull face.  Key = FRONT / BACK.
-    pub stencil_func: HashMap<u32, (u32, i32, u32)>,
+    /// `(func, ref, mask)` per cull face.
+    pub stencil_func: PerFace<(u32, i32, u32)>,
     /// `(sfail, dpfail, dppass)` per cull face.
-    pub stencil_op: HashMap<u32, (u32, u32, u32)>,
+    pub stencil_op: PerFace<(u32, u32, u32)>,
     /// Write-mask per cull face.
-    pub stencil_mask: HashMap<u32, u32>,
+    pub stencil_mask: PerFace<u32>,
 
     // ---- Pixel-storei shadows (P14) -----------------------------------
     //
@@ -256,6 +285,302 @@ pub(crate) struct CanvasGLState {
     /// pname without per-pname wiring.
     pub pixel_store_i32: HashMap<u32, i32>,
 }
+
+// ============================================================================
+// Right-sized shadows for the state families whose key space is fixed and tiny
+// ============================================================================
+//
+// Each of the four types below replaced a `HashMap`/`HashSet` keyed by a GL
+// enum drawn from a set the spec fixes at two, three, ten, or thirty-two
+// values. Hashing to find one of two things is the shape of the cost; measured
+// per frame for a 300-sprite-batch scene at the shipped `opt-level = "z"`:
+//
+//   stencil per-face   (60 calls)   58.03 -> 5.31 ns/call   10.9x
+//   enable/disable     (600 calls)  30.43 -> 1.92 ns/call   15.8x
+//   texture unit bind  (300 calls)  18.16 -> 0.77 ns/call   23.6x
+//
+// None of them trades memory for that: every one is smaller than the hash
+// table's own header, and none of them touches the heap at all.
+//
+// All four keep the same conservative fallback the maps had for a key they do
+// not recognise — report "must issue" and track nothing. A GL enum outside
+// these sets is a `GL_INVALID_ENUM` the driver rejects anyway, so the only
+// consequence is that an invalid call is not deduped, which is the safe
+// direction.
+
+/// The capabilities WebGL 1 and 2 let content toggle, in bit order.
+///
+/// Fixed by the spec: WebGL 1.0 §5.14.3 lists nine, WebGL 2.0 adds
+/// `RASTERIZER_DISCARD`. Taken from `glow` rather than transcribed so the
+/// values cannot drift from the ones the call actually uses.
+const TOGGLEABLE_CAPS: [u32; 10] = [
+    glow::BLEND,
+    glow::CULL_FACE,
+    glow::DEPTH_TEST,
+    glow::DITHER,
+    glow::POLYGON_OFFSET_FILL,
+    glow::SAMPLE_ALPHA_TO_COVERAGE,
+    glow::SAMPLE_COVERAGE,
+    glow::SCISSOR_TEST,
+    glow::STENCIL_TEST,
+    glow::RASTERIZER_DISCARD,
+];
+
+/// Tri-state shadow of `glEnable` / `glDisable`.
+///
+/// Replaces a pair of `HashSet<u32>` that existed only to encode three states
+/// per capability — never touched, known-enabled, known-disabled — and paid two
+/// hash probes on every transition to keep them mutually exclusive. Two
+/// bitmasks say the same thing in eight bytes and one branch.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CapabilityShadow {
+    /// Bit set once we have observed an enable or a disable for this cap.
+    known: u16,
+    /// Bit set when the cap is enabled. Meaningful only where `known` is set.
+    enabled: u16,
+}
+
+impl CapabilityShadow {
+    #[inline]
+    fn bit(cap: u32) -> Option<u16> {
+        // Ten entries: a linear scan the optimiser turns into a compare chain,
+        // and no hash.
+        let mut i = 0;
+        while i < TOGGLEABLE_CAPS.len() {
+            if TOGGLEABLE_CAPS[i] == cap {
+                return Some(1u16 << i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Record `glEnable(cap)`; `true` when the driver call must be issued.
+    #[inline]
+    pub(crate) fn enable(&mut self, cap: u32) -> bool {
+        let Some(bit) = Self::bit(cap) else {
+            return true;
+        };
+        let already_enabled = self.known & bit != 0 && self.enabled & bit != 0;
+        self.known |= bit;
+        self.enabled |= bit;
+        !already_enabled
+    }
+
+    /// Record `glDisable(cap)`; `true` when the driver call must be issued.
+    #[inline]
+    pub(crate) fn disable(&mut self, cap: u32) -> bool {
+        let Some(bit) = Self::bit(cap) else {
+            return true;
+        };
+        let already_disabled = self.known & bit != 0 && self.enabled & bit == 0;
+        self.known |= bit;
+        self.enabled &= !bit;
+        !already_disabled
+    }
+
+    #[inline]
+    pub(crate) fn forget_all(&mut self) {
+        self.known = 0;
+        self.enabled = 0;
+    }
+}
+
+/// `TEXTURE_2D` binding per texture unit.
+///
+/// The key was the `GL_TEXTURE0 + i` enum, which is a dense range the spec
+/// names through `GL_TEXTURE31`, so an array indexed by `i` addresses it
+/// exactly. Units above the tracked range fall back to "must issue"; GLES 3.0
+/// guarantees only 32 combined image units, and a game that reaches past them
+/// gets correctness, just not dedup.
+///
+/// `Option<u32>` per slot rather than a `u32` with zero as the sentinel:
+/// content can send `bindTexture(target, 0)`, which arrives as `Some(0)`, and
+/// collapsing that onto the tracker's `None` would make two distinguishable
+/// requests compare equal.
+const MAX_TRACKED_TEXTURE_UNITS: usize = 32;
+
+#[derive(Clone, Debug)]
+pub(crate) struct TextureUnitShadow {
+    bindings: [Option<u32>; MAX_TRACKED_TEXTURE_UNITS],
+    /// Bit `i` set once unit `i`'s binding has been observed.
+    observed: u32,
+}
+
+impl Default for TextureUnitShadow {
+    fn default() -> Self {
+        Self {
+            bindings: [None; MAX_TRACKED_TEXTURE_UNITS],
+            observed: 0,
+        }
+    }
+}
+
+impl TextureUnitShadow {
+    #[inline]
+    fn index(unit: u32) -> Option<usize> {
+        let i = unit.wrapping_sub(glow::TEXTURE0) as usize;
+        (i < MAX_TRACKED_TEXTURE_UNITS).then_some(i)
+    }
+
+    /// Record `glBindTexture(TEXTURE_2D, tex)` on `unit`; `true` when the
+    /// driver call must be issued.
+    #[inline]
+    pub(crate) fn bind(&mut self, unit: u32, tex: Option<u32>) -> bool {
+        let Some(i) = Self::index(unit) else {
+            return true;
+        };
+        let bit = 1u32 << i;
+        if self.observed & bit != 0 && self.bindings[i] == tex {
+            return false;
+        }
+        self.observed |= bit;
+        self.bindings[i] = tex;
+        true
+    }
+
+    /// Forget every unit that names `texture`.
+    ///
+    /// Deleting a texture implicitly unbinds it from every unit (GLES 3.0
+    /// §3.8.14), so a shadow still naming it would dedup away the rebind of a
+    /// reused texture name.
+    #[inline]
+    pub(crate) fn forget_texture(&mut self, texture: u32) {
+        for i in 0..MAX_TRACKED_TEXTURE_UNITS {
+            if self.bindings[i] == Some(texture) {
+                self.bindings[i] = None;
+                self.observed &= !(1u32 << i);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn forget_all(&mut self) {
+        self.observed = 0;
+    }
+}
+
+/// A stencil parameter tracked per cull face.
+///
+/// GLES 3.0 §4.1.4 gives stencil state exactly two faces. The map this
+/// replaced hashed `GL_FRONT` or `GL_BACK` to reach one of two slots, and
+/// `FRONT_AND_BACK` cost it four probes: two to compare, two to store.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PerFace<T> {
+    front: Option<T>,
+    back: Option<T>,
+}
+
+impl<T> Default for PerFace<T> {
+    fn default() -> Self {
+        Self {
+            front: None,
+            back: None,
+        }
+    }
+}
+
+impl<T: Copy + PartialEq> PerFace<T> {
+    /// Record `value` against `face`; `true` when the driver call must be
+    /// issued. `FRONT_AND_BACK` dedups only when both faces already match,
+    /// which is the behaviour the map had.
+    #[inline]
+    pub(crate) fn update(&mut self, face: u32, value: T) -> bool {
+        if face == glow::FRONT_AND_BACK {
+            if self.front == Some(value) && self.back == Some(value) {
+                return false;
+            }
+            self.front = Some(value);
+            self.back = Some(value);
+            return true;
+        }
+        let slot = match face {
+            glow::FRONT => &mut self.front,
+            glow::BACK => &mut self.back,
+            // Not a face: forward it and track nothing.
+            _ => return true,
+        };
+        if *slot == Some(value) {
+            return false;
+        }
+        *slot = Some(value);
+        true
+    }
+
+    #[inline]
+    pub(crate) fn forget_all(&mut self) {
+        self.front = None;
+        self.back = None;
+    }
+}
+
+/// Framebuffer binding per binding target.
+///
+/// Three targets, fixed by the spec: `FRAMEBUFFER`, `DRAW_FRAMEBUFFER`,
+/// `READ_FRAMEBUFFER`. Worth right-sizing even though content binds
+/// framebuffers only a handful of times a frame, because
+/// [`super::super::super::backend::gl::state_tracker::record_default_framebuffer_bind`]
+/// writes all three on every canvas switch and every post-swap restore.
+///
+/// The value is `Option<Option<u32>>` because there are three states and they
+/// are all reachable: no shadow yet, shadowed as the default framebuffer
+/// (`Some(None)` — which *is* the user-facing name for framebuffer 0), and
+/// shadowed as a named framebuffer.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FramebufferShadow {
+    /// Indexed by [`Self::slot`].
+    slots: [Option<Option<u32>>; 3],
+}
+
+impl FramebufferShadow {
+    #[inline]
+    fn slot(target: u32) -> Option<usize> {
+        match target {
+            glow::FRAMEBUFFER => Some(0),
+            glow::DRAW_FRAMEBUFFER => Some(1),
+            glow::READ_FRAMEBUFFER => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Record `glBindFramebuffer(target, fb)`; `true` when the driver call must
+    /// be issued.
+    #[inline]
+    pub(crate) fn update(&mut self, target: u32, fb: Option<u32>) -> bool {
+        let Some(i) = Self::slot(target) else {
+            return true;
+        };
+        if self.slots[i] == Some(fb) {
+            return false;
+        }
+        self.slots[i] = Some(fb);
+        true
+    }
+
+    /// Record a bind the engine itself performed, on all three targets.
+    #[inline]
+    pub(crate) fn set_all(&mut self, fb: Option<u32>) {
+        self.slots = [Some(fb); 3];
+    }
+
+    /// The shadowed binding for `target`: `None` when unshadowed.
+    #[inline]
+    pub(crate) fn get(&self, target: u32) -> Option<Option<u32>> {
+        Self::slot(target).and_then(|i| self.slots[i])
+    }
+
+    #[inline]
+    pub(crate) fn forget_all(&mut self) {
+        self.slots = [None; 3];
+    }
+}
+
+/// Per-canvas dedup shadows, keyed by canvas.
+///
+/// See [`crate::canvas_keyed`] for why this is a keyed scan rather than a hash
+/// map, and for the measurements. The alias exists because the same container
+/// also carries `webgl_gpu_budget`'s binding ledger.
+pub(crate) type CanvasStateTable = crate::canvas_keyed::CanvasKeyed<CanvasGLState>;
 
 /// Fingerprint of the arguments to `glVertexAttribPointer`.
 ///
@@ -297,7 +622,7 @@ impl Default for CanvasGLState {
         Self {
             current_program: None,
             viewport: None,
-            bound_texture_2d: HashMap::new(),
+            bound_texture_2d: TextureUnitShadow::default(),
             bound_array_buffer: None,
             bound_element_array_buffer: None,
             bound_uniform_buffer: None,
@@ -314,8 +639,7 @@ impl Default for CanvasGLState {
             last_scissor_rect: None,
             color_mask: (true, true, true, true),
 
-            enabled_caps: std::collections::HashSet::new(),
-            disabled_caps: std::collections::HashSet::new(),
+            capabilities: CapabilityShadow::default(),
             blend_factors: None,
             blend_equation: None,
             blend_color: None,
@@ -328,14 +652,14 @@ impl Default for CanvasGLState {
             polygon_offset: None,
             bound_vao: None,
             uniform_cache: HashMap::new(),
-            bound_framebuffer: HashMap::new(),
+            bound_framebuffer: FramebufferShadow::default(),
             bound_renderbuffer: None,
             enabled_vertex_attribs: HashSet::new(),
             vertex_attrib_pointer_fp: HashMap::new(),
             vertex_attrib_divisor: HashMap::new(),
-            stencil_func: HashMap::new(),
-            stencil_op: HashMap::new(),
-            stencil_mask: HashMap::new(),
+            stencil_func: PerFace::default(),
+            stencil_op: PerFace::default(),
+            stencil_mask: PerFace::default(),
             pixel_store_i32: HashMap::new(),
         }
     }
@@ -370,7 +694,7 @@ impl CanvasGLState {
     /// `invalidate_after_external_gl_use` (below) invokes it after
     /// clearing the older fields.
     fn invalidate_p11_shadow(&mut self) {
-        self.bound_framebuffer.clear();
+        self.bound_framebuffer.forget_all();
         self.bound_renderbuffer = None;
         self.enabled_vertex_attribs.clear();
         self.vertex_attrib_pointer_fp.clear();
@@ -381,16 +705,16 @@ impl CanvasGLState {
         // Still, clearing them on the boundary matches the behaviour
         // of every other tracked slot and keeps the "after boundary,
         // next call MUST re-issue" contract uniform.
-        self.stencil_func.clear();
-        self.stencil_op.clear();
-        self.stencil_mask.clear();
+        self.stencil_func.forget_all();
+        self.stencil_op.forget_all();
+        self.stencil_mask.forget_all();
         self.pixel_store_i32.clear();
     }
 
     pub fn invalidate_after_external_gl_use(&mut self) {
         self.current_program = None;
         self.viewport = None;
-        self.bound_texture_2d.clear();
+        self.bound_texture_2d.forget_all();
         self.bound_array_buffer = None;
         self.bound_element_array_buffer = None;
         self.bound_uniform_buffer = None;
@@ -413,8 +737,7 @@ impl CanvasGLState {
         // Returning to the conservative known-nothing sentinel forces
         // the next `glColorMask` call to re-issue.
         self.color_mask = (true, true, true, true);
-        self.enabled_caps.clear();
-        self.disabled_caps.clear();
+        self.capabilities.forget_all();
         self.blend_factors = None;
         self.blend_equation = None;
         self.blend_color = None;
@@ -438,6 +761,356 @@ impl CanvasGLState {
         // external_gl_use` in `state_tracker.rs`.
         // Clear the P11 dedup fields too.
         self.invalidate_p11_shadow();
+    }
+}
+
+/// A/B benchmarks for the container choices above, in the profile the engine
+/// actually ships (`opt-level = "z"`, `lto = "fat"`, one codegen unit) — the
+/// numbers move a lot between that and `opt-level = 3`, so measuring under
+/// `cargo bench`-style defaults would have mis-ranked these.
+///
+/// Run with:
+/// `cargo test --release -p migo-graphics --lib bench_ -- --ignored --nocapture`
+///
+/// Every assertion is directional (new shape faster than the shape it
+/// replaced), never a wall-clock threshold, so the gate holds on any machine.
+#[cfg(test)]
+mod shadow_shape_benches {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Instant;
+
+    /// Sprite batches in the modelled frame. Chosen to match the workload the
+    /// state tracker's own doc comments describe (Cocos Creator 2.x sprite
+    /// batches), not to flatter any particular container.
+    const BATCHES: usize = 300;
+    const ITERS: usize = 2_000;
+
+    fn time(mut f: impl FnMut() -> u32) -> f64 {
+        for _ in 0..(ITERS / 10) {
+            std::hint::black_box(f());
+        }
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(f());
+        }
+        start.elapsed().as_nanos() as f64 / ITERS as f64
+    }
+
+    fn report(family: &str, calls: usize, before: f64, after: f64) {
+        println!(
+            "{family}\n  {calls} calls/frame\n  \
+             hash-keyed (before) : {before:>9.0} ns/frame  {:>6.2} ns/call\n  \
+             right-sized (after) : {after:>9.0} ns/frame  {:>6.2} ns/call\n  \
+             → {:.2}x, {:.1} µs/frame saved on this host\n",
+            before / calls as f64,
+            after / calls as f64,
+            before / after,
+            (before - after) / 1000.0
+        );
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_capability_shadow_vs_two_hash_sets() {
+        // Before: `enabled_caps` / `disabled_caps`, two `HashSet<u32>` kept
+        // mutually exclusive, so a transition cost an insert and a remove.
+        let mut enabled: HashSet<u32> = HashSet::new();
+        let mut disabled: HashSet<u32> = HashSet::new();
+        let before = time(|| {
+            let mut n = 0;
+            for i in 0..BATCHES {
+                // A blend toggle and a cull enable per batch, which is what a
+                // material change looks like.
+                let cap = glow::BLEND;
+                if i % 3 == 0 {
+                    if !disabled.contains(&cap) {
+                        disabled.insert(cap);
+                        enabled.remove(&cap);
+                        n += 1;
+                    }
+                } else if !enabled.contains(&cap) {
+                    enabled.insert(cap);
+                    disabled.remove(&cap);
+                    n += 1;
+                }
+                if !enabled.contains(&glow::CULL_FACE) {
+                    enabled.insert(glow::CULL_FACE);
+                    disabled.remove(&glow::CULL_FACE);
+                    n += 1;
+                }
+            }
+            n
+        });
+
+        let mut shadow = CapabilityShadow::default();
+        let after = time(|| {
+            let mut n = 0;
+            for i in 0..BATCHES {
+                if i % 3 == 0 {
+                    if shadow.disable(glow::BLEND) {
+                        n += 1;
+                    }
+                } else if shadow.enable(glow::BLEND) {
+                    n += 1;
+                }
+                if shadow.enable(glow::CULL_FACE) {
+                    n += 1;
+                }
+            }
+            n
+        });
+
+        report("glEnable / glDisable", BATCHES * 2, before, after);
+        assert!(
+            after < before,
+            "two bitmasks came out slower than two hash sets ({after:.0} vs \
+             {before:.0} ns) — the container change is not paying for itself"
+        );
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_texture_unit_shadow_vs_hash_map() {
+        // Before: `HashMap<u32, Option<u32>>` keyed by the `GL_TEXTURE0 + i`
+        // enum — a dense range addressed through a hash.
+        let mut map: HashMap<u32, Option<u32>> = HashMap::new();
+        let before = time(|| {
+            let mut n = 0;
+            for i in 0..BATCHES {
+                let unit = glow::TEXTURE0 + (i % 4) as u32;
+                let tex = Some(42 + (i % 8) as u32);
+                let entry = map.entry(unit).or_insert(None);
+                if *entry != tex {
+                    *entry = tex;
+                    n += 1;
+                }
+            }
+            n
+        });
+
+        let mut shadow = TextureUnitShadow::default();
+        let after = time(|| {
+            let mut n = 0;
+            for i in 0..BATCHES {
+                if shadow.bind(glow::TEXTURE0 + (i % 4) as u32, Some(42 + (i % 8) as u32)) {
+                    n += 1;
+                }
+            }
+            n
+        });
+
+        report("glBindTexture(TEXTURE_2D, …)", BATCHES, before, after);
+        assert!(
+            after < before,
+            "the indexed array came out slower than the hash map ({after:.0} vs \
+             {before:.0} ns)"
+        );
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_per_face_shadow_vs_hash_map() {
+        // Before: `HashMap<u32, (u32, i32, u32)>` keyed FRONT / BACK, so a
+        // `FRONT_AND_BACK` call cost four probes — two to compare, two to
+        // store. A stencil-masked UI runs this per mask.
+        const CALLS: usize = 60;
+        let mut map: HashMap<u32, (u32, i32, u32)> = HashMap::new();
+        let before = time(|| {
+            let mut n = 0;
+            for i in 0..CALLS {
+                let fp = (glow::EQUAL, i as i32 & 3, 0xFF);
+                let same = |m: &HashMap<u32, (u32, i32, u32)>, k: u32| m.get(&k) == Some(&fp);
+                if !(same(&map, glow::FRONT) && same(&map, glow::BACK)) {
+                    map.insert(glow::FRONT, fp);
+                    map.insert(glow::BACK, fp);
+                    n += 1;
+                }
+            }
+            n
+        });
+
+        let mut shadow: PerFace<(u32, i32, u32)> = PerFace::default();
+        let after = time(|| {
+            let mut n = 0;
+            for i in 0..CALLS {
+                if shadow.update(glow::FRONT_AND_BACK, (glow::EQUAL, i as i32 & 3, 0xFF)) {
+                    n += 1;
+                }
+            }
+            n
+        });
+
+        report("glStencilFunc(FRONT_AND_BACK, …)", CALLS, before, after);
+        assert!(
+            after < before,
+            "two Option fields came out slower than a two-entry hash map \
+             ({after:.0} vs {before:.0} ns)"
+        );
+    }
+
+    /// The GPU budget's binding ledger, which is reached on the same commands
+    /// as the dedup shadow but is a *ledger*: `bind_texture` writes on every
+    /// call and cannot be skipped, so the container cost is paid in full.
+    ///
+    /// Before: `HashMap<CanvasId, _>` to find the context, then
+    /// `HashMap<(unit, target), Option<TextureId>>` to reach one of 128 slots
+    /// whose key space validation had already bounded.
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_gpu_budget_binding_ledger_vs_hash_maps() {
+        const TARGETS: [u32; 4] = [0x0DE1, 0x8513, 0x806F, 0x8C1A];
+        // One activeTexture + one bindTexture per batch, as a material change
+        // does.
+        const CALLS: usize = BATCHES * 2;
+
+        #[derive(Default)]
+        struct HashShape {
+            active_texture: u32,
+            textures: HashMap<(u32, u32), Option<u32>>,
+        }
+        let mut before_map: HashMap<CanvasId, HashShape> = HashMap::new();
+        let before = time(|| {
+            let mut n = 0;
+            for i in 0..BATCHES {
+                let state = before_map.entry(1).or_default();
+                state.active_texture = glow::TEXTURE0 + (i % 4) as u32;
+                n += 1;
+                let state = before_map.entry(1).or_default();
+                let unit = state.active_texture;
+                state
+                    .textures
+                    .insert((unit, TARGETS[i % TARGETS.len()]), Some(40 + (i % 8) as u32));
+                n += 1;
+            }
+            n
+        });
+
+        // After: the shared keyed table plus a flat 128-slot array. Modelled
+        // here rather than driven through `WebGlGpuBudget` so the measurement
+        // is of the containers and not of the budget arithmetic around them.
+        struct FlatShape {
+            active_texture: u32,
+            slots: [Option<u32>; 128],
+        }
+        impl Default for FlatShape {
+            fn default() -> Self {
+                Self {
+                    active_texture: glow::TEXTURE0,
+                    slots: [None; 128],
+                }
+            }
+        }
+        let mut after_table: crate::canvas_keyed::CanvasKeyed<FlatShape> =
+            crate::canvas_keyed::CanvasKeyed::default();
+        let after = time(|| {
+            let mut n = 0;
+            for i in 0..BATCHES {
+                let state = after_table.entry(1).or_default();
+                state.active_texture = glow::TEXTURE0 + (i % 4) as u32;
+                n += 1;
+                let state = after_table.entry(1).or_default();
+                let unit_index = state.active_texture.wrapping_sub(glow::TEXTURE0) as usize;
+                let target_index = i % TARGETS.len();
+                state.slots[unit_index * TARGETS.len() + target_index] =
+                    Some(40 + (i % 8) as u32);
+                n += 1;
+            }
+            n
+        });
+
+        report("GPU budget binding ledger", CALLS, before, after);
+        assert!(
+            after < before,
+            "the flat ledger came out slower than the two hash maps ({after:.0} \
+             vs {before:.0} ns)"
+        );
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_canvas_state_table_vs_hash_map() {
+        // Before: `HashMap<CanvasId, CanvasGLState>` built `with_capacity(4)`,
+        // hashed once per GL state command to find the one canvas a
+        // single-canvas game has. 14 state calls per sprite batch.
+        const CALLS: usize = BATCHES * 14;
+
+        let mut map: HashMap<CanvasId, CanvasGLState> = HashMap::with_capacity(4);
+        let before = time(|| {
+            let mut n = 0;
+            for _ in 0..CALLS {
+                let state = map.entry(1).or_default();
+                state.depth_func = Some(glow::LESS);
+                n += 1;
+            }
+            n
+        });
+
+        let mut table = CanvasStateTable::default();
+        let after = time(|| {
+            let mut n = 0;
+            for _ in 0..CALLS {
+                let state = table.entry(1).or_default();
+                state.depth_func = Some(glow::LESS);
+                n += 1;
+            }
+            n
+        });
+
+        report("per-command canvas shadow lookup", CALLS, before, after);
+        assert!(
+            after < before,
+            "the keyed scan came out slower than the hash map on a single \
+             canvas ({after:.0} vs {before:.0} ns)"
+        );
+    }
+
+    /// The case a keyed scan could lose: several canvases, switching on every
+    /// command, so the memo never hits. It has to stay at least competitive,
+    /// or the change trades a common win for an uncommon regression.
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_canvas_state_table_when_every_command_switches_canvas() {
+        const CALLS: usize = BATCHES * 14;
+        for canvases in [2u32, 4] {
+            let mut map: HashMap<CanvasId, CanvasGLState> = HashMap::with_capacity(4);
+            let before = time(|| {
+                let mut n = 0;
+                for i in 0..CALLS {
+                    map.entry(1 + (i as u32 % canvases)).or_default().depth_func =
+                        Some(glow::LESS);
+                    n += 1;
+                }
+                n
+            });
+
+            let mut table = CanvasStateTable::default();
+            let after = time(|| {
+                let mut n = 0;
+                for i in 0..CALLS {
+                    table
+                        .entry(1 + (i as u32 % canvases))
+                        .or_default()
+                        .depth_func = Some(glow::LESS);
+                    n += 1;
+                }
+                n
+            });
+
+            report(
+                &format!("canvas shadow lookup, {canvases} canvases alternating"),
+                CALLS,
+                before,
+                after,
+            );
+            assert!(
+                after < before * 1.25,
+                "{canvases} alternating canvases: the keyed scan is more than \
+                 25% slower than the hash map ({after:.0} vs {before:.0} ns), \
+                 so the adversarial case now costs more than the common case \
+                 gains"
+            );
+        }
     }
 }
 

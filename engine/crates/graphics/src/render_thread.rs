@@ -2432,7 +2432,7 @@ impl RenderThread {
                                        render_binding: &mut RenderSurfaceBinding,
                                        render_server: &mut RenderServer|
                  -> LoopCtl {
-                    crate::atrace_scope!("migo.render.drain_cmds");
+                    crate::atrace_scope!(c"migo.render.drain_cmds");
                     // Drain pending commands with a *dual budget*:
                     // capped by both command count and elapsed CPU
                     // time.  Previously only the count was bounded,
@@ -2543,7 +2543,7 @@ impl RenderThread {
                                                         needs_recovery: &mut bool,
                                                         render_binding: &RenderSurfaceBinding,
                                                         surface_system: &mut SurfaceSystem| {
-                    crate::atrace_scope!("migo.render.present_and_raf");
+                    crate::atrace_scope!(c"migo.render.present_and_raf");
                     let _ = ts; // RAF is signalled before the drain now (see signal_raf)
                     // Drain Canvas2D snapshot textures captured during this
                     // frame's `getImageData` calls.  By this point the
@@ -2628,7 +2628,7 @@ impl RenderThread {
                         // framebuffer so the driver can skip loading unchanged tiles.
                         cm.declare_frame_damage(onscreen_id);
 
-                        crate::atrace_scope!("migo.render.flush_2d");
+                        crate::atrace_scope!(c"migo.render.flush_2d");
                         match cm.flush_dirty_2d_contexts() {
                             Ok(flushed_ids) => {
                                 for canvas_id in flushed_ids {
@@ -2648,7 +2648,7 @@ impl RenderThread {
                             )
                         };
 
-                        crate::atrace_scope!("migo.render.swap_buffers");
+                        crate::atrace_scope!(c"migo.render.swap_buffers");
                         // Final generation re-check at the swap boundary. If
                         // destroy raced the flush/damage work, skip EGL swap;
                         // presenting to the abandoned BufferQueue is forbidden.

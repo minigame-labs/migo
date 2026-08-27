@@ -4,6 +4,21 @@ use std::collections::HashMap;
 
 const MAX_CACHED_UNIFORM_VALUE_BYTES: usize = 64 * 1024;
 
+/// Compare-and-store against the shadow for `(program, location)`.
+///
+/// Returns `true` when the upload is not redundant and must be issued.
+///
+/// **One hash probe on each of the two paths a frame actually takes.** Both
+/// deduping an unchanged value and overwriting a changed one are resolved by
+/// the single `get_mut` below, because a value that changed is written into the
+/// allocation the comparison just read. Only a location this program has not
+/// cached yet pays a second probe, and that happens once per location per
+/// program rather than once per frame.
+///
+/// The previous shape probed `get` to compare, `contains_key` to decide whether
+/// eviction would displace this very key, and `entry` to store — three probes
+/// to change a uniform in a full cache, two in a warm one, for a path a
+/// shader-heavy frame runs thousands of times.
 pub(crate) fn update(
     cache: &mut HashMap<(u32, u32), Vec<u8>>,
     maximum_entries: usize,
@@ -20,26 +35,25 @@ pub(crate) fn update(
         cache.remove(&key);
         return true;
     }
-    if cache.get(&key).is_some_and(|previous| previous == value) {
-        return false;
+
+    if let Some(stored) = cache.get_mut(&key) {
+        if stored.as_slice() == value {
+            return false;
+        }
+        // Same key, new bytes: reuse the allocation rather than reinserting.
+        stored.clear();
+        stored.extend_from_slice(value);
+        return true;
     }
 
-    if cache.len() >= maximum_entries && !cache.contains_key(&key) {
-        if let Some(evicted) = cache.keys().next().copied() {
-            cache.remove(&evicted);
-        }
+    // New key. Eviction can no longer displace it — the lookup above proved
+    // it absent — so the `contains_key` the old shape needed here is gone.
+    if cache.len() >= maximum_entries
+        && let Some(evicted) = cache.keys().next().copied()
+    {
+        cache.remove(&evicted);
     }
-
-    match cache.entry(key) {
-        std::collections::hash_map::Entry::Occupied(mut entry) => {
-            let stored = entry.get_mut();
-            stored.clear();
-            stored.extend_from_slice(value);
-        }
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(value.to_vec());
-        }
-    }
+    cache.insert(key, value.to_vec());
     true
 }
 

@@ -32,18 +32,63 @@ use shared::protocol::render_cmd::{BufferId, ProgramId, VaoId};
 /// Returns `true` if `glUseProgram(new)` must actually be issued.
 ///
 /// The tracker treats "unknown" (no previous program) as "must issue".
+///
+/// **This deliberately leaves `uniform_cache` alone.** A uniform's value is
+/// state of the *program object* (GLES 3.0 §2.11.6, WebGL 1.0 §5.14.10), not
+/// of the context, so `glUseProgram` cannot change it and every cached entry
+/// stays true across a switch. An earlier revision dropped the outgoing
+/// program's entries here, which cost an O(cache) walk plus a heap free per
+/// switch and left nothing cached for the workload the dedup exists for —
+/// a frame that cycles between two or three programs. Pinned by
+/// `cycling_between_programs_keeps_each_programs_uniform_cache`.
+///
+/// The event that *does* invalidate these entries is a successful re-link;
+/// see [`invalidate_program_uniforms`].
 pub(crate) fn update_use_program(state: &mut CanvasGLState, new: ProgramId) -> bool {
     if state.current_program == Some(new) {
         return false;
     }
     state.current_program = Some(new);
-    // Changing program invalidates our uniform cache.  Keep entries that
-    // belong to the same program (user may re-use it later), drop ones
-    // that belonged to whichever program came before.  The simpler
-    // policy of flushing everything on switch is wrong for games that
-    // cycle between two or three programs per frame.
-    state.uniform_cache.retain(|(prog, _), _| *prog == new);
     true
+}
+
+/// Forget every cached uniform value for `program`.
+///
+/// **The one event that makes these entries wrong.** A successful
+/// `glLinkProgram` — and `glProgramBinary`, which GLES 3.0 §2.11.4 defines to
+/// behave as a successful link — allocates fresh uniform storage and
+/// initialises it, so every value the driver held is gone. Leave the shadow in
+/// place and the content's next upload of an unchanged value gets deduped
+/// against a driver that is now holding zero: the uniform silently stays at
+/// its initial value and the draw paints with it. Static camera plus a re-link
+/// is enough, and re-linking is not exotic — Pixi v8 sorts attributes and
+/// re-links, which is why `ProgramMeta::attrib_bindings` exists.
+///
+/// Also the right call on delete: program names come from the client, so a
+/// recycled name would otherwise inherit the dead program's entries.
+pub(crate) fn invalidate_program_uniforms(state: &mut CanvasGLState, program: ProgramId) {
+    state.uniform_cache.retain(|(prog, _), _| *prog != program);
+}
+
+/// Forget everything this canvas shadowed about a program that has been
+/// deleted.
+///
+/// Separate from [`invalidate_program_uniforms`] because deletion also drops
+/// the *binding*, and a re-link does not: GLES 3.0 §2.11.4 installs the new
+/// executable under the same name, so `current_program` still names the
+/// re-linked program and clearing it there would buy a redundant
+/// `glUseProgram` per re-link.
+///
+/// Clearing `current_program` matters because program names are chosen by the
+/// client. A name that is deleted and reused names a different program object,
+/// and a shadow still claiming it is current dedups the `glUseProgram` that
+/// would install it — so the draw runs under whatever program the driver
+/// actually has bound.
+pub(crate) fn forget_deleted_program(state: &mut CanvasGLState, program: ProgramId) {
+    if state.current_program == Some(program) {
+        state.current_program = None;
+    }
+    invalidate_program_uniforms(state, program);
 }
 
 /// Hash-and-compare dedup for a uniform upload.
@@ -208,12 +253,7 @@ pub(crate) fn update_bind_texture_2d(state: &mut CanvasGLState, tex: Option<u32>
         Some(u) => u,
         None => return true,
     };
-    let entry = state.bound_texture_2d.entry(unit).or_insert(None);
-    if *entry == tex {
-        return false;
-    }
-    *entry = tex;
-    true
+    state.bound_texture_2d.bind(unit, tex)
 }
 
 // ============================================================================
@@ -349,21 +389,7 @@ pub(crate) fn update_stencil_func(
     ref_: i32,
     mask: u32,
 ) -> bool {
-    let fp = (func, ref_, mask);
-    let same = |k: u32| state.stencil_func.get(&k) == Some(&fp);
-    if face == glow::FRONT_AND_BACK {
-        if same(glow::FRONT) && same(glow::BACK) {
-            return false;
-        }
-        state.stencil_func.insert(glow::FRONT, fp);
-        state.stencil_func.insert(glow::BACK, fp);
-    } else {
-        if same(face) {
-            return false;
-        }
-        state.stencil_func.insert(face, fp);
-    }
-    true
+    state.stencil_func.update(face, (func, ref_, mask))
 }
 
 #[inline]
@@ -374,39 +400,12 @@ pub(crate) fn update_stencil_op(
     dpfail: u32,
     dppass: u32,
 ) -> bool {
-    let fp = (sfail, dpfail, dppass);
-    let same = |k: u32| state.stencil_op.get(&k) == Some(&fp);
-    if face == glow::FRONT_AND_BACK {
-        if same(glow::FRONT) && same(glow::BACK) {
-            return false;
-        }
-        state.stencil_op.insert(glow::FRONT, fp);
-        state.stencil_op.insert(glow::BACK, fp);
-    } else {
-        if same(face) {
-            return false;
-        }
-        state.stencil_op.insert(face, fp);
-    }
-    true
+    state.stencil_op.update(face, (sfail, dpfail, dppass))
 }
 
 #[inline]
 pub(crate) fn update_stencil_mask(state: &mut CanvasGLState, face: u32, mask: u32) -> bool {
-    let same = |k: u32| state.stencil_mask.get(&k) == Some(&mask);
-    if face == glow::FRONT_AND_BACK {
-        if same(glow::FRONT) && same(glow::BACK) {
-            return false;
-        }
-        state.stencil_mask.insert(glow::FRONT, mask);
-        state.stencil_mask.insert(glow::BACK, mask);
-    } else {
-        if same(face) {
-            return false;
-        }
-        state.stencil_mask.insert(face, mask);
-    }
-    true
+    state.stencil_mask.update(face, mask)
 }
 
 // ============================================================================
@@ -468,26 +467,19 @@ pub(crate) fn update_polygon_offset(state: &mut CanvasGLState, factor: f32, unit
 // our shadow drifts. cc.Mask round-avatars get rendered as triangles
 // when our dedup skips the next `glEnable` because the shadow says it
 // is already on. Always issue real GL calls for STENCIL_TEST.
-const GL_STENCIL_TEST: u32 = 0x0B90;
 
 /// `glEnable(cap)` — returns true if a real call is required.
+#[inline]
 pub(crate) fn update_enable(state: &mut CanvasGLState, cap: u32) -> bool {
-    if state.enabled_caps.contains(&cap) {
-        return cap == GL_STENCIL_TEST;
-    }
-    state.enabled_caps.insert(cap);
-    state.disabled_caps.remove(&cap);
-    true
+    let changed = state.capabilities.enable(cap);
+    changed || cap == glow::STENCIL_TEST
 }
 
 /// `glDisable(cap)` — returns true if a real call is required.
+#[inline]
 pub(crate) fn update_disable(state: &mut CanvasGLState, cap: u32) -> bool {
-    if state.disabled_caps.contains(&cap) {
-        return cap == GL_STENCIL_TEST;
-    }
-    state.disabled_caps.insert(cap);
-    state.enabled_caps.remove(&cap);
-    true
+    let changed = state.capabilities.disable(cap);
+    changed || cap == glow::STENCIL_TEST
 }
 
 // ============================================================================
@@ -505,13 +497,7 @@ pub(crate) fn update_bind_framebuffer(
     target: u32,
     fb: Option<u32>,
 ) -> bool {
-    match state.bound_framebuffer.get(&target) {
-        Some(shadow) if *shadow == fb => false,
-        _ => {
-            state.bound_framebuffer.insert(target, fb);
-            true
-        }
-    }
+    state.bound_framebuffer.update(target, fb)
 }
 
 /// Record that the *engine* re-pointed this canvas at its default framebuffer,
@@ -535,13 +521,7 @@ pub(crate) fn update_bind_framebuffer(
 /// All three targets, because binding `FRAMEBUFFER` sets the draw *and* read
 /// bindings, and the blit this most often follows clobbered the read target too.
 pub(crate) fn record_default_framebuffer_bind(state: &mut CanvasGLState) {
-    for target in [
-        glow::FRAMEBUFFER,
-        glow::DRAW_FRAMEBUFFER,
-        glow::READ_FRAMEBUFFER,
-    ] {
-        state.bound_framebuffer.insert(target, None);
-    }
+    state.bound_framebuffer.set_all(None);
     state.draws_to_default_fbo = true;
 }
 
@@ -703,19 +683,162 @@ mod tests {
         assert!(update_use_program(&mut s, 1));
     }
 
+    /// A uniform's value belongs to the program object, not to the context
+    /// (GLES 3.0 §2.11.6), so `glUseProgram` does not disturb it and neither
+    /// may the shadow. Cycling between two programs per frame — what the
+    /// dedup exists for — must leave both programs' entries intact.
     #[test]
-    fn use_program_flushes_other_programs_uniforms() {
-        // Only entries for the new program should survive.
+    fn cycling_between_programs_keeps_each_programs_uniform_cache() {
         let mut s = fresh_state();
+        let bytes = [1u8, 2, 3];
+
         update_use_program(&mut s, 1);
-        update_uniform(&mut s, 1, 10, &[1u8, 2, 3]);
-        update_uniform(&mut s, 1, 20, &[4u8, 5]);
+        assert!(update_uniform(&mut s, 1, 10, &bytes));
         update_use_program(&mut s, 2);
-        update_uniform(&mut s, 2, 10, &[7u8]);
-        // Switch back to 1; its uniform cache is now gone.
+        assert!(update_uniform(&mut s, 2, 10, &bytes));
         update_use_program(&mut s, 1);
-        // (1, 10) is gone ⇒ next upload must re-issue.
-        assert!(update_uniform(&mut s, 1, 10, &[1u8, 2, 3]));
+
+        assert!(
+            !update_uniform(&mut s, 1, 10, &bytes),
+            "program 1's cached uniform was dropped when program 2 became \
+             current, so every frame that cycles programs re-uploads every \
+             uniform it already deduped"
+        );
+        update_use_program(&mut s, 2);
+        assert!(
+            !update_uniform(&mut s, 2, 10, &bytes),
+            "program 2's entry was dropped on the way back to program 1"
+        );
+    }
+
+    // ---- Re-link is the event that invalidates a uniform shadow -----------
+    //
+    // GLES 3.0 §2.11.4: a successful `LinkProgram` gives the program fresh
+    // uniform storage, initialised — so the driver no longer holds whatever we
+    // cached. Skipping the re-upload of an unchanged value then leaves the
+    // uniform at zero, with no GL error and nothing in a log.
+
+    /// The defect. Without the invalidation the second upload of the *same*
+    /// bytes is deduped against a driver that was just reset.
+    #[test]
+    fn a_relink_makes_the_next_identical_uniform_upload_reach_the_driver() {
+        let mut s = fresh_state();
+        let prog: ProgramId = 7;
+        let mvp = [0u8; 64];
+
+        update_use_program(&mut s, prog);
+        assert!(update_uniform(&mut s, prog, 3, &mvp));
+        assert!(
+            !update_uniform(&mut s, prog, 3, &mvp),
+            "fixture must be deduping, or the test below proves nothing"
+        );
+
+        invalidate_program_uniforms(&mut s, prog);
+
+        assert!(
+            update_uniform(&mut s, prog, 3, &mvp),
+            "the driver reset this uniform to zero on re-link, so re-uploading \
+             the same value MUST reach GL — deduping it paints with zero"
+        );
+    }
+
+    /// Scoped to the program that was re-linked. Sweeping the whole table
+    /// would satisfy the test above while re-uploading every other program's
+    /// uniforms, which is the cost the dedup exists to remove.
+    #[test]
+    fn a_relink_leaves_other_programs_uniform_shadows_alone() {
+        let mut s = fresh_state();
+        let bytes = [4u8, 5, 6, 7];
+
+        assert!(update_uniform(&mut s, 1, 2, &bytes));
+        assert!(update_uniform(&mut s, 9, 2, &bytes));
+
+        invalidate_program_uniforms(&mut s, 1);
+
+        assert!(
+            update_uniform(&mut s, 1, 2, &bytes),
+            "the re-linked program's entry survived"
+        );
+        assert!(
+            !update_uniform(&mut s, 9, 2, &bytes),
+            "an unrelated program's entry was dropped by a re-link that cannot \
+             have touched its uniforms"
+        );
+    }
+
+    /// A re-link installs the new executable under the same name, so the
+    /// binding is unchanged. Clearing it would cost a redundant `glUseProgram`
+    /// on every re-link.
+    #[test]
+    fn a_relink_leaves_the_program_binding_shadow_intact() {
+        let mut s = fresh_state();
+        assert!(update_use_program(&mut s, 7));
+
+        invalidate_program_uniforms(&mut s, 7);
+
+        assert!(
+            !update_use_program(&mut s, 7),
+            "the re-link cleared the binding shadow, so the content's next \
+             useProgram of the still-current program reaches the driver for nothing"
+        );
+    }
+
+    /// Deletion is the other half: the name is free for the client to reuse,
+    /// and a shadow still claiming it is current dedups away the `glUseProgram`
+    /// that would install whatever program the name now refers to.
+    #[test]
+    fn deleting_the_current_program_clears_the_binding_shadow() {
+        let mut s = fresh_state();
+        let bytes = [3u8, 3];
+        assert!(update_use_program(&mut s, 7));
+        assert!(update_uniform(&mut s, 7, 1, &bytes));
+
+        forget_deleted_program(&mut s, 7);
+
+        assert!(
+            update_use_program(&mut s, 7),
+            "a reused program name was deduped against the deleted program's \
+             binding, so the draw runs under whatever the driver still has bound"
+        );
+        assert!(
+            update_uniform(&mut s, 7, 1, &bytes),
+            "a reused program name inherited the deleted program's uniform cache"
+        );
+    }
+
+    /// Deleting a program that is not current must not disturb the binding —
+    /// games delete unused programs mid-scene.
+    #[test]
+    fn deleting_a_non_current_program_leaves_the_binding_shadow_alone() {
+        let mut s = fresh_state();
+        assert!(update_use_program(&mut s, 7));
+
+        forget_deleted_program(&mut s, 9);
+
+        assert!(
+            !update_use_program(&mut s, 7),
+            "deleting an unrelated program invalidated the current binding"
+        );
+    }
+
+    /// Every location of the re-linked program, not just the one a test
+    /// happens to name: the driver reset all of them.
+    #[test]
+    fn a_relink_invalidates_every_location_of_that_program() {
+        let mut s = fresh_state();
+        let bytes = [1u8];
+        for loc in 0..8u32 {
+            assert!(update_uniform(&mut s, 5, loc, &bytes));
+        }
+
+        invalidate_program_uniforms(&mut s, 5);
+
+        for loc in 0..8u32 {
+            assert!(
+                update_uniform(&mut s, 5, loc, &bytes),
+                "location {loc} was left cached after a re-link"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -964,6 +1087,387 @@ mod tests {
             issued, 105,
             "expected 105 real GL calls for the 600 logical calls, \
              got {issued} (dedup is broken)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Boundaries of the right-sized shadows
+    //
+    // The hash maps these replaced accepted any `u32` as a key, so they would
+    // happily dedup a GL enum that is not a texture unit, a cull face, a
+    // framebuffer target, or a toggleable capability. The array- and
+    // bitmask-backed shadows recognise only the values the spec fixes, and
+    // forward everything else. That is the safe direction — an unrecognised
+    // enum is a `GL_INVALID_ENUM` the driver rejects, so the only cost is that
+    // an already-failing call is not deduped — but it *is* a change, so it is
+    // written down here.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_texture_unit_past_the_tracked_range_is_forwarded_every_time() {
+        let mut s = fresh_state();
+        // TEXTURE0 + 32: beyond the 32 units GLES 3.0 guarantees.
+        update_active_texture(&mut s, glow::TEXTURE0 + 32);
+        assert!(update_bind_texture_2d(&mut s, Some(1)));
+        assert!(
+            update_bind_texture_2d(&mut s, Some(1)),
+            "an untracked unit must forward rather than dedup against a slot \
+             that does not exist"
+        );
+    }
+
+    #[test]
+    fn the_last_tracked_texture_unit_still_dedups() {
+        let mut s = fresh_state();
+        update_active_texture(&mut s, glow::TEXTURE0 + 31);
+        assert!(update_bind_texture_2d(&mut s, Some(1)));
+        assert!(!update_bind_texture_2d(&mut s, Some(1)));
+    }
+
+    /// `bindTexture(target, 0)` reaches the tracker as `Some(0)`, which is a
+    /// different request from `None`. Collapsing them would make the shadow
+    /// answer one with the other.
+    #[test]
+    fn binding_texture_zero_is_distinct_from_unbinding() {
+        let mut s = fresh_state();
+        update_active_texture(&mut s, glow::TEXTURE0);
+        assert!(update_bind_texture_2d(&mut s, Some(0)));
+        assert!(!update_bind_texture_2d(&mut s, Some(0)));
+        assert!(
+            update_bind_texture_2d(&mut s, None),
+            "None was deduped against Some(0)"
+        );
+    }
+
+    #[test]
+    fn an_unknown_capability_is_forwarded_every_time() {
+        let mut s = fresh_state();
+        // Not a toggleable WebGL capability — the driver answers INVALID_ENUM.
+        const NOT_A_CAP: u32 = 0x1234;
+        assert!(update_enable(&mut s, NOT_A_CAP));
+        assert!(update_enable(&mut s, NOT_A_CAP));
+        assert!(update_disable(&mut s, NOT_A_CAP));
+    }
+
+    /// Every capability WebGL exposes has to be tracked, or a real toggle goes
+    /// undeduped. Enumerated rather than spot-checked so adding a WebGL 2 cap
+    /// to the enum list without adding it to the shadow shows up here.
+    #[test]
+    fn every_toggleable_webgl_capability_is_tracked() {
+        for cap in [
+            glow::BLEND,
+            glow::CULL_FACE,
+            glow::DEPTH_TEST,
+            glow::DITHER,
+            glow::POLYGON_OFFSET_FILL,
+            glow::SAMPLE_ALPHA_TO_COVERAGE,
+            glow::SAMPLE_COVERAGE,
+            glow::SCISSOR_TEST,
+            glow::RASTERIZER_DISCARD,
+        ] {
+            let mut s = fresh_state();
+            assert!(update_enable(&mut s, cap), "cap {cap:#x} first enable");
+            assert!(
+                !update_enable(&mut s, cap),
+                "cap {cap:#x} is not being tracked, so every redundant enable \
+                 reaches the driver"
+            );
+            assert!(update_disable(&mut s, cap), "cap {cap:#x} first disable");
+            assert!(!update_disable(&mut s, cap), "cap {cap:#x} redundant disable");
+        }
+    }
+
+    /// STENCIL_TEST is the documented exception: Skia toggles it behind the
+    /// tracker's back, so it must never be deduped. Kept as its own test
+    /// because the bitmask rewrite moved where that decision is made.
+    #[test]
+    fn stencil_test_is_never_deduped() {
+        let mut s = fresh_state();
+        assert!(update_enable(&mut s, glow::STENCIL_TEST));
+        assert!(
+            update_enable(&mut s, glow::STENCIL_TEST),
+            "a redundant glEnable(STENCIL_TEST) was deduped — Skia toggles this \
+             outside the tracker, so the shadow cannot be trusted for it"
+        );
+        assert!(update_disable(&mut s, glow::STENCIL_TEST));
+        assert!(update_disable(&mut s, glow::STENCIL_TEST));
+    }
+
+    #[test]
+    fn an_unknown_framebuffer_target_is_forwarded_every_time() {
+        let mut s = fresh_state();
+        const NOT_A_TARGET: u32 = 0x4321;
+        assert!(update_bind_framebuffer(&mut s, NOT_A_TARGET, Some(3)));
+        assert!(update_bind_framebuffer(&mut s, NOT_A_TARGET, Some(3)));
+    }
+
+    #[test]
+    fn an_unknown_stencil_face_is_forwarded_every_time() {
+        let mut s = fresh_state();
+        const NOT_A_FACE: u32 = 0x4322;
+        assert!(update_stencil_mask(&mut s, NOT_A_FACE, 0xFF));
+        assert!(update_stencil_mask(&mut s, NOT_A_FACE, 0xFF));
+    }
+
+    /// Deleting a texture unbinds it from every unit (GLES 3.0 §3.8.14), and
+    /// the sweep must reach every unit that named it while leaving the others
+    /// deduped — a blanket reset would cost a rebind on every unit.
+    #[test]
+    fn forgetting_a_deleted_texture_touches_only_the_units_that_named_it() {
+        let mut s = fresh_state();
+        update_active_texture(&mut s, glow::TEXTURE0);
+        assert!(update_bind_texture_2d(&mut s, Some(7)));
+        update_active_texture(&mut s, glow::TEXTURE1);
+        assert!(update_bind_texture_2d(&mut s, Some(9)));
+        update_active_texture(&mut s, glow::TEXTURE2);
+        assert!(update_bind_texture_2d(&mut s, Some(7)));
+
+        s.bound_texture_2d.forget_texture(7);
+
+        update_active_texture(&mut s, glow::TEXTURE0);
+        assert!(
+            update_bind_texture_2d(&mut s, Some(7)),
+            "unit 0 still claimed the deleted texture"
+        );
+        update_active_texture(&mut s, glow::TEXTURE2);
+        assert!(
+            update_bind_texture_2d(&mut s, Some(7)),
+            "unit 2 still claimed the deleted texture"
+        );
+        update_active_texture(&mut s, glow::TEXTURE1);
+        assert!(
+            !update_bind_texture_2d(&mut s, Some(9)),
+            "unit 1 named a different texture and was reset anyway, costing a \
+             redundant rebind"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Multi-program workload: the shape uniform dedup exists for, and the
+    // shape it did not survive.
+    //
+    // Attaching invalidation to `glUseProgram` did not merely weaken the
+    // dedup on this shape, it removed it: a switch retained only the incoming
+    // program's entries, so cycling A→B→C→A emptied the table before every
+    // round and *every* unchanged uniform re-issued. Measured on a fixture
+    // this size: 3600 of 3600 logical uploads reached the driver.
+    //
+    // Asserting the issued count rather than "it dedups somewhere" is what
+    // makes this bite — the per-call dedup tests above all passed while the
+    // table was being emptied between them.
+    // ---------------------------------------------------------------------
+
+    /// Sets `uniforms_per_draw` unchanged uniforms under each of
+    /// `programs` programs, `rounds` times, cycling programs every round.
+    /// Returns `(logical calls, calls the tracker would issue)`.
+    ///
+    /// Takes the state by reference so a caller can measure a *steady-state*
+    /// frame. A frame's shadow outlives the frame; building a fresh one per
+    /// iteration measures the cold-start cost of eleven empty hash tables
+    /// instead of the per-command path.
+    fn run_program_cycling_frame(
+        s: &mut CanvasGLState,
+        programs: ProgramId,
+        rounds: usize,
+        uniforms_per_draw: u32,
+    ) -> (u32, u32) {
+        let payload = [7u8; 64];
+        let mut issued = 0u32;
+        let mut logical = 0u32;
+        for _ in 0..rounds {
+            for p in 1..=programs {
+                update_use_program(s, p);
+                for loc in 0..uniforms_per_draw {
+                    logical += 1;
+                    if update_uniform(s, p, loc, &payload) {
+                        issued += 1;
+                    }
+                }
+            }
+        }
+        (logical, issued)
+    }
+
+    fn program_cycling_frame(
+        programs: ProgramId,
+        rounds: usize,
+        uniforms_per_draw: u32,
+    ) -> (u32, u32) {
+        let mut s = fresh_state();
+        run_program_cycling_frame(&mut s, programs, rounds, uniforms_per_draw)
+    }
+
+    #[test]
+    fn a_frame_cycling_three_programs_uploads_each_unchanged_uniform_once() {
+        const PROGRAMS: ProgramId = 3;
+        const ROUNDS: usize = 100;
+        const PER_DRAW: u32 = 12;
+
+        let (logical, issued) = program_cycling_frame(PROGRAMS, ROUNDS, PER_DRAW);
+
+        assert_eq!(logical, ROUNDS as u32 * PROGRAMS * PER_DRAW);
+        // Only the first round establishes the shadow; rounds 2..N are free.
+        assert_eq!(
+            issued,
+            PROGRAMS * PER_DRAW,
+            "expected {} real uploads ({logical} logical), got {issued} — the \
+             uniform shadow is being discarded between program switches, which \
+             costs one driver call per uniform per draw for every scene with \
+             more than one material",
+            PROGRAMS * PER_DRAW
+        );
+    }
+
+    /// The dedup must not depend on how many programs the frame cycles
+    /// through — a scene gets more materials, not fewer.
+    #[test]
+    fn the_multi_program_dedup_holds_as_the_material_count_grows() {
+        for programs in [1u32, 2, 3, 8, 16] {
+            let (_, issued) = program_cycling_frame(programs, 20, 8);
+            assert_eq!(
+                issued,
+                programs * 8,
+                "{programs} programs: expected {} uploads, got {issued}",
+                programs * 8
+            );
+        }
+    }
+
+    /// Section 7.3's steady-state requirement, on the per-command dedup path.
+    ///
+    /// **This is the assertion the defect could not have passed.** Attaching
+    /// uniform invalidation to `glUseProgram` dropped the outgoing program's
+    /// entries on every switch, and each dropped entry is a `Vec<u8>` release
+    /// plus a fresh allocation the next time that uniform is uploaded — so a
+    /// frame that cycles three programs churned the heap in proportion to its
+    /// draw calls, on the thread running the game. With invalidation moved to
+    /// re-link, a settled frame touches the heap zero times: every upload is a
+    /// `get_mut` and a byte compare.
+    ///
+    /// One iteration is one frame. The warmup covers the first round, which
+    /// legitimately allocates — that is where each `(program, location)` gets
+    /// its cache entry.
+    #[test]
+    fn a_steady_state_program_cycling_frame_never_reaches_the_heap() {
+        const PROGRAMS: ProgramId = 3;
+        const ROUNDS: usize = 20;
+        const PER_DRAW: u32 = 12;
+
+        let mut s = fresh_state();
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "state_tracker: per-command dedup for a frame cycling three programs",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                let (logical, issued) =
+                    run_program_cycling_frame(&mut s, PROGRAMS, ROUNDS, PER_DRAW);
+                debug_assert_eq!(logical, ROUNDS as u32 * PROGRAMS * PER_DRAW);
+                issued
+            },
+        );
+    }
+
+    /// The same requirement for the state families whose containers were
+    /// right-sized. A settled frame of binds and toggles must not reach the
+    /// heap either — the hash maps these replaced could rehash mid-frame the
+    /// first time a scene touched a new texture unit or capability.
+    #[test]
+    fn a_steady_state_bind_and_toggle_frame_never_reaches_the_heap() {
+        let mut s = fresh_state();
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "state_tracker: per-command dedup for binds, toggles and stencil state",
+                warmup: 4,
+                measured: 64,
+            },
+            |iteration| {
+                let mut issued = 0u32;
+                for batch in 0..64u32 {
+                    if update_active_texture(&mut s, glow::TEXTURE0 + (batch & 3)) {
+                        issued += 1;
+                    }
+                    if update_bind_texture_2d(&mut s, Some(40 + (batch & 7))) {
+                        issued += 1;
+                    }
+                    if update_enable(&mut s, glow::BLEND) {
+                        issued += 1;
+                    }
+                    if update_disable(&mut s, glow::CULL_FACE) {
+                        issued += 1;
+                    }
+                    if update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, None) {
+                        issued += 1;
+                    }
+                    if update_stencil_func(
+                        &mut s,
+                        glow::FRONT_AND_BACK,
+                        glow::EQUAL,
+                        (iteration & 3) as i32,
+                        0xFF,
+                    ) {
+                        issued += 1;
+                    }
+                    if update_viewport(&mut s, 0, 0, 1080, 1920) {
+                        issued += 1;
+                    }
+                }
+                issued
+            },
+        );
+    }
+
+    /// Steady-state cost of the per-command shadow bookkeeping for the frame
+    /// above, driver calls excluded. Direction-only assertion so the number is
+    /// informative without being machine-dependent.
+    ///
+    /// Run with:
+    /// `cargo test --release -p migo-graphics --lib bench_ -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_program_cycling_frame_shadow_cost() {
+        const PROGRAMS: ProgramId = 3;
+        const ROUNDS: usize = 100;
+        const PER_DRAW: u32 = 12;
+        const ITERS: usize = 2_000;
+
+        // One long-lived shadow, as a running game has: frame N+1 sees the
+        // table frame N left behind.
+        let mut s = fresh_state();
+        for _ in 0..50 {
+            std::hint::black_box(run_program_cycling_frame(
+                &mut s, PROGRAMS, ROUNDS, PER_DRAW,
+            ));
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(run_program_cycling_frame(
+                &mut s, PROGRAMS, ROUNDS, PER_DRAW,
+            ));
+        }
+        let per_frame = start.elapsed().as_nanos() as f64 / ITERS as f64;
+
+        let logical = ROUNDS as f64 * PROGRAMS as f64 * PER_DRAW as f64;
+        println!(
+            "steady-state program-cycling frame ({PROGRAMS} programs x {ROUNDS} \
+             rounds x {PER_DRAW} uniforms = {logical:.0} logical uploads, all \
+             deduped):\n  {per_frame:.0} ns/frame of shadow bookkeeping \
+             ({:.2} ns per logical upload, {:.3}% of a 16.67 ms frame)",
+            per_frame / logical,
+            per_frame / 16_666_000.0 * 100.0
+        );
+
+        // A frame that only maintains a shadow must stay far under the frame
+        // budget; this catches an accidental O(n) walk per call, which is the
+        // defect that was here.
+        assert!(
+            per_frame < 16_666_000.0 / 10.0,
+            "shadow bookkeeping alone took {per_frame:.0} ns, over a tenth of a \
+             frame budget — something on this path is superlinear"
         );
     }
 

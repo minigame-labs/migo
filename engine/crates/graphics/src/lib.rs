@@ -67,6 +67,7 @@ pub mod atrace;
 #[doc(hidden)]
 pub mod backend;
 mod canvas;
+pub(crate) mod canvas_keyed;
 mod canvas2d_dispatcher;
 pub mod compressed_upload;
 pub(crate) mod damage_effect;
