@@ -2611,6 +2611,19 @@ impl RendererGL {
                     .vaos
                     .get_mut(&vao)
                     .and_then(|meta| meta.take_for_delete());
+                // Drop this VAO's vertex-attribute shadow. VAO names come from
+                // the client, so a reused name would otherwise inherit the dead
+                // object's layout and dedup away the `vertexAttribPointer` the
+                // new one needs — a draw reading the wrong vertex stream, with
+                // no GL error.
+                //
+                // Every canvas: a VAO name is local to the context that created
+                // it, so only one canvas can hold state for it, but finding
+                // which would mean trusting `VaoMeta::owner` to agree with the
+                // shadow. Sweeping is O(canvases) on a cold command.
+                for state in cm.gl_state.values_mut() {
+                    state.vertex_attribs.forget_vao(vao);
+                }
                 if let Some(object) = object {
                     cm.delete_gl_object(object)?;
                 }

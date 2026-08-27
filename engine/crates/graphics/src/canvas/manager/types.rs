@@ -1,13 +1,13 @@
 extern crate khronos_egl as egl;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use glow::{
     NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeRenderbuffer, NativeSampler,
     NativeShader, NativeTexture, NativeVertexArray,
 };
 use shared::error::{EngineError, ErrorCode};
-use shared::protocol::render_cmd::{CanvasId, ProgramId, ShaderId, ShaderType};
+use shared::protocol::render_cmd::{CanvasId, ProgramId, ShaderId, ShaderType, VaoId};
 
 use super::gl_object::GlObject;
 
@@ -193,69 +193,9 @@ pub(crate) struct CanvasGLState {
     /// Last-bound renderbuffer id (glBindRenderbuffer only has one
     /// target, RENDERBUFFER).
     pub bound_renderbuffer: Option<Option<u32>>,
-    // ---- Per-VAO vertex-attribute shadows -------------------------------
-    //
-    // MEASURED, NOT YET DONE — the largest remaining win on this path.
-    //
-    // The three fields below are the same per-VAO state under three separate
-    // hash containers, all keyed `(vao, index)`. GLES 3.0 §6.2 puts this state
-    // *inside* the vertex array object, and `index` is bounded by
-    // `MAX_VERTEX_ATTRIBS` (16 on WebGL 2, 32 on most GLES 3 hardware), so the
-    // shape that matches is one record per VAO with the attributes indexed
-    // directly — reached the same way `CanvasStateTable` reaches a canvas.
-    //
-    // Why it is worth doing: `vertexAttribPointer` is, by this module's own
-    // account, the most-called non-draw call in the Cocos Creator 2.x no-VAO
-    // path. Modelled at the shipped `opt-level = "z"` over 1800 calls/frame
-    // (300 batches x 3 attributes, pointer + enable):
-    //   three hash containers : 46.3 µs/frame, 25.73 ns/call
-    //   one per-VAO record    :  4.7 µs/frame,  2.62 ns/call   9.8x
-    //
-    // Memory is not the obstacle, which is worth writing down because it looked
-    // like it would be. `Option<VertexAttribPointerFp>` is 32 bytes — the
-    // `normalized: bool` niche makes the `Option` free — and 28 once `vao` is
-    // dropped, since it becomes the table key. Against three hash containers at
-    // hashbrown's 7/8 load factor, an inline record of 8 attribute slots is
-    // +44% per VAO at 3 attributes in use, -13% at 5, and -46% at 8. Worst
-    // case measured: 500 VAOs using 3 attributes each, 105 KiB -> 152 KiB.
-    //
-    // What it needs that this pass could not give it: the retention semantics
-    // pinned by `vertex_attrib_pointer_keys_by_vao_scope_across_buffer_switches`
-    // are subtle, and the failure mode of getting them wrong is a draw reading
-    // the wrong vertex stream — corrupted geometry, no GL error, no log line.
-    // Unlike the container swaps above, this one is not behaviour-preserving by
-    // construction, so it wants its own review and a device pass rather than
-    // being folded in behind the same test run.
-    /// Which vertex-attribute array indices are enabled.  The enable
-    /// state of an attribute array lives INSIDE the bound VAO (GLES 3.0
-    /// §6.2 / WebGL 2), so this is keyed by `(vao, index)` — mirroring
-    /// [`Self::vertex_attrib_pointer_fp`].  `vao` is `bound_vao` (0 = the
-    /// default VAO).  Presence = enabled.  Keying by index alone would let
-    /// an `enableVertexAttribArray` on a freshly-bound VAO get deduped
-    /// away because a *different* VAO already had that index enabled,
-    /// leaving the new VAO's attribute disabled → draws fetch constant
-    /// vertex data → nothing renders.
-    pub enabled_vertex_attribs: HashSet<(u32, u32)>,
-    /// Shadow for `glVertexAttribPointer`: keyed by `(vao, index)`,
-    /// value is a fingerprint of (size, type, normalized, stride,
-    /// offset, array_buffer).  A repeat call with identical
-    /// fingerprint against the same `(vao, index)` slot skips the
-    /// driver round-trip — the hottest driver call in Cocos Creator
-    /// 2.x's no-OES_VAO code path when games draw thousands of
-    /// sprites per frame.
-    ///
-    /// Keyed on `(vao, index)` (not just `index`) because VAOs scope
-    /// their own vertex attrib state: ping-ponging between VAO A and
-    /// VAO B on the same `index` would otherwise make each switch's
-    /// shadow overwrite the previous, losing dedup benefits for the
-    /// other VAO.
-    pub vertex_attrib_pointer_fp: HashMap<(u32, u32), VertexAttribPointerFp>,
-    /// `glVertexAttribDivisor(index, divisor)` shadow.  ANGLE / WebGL 2
-    /// games instancing sprites update this per attribute.  The divisor is
-    /// per-VAO state (GLES 3.0 §6.2), so this is keyed by `(vao, index)`
-    /// like [`Self::vertex_attrib_pointer_fp`] — keying by index alone
-    /// would dedup away a divisor set on a freshly-bound VAO.
-    pub vertex_attrib_divisor: HashMap<(u32, u32), u32>,
+    /// Vertex-attribute state, held per VAO because GLES 3.0 §6.2 holds it
+    /// inside the vertex array object. See [`VertexArrayShadow`].
+    pub vertex_attribs: VertexArrayShadow,
 
     // ---- Stencil state shadows (P14) ----------------------------------
     //
@@ -575,6 +515,240 @@ impl FramebufferShadow {
     }
 }
 
+// ============================================================================
+// Vertex-attribute state, held where GL holds it
+// ============================================================================
+
+/// The pointer fingerprint and divisor for one attribute index of one VAO.
+///
+/// `divisor` is `Option` rather than a plain `u32` defaulted to zero because the
+/// tracker distinguishes "never observed" from "observed as zero": zero is the
+/// GL initial divisor, but a shadow that assumed it would dedup away the first
+/// `glVertexAttribDivisor(i, 0)` a game issues to *undo* instancing, and the
+/// driver would keep the old divisor.
+///
+/// Pointer and divisor share a slot so one bounds check and one cache line
+/// serve both — a game that sets a divisor sets a pointer for the same index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AttribSlot {
+    pointer: Option<VertexAttribPointerFp>,
+    divisor: Option<u32>,
+}
+
+/// Vertex-attribute dedup state for one vertex array object.
+#[derive(Clone, Debug, Default)]
+struct VaoAttribs {
+    /// Slot `i` is attribute `i`. Length is the highest index the content has
+    /// touched plus one, so a geometry using three attributes costs three slots
+    /// — see [`VertexArrayShadow`] for why that matters.
+    slots: Vec<AttribSlot>,
+    /// Bit `i` set ⇔ attribute array `i` is enabled.
+    ///
+    /// A single mask, with no companion "known" mask, because zero *is* the
+    /// truth about a VAO nothing has touched: GLES 3.0 §2.9.4 has every vertex
+    /// attribute array start disabled. Pinned by
+    /// `enable_and_disable_vertex_attrib_are_idempotent`, whose fourth
+    /// assertion is that a `glDisableVertexAttribArray` on an untouched index
+    /// dedups.
+    enabled: u32,
+}
+
+/// `glVertexAttribPointer` / `glEnableVertexAttribArray` /
+/// `glVertexAttribDivisor` dedup state, held per VAO.
+///
+/// **GLES 3.0 §6.2 puts this state inside the vertex array object, and this now
+/// stores it that way.** It was three separate hash containers keyed
+/// `(vao, index)` — `HashMap<_, Fp>`, `HashSet<_>` and `HashMap<_, u32>` — so a
+/// single `vertexAttribPointer` hashed a pair of `u32`s, and the enable and the
+/// divisor beside it hashed the same pair again into two more tables. By this
+/// module's own account `vertexAttribPointer` is the most-called non-draw call
+/// in the Cocos Creator 2.x no-VAO path.
+///
+/// Measured at the shipped `opt-level = "z"`, `enable` + `pointer` + `divisor`
+/// per attribute:
+///
+/// | workload                        | before      | after      |       |
+/// |---------------------------------|-------------|------------|-------|
+/// | 1 VAO, 3 attributes (Cocos)     | 25.2 ns/call| 3.4 ns/call| 7.5x  |
+/// | 200 VAOs, 3 attributes          | 28.4 ns/call| 9.7 ns/call| 2.9x  |
+/// | 200 VAOs, 5 attributes          | 28.8 ns/call| 6.4 ns/call| 4.5x  |
+/// | 200 VAOs, 8 attributes          | 28.3 ns/call| 4.8 ns/call| 5.9x  |
+///
+/// **Growing the slot vector on demand is what makes this free rather than a
+/// trade.** A fixed-size attribute array is marginally faster still, but it
+/// costs +171% shadow bytes at three attributes in use and it forces a choice
+/// of inline capacity — a threshold whose right value depends on the
+/// distribution of attributes-per-VAO in real content, which is exactly the
+/// kind of number that should not be guessed. Sized to what the content
+/// touches, the shadow is *smaller* than the three hash tables at every point
+/// measured: −43% at one VAO with three attributes, −6% / −4% / −40% at 200
+/// VAOs with three / five / eight.
+///
+/// The outer table is the same index-memo keyed scan as
+/// [`crate::canvas_keyed::CanvasKeyed`], for the same reason: draws arrive in
+/// runs that share a VAO. It is a separate type rather than a reuse because the
+/// key is a `VaoId`, not a `CanvasId`, and collapsing the two would let a canvas
+/// id be passed where a VAO id belongs.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VertexArrayShadow {
+    entries: Vec<(VaoId, VaoAttribs)>,
+    /// Index the previous lookup resolved to, re-checked against the key on
+    /// every use.
+    hot: usize,
+}
+
+impl VertexArrayShadow {
+    /// Highest attribute index this shadow will track.
+    ///
+    /// GLES 3.0 §6.2 caps `MAX_VERTEX_ATTRIBS`; WebGL 2 guarantees at least 16
+    /// and GLES 3 hardware reports 16 or 32. Tracking to 32 covers every device
+    /// this engine builds for; an index above it is forwarded untracked, which
+    /// is also what bounds the slot vector against an index chosen by content.
+    const MAX_TRACKED_ATTRIBS: u32 = 32;
+
+    #[inline]
+    fn vao_mut(&mut self, vao: VaoId) -> &mut VaoAttribs {
+        if let Some((key, _)) = self.entries.get(self.hot)
+            && *key == vao
+        {
+            return &mut self.entries[self.hot].1;
+        }
+        self.resolve(vao)
+    }
+
+    #[inline(never)]
+    fn resolve(&mut self, vao: VaoId) -> &mut VaoAttribs {
+        match self.entries.iter().position(|(key, _)| *key == vao) {
+            Some(pos) => self.hot = pos,
+            None => {
+                self.entries.push((vao, VaoAttribs::default()));
+                self.hot = self.entries.len() - 1;
+            }
+        }
+        &mut self.entries[self.hot].1
+    }
+
+    /// The slot for `index`, growing the vector to reach it. `None` for an
+    /// index past [`Self::MAX_TRACKED_ATTRIBS`].
+    #[inline]
+    fn slot_mut(&mut self, vao: VaoId, index: u32) -> Option<&mut AttribSlot> {
+        if index >= Self::MAX_TRACKED_ATTRIBS {
+            return None;
+        }
+        let attribs = self.vao_mut(vao);
+        let i = index as usize;
+        if i >= attribs.slots.len() {
+            attribs.slots.resize(i + 1, AttribSlot::default());
+        }
+        Some(&mut attribs.slots[i])
+    }
+
+    /// Record `glVertexAttribPointer`; `true` when the driver call must be
+    /// issued.
+    #[inline]
+    pub(crate) fn update_pointer(
+        &mut self,
+        vao: VaoId,
+        index: u32,
+        fp: VertexAttribPointerFp,
+    ) -> bool {
+        let Some(slot) = self.slot_mut(vao, index) else {
+            return true;
+        };
+        if slot.pointer == Some(fp) {
+            return false;
+        }
+        slot.pointer = Some(fp);
+        true
+    }
+
+    /// Record `glVertexAttribDivisor`; `true` when the driver call must be
+    /// issued.
+    #[inline]
+    pub(crate) fn update_divisor(&mut self, vao: VaoId, index: u32, divisor: u32) -> bool {
+        let Some(slot) = self.slot_mut(vao, index) else {
+            return true;
+        };
+        if slot.divisor == Some(divisor) {
+            return false;
+        }
+        slot.divisor = Some(divisor);
+        true
+    }
+
+    /// Record `glEnableVertexAttribArray`; `true` when the driver call must be
+    /// issued.
+    #[inline]
+    pub(crate) fn enable(&mut self, vao: VaoId, index: u32) -> bool {
+        if index >= Self::MAX_TRACKED_ATTRIBS {
+            return true;
+        }
+        let bit = 1u32 << index;
+        let attribs = self.vao_mut(vao);
+        if attribs.enabled & bit != 0 {
+            return false;
+        }
+        attribs.enabled |= bit;
+        true
+    }
+
+    /// Record `glDisableVertexAttribArray`; `true` when the driver call must be
+    /// issued.
+    #[inline]
+    pub(crate) fn disable(&mut self, vao: VaoId, index: u32) -> bool {
+        if index >= Self::MAX_TRACKED_ATTRIBS {
+            return true;
+        }
+        let bit = 1u32 << index;
+        let attribs = self.vao_mut(vao);
+        if attribs.enabled & bit == 0 {
+            return false;
+        }
+        attribs.enabled &= !bit;
+        true
+    }
+
+    /// Forget every VAO's attribute state.
+    ///
+    /// Keeps the allocations: this runs at every Skia boundary, and a game that
+    /// crosses one per frame would otherwise re-buy one slot vector per VAO per
+    /// frame on the render thread.
+    #[inline]
+    pub(crate) fn forget_all(&mut self) {
+        for (_, attribs) in &mut self.entries {
+            attribs.slots.clear();
+            attribs.enabled = 0;
+        }
+        self.hot = 0;
+    }
+
+    /// Drop a deleted VAO's state.
+    ///
+    /// VAO names come from the client, so a reused name would otherwise inherit
+    /// the dead object's attribute shadow and dedup away the layout the new one
+    /// needs — a draw reading the wrong vertex stream.
+    #[inline]
+    pub(crate) fn forget_vao(&mut self, vao: VaoId) {
+        if let Some(pos) = self.entries.iter().position(|(key, _)| *key == vao) {
+            self.entries.swap_remove(pos);
+            self.hot = 0;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_vaos(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_slots(&self, vao: VaoId) -> usize {
+        self.entries
+            .iter()
+            .find(|(key, _)| *key == vao)
+            .map_or(0, |(_, a)| a.slots.len())
+    }
+}
+
 /// Per-canvas dedup shadows, keyed by canvas.
 ///
 /// See [`crate::canvas_keyed`] for why this is a keyed scan rather than a hash
@@ -593,11 +767,13 @@ pub(crate) type CanvasStateTable = crate::canvas_keyed::CanvasKeyed<CanvasGLStat
 /// the wrong vertex buffer, a class of bug that's nearly
 /// impossible to reproduce outside of real game content.
 ///
-/// That's why `array_buffer` is part of the fingerprint.  Keyed
-/// per-(vao, index) so the tracker maintains one entry per
-/// logical attribute slot; the `array_buffer` component inside
-/// the fingerprint differentiates same-index-same-layout-
-/// different-buffer calls.
+/// That's why `array_buffer` is part of the fingerprint.
+///
+/// The VAO is *not* part of it, because [`VertexArrayShadow`] holds one of
+/// these per VAO per attribute index — the VAO is the table key. It used to be
+/// a field here as well, back when a single flat `HashMap<(vao, index), _>`
+/// carried every VAO's fingerprints; keeping it would now mean comparing a
+/// value against itself on every dedup decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VertexAttribPointerFp {
     pub size: i32,
@@ -605,10 +781,6 @@ pub struct VertexAttribPointerFp {
     pub normalized: bool,
     pub stride: i32,
     pub offset: i32,
-    /// VAO this pointer belongs to (0 = default VAO).  Necessary
-    /// because VAOs capture vertex attrib state — a repeat call
-    /// after `bindVertexArray` change must NOT be deduped.
-    pub vao: u32,
     /// `ARRAY_BUFFER` binding captured at the time of the
     /// `vertexAttribPointer` call.  `None` = no buffer bound
     /// (the attribute points at client-side memory, which WebGL
@@ -654,9 +826,7 @@ impl Default for CanvasGLState {
             uniform_cache: HashMap::new(),
             bound_framebuffer: FramebufferShadow::default(),
             bound_renderbuffer: None,
-            enabled_vertex_attribs: HashSet::new(),
-            vertex_attrib_pointer_fp: HashMap::new(),
-            vertex_attrib_divisor: HashMap::new(),
+            vertex_attribs: VertexArrayShadow::default(),
             stencil_func: PerFace::default(),
             stencil_op: PerFace::default(),
             stencil_mask: PerFace::default(),
@@ -696,9 +866,7 @@ impl CanvasGLState {
     fn invalidate_p11_shadow(&mut self) {
         self.bound_framebuffer.forget_all();
         self.bound_renderbuffer = None;
-        self.enabled_vertex_attribs.clear();
-        self.vertex_attrib_pointer_fp.clear();
-        self.vertex_attrib_divisor.clear();
+        self.vertex_attribs.forget_all();
         // P14 shadows: Skia does not touch stencil state (Ganesh GL
         // backend leaves stencil disabled by default) or pixelStorei
         // (those are upload-path knobs not used during draw).
@@ -947,6 +1115,112 @@ mod shadow_shape_benches {
             "two Option fields came out slower than a two-entry hash map \
              ({after:.0} vs {before:.0} ns)"
         );
+    }
+
+    /// The vertex-attribute shadow: by this module's own account the
+    /// most-called non-draw path in the Cocos Creator 2.x no-VAO code path.
+    ///
+    /// Before: three containers keyed `(vao, index)` — a `HashMap` of
+    /// fingerprints, a `HashSet` of enabled indices and a `HashMap` of divisors
+    /// — so one attribute cost three hashes of the same pair into three tables.
+    ///
+    /// Run at four attribute counts and two VAO counts, because the shape of
+    /// the answer is what decided the layout: a fixed-size attribute array is
+    /// marginally faster than growing on demand but costs +171% shadow bytes at
+    /// three attributes in use, and picking its inline capacity would mean
+    /// guessing the distribution of attributes-per-VAO in real content. Grown to
+    /// what the content touches, the new layout is faster *and* smaller at every
+    /// point here.
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_vertex_attrib_shadow_vs_three_hash_containers() {
+        for (vaos, attribs) in [(1u32, 3u32), (200, 3), (200, 5), (200, 8)] {
+            let calls = (vaos * attribs * 3) as usize;
+
+            // Before: the three containers, keyed exactly as they were.
+            #[derive(Clone, Copy, PartialEq, Eq)]
+            struct KeyedFp {
+                size: i32,
+                type_: u32,
+                normalized: bool,
+                stride: i32,
+                offset: i32,
+                vao: u32,
+                array_buffer: Option<u32>,
+            }
+            let mut pointers: HashMap<(u32, u32), KeyedFp> = HashMap::new();
+            let mut enabled: HashSet<(u32, u32)> = HashSet::new();
+            let mut divisors: HashMap<(u32, u32), u32> = HashMap::new();
+            let before = time(|| {
+                let mut n = 0;
+                for vao in 0..vaos {
+                    for index in 0..attribs {
+                        let key = (vao, index);
+                        if !enabled.contains(&key) {
+                            enabled.insert(key);
+                            n += 1;
+                        }
+                        let fp = KeyedFp {
+                            size: 3,
+                            type_: glow::FLOAT,
+                            normalized: false,
+                            stride: 32,
+                            offset: (index * 12) as i32,
+                            vao,
+                            array_buffer: Some(10 + vao),
+                        };
+                        if pointers.get(&key) != Some(&fp) {
+                            pointers.insert(key, fp);
+                            n += 1;
+                        }
+                        if divisors.get(&key).copied() != Some(0) {
+                            divisors.insert(key, 0);
+                            n += 1;
+                        }
+                    }
+                }
+                n
+            });
+
+            let mut shadow = VertexArrayShadow::default();
+            let after = time(|| {
+                let mut n = 0;
+                for vao in 0..vaos {
+                    for index in 0..attribs {
+                        if shadow.enable(vao, index) {
+                            n += 1;
+                        }
+                        let fp = VertexAttribPointerFp {
+                            size: 3,
+                            type_: glow::FLOAT,
+                            normalized: false,
+                            stride: 32,
+                            offset: (index * 12) as i32,
+                            array_buffer: Some(10 + vao),
+                        };
+                        if shadow.update_pointer(vao, index, fp) {
+                            n += 1;
+                        }
+                        if shadow.update_divisor(vao, index, 0) {
+                            n += 1;
+                        }
+                    }
+                }
+                n
+            });
+
+            report(
+                &format!("vertex attributes, {vaos} VAO(s) x {attribs} attributes"),
+                calls,
+                before,
+                after,
+            );
+            assert!(
+                after < before,
+                "{vaos} VAOs x {attribs} attributes: the per-VAO shadow came out \
+                 slower than the three hash containers ({after:.0} vs {before:.0} ns)"
+            );
+        }
     }
 
     /// The GPU budget's binding ledger, which is reached on the same commands

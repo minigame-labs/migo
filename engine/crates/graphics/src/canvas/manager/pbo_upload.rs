@@ -410,6 +410,44 @@ impl PboPool {
     /// timeout) for the DMA transfer to complete before returning it.  This
     /// prevents GPU stalls on Adreno and similar drivers where reusing a PBO
     /// whose transfer is still in flight causes the driver to block.
+    ///
+    /// # Open question: this wait may be unnecessary, and it is expensive
+    ///
+    /// **Every write to a PBO from this pool is a full respecify.** All four
+    /// sites — [`upload_pbo_mutable`], [`upload_pbo_immutable`], and the two
+    /// WebGL paths in `renderergl::handler` — call
+    /// `buffer_data_u8_slice(PIXEL_UNPACK_BUFFER, .., STREAM_DRAW)` over the
+    /// whole buffer; none uses `buffer_sub_data` or a mapping. A conforming
+    /// GLES 3.0 driver orphans the previous storage on that call (§2.9), which
+    /// is exactly why `STREAM_DRAW` plus a full `glBufferData` is the canonical
+    /// stall-free streaming idiom — and makes the hazard this waits for
+    /// disappear one call later.
+    ///
+    /// This engine's *other* PBO pool says so, in
+    /// [`crate::upload_thread`]: "`STREAM_DRAW` with a full-buffer replacement
+    /// orphans the driver-side storage (per spec §6.2), so reuse is safe even
+    /// though the previous DMA may not have completed on the GPU." That pool
+    /// keeps no fences and waits for nothing.
+    ///
+    /// The cost of being wrong about it is not small. The timeout is 5 ms
+    /// against a 16.67 ms frame, this runs on the render thread, and a wait
+    /// that *does* expire also deletes the buffer and creates a fresh one —
+    /// so a sustained GPU overrun turns the pool into a create/delete treadmill
+    /// on the exact frames that could least afford it.
+    ///
+    /// **Not removed, because the comment above is a coherent claim about
+    /// non-conforming hardware and not a misreading.** It asserts that Adreno
+    /// blocks *inside* `glBufferData` rather than orphaning, in which case this
+    /// converts an unbounded driver stall into a bounded one plus a fallback.
+    /// Settling it needs one measurement on an Adreno device: time
+    /// `glBufferData` on a PBO with an unsignalled fence, with and without the
+    /// wait. If the driver does orphan, the better fix is not to delete this
+    /// but to make the orphan explicit — `glBufferData(target, size, NULL)`
+    /// before the data upload — which costs nothing and needs no fence at all.
+    ///
+    /// Whoever runs that measurement should also reconcile the two pools: they
+    /// currently implement opposite policies for the same access pattern, and
+    /// only one of them can be right.
     pub fn acquire(&mut self, gl: &glow::Context, size: usize) -> Option<glow::NativeBuffer> {
         if !self.pbo_supported {
             return None;

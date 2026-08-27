@@ -2775,6 +2775,36 @@ impl CanvasManager {
         }
 
         // Also re-check any previously deferred uploads.
+        //
+        // MEASURED, NOT DONE — one allocation round trip per frame while any
+        // upload is in flight.
+        //
+        // `for c in deferred` consumes the vector, so its buffer is freed at the
+        // end of the loop; `std::mem::take` above left `pending_uploads` at
+        // capacity zero, so the re-defer push below has to buy a new one. During
+        // a level load or texture streaming that is a `malloc` and a `free` per
+        // frame on the render thread, which is what Section 7.3 forbids.
+        //
+        // The fix is `Vec::append`, which moves the elements and leaves the
+        // source empty *with its capacity intact*, plus a scratch vector held in
+        // a field so it survives the frame:
+        //
+        //     let mut scratch = std::mem::take(&mut self.upload_drain_scratch);
+        //     scratch.append(&mut self.pending_uploads);
+        //     upload.drain_completed(&mut scratch);
+        //     for c in scratch.drain(..) { … self.pending_uploads.push(c) … }
+        //     self.upload_drain_scratch = scratch;
+        //
+        // which also removes the `completed` vector entirely by draining
+        // straight into the scratch. Element order is unchanged: deferred first,
+        // newly completed after.
+        //
+        // Left undone because it cannot be gated from here. The claim is about
+        // the heap, so the instrument has to be `assert_no_steady_state_
+        // allocation`, and this function calls `self.gl.client_wait_sync`, so
+        // reaching it needs a live GL context. Landing this wants an
+        // `UploadThread` fixture first — otherwise the change is an untested
+        // edit to a path that decides whether a texture is registered or leaked.
         let mut deferred = std::mem::take(&mut self.pending_uploads);
         deferred.extend(completed);
 

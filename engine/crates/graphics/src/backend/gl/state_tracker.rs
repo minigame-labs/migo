@@ -562,23 +562,15 @@ pub(crate) fn update_color_mask(
 pub(crate) fn update_enable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
     // Enable state is per-VAO: scope the shadow by the bound VAO so that
     // re-enabling the same index on a different VAO still hits the driver.
-    let key = (state.bound_vao.unwrap_or(0), index);
-    if state.enabled_vertex_attribs.contains(&key) {
-        return false;
-    }
-    state.enabled_vertex_attribs.insert(key);
-    true
+    let vao = state.bound_vao.unwrap_or(0);
+    state.vertex_attribs.enable(vao, index)
 }
 
 /// `glDisableVertexAttribArray(index)`.  Returns `true` when the index
 /// was previously tracked as enabled *for the currently bound VAO*.
 pub(crate) fn update_disable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
-    let key = (state.bound_vao.unwrap_or(0), index);
-    if !state.enabled_vertex_attribs.contains(&key) {
-        return false;
-    }
-    state.enabled_vertex_attribs.remove(&key);
-    true
+    let vao = state.bound_vao.unwrap_or(0);
+    state.vertex_attribs.disable(vao, index)
 }
 
 /// `glVertexAttribPointer(index, size, type, normalized, stride, offset)`.
@@ -612,7 +604,6 @@ pub(crate) fn update_vertex_attrib_pointer(
         normalized,
         stride,
         offset,
-        vao,
         // The inner `Option<u32>` of `bound_array_buffer` is
         // `None` when no buffer has ever been bound (tracker
         // never saw a call) vs `Some(None)` for "known: no
@@ -621,12 +612,7 @@ pub(crate) fn update_vertex_attrib_pointer(
         // state by tracking None explicitly in the fingerprint.
         array_buffer: state.bound_array_buffer.and_then(|b| b),
     };
-    let key = (vao, index);
-    if state.vertex_attrib_pointer_fp.get(&key) == Some(&fp) {
-        return false;
-    }
-    state.vertex_attrib_pointer_fp.insert(key, fp);
-    true
+    state.vertex_attribs.update_pointer(vao, index, fp)
 }
 
 /// `glVertexAttribDivisor(index, divisor)` dedup for WebGL 2 /
@@ -637,14 +623,8 @@ pub(crate) fn update_vertex_attrib_divisor(
     divisor: u32,
 ) -> bool {
     // Divisor is per-VAO: scope the shadow by the bound VAO.
-    let key = (state.bound_vao.unwrap_or(0), index);
-    match state.vertex_attrib_divisor.get(&key).copied() {
-        Some(cur) if cur == divisor => false,
-        _ => {
-            state.vertex_attrib_divisor.insert(key, divisor);
-            true
-        }
-    }
+    let vao = state.bound_vao.unwrap_or(0);
+    state.vertex_attribs.update_divisor(vao, index, divisor)
 }
 
 /// Test-only helper: construct a fresh state as the baseline for tests.
@@ -1087,6 +1067,281 @@ mod tests {
             issued, 105,
             "expected 105 real GL calls for the 600 logical calls, \
              got {issued} (dedup is broken)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The per-VAO vertex-attribute shadow
+    //
+    // The ten tests above pin the dedup semantics and passed unchanged across
+    // the move from three `(vao, index)`-keyed hash containers to one record
+    // per VAO — which is what makes that move behaviour-preserving. What they
+    // do not cover is the shadow's own shape: how far it tracks, how much it
+    // allocates, and what deleting a VAO drops. That is here.
+    // ---------------------------------------------------------------------
+
+    /// **The property that makes this layout free rather than a trade.** Slots
+    /// are grown to the highest index the content touches, so a geometry using
+    /// three attributes costs three slots, not a fixed sixteen or thirty-two.
+    /// A fixed array would be marginally faster and cost +171% shadow bytes at
+    /// this attribute count.
+    #[test]
+    fn the_attribute_slots_are_sized_to_what_the_content_touches() {
+        let mut s = fresh_state();
+        for index in 0..3u32 {
+            assert!(update_enable_vertex_attrib(&mut s, index));
+            assert!(update_vertex_attrib_pointer(
+                &mut s,
+                index,
+                3,
+                glow::FLOAT,
+                false,
+                32,
+                0
+            ));
+        }
+
+        assert_eq!(
+            s.vertex_attribs.tracked_slots(0),
+            3,
+            "three attributes in use should cost three slots"
+        );
+
+        // Reaching a higher index grows to exactly that index, not to the cap.
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            5,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
+        assert_eq!(s.vertex_attribs.tracked_slots(0), 6);
+    }
+
+    /// One record per VAO the content actually binds — the outer table grows the
+    /// same way the slots do.
+    #[test]
+    fn only_the_vaos_the_content_binds_are_tracked() {
+        let mut s = fresh_state();
+        assert_eq!(s.vertex_attribs.tracked_vaos(), 0);
+        for vao in [0u32, 4, 9] {
+            update_bind_vertex_array(&mut s, Some(vao));
+            assert!(update_enable_vertex_attrib(&mut s, 0));
+        }
+        assert_eq!(s.vertex_attribs.tracked_vaos(), 3);
+        // Re-binding a VAO already seen does not add another record.
+        update_bind_vertex_array(&mut s, Some(4));
+        assert!(!update_enable_vertex_attrib(&mut s, 0));
+        assert_eq!(s.vertex_attribs.tracked_vaos(), 3);
+    }
+
+    /// An attribute index past what any GLES 3 device exposes is forwarded
+    /// rather than tracked — that is also what stops a content-chosen index
+    /// from sizing the slot vector.
+    #[test]
+    fn an_attribute_index_past_the_tracked_range_is_forwarded_every_time() {
+        let mut s = fresh_state();
+        const PAST_END: u32 = 32;
+
+        assert!(update_enable_vertex_attrib(&mut s, PAST_END));
+        assert!(
+            update_enable_vertex_attrib(&mut s, PAST_END),
+            "an untracked index must forward rather than dedup"
+        );
+        assert!(update_vertex_attrib_pointer(
+            &mut s, PAST_END, 3, glow::FLOAT, false, 32, 0
+        ));
+        assert!(update_vertex_attrib_pointer(
+            &mut s, PAST_END, 3, glow::FLOAT, false, 32, 0
+        ));
+        assert!(update_vertex_attrib_divisor(&mut s, PAST_END, 1));
+        assert!(update_vertex_attrib_divisor(&mut s, PAST_END, 1));
+        assert!(
+            update_disable_vertex_attrib(&mut s, PAST_END),
+            "disable of an untracked index must forward too"
+        );
+        assert_eq!(
+            s.vertex_attribs.tracked_slots(0),
+            0,
+            "an out-of-range index sized the slot vector"
+        );
+    }
+
+    #[test]
+    fn the_last_tracked_attribute_index_still_dedups() {
+        let mut s = fresh_state();
+        assert!(update_enable_vertex_attrib(&mut s, 31));
+        assert!(!update_enable_vertex_attrib(&mut s, 31));
+        assert!(update_vertex_attrib_pointer(
+            &mut s, 31, 3, glow::FLOAT, false, 32, 0
+        ));
+        assert!(!update_vertex_attrib_pointer(
+            &mut s, 31, 3, glow::FLOAT, false, 32, 0
+        ));
+    }
+
+    /// Deleting a VAO must drop its shadow and nothing else. VAO names come
+    /// from the client, so a reused name that inherited the dead object's
+    /// layout would dedup away the `vertexAttribPointer` the new one needs, and
+    /// the draw would read the wrong vertex stream.
+    #[test]
+    fn deleting_a_vao_drops_its_shadow_and_leaves_the_others() {
+        let mut s = fresh_state();
+        s.bound_array_buffer = Some(Some(7));
+        for vao in [1u32, 2] {
+            update_bind_vertex_array(&mut s, Some(vao));
+            s.bound_array_buffer = Some(Some(7));
+            assert!(update_enable_vertex_attrib(&mut s, 0));
+            assert!(update_vertex_attrib_pointer(
+                &mut s, 0, 3, glow::FLOAT, false, 32, 0
+            ));
+        }
+
+        s.vertex_attribs.forget_vao(1);
+
+        update_bind_vertex_array(&mut s, Some(1));
+        s.bound_array_buffer = Some(Some(7));
+        assert!(
+            update_enable_vertex_attrib(&mut s, 0),
+            "the deleted VAO's enable shadow survived, so a reused name draws \
+             with a disabled attribute"
+        );
+        assert!(
+            update_vertex_attrib_pointer(&mut s, 0, 3, glow::FLOAT, false, 32, 0),
+            "the deleted VAO's layout shadow survived, so a reused name draws \
+             from whatever stream the dead object pointed at"
+        );
+
+        update_bind_vertex_array(&mut s, Some(2));
+        s.bound_array_buffer = Some(Some(7));
+        assert!(
+            !update_enable_vertex_attrib(&mut s, 0),
+            "an unrelated VAO's shadow was dropped by the delete, costing it a \
+             redundant re-enable"
+        );
+        assert!(!update_vertex_attrib_pointer(
+            &mut s, 0, 3, glow::FLOAT, false, 32, 0
+        ));
+    }
+
+    /// The Skia boundary forgets the state but keeps the buffers.
+    ///
+    /// **Asserted with the allocation probe rather than by counting records**,
+    /// because counting proved nothing: a first draft checked
+    /// `tracked_vaos() == 1` *after* the re-issues that follow the boundary, and
+    /// those recreate the record — so a `forget_all` that dropped every
+    /// allocation satisfied it too. The claim is about the heap, so the
+    /// instrument has to be the heap.
+    ///
+    /// One iteration is one frame of a game that crosses the boundary once per
+    /// frame, which is what a Canvas2D overlay on a WebGL scene does. A
+    /// `forget_all` that dropped the records would re-buy one slot vector per
+    /// VAO here, forever, on the render thread.
+    #[test]
+    fn crossing_the_skia_boundary_every_frame_never_reaches_the_heap() {
+        let mut s = fresh_state();
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "state_tracker: vertex-attribute shadow across a per-frame Skia boundary",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                let mut issued = 0u32;
+                for vao in 0..4u32 {
+                    update_bind_vertex_array(&mut s, Some(vao));
+                    s.bound_array_buffer = Some(Some(10 + vao));
+                    for index in 0..5u32 {
+                        if update_enable_vertex_attrib(&mut s, index) {
+                            issued += 1;
+                        }
+                        if update_vertex_attrib_pointer(
+                            &mut s,
+                            index,
+                            3,
+                            glow::FLOAT,
+                            false,
+                            32,
+                            (index * 12) as i32,
+                        ) {
+                            issued += 1;
+                        }
+                    }
+                }
+                // The boundary: Skia ran, so everything the shadow claimed is
+                // now unknown.
+                s.invalidate_after_external_gl_use();
+                issued
+            },
+        );
+    }
+
+    /// The other half of the boundary contract: after it, every setter must
+    /// re-issue. A `forget_all` that kept the allocations *and* the state would
+    /// pass the burst above while painting with whatever Skia left bound.
+    #[test]
+    fn the_skia_boundary_makes_every_attribute_setter_reissue() {
+        let mut s = fresh_state();
+        s.bound_array_buffer = Some(Some(7));
+        assert!(update_enable_vertex_attrib(&mut s, 2));
+        assert!(update_vertex_attrib_pointer(
+            &mut s, 2, 3, glow::FLOAT, false, 32, 0
+        ));
+        assert!(update_vertex_attrib_divisor(&mut s, 2, 1));
+
+        s.invalidate_after_external_gl_use();
+        s.bound_array_buffer = Some(Some(7));
+
+        assert!(update_enable_vertex_attrib(&mut s, 2));
+        assert!(update_vertex_attrib_pointer(
+            &mut s, 2, 3, glow::FLOAT, false, 32, 0
+        ));
+        assert!(update_vertex_attrib_divisor(&mut s, 2, 1));
+    }
+
+    /// Section 7.3's steady-state requirement on the attribute path: a settled
+    /// frame re-asserting the same layout must not reach the heap. The slot
+    /// vectors are bought once, when the content first touches each index.
+    #[test]
+    fn a_steady_state_vertex_attribute_frame_never_reaches_the_heap() {
+        let mut s = fresh_state();
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "state_tracker: per-command vertex-attribute dedup across four VAOs",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                let mut issued = 0u32;
+                for vao in 0..4u32 {
+                    update_bind_vertex_array(&mut s, Some(vao));
+                    s.bound_array_buffer = Some(Some(10 + vao));
+                    for index in 0..5u32 {
+                        if update_enable_vertex_attrib(&mut s, index) {
+                            issued += 1;
+                        }
+                        if update_vertex_attrib_pointer(
+                            &mut s,
+                            index,
+                            3,
+                            glow::FLOAT,
+                            false,
+                            32,
+                            (index * 12) as i32,
+                        ) {
+                            issued += 1;
+                        }
+                        if update_vertex_attrib_divisor(&mut s, index, 0) {
+                            issued += 1;
+                        }
+                    }
+                }
+                issued
+            },
         );
     }
 
