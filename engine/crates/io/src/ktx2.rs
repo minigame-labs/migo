@@ -387,7 +387,8 @@ mod tests {
 
         let err = parse_ktx2(&buf).unwrap_err();
         assert!(
-            err == "ktx2: level index span overflow" || err == "ktx2: file too short for level index",
+            err == "ktx2: level index span overflow"
+                || err == "ktx2: file too short for level index",
             "unexpected error: {err}"
         );
     }

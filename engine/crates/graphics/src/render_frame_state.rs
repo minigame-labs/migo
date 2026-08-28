@@ -416,14 +416,23 @@ mod adjacency {
     #[test]
     fn a_merge_needs_mode_unit_and_contiguity_all_three() {
         // Contiguous, same mode: mergeable.
-        assert_eq!(replay_shaped(&[Some(arrays(0, 6)), Some(arrays(6, 6))]).2, 1);
+        assert_eq!(
+            replay_shaped(&[Some(arrays(0, 6)), Some(arrays(6, 6))]).2,
+            1
+        );
 
         // A gap: the second draw skips vertices 6..12.
-        assert_eq!(replay_shaped(&[Some(arrays(0, 6)), Some(arrays(12, 6))]).2, 0);
+        assert_eq!(
+            replay_shaped(&[Some(arrays(0, 6)), Some(arrays(12, 6))]).2,
+            0
+        );
 
         // Overlap: contiguity is strict, because a merge must preserve what is
         // painted and an overlapping merge would not.
-        assert_eq!(replay_shaped(&[Some(arrays(0, 6)), Some(arrays(3, 6))]).2, 0);
+        assert_eq!(
+            replay_shaped(&[Some(arrays(0, 6)), Some(arrays(3, 6))]).2,
+            0
+        );
 
         // Different primitive mode, perfectly contiguous.
         let lines = DrawShape {
@@ -453,8 +462,14 @@ mod adjacency {
         );
 
         // An empty draw cannot anchor a merge in either direction.
-        assert_eq!(replay_shaped(&[Some(arrays(0, 0)), Some(arrays(0, 6))]).2, 0);
-        assert_eq!(replay_shaped(&[Some(arrays(0, 6)), Some(arrays(6, 0))]).2, 0);
+        assert_eq!(
+            replay_shaped(&[Some(arrays(0, 0)), Some(arrays(0, 6))]).2,
+            0
+        );
+        assert_eq!(
+            replay_shaped(&[Some(arrays(0, 6)), Some(arrays(6, 0))]).2,
+            0
+        );
     }
 
     /// A draw with no shape — a Canvas2D paint, an instanced draw — counts and

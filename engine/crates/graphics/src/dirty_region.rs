@@ -269,7 +269,11 @@ mod tests {
         // 100_000 x 100_000 is 10^10, far past i32::MAX.
         assert!(worth_scissoring(&region(1000, 1000), 100_000, 100_000));
         // And a dirty region that genuinely covers most of it does not.
-        assert!(!worth_scissoring(&region(100_000, 60_000), 100_000, 100_000));
+        assert!(!worth_scissoring(
+            &region(100_000, 60_000),
+            100_000,
+            100_000
+        ));
     }
 
     // ---- giving the state back ---------------------------------------

@@ -1542,7 +1542,12 @@ pub async fn op_read_fd(
         get_scheduler(&st)
     };
     let domain = scheduler.domain();
-    let request = read_request(BackendKind::Filesystem, RequestKind::Async, Some(length), None);
+    let request = read_request(
+        BackendKind::Filesystem,
+        RequestKind::Async,
+        Some(length),
+        None,
+    );
 
     scheduler
         .run_async(request, move || domain.read_file(rid, length, position))
@@ -1563,7 +1568,12 @@ pub fn op_read_fd_sync(
     let started_at = Instant::now();
     let scheduler = get_scheduler(state);
     let domain = scheduler.domain();
-    let request = read_request(BackendKind::Filesystem, RequestKind::Sync, Some(length), None);
+    let request = read_request(
+        BackendKind::Filesystem,
+        RequestKind::Sync,
+        Some(length),
+        None,
+    );
 
     let target = format!("rid={rid}");
     let result: Result<ToJsBuffer, IOError> = scheduler

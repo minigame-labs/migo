@@ -565,7 +565,6 @@ pub fn extract_zip_with_budget(
             trace!("extract_zip: creating directory {}", outpath.display());
             tree.ensure_dir(relative)?;
         } else {
-
             // Per-entry ratio check: uncompressed / compressed.
             let compressed = file.compressed_size();
             let uncompressed_hdr = file.size();
@@ -788,14 +787,16 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             for e in 0..ENTRIES_PER_ARCHIVE {
-                zip.start_file(format!("dir/entry_{e}.bin"), options).unwrap();
+                zip.start_file(format!("dir/entry_{e}.bin"), options)
+                    .unwrap();
                 zip.write_all(&payload).unwrap();
             }
             zip.finish().unwrap();
             archives.push(zip_path);
         }
 
-        let uncompressed = (ARCHIVES * ENTRIES_PER_ARCHIVE * ENTRY_BYTES) as f64 / (1024.0 * 1024.0);
+        let uncompressed =
+            (ARCHIVES * ENTRIES_PER_ARCHIVE * ENTRY_BYTES) as f64 / (1024.0 * 1024.0);
         let compressed: u64 = archives
             .iter()
             .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
@@ -850,7 +851,9 @@ mod tests {
         );
         eprintln!(
             "cores available   {}",
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0)
         );
         eprintln!("sequential (cap=1 equivalent)  {sequential:>12?}");
         eprintln!("parallel   ({ARCHIVES} threads)          {parallel:>12?}");

@@ -4513,9 +4513,9 @@ impl CanvasManager {
                 // silently, with no GL error and nothing to attribute it to. We
                 // still proceed, because a stale snapshot beats abandoning the
                 // frame, but we say so.
-                let waited = self
-                    .gl
-                    .client_wait_sync(fence, glow::SYNC_FLUSH_COMMANDS_BIT, i32::MAX);
+                let waited =
+                    self.gl
+                        .client_wait_sync(fence, glow::SYNC_FLUSH_COMMANDS_BIT, i32::MAX);
                 if !fence_signalled(waited) {
                     let cause = if waited == glow::TIMEOUT_EXPIRED {
                         "timed out"
@@ -6672,7 +6672,8 @@ mod tests {
         arriving: &[u32],
         ready: impl Fn(u32) -> bool,
     ) -> Vec<u32> {
-        let mut staged = stage_upload_drain(scratch, pending, |sink| sink.extend_from_slice(arriving));
+        let mut staged =
+            stage_upload_drain(scratch, pending, |sink| sink.extend_from_slice(arriving));
         let mut registered = Vec::new();
         for item in staged.drain(..) {
             if ready(item) {
@@ -6715,10 +6716,9 @@ mod tests {
                 measured: 64,
             },
             |_| {
-                let mut staged =
-                    stage_upload_drain(&mut scratch, &mut pending, |sink| {
-                        sink.extend_from_slice(&arriving)
-                    });
+                let mut staged = stage_upload_drain(&mut scratch, &mut pending, |sink| {
+                    sink.extend_from_slice(&arriving)
+                });
                 let mut n = 0u32;
                 for item in staged.drain(..) {
                     if ready(item) {

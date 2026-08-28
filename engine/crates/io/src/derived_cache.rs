@@ -475,21 +475,22 @@ pub fn schedule_derived_cache_prune_with_budget(
     let dir = game_cache_dir.to_path_buf();
     // Background priority on the FS lane: this competes with the very asset
     // loads the cache exists to accelerate, so it yields to all of them.
-    let submitted = scheduler
-        .pools()
-        .submit_async(PoolKind::Fs, PriorityClass::Background, move || {
-            let report = prune_derived_cache(&dir, budget_bytes);
-            if report.files_removed > 0 || report.scan_capped {
-                tracing::info!(
-                    files_kept = report.files_kept,
-                    files_removed = report.files_removed,
-                    bytes_kept = report.bytes_kept,
-                    bytes_removed = report.bytes_removed,
-                    scan_capped = report.scan_capped,
-                    "derived cache pruned"
-                );
-            }
-        });
+    let submitted =
+        scheduler
+            .pools()
+            .submit_async(PoolKind::Fs, PriorityClass::Background, move || {
+                let report = prune_derived_cache(&dir, budget_bytes);
+                if report.files_removed > 0 || report.scan_capped {
+                    tracing::info!(
+                        files_kept = report.files_kept,
+                        files_removed = report.files_removed,
+                        bytes_kept = report.bytes_kept,
+                        bytes_removed = report.bytes_removed,
+                        scan_capped = report.scan_capped,
+                        "derived cache pruned"
+                    );
+                }
+            });
 
     if submitted.is_err() {
         tracing::debug!("derived cache prune not scheduled: IO pool closed");

@@ -1356,9 +1356,9 @@ fn encode_zip_data(data: Vec<u8>, encoding: Option<&str>) -> ZipEntryData {
                 // rather than handed back as bytes: a caller that named an
                 // encoding is expecting a string, and switching it to an
                 // ArrayBuffer would change a behaviour no test pins.
-                Err(_) => ZipEntryData::Text(
-                    base64::engine::general_purpose::STANDARD.encode(&data),
-                ),
+                Err(_) => {
+                    ZipEntryData::Text(base64::engine::general_purpose::STANDARD.encode(&data))
+                }
             }
         }
     }
@@ -1656,8 +1656,8 @@ mod tests {
         let zip_path = dir.join("entries.zip");
         let file = std::fs::File::create(&zip_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let options =
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         for (name, body) in entries {
             zip.start_file(*name, options).unwrap();
             zip.write_all(body).unwrap();
@@ -1725,7 +1725,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(results.len(), 2, "a missing entry must not drop its sibling");
+        assert_eq!(
+            results.len(),
+            2,
+            "a missing entry must not drop its sibling"
+        );
         assert_eq!(results[0].path, "absent.txt");
         assert!(results[0].data.is_none());
         assert!(
@@ -1753,7 +1757,12 @@ mod tests {
 
         let mut seen: Vec<(String, String)> = results
             .iter()
-            .map(|r| (r.path.clone(), entry_text(r).unwrap_or_default().to_string()))
+            .map(|r| {
+                (
+                    r.path.clone(),
+                    entry_text(r).unwrap_or_default().to_string(),
+                )
+            })
             .collect();
         seen.sort();
         assert_eq!(

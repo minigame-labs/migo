@@ -3868,9 +3868,7 @@ mod tests {
     #[test]
     fn use_program_validates_before_it_consults_the_shadow() {
         const SRC: &str = include_str!("handler.rs");
-        let arm_start = SRC
-            .find("GLCmd::UseProgram {")
-            .expect("the UseProgram arm");
+        let arm_start = SRC.find("GLCmd::UseProgram {").expect("the UseProgram arm");
         let arm = &SRC[arm_start..arm_start + 1200];
         let arm_end = arm.find("GLCmd::GetAttribLocation").unwrap_or(arm.len());
         let arm = &arm[..arm_end];

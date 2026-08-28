@@ -751,7 +751,10 @@ mod tests {
     /// slow upload must not force every later acquire onto a fresh buffer.
     #[test]
     fn the_scan_looks_past_an_in_flight_entry_to_a_ready_one() {
-        assert_eq!(first_reusable(&[(4096, false), (2048, true)], 1024), Some(1));
+        assert_eq!(
+            first_reusable(&[(4096, false), (2048, true)], 1024),
+            Some(1)
+        );
     }
 
     /// And past a too-small one, in either order — a pool sorted by size puts

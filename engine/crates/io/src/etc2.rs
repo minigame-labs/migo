@@ -112,19 +112,25 @@ pub fn encode_etc2_rgb(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
     let blocks_y = (height / 4) as usize;
     let mut out = vec![0u8; blocks_x * blocks_y * ETC2_RGB_BLOCK_BYTES];
 
-    encode_block_rows(blocks_x, blocks_y, ETC2_RGB_BLOCK_BYTES, &mut out, |by, row| {
-        let mut block = [[0u8; 3]; 16];
-        for (bx, dst) in row.chunks_mut(ETC2_RGB_BLOCK_BYTES).enumerate() {
-            for y in 0..4 {
-                for x in 0..4 {
-                    let px = (by * 4 + y) * width as usize + (bx * 4 + x);
-                    let base = px * 4;
-                    block[y * 4 + x] = [rgba[base], rgba[base + 1], rgba[base + 2]];
+    encode_block_rows(
+        blocks_x,
+        blocks_y,
+        ETC2_RGB_BLOCK_BYTES,
+        &mut out,
+        |by, row| {
+            let mut block = [[0u8; 3]; 16];
+            for (bx, dst) in row.chunks_mut(ETC2_RGB_BLOCK_BYTES).enumerate() {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let px = (by * 4 + y) * width as usize + (bx * 4 + x);
+                        let base = px * 4;
+                        block[y * 4 + x] = [rgba[base], rgba[base + 1], rgba[base + 2]];
+                    }
                 }
+                dst.copy_from_slice(&encode_block(&block));
             }
-            dst.copy_from_slice(&encode_block(&block));
-        }
-    });
+        },
+    );
 
     Ok(out)
 }

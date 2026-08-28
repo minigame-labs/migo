@@ -1186,8 +1186,7 @@ mod tests {
         /// The aggregate the process actually grants for `n` contexts.
         fn granted(aggregate: usize, n: usize) -> usize {
             set_skia_resource_cache_budget(aggregate);
-            let guards: Vec<LiveContextCount> =
-                (0..n).map(|_| LiveContextCount::enrol()).collect();
+            let guards: Vec<LiveContextCount> = (0..n).map(|_| LiveContextCount::enrol()).collect();
             let total = per_ctx_resource_cache_bytes() * n;
             drop(guards);
             total
@@ -1251,7 +1250,8 @@ mod tests {
             // 3 hid that TierB's is nearly 7.
             let observed = (at_80 as u64 * 10) / aggregate as u64;
             assert_eq!(
-                observed, tenths,
+                observed,
+                tenths,
                 "{label}: overshoot at 80 contexts is {}.{}x the {aggregate} \
                  byte ceiling, not {}.{}x",
                 observed / 10,

@@ -1415,10 +1415,22 @@ mod tests {
             "an untracked index must forward rather than dedup"
         );
         assert!(update_vertex_attrib_pointer(
-            &mut s, PAST_END, 3, glow::FLOAT, false, 32, 0
+            &mut s,
+            PAST_END,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
         ));
         assert!(update_vertex_attrib_pointer(
-            &mut s, PAST_END, 3, glow::FLOAT, false, 32, 0
+            &mut s,
+            PAST_END,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
         ));
         assert!(update_vertex_attrib_divisor(&mut s, PAST_END, 1));
         assert!(update_vertex_attrib_divisor(&mut s, PAST_END, 1));
@@ -1439,10 +1451,22 @@ mod tests {
         assert!(update_enable_vertex_attrib(&mut s, 31));
         assert!(!update_enable_vertex_attrib(&mut s, 31));
         assert!(update_vertex_attrib_pointer(
-            &mut s, 31, 3, glow::FLOAT, false, 32, 0
+            &mut s,
+            31,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
         ));
         assert!(!update_vertex_attrib_pointer(
-            &mut s, 31, 3, glow::FLOAT, false, 32, 0
+            &mut s,
+            31,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
         ));
     }
 
@@ -1459,7 +1483,13 @@ mod tests {
             s.bound_array_buffer = Some(Some(7));
             assert!(update_enable_vertex_attrib(&mut s, 0));
             assert!(update_vertex_attrib_pointer(
-                &mut s, 0, 3, glow::FLOAT, false, 32, 0
+                &mut s,
+                0,
+                3,
+                glow::FLOAT,
+                false,
+                32,
+                0
             ));
         }
 
@@ -1486,7 +1516,13 @@ mod tests {
              redundant re-enable"
         );
         assert!(!update_vertex_attrib_pointer(
-            &mut s, 0, 3, glow::FLOAT, false, 32, 0
+            &mut s,
+            0,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
         ));
     }
 
@@ -1552,7 +1588,13 @@ mod tests {
         s.bound_array_buffer = Some(Some(7));
         assert!(update_enable_vertex_attrib(&mut s, 2));
         assert!(update_vertex_attrib_pointer(
-            &mut s, 2, 3, glow::FLOAT, false, 32, 0
+            &mut s,
+            2,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
         ));
         assert!(update_vertex_attrib_divisor(&mut s, 2, 1));
 
@@ -1561,7 +1603,13 @@ mod tests {
 
         assert!(update_enable_vertex_attrib(&mut s, 2));
         assert!(update_vertex_attrib_pointer(
-            &mut s, 2, 3, glow::FLOAT, false, 32, 0
+            &mut s,
+            2,
+            3,
+            glow::FLOAT,
+            false,
+            32,
+            0
         ));
         assert!(update_vertex_attrib_divisor(&mut s, 2, 1));
     }
@@ -1692,7 +1740,10 @@ mod tests {
                  reaches the driver"
             );
             assert!(update_disable(&mut s, cap), "cap {cap:#x} first disable");
-            assert!(!update_disable(&mut s, cap), "cap {cap:#x} redundant disable");
+            assert!(
+                !update_disable(&mut s, cap),
+                "cap {cap:#x} redundant disable"
+            );
         }
     }
 
@@ -1791,7 +1842,12 @@ mod tests {
         const GL_UNIFORM_BUFFER: u32 = 0x8A11;
         let mut s = fresh_state();
 
-        assert!(update_bind_buffer_base(&mut s, GL_UNIFORM_BUFFER, 0, Some(7)));
+        assert!(update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            0,
+            Some(7)
+        ));
         assert!(!update_bind_buffer_base(
             &mut s,
             GL_UNIFORM_BUFFER,
@@ -1799,7 +1855,12 @@ mod tests {
             Some(7)
         ));
         // A different index is a different slot.
-        assert!(update_bind_buffer_base(&mut s, GL_UNIFORM_BUFFER, 5, Some(7)));
+        assert!(update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            5,
+            Some(7)
+        ));
         // Same buffer and index, but a window rather than the whole buffer.
         assert!(
             update_bind_buffer_range(&mut s, GL_UNIFORM_BUFFER, 0, Some(7), 256, 64),
@@ -1814,7 +1875,12 @@ mod tests {
             64
         ));
         // And back to the whole buffer must re-issue.
-        assert!(update_bind_buffer_base(&mut s, GL_UNIFORM_BUFFER, 0, Some(7)));
+        assert!(update_bind_buffer_base(
+            &mut s,
+            GL_UNIFORM_BUFFER,
+            0,
+            Some(7)
+        ));
     }
 
     #[test]

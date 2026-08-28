@@ -358,8 +358,7 @@ mod tests {
     /// *not* fire, so nobody reads the classification as evidence that those two
     /// ops are treated separately — they are not.
     #[test]
-    fn the_shader_info_log_readback_arms_are_unreachable_through_the_gl_sync_path()
-    {
+    fn the_shader_info_log_readback_arms_are_unreachable_through_the_gl_sync_path() {
         // The arms work when given a matching name...
         assert_eq!(
             class_for_op("get_shader_info_log"),

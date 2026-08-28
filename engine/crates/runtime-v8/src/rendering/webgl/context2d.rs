@@ -595,15 +595,18 @@ pub fn op_capture_canvas2d_snapshot(
     if snapshot_id == 0 || checked_canvas_rgba_byte_len(width, height).is_none() {
         return;
     }
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::CaptureSnapshot {
-                x,
-                y,
-                width,
-                height,
-                snapshot_id,
-                cache_key: None,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::CaptureSnapshot {
+            x,
+            y,
+            width,
+            height,
+            snapshot_id,
+            cache_key: None,
+        },
+    );
 }
 
 const OP_FORCE_READBACK_SNAPSHOT: &str = "canvas2d force_readback_snapshot";
@@ -848,15 +851,18 @@ pub fn op_capture_canvas2d_snapshot_for_cache(
         canvas_h,
         font_generation,
     );
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::CaptureSnapshot {
-                x,
-                y,
-                width,
-                height,
-                snapshot_id,
-                cache_key: Some(Box::new(key)),
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::CaptureSnapshot {
+            x,
+            y,
+            width,
+            height,
+            snapshot_id,
+            cache_key: Some(Box::new(key)),
+        },
+    );
 }
 
 /// Hit-path GL upload.  Emits `GLCmd::TexImage2DFromTextCache` so the
@@ -905,7 +911,8 @@ pub fn op_tex_image_2d_from_text_cache(
             level,
             internalformat,
             key: Box::new(key),
-        });
+        },
+    );
 }
 
 // ============================================================================
@@ -914,8 +921,8 @@ pub fn op_tex_image_2d_from_text_cache(
 
 #[op2(fast)]
 pub fn op_frame_begin(state: &mut OpState, #[smi] canvas_id: u32) {
-        with_collector(state, |collector| {
-            collector.frame_begin(canvas_id);
+    with_collector(state, |collector| {
+        collector.frame_begin(canvas_id);
     });
 }
 
@@ -1057,8 +1064,8 @@ batched_op!(op_save, Canvas2DCmd::Save);
 
 #[op2(fast)]
 pub fn op_restore(state: &mut OpState, #[smi] canvas_id: u32) {
-        with_collector(state, |collector| {
-            collector.restore(canvas_id);
+    with_collector(state, |collector| {
+        collector.restore(canvas_id);
     });
 }
 
@@ -1084,7 +1091,11 @@ pub fn op_quadratic_curve_to(
     x: f32,
     y: f32,
 ) {
-    queue_canvas2d(state, canvas_id, Canvas2DCmd::QuadraticCurveTo { cpx, cpy, x, y });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::QuadraticCurveTo { cpx, cpy, x, y },
+    );
 }
 
 #[op2(fast)]
@@ -1098,15 +1109,18 @@ pub fn op_bezier_curve_to(
     x: f32,
     y: f32,
 ) {
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::BezierCurveTo {
-                cp1x,
-                cp1y,
-                cp2x,
-                cp2y,
-                x,
-                y,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::BezierCurveTo {
+            cp1x,
+            cp1y,
+            cp2x,
+            cp2y,
+            x,
+            y,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1120,15 +1134,18 @@ pub fn op_arc(
     end_angle: f32,
     counterclockwise: bool,
 ) {
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::Arc {
-                x,
-                y,
-                radius,
-                start_angle,
-                end_angle,
-                counterclockwise,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::Arc {
+            x,
+            y,
+            radius,
+            start_angle,
+            end_angle,
+            counterclockwise,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1141,14 +1158,17 @@ pub fn op_arc_to(
     y2: f32,
     radius: f32,
 ) {
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::ArcTo {
-                x1,
-                y1,
-                x2,
-                y2,
-                radius,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::ArcTo {
+            x1,
+            y1,
+            x2,
+            y2,
+            radius,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1170,17 +1190,20 @@ pub fn op_ellipse(
     end_angle: f32,
     counterclockwise: bool,
 ) {
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::Ellipse {
-                x,
-                y,
-                radius_x,
-                radius_y,
-                rotation,
-                start_angle,
-                end_angle,
-                counterclockwise,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::Ellipse {
+            x,
+            y,
+            radius_x,
+            radius_y,
+            rotation,
+            start_angle,
+            end_angle,
+            counterclockwise,
+        },
+    );
 }
 
 // Rectangle operations
@@ -1209,13 +1232,16 @@ pub fn op_fill_text(
     y: f32,
     max_width: f32,
 ) {
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::FillText {
-                text,
-                x,
-                y,
-                max_width,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::FillText {
+            text,
+            x,
+            y,
+            max_width,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1227,21 +1253,24 @@ pub fn op_stroke_text(
     y: f32,
     max_width: f32,
 ) {
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::StrokeText {
-                text,
-                x,
-                y,
-                max_width,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::StrokeText {
+            text,
+            x,
+            y,
+            max_width,
+        },
+    );
 }
 
 // Style operations (with deduplication)
 #[op2(fast)]
 pub fn op_set_fill_style(state: &mut OpState, #[smi] canvas_id: u32, #[string] color_str: String) {
-        with_collector(state, |collector| {
-            let color = parse_color_string(&color_str);
-            collector.set_fill_color(canvas_id, color);
+    with_collector(state, |collector| {
+        let color = parse_color_string(&color_str);
+        collector.set_fill_color(canvas_id, color);
     });
 }
 
@@ -1251,77 +1280,77 @@ pub fn op_set_stroke_style(
     #[smi] canvas_id: u32,
     #[string] color_str: String,
 ) {
-        with_collector(state, |collector| {
-            let color = parse_color_string(&color_str);
-            collector.set_stroke_color(canvas_id, color);
+    with_collector(state, |collector| {
+        let color = parse_color_string(&color_str);
+        collector.set_stroke_color(canvas_id, color);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_line_width(state: &mut OpState, #[smi] canvas_id: u32, width: f32) {
-        with_collector(state, |collector| {
-            collector.set_line_width(canvas_id, width);
+    with_collector(state, |collector| {
+        collector.set_line_width(canvas_id, width);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_line_cap(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u8) {
-        with_collector(state, |collector| {
-            collector.set_line_cap(canvas_id, cap);
+    with_collector(state, |collector| {
+        collector.set_line_cap(canvas_id, cap);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_line_join(state: &mut OpState, #[smi] canvas_id: u32, #[smi] join: u8) {
-        with_collector(state, |collector| {
-            collector.set_line_join(canvas_id, join);
+    with_collector(state, |collector| {
+        collector.set_line_join(canvas_id, join);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_miter_limit(state: &mut OpState, #[smi] canvas_id: u32, limit: f32) {
-        with_collector(state, |collector| {
-            collector.set_miter_limit(canvas_id, limit);
+    with_collector(state, |collector| {
+        collector.set_miter_limit(canvas_id, limit);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_global_alpha(state: &mut OpState, #[smi] canvas_id: u32, alpha: f32) {
-        with_collector(state, |collector| {
-            collector.set_global_alpha(canvas_id, alpha);
+    with_collector(state, |collector| {
+        collector.set_global_alpha(canvas_id, alpha);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_composite_operation(state: &mut OpState, #[smi] canvas_id: u32, #[smi] op: u8) {
-        with_collector(state, |collector| {
-            collector.set_composite_operation(canvas_id, op);
+    with_collector(state, |collector| {
+        collector.set_composite_operation(canvas_id, op);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_line_dash(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] segments: &[u8]) {
-        with_collector(state, |collector| {
-            // segments is a Float32Array transferred as raw bytes
-            let floats: Vec<f32> = segments
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            collector.set_line_dash(canvas_id, floats);
+    with_collector(state, |collector| {
+        // segments is a Float32Array transferred as raw bytes
+        let floats: Vec<f32> = segments
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        collector.set_line_dash(canvas_id, floats);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_line_dash_offset(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-        with_collector(state, |collector| {
-            collector.set_line_dash_offset(canvas_id, offset);
+    with_collector(state, |collector| {
+        collector.set_line_dash_offset(canvas_id, offset);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_shadow_blur(state: &mut OpState, #[smi] canvas_id: u32, blur: f32) {
-        with_collector(state, |collector| {
-            collector.set_shadow_blur(canvas_id, blur);
+    with_collector(state, |collector| {
+        collector.set_shadow_blur(canvas_id, blur);
     });
 }
 
@@ -1331,23 +1360,23 @@ pub fn op_set_shadow_color(
     #[smi] canvas_id: u32,
     #[string] color_str: String,
 ) {
-        with_collector(state, |collector| {
-            let color = parse_color_string(&color_str);
-            collector.set_shadow_color(canvas_id, color);
+    with_collector(state, |collector| {
+        let color = parse_color_string(&color_str);
+        collector.set_shadow_color(canvas_id, color);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_shadow_offset_x(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-        with_collector(state, |collector| {
-            collector.set_shadow_offset_x(canvas_id, offset);
+    with_collector(state, |collector| {
+        collector.set_shadow_offset_x(canvas_id, offset);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_shadow_offset_y(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-        with_collector(state, |collector| {
-            collector.set_shadow_offset_y(canvas_id, offset);
+    with_collector(state, |collector| {
+        collector.set_shadow_offset_y(canvas_id, offset);
     });
 }
 
@@ -1364,15 +1393,15 @@ pub fn op_set_fill_style_gradient(
     r1: f32,
     #[string] stops_json: String,
 ) {
-        with_collector(state, |collector| {
-            // Parse stops from JSON: [{"offset":0,"r":255,"g":0,"b":0,"a":255}, ...]
-            let stops = parse_gradient_stops(&stops_json);
-            let gradient_type = match gradient_type {
-                1 => GradientType::Radial,
-                2 => GradientType::Conic,
-                _ => GradientType::Linear,
-            };
-            collector.set_fill_style_gradient(canvas_id, gradient_type, x0, y0, r0, x1, y1, r1, stops);
+    with_collector(state, |collector| {
+        // Parse stops from JSON: [{"offset":0,"r":255,"g":0,"b":0,"a":255}, ...]
+        let stops = parse_gradient_stops(&stops_json);
+        let gradient_type = match gradient_type {
+            1 => GradientType::Radial,
+            2 => GradientType::Conic,
+            _ => GradientType::Linear,
+        };
+        collector.set_fill_style_gradient(canvas_id, gradient_type, x0, y0, r0, x1, y1, r1, stops);
     });
 }
 
@@ -1389,24 +1418,24 @@ pub fn op_set_stroke_style_gradient(
     r1: f32,
     #[string] stops_json: String,
 ) {
-        with_collector(state, |collector| {
-            let stops = parse_gradient_stops(&stops_json);
-            let gradient_type = match gradient_type {
-                1 => GradientType::Radial,
-                2 => GradientType::Conic,
-                _ => GradientType::Linear,
-            };
-            collector.set_stroke_style_gradient(
-                canvas_id,
-                gradient_type,
-                x0,
-                y0,
-                r0,
-                x1,
-                y1,
-                r1,
-                stops,
-            );
+    with_collector(state, |collector| {
+        let stops = parse_gradient_stops(&stops_json);
+        let gradient_type = match gradient_type {
+            1 => GradientType::Radial,
+            2 => GradientType::Conic,
+            _ => GradientType::Linear,
+        };
+        collector.set_stroke_style_gradient(
+            canvas_id,
+            gradient_type,
+            x0,
+            y0,
+            r0,
+            x1,
+            y1,
+            r1,
+            stops,
+        );
     });
 }
 
@@ -1457,8 +1486,8 @@ pub fn op_set_fill_style_pattern(
     repeat_x: bool,
     repeat_y: bool,
 ) {
-        with_collector(state, |collector| {
-            collector.set_fill_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
+    with_collector(state, |collector| {
+        collector.set_fill_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
     });
 }
 
@@ -1470,8 +1499,8 @@ pub fn op_set_stroke_style_pattern(
     repeat_x: bool,
     repeat_y: bool,
 ) {
-        with_collector(state, |collector| {
-            collector.set_stroke_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
+    with_collector(state, |collector| {
+        collector.set_stroke_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
     });
 }
 
@@ -1493,40 +1522,40 @@ pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: S
     if shared::css_font_shorthand::parse_font_shorthand(&font).is_none() {
         return false;
     }
-        with_collector(state, |collector| {
-            collector.set_font(canvas_id, font);
+    with_collector(state, |collector| {
+        collector.set_font(canvas_id, font);
     });
     true
 }
 
 #[op2(fast)]
 pub fn op_set_text_align(state: &mut OpState, #[smi] canvas_id: u32, #[smi] align: u8) {
-        with_collector(state, |collector| {
-            let align = match align {
-                0 => TextAlign::Start,
-                1 => TextAlign::End,
-                2 => TextAlign::Left,
-                3 => TextAlign::Right,
-                4 => TextAlign::Center,
-                _ => TextAlign::Start,
-            };
-            collector.set_text_align(canvas_id, align);
+    with_collector(state, |collector| {
+        let align = match align {
+            0 => TextAlign::Start,
+            1 => TextAlign::End,
+            2 => TextAlign::Left,
+            3 => TextAlign::Right,
+            4 => TextAlign::Center,
+            _ => TextAlign::Start,
+        };
+        collector.set_text_align(canvas_id, align);
     });
 }
 
 #[op2(fast)]
 pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] baseline: u8) {
-        with_collector(state, |collector| {
-            let baseline = match baseline {
-                0 => TextBaseline::Top,
-                1 => TextBaseline::Hanging,
-                2 => TextBaseline::Middle,
-                3 => TextBaseline::Alphabetic,
-                4 => TextBaseline::Ideographic,
-                5 => TextBaseline::Bottom,
-                _ => TextBaseline::Alphabetic,
-            };
-            collector.set_text_baseline(canvas_id, baseline);
+    with_collector(state, |collector| {
+        let baseline = match baseline {
+            0 => TextBaseline::Top,
+            1 => TextBaseline::Hanging,
+            2 => TextBaseline::Middle,
+            3 => TextBaseline::Alphabetic,
+            4 => TextBaseline::Ideographic,
+            5 => TextBaseline::Bottom,
+            _ => TextBaseline::Alphabetic,
+        };
+        collector.set_text_baseline(canvas_id, baseline);
     });
 }
 
@@ -1536,13 +1565,13 @@ pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] b
 /// browser behaviour of ignoring unsupported directions.
 #[op2(fast)]
 pub fn op_set_text_direction(state: &mut OpState, #[smi] canvas_id: u32, #[smi] direction: u8) {
-        with_collector(state, |collector| {
-            let direction = match direction {
-                1 => shared::protocol::render_cmd::TextDirection::Ltr,
-                2 => shared::protocol::render_cmd::TextDirection::Rtl,
-                _ => shared::protocol::render_cmd::TextDirection::Inherit,
-            };
-            collector.push(canvas_id, Canvas2DCmd::SetTextDirection { direction });
+    with_collector(state, |collector| {
+        let direction = match direction {
+            1 => shared::protocol::render_cmd::TextDirection::Ltr,
+            2 => shared::protocol::render_cmd::TextDirection::Rtl,
+            _ => shared::protocol::render_cmd::TextDirection::Inherit,
+        };
+        collector.push(canvas_id, Canvas2DCmd::SetTextDirection { direction });
     });
 }
 
@@ -1574,7 +1603,11 @@ pub fn op_set_transform(
     e: f32,
     f: f32,
 ) {
-    queue_canvas2d(state, canvas_id, Canvas2DCmd::SetTransform { a, b, c, d, e, f });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::SetTransform { a, b, c, d, e, f },
+    );
 }
 
 // Image operations
@@ -1593,18 +1626,21 @@ pub fn op_draw_image(
     dw: f32,
     dh: f32,
 ) {
-    queue_canvas2d(state, canvas_id,
-            Canvas2DCmd::DrawImage {
-                image_id,
-                sx,
-                sy,
-                sw,
-                sh,
-                dx,
-                dy,
-                dw,
-                dh,
-            });
+    queue_canvas2d(
+        state,
+        canvas_id,
+        Canvas2DCmd::DrawImage {
+            image_id,
+            sx,
+            sy,
+            sw,
+            sh,
+            dx,
+            dy,
+            dw,
+            dh,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1738,10 +1774,8 @@ mod tests {
                 // Counting is part of the op's work, so it is inside the burst:
                 // `chars().count()` must not allocate either.
                 let glyphs = text.chars().count();
-                let m = super::fallback_text_metrics_for_glyph_count(
-                    glyphs,
-                    16.0 + iteration as f32,
-                );
+                let m =
+                    super::fallback_text_metrics_for_glyph_count(glyphs, 16.0 + iteration as f32);
                 m.width.to_bits()
             },
         );
@@ -1789,7 +1823,9 @@ mod tests {
         // `with_collector` / `queue_canvas2d`.
         const ALLOWED_DIRECT_BORROWS: usize = 2;
         let direct = production
-            .matches("try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>")
+            .matches(
+                "try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>",
+            )
             .count();
         assert_eq!(
             direct, ALLOWED_DIRECT_BORROWS,

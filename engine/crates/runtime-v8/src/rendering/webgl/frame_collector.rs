@@ -2311,11 +2311,11 @@ mod tests {
     fn commands_with_no_bounds_effect_keep_the_scissor_hint() {
         for (label, cmd) in [
             ("path building", Canvas2DCmd::BeginPath),
+            ("paint style", Canvas2DCmd::SetGlobalAlpha { alpha: 1.0 }),
             (
-                "paint style",
-                Canvas2DCmd::SetGlobalAlpha { alpha: 1.0 },
+                "stroke geometry",
+                Canvas2DCmd::SetLineDashOffset { offset: 2.0 },
             ),
-            ("stroke geometry", Canvas2DCmd::SetLineDashOffset { offset: 2.0 }),
             (
                 "text attribute",
                 Canvas2DCmd::SetTextAlign {

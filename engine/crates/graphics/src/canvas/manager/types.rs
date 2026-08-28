@@ -1381,9 +1381,10 @@ mod shadow_shape_benches {
                 n += 1;
                 let state = before_map.entry(1).or_default();
                 let unit = state.active_texture;
-                state
-                    .textures
-                    .insert((unit, TARGETS[i % TARGETS.len()]), Some(40 + (i % 8) as u32));
+                state.textures.insert(
+                    (unit, TARGETS[i % TARGETS.len()]),
+                    Some(40 + (i % 8) as u32),
+                );
                 n += 1;
             }
             n
@@ -1415,8 +1416,7 @@ mod shadow_shape_benches {
                 let state = after_table.entry(1).or_default();
                 let unit_index = state.active_texture.wrapping_sub(glow::TEXTURE0) as usize;
                 let target_index = i % TARGETS.len();
-                state.slots[unit_index * TARGETS.len() + target_index] =
-                    Some(40 + (i % 8) as u32);
+                state.slots[unit_index * TARGETS.len() + target_index] = Some(40 + (i % 8) as u32);
                 n += 1;
             }
             n
@@ -1480,8 +1480,7 @@ mod shadow_shape_benches {
             let before = time(|| {
                 let mut n = 0;
                 for i in 0..CALLS {
-                    map.entry(1 + (i as u32 % canvases)).or_default().depth_func =
-                        Some(glow::LESS);
+                    map.entry(1 + (i as u32 % canvases)).or_default().depth_func = Some(glow::LESS);
                     n += 1;
                 }
                 n

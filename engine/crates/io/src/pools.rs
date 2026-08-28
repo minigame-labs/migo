@@ -295,8 +295,7 @@ impl<T> QueueState<T> {
     ) -> Option<Dispatched<T>> {
         let priority_idx = priority_index(priority);
         let cursor = self.class_cursor[priority_idx];
-        let host_contended =
-            fairness == HostFairness::Enforced && self.pending_by_host.len() > 1;
+        let host_contended = fairness == HostFairness::Enforced && self.pending_by_host.len() > 1;
         let active_by_host = &self.active_by_host;
         let host_cap = config.host_cap_when_contended;
 

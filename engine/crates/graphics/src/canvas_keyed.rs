@@ -329,7 +329,11 @@ mod tests {
         }
         assert_eq!(seen, 3);
         for id in [1u32, 4, 8] {
-            assert_eq!(read(&t, id), Some(0), "canvas {id} was skipped by the sweep");
+            assert_eq!(
+                read(&t, id),
+                Some(0),
+                "canvas {id} was skipped by the sweep"
+            );
         }
     }
 
@@ -404,8 +408,7 @@ mod tests {
         for id in [1u32, 6, 11] {
             mark(&mut t, id);
         }
-        let mut drained: Vec<(CanvasId, u32)> =
-            t.drain().map(|(id, m)| (id, m.0)).collect();
+        let mut drained: Vec<(CanvasId, u32)> = t.drain().map(|(id, m)| (id, m.0)).collect();
         drained.sort_unstable();
         assert_eq!(drained, vec![(1, 1007), (6, 6007), (11, 11007)]);
         assert_eq!(t.len(), 0);

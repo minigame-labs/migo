@@ -144,10 +144,7 @@ impl FrameDamageAccumulator {
     /// discrete rects (clipped to `surface_size`).  Returns `None`
     /// when the frame requires a full redraw; otherwise a
     /// non-empty list.
-    pub(crate) fn resolve_rects(
-        &self,
-        surface_size: (i32, i32),
-    ) -> Option<DamageRects> {
+    pub(crate) fn resolve_rects(&self, surface_size: (i32, i32)) -> Option<DamageRects> {
         let mut tracker = DamageTracker::new(surface_size);
         for r in &self.rects {
             tracker.mark_rect((r[0], r[1], r[2], r[3]));
@@ -460,10 +457,7 @@ mod tests {
     // collapse chooses to group things.
 
     /// Does the resolved damage cover `rect` entirely?
-    fn covered(
-        resolved: &Option<DamageRects>,
-        rect: (i32, i32, i32, i32),
-    ) -> bool {
+    fn covered(resolved: &Option<DamageRects>, rect: (i32, i32, i32, i32)) -> bool {
         match resolved {
             // FullSurface covers everything by definition.
             None => true,

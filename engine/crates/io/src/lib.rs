@@ -33,8 +33,7 @@ pub mod task;
 mod zip_extract;
 
 pub use derived_cache::{
-    DEFAULT_DERIVED_CACHE_MAX_BYTES, PruneReport, prune_derived_cache,
-    schedule_derived_cache_prune,
+    DEFAULT_DERIVED_CACHE_MAX_BYTES, PruneReport, prune_derived_cache, schedule_derived_cache_prune,
 };
 pub use fast_image_decoder::{
     CompressedImageInfo, crop_image, decode_image_fast, decode_image_to_any,

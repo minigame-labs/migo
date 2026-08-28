@@ -1529,7 +1529,17 @@ mod tests {
             budget.active_texture(1, unit);
             assert_eq!(
                 budget
-                    .prepare_tex_image_2d(1, TEXTURE_2D, 0, RGBA as i32, 4, 4, 0, RGBA, UNSIGNED_BYTE)
+                    .prepare_tex_image_2d(
+                        1,
+                        TEXTURE_2D,
+                        0,
+                        RGBA as i32,
+                        4,
+                        4,
+                        0,
+                        RGBA,
+                        UNSIGNED_BYTE
+                    )
                     .unwrap_err(),
                 GpuAllocationError::InvalidOperation,
                 "unit {unit:#x} still names the deleted texture"
