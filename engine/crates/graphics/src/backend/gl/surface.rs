@@ -77,40 +77,88 @@ pub enum FboKind {
 /// as the process-wide lower bound; individual tiers may raise
 /// it through [`set_skia_resource_cache_budget`].
 const DEFAULT_SKIA_RESOURCE_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
-/// Minimum per-context cap.  See [`per_ctx_resource_cache_bytes`]
-/// — used so a tiny offscreen canvas still gets enough room for
-/// its glyph atlas working set.
+/// Minimum per-context cap.  See [`per_ctx_resource_cache_bytes`].
 ///
-/// **This floor outranks the aggregate ceiling, so past a certain context
-/// count the ceiling is not one.** `per_ctx_share` returns
-/// `max(aggregate / n, MIN_PER_CTX_BYTES)`, so what the process actually grants
-/// is `n * MIN_PER_CTX_BYTES` once `n > aggregate / MIN_PER_CTX_BYTES`:
+/// **Was 4 MiB, and that floor outranked the aggregate ceiling: once
+/// `n > aggregate / MIN_PER_CTX_BYTES` the process granted `n *
+/// MIN_PER_CTX_BYTES` regardless of the ceiling — 320 MiB at 80 contexts on
+/// every tier (3.3x–20x the aggregate). Both guarantees (an aggregate ceiling,
+/// and a per-context floor) cannot hold for unbounded `n`; that is arithmetic,
+/// not a call to make from a host. It wanted a device measurement, which is
+/// what this value now reflects.**
 ///
-/// | aggregate | crossover | granted at 80 contexts |
-/// |-----------|-----------|------------------------|
-/// | 96 MiB (TierA) | 24 | 320 MiB — 3.3x the ceiling |
-/// | 48 MiB (TierB) | 12 | 320 MiB — 6.6x |
-/// | 16 MiB ([`LOW_MEMORY_AGGREGATE_BYTES`]) | 4 | 320 MiB — 20x |
+/// 2026-08-28, Mali-G76 (Kirin 990): 80 live offscreen `Canvas2DContext`s, each
+/// redrawn every frame with a short `fillText` label (the `canvas_id_set`
+/// ~30-label shop-UI scale and the `render_thread` reorder fixture's 80,
+/// scripts/fixtures/skia-floor-probe-{30,80,80-dynamic}), read via
+/// `dumpsys meminfo` and render-thread CPU% (`/proc/<pid>/stat`
+/// utime+stime, median of three 2s windows — frame time is not the right
+/// instrument at 60 vsyncs/s; see the JITLESS.md precedent for why):
 ///
-/// The low-memory row is the one that bites: a memory warning arriving in a
-/// many-canvas scene floors out at four contexts, so it releases nothing below
-/// 4 MiB each and frees far less than its figure suggests.
+/// * **The overshoot is real, not theoretical, at the old floor** — and it
+///   materialised the same way whether the 80 canvases redrew *unchanging*
+///   text every frame or a different string every frame (`Graphics`
+///   398 MB vs 402 MB): being drawn every frame is what mattered, not whether
+///   the content changed. A 0-canvas control measured 9 MB of fixed `Graphics`
+///   overhead; 30 canvases measured 166 MB (+5.2 MB/canvas) and 80 measured
+///   398 MB (+4.9 MB/canvas over the control) — tracking the 4 MiB floor
+///   almost exactly, and even a little past it (some of each context's
+///   `Graphics` cost is fixed FBO/EGL surface overhead on top of the tunable
+///   Ganesh cache).
+/// * **The floor did not earn its keep.** The same 80-context fixture,
+///   rebuilt with `MIN_PER_CTX_BYTES = 0` (aggregate/n honoured exactly —
+///   1.2 MiB/context on TierA), showed render-thread CPU indistinguishable
+///   from the shipped 4 MiB floor: medians of 128.5/130.0/131.0/134.0%
+///   (floor) vs 122.5/136.0/131.5/127.5% (no floor) across four device-cooled
+///   runs each — the two distributions overlap; there is no thrash signal.
+///   This was the worst case for the floor's own justification (every context
+///   drawn every frame, none idle), and it still did not need one.
+/// * **And lowering the floor to 64 KiB did not lower `Graphics` either** —
+///   398.3 MB before this change, 398.0 MB after, at the identical 80-context
+///   fixture (0.09% apart — noise, not a trend), even though the Skia cache
+///   *ceiling* this constant controls dropped 3.3x (4 MiB/context to
+///   1.2 MiB/context). **That is the load-bearing finding, not the crossover
+///   arithmetic below.** It means the ~4.5 MB/context this file's own comment
+///   above attributed to the resource-cache floor is not coming from the
+///   resource cache at all — actual per-context Ganesh usage for a fixture
+///   this small was already far under both the old and the new ceiling, so
+///   neither ceiling was ever what Skia's cache was bumping against. The
+///   real cost is almost certainly the fixed overhead of the "one EGL context
+///   (+ `DirectContext` + FBO) per `Canvas2DContext`" architecture this
+///   file's own module comment documents as deliberate (no cross-context
+///   blit between 2D and 3D) — driver-side command-buffer pools, shader
+///   compiler state and EGL surface bookkeeping that a resource-cache-budget
+///   knob cannot touch, because it is not resource-cache memory. Fixing *that*
+///   is an architecture question (sharing GL contexts across canvases, or
+///   bounding how many are concurrently backed by one), well past a constant
+///   edit, and is not what this change claims to have done.
 ///
-/// **A real tension, not an oversight.** Both guarantees cannot hold for
-/// unbounded `n`, and capping a live canvas below its glyph-atlas working set
-/// makes Skia re-evict on every draw — worse than the overshoot. Nor are these
-/// counts hypothetical: `shared::protocol::canvas_id_set` sizes its inline
-/// capacity for a ~30-label shop UI, and `render_thread`'s reorder fixture uses
-/// 80 on the record that "nothing bounds how many canvases a game draws to in
-/// one frame".
+/// So this constant is kept at 64 KiB because it is still a real, if smaller,
+/// fix: the *ceiling* the aggregate promises (see the module doc above, "the
+/// aggregate across all live contexts stays within the 200 MB native-heap
+/// target") is honoured again at realistic scene sizes, where it previously
+/// was not, and nothing measured got worse for it. It is kept only as a
+/// backstop against a literal zero-byte cache, not as a policy lever:
+/// [`per_ctx_share`] still computes `max(aggregate / n, MIN_PER_CTX_BYTES)`,
+/// but at 64 KiB the crossover (`aggregate / MIN_PER_CTX_BYTES`) is 1536
+/// contexts on TierA, 768 on TierB, and 256 even under
+/// [`LOW_MEMORY_AGGREGATE_BYTES`] — comfortably past the 80 this repository's
+/// own fixtures anticipate as a worst case, so the floor does not bind at any
+/// scene size measured or expected. If a future scene legitimately needs more
+/// than 256 concurrently *live* contexts, that is a new measurement, not a
+/// reason to raise this back toward 4 MiB: the 80-context result above is the
+/// evidence that a uniform per-context floor is the wrong lever at that
+/// scale — the correct fix past 256 is bounding how many contexts count as
+/// "hot" (an LRU over recently-drawn contexts, so an idle canvas's cache can
+/// be released independent of how many other
+/// canvases exist), not raising a constant every live context multiplies by.
 ///
-/// Changing the policy is a memory-versus-thrash decision that wants a device
-/// PSS measurement behind it. What is fixed here is that the arithmetic is no
-/// longer silent: `the_per_context_floor_overshoots_the_aggregate_past_a_known_
-/// context_count` asserts every number in the table above, so moving this
-/// constant or [`tier_budget`] fails loudly instead of quietly relocating the
-/// crossover.
-const MIN_PER_CTX_BYTES: usize = 4 * 1024 * 1024;
+/// `the_aggregate_is_honoured_at_the_scene_sizes_this_repository_anticipates`
+/// pins the new crossover and the 80-context result so both fail loudly
+/// rather than drift quietly; `the_floor_still_backstops_a_degenerate_context_
+/// count` keeps the old "floor can still overshoot" behaviour tested, just at
+/// the (much larger) `n` where it now actually applies.
+const MIN_PER_CTX_BYTES: usize = 64 * 1024;
 const SKIA_RESOURCE_CACHE_MAX_RESOURCES: usize = 1 << 14;
 
 /// Runtime-tunable budget.  Set at engine init based on
@@ -1139,8 +1187,12 @@ mod tests {
         let fourth = LiveContextCount::enrol();
         assert_eq!(per_ctx_resource_cache_bytes(), 16 * 1024 * 1024);
 
-        // Deep enough that the per-context floor takes over from the share.
-        let many: Vec<LiveContextCount> = (0..60).map(|_| LiveContextCount::enrol()).collect();
+        // Deep enough that the per-context floor takes over from the share --
+        // at a 64 MiB budget and a 64 KiB floor that crossover is 1024
+        // contexts, well past any scene size this repository anticipates (see
+        // MIN_PER_CTX_BYTES), so this pushes past it deliberately rather than
+        // at a realistic count.
+        let many: Vec<LiveContextCount> = (0..1196).map(|_| LiveContextCount::enrol()).collect();
         assert_eq!(per_ctx_resource_cache_bytes(), MIN_PER_CTX_BYTES);
         drop(many);
 
@@ -1153,55 +1205,117 @@ mod tests {
         set_skia_resource_cache_budget(restore);
     }
 
-    /// **The per-context floor outranks the aggregate ceiling, and past a
-    /// certain context count the ceiling stops being one.** Nothing said so
-    /// before this test: the case above drives the count to 64 and asserts the
-    /// floor engages — which is the floor working as designed — and then stops.
-    /// It never states what the process is now holding.
+    /// The aggregate the process actually grants for `n` contexts.
+    fn granted(aggregate: usize, n: usize) -> usize {
+        set_skia_resource_cache_budget(aggregate);
+        let guards: Vec<LiveContextCount> = (0..n).map(|_| LiveContextCount::enrol()).collect();
+        let total = per_ctx_resource_cache_bytes() * n;
+        drop(guards);
+        total
+    }
+
+    /// **The aggregate ceiling is honoured at every scene size this
+    /// repository anticipates.** It was not always: with the 4 MiB floor this
+    /// test used to carry, 80 contexts (the `render_thread` reorder fixture's
+    /// count, on the record that "nothing bounds how many canvases a game
+    /// draws to in one frame") were granted 320 MiB against a 96 MiB TierA
+    /// ceiling — see the device measurement on `MIN_PER_CTX_BYTES` for why the
+    /// floor moved to 64 KiB instead of being defended.
     ///
-    /// `per_ctx_share` returns `max(aggregate / n, MIN_PER_CTX_BYTES)`, so the
-    /// aggregate actually granted is `n * MIN_PER_CTX_BYTES` once
-    /// `n > aggregate / MIN_PER_CTX_BYTES`. With a 4 MiB floor the crossover is
-    /// 24 contexts on TierA, 12 on TierB, and 4 for the low-memory squeeze.
-    ///
-    /// This is a real tension rather than an oversight — the two guarantees
-    /// cannot both hold for unbounded `n`, and capping a live canvas below its
-    /// glyph-atlas working set makes Skia re-evict on every draw, which is worse
-    /// than the overshoot. What it should not be is *invisible*, because the
-    /// scene sizes involved are not hypothetical: `canvas_id_set` sizes its
-    /// inline capacity for a ~30-label shop UI, and `render_thread`'s reorder
-    /// fixture uses 80 deliberately, recording that "nothing bounds how many
-    /// canvases a game draws to in one frame".
-    ///
-    /// So the numbers are asserted here. Whoever changes `MIN_PER_CTX_BYTES` or
-    /// [`tier_budget`] moves the crossover, and this fails rather than letting
-    /// it move quietly.
+    /// At 64 KiB the crossover (`aggregate / MIN_PER_CTX_BYTES`) is 1536
+    /// contexts on TierA, 768 on TierB, 256 even under the low-memory squeeze
+    /// — this pins those numbers so a future edit to `MIN_PER_CTX_BYTES` or
+    /// [`tier_budget`] cannot quietly drag the crossover back down under 80
+    /// without a test failing here.
     #[test]
-    fn the_per_context_floor_overshoots_the_aggregate_past_a_known_context_count() {
+    fn the_aggregate_is_honoured_at_the_scene_sizes_this_repository_anticipates() {
         let _serialised = BUDGET_TESTS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let restore = SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(Ordering::Relaxed);
 
-        /// The aggregate the process actually grants for `n` contexts.
-        fn granted(aggregate: usize, n: usize) -> usize {
-            set_skia_resource_cache_budget(aggregate);
-            let guards: Vec<LiveContextCount> = (0..n).map(|_| LiveContextCount::enrol()).collect();
-            let total = per_ctx_resource_cache_bytes() * n;
-            drop(guards);
-            total
+        const MIB: usize = 1024 * 1024;
+        for (tier, aggregate, crossover) in [
+            (crate::device_caps::DeviceTier::TierA, 96 * MIB, 1536),
+            (crate::device_caps::DeviceTier::TierB, 48 * MIB, 768),
+        ] {
+            assert_eq!(
+                tier_budget(tier),
+                aggregate,
+                "tier budget moved; the crossover below is computed from it"
+            );
+            assert_eq!(
+                aggregate / MIN_PER_CTX_BYTES,
+                crossover,
+                "{tier:?}: crossover moved — MIN_PER_CTX_BYTES no longer backstops \
+                 only degenerate context counts"
+            );
         }
+        assert_eq!(LOW_MEMORY_AGGREGATE_BYTES / MIN_PER_CTX_BYTES, 256);
+
+        // The scene size this repository already writes fixtures for
+        // (scripts/fixtures/skia-floor-probe-80) — well under every crossover
+        // above, so the share stays a plain aggregate/n division and the
+        // aggregate is exactly honoured, no floor involved.
+        const SHOP_UI_CANVASES: usize = 80;
+        for (label, aggregate) in [
+            ("TierA", tier_budget(crate::device_caps::DeviceTier::TierA)),
+            ("TierB", tier_budget(crate::device_caps::DeviceTier::TierB)),
+            ("low-memory", LOW_MEMORY_AGGREGATE_BYTES),
+        ] {
+            let share = aggregate / SHOP_UI_CANVASES;
+            assert!(
+                share >= MIN_PER_CTX_BYTES,
+                "{label}: aggregate/80 = {share} bytes is below the {MIN_PER_CTX_BYTES}-byte \
+                 floor, so this scene size no longer proves the floor stays out of the way"
+            );
+            let total = granted(aggregate, SHOP_UI_CANVASES);
+            assert_eq!(
+                total,
+                share * SHOP_UI_CANVASES,
+                "{label}: 80 contexts granted {total} bytes against a {aggregate} ceiling — \
+                 the floor took over at a scene size this repository ships fixtures for"
+            );
+            assert!(
+                total <= aggregate,
+                "{label}: 80 contexts granted {total} bytes, over the {aggregate} ceiling"
+            );
+        }
+
+        // Same claim for the low-memory squeeze specifically, through its own
+        // accessor: a warning arriving in an 80-canvas scene now actually
+        // squeezes proportionally instead of flooring out at four contexts.
+        let guards: Vec<LiveContextCount> = (0..SHOP_UI_CANVASES)
+            .map(|_| LiveContextCount::enrol())
+            .collect();
+        assert_eq!(
+            low_memory_per_ctx_bytes() * SHOP_UI_CANVASES,
+            (LOW_MEMORY_AGGREGATE_BYTES / SHOP_UI_CANVASES) * SHOP_UI_CANVASES,
+            "the low-memory squeeze should still divide {LOW_MEMORY_AGGREGATE_BYTES} across \
+             {SHOP_UI_CANVASES} contexts rather than flooring out"
+        );
+        drop(guards);
+
+        set_skia_resource_cache_budget(restore);
+    }
+
+    /// The floor still exists, and still backstops something: past its (much
+    /// larger, post-measurement) crossover, `per_ctx_share` still returns
+    /// `MIN_PER_CTX_BYTES` rather than a share that keeps shrinking toward
+    /// zero. What changed is only where that crossover sits — see
+    /// `MIN_PER_CTX_BYTES` and the test above.
+    #[test]
+    fn the_floor_still_backstops_a_degenerate_context_count() {
+        let _serialised = BUDGET_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let restore = SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(Ordering::Relaxed);
 
         const MIB: usize = 1024 * 1024;
         for (tier, aggregate) in [
             (crate::device_caps::DeviceTier::TierA, 96 * MIB),
             (crate::device_caps::DeviceTier::TierB, 48 * MIB),
         ] {
-            assert_eq!(
-                tier_budget(tier),
-                aggregate,
-                "tier budget moved; the crossovers below are computed from it"
-            );
             let crossover = aggregate / MIN_PER_CTX_BYTES;
 
             // At the crossover the share equals the floor, so the aggregate is
@@ -1212,7 +1326,8 @@ mod tests {
                 "{tier:?}: {crossover} contexts should still fit the ceiling"
             );
 
-            // One past it, the floor wins and the ceiling is exceeded.
+            // One past it, the floor wins and the ceiling is exceeded -- by
+            // construction, since nothing below MIN_PER_CTX_BYTES is granted.
             let over = granted(aggregate, crossover + 1);
             assert!(
                 over > aggregate,
@@ -1222,59 +1337,6 @@ mod tests {
             );
             assert_eq!(over, (crossover + 1) * MIN_PER_CTX_BYTES);
         }
-
-        // The scene size this repository already writes fixtures for, against
-        // every aggregate — these are the rows of the table on
-        // `MIN_PER_CTX_BYTES`, asserted so the table cannot drift from the code.
-        const SHOP_UI_CANVASES: usize = 80;
-        let at_80 = SHOP_UI_CANVASES * MIN_PER_CTX_BYTES;
-        for (label, aggregate, tenths) in [
-            (
-                "TierA",
-                tier_budget(crate::device_caps::DeviceTier::TierA),
-                33u64,
-            ),
-            (
-                "TierB",
-                tier_budget(crate::device_caps::DeviceTier::TierB),
-                66,
-            ),
-            ("low-memory", LOW_MEMORY_AGGREGATE_BYTES, 200),
-        ] {
-            assert_eq!(
-                granted(aggregate, SHOP_UI_CANVASES),
-                at_80,
-                "{label}: 80 contexts should grant {at_80} bytes"
-            );
-            // Tenths, because the ratios are not integers and rounding one to
-            // 3 hid that TierB's is nearly 7.
-            let observed = (at_80 as u64 * 10) / aggregate as u64;
-            assert_eq!(
-                observed,
-                tenths,
-                "{label}: overshoot at 80 contexts is {}.{}x the {aggregate} \
-                 byte ceiling, not {}.{}x",
-                observed / 10,
-                observed % 10,
-                tenths / 10,
-                tenths % 10
-            );
-        }
-
-        // The low-memory squeeze crosses over soonest of all, which is why its
-        // row is the one that bites: a warning arriving in a many-canvas scene
-        // releases nothing below the floor.
-        assert_eq!(LOW_MEMORY_AGGREGATE_BYTES / MIN_PER_CTX_BYTES, 4);
-        let guards: Vec<LiveContextCount> = (0..SHOP_UI_CANVASES)
-            .map(|_| LiveContextCount::enrol())
-            .collect();
-        assert_eq!(
-            low_memory_per_ctx_bytes() * SHOP_UI_CANVASES,
-            at_80,
-            "the low-memory squeeze also floors out, so it releases nothing \
-             below {MIN_PER_CTX_BYTES} per context"
-        );
-        drop(guards);
 
         set_skia_resource_cache_budget(restore);
     }
