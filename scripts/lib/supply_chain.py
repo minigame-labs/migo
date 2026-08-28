@@ -391,8 +391,14 @@ def validate_audit(
     vuln_count = vulnerabilities.get("count", len(vuln_list)) if isinstance(vulnerabilities, dict) else 0
     if vuln_count or vuln_list:
         for item in vuln_list or [{}]:
-            advisory = item.get("advisory", {}) if isinstance(item, dict) else {}
-            package = item.get("package", {}) if isinstance(item, dict) else {}
+            # `.get(key, {})` only substitutes the default when the key is
+            # *absent* -- cargo-audit's "yanked" warning kind carries an
+            # explicit `"advisory": null` (a yanked release has no RUSTSEC id
+            # to report), which `.get` passes through as None and the `.get`
+            # calls below then crash on. `or {}` catches both "absent" and
+            # "present but null".
+            advisory = (item.get("advisory") or {}) if isinstance(item, dict) else {}
+            package = (item.get("package") or {}) if isinstance(item, dict) else {}
             errors.append(
                 "vulnerability "
                 f"{advisory.get('id', 'unknown')} affects "
@@ -424,8 +430,11 @@ def validate_audit(
                 errors.append(f"cargo-audit warning group {group} contains a non-object")
                 continue
             kind = str(item.get("kind") or group)
-            package = item.get("package", {})
-            advisory = item.get("advisory", {})
+            # Same null-vs-absent trap as the vulnerability loop above: a
+            # "yanked" warning's "advisory" key is present and explicitly
+            # null, not absent, so `.get(key, {})` would pass None through.
+            package = item.get("package") or {}
+            advisory = item.get("advisory") or {}
             key = (
                 str(advisory.get("id", "")),
                 str(package.get("name", "")),

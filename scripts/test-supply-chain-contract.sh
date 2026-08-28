@@ -262,6 +262,38 @@ PY
         --metadata-json "$WORK/metadata.json" --policy "$WORK/policy.toml" \
         --workspace-root "$WORK" --as-of 2026-08-26
 
+    # A "yanked" warning carries `"advisory": null`, not an absent key -- a
+    # yanked release has no RUSTSEC id to report. cargo-audit produces this
+    # shape for real (RUSTSEC-2025-0141's own exception list did not cover
+    # it; a live audit against a yanked chacha20 0.10.1 crashed with
+    # `AttributeError: 'NoneType' object has no attribute 'get'` before this
+    # test existed). The gate must fail closed on the policy violation, not
+    # crash on the shape.
+    python3 - "$WORK/audit-clean.json" "$WORK/audit-yanked.json" <<'PY'
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+data["warnings"]["yanked"] = [{
+    "kind": "yanked",
+    "package": {"name": "chacha20", "version": "0.10.1"},
+    "advisory": None,
+}]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(data))
+PY
+    yanked_output="$(python3 "$CHECKER" audit --audit-json "$WORK/audit-yanked.json" \
+        --metadata-json "$WORK/metadata.json" --policy "$WORK/policy.toml" \
+        --workspace-root "$WORK" --as-of 2026-08-26 2>&1)" && yanked_status=0 || yanked_status=$?
+    if [[ "$yanked_status" -eq 0 ]]; then
+        fail "a yanked crate with no policy exception unexpectedly passed"
+    elif grep -q "Traceback" <<<"$yanked_output"; then
+        fail "a null-advisory yanked warning crashed the checker instead of failing closed"
+        printf '%s\n' "$yanked_output" >&2
+    elif ! grep -qi "yanked" <<<"$yanked_output"; then
+        fail "the checker rejected the yanked warning for the wrong reason"
+        printf '%s\n' "$yanked_output" >&2
+    else
+        pass "a null-advisory yanked warning fails closed, not with a traceback"
+    fi
+
     python3 - "$WORK/metadata.json" "$WORK/metadata-git.json" <<'PY'
 import json, pathlib, sys
 data = json.loads(pathlib.Path(sys.argv[1]).read_text())
