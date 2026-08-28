@@ -98,12 +98,25 @@ pub enum StatResult {
     Recursive(Vec<StatEntry>),
 }
 
+/// Payload for one zip entry.
+///
+/// Binary entries stay bytes all the way to the `ArrayBuffer` the caller
+/// receives. They used to be base64-encoded for transport, which cost 1.33x
+/// inflation on the wire plus a per-byte decode loop in JS.
+#[derive(Debug)]
+pub enum ZipEntryData {
+    /// The entry decoded with the caller's requested encoding.
+    Text(String),
+    /// Raw bytes, for a caller that asked for no encoding.
+    Binary(Vec<u8>),
+}
+
 /// Result for a single entry read from a zip archive.
 #[derive(Debug)]
 pub struct ZipEntryResult {
     pub path: String,
-    /// Encoded string (text for entries with encoding, base64 for binary).
-    pub data: Option<String>,
+    /// `None` when the entry could not be read; `err_msg` says why.
+    pub data: Option<ZipEntryData>,
     pub err_msg: String,
 }
 

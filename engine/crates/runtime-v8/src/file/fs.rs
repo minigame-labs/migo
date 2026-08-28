@@ -1,6 +1,6 @@
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
-use deno_core::{JsBuffer, OpState, ToJsBuffer, op2, serde_json, v8};
+use deno_core::{JsBuffer, OpState, ToJsBuffer, op2};
 use migo_io::fs_ops;
 use shared::{
     codec,
@@ -17,8 +17,9 @@ use migo_io::{
     domain::DomainError,
     pools::PoolError,
     scheduler::IoScheduler,
-    task::{BackendKind, IoRequest, PriorityClass, ReadSpec, RequestKind},
+    task::{BackendKind, IoRequest, PriorityClass, RequestKind},
 };
+use shared::protocol::io_cmd::ZipEntryData;
 
 const MAX_MATERIALIZE_LENGTH: u64 = 512 * 1024 * 1024;
 
@@ -96,29 +97,56 @@ fn pool_err(err: PoolError) -> IOError {
     }
 }
 
+/// Build the scheduler descriptor for a read.
+///
+/// `length` is what the caller asked for; `size_hint` is what the backend
+/// already knows the read will actually produce. Both bound the result, so
+/// the estimate is whichever is smaller.
+///
+/// Passing a `size_hint` is what lets a small whole-file read reach the
+/// scheduler's inline path. `readFile(path)` leaves `length` at `None`, and
+/// an unhinted `None` has to assume `MAX_READ_LENGTH` — so without a hint
+/// every whole-file read, a 200-byte JSON included, estimates at 100 MiB,
+/// classifies as expensive, and pays a worker round-trip that costs more
+/// than the read itself.
 #[inline]
-fn read_request(backend: BackendKind, request: RequestKind, length: Option<u64>) -> IoRequest {
-    let estimated_bytes = length.unwrap_or(shared::protocol::io_cmd::MAX_READ_LENGTH) as usize;
-    let spec = match length {
-        Some(length) => ReadSpec::Range {
-            position: 0,
-            length: length as usize,
-        },
-        None => ReadSpec::Whole,
-    };
+fn read_request(
+    backend: BackendKind,
+    request: RequestKind,
+    length: Option<u64>,
+    size_hint: Option<u64>,
+) -> IoRequest {
+    let estimated_bytes = match (length, size_hint) {
+        (Some(length), Some(hint)) => length.min(hint),
+        (Some(length), None) => length,
+        (None, Some(hint)) => hint,
+        (None, None) => shared::protocol::io_cmd::MAX_READ_LENGTH,
+    } as usize;
 
     IoRequest::ReadFile {
         backend,
         request,
         priority: PriorityClass::from(request),
-        spec,
         estimated_bytes,
     }
 }
 
+/// Size of `path` for read classification, or `None` when it can't be had.
+///
+/// Only called on the sync path. There the caller's thread is blocked for the
+/// whole operation, so a worker hop is pure added latency and one `stat` buys
+/// the chance to skip it — and against the read that follows either way, the
+/// syscall is a rounding error. On the async path the caller is not blocked,
+/// the hop costs throughput rather than latency, and this `stat` would land
+/// on the V8 thread for no gain.
+#[inline]
+fn fs_read_size_hint(path: &str) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|meta| meta.len())
+}
+
 #[inline]
 fn archive_read_request() -> IoRequest {
-    read_request(BackendKind::Archive, RequestKind::Async, None)
+    read_request(BackendKind::Archive, RequestKind::Async, None, None)
 }
 
 #[inline]
@@ -127,7 +155,6 @@ fn copy_request(backend: BackendKind, request: RequestKind) -> IoRequest {
         backend,
         request,
         priority: PriorityClass::from(request),
-        spec: ReadSpec::Whole,
         estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
     }
 }
@@ -561,50 +588,51 @@ fn durability_from(durable: bool) -> WriteDurability {
     }
 }
 
-/// Copy a byte range out of a V8 BackingStore safely.
-fn copy_backing_store_bytes(
-    store: &v8::SharedRef<v8::BackingStore>,
-    range: std::ops::Range<usize>,
-) -> Result<Vec<u8>, IOError> {
-    let nn = store
-        .data()
-        .ok_or_else(|| ioerr("ArrayBuffer data is null"))?;
-    let total = store.byte_length();
-    if range.start > range.end || range.end > total {
-        return Err(ioerr(format!(
-            "invalid range: {:?}, total={}",
-            range, total
-        )));
-    }
-    let len = range.end - range.start;
-    let ptr = nn.as_ptr() as *const u8;
-    // SAFETY: bounds validated by byte_length.
-    let slice = unsafe { std::slice::from_raw_parts(ptr.add(range.start), len) };
-    Ok(slice.to_vec())
+/// Bytes destined for a write, held in whichever form avoids copying them.
+///
+/// A `JsBuffer` is `Send`, owns a reference to V8's backing store, and derefs
+/// to `[u8]` — so it can move into a worker closure and be written straight
+/// out of the `ArrayBuffer`. That is the same handle `op_read_fd_into` moves
+/// across the thread boundary to fill a caller's buffer, used here in the
+/// other direction. Only the string form materialises a `Vec`, because
+/// encoding has to produce one regardless.
+///
+/// **Contract on the async ops (matches Node's `fs.write(fd, buffer, …)`):**
+/// the caller must not modify the `ArrayBuffer` until the promise settles, or
+/// the worker may write a torn mix of the old and new bytes. The sync ops have
+/// no such window — V8 is blocked for the whole call.
+enum WritePayload {
+    /// V8's own bytes, written in place.
+    Js(JsBuffer),
+    /// Bytes produced by string encoding, which allocates either way.
+    Encoded(Vec<u8>),
 }
 
-/// Prepare write data:
-/// - If `data_buf` exists: returns (store, range)
-/// - Else if `data_str` exists: encodes to Vec<u8>
-/// - Else: error
+impl std::ops::Deref for WritePayload {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            WritePayload::Js(buf) => buf,
+            WritePayload::Encoded(bytes) => bytes,
+        }
+    }
+}
+
+/// Resolve the write payload from the buffer/string pair the op received.
 fn prepare_data(
     data_buf: Option<JsBuffer>,
     data_str: Option<String>,
     encoding: Option<String>,
-) -> Result<
-    (
-        Option<(v8::SharedRef<v8::BackingStore>, std::ops::Range<usize>)>,
-        Option<Vec<u8>>,
-    ),
-    IOError,
-> {
+) -> Result<WritePayload, IOError> {
     if let Some(js_buf) = data_buf {
-        let (store, range) = js_buf.into_parts().into_parts();
-        Ok((Some((store, range)), None))
+        Ok(WritePayload::Js(js_buf))
     } else if let Some(s) = data_str {
         let enc = encoding.as_deref().unwrap_or("utf8");
-        let data = codec::encode_string(&s, enc).map_err(|e| ioerr(e.to_string()))?;
-        Ok((None, Some(data)))
+        codec::encode_string(&s, enc)
+            .map(WritePayload::Encoded)
+            .map_err(|e| ioerr(e.to_string()))
     } else {
         Err(ioerr("No data provided"))
     }
@@ -696,20 +724,10 @@ pub async fn op_write_or_append_file(
     )?)?;
     let mode = mode_from_append(append);
     let durability = durability_from(durable);
-    let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
-
-    // Extract bytes from SharedRef before the job crosses the thread
-    // boundary (SharedRef is not Send).
-    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
-        copy_backing_store_bytes(&store, range)?
-    } else if let Some(data) = data_opt {
-        data
-    } else {
-        return Err(ioerr("No data provided"));
-    };
+    let payload = prepare_data(data_buf, data_str, encoding)?;
 
     run_fs_async(scheduler, move || {
-        fs_ops::write_file(&full_path, &bytes, mode, durability)
+        fs_ops::write_file(&full_path, &payload, mode, durability)
     })
     .await
 }
@@ -734,19 +752,10 @@ pub fn op_write_or_append_file_sync(
     )?)?;
     let mode = mode_from_append(append);
     let durability = durability_from(durable);
-    let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
-
-    // Extract bytes from SharedRef (for consistency, though sync ops run on V8 thread).
-    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
-        copy_backing_store_bytes(&store, range)?
-    } else if let Some(data) = data_opt {
-        data
-    } else {
-        return Err(ioerr("No data provided"));
-    };
+    let payload = prepare_data(data_buf, data_str, encoding)?;
 
     run_fs_sync(&scheduler, move || {
-        fs_ops::write_file(&full_path, &bytes, mode, durability)
+        fs_ops::write_file(&full_path, &payload, mode, durability)
     })
 }
 
@@ -1305,19 +1314,12 @@ pub async fn op_write_file(
         get_scheduler(&st)
     };
     let domain = scheduler.domain();
-    let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
+    let payload = prepare_data(data_buf, data_str, encoding)?;
 
-    // Extract bytes from SharedRef before crossing the worker boundary
-    // (SharedRef is not Send).
-    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
-        copy_backing_store_bytes(&store, range)?
-    } else if let Some(data) = data_opt {
-        data
-    } else {
-        return Err(ioerr("No data provided"));
-    };
-
-    run_domain_async(scheduler, move || domain.write_file(rid, &bytes, position)).await
+    run_domain_async(scheduler, move || {
+        domain.write_file(rid, &payload, position)
+    })
+    .await
 }
 
 #[op2]
@@ -1331,18 +1333,11 @@ pub fn op_write_file_sync(
     #[bigint] position: Option<u64>,
 ) -> Result<usize, IOError> {
     let domain = get_scheduler(state).domain();
-    let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
+    let payload = prepare_data(data_buf, data_str, encoding)?;
 
-    // Extract bytes from SharedRef (for consistency).
-    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
-        copy_backing_store_bytes(&store, range)?
-    } else if let Some(data) = data_opt {
-        data
-    } else {
-        return Err(ioerr("No data provided"));
-    };
-
-    domain.write_file(rid, &bytes, position).map_err(domain_err)
+    domain
+        .write_file(rid, &payload, position)
+        .map_err(domain_err)
 }
 
 //
@@ -1378,12 +1373,15 @@ pub async fn op_read_file(
                     )));
                 }
             }
+            // Taken once: the limit check below and the scheduler's size hint
+            // both want it, and a pack entry size is a hashmap lookup.
+            let entry_size = mount_table.entry_size(&rel);
             // When length is not specified, check the effective read size
             // (entry_size - position) against the limit.  This prevents
             // unbounded reads from oversized pack entries regardless of
             // whether position is specified.
             if length.is_none() {
-                if let Some(entry_sz) = mount_table.entry_size(&rel) {
+                if let Some(entry_sz) = entry_size {
                     let effective = entry_sz.saturating_sub(position.unwrap_or(0));
                     if effective > max_len {
                         return Err(ioerr(format!(
@@ -1393,7 +1391,8 @@ pub async fn op_read_file(
                     }
                 }
             }
-            let request = read_request(BackendKind::Pack, request_kind, length);
+            let size_hint = entry_size.map(|sz| sz.saturating_sub(position.unwrap_or(0)));
+            let request = read_request(BackendKind::Pack, request_kind, length, size_hint);
             let data = scheduler
                 .run_async(request, move || {
                     mount_table.read_range_limited(&rel, position.unwrap_or(0), length, max_len)
@@ -1406,7 +1405,8 @@ pub async fn op_read_file(
         ResolvedPath::Filesystem(full_path) => {
             let vpath = path.clone();
             let allow_mmap = is_read_only_code_path(&path);
-            let request = read_request(BackendKind::Filesystem, request_kind, length);
+            // No size hint on the async path: see `fs_read_size_hint`.
+            let request = read_request(BackendKind::Filesystem, request_kind, length, None);
             let data = scheduler
                 .run_async(request, move || {
                     let t0 = std::time::Instant::now();
@@ -1461,12 +1461,15 @@ pub fn op_read_file_sync(
                         )));
                     }
                 }
+                // Taken once: the limit check below and the scheduler's size
+                // hint both want it, and a pack entry size is a hashmap lookup.
+                let entry_size = mount_table.entry_size(&rel);
                 // When length is not specified, check the effective read size
                 // (entry_size - position) against the limit.  This prevents
                 // unbounded reads from oversized pack entries regardless of
                 // whether position is specified.
                 if length.is_none() {
-                    if let Some(entry_sz) = mount_table.entry_size(&rel) {
+                    if let Some(entry_sz) = entry_size {
                         let effective = entry_sz.saturating_sub(position.unwrap_or(0));
                         if effective > max_len {
                             return Err(ioerr(format!(
@@ -1476,7 +1479,8 @@ pub fn op_read_file_sync(
                         }
                     }
                 }
-                let request = read_request(BackendKind::Pack, request_kind, length);
+                let size_hint = entry_size.map(|sz| sz.saturating_sub(position.unwrap_or(0)));
+                let request = read_request(BackendKind::Pack, request_kind, length, size_hint);
                 let data = scheduler
                     .run_sync(&request, move || {
                         mount_table.read_range_limited(&rel, position.unwrap_or(0), length, max_len)
@@ -1487,7 +1491,14 @@ pub fn op_read_file_sync(
             }
             ResolvedPath::Filesystem(full_path) => {
                 let allow_mmap = is_read_only_code_path(&path);
-                let request = read_request(BackendKind::Filesystem, request_kind, length);
+                // Skip the stat when `length` alone already classifies the
+                // read as cheap — it could only confirm what we know.
+                let size_hint = match length {
+                    Some(len) if len <= scheduler.policy().small_read_bytes as u64 => None,
+                    _ => fs_read_size_hint(&full_path),
+                };
+                let request =
+                    read_request(BackendKind::Filesystem, request_kind, length, size_hint);
                 let data = scheduler
                     .run_sync(&request, move || {
                         fs_ops::read_file(&full_path, position, length, allow_mmap)
@@ -1531,7 +1542,7 @@ pub async fn op_read_fd(
         get_scheduler(&st)
     };
     let domain = scheduler.domain();
-    let request = read_request(BackendKind::Filesystem, RequestKind::Async, Some(length));
+    let request = read_request(BackendKind::Filesystem, RequestKind::Async, Some(length), None);
 
     scheduler
         .run_async(request, move || domain.read_file(rid, length, position))
@@ -1552,7 +1563,7 @@ pub fn op_read_fd_sync(
     let started_at = Instant::now();
     let scheduler = get_scheduler(state);
     let domain = scheduler.domain();
-    let request = read_request(BackendKind::Filesystem, RequestKind::Sync, Some(length));
+    let request = read_request(BackendKind::Filesystem, RequestKind::Sync, Some(length), None);
 
     let target = format!("rid={rid}");
     let result: Result<ToJsBuffer, IOError> = scheduler
@@ -1605,7 +1616,7 @@ pub async fn op_read_fd_into(
     };
     let domain = scheduler.domain();
     let len = buf.len() as u64;
-    let request = read_request(BackendKind::Filesystem, RequestKind::Async, Some(len));
+    let request = read_request(BackendKind::Filesystem, RequestKind::Async, Some(len), None);
     scheduler
         .run_async(request, move || {
             domain.read_file_into(rid, buf.as_mut(), position)
@@ -1626,7 +1637,7 @@ pub fn op_read_fd_into_sync(
     let scheduler = get_scheduler(state);
     let domain = scheduler.domain();
     let len = buf.len() as u64;
-    let request = read_request(BackendKind::Filesystem, RequestKind::Sync, Some(len));
+    let request = read_request(BackendKind::Filesystem, RequestKind::Sync, Some(len), None);
     scheduler
         .run_sync(&request, move || {
             domain.read_file_into(rid, buf.as_mut(), position)
@@ -1690,13 +1701,32 @@ pub fn op_read_compressed_file_sync(
 
 // ============================ ReadZipEntry ============================
 
+/// One entry's result on its way to JS.
+///
+/// `text` and `bytes` are mutually exclusive, expressed as two optional
+/// fields rather than an enum on purpose: `serde(untagged)` routes through
+/// serde's content-buffering serializer, which loses the marker serde_v8 uses
+/// to turn a [`ToJsBuffer`] into a `Uint8Array` — the bytes would arrive in JS
+/// as a plain array of numbers. Two fields keep the buffer on serde_v8's fast
+/// path, and the JS shim picks whichever is present.
+#[derive(serde::Serialize)]
+struct ZipEntryPayload {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<ToJsBuffer>,
+    #[serde(rename = "errMsg")]
+    err_msg: String,
+}
+
 #[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_read_zip_entry(
     state: Rc<RefCell<OpState>>,
     #[string] zip_path: String,
     #[string] entries_json: String,
-) -> Result<serde_json::Value, IOError> {
+) -> Result<Vec<ZipEntryPayload>, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
     let scheduler = {
         let st = state.borrow();
@@ -1737,20 +1767,26 @@ pub async fn op_read_zip_entry(
 
     let results = results.map_err(pool_err)?.map_err(IOError::from)?;
 
-    // Build serde_json::Value — serde_v8 serializes this directly to a V8 object
-    // (no JSON stringify/parse round-trip).
-    let mut entries_map = serde_json::Map::with_capacity(results.len());
-    for entry in results {
-        let data_val = match entry.data {
-            Some(s) => serde_json::Value::String(s),
-            None => serde_json::Value::Null,
-        };
-        entries_map.insert(
-            entry.path,
-            serde_json::json!({ "data": data_val, "errMsg": entry.err_msg }),
-        );
-    }
-    Ok(serde_json::json!({ "entries": entries_map }))
+    // A list, not a map: the shim builds the keyed object, and a list keeps the
+    // archive's own entry order instead of `serde_json::Map`'s sorted one.
+    // Binary payloads ride out as `ToJsBuffer`, which serde_v8 adopts as a
+    // `Uint8Array` backing store rather than copying.
+    Ok(results
+        .into_iter()
+        .map(|entry| {
+            let (text, bytes) = match entry.data {
+                Some(ZipEntryData::Text(s)) => (Some(s), None),
+                Some(ZipEntryData::Binary(b)) => (None, Some(b.into())),
+                None => (None, None),
+            };
+            ZipEntryPayload {
+                path: entry.path,
+                text,
+                bytes,
+                err_msg: entry.err_msg,
+            }
+        })
+        .collect())
 }
 
 // ============================ Unzip ============================
@@ -1966,8 +2002,267 @@ mod tests {
 
     use super::{
         IOError, archive_read_request, copy_pack_file_async, materialize_pack_to_temp_async,
-        materialize_pack_to_temp_checked, run_domain_async,
+        materialize_pack_to_temp_checked, read_request, run_domain_async,
     };
+    use ::migo_io::task::{BackendKind, RequestKind};
+
+    /// A whole-file read carries no `length`, so the estimate rests entirely on
+    /// the size hint. Without one the request has to assume `MAX_READ_LENGTH`
+    /// and every `readFile` of a small config or atlas descriptor pays a worker
+    /// round-trip that costs more than reading the bytes.
+    #[test]
+    fn small_whole_file_reads_stay_inline_when_the_size_is_known() {
+        let scheduler = IoScheduler::new(1220);
+
+        let hinted = read_request(
+            BackendKind::Pack,
+            RequestKind::Sync,
+            None,
+            Some(200), // a 200-byte JSON, the shape this path exists for
+        );
+        assert_eq!(scheduler.classify(&hinted), RouteDecision::Inline);
+
+        let unhinted = read_request(BackendKind::Pack, RequestKind::Sync, None, None);
+        assert_eq!(
+            scheduler.classify(&unhinted),
+            RouteDecision::Delegated(PoolKind::Pack),
+            "an unknown size must stay conservative and delegate"
+        );
+    }
+
+    /// The hint narrows the estimate; it must never widen it past what the
+    /// caller asked for, or a large file would drag a small ranged read out of
+    /// the inline path.
+    #[test]
+    fn size_hint_never_raises_the_estimate_above_the_requested_length() {
+        let scheduler = IoScheduler::new(1221);
+
+        let small_read_of_big_file = read_request(
+            BackendKind::Filesystem,
+            RequestKind::Sync,
+            Some(512),
+            Some(64 * 1024 * 1024),
+        );
+        assert_eq!(
+            scheduler.classify(&small_read_of_big_file),
+            RouteDecision::Inline
+        );
+    }
+
+    /// A hint smaller than the requested length is the truth about how many
+    /// bytes will come back, so it decides the classification.
+    #[test]
+    fn size_hint_lowers_the_estimate_below_an_oversized_request() {
+        let scheduler = IoScheduler::new(1222);
+
+        // `readFileSync(path, {length: 8MB})` against a 100-byte file.
+        let request = read_request(
+            BackendKind::Filesystem,
+            RequestKind::Sync,
+            Some(8 * 1024 * 1024),
+            Some(100),
+        );
+        assert_eq!(scheduler.classify(&request), RouteDecision::Inline);
+    }
+
+    /// Large reads must keep going to a worker whatever the hint says, or a
+    /// multi-megabyte `readFileSync` would run a full decode-length copy on the
+    /// V8 thread outside the pool's accounting.
+    #[test]
+    fn large_whole_file_reads_still_delegate() {
+        let scheduler = IoScheduler::new(1223);
+
+        let request = read_request(
+            BackendKind::Filesystem,
+            RequestKind::Sync,
+            None,
+            Some(8 * 1024 * 1024),
+        );
+        assert_eq!(
+            scheduler.classify(&request),
+            RouteDecision::Delegated(PoolKind::Fs)
+        );
+    }
+
+    /// The one thing about the zip-entry payload that cannot be reasoned out
+    /// from the type: what serde_v8 actually hands JS for a `ToJsBuffer` that
+    /// sits inside a struct inside a `Vec`.
+    ///
+    /// If it degrades to a plain array of numbers, the whole point of moving
+    /// off base64 is lost and the JS shim would silently produce garbage. This
+    /// runs the real serializer through a real isolate and asks JS.
+    #[test]
+    fn zip_entry_bytes_reach_js_as_a_uint8array() {
+        use deno_core::{FastString, JsRuntime, RuntimeOptions, op2};
+
+        #[op2]
+        #[serde]
+        fn op_zip_payload_fixture() -> Vec<super::ZipEntryPayload> {
+            vec![
+                super::ZipEntryPayload {
+                    path: "img/bg.png".to_string(),
+                    text: None,
+                    bytes: Some(vec![0x00, 0xFF, 0x80, 0x01].into()),
+                    err_msg: String::new(),
+                },
+                super::ZipEntryPayload {
+                    path: "cfg.json".to_string(),
+                    text: Some("{\"a\":1}".to_string()),
+                    bytes: None,
+                    err_msg: String::new(),
+                },
+                super::ZipEntryPayload {
+                    path: "gone.txt".to_string(),
+                    text: None,
+                    bytes: None,
+                    err_msg: "entry not found".to_string(),
+                },
+            ]
+        }
+
+        deno_core::extension!(zip_payload_fixture, ops = [op_zip_payload_fixture]);
+
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions: vec![zip_payload_fixture::init()],
+            ..Default::default()
+        });
+
+        // Assertions as `throw`s: `execute_script` surfaces them as `Err`.
+        let script = r#"
+            const r = Deno.core.ops.op_zip_payload_fixture();
+            if (r.length !== 3) throw new Error("length " + r.length);
+
+            const bin = r[0];
+            if (bin.path !== "img/bg.png") throw new Error("path " + bin.path);
+            if (!(bin.bytes instanceof Uint8Array)) {
+                throw new Error("bytes is " + Object.prototype.toString.call(bin.bytes)
+                    + " -- serde_v8 did not produce a typed array");
+            }
+            if (bin.bytes.length !== 4) throw new Error("byte length " + bin.bytes.length);
+            if (bin.bytes[0] !== 0 || bin.bytes[1] !== 255 || bin.bytes[2] !== 128 || bin.bytes[3] !== 1) {
+                throw new Error("bytes " + Array.from(bin.bytes).join(","));
+            }
+            // The shim hands `.buffer` to callers, so the view must cover it exactly.
+            if (bin.bytes.byteOffset !== 0 || bin.bytes.byteLength !== bin.bytes.buffer.byteLength) {
+                throw new Error("view is not exact: offset=" + bin.bytes.byteOffset
+                    + " len=" + bin.bytes.byteLength + " buf=" + bin.bytes.buffer.byteLength);
+            }
+            if (bin.text !== undefined) throw new Error("text should be absent");
+
+            const txt = r[1];
+            if (txt.text !== '{"a":1}') throw new Error("text " + txt.text);
+            if (txt.bytes !== undefined) throw new Error("bytes should be absent");
+
+            const err = r[2];
+            if (err.errMsg !== "entry not found") throw new Error("errMsg " + err.errMsg);
+            if (err.text !== undefined || err.bytes !== undefined) {
+                throw new Error("a failed entry must carry no payload");
+            }
+        "#;
+
+        rt.execute_script("<test:zip-payload>", FastString::from_static(script))
+            .expect("zip entry payload shape");
+    }
+
+    /// The other half of the zip-entry path: the shim that turns the op's list
+    /// into the `{entries: {...}}` object callers actually see. Driven through
+    /// the real ESM export in a live runtime, so it is the shipped function
+    /// under test rather than a copy of it.
+    #[test]
+    fn zip_entries_shim_maps_bytes_text_and_failures() {
+        use deno_core::{FastString, JsRuntime, RuntimeOptions};
+
+        deno_core::extension!(
+            zip_shim_bridge,
+            deps = [host_v8_file],
+            esm_entry_point = "ext:zip_shim_bridge/bridge.js",
+            esm = ["ext:zip_shim_bridge/bridge.js" = {
+                source = r#"
+                    import { zipEntriesFromOpResult } from "ext:host_v8_file/02_file_manager.js";
+                    globalThis.__zipEntriesFromOpResult = zipEntriesFromOpResult;
+                "#
+            },],
+        );
+
+        let mut extensions = crate::main_extensions(zip_test_host_state());
+        extensions.push(zip_shim_bridge::init());
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions,
+            ..Default::default()
+        });
+
+        let script = r#"
+            const shape = globalThis.__zipEntriesFromOpResult([
+                { path: "img/bg.png", bytes: new Uint8Array([0, 255, 128, 1]), errMsg: "" },
+                { path: "cfg.json",   text: '{"a":1}',                          errMsg: "" },
+                { path: "gone.txt",                                             errMsg: "entry not found" },
+            ]);
+
+            const bin = shape.entries["img/bg.png"];
+            if (!(bin.data instanceof ArrayBuffer)) {
+                throw new Error("binary data is " + Object.prototype.toString.call(bin.data));
+            }
+            const view = new Uint8Array(bin.data);
+            if (view.length !== 4 || view[1] !== 255 || view[2] !== 128) {
+                throw new Error("bytes " + Array.from(view).join(","));
+            }
+            if (bin.errMsg !== "") throw new Error("errMsg " + bin.errMsg);
+
+            const txt = shape.entries["cfg.json"];
+            if (txt.data !== '{"a":1}') throw new Error("text " + txt.data);
+
+            const gone = shape.entries["gone.txt"];
+            if (gone.data !== null) throw new Error("a failed entry must carry null data");
+            if (gone.errMsg !== "entry not found") throw new Error("errMsg " + gone.errMsg);
+
+            // Archive order, not sorted order -- the op returns a list for this reason.
+            const keys = Object.keys(shape.entries).join(",");
+            if (keys !== "img/bg.png,cfg.json,gone.txt") throw new Error("order " + keys);
+        "#;
+
+        rt.execute_script("<test:zip-shim>", FastString::from_static(script))
+            .expect("zip entries shim");
+    }
+
+    fn zip_test_host_state() -> shared::op_state::HostOpState {
+        use shared::channel::ThreadWakeup;
+        use shared::device::gpu_caps::GpuCaps;
+        use shared::op_state::{AudioSender, HostOpState, NetworkPolicy};
+        use shared::render_command_sender::CommandSender;
+        use std::sync::atomic::AtomicBool;
+
+        let (render_tx, _render_rx) = CommandSender::new();
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
+
+        HostOpState {
+            callback_ids: Arc::new(shared::callback_id::CallbackIdAllocator::default()),
+            runtime_generation: 1,
+            id: 1,
+            app_cache_dir: PathBuf::from("/tmp/cache"),
+            app_files_dir: PathBuf::from("/tmp/files"),
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            mount_table: None,
+            render_tx,
+            text_measurer: None,
+            audio_tx: AudioSender::new(shared::audio_channel::disconnected(), ThreadWakeup::new()),
+            host_tx,
+            device_services: None,
+            raf_rx: None,
+            raf_demand: Arc::new(shared::raf_signal::RafDemand::new()),
+            request_vsync: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
+            network_policy: NetworkPolicy::default(),
+            backgrounded: Arc::new(AtomicBool::new(false)),
+            timer_backgrounded: Arc::new(AtomicBool::new(false)),
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: Arc::new(shared::op_state::ContextLostState::default()),
+            code_signing_enabled: false,
+            gpu_caps: GpuCaps::new(),
+        }
+    }
 
     #[test]
     fn q12_production_file_ops_do_not_escape_to_tokio_blocking_pool() {

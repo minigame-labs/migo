@@ -47,6 +47,32 @@ function wrapSync(fn, failPrefix) {
   }
 }
 
+/**
+ * Shape the `op_read_zip_entry` list into the `{entries: {path: {data, errMsg}}}`
+ * object callers see.
+ *
+ * `bytes` arrives as a Uint8Array over a buffer sized exactly to the entry, so
+ * `.buffer` is the caller's ArrayBuffer with no copy. It used to arrive as a
+ * base64 string that this function decoded one byte at a time.
+ *
+ * A module-level function rather than an inline `.then` body so it can be
+ * driven directly from a test without a zip file, a VFS and a live op.
+ */
+function zipEntriesFromOpResult(list) {
+  const result = { entries: {} };
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    let data = null;
+    if (item.bytes !== undefined) {
+      data = item.bytes.buffer;
+    } else if (item.text !== undefined) {
+      data = item.text;
+    }
+    result.entries[item.path] = { data, errMsg: item.errMsg };
+  }
+  return result;
+}
+
 function toUint8Array(data, offset = 0, length) {
   if (typeof data === "string" || data instanceof String) {
     return { data_str: String(data), data_buf: null };
@@ -772,35 +798,13 @@ class BaseFileManager {
     const encoding = options.encoding;
     const entries = options.entries;
     const entriesJson = JSON.stringify({ encoding, entries });
-    let encodingMap;
-    if (!encoding && Array.isArray(entries)) {
-      encodingMap = new Map();
-      for (let i = 0; i < entries.length; i++) {
-        if (entries[i].encoding) encodingMap.set(entries[i].path, entries[i].encoding);
-      }
-    }
     return wrapAsync('readZipEntry', () => {
-      return op_read_zip_entry(options.filePath, entriesJson).then((result) => {
-        if (result.entries && !encoding) {
-          const keys = Object.keys(result.entries);
-          for (let i = 0; i < keys.length; i++) {
-            const item = result.entries[keys[i]];
-            if (item.data !== null && item.data !== undefined) {
-              if (!encodingMap || !encodingMap.has(keys[i])) {
-                const binary = atob(item.data);
-                const len = binary.length;
-                const buf = new ArrayBuffer(len);
-                const view = new Uint8Array(buf);
-                for (let j = 0; j < len; j++) {
-                  view[j] = binary.charCodeAt(j);
-                }
-                item.data = buf;
-              }
-            }
-          }
-        }
-        return result;
-      });
+      // Rust returns a list of `{path, text?, bytes?, errMsg}`; `bytes` is a
+      // Uint8Array over a buffer sized exactly to the entry, so handing back
+      // `.buffer` is the whole binary path. It used to be a base64 string that
+      // JS decoded a byte at a time.
+      return op_read_zip_entry(options.filePath, entriesJson)
+        .then(zipEntriesFromOpResult);
     }, options);
   }
 
@@ -901,4 +905,4 @@ function getFileSystemManager() {
   return fileSystemManager;
 }
 
-export { BaseFileManager, getFileSystemManager };
+export { BaseFileManager, getFileSystemManager, zipEntriesFromOpResult };

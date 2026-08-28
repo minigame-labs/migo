@@ -107,7 +107,7 @@ impl<T> FairLane<T> {
     }
 }
 
-const POOL_COUNT: usize = 4;
+const POOL_COUNT: usize = 5;
 const PRIORITY_COUNT: usize = 3;
 const LANE_COUNT: usize = POOL_COUNT * PRIORITY_COUNT;
 
@@ -117,6 +117,7 @@ const fn pool_index(pool: PoolKind) -> usize {
         PoolKind::Pack => 1,
         PoolKind::Image => 2,
         PoolKind::Archive => 3,
+        PoolKind::Ingest => 4,
     }
 }
 
@@ -126,6 +127,7 @@ const fn pool_from_index(index: usize) -> PoolKind {
         1 => PoolKind::Pack,
         2 => PoolKind::Image,
         3 => PoolKind::Archive,
+        4 => PoolKind::Ingest,
         _ => panic!("invalid pool index"),
     }
 }
@@ -156,7 +158,16 @@ impl ExecutorConfig {
         let cpu_heavy_cap = worker_count.saturating_sub(1).clamp(1, 2);
         Self {
             worker_count,
-            class_caps: [worker_count, cpu_heavy_cap, cpu_heavy_cap, 1],
+            // Fs, Pack, Image, Archive, Ingest.
+            //
+            // Archive gets the CPU-heavy cap rather than 1: extraction is
+            // inflate-bound with a working set of tens of kilobytes, and
+            // measures 3.5-3.8x on four threads (`bench_parallel_extraction_speedup`,
+            // both a 78:1-compressible and an incompressible payload). It used
+            // to be pinned at 1 because it shared a class with ingest, whose
+            // per-job memory runs to tens or hundreds of MB; that constraint
+            // now lives on `Ingest`, where it belongs.
+            class_caps: [worker_count, cpu_heavy_cap, cpu_heavy_cap, cpu_heavy_cap, 1],
             host_cap_when_contended: worker_count.div_ceil(2),
             aging_interval: 16,
         }
@@ -172,6 +183,16 @@ struct Dispatched<T> {
     host: HostToken,
     pool: PoolKind,
     value: T,
+}
+
+/// Whether the per-host dispatch cap applies to a given dispatch pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostFairness {
+    /// A host already at its contended cap yields the worker to its peers.
+    Enforced,
+    /// Taken only after `Enforced` found nothing: no peer could use the free
+    /// worker, so the cap has no one left to protect.
+    Relaxed,
 }
 
 struct QueueState<T> {
@@ -217,13 +238,32 @@ impl<T> QueueState<T> {
             return None;
         }
 
+        // The per-host cap keeps one host's backlog from deciding when another
+        // host's IO runs. When it blocks *every* queued job, though, no peer
+        // was waiting for the worker it just idled -- the cap would only slow
+        // down the one host that has work while a thread sits parked. So the
+        // fair pass runs first, and a relaxed pass picks up what it refused.
+        //
+        // Class caps apply to both passes: those bound how much of a resource
+        // is in flight, not how it is shared.
+        if let Some(job) = self.pop_with_fairness(config, HostFairness::Enforced) {
+            return Some(job);
+        }
+        self.pop_with_fairness(config, HostFairness::Relaxed)
+    }
+
+    fn pop_with_fairness(
+        &mut self,
+        config: &ExecutorConfig,
+        fairness: HostFairness,
+    ) -> Option<Dispatched<T>> {
         let aging_due = self.dispatch_count != 0
             && self.dispatch_count.is_multiple_of(config.aging_interval)
             && self.has_priority_work(PriorityClass::Background)
             && (self.has_priority_work(PriorityClass::ForegroundBlocking)
                 || self.has_priority_work(PriorityClass::ForegroundAsync));
         if aging_due {
-            if let Some(job) = self.pop_priority(PriorityClass::Background, config) {
+            if let Some(job) = self.pop_priority(PriorityClass::Background, config, fairness) {
                 return Some(job);
             }
         }
@@ -233,7 +273,7 @@ impl<T> QueueState<T> {
             PriorityClass::ForegroundAsync,
             PriorityClass::Background,
         ] {
-            if let Some(job) = self.pop_priority(priority, config) {
+            if let Some(job) = self.pop_priority(priority, config, fairness) {
                 return Some(job);
             }
         }
@@ -251,10 +291,12 @@ impl<T> QueueState<T> {
         &mut self,
         priority: PriorityClass,
         config: &ExecutorConfig,
+        fairness: HostFairness,
     ) -> Option<Dispatched<T>> {
         let priority_idx = priority_index(priority);
         let cursor = self.class_cursor[priority_idx];
-        let host_contended = self.pending_by_host.len() > 1;
+        let host_contended =
+            fairness == HostFairness::Enforced && self.pending_by_host.len() > 1;
         let active_by_host = &self.active_by_host;
         let host_cap = config.host_cap_when_contended;
 
@@ -886,13 +928,81 @@ mod r5_queue_tests {
         assert_eq!(next.value, 20);
     }
 
+    /// The per-host cap is a sharing rule, so it may only cost a worker when
+    /// there is someone to share with. Here the peer's only queued job sits in
+    /// a class that is already full, so honouring the cap would park a thread
+    /// and stall the one host that can actually use it -- fairness paid for
+    /// with throughput that nobody collects.
+    #[test]
+    fn capped_host_still_gets_a_worker_no_peer_can_use() {
+        // Four workers, so the contended cap is two and the host holding three
+        // is unambiguously over it.
+        let config = ExecutorConfig::for_workers(4);
+        let mut state = QueueState::default();
+        for id in 0_u32..3 {
+            state.push(
+                HostToken(1),
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                id,
+            );
+            assert_eq!(state.pop_next(&config).unwrap().host, HostToken(1));
+        }
+
+        // Host 1 still has work. Host 2's only work is Archive, whose class cap
+        // is spent, so nothing host 2 owns can be dispatched.
+        state.push(
+            HostToken(1),
+            PoolKind::Fs,
+            PriorityClass::ForegroundAsync,
+            10,
+        );
+        state.push(
+            HostToken(2),
+            PoolKind::Archive,
+            PriorityClass::ForegroundAsync,
+            20,
+        );
+        state.active_by_class[pool_index(PoolKind::Archive)] = config.class_cap(PoolKind::Archive);
+
+        let next = state
+            .pop_next(&config)
+            .expect("a free worker must not park while dispatchable work is queued");
+        assert_eq!(next.host, HostToken(1));
+        assert_eq!(next.value, 10);
+    }
+
+    /// The relaxed pass must not become a way around the class caps: those
+    /// bound how much of a resource is in flight, not how it is shared.
+    #[test]
+    fn relaxed_pass_still_honours_class_caps() {
+        let config = ExecutorConfig::for_workers(4);
+        let mut state = QueueState::default();
+        state.active_by_class[pool_index(PoolKind::Archive)] = config.class_cap(PoolKind::Archive);
+        state.push(
+            HostToken(1),
+            PoolKind::Archive,
+            PriorityClass::ForegroundBlocking,
+            1_u32,
+        );
+
+        assert!(
+            state.pop_next(&config).is_none(),
+            "a full class must stay full even when no other host is waiting"
+        );
+        assert_eq!(state.pending_total, 1);
+    }
+
     #[test]
     fn image_pack_and_archive_respect_class_caps() {
         let config = ExecutorConfig::for_workers(6);
         for (pool, cap) in [
             (PoolKind::Image, 2_usize),
             (PoolKind::Pack, 2),
-            (PoolKind::Archive, 1),
+            (PoolKind::Archive, 2),
+            // The one class that must stay serial: a single ingest can hold
+            // an image's RGBA, its ETC2 blocks and its KTX2 container at once.
+            (PoolKind::Ingest, 1),
         ] {
             let mut state = QueueState::default();
             for id in 0_u32..4 {
@@ -1237,7 +1347,8 @@ mod r5_executor_tests {
             (PoolKind::Fs, 4),
             (PoolKind::Pack, 2),
             (PoolKind::Image, 2),
-            (PoolKind::Archive, 1),
+            (PoolKind::Archive, 2),
+            (PoolKind::Ingest, 1),
         ] {
             assert_runtime_class_cap(pool, expected_cap);
         }

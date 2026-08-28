@@ -67,6 +67,7 @@ pub mod atrace;
 #[doc(hidden)]
 pub mod backend;
 mod canvas;
+pub(crate) mod canvas_keyed;
 mod canvas2d_dispatcher;
 pub mod compressed_upload;
 pub(crate) mod damage_effect;
@@ -90,7 +91,34 @@ mod surface_binding;
 pub mod surface_system;
 pub mod text_measurer_impl;
 pub mod texture_import;
-pub mod upload_policy;
+// `upload_policy` was removed rather than wired up, and the reason belongs here
+// so it is not rebuilt.
+//
+// It offered one `select()` returning an `UploadStrategy` for all three upload
+// paths — AHB zero-copy, compressed GPU, RGBA PBO/direct — and its module doc
+// described that centralisation in the past tense, as work already done. It had
+// no callers at all: the three decisions stayed where they were, in
+// `canvas/manager/image.rs`, `pbo_upload::TextureUploadPath::select`, and
+// `compressed_upload::CompressedFormatSupport::is_supported`. A reader who
+// believed the doc would have thought changing one of those changed all three.
+//
+// Wiring it up would also have been wrong, which is the part worth keeping. Its
+// premise was that the choice is a pure function of static device capabilities,
+// and it is not:
+//
+// * `load_ahb_image` additionally consults `gpu_caps.snapshot().ahb`, a
+//   *runtime* flag that a rejected import turns off for the rest of the session.
+//   `UploadInputs` had no field for it, so a wired-up `select` would have kept
+//   returning `AndroidHardwareBuffer` after the driver refused one.
+// * That same path falls back *into* the RGBA path when the import fails, so its
+//   decision is entangled with its own error handling rather than made up front.
+// * `pbo_upload` tiers PBO against direct by image size internally, after the
+//   strategy would already have been chosen.
+//
+// A single up-front selector cannot express a decision that depends on runtime
+// state and on the outcome of attempting it. Its `Fallback` variant — never
+// constructed, documented as "returned when no specialised path applies" — was
+// the shape of that gap showing through.
 pub(crate) mod upload_server;
 pub mod upload_thread;
 mod webgl_gpu_budget;

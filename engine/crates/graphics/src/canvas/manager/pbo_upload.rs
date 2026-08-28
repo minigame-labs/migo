@@ -372,6 +372,33 @@ fn upload_sync_internal(
 /// This reduces allocation overhead for games that frequently load/unload textures.
 /// Each returned PBO carries a fence sync so that on Adreno GPUs (and others)
 /// we do not re-use a PBO whose previous DMA transfer has not completed.
+/// Whether a `glClientWaitSync` status means the previous DMA has finished.
+///
+/// Taken with a zero timeout here, so the only outcomes are "done"
+/// (`ALREADY_SIGNALED`), "done while we asked" (`CONDITION_SATISFIED`), "not
+/// done" (`TIMEOUT_EXPIRED`) and "the driver refused to answer"
+/// (`WAIT_FAILED`). The last two are the same decision: do not reuse.
+///
+/// **One spelling, three fences.** This was a local copy of the comparison
+/// `CanvasManager::drain_upload_completed` makes on upload fences, with a
+/// comment noting that two spellings of "is the GPU done" would be two chances
+/// to get one wrong. A third then appeared on the pre-blit snapshot fence, so it
+/// is now [`super::fence_signalled`] and the copies are gone.
+use super::fence_signalled as dma_complete;
+
+/// Index of the first pool entry that can be reused *without waiting* for a
+/// request of `size`, given `(entry_size, dma_complete)` per entry.
+///
+/// `None` means every candidate is either too small or still in flight, and the
+/// caller should take a fresh buffer name rather than block. Size is a hard
+/// requirement; readiness is what makes waiting unnecessary.
+#[inline]
+fn first_reusable(entries: &[(usize, bool)], size: usize) -> Option<usize> {
+    entries
+        .iter()
+        .position(|(entry_size, ready)| *entry_size >= size && *ready)
+}
+
 pub struct PboPool {
     /// Available PBOs: (buffer, capacity, optional fence from last upload).
     available: Vec<(glow::NativeBuffer, usize, Option<glow::NativeFence>)>,
@@ -410,36 +437,78 @@ impl PboPool {
     /// timeout) for the DMA transfer to complete before returning it.  This
     /// prevents GPU stalls on Adreno and similar drivers where reusing a PBO
     /// whose transfer is still in flight causes the driver to block.
+    ///
+    /// # Why this probes instead of waiting
+    ///
+    /// This used to `glClientWaitSync` for up to 5 ms on the render thread, and
+    /// on timeout delete the buffer and create a fresh one. **The wait was
+    /// strictly dominated, and settling that needs no hardware.**
+    ///
+    /// The two things that decide it:
+    ///
+    /// 1. **Every write to a PBO from this pool is a full respecify.** All four
+    ///    sites — [`upload_pbo_mutable`], [`upload_pbo_immutable`], and the two
+    ///    WebGL paths in `renderergl::handler` — call
+    ///    `buffer_data_u8_slice(PIXEL_UNPACK_BUFFER, .., STREAM_DRAW)` over the
+    ///    whole buffer; none uses `buffer_sub_data` or a mapping. A conforming
+    ///    GLES 3.0 driver orphans the previous storage on that call (§2.9),
+    ///    which is why `STREAM_DRAW` plus a full `glBufferData` is the
+    ///    canonical stall-free streaming idiom. This engine's other PBO pool
+    ///    relies on exactly that, and keeps no fences at all — see
+    ///    [`crate::upload_thread`].
+    ///
+    /// 2. **The old timeout path already did the safe thing, 5 ms late.** It
+    ///    fell back to a fresh buffer name, whose storage the caller's
+    ///    `glBufferData` allocates. A fresh buffer cannot be in flight, so it
+    ///    is safe whether or not the driver honours the orphan.
+    ///
+    /// Put together: if the driver orphans, the wait was pure waste; if it
+    /// stalls instead — the Adreno behaviour the previous comment described —
+    /// the answer is still not to wait, because the fresh buffer that the
+    /// timeout eventually produced was available immediately. Either way there
+    /// is no state of the world in which blocking the render thread helps.
+    ///
+    /// So the fence survives, demoted to a zero-timeout *probe*: it tells us
+    /// whether a warm buffer can be reused right now, and when none can we take
+    /// a fresh name instead of waiting for one. Worst case is now one
+    /// `glGenBuffers` rather than 5 ms of a 16.67 ms budget, and the two pools
+    /// no longer implement opposite policies for the same access pattern.
+    ///
+    /// The decision rests on two predicates, both pure and both exhaustively
+    /// tested without a GL context: [`dma_complete`] and [`first_reusable`].
     pub fn acquire(&mut self, gl: &glow::Context, size: usize) -> Option<glow::NativeBuffer> {
         if !self.pbo_supported {
             return None;
         }
 
-        // Find a suitable PBO from the pool.
-        if let Some(idx) = self.available.iter().position(|(_, s, _)| *s >= size) {
-            let (pbo, _, fence) = self.available.remove(idx);
-            // Wait for previous DMA to finish before reusing the buffer.
-            if let Some(f) = fence {
-                let status = unsafe {
-                    // 5 ms timeout — generous enough for any reasonable DMA.
-                    gl.client_wait_sync(f, glow::SYNC_FLUSH_COMMANDS_BIT, 5_000_000)
+        // Probe, never wait. See `first_reusable`: taking a fresh buffer is
+        // safe whatever the driver does with an in-flight one, so there is
+        // nothing a wait can buy.
+        // Inline capacity covers `max_pool_size`, which `new` caps at
+        // `DEFAULT_POOL_SIZE * 2`, so this never reaches the heap.
+        let view: smallvec::SmallVec<[(usize, bool); 8]> = self
+            .available
+            .iter()
+            .map(|(_, entry_size, fence)| {
+                let ready = match fence {
+                    None => true,
+                    // Zero timeout: this asks, it does not wait.
+                    Some(f) => dma_complete(unsafe { gl.client_wait_sync(*f, 0, 0) }),
                 };
+                (*entry_size, ready)
+            })
+            .collect();
+
+        if let Some(idx) = first_reusable(&view, size) {
+            let (pbo, _, fence) = self.available.remove(idx);
+            if let Some(f) = fence {
                 unsafe { gl.delete_sync(f) };
-                if status == glow::TIMEOUT_EXPIRED || status == glow::WAIT_FAILED {
-                    // DMA still in flight or driver error — discard this PBO
-                    // and create a fresh one to avoid a GPU stall.
-                    warn!(
-                        "PBO fence wait failed (status=0x{:X}), discarding PBO",
-                        status
-                    );
-                    unsafe { gl.delete_buffer(pbo) };
-                    return unsafe { gl.create_buffer().ok() };
-                }
             }
             return Some(pbo);
         }
 
-        // Create a new PBO.
+        // Nothing reusable without waiting — take a fresh name. Its storage is
+        // allocated by the `glBufferData` the caller is about to issue.
         unsafe { gl.create_buffer().ok() }
     }
 
@@ -585,6 +654,141 @@ mod tests {
     // Path selection is a pure function — exhaustive decision-table tests
     // below run without any GL context.  Full-stack upload tests require a
     // GL context and live in the on-device integration suite.
+
+    // ── PBO reuse: probe, never wait ─────────────────────────────────────
+    //
+    // `acquire` used to block the render thread for up to 5 ms on a fence and,
+    // on timeout, throw the buffer away and create a fresh one. The wait was
+    // strictly dominated — see `PboPool::acquire` — and these pin the two
+    // predicates the replacement rests on.
+
+    /// Every status `glClientWaitSync` can return, enumerated, for the one
+    /// predicate all three fence sites now share.
+    ///
+    /// `TIMEOUT_EXPIRED` and `WAIT_FAILED` are the same decision — the GPU has
+    /// not passed the fence — but for different reasons, and each site pays a
+    /// different price for admitting either:
+    ///
+    /// * `PboPool::acquire` would hand out a buffer whose DMA is still reading
+    ///   it, so the next upload overwrites pixels in flight.
+    /// * `drain_upload_completed` would register a texture whose upload has not
+    ///   landed, so a draw samples undefined contents.
+    /// * `snapshot_canvas2d_region` would blit pre-draw tiles, which is the
+    ///   blank-text-label defect its fence exists to prevent.
+    ///
+    /// None of the three produces a GL error, which is why the predicate is
+    /// asserted here rather than trusted.
+    #[test]
+    fn only_a_signalled_fence_means_the_gpu_is_done() {
+        assert!(dma_complete(glow::ALREADY_SIGNALED));
+        assert!(dma_complete(glow::CONDITION_SATISFIED));
+        assert!(
+            !dma_complete(glow::TIMEOUT_EXPIRED),
+            "an unfinished fence was reported as passed"
+        );
+        assert!(
+            !dma_complete(glow::WAIT_FAILED),
+            "a driver that refused to answer was read as a yes"
+        );
+
+        // The four are distinct values, so the predicate is discriminating
+        // rather than accidentally right about a pair that happens to collide.
+        let all = [
+            glow::ALREADY_SIGNALED,
+            glow::CONDITION_SATISFIED,
+            glow::TIMEOUT_EXPIRED,
+            glow::WAIT_FAILED,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two wait statuses share a value");
+            }
+        }
+
+        // And nothing outside the enumerated set is admitted — a driver
+        // returning something undocumented must not read as success.
+        for bogus in [0u32, 1, 0xFFFF_FFFF] {
+            if !all.contains(&bogus) {
+                assert!(
+                    !dma_complete(bogus),
+                    "undocumented status 0x{bogus:08X} was read as a passed fence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_pool_has_nothing_to_reuse() {
+        assert_eq!(first_reusable(&[], 1024), None);
+    }
+
+    #[test]
+    fn a_ready_entry_of_sufficient_size_is_reused() {
+        assert_eq!(first_reusable(&[(2048, true)], 1024), Some(0));
+        assert_eq!(first_reusable(&[(1024, true)], 1024), Some(0));
+    }
+
+    /// Size is a hard requirement: a too-small buffer would make the caller's
+    /// `glBufferData` reallocate anyway, which is what taking a fresh name
+    /// already does without disturbing the pool.
+    #[test]
+    fn an_entry_smaller_than_the_request_is_never_reused() {
+        assert_eq!(first_reusable(&[(512, true)], 1024), None);
+    }
+
+    /// The whole point: an in-flight entry is skipped rather than waited on.
+    #[test]
+    fn an_entry_still_in_flight_is_skipped_not_waited_for() {
+        assert_eq!(
+            first_reusable(&[(4096, false)], 1024),
+            None,
+            "an in-flight buffer was selected, so `acquire` would hand out a \
+             buffer whose previous DMA has not finished"
+        );
+    }
+
+    /// Scanning past an in-flight entry is what keeps a warm pool useful: one
+    /// slow upload must not force every later acquire onto a fresh buffer.
+    #[test]
+    fn the_scan_looks_past_an_in_flight_entry_to_a_ready_one() {
+        assert_eq!(first_reusable(&[(4096, false), (2048, true)], 1024), Some(1));
+    }
+
+    /// And past a too-small one, in either order — a pool sorted by size puts
+    /// the small entries first.
+    #[test]
+    fn the_scan_looks_past_a_too_small_entry_to_a_ready_one() {
+        assert_eq!(first_reusable(&[(256, true), (2048, true)], 1024), Some(1));
+        assert_eq!(
+            first_reusable(&[(256, true), (512, false), (2048, true)], 1024),
+            Some(2)
+        );
+    }
+
+    /// A pool where nothing qualifies must report so rather than settle for a
+    /// buffer that fails either requirement.
+    #[test]
+    fn a_pool_with_no_qualifying_entry_reports_none() {
+        assert_eq!(
+            first_reusable(&[(256, true), (4096, false), (512, true)], 1024),
+            None
+        );
+    }
+
+    /// Ties go to the earliest entry. `release` keeps the pool sorted by size,
+    /// so first-fit is also best-fit, and taking the smallest sufficient buffer
+    /// leaves the large ones for the requests that need them.
+    #[test]
+    fn first_fit_over_a_size_sorted_pool_is_best_fit() {
+        assert_eq!(
+            first_reusable(&[(1024, true), (2048, true), (4096, true)], 1024),
+            Some(0)
+        );
+        assert_eq!(
+            first_reusable(&[(1024, true), (2048, true), (4096, true)], 2000),
+            Some(1)
+        );
+    }
 
     #[test]
     fn legacy_ahb_upload_obeys_the_session_circuit_breaker() {

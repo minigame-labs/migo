@@ -11,10 +11,25 @@
 /// back to `DamageRegion::FullSurface`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DamageRect {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
+    // Private, so [`DamageRect::new`] is the only way in and "a `DamageRect`
+    // exists" means "its geometry is valid".
+    //
+    // They were `pub`, and the gap that opened is worth recording: `from_rect`
+    // documented itself as returning `FullSurface` on invalid geometry and never
+    // checked, because with public fields anyone could build a zero- or
+    // negative-sized rect without passing through the constructor. Such a rect
+    // reaches `glBlitFramebuffer` as an empty box, which repairs nothing — so
+    // the region it claimed to cover keeps the previous frame's pixels, with no
+    // GL error and nothing in a log.
+    //
+    // Production never did build one (the one caller guards on
+    // `DamageRect::new`), so this closes a latent hole rather than a live bug.
+    // The point is that the invariant is now the type's rather than the caller's:
+    // there is no longer a `from_rect` contract to get wrong.
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
 }
 
 impl DamageRect {
@@ -36,6 +51,16 @@ impl DamageRect {
             width,
             height,
         })
+    }
+
+    /// Lower-left origin and extent, in surface pixels.
+    ///
+    /// One accessor rather than four, because every consumer wants all of them
+    /// — `drawing_buffer` turns them straight into blit corners — and four calls
+    /// invite reading three and computing the fourth wrong.
+    #[inline]
+    pub fn xywh(self) -> (i32, i32, i32, i32) {
+        (self.x, self.y, self.width, self.height)
     }
 
     /// Right edge (exclusive), always valid after construction.
@@ -126,7 +151,15 @@ impl PartialRegion {
 }
 
 impl DamageRegion {
-    /// Single-rect partial region. Returns `FullSurface` on invalid geometry.
+    /// Single-rect partial region.
+    ///
+    /// No geometry check, and none needed: [`DamageRect`]'s fields are private,
+    /// so the only way to hold one is through `DamageRect::new`, which rejects
+    /// non-positive extents and edges that overflow `i32`. This used to promise
+    /// "returns `FullSurface` on invalid geometry" and never checked — a promise
+    /// that mattered because the fields were public. Making the type carry the
+    /// invariant removed the need for the promise rather than the promise's
+    /// falsehood.
     pub fn from_rect(r: DamageRect) -> Self {
         DamageRegion::Partial(PartialRegion::single(r))
     }
@@ -437,7 +470,31 @@ pub fn blit_plan(
             rects[..len as usize].copy_from_slice(p.rects());
             BlitPlan::Rects(BlitRects { rects, len })
         }
-        _ => BlitPlan::Full { linear: true },
+        // **NEAREST when the copy is 1:1, and that is the common case.**
+        //
+        // This arm used to hardcode `linear: true`, so `linear: false` was never
+        // produced and a full-surface blit always asked for bilinear filtering —
+        // including when the DrawingBuffer and the window surface are the same
+        // size, which is a straight copy. A bilinear full-screen blit makes the
+        // driver read four texels per output pixel where one would do, and on
+        // tiled mobile GPUs it can leave the fast blit path altogether.
+        //
+        // This is not a rare arm. It is taken every frame on a device without
+        // `EGL_KHR_partial_update` / `EGL_EXT_buffer_age`, and every frame for
+        // any content whose damage is full-surface — which is most 3D games,
+        // since they clear the whole screen. At 1080x2400 that is the single
+        // largest per-frame bandwidth item in the engine.
+        //
+        // `blit_from_surface` in `drawing_buffer` has always picked the filter
+        // this way for the reverse copy. The rare path had it right and the
+        // per-frame path did not.
+        //
+        // LINEAR is still required when the sizes differ: `glBlitFramebuffer`
+        // rejects a scaling blit asking for NEAREST on some drivers, which is
+        // the reason `blit_from_surface` records for the same choice.
+        _ => BlitPlan::Full {
+            linear: !db_matches_surface,
+        },
     }
 }
 
@@ -449,6 +506,53 @@ mod tests {
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> DamageRect {
         DamageRect::new(x, y, w, h).expect("valid rect")
+    }
+
+    /// **`DamageRect::new` is the only way to hold one, so its rejections are
+    /// the whole geometry invariant.**
+    ///
+    /// Every rect that reaches `glBlitFramebuffer` as a repair box comes through
+    /// here. A non-positive extent blits nothing, which leaves the region it
+    /// claimed to cover holding the previous frame's pixels — no GL error,
+    /// nothing in a log, just a stale patch. An overflowing edge is worse: the
+    /// arithmetic that computes blit corners wraps.
+    ///
+    /// This was previously only half the story, because the fields were public
+    /// and a caller could skip the constructor. They are private now, which is
+    /// what makes this test cover the type rather than one path into it.
+    #[test]
+    fn a_rect_can_only_exist_if_its_geometry_is_usable() {
+        // Degenerate extents: a blit of these copies nothing.
+        assert!(DamageRect::new(0, 0, 0, 10).is_none(), "zero width");
+        assert!(DamageRect::new(0, 0, 10, 0).is_none(), "zero height");
+        assert!(DamageRect::new(0, 0, -1, 10).is_none(), "negative width");
+        assert!(DamageRect::new(0, 0, 10, -1).is_none(), "negative height");
+
+        // Edges that overflow `i32`: `right()`/`top()` are plain adds after
+        // construction, so a rect that got in here would wrap them.
+        assert!(
+            DamageRect::new(i32::MAX, 0, 1, 1).is_none(),
+            "x + width overflows"
+        );
+        assert!(
+            DamageRect::new(0, i32::MAX, 1, 1).is_none(),
+            "y + height overflows"
+        );
+        assert!(
+            DamageRect::new(1, 1, i32::MAX, i32::MAX).is_none(),
+            "both edges overflow"
+        );
+
+        // The largest rect that still fits is accepted — the check must bound
+        // the edge, not the extent.
+        let biggest = DamageRect::new(0, 0, i32::MAX, i32::MAX).expect("edges land exactly on MAX");
+        assert_eq!(biggest.xywh(), (0, 0, i32::MAX, i32::MAX));
+
+        // And a negative origin is fine: surfaces use lower-left coordinates and
+        // a damage rect may legitimately start left of or below the origin after
+        // a transform, so long as its edges are representable.
+        let offscreen = DamageRect::new(-50, -20, 100, 40).expect("negative origin is valid");
+        assert_eq!(offscreen.xywh(), (-50, -20, 100, 40));
     }
 
     fn partial(rects: &[DamageRect]) -> DamageRegion {
@@ -798,24 +902,55 @@ mod tests {
 
     // ── scaling / multisample → Full BlitPlan ────────────────────────────────
 
+    /// A size mismatch means the blit scales, and a scaling blit needs LINEAR —
+    /// `glBlitFramebuffer` rejects a scaling NEAREST on some drivers.
     #[test]
-    fn size_mismatch_gives_full_blit_plan() {
+    fn size_mismatch_gives_a_scaling_full_blit() {
         let repair = partial(&[r(0, 0, 100, 100)]);
-        let plan = blit_plan(&repair, false, true);
-        assert_eq!(plan, BlitPlan::Full { linear: true });
+        assert_eq!(
+            blit_plan(&repair, false, true),
+            BlitPlan::Full { linear: true }
+        );
     }
 
+    /// **The filter must follow the geometry, not the reason for falling back.**
+    ///
+    /// Both cases below fail partial-repair eligibility for reasons that have
+    /// nothing to do with size — a multisampled destination, and damage that
+    /// covers everything — and in both the DrawingBuffer still matches the
+    /// surface. So the blit is a straight 1:1 copy and must ask for NEAREST.
+    ///
+    /// These two asserted `linear: true` before, which is how the engine came to
+    /// bilinear-filter a full-screen copy on every frame of any device without
+    /// the buffer-age extensions, and on every frame of any content that clears
+    /// the whole screen. Four texels read per output pixel where one would do.
     #[test]
-    fn multisample_gives_full_blit_plan() {
+    fn a_same_size_full_blit_uses_nearest_whatever_forced_it() {
+        // Multisampled destination: partial repair is ineligible, size is not the
+        // reason.
         let repair = partial(&[r(0, 0, 100, 100)]);
-        let plan = blit_plan(&repair, true, false);
-        assert_eq!(plan, BlitPlan::Full { linear: true });
-    }
+        assert_eq!(
+            blit_plan(&repair, true, false),
+            BlitPlan::Full { linear: false },
+            "a multisample fallback scaled nothing, so it must not filter"
+        );
 
-    #[test]
-    fn full_surface_repair_gives_full_blit_plan() {
-        let plan = blit_plan(&DamageRegion::FullSurface, true, true);
-        assert_eq!(plan, BlitPlan::Full { linear: true });
+        // Full-surface damage: nothing to repair partially, still a 1:1 copy.
+        assert_eq!(
+            blit_plan(&DamageRegion::FullSurface, true, true),
+            BlitPlan::Full { linear: false },
+            "full-surface damage on a matching buffer is still a straight copy"
+        );
+
+        // And when the sizes really do differ, both fallbacks scale.
+        assert_eq!(
+            blit_plan(&DamageRegion::FullSurface, false, true),
+            BlitPlan::Full { linear: true }
+        );
+        assert_eq!(
+            blit_plan(&repair, false, false),
+            BlitPlan::Full { linear: true }
+        );
     }
 
     // ── same-size partial → Rects NEAREST ────────────────────────────────────

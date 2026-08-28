@@ -12,7 +12,7 @@ use std::{
 };
 
 #[cfg(feature = "zip-extract")]
-use shared::protocol::io_cmd::ZipEntryResult;
+use shared::protocol::io_cmd::{ZipEntryData, ZipEntryResult};
 use shared::{
     error::{EngineError, ErrorCode},
     protocol::io_cmd::{
@@ -975,15 +975,30 @@ fn next_temp_id() -> u64 {
 
 /// Threshold above which whole-file reads are served via mmap.
 ///
-/// Below this size the raw `File::read` loop is as fast or faster
-/// than setting up a memory mapping + tearing it down again; above
-/// it, avoiding the `Vec` realloc cycle and the per-chunk syscall
-/// boundary wins by a factor of 2-4× on the tail of our read
-/// distribution (big KTX2 atlases, packed JSON blobs, derived
-/// cache sidecars). 256 KiB is slightly above the median Android
-/// kernel readahead window so a single mmap on a file at or above
-/// this size typically issues one readahead instead of many.
-const MMAP_READ_THRESHOLD: u64 = 256 * 1024;
+/// The mmap path is not zero-copy — it maps, then `to_vec`s — so it is not
+/// saving a copy. What it trades is one mapping plus a page fault per page
+/// against a presized `read`. That trade only pays once the file is large
+/// enough for the fault stream to beat the read, and it is a loss below that.
+///
+/// Measured by `bench_mmap_vs_presized_read` on ext4 with a warm page cache,
+/// as a ratio of `read` time to `mmap` time (above 1.0 means mmap wins):
+///
+/// ```text
+///   256 KiB  0.45      2 MiB  0.71       8 MiB  1.20
+///   512 KiB  0.61      4 MiB  0.68      16 MiB  1.48
+///     1 MiB  0.69
+/// ```
+///
+/// The crossover sits between 4 and 8 MiB, so that is where the threshold
+/// goes. It used to be 256 KiB, on the theory that a single mapping issues one
+/// readahead where `read` issues many; the measurement says the opposite at
+/// that size, and everything from 256 KiB to 4 MiB — which is most of a game's
+/// atlases and JSON bundles — was paying 1.4–2.2x for the branch.
+///
+/// Re-run the bench before moving this. Absolute numbers are host-specific;
+/// the shape (per-page fault overhead dominating until the file is large) is
+/// not, which is why the old value was wrong on any filesystem.
+const MMAP_READ_THRESHOLD: u64 = 8 * 1024 * 1024;
 
 /// Read a file (or a range within it). Enforces MAX_READ_LENGTH.
 ///
@@ -1258,7 +1273,7 @@ fn read_zip_entries_from_reader<R: Read + std::io::Seek>(
             let entry_size = entry.size();
             match read_zip_entry_limited(&mut entry, entry_size, None, None) {
                 Ok(buf) => {
-                    let data = encode_zip_data(&buf, global_encoding.as_deref());
+                    let data = encode_zip_data(buf, global_encoding.as_deref());
                     results.push(ZipEntryResult {
                         path: name,
                         data: Some(data),
@@ -1296,7 +1311,7 @@ fn read_zip_entries_from_reader<R: Read + std::io::Seek>(
                     let entry_size = entry.size();
                     match read_zip_entry_limited(&mut entry, entry_size, position, length) {
                         Ok(buf) => {
-                            let data = encode_zip_data(&buf, encoding);
+                            let data = encode_zip_data(buf, encoding);
                             results.push(ZipEntryResult {
                                 path,
                                 data: Some(data),
@@ -1327,17 +1342,23 @@ fn read_zip_entries_from_reader<R: Read + std::io::Seek>(
 }
 
 #[cfg(feature = "zip-extract")]
-fn encode_zip_data(data: &[u8], encoding: Option<&str>) -> String {
+fn encode_zip_data(data: Vec<u8>, encoding: Option<&str>) -> ZipEntryData {
     use base64::Engine;
     match encoding {
-        // No encoding -> binary, return base64 for transport
-        None => base64::engine::general_purpose::STANDARD.encode(data),
+        // No encoding -> the caller wants bytes, and bytes are what the op
+        // hands V8. Nothing encodes or copies them on the way.
+        None => ZipEntryData::Binary(data),
         Some(enc) => {
             // Delegate to codec for full encoding coverage (utf8, utf16le, ucs2, etc.)
-            match shared::codec::decode_bytes(data, enc) {
-                Ok(s) => s,
-                // If codec doesn't support it, fall back to base64
-                Err(_) => base64::engine::general_purpose::STANDARD.encode(data),
+            match shared::codec::decode_bytes(&data, enc) {
+                Ok(s) => ZipEntryData::Text(s),
+                // Codec doesn't know this encoding. Kept as base64 *text*
+                // rather than handed back as bytes: a caller that named an
+                // encoding is expecting a string, and switching it to an
+                // ArrayBuffer would change a behaviour no test pins.
+                Err(_) => ZipEntryData::Text(
+                    base64::engine::general_purpose::STANDARD.encode(&data),
+                ),
             }
         }
     }
@@ -1550,6 +1571,239 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Does the mmap branch in `read_file` earn its keep?
+    ///
+    /// It maps the file and then immediately `to_vec()`s it, so it is not
+    /// saving a copy — the comment there says as much. The claim is that one
+    /// mapping triggers a single readahead where `read` issues many. This puts
+    /// a number on it, because the branch costs an `allow_mmap` flag threaded
+    /// through four call sites plus a soundness rule (never map a file a
+    /// writer could truncate) and should only exist if it pays.
+    ///
+    /// Page cache is warmed first, so this measures the warm path both games
+    /// and this test actually hit on a second load. A cold-cache comparison
+    /// needs `drop_caches` and root.
+    #[test]
+    #[ignore]
+    fn bench_mmap_vs_presized_read() {
+        const ITERATIONS: u32 = 50;
+        for size_kib in [256usize, 512, 1024, 2048, 4096, 8192, 16384] {
+            let dir = tmp_dir(&format!("bench_mmap_{size_kib}"));
+            let path = dir.join("payload.bin");
+            std::fs::write(&path, vec![0xA5u8; size_kib * 1024]).unwrap();
+            let p = path.to_str().unwrap();
+
+            for _ in 0..5 {
+                std::hint::black_box(read_file(p, None, None, false).unwrap());
+                std::hint::black_box(read_file(p, None, None, true).unwrap());
+            }
+
+            let via_read = {
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    std::hint::black_box(read_file(p, None, None, false).unwrap());
+                }
+                started.elapsed()
+            };
+            let via_mmap = {
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    std::hint::black_box(read_file(p, None, None, true).unwrap());
+                }
+                started.elapsed()
+            };
+
+            eprintln!(
+                "{size_kib:>5} KiB   read {:>10?}/call   mmap {:>10?}/call   mmap is {:.2}x read",
+                via_read / ITERATIONS,
+                via_mmap / ITERATIONS,
+                via_read.as_secs_f64() / via_mmap.as_secs_f64().max(f64::MIN_POSITIVE)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // readZipEntry
+    //
+    // These pin the JS-visible contract of a public API that had no coverage:
+    // binary entries arrive as bytes, entries with an encoding arrive decoded,
+    // and a missing entry reports rather than fails the batch.
+    // ---------------------------------------------------------------------
+
+    #[cfg(feature = "zip-extract")]
+    fn entry_text(result: &ZipEntryResult) -> Option<&str> {
+        match result.data.as_ref()? {
+            ZipEntryData::Text(s) => Some(s.as_str()),
+            ZipEntryData::Binary(_) => panic!("expected text for {}", result.path),
+        }
+    }
+
+    #[cfg(feature = "zip-extract")]
+    fn entry_bytes(result: &ZipEntryResult) -> Option<&[u8]> {
+        match result.data.as_ref()? {
+            ZipEntryData::Binary(b) => Some(b.as_slice()),
+            ZipEntryData::Text(_) => panic!("expected bytes for {}", result.path),
+        }
+    }
+
+    #[cfg(feature = "zip-extract")]
+    fn write_test_zip(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+        use std::io::Write;
+
+        let zip_path = dir.join("entries.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        zip_path
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_without_encoding_stays_raw_bytes() {
+        let dir = tmp_dir("zip_entry_binary");
+        // Bytes that are not valid UTF-8, so only a binary-safe transport can
+        // carry them intact.
+        let payload: Vec<u8> = vec![0x00, 0xFF, 0x89, 0x50, 0x4E, 0x47, 0x80, 0x01];
+        let zip_path = write_test_zip(&dir, &[("img/bg.png", &payload)]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"entries":[{"path":"img/bg.png"}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "img/bg.png");
+        assert_eq!(results[0].err_msg, "");
+        assert_eq!(
+            entry_bytes(&results[0]).expect("entry data"),
+            payload.as_slice(),
+            "binary entries must survive the transport byte-for-byte"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_with_utf8_encoding_is_decoded_text() {
+        let dir = tmp_dir("zip_entry_text");
+        let zip_path = write_test_zip(&dir, &[("cfg.json", b"{\"a\":1}")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":[{"path":"cfg.json"}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(entry_text(&results[0]), Some("{\"a\":1}"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn missing_zip_entry_reports_without_failing_the_batch() {
+        let dir = tmp_dir("zip_entry_missing");
+        let zip_path = write_test_zip(&dir, &[("present.txt", b"here")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":[{"path":"absent.txt"},{"path":"present.txt"}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 2, "a missing entry must not drop its sibling");
+        assert_eq!(results[0].path, "absent.txt");
+        assert!(results[0].data.is_none());
+        assert!(
+            results[0].err_msg.contains("not found"),
+            "unexpected error: {}",
+            results[0].err_msg
+        );
+        assert_eq!(entry_text(&results[1]), Some("here"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entries_all_reads_every_file_and_skips_directories() {
+        let dir = tmp_dir("zip_entry_all");
+        let zip_path = write_test_zip(&dir, &[("a.txt", b"one"), ("sub/b.txt", b"two")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":"all"}"#,
+            None,
+        )
+        .unwrap();
+
+        let mut seen: Vec<(String, String)> = results
+            .iter()
+            .map(|r| (r.path.clone(), entry_text(r).unwrap_or_default().to_string()))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("a.txt".to_string(), "one".to_string()),
+                ("sub/b.txt".to_string(), "two".to_string()),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_honours_position_and_length() {
+        let dir = tmp_dir("zip_entry_range");
+        let zip_path = write_test_zip(&dir, &[("data.txt", b"0123456789")]);
+
+        let results = read_zip_entry(
+            zip_path.to_str().unwrap(),
+            r#"{"encoding":"utf8","entries":[{"path":"data.txt","position":3,"length":4}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(entry_text(&results[0]), Some("3456"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip-extract")]
+    #[test]
+    fn zip_entry_reads_from_in_memory_pack_data() {
+        let dir = tmp_dir("zip_entry_packdata");
+        let zip_path = write_test_zip(&dir, &[("in_pack.txt", b"from memory")]);
+        let bytes = std::fs::read(&zip_path).unwrap();
+
+        // The pack-backed path parses the archive out of a buffer rather than
+        // a file, and must produce the same results.
+        let results = read_zip_entry(
+            "/nonexistent/ignored.zip",
+            r#"{"encoding":"utf8","entries":[{"path":"in_pack.txt"}]}"#,
+            Some(bytes),
+        )
+        .unwrap();
+
+        assert_eq!(entry_text(&results[0]), Some("from memory"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[derive(Debug)]

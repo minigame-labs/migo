@@ -81,9 +81,10 @@ mod pbo_upload;
 mod types;
 
 pub(crate) use types::{
-    BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta,
-    MAX_UNIFORM_CACHE, ProgramMeta, QueryMeta, RenderbufferMeta, SamplerMeta, ScissorState,
-    ShaderMeta, SyncMeta, TextureMeta, TransformFeedbackMeta, VaoMeta, VertexAttribPointerFp, ee,
+    BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, CanvasStateTable,
+    FramebufferMeta, MAX_UNIFORM_CACHE, ProgramMeta, QueryMeta, RenderbufferMeta, SamplerMeta,
+    ScissorState, ShaderMeta, SyncMeta, TextureMeta, TransformFeedbackMeta, VaoMeta,
+    VertexAttribPointerFp, ee,
 };
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
@@ -163,6 +164,114 @@ fn should_latch_default_fbo_readback(needs_default_fbo_readback: bool) -> bool {
     !needs_default_fbo_readback
 }
 
+/// Gather one frame's worth of upload completions into a reusable buffer:
+/// whatever was deferred from earlier frames, then whatever `fill` produces.
+///
+/// **Both vectors keep their allocations.** The shape this replaced —
+/// `let mut v = Vec::new(); fill(&mut v); let mut d = mem::take(&mut pending);
+/// d.extend(v); for x in d { … pending.push(x) }` — gave one back and bought
+/// another every frame that had an upload in flight, because consuming `d` by
+/// value frees its buffer while `mem::take` has already reduced `pending` to
+/// capacity zero. During a level load or texture streaming that is a `malloc`
+/// and a `free` per frame on the render thread.
+///
+/// `Vec::append` is what makes it free: it moves the elements out of `pending`
+/// and leaves it empty *with its capacity intact*, so the caller's re-defer
+/// pushes land in the buffer that is already there. `fill` drains straight into
+/// the scratch, which removes the intermediate vector entirely.
+///
+/// Element order is preserved — deferred first, newly arrived after — because
+/// the caller's fence check is order-sensitive in one direction: an upload
+/// deferred N frames ago is the one most likely to be ready now, and putting it
+/// first keeps the common case at the front of the scan.
+///
+/// **The Canvas2D snapshot pool's two caps only work as a pair, so their
+/// relationship is a build error rather than a test.**
+///
+/// Guards `CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS` (1024 entries) and
+/// `MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES` (64 MiB, tied to the sync-readback
+/// ceiling). Three things have to stay true:
+///
+/// 1. For the shape the pool exists to cache — a 200x40 RGBA8 text strip,
+///    32,000 bytes — the *count* cap binds first. If the byte cap started
+///    binding, a text-heavy frame would be limited by GPU bytes instead of entry
+///    count and the 1024 figure would stop meaning anything.
+/// 2. For a large capture — 1024x1024 RGBA is 4 MiB — the *byte* cap binds
+///    first, which is its only job. Sixteen of those reach 64 MiB while the
+///    count cap is still a thousand entries away.
+/// 3. The count cap comfortably exceeds the worst case it was sized for: ~200
+///    text sprites in one Cocos shop frame, each taking a snapshot. Four times
+///    over, so a scene twice as heavy still has headroom.
+///
+/// **A free `const`, deliberately.** This first lived as an associated const
+/// inside `impl CanvasManager`, which compiles but enforces nothing: an unused
+/// associated const's initializer is never evaluated, so breaking a cap left the
+/// build green. Reverse-validating the assertion is what surfaced that — the
+/// form matters as much as the predicate.
+const _: () = {
+    const TEXT_STRIP: usize = 200 * 40 * 4;
+    const LARGE_CAPTURE: usize = 1024 * 1024 * 4;
+    const OBSERVED_SPRITES_PER_FRAME: usize = 200;
+
+    assert!(
+        CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES / TEXT_STRIP
+            > CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS,
+        "the byte cap now binds before the count cap for a typical text strip, \
+         so a text-heavy frame is limited by GPU bytes rather than entry count"
+    );
+    assert!(
+        CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES / LARGE_CAPTURE
+            < CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS,
+        "the byte cap no longer bounds large captures before the count cap, \
+         which was its only job"
+    );
+    assert!(
+        CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS >= OBSERVED_SPRITES_PER_FRAME * 4,
+        "the count cap no longer comfortably exceeds the ~200 text sprites per \
+         frame it was sized for"
+    );
+};
+
+/// Whether a `glClientWaitSync` status means the GPU has passed the fence.
+///
+/// The four possible returns are `ALREADY_SIGNALED` (done before we asked),
+/// `CONDITION_SATISFIED` (done while we waited), `TIMEOUT_EXPIRED` (not done)
+/// and `WAIT_FAILED` (the driver refused to answer). Only the first two are a
+/// yes, and the last two are the same decision at every call site even though
+/// they mean different things — one is a slow GPU, the other is a broken one,
+/// and neither permits proceeding as though the work landed.
+///
+/// **One spelling for three fences,** which is the point of hoisting it here.
+/// `drain_upload_completed` polls upload fences with a zero timeout,
+/// `pbo_upload::PboPool::acquire` polls DMA fences the same way, and
+/// `snapshot_canvas2d_region` waits on a pre-blit fence with a real timeout.
+/// Each had its own copy of the comparison; a fourth would eventually have
+/// admitted `TIMEOUT_EXPIRED` by writing `!=` where it meant `==`, and the
+/// symptom — reusing a buffer the GPU is still reading, or blitting pre-draw
+/// tiles — produces no GL error.
+///
+/// A free function so it can be tested without a GL context, like
+/// [`stage_upload_drain`] below.
+#[inline]
+pub(super) fn fence_signalled(status: u32) -> bool {
+    status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED
+}
+
+/// A free function rather than a method so the allocation claim can be gated
+/// without a GL context: [`CanvasManager::drain_upload_completed`] calls
+/// `glClientWaitSync`, and reaching it needs a live context.
+fn stage_upload_drain<T>(
+    scratch: &mut Vec<T>,
+    pending: &mut Vec<T>,
+    fill: impl FnOnce(&mut Vec<T>),
+) -> Vec<T> {
+    let mut staged = std::mem::take(scratch);
+    staged.clear();
+    staged.append(pending);
+    fill(&mut staged);
+    staged
+}
+
 fn decide_async_upload_reject_action(
     upload_thread_healthy: bool,
     upload_server: Option<&crate::upload_server::UploadServer>,
@@ -220,7 +329,9 @@ pub(crate) struct CanvasManager {
     next_canvas_id: AtomicU32,
 
     // 2D
-    pub(super) contexts_2d: HashMap<CanvasId, Canvas2DContext>,
+    /// See [`crate::canvas_keyed`]: reached twice per Canvas2D command, once to
+    /// classify the draw's damage and once to run the command.
+    pub(super) contexts_2d: crate::canvas_keyed::CanvasKeyed<Canvas2DContext>,
     pub(super) dirty_2d: HashSet<CanvasId>,
 
     // Image registry
@@ -241,8 +352,21 @@ pub(crate) struct CanvasManager {
     /// Keyed by an opaque `snapshot_id` JS holds onto.  Drained at
     /// frame-end (`drain_canvas2d_snapshots`) so cocos's
     /// `getImageData(text)`→`texImage2D` pattern stays GPU-only and
-    /// never builds up across frames.  Bounded at
-    /// [`MAX_LIVE_CANVAS2D_SNAPSHOTS`] entries; oldest evicted first.
+    /// never builds up across frames.
+    ///
+    /// Bounded two ways, and **at the cap a new capture is refused, not traded
+    /// for an old one** — this said "oldest evicted first", which the code has
+    /// never done and must not. Every live entry is waiting for a
+    /// `TexImage2DFromSnapshot` that JS has already committed to issuing;
+    /// evicting one to make room turns a bounded pool into a missing texture.
+    /// Refusing returns `0`, which JS reads as "fall back to the legacy CPU
+    /// readback" — slower for that one label, correct for all of them.
+    ///
+    /// The two bounds are `MAX_LIVE_CANVAS2D_SNAPSHOTS` (1024 entries) and
+    /// `MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES` (64 MiB). Which one binds depends on
+    /// snapshot size: at the typical 200x40 text strip (31.25 KiB) the byte cap
+    /// would allow ~2048, so the count cap binds first; for large captures the
+    /// byte cap binds first. Both are checked before any GPU work.
     canvas2d_snapshots: HashMap<u32, Canvas2DSnapshotEntry>,
     /// Aggregate RGBA bytes retained by the live snapshot textures.
     canvas2d_snapshot_bytes: usize,
@@ -354,6 +478,33 @@ pub(crate) struct CanvasManager {
     /// path only; it adds no work to drawing or presentation.
     pending_onscreen: Option<PendingOnscreenEgl>,
 
+    /// The canvases a context-loss teardown destroyed and the rebuild still owes
+    /// the game, parked here so a failed attempt can resume instead of losing
+    /// them.
+    ///
+    /// **Why a field and not a local.** `tear_down_share_group` returns a
+    /// [`ShareGroupRestorePlan`] precisely so the obligation to re-create those
+    /// canvases is explicit — its doc says a teardown not followed by a matching
+    /// restore "silently strands live JS handles". But `#[must_use]` only catches
+    /// *ignoring* the value, not dropping it on an early return, and
+    /// `try_recover_context` had two `?` between the teardown and the restore
+    /// (`create_pbuffer_context`, `bind_resource`) plus more inside the restore
+    /// itself. Any of them fired and the plan went out of scope with the local.
+    ///
+    /// The next attempt would then tear down an already-empty registry, get an
+    /// empty plan, and the canvases from the first teardown would be stranded for
+    /// the life of the process — JS registers a canvas exactly once, so there is
+    /// no lazy rebuild to fall back on. A game whose EGL recovery hit a transient
+    /// failure mid-rebuild would keep running with ids that resolve to nothing.
+    ///
+    /// Parking it makes a retry resume the *original* debt.
+    /// `register_offscreen` already returns `Ok(())` for an id it holds, so
+    /// re-running a partially applied plan is idempotent.
+    ///
+    /// Mirrors [`Self::pending_onscreen`], which exists for the same reason one
+    /// step earlier in the same function.
+    pending_share_group_restore: Option<ShareGroupRestorePlan>,
+
     /// Makes explicit shutdown and the `Drop` fallback share one idempotent
     /// teardown path.
     teardown_complete: bool,
@@ -369,7 +520,7 @@ pub(crate) struct CanvasManager {
     pub(crate) textures: HashMap<TextureId, TextureMeta>,
     pub(crate) framebuffers: HashMap<FramebufferId, FramebufferMeta>,
     pub(crate) renderbuffers: HashMap<RenderbufferId, RenderbufferMeta>,
-    pub(crate) gl_state: HashMap<CanvasId, CanvasGLState>,
+    pub(crate) gl_state: CanvasStateTable,
     /// Ordered, authoritative accounting for WebGL-created texture and
     /// renderbuffer storage. This excludes Canvas2D/internal renderer objects.
     pub(crate) webgl_gpu_budget: crate::webgl_gpu_budget::WebGlGpuBudget,
@@ -480,6 +631,12 @@ pub(crate) struct CanvasManager {
     /// Uploads whose GPU fence has not yet signaled.
     /// Re-checked each frame in `drain_upload_completed()`.
     pending_uploads: Vec<crate::upload_thread::CompletedUpload>,
+    /// Working buffer for [`Self::drain_upload_completed`], held across frames
+    /// so neither it nor `pending_uploads` ever hands its allocation back.
+    /// See [`stage_upload_drain`].
+    upload_drain_scratch: Vec<crate::upload_thread::CompletedUpload>,
+    /// Working buffer for the dropped-upload half of the same drain.
+    upload_dropped_scratch: Vec<crate::upload_thread::DroppedUpload>,
 
     /// Deferred LoadImage responses — sent only after the async upload
     /// thread has completed and the texture is registered.
@@ -802,7 +959,7 @@ impl CanvasManager {
             bound: BoundContext::Resource,
             canvases: HashMap::with_capacity(4),
             next_canvas_id: AtomicU32::new(2), // 1 is reserved for onscreen
-            contexts_2d: HashMap::with_capacity(4),
+            contexts_2d: crate::canvas_keyed::CanvasKeyed::default(),
             dirty_2d: HashSet::with_capacity(4),
             image_registry: ImageRegistry::new(),
             image_copy_fbos: HashMap::with_capacity(4),
@@ -822,6 +979,7 @@ impl CanvasManager {
             installed_surface: None,
             frame_rate_request: shared::frame_rate::DEFAULT_FPS,
             pending_onscreen: None,
+            pending_share_group_restore: None,
             teardown_complete: false,
             native_release_confirmed: false,
             programs: HashMap::with_capacity(16),
@@ -830,7 +988,7 @@ impl CanvasManager {
             textures: HashMap::with_capacity(64),
             framebuffers: HashMap::with_capacity(8),
             renderbuffers: HashMap::with_capacity(8),
-            gl_state: HashMap::with_capacity(4),
+            gl_state: CanvasStateTable::default(),
             webgl_gpu_budget: crate::webgl_gpu_budget::WebGlGpuBudget::new(),
             vaos: HashMap::with_capacity(16),
             samplers: HashMap::with_capacity(8),
@@ -850,6 +1008,8 @@ impl CanvasManager {
             upload_thread,
             shader_cache,
             pending_uploads: Vec::new(),
+            upload_drain_scratch: Vec::new(),
+            upload_dropped_scratch: Vec::new(),
             pending_load_responses: HashMap::new(),
             deferred_uploads: std::collections::VecDeque::new(),
             cancelled_uploads: HashSet::new(),
@@ -2169,9 +2329,23 @@ impl CanvasManager {
         let onscreen_id = CanvasId::from(1u32);
 
         // ---- Phase 1: hard teardown of the dead share group ----
-        // Returns the JS-visible canvases the teardown just destroyed; Phase 2
+        // Records the JS-visible canvases the teardown just destroyed; Phase 2
         // owes their re-creation.
-        let restore = self.tear_down_share_group();
+        //
+        // Parked on `self` rather than held in a local. Everything below can
+        // fail, and a plan that goes out of scope with a local strands every
+        // canvas it recorded — see `pending_share_group_restore`. A retry
+        // resumes the debt recorded here instead of tearing down an
+        // already-empty registry.
+        if self.pending_share_group_restore.is_none() {
+            let plan = self.tear_down_share_group();
+            self.pending_share_group_restore = Some(plan);
+        } else {
+            tracing::warn!(
+                "EGL recovery: resuming the share-group restore a previous attempt \
+                 could not settle"
+            );
+        }
 
         // ---- Phase 2: rebuild the share group ----
         let (resource_ctx, resource_surf) = egl_ops::create_pbuffer_context(
@@ -2227,7 +2401,22 @@ impl CanvasManager {
                 .map_err(|failure| failure.error)?;
             // Settle the teardown's debt: the onscreen 2D context plus every
             // offscreen canvas whose id JS still holds.
-            self.restore_share_group(&restore, onscreen_id)?;
+            //
+            // Taken out to satisfy the borrow, and put straight back if the
+            // restore fails: `restore_share_group` uses `?` per canvas, so a
+            // failure part-way leaves the untouched tail owed. Dropping the plan
+            // here would strand exactly those.
+            let plan = self
+                .pending_share_group_restore
+                .take()
+                .expect("Phase 1 parks a plan before any fallible step");
+            match self.restore_share_group(&plan, onscreen_id) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.pending_share_group_restore = Some(plan);
+                    return Err(e);
+                }
+            }
             // ---- Phase 3: probe the rebuilt context for real usability ----
             Ok(self.probe_context_usable(onscreen_id))
         })();
@@ -2279,7 +2468,7 @@ impl CanvasManager {
 
         // Skia contexts: abandoned on the loss path; drop every one so they
         // rebuild against the new share group. `abandon()` makes Drop a no-op.
-        for (_id, mut ctx) in std::mem::take(&mut self.contexts_2d) {
+        for (_id, mut ctx) in self.contexts_2d.drain().collect::<Vec<_>>() {
             ctx.abandon();
         }
         self.dirty_2d.clear();
@@ -2664,6 +2853,28 @@ impl CanvasManager {
 
     // ==================== Context Binding ====================
 
+    /// Make the resource context current.
+    ///
+    /// **Unconditionally, unlike [`Self::make_current_needed`], and that
+    /// asymmetry is load-bearing.** The obvious symmetry fix — an
+    /// `if self.bound == BoundContext::Resource { return Ok(()) }` guard —
+    /// introduces a use-after-destroy.
+    ///
+    /// The caller that forbids it is context recreation after a GPU reset
+    /// (`recreate_contexts_after_loss`, the `bind_resource()` a few dozen lines
+    /// below the new `self.resource = …`): at that point `self.bound` can still
+    /// read `Resource` from *before* the recreation, naming the context that was
+    /// just destroyed. The shadow is stale by construction there, so a guard
+    /// that trusted it would skip the `eglMakeCurrent` and leave the thread
+    /// current on a dead context — every GL call after it undefined.
+    ///
+    /// The cost of not guarding is a redundant `eglMakeCurrent` on the paths
+    /// where the shadow *is* accurate. Those are the canvas-destroy sweep and
+    /// `restore_bound` with a saved `Resource`, neither of which is the
+    /// steady-state frame path: a rendering frame is bound to a canvas, and
+    /// `restore_bound` reaches the canvas arm, which does short-circuit through
+    /// `make_current_needed`. So the redundancy is off the hot path and the
+    /// hazard it would trade for is not.
     pub(super) fn bind_resource(&mut self) -> EngineResult<()> {
         self.egl
             .make_current(
@@ -2737,19 +2948,28 @@ impl CanvasManager {
     ///
     /// Called once per frame from the render thread (non-blocking).
     /// Returns the number of dropped upload recoveries processed this call.
+    ///
+    /// Allocation-free in steady state; see [`stage_upload_drain`].
     pub(crate) fn drain_upload_completed(&mut self) -> u32 {
         let upload = match self.upload_thread.as_mut() {
             Some(u) => u,
             None => return 0,
         };
 
-        let mut completed = Vec::new();
-        upload.drain_completed(&mut completed);
+        // Both halves stage into scratch buffers that outlive the frame. See
+        // `stage_upload_drain` for why the obvious `Vec::new()` + `for x in v`
+        // shape was an allocation round trip per frame.
+        let mut deferred = stage_upload_drain(
+            &mut self.upload_drain_scratch,
+            &mut self.pending_uploads,
+            |sink| upload.drain_completed(sink),
+        );
 
         // Process uploads that completed but whose results could not be
         // delivered (result channel full/disconnected).  Each item carries
         // image_id + byte_len for consistent per-item recovery.
-        let mut dropped = Vec::new();
+        let mut dropped = std::mem::take(&mut self.upload_dropped_scratch);
+        dropped.clear();
         upload.drain_dropped(&mut dropped);
         let dropped_recovery_count = dropped.len() as u32;
         for d in &dropped {
@@ -2773,15 +2993,13 @@ impl CanvasManager {
             self.cancelled_uploads.remove(&d.image_id);
         }
 
-        // Also re-check any previously deferred uploads.
-        let mut deferred = std::mem::take(&mut self.pending_uploads);
-        deferred.extend(completed);
-
-        for c in deferred {
+        // Deferred first, newly completed after — the order `stage_upload_drain`
+        // preserves and the order this loop has always seen.
+        for c in deferred.drain(..) {
             // Non-blocking fence check (timeout = 0).
             let status = unsafe { self.gl.client_wait_sync(c.fence, 0, 0) };
 
-            if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
+            if fence_signalled(status) {
                 // GPU upload complete — delete the fence.
                 unsafe { self.gl.delete_sync(c.fence) };
 
@@ -2820,10 +3038,16 @@ impl CanvasManager {
                     c.height
                 );
             } else {
-                // Not ready yet — defer to next frame.
+                // Not ready yet — defer to next frame. `stage_upload_drain`
+                // left `pending_uploads` empty but with its capacity, so this
+                // does not go to the heap.
                 self.pending_uploads.push(c);
             }
         }
+        // Both scratch buffers go home empty, keeping their capacity for the
+        // next frame.
+        self.upload_drain_scratch = deferred;
+        self.upload_dropped_scratch = dropped;
         dropped_recovery_count
     }
 
@@ -3551,10 +3775,11 @@ impl CanvasManager {
         let mut flat: [egl::Int; 16] = [0; 16];
         let n = rects.len().min(4);
         for (i, r) in rects.iter().take(n).enumerate() {
-            flat[i * 4] = r.x;
-            flat[i * 4 + 1] = r.y;
-            flat[i * 4 + 2] = r.width;
-            flat[i * 4 + 3] = r.height;
+            let (x, y, width, height) = r.xywh();
+            flat[i * 4] = x;
+            flat[i * 4 + 1] = y;
+            flat[i * 4 + 2] = width;
+            flat[i * 4 + 3] = height;
         }
         let ret = unsafe { set_damage(self.display, surf, flat.as_ptr(), n as egl::Int) };
         ret == egl::TRUE
@@ -3710,11 +3935,12 @@ impl CanvasManager {
         let Some(rect) = region.bounding_rect() else {
             return ResolvedDamage::FullSurface;
         };
+        let (x, y, width, height) = rect.xywh();
         ResolvedDamage::Partial {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
+            x,
+            y,
+            width,
+            height,
         }
     }
 
@@ -3828,6 +4054,7 @@ impl CanvasManager {
         self.dirty_2d.len()
     }
 
+    #[allow(dead_code)]
     /// Save current GL state and set a safe baseline for Canvas2D / Skia
     /// text atlas uploads.
     /// Mark every live 2D context's Skia cache as stale.  Called
@@ -3841,7 +4068,6 @@ impl CanvasManager {
     /// [`Self::mark_all_2d_contexts_stale_bits`] instead. Kept as
     /// the documented full-invalidation escape hatch for a
     /// fall-back path that can't identify which bits are dirty.
-    #[allow(dead_code)]
     pub(crate) fn mark_all_2d_contexts_stale(&mut self) {
         for ctx in self.contexts_2d.values_mut() {
             ctx.mark_state_stale();
@@ -3873,9 +4099,9 @@ impl CanvasManager {
         }
     }
 
+    #[allow(dead_code)]
     /// Narrow-scope variant of [`mark_2d_context_stale`]: the caller
     /// declares which slice of Skia's GL state needs invalidation.
-    #[allow(dead_code)]
     pub(crate) fn mark_2d_context_stale_bits(&mut self, canvas_id: CanvasId, bits: u32) {
         if let Some(ctx) = self.contexts_2d.get_mut(&canvas_id) {
             ctx.mark_state_stale_bits(bits);
@@ -3995,7 +4221,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {
@@ -4139,6 +4365,12 @@ impl CanvasManager {
     const MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES: usize =
         shared::protocol::render_cmd::MAX_SYNC_READBACK_BYTES;
 
+    // The relationship these two caps must keep is enforced at compile time by
+    // `SNAPSHOT_CAP_RELATIONS` at module scope — a free `const`, because an
+    // unused *associated* const's initializer is not evaluated and an assertion
+    // placed here proved nothing (verified by breaking a cap and watching the
+    // build succeed).
+
     /// Capture a Canvas2D sub-rectangle into a GL texture using a
     /// caller-supplied `snapshot_id`.  Powers the fire-and-forget
     /// hot path where JS pre-allocated the id from a process-local
@@ -4165,6 +4397,17 @@ impl CanvasManager {
         snapshot_id: u32,
     ) -> EngineResult<u32> {
         if width == 0 || height == 0 {
+            return Ok(0);
+        }
+        // `0` is the JS sentinel for "no snapshot", so an entry under that key
+        // could never be looked up. Rejected here rather than after the capture:
+        // this used to be checked just before the pool insert, by which point a
+        // texture had been created, an FBO blit issued and the surrounding GL
+        // state saved and restored — all of it for a result guaranteed to be
+        // thrown away. `op_capture_canvas2d_snapshot` screens this JS-side too,
+        // so reaching it means a different runtime or stale cached JS; the point
+        // of defence in depth is to cost nothing when it holds.
+        if snapshot_id == 0 {
             return Ok(0);
         }
         let snapshot_bytes =
@@ -4261,9 +4504,31 @@ impl CanvasManager {
                 // Mali (cocos labels rendered blank again).  The
                 // CPU-side `client_wait_sync` is load-bearing; do
                 // not touch without a Mali device in hand.
-                let _ = self
+                //
+                // The result is inspected rather than discarded. It used to be
+                // `let _ =`, which threw away the one fact that matters here:
+                // on `TIMEOUT_EXPIRED` the fence did *not* signal, the blit
+                // below samples pre-draw tiles anyway, and the symptom is
+                // exactly the blank-label defect this fence exists to prevent —
+                // silently, with no GL error and nothing to attribute it to. We
+                // still proceed, because a stale snapshot beats abandoning the
+                // frame, but we say so.
+                let waited = self
                     .gl
                     .client_wait_sync(fence, glow::SYNC_FLUSH_COMMANDS_BIT, i32::MAX);
+                if !fence_signalled(waited) {
+                    let cause = if waited == glow::TIMEOUT_EXPIRED {
+                        "timed out"
+                    } else {
+                        "failed"
+                    };
+                    tracing::warn!(
+                        canvas_id = ?canvas_id,
+                        "snapshot_canvas2d_region: pre-blit fence {cause} \
+                         (0x{waited:04X}); the snapshot may sample pre-draw \
+                         tile contents (blank or stale text)"
+                    );
+                }
                 self.gl.delete_sync(fence);
             }
         }
@@ -4463,14 +4728,6 @@ impl CanvasManager {
                 | crate::backend::gl::surface::gr_state_bits::RENDER_TARGET,
         );
 
-        // Use caller-supplied id (or auto-allocated by the wrapper).
-        // ID == 0 means "JS sentinel for absent snapshot"; reject so
-        // a buggy caller can't poison the pool with a never-lookup
-        // entry.
-        if snapshot_id == 0 {
-            unsafe { self.gl.delete_texture(dest_tex) };
-            return Ok(0);
-        }
         self.canvas2d_snapshots.insert(
             snapshot_id,
             Canvas2DSnapshotEntry {
@@ -4590,7 +4847,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {
@@ -4717,7 +4974,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {
@@ -4927,7 +5184,7 @@ impl CanvasManager {
         let prev_read_fbo = self
             .gl_state
             .get(&canvas_id)
-            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .and_then(|s| s.bound_framebuffer.get(glow::READ_FRAMEBUFFER))
             .flatten();
 
         {
@@ -5422,6 +5679,7 @@ impl CanvasManager {
         self.image_registry.wrapper_cache_len()
     }
 
+    #[allow(dead_code)]
     /// Try to pack a small RGBA image into the shared atlas.
     ///
     /// Lazy-initialises [`Self::atlas`] on the first call.  Returns
@@ -5443,7 +5701,6 @@ impl CanvasManager {
     /// Caller must have a current GL context on the calling thread.
     /// The atlas module's `upload` is `unsafe` for the same reason;
     /// this wrapper forwards the obligation.
-    #[allow(dead_code)]
     pub(crate) unsafe fn atlas_upload_small(
         &mut self,
         width: u16,
@@ -5490,9 +5747,9 @@ impl CanvasManager {
         }
     }
 
+    #[allow(dead_code)]
     /// Number of uploads currently waiting for budget.  Exposed so
     /// the debug overlay / metrics probe the backlog depth.
-    #[allow(dead_code)]
     pub(crate) fn deferred_upload_depth(&self) -> usize {
         self.deferred_uploads.len()
     }
@@ -6044,6 +6301,79 @@ mod recovery_source_guards {
         );
     }
 
+    /// **A recovery attempt that fails part-way must not lose the canvases the
+    /// teardown recorded**, because JS registers a canvas exactly once and
+    /// anything dropped here is stranded for the life of the process.
+    ///
+    /// `tear_down_share_group` returns a `#[must_use]`
+    /// `ShareGroupRestorePlan` to make that obligation explicit, and it did not
+    /// hold: `#[must_use]` catches ignoring a value, not dropping one on an early
+    /// return, and the plan was a local with two `?` between its creation and its
+    /// use (`create_pbuffer_context`, `bind_resource`) plus more inside
+    /// `restore_share_group`. Any of those firing lost every canvas the plan
+    /// carried, and the next attempt would tear down an already-empty registry
+    /// and record nothing.
+    ///
+    /// So the plan is parked on `self.pending_share_group_restore` before the
+    /// first fallible step and cleared only when a restore fully succeeds. This
+    /// asserts that shape, since reaching the path needs EGL and a GPU reset.
+    #[test]
+    fn a_failed_recovery_hands_its_restore_debt_to_the_next_attempt() {
+        let body = function_body(MGR, "pub(crate) fn try_recover_context");
+
+        // The plan must be parked, not bound to a local that an early return
+        // would drop.
+        let park = body
+            .find("self.pending_share_group_restore = Some(plan)")
+            .expect(
+                "the restore plan must be parked on `self` before the fallible \
+                 rebuild, or an early return strands every canvas it recorded",
+            );
+        let teardown = body
+            .find("self.tear_down_share_group()")
+            .expect("recovery must tear down the dead share group");
+        assert!(
+            teardown < park,
+            "the plan must be parked immediately after the teardown that produced it"
+        );
+
+        // Everything that can fail must come after the park.
+        for fallible in ["create_pbuffer_context(", "self.bind_resource()?"] {
+            let at = body
+                .find(fallible)
+                .unwrap_or_else(|| panic!("{fallible} is no longer in the recovery path"));
+            assert!(
+                park < at,
+                "{fallible} runs before the restore plan is parked, so its `?` \
+                 would drop the plan"
+            );
+        }
+
+        // A retry must resume the parked plan rather than tearing down again —
+        // the registry is empty by then, so a second teardown records nothing.
+        assert!(
+            body.contains("if self.pending_share_group_restore.is_none()"),
+            "recovery must reuse a parked plan instead of unconditionally tearing \
+             down; a second teardown of an empty registry yields an empty plan"
+        );
+
+        // And a failed restore must give the plan back, because
+        // `restore_share_group` uses `?` per canvas and leaves the tail owed.
+        let restore_at = body
+            .find("self.restore_share_group(")
+            .expect("recovery must restore the recorded canvases");
+        let give_back = body[restore_at..]
+            .find("self.pending_share_group_restore = Some(plan)")
+            .expect(
+                "a failed `restore_share_group` must hand the plan back, or the \
+                 canvases it had not reached yet are stranded",
+            );
+        assert!(
+            give_back > 0,
+            "the plan must be returned after the restore call, not before"
+        );
+    }
+
     /// Every 2D context recovery rebuilds must also get its drawing state back.
     ///
     /// The JS setters de-duplicate against a shadow (`if (this._fillStyle ===
@@ -6202,18 +6532,39 @@ mod recovery_source_guards {
         );
     }
 
+    /// A half-restored share group must never report a recovered context.
+    ///
+    /// Asserts the property rather than one spelling of it. The first version
+    /// searched for the literal `self.restore_share_group(&restore, onscreen_id)?`
+    /// and went red when the call grew a `match` so a failed restore could hand
+    /// its plan back — a change that strengthened the very guarantee this test
+    /// exists for. What matters is that a failure leaves the block before the
+    /// flag is cleared, however the failure is spelled.
     #[test]
     fn offscreen_restore_failure_keeps_the_context_lost() {
         let body = function_body(MGR, "pub(crate) fn try_recover_context");
         let restore = body
-            .find("self.restore_share_group(&restore, onscreen_id)?")
-            .expect("restore failure must propagate into the all-or-nothing block");
+            .find("self.restore_share_group(")
+            .expect("recovery must restore the canvases the teardown destroyed");
         let clears_flag = body
             .find("self.context_lost = false;")
             .expect("successful recovery must clear the lost flag");
         assert!(
             restore < clears_flag,
             "a half-restored share group must never report a recovered context"
+        );
+
+        // The failure has to leave the fallible block. Either spelling does:
+        // a `?` on the call, or an explicit early `return Err`.
+        let after = &body[restore..];
+        let propagates = after
+            .split("self.context_lost")
+            .next()
+            .is_some_and(|between| between.contains("return Err(e)") || between.contains(")?;"));
+        assert!(
+            propagates,
+            "a failed restore no longer leaves the all-or-nothing block, so a \
+             half-restored share group could reach `context_lost = false`"
         );
     }
 
@@ -6259,6 +6610,160 @@ mod recovery_source_guards {
 mod tests {
     use super::*;
     use crate::damage_effect::{DamageEffect, FrameDamageAccumulator};
+
+    /// **At the cap a snapshot is refused, never traded for an older one.**
+    ///
+    /// The field doc used to promise "oldest evicted first", which the code has
+    /// never done and must not: every live entry is waiting for a
+    /// `TexImage2DFromSnapshot` that JS already committed to issuing, so
+    /// evicting one to admit another turns a bounded pool into a missing
+    /// texture. Refusing returns `0`, which JS reads as "fall back to the legacy
+    /// CPU readback" — slower for one label, correct for all of them. A reader
+    /// who trusted the old doc would have "fixed" the code toward the eviction
+    /// it described.
+    ///
+    /// The caps' arithmetic is not checked here: it is all compile-time
+    /// constants, so it lives next to them as `const _: () = assert!(…)` and a
+    /// mis-relation fails the build rather than the suite.
+    ///
+    /// What this pins instead is the refusal itself, at the level a host can
+    /// reach it. `snapshot_canvas2d_region_with_id` needs an EGL context, so
+    /// the assertion is on the decision function's shape rather than on a live
+    /// capture — stated plainly rather than dressed up as an end-to-end test.
+    #[test]
+    fn a_full_snapshot_pool_refuses_rather_than_evicting() {
+        // The two rejection sites, read out of the source. Crude, and chosen
+        // deliberately over a mock: the alternative is a fake GL context whose
+        // agreement with a driver is its own open question, and what is in doubt
+        // here is not GL behaviour but whether this function still *refuses*.
+        const SRC: &str = include_str!("mod.rs");
+        let body_start = SRC
+            .find("pub(crate) fn snapshot_canvas2d_region_with_id")
+            .expect("the capture entry point");
+        let body = &SRC[body_start..body_start + 4000];
+
+        assert!(
+            body.contains("canvas2d_snapshot_order.len() >= Self::MAX_LIVE_CANVAS2D_SNAPSHOTS"),
+            "the count cap is no longer consulted in the capture path"
+        );
+        assert!(
+            body.contains("next_snapshot_bytes > Self::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES"),
+            "the byte cap is no longer consulted in the capture path"
+        );
+        for evicting in ["pop_front", "remove(&evict", "evict"] {
+            assert!(
+                !body.contains(evicting),
+                "the capture path now contains {evicting:?}. If the pool has \
+                 started evicting to make room, every evicted entry is a \
+                 `TexImage2DFromSnapshot` that will find nothing — see this \
+                 test's doc for why refusing is the only safe answer at the cap"
+            );
+        }
+    }
+
+    // ── Upload drain staging ─────────────────────────────────────────────
+
+    /// One frame of the drain: some completions arrive, some are deferred to
+    /// the next frame. Modelled the way `drain_upload_completed` runs it, with
+    /// the fence verdict standing in for the real `glClientWaitSync`.
+    fn one_drain_frame(
+        scratch: &mut Vec<u32>,
+        pending: &mut Vec<u32>,
+        arriving: &[u32],
+        ready: impl Fn(u32) -> bool,
+    ) -> Vec<u32> {
+        let mut staged = stage_upload_drain(scratch, pending, |sink| sink.extend_from_slice(arriving));
+        let mut registered = Vec::new();
+        for item in staged.drain(..) {
+            if ready(item) {
+                registered.push(item);
+            } else {
+                pending.push(item);
+            }
+        }
+        *scratch = staged;
+        registered
+    }
+
+    /// Section 7.3 on the once-per-frame upload drain.
+    ///
+    /// **This is the assertion the previous shape could not have passed.** It
+    /// consumed the staging vector by value — freeing its buffer — after
+    /// `mem::take` had already reduced `pending_uploads` to capacity zero, so
+    /// every frame with an upload still in flight bought a fresh buffer for the
+    /// re-defer. A level load runs that for as many frames as it takes.
+    ///
+    /// The fixture keeps one item permanently unready, which is what makes the
+    /// re-defer happen on every measured iteration.
+    #[test]
+    fn a_steady_state_upload_drain_never_reaches_the_heap() {
+        let mut scratch = Vec::new();
+        let mut pending = Vec::new();
+        // Item 0 never becomes ready; items 1..4 always do.
+        let arriving = [1u32, 2, 3, 4];
+        let ready = |item: u32| item != 0;
+        // Seed the deferred item and let both buffers reach their steady size.
+        pending.push(0);
+        for _ in 0..4 {
+            one_drain_frame(&mut scratch, &mut pending, &arriving, ready);
+        }
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "canvas manager: per-frame upload completion drain",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                let mut staged =
+                    stage_upload_drain(&mut scratch, &mut pending, |sink| {
+                        sink.extend_from_slice(&arriving)
+                    });
+                let mut n = 0u32;
+                for item in staged.drain(..) {
+                    if ready(item) {
+                        n += 1;
+                    } else {
+                        pending.push(item);
+                    }
+                }
+                scratch = staged;
+                n
+            },
+        );
+        assert_eq!(pending, vec![0], "the unready item must stay deferred");
+    }
+
+    /// Order is load-bearing: an upload deferred from an earlier frame is the
+    /// one most likely to be ready now, so it has to stay ahead of the
+    /// completions that only just arrived.
+    #[test]
+    fn staging_keeps_deferred_uploads_ahead_of_newly_arrived_ones() {
+        let mut scratch = Vec::new();
+        let mut pending = vec![10u32, 11];
+        let staged = stage_upload_drain(&mut scratch, &mut pending, |sink| {
+            sink.extend_from_slice(&[20, 21])
+        });
+        assert_eq!(staged, vec![10, 11, 20, 21]);
+        assert!(
+            pending.is_empty(),
+            "the deferred list must be emptied, or its items are staged twice"
+        );
+    }
+
+    /// The scratch comes back reusable, not carrying last frame's contents into
+    /// this one — which would register the same upload twice.
+    #[test]
+    fn staging_starts_from_an_empty_buffer_even_if_the_scratch_was_dirty() {
+        let mut scratch = vec![99u32, 98];
+        let mut pending = vec![1u32];
+        let staged = stage_upload_drain(&mut scratch, &mut pending, |sink| sink.push(2));
+        assert_eq!(
+            staged,
+            vec![1, 2],
+            "a dirty scratch leaked last frame's uploads into this frame"
+        );
+    }
 
     #[test]
     fn egl_swap_failures_distinguish_context_surface_and_retryable_errors() {

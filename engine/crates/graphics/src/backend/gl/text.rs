@@ -95,7 +95,7 @@ pub struct TextContext {
     /// against an immutable `TextContext`; interior mutability
     /// keeps call sites ergonomic without forcing `&mut self`
     /// through the renderer.
-    measure_cache: core::cell::RefCell<lru::LruCache<TextMeasureKey, TextMetrics>>,
+    measure_cache: core::cell::RefCell<lru::LruCache<TextMeasureKey, Verified<TextMetrics>>>,
     /// Per-(text, attrs) shaped-text cache.  Populated lazily by both
     /// `measure_text` and the fast-path `paint_text` branch.  When the
     /// text qualifies for the SkTextBlob fast path (pure ASCII, single
@@ -116,7 +116,7 @@ pub struct TextContext {
     /// golden verification (see `try_fast_path_paint`), so nothing
     /// reads it back through a live code path yet.
     #[allow(dead_code)]
-    shape_cache: core::cell::RefCell<lru::LruCache<TextMeasureKey, ShapedText>>,
+    shape_cache: core::cell::RefCell<lru::LruCache<TextMeasureKey, Verified<ShapedText>>>,
     /// Warn once per unresolved family chain so misconfigured hosts
     /// get a clear signal instead of silent "paint nothing".
     unresolved_family_warnings: core::cell::RefCell<std::collections::HashSet<String>>,
@@ -169,9 +169,19 @@ struct ShapedText {
 /// Excludes fill/stroke paint (measurement is paint-independent) and
 /// `maxWidth` (applied as a post-layout horizontal scale, not during
 /// shaping -- see `paint_text`).
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// **A hash of the text, not the text.** `measure_text` is called once per
+/// text run per frame by auto-sizing UI code, and a key owning a `String`
+/// meant every one of those calls allocated and freed one — including the
+/// hits, which is the whole path the cache exists to make free. The key is
+/// `Copy` and 40 bytes now, so a lookup touches the heap zero times.
+///
+/// A hash is not an identity, so the text rides along in the value and every
+/// hit compares it: see [`Verified`]. That turns a collision into a miss
+/// rather than into the wrong metrics for the wrong string, which for a
+/// `measureText` result means a mislaid label with nothing to point at it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 struct TextMeasureKey {
-    text: String,
+    text_hash: u64,
     size_bits: u32,
     families_hash: u64,
     weight: u16,
@@ -194,21 +204,58 @@ struct TextMeasureKey {
 impl TextMeasureKey {
     fn new(text: &str, attrs: &TextAttrs, font_epoch: u64) -> Self {
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut families = std::collections::hash_map::DefaultHasher::new();
         for f in attrs.families.iter() {
-            f.hash(&mut hasher);
+            f.hash(&mut families);
         }
+        // Separate hasher from the families one: folding both into a single
+        // digest would let a family-name change and a text change cancel out.
+        let mut body = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut body);
         Self {
-            text: text.to_string(),
+            text_hash: body.finish(),
             // `f32` isn't Hash/Eq by itself; bit-cast to preserve
             // exact equality (including for NaN, which never hits
             // this path because we clamp to 0 earlier).
             size_bits: attrs.size.to_bits(),
-            families_hash: hasher.finish(),
+            families_hash: families.finish(),
             weight: attrs.weight,
             italic: attrs.italic,
             direction: attrs.direction,
             font_epoch,
+        }
+    }
+}
+
+/// A cache entry that carries the text its key only hashed.
+///
+/// The one place the "a hash is not an identity" obligation of
+/// [`TextMeasureKey`] is discharged, so the two caches keyed by it cannot
+/// drift apart on it. A hit that fails the comparison is reported as a miss
+/// and the caller recomputes and overwrites — correct, and for a 64-bit digest
+/// over a 256-entry cache, never observed.
+#[derive(Debug, Clone)]
+struct Verified<T> {
+    text: String,
+    value: T,
+}
+
+impl<T> Verified<T> {
+    #[inline]
+    fn new(text: &str, value: T) -> Self {
+        Self {
+            text: text.to_string(),
+            value,
+        }
+    }
+
+    /// The cached value, if this entry really is about `text`.
+    #[inline]
+    fn matching(&self, text: &str) -> Option<&T> {
+        if self.text == text {
+            Some(&self.value)
+        } else {
+            None
         }
     }
 }
@@ -368,9 +415,10 @@ impl TextContext {
         )
     }
 
-    fn effective_families(&self, attrs: &TextAttrs) -> Vec<String> {
-        self.effective_families_for_text(attrs, None)
-    }
+    /// Inline capacity of the family chain. A CSS `font-family` list of three
+    /// or four names plus this engine's two fallbacks is the widest shape seen
+    /// in practice; a longer list spills to the heap and still works.
+    const FAMILY_CHAIN_INLINE: usize = 8;
 
     /// Compute the family fallback chain used when building a
     /// [`ParagraphStyle`] / [`TextStyle`].  R-1: the chain is
@@ -392,27 +440,37 @@ impl TextContext {
     /// the strategy Slint (parley + fontique) and Flutter (txt +
     /// `FontCollection::defaultFallback`) use.
     ///
-    /// The `text` parameter is retained (and ignored) so
-    /// callers that still pass the live paint text can be
-    /// rewritten to drop the argument incrementally without
-    /// breaking the build.
-    fn effective_families_for_text(&self, attrs: &TextAttrs, _text: Option<&str>) -> Vec<String> {
-        let mut families: Vec<String> = if attrs.families.is_empty() {
-            Vec::new()
-        } else {
-            attrs.families.iter().cloned().collect()
-        };
+    /// **Borrows the names rather than cloning them.** This runs once per
+    /// `fillText` / `strokeText` and once per measure miss, and it used to
+    /// return `Vec<String>`: one allocation for the vector plus one per author
+    /// family plus one per fallback appended — four heap events for the
+    /// ordinary `font-family: Arial`, every text draw, on the render thread.
+    /// Both consumers only ever read the names (`SkTextStyle::set_font_families`
+    /// takes `&[impl AsRef<str>]`, `SkFontMgr::match_family_style` takes
+    /// `&str`), so nothing needed to own them.
+    ///
+    /// The chain outlives neither `self` nor `attrs`, which is what makes the
+    /// borrow sound and is why the signature ties it to both.
+    ///
+    /// The `text` parameter this once took, retained-and-ignored so callers
+    /// could drop it incrementally, is gone with the last caller that passed it.
+    fn effective_families<'a>(
+        &'a self,
+        attrs: &'a TextAttrs,
+    ) -> smallvec::SmallVec<[&'a str; Self::FAMILY_CHAIN_INLINE]> {
+        let mut families: smallvec::SmallVec<[&'a str; Self::FAMILY_CHAIN_INLINE]> =
+            attrs.families.iter().map(String::as_str).collect();
         if !families
             .iter()
             .any(|f| f.eq_ignore_ascii_case(&self.system_fallback_family))
         {
-            families.push(self.system_fallback_family.clone());
+            families.push(&self.system_fallback_family);
         }
         if !families
             .iter()
             .any(|f| f.eq_ignore_ascii_case(&self.bundled_fallback_family))
         {
-            families.push(self.bundled_fallback_family.clone());
+            families.push(&self.bundled_fallback_family);
         }
         families
     }
@@ -717,6 +775,7 @@ impl TextContext {
         None
     }
 
+    #[allow(dead_code)]
     /// Look up (or populate) the shape-cache entry for
     /// `(text, attrs)`.  Returns `None` when no typeface can be
     /// resolved — callers treat this as "fall back to paragraph".
@@ -724,14 +783,19 @@ impl TextContext {
     /// Unused today: its only intended caller, the SkTextBlob fast
     /// path, is disabled pending golden verification (see
     /// `try_fast_path_paint`).
-    #[allow(dead_code)]
     fn obtain_shaped_text(
         &self,
         key: &TextMeasureKey,
         text: &str,
         attrs: &TextAttrs,
     ) -> Option<ShapedText> {
-        if let Some(existing) = self.shape_cache.borrow_mut().get(key).cloned() {
+        if let Some(existing) = self
+            .shape_cache
+            .borrow_mut()
+            .get(key)
+            .and_then(|entry| entry.matching(text))
+            .cloned()
+        {
             crate::render_diagnostics::hit_shape_cache();
             return Some(existing);
         }
@@ -775,7 +839,7 @@ impl TextContext {
         let entry = ShapedText { metrics, blob };
         self.shape_cache
             .borrow_mut()
-            .put(key.clone(), entry.clone());
+            .put(*key, Verified::new(text, entry.clone()));
         Some(entry)
     }
 
@@ -788,7 +852,12 @@ impl TextContext {
     /// hash lookup instead of re-running HarfBuzz shaping.
     pub fn measure_text(&self, text: &str, attrs: &TextAttrs) -> TextMetrics {
         let key = TextMeasureKey::new(text, attrs, self.font_epoch.get());
-        if let Some(cached) = self.measure_cache.borrow_mut().get(&key) {
+        if let Some(cached) = self
+            .measure_cache
+            .borrow_mut()
+            .get(&key)
+            .and_then(|entry| entry.matching(text))
+        {
             crate::render_diagnostics::hit_measure_cache();
             return cached.clone();
         }
@@ -830,7 +899,9 @@ impl TextContext {
             alphabetic_baseline: 0.0,
             ideographic_baseline: ideo_baseline,
         };
-        self.measure_cache.borrow_mut().put(key, metrics.clone());
+        self.measure_cache
+            .borrow_mut()
+            .put(key, Verified::new(text, metrics.clone()));
         metrics
     }
 
@@ -1110,6 +1181,120 @@ mod tests {
         assert_eq!(
             first.actual_bounding_box_right.to_bits(),
             second.actual_bounding_box_right.to_bits()
+        );
+    }
+
+    /// Section 7.3's steady-state requirement on `measureText`.
+    ///
+    /// **This is the assertion the previous key could not have passed.** The
+    /// key owned a `String`, built before the lookup, so every call — hit
+    /// included — allocated and freed one. Auto-sizing UI code measures every
+    /// label every frame, which made the cache's whole purpose, the hit, cost a
+    /// heap round trip on the thread running the game.
+    #[test]
+    fn a_steady_state_measure_text_hit_never_reaches_the_heap() {
+        let mut ctx = TextContext::new();
+        assert!(ctx.register_family("test-noto", NOTO_SANS));
+        let attrs = test_attrs(18.0);
+        let label = "Score: 1234";
+        // Resident before the burst, or the burst measures the shaping path.
+        assert!(ctx.measure_text(label, &attrs).width > 0.0);
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "text: measureText lookup on a resident label",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| ctx.measure_text(label, &attrs).width,
+        );
+    }
+
+    /// Section 7.3 on the family chain, which every text draw builds.
+    ///
+    /// Four heap events for `font-family: Arial` before this: the vector, the
+    /// author family's clone, and one per appended fallback. Borrowed, it is
+    /// zero — and the widest realistic chain still fits inline.
+    #[test]
+    fn building_the_family_chain_never_reaches_the_heap() {
+        let ctx = TextContext::new();
+        let mut attrs = test_attrs(16.0);
+        // A four-name CSS chain plus the two fallbacks: six of the eight
+        // inline slots, so the burst covers the shape that would spill first.
+        attrs.families = std::sync::Arc::new(vec![
+            "Helvetica Neue".to_string(),
+            "Helvetica".to_string(),
+            "Arial".to_string(),
+            "Liberation Sans".to_string(),
+        ]);
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "text: family fallback chain for one text draw",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| ctx.effective_families(&attrs).len(),
+        );
+    }
+
+    /// The chain's contents, since the burst above only proves it is cheap.
+    /// Both fallbacks appended, in order, and neither duplicated when the
+    /// author already named it.
+    #[test]
+    fn the_family_chain_appends_each_fallback_exactly_once() {
+        let ctx = TextContext::new();
+        let mut attrs = test_attrs(16.0);
+
+        attrs.families = std::sync::Arc::new(vec!["Arial".to_string()]);
+        let chain: Vec<&str> = ctx.effective_families(&attrs).to_vec();
+        assert_eq!(chain, vec!["Arial", "sans-serif", "migo-default-sans"]);
+
+        // Author already asked for the generic; it must not appear twice, and
+        // the match is case-insensitive.
+        attrs.families = std::sync::Arc::new(vec!["SANS-SERIF".to_string()]);
+        let chain: Vec<&str> = ctx.effective_families(&attrs).to_vec();
+        assert_eq!(chain, vec!["SANS-SERIF", "migo-default-sans"]);
+
+        // No author families at all: the fallbacks alone, still in order.
+        attrs.families = std::sync::Arc::new(Vec::new());
+        let chain: Vec<&str> = ctx.effective_families(&attrs).to_vec();
+        assert_eq!(chain, vec!["sans-serif", "migo-default-sans"]);
+    }
+
+    /// The obligation a hashed key takes on: two different strings that landed
+    /// on one slot must not share its metrics. Forced by writing the collision
+    /// directly, because a 64-bit digest will not produce one on demand.
+    #[test]
+    fn a_key_collision_is_a_miss_not_the_wrong_strings_metrics() {
+        let mut ctx = TextContext::new();
+        assert!(ctx.register_family("test-noto", NOTO_SANS));
+        let attrs = test_attrs(24.0);
+
+        let narrow = "l";
+        let wide = "MMMMMMMMMM";
+        let narrow_metrics = ctx.measure_text(narrow, &attrs);
+        let wide_metrics = ctx.measure_text(wide, &attrs);
+        assert!(
+            wide_metrics.width > narrow_metrics.width * 5.0,
+            "fixture strings must measure far apart, or this proves nothing"
+        );
+
+        // Plant the wide string's entry under the narrow string's key — the
+        // shape a hash collision takes.
+        let narrow_key = TextMeasureKey::new(narrow, &attrs, ctx.font_epoch.get());
+        ctx.measure_cache
+            .borrow_mut()
+            .put(narrow_key, Verified::new(wide, wide_metrics));
+
+        let after = ctx.measure_text(narrow, &attrs);
+        assert_eq!(
+            after.width.to_bits(),
+            narrow_metrics.width.to_bits(),
+            "the colliding entry was served for the wrong string: measuring {narrow:?} \
+             returned {} instead of {}",
+            after.width,
+            narrow_metrics.width
         );
     }
 

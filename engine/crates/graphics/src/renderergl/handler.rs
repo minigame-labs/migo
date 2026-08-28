@@ -501,7 +501,14 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_arrays(mode, first, count) };
-                crate::render_diagnostics::bump_draw_call();
+                crate::render_diagnostics::bump_draw_call_shaped(
+                    crate::render_frame_state::DrawShape {
+                        mode,
+                        elements: false,
+                        start: first,
+                        len: count,
+                    },
+                );
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
@@ -515,7 +522,21 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_elements(mode, count, index_type, offset) };
-                crate::render_diagnostics::bump_draw_call();
+                crate::render_diagnostics::bump_draw_call_shaped(
+                    crate::render_frame_state::DrawShape {
+                        mode,
+                        elements: true,
+                        // `offset` is a *byte* offset into the index buffer, but
+                        // `count` is a number of indices. Contiguity has to be
+                        // tested in one unit, so convert: a draw of 6 shorts
+                        // ending at byte 12 is continued by one starting at
+                        // byte 12, which is index 6.
+                        start: crate::render_frame_state::indices_from_byte_offset(
+                            offset, index_type,
+                        ),
+                        len: count,
+                    },
+                );
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
@@ -656,6 +677,21 @@ impl RendererGL {
                         }
                     }
                 }
+                // The link reset this program's uniforms driver-side, so drop
+                // what we shadowed for it — see
+                // `state_tracker::invalidate_program_uniforms`. Both branches
+                // above reset them: GLES 3.0 §2.11.4 defines `ProgramBinary` to
+                // behave as a successful link, and a *failed* re-link discards
+                // the previous executable rather than restoring it, so there is
+                // no outcome where the old values survive.
+                //
+                // Every canvas, because programs are shared across the EGL
+                // share group (ES 3.0 Appendix C.1) — the canvas that re-links
+                // need not be the one that cached the uniform. Same reasoning
+                // as the `DeleteTexture` sweep below.
+                for state in cm.gl_state.values_mut() {
+                    st::invalidate_program_uniforms(state, program_id);
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -748,14 +784,17 @@ impl RendererGL {
 
             GLCmd::DeleteProgram { program_id } => {
                 if let Some(mut meta) = cm.programs.remove(&program_id) {
-                    // Invalidate dedup state: if this program was current, clear it
-                    // so the next UseProgram with the same ID isn't skipped.
-                    if let Some(owner) = meta.owner_canvas {
-                        if let Some(state) = cm.gl_state.get_mut(&owner) {
-                            if state.current_program == Some(program_id) {
-                                state.current_program = None;
-                            }
-                        }
+                    // Drop the binding shadow and this program's cached uniform
+                    // values, so a client that reuses the name does not inherit
+                    // the dead program's dedup state.
+                    //
+                    // Every canvas, not `meta.owner_canvas`: a program created
+                    // on the resource context has `owner_canvas == None`, which
+                    // reached no canvas at all, and programs are shared across
+                    // the EGL share group anyway so any canvas in the group may
+                    // have made this one current.
+                    for state in cm.gl_state.values_mut() {
+                        st::forget_deleted_program(state, program_id);
                     }
                     meta.deleted = true;
                     if let Some(ph) = meta.gl_handle {
@@ -1217,9 +1256,7 @@ impl RendererGL {
                     // entries so the next BindTexture with the same ID isn't
                     // incorrectly deduped.
                     for state in cm.gl_state.values_mut() {
-                        state
-                            .bound_texture_2d
-                            .retain(|_, tid| *tid != Some(texture_id));
+                        state.bound_texture_2d.forget_texture(texture_id);
                     }
                     if let Some(h) = meta.gl_handle {
                         cm.delete_gl_object(GlObject::Texture(h))?;
@@ -1892,18 +1929,20 @@ impl RendererGL {
                 let py = logical_to_physical_i32(cm, y);
                 let pw = logical_to_physical_i32(cm, width);
                 let ph = logical_to_physical_i32(cm, height);
-                unsafe { gl.scissor(px, py, pw, ph) };
-                let s = cm.gl_state.entry(canvas_id).or_default();
-                s.last_scissor_rect = Some((px, py, pw, ph));
-                // If scissor test is currently enabled (known or unknown rect),
-                // promote to Enabled with the explicit rect.
-                if !matches!(s.scissor, ScissorState::Disabled) {
-                    s.scissor = ScissorState::Enabled {
-                        x: px,
-                        y: py,
-                        width: pw,
-                        height: ph,
-                    };
+                // Deduped, which it was not before, and the note that used to
+                // sit here explained why: the engine re-pointed the driver's box
+                // behind this tracker's back on the present path, so a shadow
+                // hit could skip a call the driver needed and clip every later
+                // draw to the engine's rect. Silent wrong pixels.
+                //
+                // What changed is that `dirty_region::apply_scissor` and its
+                // restore now go through `ScissorBorrow` and write
+                // `last_scissor_rect` from the same computation that feeds the
+                // driver, and the blit only ever touches the enable bit — which
+                // it restores from what it read. Every writer of the driver's box
+                // is now visible here. See `state_tracker::update_scissor`.
+                if st::update_scissor(cm.gl_state.entry(canvas_id).or_default(), px, py, pw, ph) {
+                    unsafe { gl.scissor(px, py, pw, ph) };
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -2595,6 +2634,19 @@ impl RendererGL {
                     .vaos
                     .get_mut(&vao)
                     .and_then(|meta| meta.take_for_delete());
+                // Drop this VAO's vertex-attribute shadow. VAO names come from
+                // the client, so a reused name would otherwise inherit the dead
+                // object's layout and dedup away the `vertexAttribPointer` the
+                // new one needs — a draw reading the wrong vertex stream, with
+                // no GL error.
+                //
+                // Every canvas: a VAO name is local to the context that created
+                // it, so only one canvas can hold state for it, but finding
+                // which would mean trusting `VaoMeta::owner` to agree with the
+                // shadow. Sweeping is O(canvases) on a cold command.
+                for state in cm.gl_state.values_mut() {
+                    state.vertex_attribs.forget_vao(vao);
+                }
                 if let Some(object) = object {
                     cm.delete_gl_object(object)?;
                 }
@@ -3790,6 +3842,59 @@ mod tests {
                 width: 200,
                 height: 200
             }
+        );
+    }
+
+    /// **`UseProgram` validates before it dedups, and that order is the point.**
+    ///
+    /// The obvious optimisation is to check the shadow first: `update_use_program`
+    /// keys on the *client* `program_id`, which is in hand before any lookup, so
+    /// a redundant `useProgram(sameProgram)` could return without touching the
+    /// `programs` map, without the ownership check, and without the deleted
+    /// check. That is a hash lookup and two branches saved per redundant call,
+    /// and a game that leans on the dedup makes many.
+    ///
+    /// It is also wrong. Those checks are the only thing that turns
+    /// `useProgram(deletedProgram)` and `useProgram(neverCreated)` into errors.
+    /// Skip them when the shadow says "already current" and the same call
+    /// silently succeeds or fails depending on what the shadow happens to hold —
+    /// a game gets an error the first time and nothing the second.
+    ///
+    /// So the order is asserted here rather than left to be rediscovered. The
+    /// dispatch itself needs an EGL context, so this reads the source: crude, and
+    /// chosen over a mock GL whose agreement with a driver would be its own open
+    /// question. What is in doubt is not GL behaviour but whether the lookup is
+    /// still ahead of the dedup.
+    #[test]
+    fn use_program_validates_before_it_consults_the_shadow() {
+        const SRC: &str = include_str!("handler.rs");
+        let arm_start = SRC
+            .find("GLCmd::UseProgram {")
+            .expect("the UseProgram arm");
+        let arm = &SRC[arm_start..arm_start + 1200];
+        let arm_end = arm.find("GLCmd::GetAttribLocation").unwrap_or(arm.len());
+        let arm = &arm[..arm_end];
+
+        let lookup = arm
+            .find("cm.programs.get(&program_id)")
+            .expect("UseProgram no longer resolves the program id at all");
+        let owner = arm
+            .find("check_owner")
+            .expect("UseProgram no longer checks program ownership");
+        let deleted = arm
+            .find("meta.deleted")
+            .expect("UseProgram no longer rejects a deleted program");
+        let dedup = arm
+            .find("st::update_use_program")
+            .expect("UseProgram no longer dedups");
+
+        assert!(
+            lookup < dedup && owner < dedup && deleted < dedup,
+            "the shadow is now consulted before validation (lookup at {lookup}, \
+             owner at {owner}, deleted at {deleted}, dedup at {dedup}). A \
+             redundant useProgram on a deleted or missing program would then \
+             succeed silently, where the first call errored — see this test's \
+             doc for why the saved hash lookup is not worth that"
         );
     }
 }

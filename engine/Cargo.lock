@@ -1761,6 +1761,7 @@ dependencies = [
  "digest",
  "hex",
  "image",
+ "libc",
  "lru",
  "md-5",
  "memmap2",

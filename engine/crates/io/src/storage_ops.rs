@@ -248,9 +248,18 @@ pub fn storage_get_sync_with_scheduler(
     key: String,
     quota_bytes: u64,
 ) -> Result<Option<String>, EngineError> {
-    // Estimated byte size is only used for the scheduler's active-
-    // byte accounting; a rough upper bound (the common mini-game platform
-    // per-value max is 1 MiB) is enough.
+    // Zero, deliberately: it makes the read classify `Inline` and run on the
+    // calling thread.
+    //
+    // A sync caller is blocked for the whole operation either way, so handing
+    // the query to a worker only adds the round-trip -- ~26us against a KV
+    // lookup that costs a few. And the size that would justify delegating is
+    // the *value's*, which nobody knows until the row is read; the only way to
+    // find out is a second query as expensive as the first.
+    //
+    // Do not "fix" this to a nominal upper bound. Anything above
+    // `CheapPolicy::small_copy_bytes` flips every `getStorageSync` onto a
+    // worker and pays that round-trip for nothing.
     let request = storage_get_request(RequestKind::Sync, 0);
     scheduler
         .run_sync(&request, move || storage_get(&dir, &key, quota_bytes))
@@ -264,6 +273,9 @@ pub async fn storage_get_with_scheduler(
     quota_bytes: u64,
     request: RequestKind,
 ) -> Result<Option<String>, EngineError> {
+    // Zero for the same reason as the sync entry point above. On the async
+    // path it changes nothing -- `classify_storage_get` delegates anything
+    // that is not `Sync` + `ForegroundBlocking` regardless.
     let req = storage_get_request(request, 0);
     match request {
         RequestKind::Sync => scheduler
@@ -338,6 +350,43 @@ mod tests {
 
     fn fresh_dir() -> tempfile::TempDir {
         tempdir().unwrap()
+    }
+
+    /// A sync `getStorage` must run on the calling thread.
+    ///
+    /// The estimate the wrapper passes is what decides this, and it is a bare
+    /// `0` whose reason lives only in a comment. This pins the outcome, so
+    /// raising that estimate to something that "looks more honest" fails here
+    /// instead of quietly adding a worker round-trip to every synchronous
+    /// storage read.
+    #[test]
+    fn sync_storage_get_runs_inline_not_on_a_worker() {
+        // A private executor, not the process-global one: the thread-count
+        // assertion below is only evidence if no other test could have started
+        // those threads.
+        let scheduler = Arc::new(IoScheduler::local_for_test(431, 2));
+        let dir = fresh_dir();
+        storage_set(dir.path(), "k", "v", QUOTA).unwrap();
+
+        let value = storage_get_sync_with_scheduler(
+            Arc::clone(&scheduler),
+            dir.path().to_path_buf(),
+            "k".to_string(),
+            QUOTA,
+        )
+        .unwrap();
+        assert_eq!(value.as_deref(), Some("v"));
+
+        let metrics = scheduler.metrics();
+        assert_eq!(metrics.inline_runs, 1, "the read did not run inline");
+        assert_eq!(metrics.delegated_runs, 0);
+        // The strongest evidence available: a delegated run would have had to
+        // start the pool to execute anywhere.
+        assert_eq!(
+            scheduler.pools().started_thread_count_for_test(),
+            0,
+            "a synchronous storage read started IO worker threads"
+        );
     }
 
     /// Concurrent first writes to a brand-new store must all land.

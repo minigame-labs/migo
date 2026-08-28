@@ -644,6 +644,73 @@ mod tests {
         assert_eq!(next_drops.load(Ordering::Relaxed), 1);
     }
 
+    /// **A release arriving while a recreate is staged must be refused, and the
+    /// state that makes that reachable is the one the test above establishes.**
+    /// `unsettled_transaction_blocks_a_second_recreate` covers the other half —
+    /// a second *recreate* — but nothing covered the release path, so
+    /// `release_surface_binding`'s first guard had no test.
+    ///
+    /// It is not an unreachable defensive check. Both entry points are driven
+    /// from the render thread and so cannot interleave on their own, but a panic
+    /// during install leaves the candidate in `pending` *deliberately*, to keep
+    /// the native resource alive until CanvasManager has torn EGL down. In that
+    /// quarantined state a render-control release is exactly what can arrive
+    /// next, and without the guard it would run `release_retired_resource`
+    /// against `current` — tearing EGL down and clearing the slot — while a
+    /// staged candidate is still waiting to be committed into it. Two ownership
+    /// transactions on one binding, and the thing that loses is the native
+    /// window.
+    ///
+    /// So the assertion is not merely that it errors: it is that the refusal
+    /// leaves *both* leases exactly where the quarantine put them, with nothing
+    /// dropped, so the eventual `clear_after_egl_teardown` still owns both.
+    #[test]
+    fn a_release_during_a_quarantined_recreate_is_refused_and_changes_nothing() {
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let next_drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let first = lease(gate.attach_or_update().unwrap(), 1, &first_drops);
+        let first_generation = first.generation();
+        let mut binding = RenderSurfaceBinding::new();
+        binding.commit(first);
+
+        gate.retire_current().unwrap();
+        let next = lease(gate.attach_or_update().unwrap(), 2, &next_drops);
+        let next_generation = next.generation();
+
+        // Reach the quarantine the same way production does: panic mid-install.
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _transaction = binding.begin_recreate(next).unwrap();
+            panic!("simulated EGL panic");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(binding.pending_generation(), Some(next_generation));
+
+        // A render-control release for the retired generation now arrives.
+        let mut teardown_ran = false;
+        let error = release_surface_binding(&mut binding, first_generation, || {
+            teardown_ran = true;
+            Ok(())
+        })
+        .expect_err("a release must not interleave with a staged recreate");
+
+        assert_eq!(error.code, shared::error::ErrorCode::InvalidOperation);
+        assert!(
+            !teardown_ran,
+            "EGL teardown ran for a binding whose recreate had not settled"
+        );
+        // Nothing moved: both leases are still owned by the binding.
+        assert_eq!(binding.generation(), Some(first_generation));
+        assert_eq!(binding.pending_generation(), Some(next_generation));
+        assert_eq!(first_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(next_drops.load(Ordering::Relaxed), 0);
+
+        // And the quarantine still resolves normally afterwards, releasing both.
+        binding.clear_after_egl_teardown();
+        assert_eq!(first_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(next_drops.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn unsettled_transaction_blocks_a_second_recreate() {
         let drops = Arc::new(AtomicUsize::new(0));

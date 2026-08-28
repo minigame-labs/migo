@@ -186,6 +186,32 @@ pub struct DebugStats {
     /// game is thrashing state between draws; a very low one means
     /// the dedup is catching most redundancy.
     pub state_changes: AtomicU32,
+    /// Cumulative draws issued with **zero post-dedup state changes since the
+    /// previous draw of the same frame** — the upper bound on what a draw-call
+    /// batching pass could merge.
+    ///
+    /// `state_changes / draw_calls` measures how much state a frame churns but
+    /// says nothing about *where* it churns: a frame that sets up heavily and
+    /// then issues fifty untouched draws reads the same as one alternating a
+    /// change per draw, and only the first has anything to merge. This
+    /// separates them, which is the number the batching question was missing.
+    ///
+    /// `adjacent_draws / draw_calls` near zero closes that question for the
+    /// workload measured — there is nothing to merge. A high ratio does not
+    /// open it on its own: a merge also needs matching primitive modes and
+    /// contiguous vertex or index ranges, which this does not check.
+    pub adjacent_draws: AtomicU32,
+    /// Cumulative draws that are adjacent **and could actually be merged**:
+    /// same primitive mode, and a range continuing exactly where the previous
+    /// draw's ended.
+    ///
+    /// The figure that can open the batching question, where `adjacent_draws`
+    /// can only close it. A frame can be 98% adjacent and 0% mergeable —
+    /// drawing the same six vertices sixty-four times has nothing between the
+    /// draws, but one draw of 384 vertices would paint different pixels. Only a
+    /// contiguous range makes the merge an identity, and an identity is the only
+    /// merge a renderer may perform without the game's consent.
+    pub mergeable_draws: AtomicU32,
     /// Cumulative bytes uploaded via PBO / direct `glTexSubImage2D`
     /// calls this frame.  Resets to 0 at each `Present`.
     pub texture_upload_bytes: AtomicU32,

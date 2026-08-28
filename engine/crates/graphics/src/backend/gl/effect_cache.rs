@@ -41,6 +41,24 @@ const GRADIENT_CACHE_CAP: usize = 64;
 /// except for the NaN payload, which never shows up on Canvas 2D
 /// shadow parameters (JS coerces via `Number` which normalises
 /// NaN to one pattern).
+/// **Exact, not hashed.** Every parameter of the filter gets its own field, so
+/// two distinct shadows can never share a key and the cache needs no
+/// verification step.
+///
+/// The two sigma channels used to be folded into one `u32` by a `mix_u32`
+/// helper whose own comment called it "reversible-ish". Two `u32`s do not fit in
+/// one, so collisions existed by pigeonhole, and for any pair of `sigma_x`
+/// values a colliding `sigma_y` can be solved for directly — the rotate and the
+/// wrapping add are both bijections. On a collision the cache hands back an
+/// `ImageFilter` built for a different blur or offset, which paints a wrong
+/// shadow with no error anywhere.
+///
+/// Its two sibling caches in this file take the other route: hash the key and
+/// re-verify the contents on hit, with a comment explaining that a collision
+/// would otherwise return the wrong effect. They have to, because their keys
+/// cover variable-length data. A shadow's parameters are five fixed-width
+/// scalars, so the key can simply be all of them — which is also less code than
+/// either alternative, and removes the only caller of `mix_u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ShadowKey {
     /// Premultiplied `SkColor` (ARGB u32).  Already embeds
@@ -48,7 +66,8 @@ struct ShadowKey {
     /// shadow colour but different alpha get different keys (which
     /// is correct — the filter bakes the colour in).
     color: u32,
-    sigma_bits: u32,
+    sigma_x_bits: u32,
+    sigma_y_bits: u32,
     dx_bits: u32,
     dy_bits: u32,
 }
@@ -131,23 +150,14 @@ pub fn get_or_build_drop_shadow(
 ) -> Option<ImageFilter> {
     let key = ShadowKey {
         color,
-        sigma_bits: sigma_x.to_bits(),
+        sigma_x_bits: sigma_x.to_bits(),
+        sigma_y_bits: sigma_y.to_bits(),
         dx_bits: dx.to_bits(),
         dy_bits: dy.to_bits(),
     };
-    // Separate from the key above so `sigma_x != sigma_y` still
-    // participates in the cache hit test even though Canvas 2D
-    // always uses equal sigmas.
-    let key = (key, sigma_y.to_bits());
-    let packed = ShadowKey {
-        color: key.0.color,
-        sigma_bits: mix_u32(key.0.sigma_bits, key.1),
-        dx_bits: key.0.dx_bits,
-        dy_bits: key.0.dy_bits,
-    };
     SHADOW_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
-        if let Some(hit) = cache.get(&packed) {
+        if let Some(hit) = cache.get(&key) {
             crate::render_diagnostics::hit_shadow_filter_cache();
             return Some(hit.clone());
         }
@@ -160,7 +170,7 @@ pub fn get_or_build_drop_shadow(
             None,
             None,
         )?;
-        cache.put(packed, filter.clone());
+        cache.put(key, filter.clone());
         Some(filter)
     })
 }
@@ -382,20 +392,10 @@ fn build_colors_positions(
 /// Empty the caches.  Never strictly necessary (entries are bounded)
 /// but useful from tests that want deterministic refcount assertions
 /// or from a future `freeGpuResources` integration.
-#[allow(dead_code)]
 pub fn clear_all() {
     SHADOW_CACHE.with(|c| c.borrow_mut().clear());
     DASH_CACHE.with(|c| c.borrow_mut().clear());
     GRADIENT_CACHE.with(|c| c.borrow_mut().clear());
-}
-
-#[inline]
-fn mix_u32(a: u32, b: u32) -> u32 {
-    // Reversible-ish mix so the two sigma channels contribute
-    // independently to the packed key.  We use wrapping xorshift
-    // rather than a full hash because the bit patterns are already
-    // IEEE-754 floats — entropy is high in the mantissa.
-    a.wrapping_mul(0x9E37_79B9).wrapping_add(b.rotate_left(13))
 }
 
 fn hash_intervals(intervals: &[f32]) -> u64 {
@@ -410,6 +410,156 @@ fn hash_intervals(intervals: &[f32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Two distinct shadows must never share a key**, because the shadow cache
+    /// is the one cache here with no content re-verification — a shared key
+    /// means the second shadow silently gets the first one's filter.
+    ///
+    /// The sigmas used to be folded into a single `u32` by a "reversible-ish"
+    /// mix, which cannot be injective: two `u32`s do not fit in one. Every field
+    /// now stands on its own, so this test is checking that the struct still has
+    /// a field per parameter rather than checking a hash function's luck.
+    ///
+    /// Keys rather than filters, deliberately: building a real `ImageFilter`
+    /// needs Skia and would test Skia's constructor instead of the key.
+    #[test]
+    fn every_shadow_parameter_changes_the_cache_key() {
+        let base = ShadowKey {
+            color: 0xFF00_0000,
+            sigma_x_bits: 2.0f32.to_bits(),
+            sigma_y_bits: 2.0f32.to_bits(),
+            dx_bits: 3.0f32.to_bits(),
+            dy_bits: 4.0f32.to_bits(),
+        };
+
+        // One field at a time, so a key that dropped any single parameter fails
+        // on exactly that line.
+        let variants = [
+            (
+                "color",
+                ShadowKey {
+                    color: 0xFF00_00FF,
+                    ..base
+                },
+            ),
+            (
+                "sigma_x",
+                ShadowKey {
+                    sigma_x_bits: 2.5f32.to_bits(),
+                    ..base
+                },
+            ),
+            (
+                "sigma_y",
+                ShadowKey {
+                    sigma_y_bits: 2.5f32.to_bits(),
+                    ..base
+                },
+            ),
+            (
+                "dx",
+                ShadowKey {
+                    dx_bits: 3.5f32.to_bits(),
+                    ..base
+                },
+            ),
+            (
+                "dy",
+                ShadowKey {
+                    dy_bits: 4.5f32.to_bits(),
+                    ..base
+                },
+            ),
+        ];
+        for (field, variant) in variants {
+            assert_ne!(
+                variant, base,
+                "changing {field} left the cache key unchanged, so a shadow \
+                 differing only in {field} would be served the wrong filter"
+            );
+        }
+
+        // Anisotropic blur: `sigma_x != sigma_y` must be distinguishable from
+        // both isotropic keys. Canvas 2D only ever asks for equal sigmas, but the
+        // function takes them separately and the key has to mean what it says.
+        let iso_x = ShadowKey {
+            sigma_y_bits: 2.0f32.to_bits(),
+            ..base
+        };
+        let aniso = ShadowKey {
+            sigma_x_bits: 2.0f32.to_bits(),
+            sigma_y_bits: 7.0f32.to_bits(),
+            ..base
+        };
+        let swapped = ShadowKey {
+            sigma_x_bits: 7.0f32.to_bits(),
+            sigma_y_bits: 2.0f32.to_bits(),
+            ..base
+        };
+        assert_ne!(aniso, iso_x);
+        assert_ne!(
+            aniso, swapped,
+            "the two sigma channels are interchangeable in the key, so a blur \
+             wide in x reads as one wide in y"
+        );
+
+        // And the key must be a plain tuple of its fields: equal fields, equal
+        // key, or the cache would miss on every repeat of the same shadow.
+        assert_eq!(base, ShadowKey { ..base });
+    }
+
+    /// **The key must be populated from the arguments, not just shaped
+    /// correctly.**
+    ///
+    /// `every_shadow_parameter_changes_the_cache_key` builds `ShadowKey` values
+    /// by hand, so it proves the struct discriminates — and stays green if
+    /// `get_or_build_drop_shadow` fills a field from the wrong argument, which is
+    /// the mistake the old `mix_u32` packing invited. Verified by making
+    /// `sigma_y_bits` read `sigma_x`: the hand-built test passed unchanged.
+    ///
+    /// This one goes through the real function and counts entries, which is the
+    /// only handle on cache identity skia-safe offers (an `RCHandle` exposes no
+    /// pointer equality). Five distinct shadows must leave five entries; any
+    /// parameter the key drops shows up as a smaller count.
+    #[test]
+    fn distinct_shadows_reach_the_cache_as_distinct_entries() {
+        clear_all();
+        const COLOR: u32 = 0xFF00_0000;
+
+        // Base, then one argument changed at a time — including `sigma_y` alone,
+        // which is the channel the packed key could lose.
+        let built = [
+            get_or_build_drop_shadow(COLOR, 4.0, 4.0, 2.0, 2.0),
+            get_or_build_drop_shadow(COLOR, 5.0, 4.0, 2.0, 2.0), // sigma_x
+            get_or_build_drop_shadow(COLOR, 4.0, 5.0, 2.0, 2.0), // sigma_y only
+            get_or_build_drop_shadow(COLOR, 4.0, 4.0, 3.0, 2.0), // dx
+            get_or_build_drop_shadow(COLOR, 4.0, 4.0, 2.0, 3.0), // dy
+        ];
+        for (i, filter) in built.iter().enumerate() {
+            assert!(filter.is_some(), "shadow {i} failed to build");
+        }
+
+        SHADOW_CACHE.with(|c| {
+            assert_eq!(
+                c.borrow().len(),
+                5,
+                "five distinct shadows produced fewer entries, so the key drops \
+                 one of the five parameters and some shadow is being served \
+                 another's filter"
+            );
+        });
+
+        // Repeating the anisotropic one must hit rather than add a sixth.
+        let _again = get_or_build_drop_shadow(COLOR, 4.0, 5.0, 2.0, 2.0);
+        SHADOW_CACHE.with(|c| {
+            assert_eq!(
+                c.borrow().len(),
+                5,
+                "a repeat of an existing shadow added an entry, so the key is \
+                 not stable across identical calls"
+            );
+        });
+    }
 
     #[test]
     fn shadow_cache_hits_on_identical_params() {

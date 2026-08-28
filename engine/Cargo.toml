@@ -226,6 +226,32 @@ debug = false
 # is the size direction: `opt-level = 3` does not emit smaller code than `2`,
 # and `2` is already over budget.
 #
+# 2026-08-27, host microbenchmarks, and the reason they do not reopen the
+# question. The GL state-shadow rewrite landed that day shipped eight A/B
+# benchmarks (`cargo test --release -p migo-graphics --lib bench_ --
+# --ignored`). Run at each codegen level on x86_64, they show `opt-level = "z"`
+# to be 2.5-3.5x slower than `s` / `2` / `3` on the per-command dedup path, with
+# `3` best or tied-best throughout. That looks like it contradicts hot2's device
+# result. It does not, for two reasons, and both matter more than the ratio:
+#
+#   1. The path is small. Summed over one modelled frame -- per-command canvas
+#      shadow lookup, GPU budget ledger, capability toggles, texture binds,
+#      stencil, and 200 VAOs x 5 attributes -- `z` costs 26.5 us and `3` costs
+#      14.8 us. Against 16.67 ms that is 0.16% of a frame, which is exactly the
+#      shape of a result that dissolves into a device harness noise floor.
+#      Three interleaved rounds on a Mate 30 Pro already said so.
+#
+#   2. The rewrite ate the headroom. The same composite over the *previous*
+#      hash-keyed containers was 214 us at `z` and 68 us at `3` -- so before
+#      that day, a codegen bump was worth ~146 us/frame on this path; after it,
+#      ~11.7 us. Twelve and a half times less. Re-running the A/B against the
+#      current tree is re-running it against a much smaller effect than the one
+#      that already failed to register.
+#
+# So: measure the frame, not the microbenchmark. If a codegen bump is ever worth
+# re-asking, the trigger is a profile showing the render thread CPU-bound in
+# workspace code, not a ratio on a bench.
+#
 # They are kept, rather than deleted with the question they answered, because
 # re-asking after the code changes should cost a build and not a reconstruction.
 # test-q14-codegen-profiles.sh keeps them wired; it does not endorse shipping one.

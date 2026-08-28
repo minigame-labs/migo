@@ -85,6 +85,8 @@ fn add_if_nonzero(dst: &std::sync::atomic::AtomicU32, delta: u32) {
 fn publish(stats: &DebugStats, batch: FrameDiagnosticBatch) {
     add_if_nonzero(&stats.draw_calls, batch.draw_calls);
     add_if_nonzero(&stats.state_changes, batch.state_changes);
+    add_if_nonzero(&stats.adjacent_draws, batch.adjacent_draws);
+    add_if_nonzero(&stats.mergeable_draws, batch.mergeable_draws);
     // This is a per-frame gauge, not a cumulative byte counter.
     stats
         .texture_upload_bytes
@@ -168,6 +170,14 @@ macro_rules! forward_counter {
 }
 
 forward_counter!(bump_draw_call, bump_draw_call);
+
+/// [`bump_draw_call`] for a draw whose vertex or index range is known, so the
+/// contiguity behind `mergeable_draws` can be tested. See
+/// [`crate::render_frame_state::DrawShape`].
+#[inline(always)]
+pub(crate) fn bump_draw_call_shaped(shape: crate::render_frame_state::DrawShape) {
+    with_accumulator(|diagnostics| diagnostics.bump_draw_call_shaped(shape));
+}
 forward_counter!(bump_state_change, bump_state_change);
 forward_counter!(hit_measure_cache, hit_measure_cache);
 forward_counter!(miss_measure_cache, miss_measure_cache);

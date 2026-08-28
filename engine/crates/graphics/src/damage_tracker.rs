@@ -39,9 +39,40 @@ impl DamageTracker {
         }
     }
 
+    /// Record a damaged rect. Rejects geometry the downstream arithmetic cannot
+    /// represent, which is the whole of its validation duty.
+    ///
+    /// **Rejecting an unrepresentable edge here is what keeps `resolve`,
+    /// `dirty_aabb` and `collapse_to_aabb` free to add `x + width` in plain
+    /// `i32`.** They all do, in six places, and the input is not bounded by
+    /// anything else: `canvas2d_dispatcher::classify_draw_damage` derives these
+    /// coordinates from a CTM-transformed rect with `.floor() as i32`, and a
+    /// float cast in Rust *saturates*, so a pathological transform yields
+    /// `i32::MAX` rather than a wrap or a NaN.
+    ///
+    /// Left alone, that overflows. In release the wrap happened to be harmless —
+    /// `right` came out hugely negative, the `left >= right` emptiness check
+    /// fired, and `resolve` returned `FullSurface`, which is conservative. In
+    /// debug it is an arithmetic-overflow panic on the render thread, driven by
+    /// content-controlled input, and the engine does get built in debug (the
+    /// `verify-canvas-follows-surface` gate runs a dev-profile player).
+    ///
+    /// Same strategy as `present_damage::DamageRect::new`, which checks its
+    /// edges in `i64` for the same reason: put the invariant at the one entry
+    /// point so every consumer downstream inherits it.
     pub fn mark_rect(&mut self, rect: (i32, i32, i32, i32)) {
-        let (_x, _y, width, height) = rect;
+        let (x, y, width, height) = rect;
         if width <= 0 || height <= 0 {
+            return;
+        }
+        // `i64` so the check itself cannot overflow.
+        let right = i64::from(x) + i64::from(width);
+        let bottom = i64::from(y) + i64::from(height);
+        if right > i64::from(i32::MAX) || bottom > i64::from(i32::MAX) {
+            // Unrepresentable extent. Escalating to a full redraw is the honest
+            // answer — a rect this large covers the surface anyway, and it keeps
+            // every `x + width` below in range.
+            self.force_full = true;
             return;
         }
         if self.dirty.len() < MAX_DAMAGE_RECTS {
@@ -195,6 +226,87 @@ fn collapse_to_aabb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A rect whose right or bottom edge overflows `i32` must not reach the
+    /// arithmetic**, which adds `x + width` in plain `i32` in six places across
+    /// `resolve`, `dirty_aabb` and `collapse_to_aabb`.
+    ///
+    /// Reachable input, not a hypothetical: `classify_draw_damage` derives these
+    /// coordinates from a CTM-transformed rect via `.floor() as i32`, and a float
+    /// cast in Rust saturates, so a pathological transform hands over `i32::MAX`.
+    ///
+    /// In release the wrap was harmless by luck — `right` came out negative, the
+    /// emptiness check fired, `FullSurface`. In debug it is an overflow panic on
+    /// the render thread. This test runs in both, and in debug it fails by
+    /// panicking inside `resolve` if the guard is removed rather than by an
+    /// assertion, which is the point.
+    #[test]
+    fn an_unrepresentable_edge_escalates_instead_of_overflowing() {
+        let mut t = DamageTracker::new((1080, 1920));
+
+        // Right edge past i32::MAX.
+        t.mark_rect((i32::MAX - 10, 0, 100, 50));
+        assert_eq!(
+            t.resolve(),
+            ResolvedDamage::FullSurface,
+            "an unrepresentable rect must escalate to a full redraw"
+        );
+
+        // Bottom edge past i32::MAX, on a fresh tracker.
+        let mut t = DamageTracker::new((1080, 1920));
+        t.mark_rect((0, i32::MAX - 10, 50, 100));
+        assert_eq!(t.resolve(), ResolvedDamage::FullSurface);
+
+        // The guard must bound the *edge*, not reject large extents. The largest
+        // representable rect gets through `mark_rect` — which is the property
+        // under test — and `resolve` then reports `FullSurface` for its own
+        // reason: a rect covering the whole surface has nothing to repair
+        // partially. Two different escalations that happen to agree, so the
+        // interesting assertion is the one below, on a rect that is large but
+        // not total.
+        let mut t = DamageTracker::new((1080, 1920));
+        t.mark_rect((0, 0, i32::MAX, i32::MAX));
+        assert_eq!(t.resolve(), ResolvedDamage::FullSurface);
+
+        // Large, representable, and *not* covering the surface: this must clamp
+        // to a partial rect. If the edge guard were written against the extent
+        // instead of the edge, this rect would be rejected and the frame would
+        // repaint in full for nothing.
+        let mut t = DamageTracker::new((1080, 1920));
+        t.mark_rect((0, 0, i32::MAX, 100));
+        assert_eq!(
+            t.resolve(),
+            ResolvedDamage::Partial {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 100
+            },
+            "a representable rect with a huge extent must clamp, not escalate"
+        );
+
+        // And an overflowing rect among ordinary ones still escalates rather
+        // than being quietly dropped: it covers everything, so the frame does.
+        let mut t = DamageTracker::new((1080, 1920));
+        t.mark_rect((10, 10, 100, 100));
+        t.mark_rect((i32::MAX - 1, 0, 2, 2));
+        assert_eq!(t.resolve(), ResolvedDamage::FullSurface);
+    }
+
+    /// Past the rect cap the collapse also adds edges, so an overflowing rect
+    /// arriving *after* the cap must be stopped by the same guard — the collapse
+    /// runs before any emptiness check could catch it.
+    #[test]
+    fn an_unrepresentable_edge_is_stopped_before_the_collapse() {
+        let mut t = DamageTracker::new((1080, 1920));
+        for i in 0..MAX_DAMAGE_RECTS {
+            t.mark_rect((i as i32 * 10, 0, 5, 5));
+        }
+        // The next rect takes the collapse path, where `collapse_to_aabb` adds
+        // `x + w` for every held rect and the incoming one.
+        t.mark_rect((i32::MAX - 1, 0, 2, 2));
+        assert_eq!(t.resolve(), ResolvedDamage::FullSurface);
+    }
 
     #[test]
     fn falls_back_to_full_redraw_when_frame_contains_untracked_readback() {

@@ -1,7 +1,33 @@
-//! Texture atlas auto-packing.
+//! Texture atlas auto-packing. **Built and plumbed, not switched on.**
 //!
-//! Small textures (<= 256x256) are packed into 2048x2048 atlas pages to
-//! reduce GL texture bind/switch overhead.
+//! The intent: pack small textures (<= 256x256) into 2048x2048 atlas pages so
+//! images that would each need their own `glBindTexture` share one, cutting
+//! bind/switch overhead between draws.
+//!
+//! Nothing calls it today. `CanvasManager::atlas` is `None` from construction,
+//! and the only thing that would populate it — `atlas_upload_small` — is
+//! this doc used to describe the packing in the present tense, as though images
+//! were flowing through it.
+//!
+//! The consumer side *is* live and correct: `ImageEntry::atlas_origin` is read
+//! on the image-copy path and its `unwrap_or((0, 0))` handles the always-`None`
+//! case, so enabling the atlas is a matter of routing uploads into it rather
+//! than of finishing the plumbing.
+//!
+//! ## Whether to enable it is now a measurable question
+//!
+//! An atlas earns its keep by removing texture binds *between draws*, which is
+//! exactly what `FrameDiagnosticBatch::adjacent_draws` counts: draws with no
+//! post-dedup state change since the previous one. A workload whose draws are
+//! separated only by `glBindTexture` would show near-zero adjacency before an
+//! atlas and high adjacency after. `scripts/measure-draw-batching.sh` reads
+//! those counters, and T10 in `scripts/DEVICE-VERIFICATION-RENDERING.md` is the
+//! device task that would produce the before number.
+//!
+//! Kept rather than deleted because, unlike the `upload_policy` module removed
+//! from `lib.rs`, nothing here is falsified — a shelf packer for small images is
+//! a sound optimisation with its own tests, waiting on evidence that this
+//! engine's workloads bind enough small textures to care.
 //!
 //! ## Architecture
 //!

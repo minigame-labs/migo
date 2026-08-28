@@ -159,10 +159,93 @@ struct RenderbufferRecord {
     bytes: u64,
 }
 
+/// The four texture binding targets a WebGL 2 context can bind to, in slot
+/// order. Fixed by [`normalize_binding_target`], which rejects everything else
+/// before it can reach the ledger.
+const BINDING_TARGETS: [u32; 4] = [
+    GL_TEXTURE_2D,
+    GL_TEXTURE_CUBE_MAP,
+    GL_TEXTURE_3D,
+    GL_TEXTURE_2D_ARRAY,
+];
+
+/// Which texture is bound to each `(unit, target)` pair of one context.
+///
+/// **The key space here is completely dense and completely bounded**, and was
+/// nonetheless a `HashMap<(u32, u32), Option<TextureId>>`: `unit` is validated
+/// into `GL_TEXTURE0 .. GL_TEXTURE0 + WEBGL_TEXTURE_UNIT_COUNT` by
+/// [`is_valid_texture_unit`] and `target` into one of exactly four values by
+/// [`normalize_binding_target`], both *before* reaching this ledger. So every
+/// `bindTexture` hashed a pair of `u32`s to address one of 128 slots that could
+/// have been indexed directly — and unlike the dedup shadows this is a ledger,
+/// so the write happens on every call and cannot be skipped.
+///
+/// A flat array is also exactly equivalent, not merely close: the one reader,
+/// [`WebGlGpuBudget::bound_texture`], finishes with `.copied().flatten()`, so an
+/// absent key and a key holding `None` were already indistinguishable to it.
+/// That is what lets `None` cover both "never bound" and "explicitly unbound"
+/// with no tri-state.
+///
+/// 1 KiB per context, against 1-4 contexts.
+#[derive(Debug)]
+struct TextureUnitLedger {
+    /// `slots[unit_index * BINDING_TARGETS.len() + target_index]`.
+    slots: [Option<TextureId>; (WEBGL_TEXTURE_UNIT_COUNT as usize) * BINDING_TARGETS.len()],
+}
+
+impl Default for TextureUnitLedger {
+    fn default() -> Self {
+        Self {
+            slots: [None; (WEBGL_TEXTURE_UNIT_COUNT as usize) * BINDING_TARGETS.len()],
+        }
+    }
+}
+
+impl TextureUnitLedger {
+    /// Slot for a `(unit, target)` pair that has already passed validation.
+    /// `None` for anything else, which forwards the caller to its existing
+    /// "not a valid binding" path rather than inventing a slot.
+    #[inline]
+    fn slot(unit: u32, target: u32) -> Option<usize> {
+        let unit_index = unit.wrapping_sub(GL_TEXTURE0) as usize;
+        if unit_index >= WEBGL_TEXTURE_UNIT_COUNT as usize {
+            return None;
+        }
+        let target_index = BINDING_TARGETS.iter().position(|t| *t == target)?;
+        Some(unit_index * BINDING_TARGETS.len() + target_index)
+    }
+
+    #[inline]
+    fn set(&mut self, unit: u32, target: u32, texture: Option<TextureId>) {
+        if let Some(i) = Self::slot(unit, target) {
+            self.slots[i] = texture;
+        }
+    }
+
+    #[inline]
+    fn get(&self, unit: u32, target: u32) -> Option<TextureId> {
+        Self::slot(unit, target).and_then(|i| self.slots[i])
+    }
+
+    /// Drop every binding that names `texture`.
+    ///
+    /// Deleting a texture unbinds it from every unit of every context
+    /// (GLES 3.0 §3.8.14), so a ledger still naming it would charge a later
+    /// upload against a texture that no longer exists.
+    #[inline]
+    fn forget_texture(&mut self, texture: TextureId) {
+        for slot in &mut self.slots {
+            if *slot == Some(texture) {
+                *slot = None;
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BindingState {
     active_texture: u32,
-    textures: HashMap<(u32, u32), Option<TextureId>>,
+    textures: TextureUnitLedger,
     renderbuffer: Option<RenderbufferId>,
 }
 
@@ -170,7 +253,7 @@ impl Default for BindingState {
     fn default() -> Self {
         Self {
             active_texture: GL_TEXTURE0,
-            textures: HashMap::new(),
+            textures: TextureUnitLedger::default(),
             renderbuffer: None,
         }
     }
@@ -220,7 +303,9 @@ pub(crate) struct WebGlGpuBudget {
     limits: GpuBudgetLimits,
     process: Arc<ProcessUsage>,
     contexts: HashMap<CanvasId, u64>,
-    bindings: HashMap<CanvasId, BindingState>,
+    /// See [`crate::canvas_keyed`]: reached on every `bindTexture` /
+    /// `activeTexture`, one entry per live context.
+    bindings: crate::canvas_keyed::CanvasKeyed<BindingState>,
     textures: HashMap<TextureId, TextureRecord>,
     renderbuffers: HashMap<RenderbufferId, RenderbufferRecord>,
 }
@@ -246,7 +331,7 @@ impl WebGlGpuBudget {
             limits,
             process,
             contexts: HashMap::new(),
-            bindings: HashMap::new(),
+            bindings: crate::canvas_keyed::CanvasKeyed::default(),
             textures: HashMap::new(),
             renderbuffers: HashMap::new(),
         }
@@ -327,9 +412,8 @@ impl WebGlGpuBudget {
             return;
         };
         let state = self.bindings.entry(canvas_id).or_default();
-        state
-            .textures
-            .insert((state.active_texture, binding_target), texture);
+        let unit = state.active_texture;
+        state.textures.set(unit, binding_target, texture);
     }
 
     pub(crate) fn bind_renderbuffer(
@@ -666,7 +750,7 @@ impl WebGlGpuBudget {
             return 0;
         };
         for state in self.bindings.values_mut() {
-            state.textures.retain(|_, bound| *bound != Some(texture));
+            state.textures.forget_texture(texture);
         }
         let bytes = record.storage.byte_len();
         self.release_context_bytes(record.owner, bytes);
@@ -733,9 +817,7 @@ impl WebGlGpuBudget {
             .ok_or(GpuAllocationError::InvalidOperation)?;
         state
             .textures
-            .get(&(state.active_texture, binding_target))
-            .copied()
-            .flatten()
+            .get(state.active_texture, binding_target)
             .ok_or(GpuAllocationError::InvalidOperation)
     }
 
@@ -1347,6 +1429,150 @@ mod tests {
         assert_eq!(budget.delete_texture(11), 0);
         assert_eq!(budget.context_usage(1), 64);
         assert_eq!(budget.delete_texture(12), 64);
+        assert_eq!(scope.process_usage(), 0);
+    }
+
+    // ── The texture-unit ledger ──────────────────────────────────────────
+    //
+    // These cover the container that replaced `HashMap<(unit, target), _>`.
+    // The two binding tests above pin one unit and one target between them,
+    // which a ledger that ignored both keys entirely would still pass — so the
+    // scoping is asserted here rather than assumed.
+
+    /// Each `(unit, target)` pair is its own slot: an upload resolves to the
+    /// texture bound at the *active* unit and the *requested* target, not to
+    /// whatever was bound last.
+    #[test]
+    fn an_upload_resolves_the_texture_bound_at_its_own_unit_and_target() {
+        let scope = GpuBudgetTestScope::new(limits(4_096, 8_192));
+        let mut budget = scope.registry();
+        for id in [21u32, 22, 23] {
+            budget.create_texture(1, id).unwrap();
+        }
+
+        // Unit 0 / TEXTURE_2D, unit 3 / TEXTURE_2D, unit 0 / TEXTURE_CUBE_MAP.
+        budget.active_texture(1, TEXTURE0);
+        budget.bind_texture(1, TEXTURE_2D, Some(21));
+        budget.active_texture(1, TEXTURE0 + 3);
+        budget.bind_texture(1, TEXTURE_2D, Some(22));
+        budget.active_texture(1, TEXTURE0);
+        budget.bind_texture(1, TEXTURE_CUBE_MAP, Some(23));
+
+        // Still on unit 0: a 2D upload must charge 21, and a cube upload 23.
+        let a = budget
+            .prepare_tex_image_2d(1, TEXTURE_2D, 0, RGBA as i32, 4, 4, 0, RGBA, UNSIGNED_BYTE)
+            .unwrap();
+        budget.commit(a);
+        assert_eq!(
+            budget.delete_texture(21),
+            64,
+            "the 2D upload on unit 0 was charged to another slot's texture"
+        );
+
+        budget.active_texture(1, TEXTURE0 + 3);
+        let b = budget
+            .prepare_tex_image_2d(1, TEXTURE_2D, 0, RGBA as i32, 2, 2, 0, RGBA, UNSIGNED_BYTE)
+            .unwrap();
+        budget.commit(b);
+        assert_eq!(
+            budget.delete_texture(22),
+            16,
+            "the 2D upload on unit 3 did not resolve unit 3's binding"
+        );
+
+        assert_eq!(budget.delete_texture(23), 0, "the cube texture was charged");
+        assert_eq!(scope.process_usage(), 0);
+    }
+
+    /// The highest unit GLES 3 exposes has a slot; the existing tests only ever
+    /// touch unit 0 and unit 3, so an off-by-one at the top of the range would
+    /// go unnoticed.
+    #[test]
+    fn the_last_texture_unit_has_its_own_slot() {
+        let scope = GpuBudgetTestScope::new(limits(1_024, 2_048));
+        let mut budget = scope.registry();
+        budget.create_texture(1, 31).unwrap();
+
+        budget.active_texture(1, TEXTURE0 + 31);
+        budget.bind_texture(1, TEXTURE_2D, Some(31));
+        let allocation = budget
+            .prepare_tex_image_2d(1, TEXTURE_2D, 0, RGBA as i32, 4, 4, 0, RGBA, UNSIGNED_BYTE)
+            .unwrap();
+        budget.commit(allocation);
+
+        assert_eq!(budget.delete_texture(31), 64);
+        assert_eq!(scope.process_usage(), 0);
+    }
+
+    /// Deleting a texture unbinds it everywhere (GLES 3.0 §3.8.14) and nowhere
+    /// else. A sweep that cleared the whole ledger would make a later upload
+    /// against a surviving binding fail with `InvalidOperation`.
+    #[test]
+    fn deleting_a_texture_clears_only_the_slots_that_named_it() {
+        let scope = GpuBudgetTestScope::new(limits(4_096, 8_192));
+        let mut budget = scope.registry();
+        budget.create_texture(1, 41).unwrap();
+        budget.create_texture(1, 42).unwrap();
+
+        // 41 on two different units, 42 on a third.
+        budget.active_texture(1, TEXTURE0);
+        budget.bind_texture(1, TEXTURE_2D, Some(41));
+        budget.active_texture(1, TEXTURE0 + 1);
+        budget.bind_texture(1, TEXTURE_2D, Some(41));
+        budget.active_texture(1, TEXTURE0 + 2);
+        budget.bind_texture(1, TEXTURE_2D, Some(42));
+
+        assert_eq!(budget.delete_texture(41), 0);
+
+        // Both of 41's units are now unbound.
+        for unit in [TEXTURE0, TEXTURE0 + 1] {
+            budget.active_texture(1, unit);
+            assert_eq!(
+                budget
+                    .prepare_tex_image_2d(1, TEXTURE_2D, 0, RGBA as i32, 4, 4, 0, RGBA, UNSIGNED_BYTE)
+                    .unwrap_err(),
+                GpuAllocationError::InvalidOperation,
+                "unit {unit:#x} still names the deleted texture"
+            );
+        }
+
+        // 42's unit is untouched and still usable.
+        budget.active_texture(1, TEXTURE0 + 2);
+        let allocation = budget
+            .prepare_tex_image_2d(1, TEXTURE_2D, 0, RGBA as i32, 4, 4, 0, RGBA, UNSIGNED_BYTE)
+            .expect("an unrelated binding was swept away by the delete");
+        budget.commit(allocation);
+        assert_eq!(budget.delete_texture(42), 64);
+        assert_eq!(scope.process_usage(), 0);
+    }
+
+    /// Two contexts keep separate ledgers — the canvas-keyed table is what
+    /// separates them, and a memo that answered without checking its key would
+    /// charge one context's upload to the other's texture.
+    #[test]
+    fn two_contexts_keep_separate_texture_unit_ledgers() {
+        let scope = GpuBudgetTestScope::new(limits(4_096, 8_192));
+        let mut budget = scope.registry();
+        budget.create_texture(1, 51).unwrap();
+        budget.create_texture(2, 52).unwrap();
+
+        budget.bind_texture(1, TEXTURE_2D, Some(51));
+        budget.bind_texture(2, TEXTURE_2D, Some(52));
+
+        // Alternate contexts so the memo is stale on both lookups.
+        let a = budget
+            .prepare_tex_image_2d(1, TEXTURE_2D, 0, RGBA as i32, 4, 4, 0, RGBA, UNSIGNED_BYTE)
+            .unwrap();
+        budget.commit(a);
+        let b = budget
+            .prepare_tex_image_2d(2, TEXTURE_2D, 0, RGBA as i32, 2, 2, 0, RGBA, UNSIGNED_BYTE)
+            .unwrap();
+        budget.commit(b);
+
+        assert_eq!(budget.context_usage(1), 64, "context 1's charge is wrong");
+        assert_eq!(budget.context_usage(2), 16, "context 2's charge is wrong");
+        assert_eq!(budget.delete_texture(51), 64);
+        assert_eq!(budget.delete_texture(52), 16);
         assert_eq!(scope.process_usage(), 0);
     }
 

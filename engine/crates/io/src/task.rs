@@ -26,13 +26,16 @@ pub enum PoolKind {
     Fs,
     Pack,
     Image,
+    /// Zip extraction. CPU-bound on inflate with a working set of tens of
+    /// kilobytes, so it parallelises nearly linearly and is safe to run
+    /// several at a time.
     Archive,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadSpec {
-    Whole,
-    Range { position: u64, length: usize },
+    /// Package ingest. Shares the archive machinery but not its cost profile:
+    /// transcoding one image holds the encoded bytes, the decoded RGBA, the
+    /// ETC2 blocks and the KTX2 container at once — tens of MB for a 2048²
+    /// asset, over a hundred for a 4096² one. It gets its own class so that
+    /// staying serial, which it must, does not also hold extraction back.
+    Ingest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +44,15 @@ pub enum IoRequest {
         backend: BackendKind,
         request: RequestKind,
         priority: PriorityClass,
-        spec: ReadSpec,
+        /// Upper bound on the bytes this read will produce. This is the only
+        /// input to the cheap/expensive decision.
+        ///
+        /// There used to be a `ReadSpec` beside it distinguishing whole-file
+        /// from ranged reads, with the range's length narrowing the inline
+        /// threshold. It could not change any outcome: the estimate is already
+        /// bounded by the requested length, so narrowing the threshold to that
+        /// same length was implied. It also carried a `position` that nothing
+        /// read and every caller filled with `0`.
         estimated_bytes: usize,
     },
     GetFileInfo {
@@ -130,7 +141,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 0,
         };
         assert_eq!(read.priority(), PriorityClass::ForegroundBlocking);

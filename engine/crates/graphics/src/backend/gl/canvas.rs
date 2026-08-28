@@ -341,9 +341,19 @@ impl Canvas2DRenderer {
             }
             SetLineDash { segments } => {
                 // Spec: odd-length dash arrays double up to even length.
-                let mut d = segments.clone();
-                if d.len() % 2 == 1 {
-                    d.extend_from_slice(&d.clone());
+                //
+                // `extend_from_within` rather than `extend_from_slice(&d.clone())`:
+                // the clone existed only to dodge the borrow of `d` while
+                // extending it, and it bought a whole second vector to do it.
+                let doubled = segments.len() % 2 == 1;
+                let mut d = Vec::with_capacity(if doubled {
+                    segments.len() * 2
+                } else {
+                    segments.len()
+                });
+                d.extend_from_slice(segments);
+                if doubled {
+                    d.extend_from_within(..);
                 }
                 self.state.line_dash = std::sync::Arc::new(d);
                 false
@@ -627,7 +637,6 @@ impl Canvas2DRenderer {
     /// Apply a Canvas2D shadow to the given paint if the current shadow is
     /// visible.  Exposed so `fill` / `stroke` paths can opt in at draw
     /// time without paying the cost when shadows are off (the common case).
-    #[allow(dead_code)] // wired up in P4b drawing-side refinement
     pub fn maybe_apply_shadow(_paint: &mut skia_safe::Paint, shadow: &Shadow) -> bool {
         if !shadow.is_visible() {
             return false;
@@ -638,7 +647,6 @@ impl Canvas2DRenderer {
 }
 
 /// Unused-import silencer for imports that only matter in the stubs above.
-#[allow(dead_code)]
 fn _force_use_imports() {
     let _ = ProtocolColor::black();
     let _ = TextAlign::Start;

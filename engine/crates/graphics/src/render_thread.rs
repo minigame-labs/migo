@@ -313,7 +313,7 @@ fn execute_canvas_batch(
         if state_safe { payload.dirty_rect } else { None }
     };
 
-    let scissor_applied = if let Some(setup) =
+    let scissor_borrow = if let Some(setup) =
         prepare_batch_scissor(present, &dirty_rect, cm.get_canvas_size(canvas_id).ok())
     {
         // Bind the target canvas before touching GL state so scissor
@@ -328,15 +328,14 @@ fn execute_canvas_batch(
         // tiles (Mali, PowerVR).  Buffer-age partial repair further needs the
         // DrawingBuffer and destination pixels to persist, so invalidation
         // must stay off this path.
-        let applied = if cm.make_current_needed(canvas_id).is_ok() {
-            dirty_region::apply_scissor(gl, &setup.region, setup.canvas_w, setup.canvas_h);
-            true
+        if cm.make_current_needed(canvas_id).is_ok() {
+            let state = cm.gl_state.entry(canvas_id).or_default();
+            dirty_region::apply_scissor(gl, state, &setup.region, setup.canvas_w, setup.canvas_h)
         } else {
-            false
-        };
-        applied
+            None
+        }
     } else {
-        false
+        None
     };
 
     // G-1: pin every image id this batch references so a
@@ -392,12 +391,15 @@ fn execute_canvas_batch(
         }
     }
 
-    if scissor_applied {
+    // The borrow is a value, so this cannot be skipped without the compiler
+    // noticing an unused `#[must_use]` — the pairing is no longer a convention.
+    if let Some(borrow) = scissor_borrow {
         debug_assert!(
             cm.current_canvas_id() == Some(canvas_id),
-            "clear_scissor target mismatch: expected canvas {canvas_id:?} to be current"
+            "restore_scissor target mismatch: expected canvas {canvas_id:?} to be current"
         );
-        dirty_region::clear_scissor(gl);
+        let state = cm.gl_state.entry(canvas_id).or_default();
+        dirty_region::restore_scissor(gl, state, borrow);
     }
     if batch_dirty {
         cm.mark_2d_dirty(canvas_id);
@@ -2432,7 +2434,7 @@ impl RenderThread {
                                        render_binding: &mut RenderSurfaceBinding,
                                        render_server: &mut RenderServer|
                  -> LoopCtl {
-                    crate::atrace_scope!("migo.render.drain_cmds");
+                    crate::atrace_scope!(c"migo.render.drain_cmds");
                     // Drain pending commands with a *dual budget*:
                     // capped by both command count and elapsed CPU
                     // time.  Previously only the count was bounded,
@@ -2543,7 +2545,7 @@ impl RenderThread {
                                                         needs_recovery: &mut bool,
                                                         render_binding: &RenderSurfaceBinding,
                                                         surface_system: &mut SurfaceSystem| {
-                    crate::atrace_scope!("migo.render.present_and_raf");
+                    crate::atrace_scope!(c"migo.render.present_and_raf");
                     let _ = ts; // RAF is signalled before the drain now (see signal_raf)
                     // Drain Canvas2D snapshot textures captured during this
                     // frame's `getImageData` calls.  By this point the
@@ -2628,7 +2630,7 @@ impl RenderThread {
                         // framebuffer so the driver can skip loading unchanged tiles.
                         cm.declare_frame_damage(onscreen_id);
 
-                        crate::atrace_scope!("migo.render.flush_2d");
+                        crate::atrace_scope!(c"migo.render.flush_2d");
                         match cm.flush_dirty_2d_contexts() {
                             Ok(flushed_ids) => {
                                 for canvas_id in flushed_ids {
@@ -2648,7 +2650,7 @@ impl RenderThread {
                             )
                         };
 
-                        crate::atrace_scope!("migo.render.swap_buffers");
+                        crate::atrace_scope!(c"migo.render.swap_buffers");
                         // Final generation re-check at the swap boundary. If
                         // destroy raced the flush/damage work, skip EGL swap;
                         // presenting to the abandoned BufferQueue is forbidden.

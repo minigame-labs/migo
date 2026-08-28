@@ -2,7 +2,7 @@ use crate::{
     cost::CheapPolicy,
     domain::IoDomain,
     pools::{IoPools, PoolError},
-    task::{BackendKind, IoRequest, PoolKind, PriorityClass, ReadSpec, RequestKind},
+    task::{BackendKind, IoRequest, PoolKind, PriorityClass, RequestKind},
 };
 use std::{
     collections::HashMap,
@@ -55,7 +55,11 @@ pub enum RouteDecision {
     Delegated(PoolKind),
 }
 
-#[derive(Clone)]
+/// Deliberately **not** `Clone`. `Drop` closes the shared `Arc<IoDomain>`, so
+/// a second owner dropping first would shut down IO for every other holder —
+/// a struct-level clone and an `Arc::clone` would read identically at the call
+/// site and mean opposite things. Share one scheduler through `Arc`, which is
+/// what every caller already does.
 pub struct IoScheduler {
     host_id: i32,
     pools: IoPools,
@@ -342,9 +346,8 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
             backend,
             request: _,
             priority,
-            spec,
             estimated_bytes,
-        } => classify_read(*backend, *priority, *spec, *estimated_bytes, policy),
+        } => classify_read(*backend, *priority, *estimated_bytes, policy),
         IoRequest::GetFileInfo {
             backend, priority, ..
         } => classify_metadata(*backend, *priority),
@@ -356,7 +359,10 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
             }
         }
         IoRequest::Unzip { .. } => RouteDecision::Delegated(PoolKind::Archive),
-        IoRequest::PackageIngest { .. } => RouteDecision::Delegated(PoolKind::Archive),
+        // Not `Archive`: ingest holds an image's encoded bytes, its decoded
+        // RGBA, its ETC2 blocks and its KTX2 container simultaneously, so it
+        // stays serial while extraction runs several at a time.
+        IoRequest::PackageIngest { .. } => RouteDecision::Delegated(PoolKind::Ingest),
         IoRequest::VerifyPackage { .. } => RouteDecision::Delegated(PoolKind::Fs),
         IoRequest::StorageGet {
             request,
@@ -384,7 +390,6 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
 fn classify_read(
     backend: BackendKind,
     priority: PriorityClass,
-    spec: ReadSpec,
     estimated_bytes: usize,
     policy: &CheapPolicy,
 ) -> RouteDecision {
@@ -395,7 +400,7 @@ fn classify_read(
         // pool hop just adds a thread handoff to a sub-millisecond
         // operation. Everything else still fans out to the pack pool.
         BackendKind::Pack => {
-            if is_foreground(priority) && estimated_bytes <= inline_read_bytes(spec, policy) {
+            if is_foreground(priority) && estimated_bytes <= policy.small_read_bytes {
                 RouteDecision::Inline
             } else {
                 RouteDecision::Delegated(PoolKind::Pack)
@@ -403,7 +408,7 @@ fn classify_read(
         }
         BackendKind::Archive => RouteDecision::Delegated(PoolKind::Archive),
         BackendKind::Filesystem => {
-            if is_foreground(priority) && estimated_bytes <= inline_read_bytes(spec, policy) {
+            if is_foreground(priority) && estimated_bytes <= policy.small_read_bytes {
                 RouteDecision::Inline
             } else {
                 RouteDecision::Delegated(PoolKind::Fs)
@@ -440,13 +445,6 @@ fn classify_storage_get(
     }
 }
 
-fn inline_read_bytes(spec: ReadSpec, policy: &CheapPolicy) -> usize {
-    match spec {
-        ReadSpec::Whole => policy.small_read_bytes,
-        ReadSpec::Range { length, .. } => policy.small_read_bytes.min(length),
-    }
-}
-
 fn is_foreground(priority: PriorityClass) -> bool {
     matches!(
         priority,
@@ -469,7 +467,7 @@ mod tests {
     use crate::{
         cost::CheapPolicy,
         scheduler::{IoScheduler, RouteDecision, classify_request},
-        task::{BackendKind, IoRequest, PoolKind, PriorityClass, ReadSpec, RequestKind},
+        task::{BackendKind, IoRequest, PoolKind, PriorityClass, RequestKind},
     };
 
     #[test]
@@ -481,7 +479,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 
@@ -507,7 +504,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 
@@ -523,17 +519,12 @@ mod tests {
             backend: BackendKind::Filesystem,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Range {
-                position: 0,
-                length: 32,
-            },
             estimated_bytes: 32,
         };
         let delegated_req = IoRequest::ReadFile {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 
@@ -663,7 +654,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
         assert_eq!(scheduler_b.run_sync(&pack_req, || 3_u32).unwrap(), 3);
@@ -683,7 +673,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Whole,
             estimated_bytes: 128 * 1024,
         };
 
@@ -699,10 +688,6 @@ mod tests {
             backend: BackendKind::Filesystem,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Range {
-                position: 0,
-                length: 1024,
-            },
             estimated_bytes: 1024,
         };
 
@@ -720,10 +705,6 @@ mod tests {
             backend: BackendKind::Filesystem,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Range {
-                position: 0,
-                length: 1024,
-            },
             estimated_bytes: 1024,
         };
 
@@ -990,6 +971,36 @@ mod tests {
         );
     }
 
+    /// Extraction and ingest must not share a class.
+    ///
+    /// They ran on one before, which forced a single cap onto two opposite
+    /// profiles: ingest holds tens to hundreds of MB per job and has to stay
+    /// serial, extraction holds tens of KB and measures 3.5-3.8x on four
+    /// threads. One cap could only serve the dangerous one, so extraction was
+    /// pinned at 1 for a constraint that was never its own.
+    #[test]
+    fn extraction_and_ingest_are_scheduled_as_separate_classes() {
+        let unzip = IoRequest::Unzip {
+            backend: BackendKind::Filesystem,
+            priority: PriorityClass::Background,
+            compressed_bytes: 4 * 1024 * 1024,
+        };
+        let ingest = IoRequest::PackageIngest {
+            priority: PriorityClass::Background,
+            compressed_bytes: 4 * 1024 * 1024,
+        };
+        let policy = CheapPolicy::default();
+
+        assert_eq!(
+            classify_request(&unzip, &policy),
+            RouteDecision::Delegated(PoolKind::Archive)
+        );
+        assert_eq!(
+            classify_request(&ingest, &policy),
+            RouteDecision::Delegated(PoolKind::Ingest)
+        );
+    }
+
     #[test]
     fn scheduler_routes_uncached_image_decode_requests_to_image_pool() {
         let req = IoRequest::DecodeImage {
@@ -1029,7 +1040,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1054,6 +1064,106 @@ mod tests {
         assert_eq!(message, "pack worker panic");
     }
 
+    /// What the inline fast path is actually worth, in the shape
+    /// `readFileSync` hits it.
+    ///
+    /// Both requests describe the same 200-byte whole-file read. The hinted
+    /// one carries the size the backend already knew and classifies `Inline`;
+    /// the unhinted one has to assume `MAX_READ_LENGTH`, classifies
+    /// `Delegated`, and pays a worker round-trip for a read that would have
+    /// finished in the time the handoff takes.
+    ///
+    /// `#[ignore]` and reported rather than bounded: the absolute numbers are
+    /// hardware-dependent. The assertion is only on the direction, which is
+    /// the part that must never regress.
+    #[test]
+    #[ignore]
+    fn bench_inline_vs_delegated_dispatch() {
+        const ITERATIONS: u32 = 2000;
+        let scheduler = IoScheduler::new(401);
+
+        let hinted = IoRequest::ReadFile {
+            backend: BackendKind::Pack,
+            request: RequestKind::Sync,
+            priority: PriorityClass::ForegroundBlocking,
+            estimated_bytes: 200,
+        };
+        let unhinted = IoRequest::ReadFile {
+            backend: BackendKind::Pack,
+            request: RequestKind::Sync,
+            priority: PriorityClass::ForegroundBlocking,
+            estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
+        };
+
+        assert_eq!(scheduler.classify(&hinted), RouteDecision::Inline);
+        assert_eq!(
+            scheduler.classify(&unhinted),
+            RouteDecision::Delegated(PoolKind::Pack)
+        );
+
+        // Spawn the worker threads before timing, or the first delegated call
+        // absorbs the pool's one-time startup and overstates the gap.
+        scheduler.run_sync(&unhinted, || 0_u8).unwrap();
+
+        // A trivial job, so what is being timed is dispatch overhead and
+        // nothing else -- which is the whole difference between the two paths
+        // for a read this small.
+        let inline = {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                scheduler.run_sync(&hinted, || 7_u8).unwrap();
+            }
+            started.elapsed()
+        };
+        let delegated = {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                scheduler.run_sync(&unhinted, || 7_u8).unwrap();
+            }
+            started.elapsed()
+        };
+
+        eprintln!(
+            "inline    {:>10?} total  {:>10?}/call",
+            inline,
+            inline / ITERATIONS
+        );
+        eprintln!(
+            "delegated {:>10?} total  {:>10?}/call",
+            delegated,
+            delegated / ITERATIONS
+        );
+        eprintln!(
+            "worker round-trip costs {:.1}x an inline dispatch",
+            delegated.as_secs_f64() / inline.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+
+        // The filesystem sync path buys its hint with one `stat`. Pack reads
+        // get theirs free from the mount table, so this is the only case that
+        // pays, and the number it pays against is `delegated` above.
+        let probe = std::env::temp_dir().join(format!("migo-stat-probe-{}", std::process::id()));
+        std::fs::write(&probe, b"x").unwrap();
+        let stat = {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(std::fs::metadata(&probe).map(|m| m.len()).unwrap_or(0));
+            }
+            started.elapsed()
+        };
+        let _ = std::fs::remove_file(&probe);
+        eprintln!(
+            "size-hint stat {:>10?}/call  -- {:.1}% of the round-trip it avoids",
+            stat / ITERATIONS,
+            100.0 * stat.as_secs_f64() / delegated.as_secs_f64()
+        );
+
+        assert!(
+            inline < delegated,
+            "the inline path is no longer cheaper than a worker round-trip \
+             (inline {inline:?}, delegated {delegated:?})"
+        );
+    }
+
     #[test]
     fn run_async_completes_without_tokio_blocking_threads() {
         let scheduler = IoScheduler::new(201);
@@ -1061,7 +1171,6 @@ mod tests {
             backend: BackendKind::Pack,
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
-            spec: ReadSpec::Whole,
             estimated_bytes: 256 * 1024,
         };
 

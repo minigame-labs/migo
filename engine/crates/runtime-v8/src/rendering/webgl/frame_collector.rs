@@ -61,6 +61,41 @@ impl Canvas2DSegment {
         self.dirty_poisoned = true;
     }
 
+    /// Classify one command's effect on the segment's scissor hint.
+    ///
+    /// **Every variant is listed, and the unreachable default poisons.** This
+    /// hint becomes a real `glScissor` on the render thread —
+    /// `render_thread::apply_scissor`, reached through `prepare_batch_scissor` —
+    /// so a command whose damage this under-reports has its pixels clipped away,
+    /// with no GL error and nothing in a log.
+    ///
+    /// `Canvas2DCmd` is `#[non_exhaustive]`, so a match from this crate cannot
+    /// be exhaustive and the compiler will not report a new variant here. That
+    /// attribute is a declaration that variants *will* be added — which is
+    /// exactly why the catch-all previously reading `_ => {}` was the wrong
+    /// default. It promised, of every command not yet written, that it damages
+    /// nothing.
+    ///
+    /// So the default is now [`Self::poison_dirty`]: an unclassified command
+    /// costs one full-segment repaint and cannot be wrong. The trade is
+    /// deliberate and one-directional — correctness comes free, and a new
+    /// command that really is boundable has to be added to the arms below to get
+    /// its scissor back. Losing a little partial-update efficiency until someone
+    /// notices is recoverable; shipping a clipped draw is not.
+    ///
+    /// The arms are spelled out rather than collapsed into that default because
+    /// the classification *is* the documentation: each group below records why a
+    /// command cannot widen a rect-shaped bound, and that reasoning is what a
+    /// future reader needs in order to place a new variant correctly.
+    ///
+    /// Note the division of labour with the render thread's second gate.
+    /// `canvas2d_dispatcher::state_allows_partial` independently discards the
+    /// hint when the *authoritative* 2D state is unsafe (shadow, non-source-over
+    /// blend, `globalAlpha != 1`, high miter limit, non-axis-aligned CTM). That
+    /// gate covers state, not commands: it re-derives safety from what the state
+    /// became, so a command that widens damage without touching one of those
+    /// five fields passes it. Both layers are needed, and this one is the only
+    /// one that sees commands.
     #[inline]
     fn mark_dirty_for_cmd(&mut self, cmd: &Canvas2DCmd) {
         match cmd {
@@ -112,8 +147,96 @@ impl Canvas2DSegment {
                 self.poison_dirty();
             }
 
-            // ── Everything else (path building, other setters) — no dirty impact ──
-            _ => {}
+            // Composite mode. `copy`, `source-in`, `destination-out`, `xor` and
+            // friends write — or clear — pixels the source geometry never
+            // covers, so a rect bound is meaningless under them.
+            //
+            // The render thread's `state_allows_partial` rejects any non
+            // source-over blend too, and would catch this on its own. Poisoning
+            // here as well is deliberate: this arm should say what the command
+            // means rather than defer to a gate in another crate that happens to
+            // agree today, and a mode change costs at most one segment repaint.
+            Canvas2DCmd::SetCompositeOperation { .. } => {
+                self.poison_dirty();
+            }
+
+            // A resize re-specifies the backing store, which per spec clears the
+            // canvas and resets the context. The reallocation makes the surface
+            // transparent whatever the scissor says, so the hint cannot clip a
+            // draw here — but it can leave the *presented* window showing older
+            // content outside a small rect while the canvas behind it went
+            // transparent. Full repaint for the segment.
+            Canvas2DCmd::ResizeCanvas { .. } => {
+                self.poison_dirty();
+            }
+
+            // ── No effect on the bounds of a subsequent rect-shaped draw ──
+            //
+            // Path building: geometry accumulates but paints nothing. What
+            // eventually paints it is `Fill` / `Stroke` / `Clip`, all poisoned
+            // above, so the path itself never needs a bound.
+            Canvas2DCmd::BeginPath
+            | Canvas2DCmd::ClosePath
+            | Canvas2DCmd::MoveTo { .. }
+            | Canvas2DCmd::LineTo { .. }
+            | Canvas2DCmd::QuadraticCurveTo { .. }
+            | Canvas2DCmd::BezierCurveTo { .. }
+            | Canvas2DCmd::Arc { .. }
+            | Canvas2DCmd::ArcTo { .. }
+            | Canvas2DCmd::Rect { .. }
+            | Canvas2DCmd::Ellipse { .. } => {}
+
+            // Paint styles: change the colour of covered pixels, never which
+            // pixels are covered.
+            Canvas2DCmd::SetFillStyle { .. }
+            | Canvas2DCmd::SetStrokeStyle { .. }
+            | Canvas2DCmd::SetFillStyleGradient { .. }
+            | Canvas2DCmd::SetStrokeStyleGradient { .. }
+            | Canvas2DCmd::SetFillStylePattern { .. }
+            | Canvas2DCmd::SetStrokeStylePattern { .. }
+            | Canvas2DCmd::SetGlobalAlpha { .. } => {}
+
+            // Stroke geometry attributes. These do widen a stroke's bounds, but
+            // every command that strokes — `Stroke`, `StrokeRect`, `StrokeText`
+            // — is poisoned above, so no rect-shaped bound ever depends on them.
+            // (`SetLineWidth` is nonetheless poisoned, one arm up, as a hedge
+            // against a future bounded stroke.)
+            Canvas2DCmd::SetLineCap { .. }
+            | Canvas2DCmd::SetLineJoin { .. }
+            | Canvas2DCmd::SetMiterLimit { .. }
+            | Canvas2DCmd::SetLineDash { .. }
+            | Canvas2DCmd::SetLineDashOffset { .. } => {}
+
+            // Text attributes: only `FillText` / `StrokeText` consume them, and
+            // both are poisoned above.
+            Canvas2DCmd::SetFont { .. }
+            | Canvas2DCmd::SetTextAlign { .. }
+            | Canvas2DCmd::SetTextBaseline { .. }
+            | Canvas2DCmd::SetTextDirection { .. } => {}
+
+            // `save` / `restore` move the whole state, transform and composite
+            // mode included — but the poison is sticky for the segment, so any
+            // transform or mode change *inside* it has already poisoned by the
+            // time a `restore` could put one back. Nothing left to widen.
+            Canvas2DCmd::Save | Canvas2DCmd::Restore => {}
+
+            // Reads, not writes: no pixel changes.
+            Canvas2DCmd::MeasureText { .. }
+            | Canvas2DCmd::GetImageData { .. }
+            | Canvas2DCmd::CaptureSnapshot { .. }
+            | Canvas2DCmd::ReadSnapshotPixels { .. } => {}
+
+            // Context creation paints nothing.
+            Canvas2DCmd::CreateContext2D => {}
+
+            // Unreachable today — every variant above is named. Required
+            // because `Canvas2DCmd` is `#[non_exhaustive]`, and it poisons
+            // because that attribute means this arm is where a variant added
+            // tomorrow arrives. See the classification note above: an
+            // unclassified command must cost a repaint, not a clipped draw.
+            _ => {
+                self.poison_dirty();
+            }
         }
     }
 }
@@ -220,6 +343,68 @@ impl UnifiedFrameCollector {
         self.frame_peak_bytes = self.frame_peak_bytes.max(self.pending_bytes);
     }
 
+    /// The open GL segment, opening one if the current segment is not GL.
+    ///
+    /// **Exists so the invariant has one home.** `current == CurrentKind::GL`
+    /// implies the last segment is a `FrameSegment::GL`, and both fields are
+    /// private to this type, so a violation could only be a bug in this file.
+    /// Three call sites used to establish that and then re-derive it with
+    /// `if let Some(FrameSegment::GL(seg)) = self.segments.last_mut()`, whose
+    /// `else` was to fall out of the block — silently dropping the command
+    /// while `pending_bytes` had already counted it.
+    ///
+    /// A dropped render command is the worst shape a failure can take here:
+    /// no error, no log, a frame that is simply wrong, and — because the
+    /// violation would be structural rather than per-command — every push after
+    /// it dropped too. `build_frame_packet_inner` already carries a "defence in
+    /// depth" reset for the *mirror* of this (`pending_bytes` counted but no
+    /// segment landed), so the concern was live; what was missing was making the
+    /// cause loud rather than papering over the symptom.
+    ///
+    /// `expect` follows the same reasoning as
+    /// `SurfaceRecreateGuard::candidate` in `migo-graphics`: a structural
+    /// invariant that the type alone controls is asserted, not degraded around.
+    #[inline]
+    fn gl_segment(&mut self) -> &mut GlSegment {
+        if self.current != CurrentKind::GL {
+            self.segments.push(FrameSegment::GL(GlSegment {
+                commands: take_gl_command_vec(),
+            }));
+            self.current = CurrentKind::GL;
+        }
+        match self.segments.last_mut() {
+            Some(FrameSegment::GL(seg)) => seg,
+            _ => unreachable!(
+                "CurrentKind::GL requires the last segment to be GL; \
+                 the collector's own fields are the only way to break that"
+            ),
+        }
+    }
+
+    /// The open Canvas2D segment for `canvas_id`, opening one if the current
+    /// segment is a different canvas or a GL segment. See [`Self::gl_segment`]
+    /// for why the invariant is asserted here rather than re-derived.
+    #[inline]
+    fn canvas2d_segment(&mut self, canvas_id: u32) -> &mut Canvas2DSegment {
+        if self.current != CurrentKind::Canvas2D(canvas_id) {
+            self.segments.push(FrameSegment::Canvas2D(Canvas2DSegment {
+                canvas_id,
+                commands: take_canvas_command_vec(),
+                dirty_rect: None,
+                dirty_poisoned: false,
+            }));
+            self.current = CurrentKind::Canvas2D(canvas_id);
+        }
+        match self.segments.last_mut() {
+            Some(FrameSegment::Canvas2D(seg)) => seg,
+            _ => unreachable!(
+                "CurrentKind::Canvas2D requires the last segment to be that \
+                 canvas's; the collector's own fields are the only way to \
+                 break that"
+            ),
+        }
+    }
+
     fn publish_frame_peak(&mut self) {
         let peak = self.frame_peak_bytes.min(u32::MAX as usize) as u32;
         self.frame_peak_bytes = 0;
@@ -262,50 +447,38 @@ impl UnifiedFrameCollector {
     }
 
     pub(crate) fn push_canvas2d(&mut self, canvas_id: u32, cmd: Canvas2DCmd) {
-        if self.current != CurrentKind::Canvas2D(canvas_id) {
-            self.segments.push(FrameSegment::Canvas2D(Canvas2DSegment {
-                canvas_id,
-                commands: take_canvas_command_vec(),
-                dirty_rect: None,
-                dirty_poisoned: false,
-            }));
-            self.current = CurrentKind::Canvas2D(canvas_id);
-        }
         // Walk the full deep size (enum base + heap payload) so the
         // budget reflects reality.  The previous implementation
         // only added `size_of::<Canvas2DCmd>()`, missing text
         // strings, line dash vectors, gradient stops, and
         // DrawImageBatch slot arrays — a single `fillText` with a
         // 1 KB user string reported ~150 B instead of 1.15 KB.
-        self.pending_bytes = self
-            .pending_bytes
-            .saturating_add(cmd.approx_deep_size_bytes());
+        //
+        // Read before the command moves into the segment; counted after, so
+        // `build_frame_packet_inner`'s "segments empty ⇒ pending_bytes == 0"
+        // still holds at every point a caller could observe.
+        let bytes = cmd.approx_deep_size_bytes();
+
+        let seg = self.canvas2d_segment(canvas_id);
+        seg.mark_dirty_for_cmd(&cmd);
+        seg.commands.push(cmd);
+
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
         self.record_pending_peak();
-        if let Some(FrameSegment::Canvas2D(seg)) = self.segments.last_mut() {
-            seg.mark_dirty_for_cmd(&cmd);
-            seg.commands.push(cmd);
-        }
     }
 
     pub(crate) fn push_gl(&mut self, cmd: GLCmd) {
-        if self.current != CurrentKind::GL {
-            self.segments.push(FrameSegment::GL(GlSegment {
-                commands: take_gl_command_vec(),
-            }));
-            self.current = CurrentKind::GL;
-        }
         // Deep size walk - see the Canvas2D counterpart.  This is
         // especially critical for `BufferData(Vec<u8>)` /
         // `TexImage2D(Arc<Vec<u8>>)` / `ShaderSource(String)`, the
         // three GL variants most likely to single-handedly blow
         // the budget.
-        self.pending_bytes = self
-            .pending_bytes
-            .saturating_add(cmd.approx_deep_size_bytes());
+        let bytes = cmd.approx_deep_size_bytes();
+
+        self.gl_segment().commands.push(cmd);
+
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
         self.record_pending_peak();
-        if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
-            seg.commands.push(cmd);
-        }
     }
 
     /// Fast-path variant of [`Self::push_gl`] for scalar-only
@@ -336,17 +509,9 @@ impl UnifiedFrameCollector {
     #[inline]
     pub(crate) fn push_gl_fast(&mut self, cmd: GLCmd) {
         const BASE_BYTES: usize = std::mem::size_of::<GLCmd>();
-        if self.current != CurrentKind::GL {
-            self.segments.push(FrameSegment::GL(GlSegment {
-                commands: take_gl_command_vec(),
-            }));
-            self.current = CurrentKind::GL;
-        }
+        self.gl_segment().commands.push(cmd);
         self.pending_bytes = self.pending_bytes.saturating_add(BASE_BYTES);
         self.record_pending_peak();
-        if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
-            seg.commands.push(cmd);
-        }
     }
 
     /// Bulk-append a decoded GL command batch from the stream submit path.
@@ -383,8 +548,18 @@ impl UnifiedFrameCollector {
         if self.current == CurrentKind::GL {
             // Extend the current GL segment in place, leaving `commands` empty
             // to return its allocation when it goes out of scope.
-            if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
-                seg.commands.append(&mut commands);
+            //
+            // Not `Self::gl_segment`: that would take a fresh pooled vec on the
+            // miss path and then copy into it, where the `else` below moves this
+            // one in whole. The invariant is asserted the same way, for the same
+            // reason — a batch dropped here is an entire decoded command stream
+            // gone, with `approx_bytes` still counted against the budget.
+            match self.segments.last_mut() {
+                Some(FrameSegment::GL(seg)) => seg.commands.append(&mut commands),
+                _ => unreachable!(
+                    "CurrentKind::GL requires the last segment to be GL; \
+                     the collector's own fields are the only way to break that"
+                ),
             }
         } else {
             // Start a new GL segment by moving the vec directly in.
@@ -1927,6 +2102,236 @@ mod tests {
             _ => panic!("expected CanvasBatch"),
         };
         assert!(dirty.is_none(), "SetLineWidth must poison scissor hint");
+    }
+
+    /// **Every pushed command must reach a segment — the property the four
+    /// `if let Some(FrameSegment::…)` sites could silently fail.**
+    ///
+    /// Those sites established "the last segment is of this kind" and then
+    /// re-derived it, with nothing on the `else`: a command whose segment lookup
+    /// missed was dropped, after `pending_bytes` had already counted it. Now the
+    /// lookup lives in `gl_segment` / `canvas2d_segment` and asserts instead.
+    ///
+    /// The assertion cannot be triggered from outside the type — the fields it
+    /// depends on are private, which is exactly why it is an invariant and not a
+    /// runtime condition. What a test *can* pin is the observable consequence:
+    /// across every segment-transition shape, the number of commands that come
+    /// back out equals the number pushed in. A regression that reintroduced a
+    /// silent miss would show up here as a short count.
+    #[test]
+    fn every_pushed_command_lands_in_a_segment() {
+        // One case per transition the segment tracker can make: first push,
+        // same-kind repeat, canvas switch, 2D→GL, GL→2D, and back again.
+        let pushes: Vec<(u32, Canvas2DCmd)> = vec![
+            (1, a_rect()),
+            (1, a_rect()),
+            (2, a_rect()),
+            (2, a_rect()),
+            (1, a_rect()),
+        ];
+
+        let mut c = UnifiedFrameCollector::new();
+        let mut expected_2d = 0usize;
+        let mut expected_gl = 0usize;
+        for (i, (canvas, cmd)) in pushes.into_iter().enumerate() {
+            c.push_canvas2d(canvas, cmd);
+            expected_2d += 1;
+            // Interleave GL work so the collector keeps changing segment kind.
+            if i % 2 == 0 {
+                c.push_gl(clear_command());
+                c.push_gl_fast(clear_command());
+                expected_gl += 2;
+            }
+        }
+
+        let packet = c.build_frame_packet(true).expect("a packet");
+        let mut got_2d = 0usize;
+        let mut got_gl = 0usize;
+        for op in packet.ops() {
+            match op {
+                FrameOp::CanvasBatch(p) => got_2d += p.commands.len(),
+                FrameOp::GlBatch(b) => got_gl += b.commands.len(),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            got_2d, expected_2d,
+            "{} of {expected_2d} Canvas2D commands reached a segment",
+            got_2d
+        );
+        assert_eq!(
+            got_gl, expected_gl,
+            "{} of {expected_gl} GL commands reached a segment",
+            got_gl
+        );
+    }
+
+    /// **A run of plain Canvas2D draws must be able to trip the soft byte
+    /// budget, which for eighteen of them it could not.**
+    ///
+    /// `AUTO_FLUSH_SOFT_BUDGET_BYTES` exists so a JS turn cannot pin unbounded
+    /// pending commands while the render thread works — its own doc names the
+    /// case. But the check lived in `webgl::maybe_auto_flush`, which the
+    /// hand-written Canvas2D ops (`op_fill_rect`, `op_move_to`, `op_arc`, the
+    /// rest) never called: they pushed and returned. Only the eight
+    /// `batched_op!`-generated ops asked, and they paid a second `OpState`
+    /// borrow — a `BTreeMap` descent, ~15 ns — to ask.
+    ///
+    /// Both now go through `context2d::with_collector`, which reads
+    /// `should_auto_flush` on the borrow the push already holds. The check is
+    /// free, so every op can have it.
+    ///
+    /// This test owns the collector half of that claim: that pushing ordinary
+    /// scalar draws does drive `pending_bytes` to the budget and flip
+    /// `should_auto_flush`. Whether each op calls the funnel is a fact about
+    /// `context2d.rs` and is asserted there.
+    #[test]
+    fn a_run_of_plain_rect_draws_reaches_the_auto_flush_budget() {
+        let mut c = UnifiedFrameCollector::new();
+        assert!(
+            !c.should_auto_flush(),
+            "an empty collector must not ask for a flush"
+        );
+
+        // The cheapest possible draw, repeated. If even this reaches the budget,
+        // the guard is reachable from any op — which is the point.
+        let mut pushes = 0u64;
+        while !c.should_auto_flush() {
+            c.push_canvas2d(
+                1,
+                Canvas2DCmd::FillRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                },
+            );
+            pushes += 1;
+            assert!(
+                pushes < 5_000_000,
+                "5M scalar fillRects did not reach the {AUTO_FLUSH_SOFT_BUDGET_BYTES}-byte \
+                 budget; either the accounting stopped counting them or the \
+                 budget is unreachable from a plain draw"
+            );
+        }
+
+        // Worth recording what the reachable depth actually is: this is how many
+        // un-flushed scalar draws a JS turn could hold before the guard fires.
+        assert!(
+            c.approx_pending_bytes() >= AUTO_FLUSH_SOFT_BUDGET_BYTES,
+            "should_auto_flush tripped at {} bytes, below the budget",
+            c.approx_pending_bytes()
+        );
+        println!("  budget reached after {pushes} scalar fillRect pushes");
+
+        // And a flush clears it, so the guard is not sticky — a frame that
+        // flushes mid-way keeps drawing rather than flushing on every push.
+        let _ = c.build_frame_packet(true);
+        assert!(
+            !c.should_auto_flush(),
+            "the budget stayed tripped after a flush, so every later push would \
+             cut another barrier"
+        );
+    }
+
+    /// Read the segment's scissor hint out of a built packet.
+    fn hint_after(commands: Vec<Canvas2DCmd>) -> Option<shared::protocol::DirtyRect> {
+        let mut c = UnifiedFrameCollector::new();
+        for cmd in commands {
+            c.push_canvas2d(1, cmd);
+        }
+        let packet = c.build_frame_packet(true).expect("a packet");
+        match &packet.ops()[1] {
+            FrameOp::CanvasBatch(p) => p.dirty_rect,
+            other => panic!("expected CanvasBatch, got {other:?}"),
+        }
+    }
+
+    fn a_rect() -> Canvas2DCmd {
+        Canvas2DCmd::FillRect {
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        }
+    }
+
+    /// **`globalCompositeOperation` writes outside the source geometry, so it
+    /// must poison — and before this it fell through to `_ => {}`.**
+    ///
+    /// Under `copy` a `fillRect(0,0,10,10)` clears the whole rest of the canvas;
+    /// `destination-out`, `source-in` and `xor` likewise change pixels the rect
+    /// never covers. A 10x10 hint would scissor that away and leave the stale
+    /// content on screen.
+    ///
+    /// The render thread's `state_allows_partial` rejects any non-source-over
+    /// blend and would have caught it. That does not make this arm redundant: it
+    /// is the only layer that sees the *command*, and a hint that is wrong on
+    /// arrival relies on a gate in another crate continuing to agree.
+    #[test]
+    fn set_composite_operation_poisons_dirty_rect() {
+        let hint = hint_after(vec![
+            // 9 = `copy`, per the encoding documented on the variant: the
+            // mode that clears everything the source does not cover.
+            Canvas2DCmd::SetCompositeOperation { op: 9 },
+            a_rect(),
+        ]);
+        assert!(
+            hint.is_none(),
+            "a composite mode change must poison the scissor hint; got {hint:?}"
+        );
+    }
+
+    /// A resize re-specifies the backing store, which clears the canvas. The
+    /// reallocation is unconditional so it cannot itself be scissored away, but
+    /// a small hint would let the presented window keep older content outside it
+    /// while the canvas behind went transparent.
+    #[test]
+    fn resize_canvas_poisons_dirty_rect() {
+        let hint = hint_after(vec![
+            Canvas2DCmd::ResizeCanvas {
+                w: Some(320),
+                h: Some(200),
+            },
+            a_rect(),
+        ]);
+        assert!(
+            hint.is_none(),
+            "a canvas resize must poison the scissor hint; got {hint:?}"
+        );
+    }
+
+    /// The commands that genuinely cannot widen a rect bound must still *not*
+    /// poison — otherwise the fail-safe default would have been achieved by
+    /// throwing partial updates away entirely, which is not a fix.
+    ///
+    /// One representative per group in the match: path building, paint style,
+    /// stroke geometry, text attribute, save/restore, and a read.
+    #[test]
+    fn commands_with_no_bounds_effect_keep_the_scissor_hint() {
+        for (label, cmd) in [
+            ("path building", Canvas2DCmd::BeginPath),
+            (
+                "paint style",
+                Canvas2DCmd::SetGlobalAlpha { alpha: 1.0 },
+            ),
+            ("stroke geometry", Canvas2DCmd::SetLineDashOffset { offset: 2.0 }),
+            (
+                "text attribute",
+                Canvas2DCmd::SetTextAlign {
+                    align: shared::protocol::render_cmd::TextAlign::Start,
+                },
+            ),
+            ("state stack", Canvas2DCmd::Save),
+            ("state stack", Canvas2DCmd::Restore),
+        ] {
+            let hint = hint_after(vec![cmd, a_rect()]);
+            assert_eq!(
+                hint.map(|r| (r.x, r.y, r.width, r.height)),
+                Some((0.0, 0.0, 10.0, 10.0)),
+                "{label}: a command with no bounds effect discarded the hint"
+            );
+        }
     }
 }
 

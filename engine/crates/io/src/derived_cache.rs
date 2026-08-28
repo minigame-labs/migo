@@ -24,6 +24,9 @@ use std::time::SystemTime;
 
 use shared::protocol::io_cmd::{CompressedImage, DecodedImage, NormalizedImage};
 
+use crate::scheduler::IoScheduler;
+use crate::task::{PoolKind, PriorityClass};
+
 /// Derived cache key components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedKey {
@@ -38,17 +41,42 @@ pub struct DerivedKey {
     pub target_height: u32,
 }
 
+/// Namespaces every derived filename by the SDK build that produced it.
+///
+/// A sidecar's validity depends on decoder behaviour, not just on the key
+/// fields: change how an image decodes, how it resizes, or which colour space
+/// it lands in, and every existing sidecar is now wrong while still matching
+/// its key perfectly. [`DERIVED_VERSION`] guards the *file format*, so it does
+/// not catch this, and relying on someone remembering to bump it for a
+/// semantic change is how you ship corrupted textures that vanish the moment a
+/// user clears their cache — the least diagnosable bug shape there is.
+///
+/// Folding the version into the filename makes it automatic: a new build looks
+/// for names the old build never wrote, so it re-transcodes once and
+/// [`prune_derived_cache`] reclaims what it orphaned.
+const DERIVED_CACHE_NAMESPACE: &str = env!("CARGO_PKG_VERSION");
+
 impl DerivedKey {
     /// SHA-256 based hex hash for the filename (collision-resistant).
     pub fn hash(&self) -> String {
+        self.hash_in_namespace(DERIVED_CACHE_NAMESPACE)
+    }
+
+    /// [`Self::hash`] against an explicit namespace, so a test can show two
+    /// builds disagree without being two builds.
+    fn hash_in_namespace(&self, namespace: &str) -> String {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();
+        // Length-prefixed: without it a namespace/path pair could be split
+        // differently and collide with another pair that concatenates the same.
+        h.update((namespace.len() as u32).to_le_bytes());
+        h.update(namespace.as_bytes());
         h.update(self.asset_path.as_bytes());
-        h.update(&self.source_generation.to_le_bytes());
-        h.update(&self.gpu_format.to_le_bytes());
-        h.update(&[self.variant_kind]);
-        h.update(&self.target_width.to_le_bytes());
-        h.update(&self.target_height.to_le_bytes());
+        h.update(self.source_generation.to_le_bytes());
+        h.update(self.gpu_format.to_le_bytes());
+        h.update([self.variant_kind]);
+        h.update(self.target_width.to_le_bytes());
+        h.update(self.target_height.to_le_bytes());
         // Use first 16 bytes (128 bits) of SHA-256 for filename.
         let result = h.finalize();
         hex::encode(&result[..16])
@@ -341,9 +369,9 @@ pub struct PruneReport {
 /// evicting least-recently-modified files (proxying LRU as explained
 /// in the module-level doc) until the total is under `budget_bytes`.
 ///
-/// Safe to call repeatedly: it re-reads the directory each time. The
-/// runtime is expected to invoke this at session-start with
-/// [`DEFAULT_DERIVED_CACHE_MAX_BYTES`] as a background task.
+/// Safe to call repeatedly: it re-reads the directory each time. Callers
+/// should go through [`schedule_derived_cache_prune`] rather than invoking
+/// this on a latency-sensitive thread — it is a full directory scan.
 ///
 /// Returns a [`PruneReport`] suitable for structured logging.
 pub fn prune_derived_cache(game_cache_dir: &Path, budget_bytes: u64) -> PruneReport {
@@ -411,6 +439,60 @@ pub fn prune_derived_cache(game_cache_dir: &Path, budget_bytes: u64) -> PruneRep
         bytes_kept: running,
         bytes_removed,
         scan_capped,
+    }
+}
+
+/// Schedule this game's derived-cache prune on the background IO lane.
+///
+/// [`save_derived`] writes a sidecar on every decode miss and nothing else
+/// bounds the directory, so across sessions it grows until the device runs
+/// out of space. This is the call that makes
+/// [`DEFAULT_DERIVED_CACHE_MAX_BYTES`] mean something; the budget existed
+/// before it did, but no caller enforced it.
+///
+/// Fire-and-forget by construction. Dropping the receiver does not cancel the
+/// job — the worker runs it and discards the result — which is what a
+/// best-effort reclaim wants: its only failure mode is "try again next
+/// session", and session startup must not wait on a directory scan.
+pub fn schedule_derived_cache_prune(scheduler: &IoScheduler, game_cache_dir: &Path) {
+    schedule_derived_cache_prune_with_budget(
+        scheduler,
+        game_cache_dir,
+        DEFAULT_DERIVED_CACHE_MAX_BYTES,
+    )
+}
+
+/// [`schedule_derived_cache_prune`] against an explicit budget.
+pub fn schedule_derived_cache_prune_with_budget(
+    scheduler: &IoScheduler,
+    game_cache_dir: &Path,
+    budget_bytes: u64,
+) {
+    if scheduler.ensure_open().is_err() {
+        return;
+    }
+
+    let dir = game_cache_dir.to_path_buf();
+    // Background priority on the FS lane: this competes with the very asset
+    // loads the cache exists to accelerate, so it yields to all of them.
+    let submitted = scheduler
+        .pools()
+        .submit_async(PoolKind::Fs, PriorityClass::Background, move || {
+            let report = prune_derived_cache(&dir, budget_bytes);
+            if report.files_removed > 0 || report.scan_capped {
+                tracing::info!(
+                    files_kept = report.files_kept,
+                    files_removed = report.files_removed,
+                    bytes_kept = report.bytes_kept,
+                    bytes_removed = report.bytes_removed,
+                    scan_capped = report.scan_capped,
+                    "derived cache pruned"
+                );
+            }
+        });
+
+    if submitted.is_err() {
+        tracing::debug!("derived cache prune not scheduled: IO pool closed");
     }
 }
 
@@ -739,6 +821,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The prune existed and worked before anything called it, so a test that
+    /// only drove `prune_derived_cache` directly would have stayed green
+    /// through the entire period the disk cache was unbounded. This one fails
+    /// if the scheduling half is removed again.
+    #[test]
+    fn scheduled_prune_enforces_the_budget_on_a_worker() {
+        let dir = tmp("prune_scheduled");
+        let cache_dir = derived_cache_dir(&dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for i in 0..6u32 {
+            let path = cache_dir.join(format!("f_{i:02}.bin"));
+            std::fs::write(&path, vec![0u8; 1024]).unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(base + std::time::Duration::from_secs(u64::from(i))),
+            )
+            .unwrap();
+        }
+
+        let scheduler = IoScheduler::local_for_test(311, 2);
+        schedule_derived_cache_prune_with_budget(&scheduler, &dir, 3 * 1024);
+
+        // Fire-and-forget, so there is no handle to join: poll for the effect
+        // under a deadline rather than sleeping a guessed interval.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache_dir.join("f_00.bin").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            !cache_dir.join("f_00.bin").exists(),
+            "the scheduled prune never ran: the oldest file is still on disk"
+        );
+        assert!(
+            cache_dir.join("f_05.bin").exists(),
+            "the prune ran but evicted newest-first"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A closed scheduler must not start worker threads for a best-effort
+    /// reclaim on a session that is already going away.
+    #[test]
+    fn scheduled_prune_is_dropped_when_the_scheduler_is_closed() {
+        let dir = tmp("prune_scheduled_closed");
+        let cache_dir = derived_cache_dir(&dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("a.bin"), vec![0u8; 4096]).unwrap();
+
+        let scheduler = IoScheduler::local_for_test(313, 2);
+        scheduler.close();
+        schedule_derived_cache_prune_with_budget(&scheduler, &dir, 1);
+
+        assert!(cache_dir.join("a.bin").exists());
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn prune_noop_when_under_budget() {
         let dir = tmp("prune_noop");
@@ -749,6 +891,60 @@ mod tests {
         assert_eq!(report.files_removed, 0);
         assert!(cache_dir.join("a.bin").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two SDK builds must not read each other's sidecars. The key fields are
+    /// identical here — that is the point: what changed is the decoder, and
+    /// nothing in the key can see that.
+    #[test]
+    fn a_different_sdk_build_does_not_reuse_the_same_sidecar() {
+        let key = DerivedKey {
+            asset_path: "sprites/hero.png".into(),
+            source_generation: 7,
+            gpu_format: 0,
+            variant_kind: 0,
+            target_width: 0,
+            target_height: 0,
+        };
+
+        assert_ne!(
+            key.hash_in_namespace("0.9.4"),
+            key.hash_in_namespace("0.9.5"),
+            "an SDK upgrade must land in a fresh derived-cache namespace"
+        );
+        assert_eq!(
+            key.hash_in_namespace("0.9.4"),
+            key.hash_in_namespace("0.9.4"),
+            "the same build must keep hitting its own cache"
+        );
+        assert_eq!(
+            key.hash(),
+            key.hash_in_namespace(env!("CARGO_PKG_VERSION")),
+            "the shipped hash must be the one namespaced by this build"
+        );
+    }
+
+    /// The namespace is length-prefixed so it cannot be re-split against the
+    /// asset path into a different pair with the same digest.
+    #[test]
+    fn namespace_and_path_cannot_be_confused_for_each_other() {
+        let split_one = DerivedKey {
+            asset_path: "b/c.png".into(),
+            source_generation: 1,
+            gpu_format: 0,
+            variant_kind: 0,
+            target_width: 0,
+            target_height: 0,
+        };
+        let split_two = DerivedKey {
+            asset_path: "c.png".into(),
+            ..split_one.clone()
+        };
+
+        assert_ne!(
+            split_one.hash_in_namespace("a"),
+            split_two.hash_in_namespace("ab/"),
+        );
     }
 
     #[test]

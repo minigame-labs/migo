@@ -157,16 +157,25 @@ pub fn parse_ktx2(data: &[u8]) -> Result<Ktx2File<'_>, &'static str> {
     // level 0 so treat it as at least 1.
     let actual_levels = if level_count == 0 { 1 } else { level_count };
 
-    // Verify that the level index for level 0 fits in the buffer.
+    // Verify that the level index for level 0 fits in the buffer. `level_count`
+    // is attacker-controlled, so the index span is computed with checked
+    // arithmetic: a wrapped product would produce a small `level_index_end`
+    // that passes the length check below while describing a span that isn't
+    // there.
     let level_index_start = HEADER_SIZE;
-    let level_index_end = level_index_start + (actual_levels as usize) * LEVEL_INDEX_ENTRY_SIZE;
+    let level_index_end = (actual_levels as usize)
+        .checked_mul(LEVEL_INDEX_ENTRY_SIZE)
+        .and_then(|span| level_index_start.checked_add(span))
+        .ok_or("ktx2: level index span overflow")?;
     if data.len() < level_index_end {
         return Err("ktx2: file too short for level index");
     }
 
-    // Level 0 entry is the first in the level index.
-    let level0_offset = read_u64(data, level_index_start) as usize;
-    let level0_length = read_u64(data, level_index_start + 8) as usize;
+    // Level 0 entry is the first in the level index. Compare in `u64` before
+    // narrowing: on a 32-bit target `as usize` would truncate a large offset
+    // into a small in-bounds one.
+    let level0_offset = read_u64(data, level_index_start);
+    let level0_length = read_u64(data, level_index_start + 8);
 
     if level0_length == 0 {
         return Err("ktx2: level 0 has zero length");
@@ -176,9 +185,19 @@ pub fn parse_ktx2(data: &[u8]) -> Result<Ktx2File<'_>, &'static str> {
         .checked_add(level0_length)
         .ok_or("ktx2: level 0 range overflow")?;
 
-    if level0_end > data.len() {
+    if level0_end > data.len() as u64 {
         return Err("ktx2: level 0 data out of bounds");
     }
+
+    // Payload must start after the level index. Without this a crafted file
+    // can point level 0 at the header or at the index itself, and those bytes
+    // would be handed to the GPU as texture data.
+    if level0_offset < level_index_end as u64 {
+        return Err("ktx2: level 0 data overlaps the header or level index");
+    }
+
+    let level0_offset = level0_offset as usize;
+    let level0_end = level0_end as usize;
 
     Ok(Ktx2File {
         header: Ktx2Header {
@@ -325,6 +344,65 @@ mod tests {
 
         let ktx2 = parse_ktx2(&buf).expect("should parse");
         assert_eq!(ktx2.header.format, VkFormat::Unknown(999));
+    }
+
+    #[test]
+    fn reject_level0_pointing_into_the_header() {
+        let payload = vec![0xEE; 32];
+        let mut buf = make_test_ktx2(147, 4, 4, &payload);
+        // Offset 0 is in bounds and `offset + length` still fits, so only an
+        // explicit lower bound stops the magic and header being handed to the
+        // GPU as texture data.
+        buf[HEADER_SIZE..HEADER_SIZE + 8].copy_from_slice(&0u64.to_le_bytes());
+
+        assert_eq!(
+            parse_ktx2(&buf).unwrap_err(),
+            "ktx2: level 0 data overlaps the header or level index"
+        );
+    }
+
+    #[test]
+    fn reject_level0_overlapping_the_level_index() {
+        let payload = vec![0xEE; 32];
+        let mut buf = make_test_ktx2(147, 4, 4, &payload);
+        // One byte short of where the index ends.
+        let offset = (HEADER_SIZE + LEVEL_INDEX_ENTRY_SIZE - 1) as u64;
+        buf[HEADER_SIZE..HEADER_SIZE + 8].copy_from_slice(&offset.to_le_bytes());
+        buf[HEADER_SIZE + 8..HEADER_SIZE + 16].copy_from_slice(&8u64.to_le_bytes());
+
+        assert_eq!(
+            parse_ktx2(&buf).unwrap_err(),
+            "ktx2: level 0 data overlaps the header or level index"
+        );
+    }
+
+    #[test]
+    fn reject_level_count_whose_index_span_overflows() {
+        let payload = vec![0xEE; 32];
+        let mut buf = make_test_ktx2(147, 4, 4, &payload);
+        // `level_count * 24` is the product an attacker controls. On a 32-bit
+        // target this wraps; on 64-bit it stays huge. Either way the file is
+        // nowhere near long enough, and neither outcome may index the buffer.
+        buf[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let err = parse_ktx2(&buf).unwrap_err();
+        assert!(
+            err == "ktx2: level index span overflow" || err == "ktx2: file too short for level index",
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_level0_length_running_past_the_buffer() {
+        let payload = vec![0xEE; 32];
+        let mut buf = make_test_ktx2(147, 4, 4, &payload);
+        buf[HEADER_SIZE + 8..HEADER_SIZE + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let err = parse_ktx2(&buf).unwrap_err();
+        assert!(
+            err == "ktx2: level 0 range overflow" || err == "ktx2: level 0 data out of bounds",
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

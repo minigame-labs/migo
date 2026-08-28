@@ -82,12 +82,35 @@ impl FrameScheduler {
         if should_render {
             next_deadline_ms += frame_interval_ms;
 
+            // Two steps that look redundant and are not. The `if` jumps a long
+            // stall's worth of missed slots in one multiply — a single `while`
+            // would iterate once per slot, and an app backgrounded for a minute
+            // is 3600 of them. The `while` then cleans up after the multiply,
+            // which `.floor() + 1.0` makes mathematically overshoot but
+            // floating-point rounding can land exactly on `raf_time_ms`.
             if next_deadline_ms <= raf_time_ms {
                 let skipped_slots =
                     ((raf_time_ms - next_deadline_ms) / frame_interval_ms).floor() + 1.0;
                 next_deadline_ms += skipped_slots * frame_interval_ms;
             }
 
+            // **Terminates because `raf_time_ms` cannot be infinite, and that is
+            // a fact about the FFI boundary rather than about this loop.** Both
+            // producers take an integer nanosecond count — `frame_time_nanos:
+            // i64` in `capi::migo_session_notify_vsync`, `jlong` in the Android
+            // `onVsync` — and `i64 as f64 / 1e6` is always finite. Given a finite
+            // `raf_time_ms` and a positive `frame_interval_ms` (`clamp_fps`
+            // floors the rate at `MIN_FPS`), each iteration adds a positive
+            // constant and the loop ends.
+            //
+            // Spelled out because this file spends several paragraphs on not
+            // trusting the host's clock, which makes an unbounded `while` over a
+            // host-supplied value read like an oversight. Were either entry point
+            // ever to take an `f64`, `+inf` would spin here forever: `inf <= inf`
+            // holds and `inf + interval` is still `inf`. A guard *here* would be
+            // a branch every frame against an input the types already exclude, so
+            // the boundary is where it belongs — and `shared::frame_rate::
+            // requested_fps` already rejects non-finite input for this reason.
             while next_deadline_ms <= raf_time_ms {
                 next_deadline_ms += frame_interval_ms;
             }

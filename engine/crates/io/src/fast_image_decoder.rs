@@ -846,15 +846,43 @@ pub fn resize_image(img: NormalizedImage, target_w: u32, target_h: u32) -> Norma
     let w = img.width;
     let h = img.height;
     let raw: Vec<u8> = Arc::try_unwrap(img.rgba).unwrap_or_else(|arc| (*arc).clone());
+
+    // Checked before `from_raw` rather than after, because `from_raw` consumes
+    // the buffer on rejection and leaves nothing to hand back. Returning the
+    // image unresized keeps `width`/`height` describing the bytes that are
+    // actually there; a sentinel with the original dimensions and an empty
+    // buffer would lie to every downstream `w * h * 4` index.
+    let required = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|px| px.checked_mul(4));
+    if required.is_none_or(|needed| raw.len() < needed) {
+        tracing::warn!(
+            "resize_image: buffer holds {} bytes, {}x{} needs {:?} — skipping resize",
+            raw.len(),
+            w,
+            h,
+            required
+        );
+        return NormalizedImage {
+            width: w,
+            height: h,
+            rgba: Arc::new(raw),
+        };
+    }
+
     let src = match image::RgbaImage::from_raw(w, h, raw) {
         Some(s) => s,
         None => {
-            tracing::warn!("resize_image: invalid buffer size {w}x{h}");
-            // We consumed `img.rgba` above; rebuild a sentinel image
-            // rather than returning the now-empty `img`.
+            // Unreachable given the length check above — an undersized buffer
+            // is `from_raw`'s only rejection cause. Kept total rather than
+            // `unwrap`ing a decoder invariant on the image path, and reported
+            // as 0x0 because `from_raw` consumed the bytes: an empty buffer
+            // described as `w`x`h` is the inconsistency this branch exists to
+            // avoid.
+            tracing::warn!("resize_image: from_raw rejected a checked {w}x{h} buffer");
             return NormalizedImage {
-                width: w,
-                height: h,
+                width: 0,
+                height: 0,
                 rgba: Arc::new(Vec::new()),
             };
         }
