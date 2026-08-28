@@ -601,6 +601,23 @@ stage_external_engine_assets() {
         compress_level=9
     fi
 
+    # The AAR the derive tool reads from only carries the per-slice manifest
+    # asset (assets/migo/artifacts/slices/<abi>.json) when artifact-manifest
+    # generation actually succeeded. stage_artifact_manifests already lets
+    # that fail silently for --artifact-manifest optional (the debug
+    # default) and continues the build without it -- but this function used
+    # to run the derive tool unconditionally regardless, so a debug build
+    # with unavailable manifests (an unreachable V8 provenance recipe, most
+    # commonly) built a perfectly good AAR and then failed the whole script
+    # here anyway, on a step the "continuing debug-only build" warning had
+    # already said was being skipped. MANIFEST_INDEX is the same on-disk
+    # marker the attestation step below already treats as "manifests are
+    # available"; mirror it here instead of assuming.
+    if [[ ! -f "$MANIFEST_INDEX" ]]; then
+        print_warning "Skipping engine-less AAR derivation: no artifact manifest was generated for this build"
+        return 0
+    fi
+
     print_info "Deriving the engine-less AAR and engine archives..."
     rm -f "$nojni" "$nojni.attestation.json"
     local stale
