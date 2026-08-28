@@ -476,10 +476,11 @@ pub(crate) fn blit_to_surface(
                     // NEAREST. Up to four bounded rect ops; no full retry after
                     // a partial declaration succeeded.
                     for r in rects.rects() {
-                        let x0 = r.x;
-                        let y0 = r.y;
-                        let x1 = r.x + r.width;
-                        let y1 = r.y + r.height;
+                        let (rx, ry, rw, rh) = r.xywh();
+                        let x0 = rx;
+                        let y0 = ry;
+                        let x1 = rx + rw;
+                        let y1 = ry + rh;
                         gl.blit_framebuffer(
                             x0,
                             y0,

@@ -3718,10 +3718,11 @@ impl CanvasManager {
         let mut flat: [egl::Int; 16] = [0; 16];
         let n = rects.len().min(4);
         for (i, r) in rects.iter().take(n).enumerate() {
-            flat[i * 4] = r.x;
-            flat[i * 4 + 1] = r.y;
-            flat[i * 4 + 2] = r.width;
-            flat[i * 4 + 3] = r.height;
+            let (x, y, width, height) = r.xywh();
+            flat[i * 4] = x;
+            flat[i * 4 + 1] = y;
+            flat[i * 4 + 2] = width;
+            flat[i * 4 + 3] = height;
         }
         let ret = unsafe { set_damage(self.display, surf, flat.as_ptr(), n as egl::Int) };
         ret == egl::TRUE
@@ -3877,11 +3878,12 @@ impl CanvasManager {
         let Some(rect) = region.bounding_rect() else {
             return ResolvedDamage::FullSurface;
         };
+        let (x, y, width, height) = rect.xywh();
         ResolvedDamage::Partial {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
+            x,
+            y,
+            width,
+            height,
         }
     }
 
