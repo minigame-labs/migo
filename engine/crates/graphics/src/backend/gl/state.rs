@@ -448,6 +448,101 @@ impl StateStack {
 mod tests {
     use super::*;
 
+    // ---- save / restore is allocation-free, and stays that way ---------
+
+    /// Section 7.3 on `save()` / `restore()`.
+    ///
+    /// **This gate protects a property that a single added field would break.**
+    /// [`Canvas2DState`] is scalars plus `Arc`s — `line_dash`,
+    /// `text.families`, and the gradient `stops` inside [`StyleKind`] — so the
+    /// snapshot [`StateStack::push`] takes is a fixed-size copy and a handful
+    /// of refcount bumps, never a heap event. Give any of those fields a bare
+    /// `Vec` or `String` and every `save()` a UI issues, which is one per
+    /// styled draw, silently buys and frees a block on the render thread. The
+    /// type's own doc cannot enforce that; this can.
+    ///
+    /// The stack's `Vec` is warmed outside the burst: it is built
+    /// `with_capacity(8)` and grows once per new maximum nesting depth, which
+    /// is startup cost rather than steady state.
+    #[test]
+    fn a_steady_state_save_and_restore_never_reaches_the_heap() {
+        let mut state = Canvas2DState::default();
+        let mut stack = StateStack::new();
+
+        // A dash pattern and a gradient fill, so the Arc-carrying fields are
+        // populated rather than left at their scalar defaults — a snapshot of
+        // an all-default state would not exercise them.
+        state.line_dash = Arc::new(vec![4.0, 2.0]);
+        state.fill = StyleKind::LinearGradient {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 100.0,
+            stops: Arc::new(vec![GradientStop {
+                offset: 0.0,
+                color: Color::black(),
+            }]),
+        };
+
+        // Reach the deepest nesting the burst will use, so the stack's own
+        // growth is paid before measurement.
+        const DEPTH: usize = 8;
+        for _ in 0..DEPTH {
+            stack.push(&state);
+        }
+        for _ in 0..DEPTH {
+            stack.pop(&mut state);
+        }
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "canvas2d: save/restore snapshot at nesting depth 8",
+                warmup: 4,
+                measured: 64,
+            },
+            |_| {
+                for _ in 0..DEPTH {
+                    stack.push(&state);
+                }
+                let mut popped = 0u32;
+                for _ in 0..DEPTH {
+                    if stack.pop(&mut state) {
+                        popped += 1;
+                    }
+                }
+                popped
+            },
+        );
+    }
+
+    /// The snapshot has to be a real snapshot: a `restore()` must put back the
+    /// values the matching `save()` saw, including the ones behind an `Arc`.
+    /// A gate on allocation alone would pass an implementation that shared
+    /// state instead of copying it.
+    #[test]
+    fn restore_puts_back_every_field_the_save_captured() {
+        let mut state = Canvas2DState::default();
+        let mut stack = StateStack::new();
+
+        state.line_width = 7.0;
+        state.global_alpha = 0.25;
+        state.line_dash = Arc::new(vec![1.0, 2.0, 3.0]);
+        state.text.size = 42.0;
+        state.ctm = [2.0, 0.0, 0.0, 2.0, 10.0, 20.0];
+        let saved = state.clone();
+
+        stack.push(&state);
+        // Change everything the snapshot covers.
+        state.line_width = 1.0;
+        state.global_alpha = 1.0;
+        state.line_dash = Arc::new(Vec::new());
+        state.text.size = 10.0;
+        state.ctm = CTM_IDENTITY;
+
+        assert!(stack.pop(&mut state), "the stack had a snapshot to pop");
+        assert_eq!(state, saved, "restore did not put the saved state back");
+    }
+
     // ---- defaults ------------------------------------------------------
     #[test]
     fn defaults_match_whatwg_spec() {

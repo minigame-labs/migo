@@ -374,18 +374,17 @@ fn upload_sync_internal(
 /// we do not re-use a PBO whose previous DMA transfer has not completed.
 /// Whether a `glClientWaitSync` status means the previous DMA has finished.
 ///
-/// Taken with a zero timeout, so the only outcomes are "done"
+/// Taken with a zero timeout here, so the only outcomes are "done"
 /// (`ALREADY_SIGNALED`), "done while we asked" (`CONDITION_SATISFIED`), "not
 /// done" (`TIMEOUT_EXPIRED`) and "the driver refused to answer"
-/// (`WAIT_FAILED`). The last two are the same decision here: do not reuse.
+/// (`WAIT_FAILED`). The last two are the same decision: do not reuse.
 ///
-/// Same predicate `CanvasManager::drain_upload_completed` uses on the upload
-/// fences, deliberately — two spellings of "is the GPU done" would be two
-/// chances to get one of them wrong.
-#[inline]
-fn dma_complete(status: u32) -> bool {
-    status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED
-}
+/// **One spelling, three fences.** This was a local copy of the comparison
+/// `CanvasManager::drain_upload_completed` makes on upload fences, with a
+/// comment noting that two spellings of "is the GPU done" would be two chances
+/// to get one wrong. A third then appeared on the pre-blit snapshot fence, so it
+/// is now [`super::fence_signalled`] and the copies are gone.
+use super::fence_signalled as dma_complete;
 
 /// Index of the first pool entry that can be reused *without waiting* for a
 /// request of `size`, given `(entry_size, dma_complete)` per entry.
@@ -663,23 +662,59 @@ mod tests {
     // strictly dominated — see `PboPool::acquire` — and these pin the two
     // predicates the replacement rests on.
 
-    /// Every status a zero-timeout `glClientWaitSync` can return, enumerated.
-    /// `TIMEOUT_EXPIRED` and `WAIT_FAILED` are the same decision — do not reuse
-    /// — but for different reasons, and a predicate that admitted either would
-    /// hand out a buffer whose DMA is still reading it.
+    /// Every status `glClientWaitSync` can return, enumerated, for the one
+    /// predicate all three fence sites now share.
+    ///
+    /// `TIMEOUT_EXPIRED` and `WAIT_FAILED` are the same decision — the GPU has
+    /// not passed the fence — but for different reasons, and each site pays a
+    /// different price for admitting either:
+    ///
+    /// * `PboPool::acquire` would hand out a buffer whose DMA is still reading
+    ///   it, so the next upload overwrites pixels in flight.
+    /// * `drain_upload_completed` would register a texture whose upload has not
+    ///   landed, so a draw samples undefined contents.
+    /// * `snapshot_canvas2d_region` would blit pre-draw tiles, which is the
+    ///   blank-text-label defect its fence exists to prevent.
+    ///
+    /// None of the three produces a GL error, which is why the predicate is
+    /// asserted here rather than trusted.
     #[test]
-    fn only_a_signalled_fence_means_the_dma_is_done() {
+    fn only_a_signalled_fence_means_the_gpu_is_done() {
         assert!(dma_complete(glow::ALREADY_SIGNALED));
         assert!(dma_complete(glow::CONDITION_SATISFIED));
         assert!(
             !dma_complete(glow::TIMEOUT_EXPIRED),
-            "an unfinished DMA was reported as complete, so the next upload \
-             would overwrite a buffer the GPU is still reading"
+            "an unfinished fence was reported as passed"
         );
         assert!(
             !dma_complete(glow::WAIT_FAILED),
             "a driver that refused to answer was read as a yes"
         );
+
+        // The four are distinct values, so the predicate is discriminating
+        // rather than accidentally right about a pair that happens to collide.
+        let all = [
+            glow::ALREADY_SIGNALED,
+            glow::CONDITION_SATISFIED,
+            glow::TIMEOUT_EXPIRED,
+            glow::WAIT_FAILED,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two wait statuses share a value");
+            }
+        }
+
+        // And nothing outside the enumerated set is admitted — a driver
+        // returning something undocumented must not read as success.
+        for bogus in [0u32, 1, 0xFFFF_FFFF] {
+            if !all.contains(&bogus) {
+                assert!(
+                    !dma_complete(bogus),
+                    "undocumented status 0x{bogus:08X} was read as a passed fence"
+                );
+            }
+        }
     }
 
     #[test]

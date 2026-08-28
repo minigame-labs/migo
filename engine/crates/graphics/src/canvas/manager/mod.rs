@@ -185,6 +185,78 @@ fn should_latch_default_fbo_readback(needs_default_fbo_readback: bool) -> bool {
 /// deferred N frames ago is the one most likely to be ready now, and putting it
 /// first keeps the common case at the front of the scan.
 ///
+/// **The Canvas2D snapshot pool's two caps only work as a pair, so their
+/// relationship is a build error rather than a test.**
+///
+/// Guards `CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS` (1024 entries) and
+/// `MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES` (64 MiB, tied to the sync-readback
+/// ceiling). Three things have to stay true:
+///
+/// 1. For the shape the pool exists to cache — a 200x40 RGBA8 text strip,
+///    32,000 bytes — the *count* cap binds first. If the byte cap started
+///    binding, a text-heavy frame would be limited by GPU bytes instead of entry
+///    count and the 1024 figure would stop meaning anything.
+/// 2. For a large capture — 1024x1024 RGBA is 4 MiB — the *byte* cap binds
+///    first, which is its only job. Sixteen of those reach 64 MiB while the
+///    count cap is still a thousand entries away.
+/// 3. The count cap comfortably exceeds the worst case it was sized for: ~200
+///    text sprites in one Cocos shop frame, each taking a snapshot. Four times
+///    over, so a scene twice as heavy still has headroom.
+///
+/// **A free `const`, deliberately.** This first lived as an associated const
+/// inside `impl CanvasManager`, which compiles but enforces nothing: an unused
+/// associated const's initializer is never evaluated, so breaking a cap left the
+/// build green. Reverse-validating the assertion is what surfaced that — the
+/// form matters as much as the predicate.
+const _: () = {
+    const TEXT_STRIP: usize = 200 * 40 * 4;
+    const LARGE_CAPTURE: usize = 1024 * 1024 * 4;
+    const OBSERVED_SPRITES_PER_FRAME: usize = 200;
+
+    assert!(
+        CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES / TEXT_STRIP
+            > CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS,
+        "the byte cap now binds before the count cap for a typical text strip, \
+         so a text-heavy frame is limited by GPU bytes rather than entry count"
+    );
+    assert!(
+        CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES / LARGE_CAPTURE
+            < CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS,
+        "the byte cap no longer bounds large captures before the count cap, \
+         which was its only job"
+    );
+    assert!(
+        CanvasManager::MAX_LIVE_CANVAS2D_SNAPSHOTS >= OBSERVED_SPRITES_PER_FRAME * 4,
+        "the count cap no longer comfortably exceeds the ~200 text sprites per \
+         frame it was sized for"
+    );
+};
+
+/// Whether a `glClientWaitSync` status means the GPU has passed the fence.
+///
+/// The four possible returns are `ALREADY_SIGNALED` (done before we asked),
+/// `CONDITION_SATISFIED` (done while we waited), `TIMEOUT_EXPIRED` (not done)
+/// and `WAIT_FAILED` (the driver refused to answer). Only the first two are a
+/// yes, and the last two are the same decision at every call site even though
+/// they mean different things — one is a slow GPU, the other is a broken one,
+/// and neither permits proceeding as though the work landed.
+///
+/// **One spelling for three fences,** which is the point of hoisting it here.
+/// `drain_upload_completed` polls upload fences with a zero timeout,
+/// `pbo_upload::PboPool::acquire` polls DMA fences the same way, and
+/// `snapshot_canvas2d_region` waits on a pre-blit fence with a real timeout.
+/// Each had its own copy of the comparison; a fourth would eventually have
+/// admitted `TIMEOUT_EXPIRED` by writing `!=` where it meant `==`, and the
+/// symptom — reusing a buffer the GPU is still reading, or blitting pre-draw
+/// tiles — produces no GL error.
+///
+/// A free function so it can be tested without a GL context, like
+/// [`stage_upload_drain`] below.
+#[inline]
+pub(super) fn fence_signalled(status: u32) -> bool {
+    status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED
+}
+
 /// A free function rather than a method so the allocation claim can be gated
 /// without a GL context: [`CanvasManager::drain_upload_completed`] calls
 /// `glClientWaitSync`, and reaching it needs a live context.
@@ -257,7 +329,9 @@ pub(crate) struct CanvasManager {
     next_canvas_id: AtomicU32,
 
     // 2D
-    pub(super) contexts_2d: HashMap<CanvasId, Canvas2DContext>,
+    /// See [`crate::canvas_keyed`]: reached twice per Canvas2D command, once to
+    /// classify the draw's damage and once to run the command.
+    pub(super) contexts_2d: crate::canvas_keyed::CanvasKeyed<Canvas2DContext>,
     pub(super) dirty_2d: HashSet<CanvasId>,
 
     // Image registry
@@ -278,8 +352,21 @@ pub(crate) struct CanvasManager {
     /// Keyed by an opaque `snapshot_id` JS holds onto.  Drained at
     /// frame-end (`drain_canvas2d_snapshots`) so cocos's
     /// `getImageData(text)`→`texImage2D` pattern stays GPU-only and
-    /// never builds up across frames.  Bounded at
-    /// [`MAX_LIVE_CANVAS2D_SNAPSHOTS`] entries; oldest evicted first.
+    /// never builds up across frames.
+    ///
+    /// Bounded two ways, and **at the cap a new capture is refused, not traded
+    /// for an old one** — this said "oldest evicted first", which the code has
+    /// never done and must not. Every live entry is waiting for a
+    /// `TexImage2DFromSnapshot` that JS has already committed to issuing;
+    /// evicting one to make room turns a bounded pool into a missing texture.
+    /// Refusing returns `0`, which JS reads as "fall back to the legacy CPU
+    /// readback" — slower for that one label, correct for all of them.
+    ///
+    /// The two bounds are `MAX_LIVE_CANVAS2D_SNAPSHOTS` (1024 entries) and
+    /// `MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES` (64 MiB). Which one binds depends on
+    /// snapshot size: at the typical 200x40 text strip (31.25 KiB) the byte cap
+    /// would allow ~2048, so the count cap binds first; for large captures the
+    /// byte cap binds first. Both are checked before any GPU work.
     canvas2d_snapshots: HashMap<u32, Canvas2DSnapshotEntry>,
     /// Aggregate RGBA bytes retained by the live snapshot textures.
     canvas2d_snapshot_bytes: usize,
@@ -845,7 +932,7 @@ impl CanvasManager {
             bound: BoundContext::Resource,
             canvases: HashMap::with_capacity(4),
             next_canvas_id: AtomicU32::new(2), // 1 is reserved for onscreen
-            contexts_2d: HashMap::with_capacity(4),
+            contexts_2d: crate::canvas_keyed::CanvasKeyed::default(),
             dirty_2d: HashSet::with_capacity(4),
             image_registry: ImageRegistry::new(),
             image_copy_fbos: HashMap::with_capacity(4),
@@ -2324,7 +2411,7 @@ impl CanvasManager {
 
         // Skia contexts: abandoned on the loss path; drop every one so they
         // rebuild against the new share group. `abandon()` makes Drop a no-op.
-        for (_id, mut ctx) in std::mem::take(&mut self.contexts_2d) {
+        for (_id, mut ctx) in self.contexts_2d.drain().collect::<Vec<_>>() {
             ctx.abandon();
         }
         self.dirty_2d.clear();
@@ -2855,7 +2942,7 @@ impl CanvasManager {
             // Non-blocking fence check (timeout = 0).
             let status = unsafe { self.gl.client_wait_sync(c.fence, 0, 0) };
 
-            if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
+            if fence_signalled(status) {
                 // GPU upload complete — delete the fence.
                 unsafe { self.gl.delete_sync(c.fence) };
 
@@ -4219,6 +4306,12 @@ impl CanvasManager {
     const MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES: usize =
         shared::protocol::render_cmd::MAX_SYNC_READBACK_BYTES;
 
+    // The relationship these two caps must keep is enforced at compile time by
+    // `SNAPSHOT_CAP_RELATIONS` at module scope — a free `const`, because an
+    // unused *associated* const's initializer is not evaluated and an assertion
+    // placed here proved nothing (verified by breaking a cap and watching the
+    // build succeed).
+
     /// Capture a Canvas2D sub-rectangle into a GL texture using a
     /// caller-supplied `snapshot_id`.  Powers the fire-and-forget
     /// hot path where JS pre-allocated the id from a process-local
@@ -4245,6 +4338,17 @@ impl CanvasManager {
         snapshot_id: u32,
     ) -> EngineResult<u32> {
         if width == 0 || height == 0 {
+            return Ok(0);
+        }
+        // `0` is the JS sentinel for "no snapshot", so an entry under that key
+        // could never be looked up. Rejected here rather than after the capture:
+        // this used to be checked just before the pool insert, by which point a
+        // texture had been created, an FBO blit issued and the surrounding GL
+        // state saved and restored — all of it for a result guaranteed to be
+        // thrown away. `op_capture_canvas2d_snapshot` screens this JS-side too,
+        // so reaching it means a different runtime or stale cached JS; the point
+        // of defence in depth is to cost nothing when it holds.
+        if snapshot_id == 0 {
             return Ok(0);
         }
         let snapshot_bytes =
@@ -4341,9 +4445,31 @@ impl CanvasManager {
                 // Mali (cocos labels rendered blank again).  The
                 // CPU-side `client_wait_sync` is load-bearing; do
                 // not touch without a Mali device in hand.
-                let _ = self
+                //
+                // The result is inspected rather than discarded. It used to be
+                // `let _ =`, which threw away the one fact that matters here:
+                // on `TIMEOUT_EXPIRED` the fence did *not* signal, the blit
+                // below samples pre-draw tiles anyway, and the symptom is
+                // exactly the blank-label defect this fence exists to prevent —
+                // silently, with no GL error and nothing to attribute it to. We
+                // still proceed, because a stale snapshot beats abandoning the
+                // frame, but we say so.
+                let waited = self
                     .gl
                     .client_wait_sync(fence, glow::SYNC_FLUSH_COMMANDS_BIT, i32::MAX);
+                if !fence_signalled(waited) {
+                    let cause = if waited == glow::TIMEOUT_EXPIRED {
+                        "timed out"
+                    } else {
+                        "failed"
+                    };
+                    tracing::warn!(
+                        canvas_id = ?canvas_id,
+                        "snapshot_canvas2d_region: pre-blit fence {cause} \
+                         (0x{waited:04X}); the snapshot may sample pre-draw \
+                         tile contents (blank or stale text)"
+                    );
+                }
                 self.gl.delete_sync(fence);
             }
         }
@@ -4543,14 +4669,6 @@ impl CanvasManager {
                 | crate::backend::gl::surface::gr_state_bits::RENDER_TARGET,
         );
 
-        // Use caller-supplied id (or auto-allocated by the wrapper).
-        // ID == 0 means "JS sentinel for absent snapshot"; reject so
-        // a buggy caller can't poison the pool with a never-lookup
-        // entry.
-        if snapshot_id == 0 {
-            unsafe { self.gl.delete_texture(dest_tex) };
-            return Ok(0);
-        }
         self.canvas2d_snapshots.insert(
             snapshot_id,
             Canvas2DSnapshotEntry {
@@ -6339,6 +6457,56 @@ mod recovery_source_guards {
 mod tests {
     use super::*;
     use crate::damage_effect::{DamageEffect, FrameDamageAccumulator};
+
+    /// **At the cap a snapshot is refused, never traded for an older one.**
+    ///
+    /// The field doc used to promise "oldest evicted first", which the code has
+    /// never done and must not: every live entry is waiting for a
+    /// `TexImage2DFromSnapshot` that JS already committed to issuing, so
+    /// evicting one to admit another turns a bounded pool into a missing
+    /// texture. Refusing returns `0`, which JS reads as "fall back to the legacy
+    /// CPU readback" — slower for one label, correct for all of them. A reader
+    /// who trusted the old doc would have "fixed" the code toward the eviction
+    /// it described.
+    ///
+    /// The caps' arithmetic is not checked here: it is all compile-time
+    /// constants, so it lives next to them as `const _: () = assert!(…)` and a
+    /// mis-relation fails the build rather than the suite.
+    ///
+    /// What this pins instead is the refusal itself, at the level a host can
+    /// reach it. `snapshot_canvas2d_region_with_id` needs an EGL context, so
+    /// the assertion is on the decision function's shape rather than on a live
+    /// capture — stated plainly rather than dressed up as an end-to-end test.
+    #[test]
+    fn a_full_snapshot_pool_refuses_rather_than_evicting() {
+        // The two rejection sites, read out of the source. Crude, and chosen
+        // deliberately over a mock: the alternative is a fake GL context whose
+        // agreement with a driver is its own open question, and what is in doubt
+        // here is not GL behaviour but whether this function still *refuses*.
+        const SRC: &str = include_str!("mod.rs");
+        let body_start = SRC
+            .find("pub(crate) fn snapshot_canvas2d_region_with_id")
+            .expect("the capture entry point");
+        let body = &SRC[body_start..body_start + 4000];
+
+        assert!(
+            body.contains("canvas2d_snapshot_order.len() >= Self::MAX_LIVE_CANVAS2D_SNAPSHOTS"),
+            "the count cap is no longer consulted in the capture path"
+        );
+        assert!(
+            body.contains("next_snapshot_bytes > Self::MAX_LIVE_CANVAS2D_SNAPSHOT_BYTES"),
+            "the byte cap is no longer consulted in the capture path"
+        );
+        for evicting in ["pop_front", "remove(&evict", "evict"] {
+            assert!(
+                !body.contains(evicting),
+                "the capture path now contains {evicting:?}. If the pool has \
+                 started evicting to make room, every evicted entry is a \
+                 `TexImage2DFromSnapshot` that will find nothing — see this \
+                 test's doc for why refusing is the only safe answer at the cap"
+            );
+        }
+    }
 
     // ── Upload drain staging ─────────────────────────────────────────────
 

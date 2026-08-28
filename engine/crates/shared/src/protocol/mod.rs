@@ -66,7 +66,51 @@ pub enum SyncOpClass {
     Default,
 }
 
-fn class_for_op(op: &str) -> SyncOpClass {
+/// Pick a deadline class from an op's name.
+///
+/// # The mechanism is a substring match, with two consequences worth knowing
+///
+/// **A rename is a silent 2500x change.** The names are `'static` literals
+/// declared next to their ops, so editing `OP_MEASURE_TEXT`'s string — a
+/// reasonable-looking tidy-up — moves `measureText` from the 4 ms deadline to
+/// the 10 s one, and nothing fails. `every_sync_op_name_lands_in_its_intended_
+/// deadline_class` pins the current mapping for exactly that reason.
+///
+/// **It cannot distinguish the synchronous GL ops, because they share one
+/// name.** All 18 `GLCmd` variants that carry a `resp` — `GetParameter`,
+/// `CheckFramebufferStatus`, `ClientWaitSync`, `GetQueryParameter`,
+/// `GetShaderInfoLog`, `GetProgramInfoLog` and the rest — travel through
+/// `send_gl_with_resp_sync`, which passes the single name [`OP_GL`]
+/// (`"gl command"`). So they all land on `Default`, and:
+///
+/// * The `get_shader_info_log` / `get_program_info_log` arms below are
+///   unreachable. No op is named either of those; they are waiting for a name
+///   that is never passed.
+/// * `ClientWaitSync` and `GetQueryParameter` are *designed* to be polled every
+///   frame — a fence probe and a timer/occlusion query respectively — and yet
+///   they get the 10 s deadline. That is at odds with the policy
+///   [`MEASURE_TIMEOUT_MS`] states for per-frame ops: surface a render-thread
+///   stall "within a couple of milliseconds rather than eating the full 10 s
+///   budget and freezing the whole tick".
+///
+/// The deadline never fires in normal operation — a healthy round-trip is
+/// sub-millisecond, and `send_render_with_resp_sync` already warns past 5 ms.
+/// What it bounds is the damage when the render thread is wedged, and for a
+/// fence poll that bound is currently 10 s of frozen JS.
+///
+/// **Not changed here, deliberately.** Shortening it means deciding what a
+/// spuriously-failed `clientWaitSync` does to a game's async-readback logic,
+/// which is a product call wanting a device measurement, not a constant edit.
+/// Making the classification *able* to tell these ops apart is a small change —
+/// thread the name through `send_gl_with_resp_sync` — but on its own it alters
+/// nothing except log text, so it belongs with the decision rather than before
+/// it.
+/// `pub` for the same reason [`SyncOpClass`] is: a downstream crate declares
+/// the op names, so it is the only place that can check one lands in the class
+/// its op needs. Exposing the type without the classifier left that
+/// unverifiable — see
+/// `context2d::tests::each_sync_op_name_still_selects_the_deadline_its_op_needs`.
+pub fn class_for_op(op: &str) -> SyncOpClass {
     // Cheap prefix match — op names are `'static` string
     // constants so the comparison compiles to byte-tests.  Kept
     // here (not on the op site) so we don't have to touch every
@@ -263,4 +307,74 @@ pub async fn send_gl_with_resp_async<T>(
     build: impl FnOnce(RenderCmdResp<T>) -> RenderCommand,
 ) -> Result<T, EngineError> {
     send_render_with_resp_async(ctx, OP_GL, build).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OP_GL, SyncOpClass, class_for_op, timeout_for_op};
+    use std::time::Duration;
+
+    /// The two classes must keep mapping to different deadlines, or the
+    /// classification stops deciding anything.
+    ///
+    /// Note what this test deliberately does *not* claim. It cannot check that
+    /// any real op's name lands in the right class, because the names are
+    /// declared in `runtime-v8` and this crate is upstream of it. A first
+    /// version of this test hardcoded the name strings and asserted their
+    /// classes — and passed unchanged when `OP_MEASURE_TEXT` was renamed, which
+    /// is precisely the failure it was written to catch. The duplicated literals
+    /// made divergence invisible rather than loud.
+    ///
+    /// That check now lives where the constants do:
+    /// `context2d::tests::each_sync_op_name_still_selects_the_deadline_its_op_needs`.
+    #[test]
+    fn the_two_deadline_classes_stay_far_apart() {
+        let measure = timeout_for_op("canvas2d measure_text");
+        assert_eq!(class_for_op("canvas2d measure_text"), SyncOpClass::Measure);
+        assert!(
+            measure < Duration::from_millis(17),
+            "the measure deadline ({measure:?}) must stay inside a 60 Hz frame, \
+             or a stalled measureText becomes a visible hitch rather than a \
+             sub-frame one"
+        );
+        assert!(
+            timeout_for_op(OP_GL) > measure * 100,
+            "the classes have converged; classifying an op no longer changes \
+             its deadline"
+        );
+    }
+
+    /// The two `Readback` substrings for shader/program info logs are
+    /// unreachable, and that is a fact about the code rather than a wish.
+    ///
+    /// Both ops exist — `GLCmd::GetShaderInfoLog` and `GetProgramInfoLog` carry
+    /// a `resp` — but they travel through `send_gl_with_resp_sync`, which names
+    /// every synchronous GL op `OP_GL`. Nothing ever passes a string containing
+    /// `get_shader_info_log`, so the arm cannot fire.
+    ///
+    /// Asserted rather than deleted: the arms are harmless, they document an
+    /// intent, and they become live the moment someone threads a real name
+    /// through the GL sync path. What is worth pinning is that today they do
+    /// *not* fire, so nobody reads the classification as evidence that those two
+    /// ops are treated separately — they are not.
+    #[test]
+    fn the_shader_info_log_readback_arms_are_unreachable_through_the_gl_sync_path()
+    {
+        // The arms work when given a matching name...
+        assert_eq!(
+            class_for_op("get_shader_info_log"),
+            SyncOpClass::Readback,
+            "the arm itself is broken, which is a different bug"
+        );
+        assert_eq!(class_for_op("get_program_info_log"), SyncOpClass::Readback);
+
+        // ...but the name the GL sync path actually passes is not one of them,
+        // so every synchronous GL op — including those two — is `Default`.
+        assert_eq!(class_for_op(OP_GL), SyncOpClass::Default);
+        assert!(
+            !OP_GL.contains("get_shader_info_log") && !OP_GL.contains("get_program_info_log"),
+            "OP_GL now names an info-log op; the arms above have become live \
+             and this test should be replaced by one covering the new mapping"
+        );
+    }
 }

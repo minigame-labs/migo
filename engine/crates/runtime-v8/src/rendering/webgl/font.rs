@@ -9,8 +9,10 @@ use shared::{
     vfs::FileOp,
 };
 
-const OP_LOAD_FONT: &str = "load_font";
-const OP_GET_TEXT_LINE_HEIGHT: &str = "get_text_line_height";
+/// `pub(super)` so `context2d`'s deadline-class test can cover every sync op
+/// name in one list — see `each_sync_op_name_still_selects_the_deadline_its_op_needs`.
+pub(super) const OP_LOAD_FONT: &str = "load_font";
+pub(super) const OP_GET_TEXT_LINE_HEIGHT: &str = "get_text_line_height";
 
 #[derive(Debug, PartialEq, Eq)]
 struct FontRegistrationRequest {

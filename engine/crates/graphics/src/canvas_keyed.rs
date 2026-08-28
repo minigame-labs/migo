@@ -80,10 +80,40 @@ impl<V> CanvasKeyed<V> {
 
     #[inline]
     pub(crate) fn get(&self, id: &CanvasId) -> Option<&V> {
+        // Reads the memo but cannot refresh it — `&self`. Still worth checking:
+        // the caller that just resolved this canvas through a `&mut` path is
+        // the common one.
+        if let Some((key, value)) = self.entries.get(self.hot)
+            && key == id
+        {
+            return Some(value);
+        }
         self.entries
             .iter()
             .find(|(key, _)| key == id)
             .map(|(_, value)| value)
+    }
+
+    /// Like [`Self::get`] but refreshes the memo, and mutable.
+    ///
+    /// Distinct from [`Self::value_mut`] because this must not create: callers
+    /// use the `None` to mean "this canvas has no 2D context", which is a real
+    /// answer rather than a reason to make one.
+    #[inline]
+    pub(crate) fn get_mut(&mut self, id: &CanvasId) -> Option<&mut V> {
+        if let Some((key, _)) = self.entries.get(self.hot)
+            && key == id
+        {
+            return Some(&mut self.entries[self.hot].1);
+        }
+        let pos = self.entries.iter().position(|(key, _)| key == id)?;
+        self.hot = pos;
+        Some(&mut self.entries[pos].1)
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, id: &CanvasId) -> bool {
+        self.entries.iter().any(|(key, _)| key == id)
     }
 
     /// Replace this canvas's value wholesale, as context recreation does.
@@ -122,6 +152,17 @@ impl<V> CanvasKeyed<V> {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.hot = 0;
+    }
+
+    /// Take every entry, leaving the table empty.
+    ///
+    /// For teardown, which drops each canvas's value under its own GL context
+    /// and so needs to own them one at a time. The allocation is given back
+    /// with them — this is not a per-frame path.
+    #[inline]
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (CanvasId, V)> + '_ {
+        self.hot = 0;
+        self.entries.drain(..)
     }
 
     /// Reserve room for `additional` more canvases, reporting failure instead
@@ -313,6 +354,63 @@ mod tests {
         // The memo now points at canvas 2.
         assert_eq!(read(&t, 1), Some(1007));
         assert_eq!(read(&t, 2), Some(2007));
+    }
+
+    /// `get_mut` must not create. Callers read its `None` as "this canvas has
+    /// no 2D context", which is a real answer — a version that made one would
+    /// hand back an unusable context and lose the distinction.
+    #[test]
+    fn get_mut_reports_an_absent_canvas_rather_than_creating_one() {
+        let mut t: CanvasKeyed<Marked> = CanvasKeyed::default();
+        mark(&mut t, 1);
+        assert!(t.get_mut(&9).is_none());
+        assert_eq!(t.len(), 1, "get_mut created an entry for an absent canvas");
+    }
+
+    /// `get_mut` refreshes the memo, so the same canvas asked twice in a row —
+    /// which is what a Canvas2D command does, once to classify damage and once
+    /// to run — resolves through it the second time.
+    #[test]
+    fn get_mut_finds_a_canvas_that_is_not_the_memoised_one() {
+        let mut t: CanvasKeyed<Marked> = CanvasKeyed::default();
+        mark(&mut t, 1);
+        mark(&mut t, 2);
+        // The memo points at canvas 2.
+        t.get_mut(&1).expect("canvas 1 exists").0 = 77;
+        assert_eq!(read(&t, 1), Some(77));
+        assert_eq!(read(&t, 2), Some(2007), "canvas 2 was written instead");
+        // And again, now through the memo.
+        t.get_mut(&1).expect("canvas 1 exists").0 = 78;
+        assert_eq!(read(&t, 1), Some(78));
+        assert_eq!(read(&t, 2), Some(2007));
+    }
+
+    #[test]
+    fn contains_key_answers_for_present_and_absent_canvases() {
+        let mut t: CanvasKeyed<Marked> = CanvasKeyed::default();
+        mark(&mut t, 4);
+        assert!(t.contains_key(&4));
+        assert!(!t.contains_key(&5));
+        assert!(t.remove(&4).is_some());
+        assert!(!t.contains_key(&4));
+    }
+
+    /// `drain` hands every entry over and leaves the table empty — teardown
+    /// drops each canvas's value under its own GL context, so it needs to own
+    /// them one at a time.
+    #[test]
+    fn drain_yields_every_entry_and_empties_the_table() {
+        let mut t: CanvasKeyed<Marked> = CanvasKeyed::default();
+        for id in [1u32, 6, 11] {
+            mark(&mut t, id);
+        }
+        let mut drained: Vec<(CanvasId, u32)> =
+            t.drain().map(|(id, m)| (id, m.0)).collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![(1, 1007), (6, 6007), (11, 11007)]);
+        assert_eq!(t.len(), 0);
+        // And the memo went with them: a lookup after the drain must miss.
+        assert!(t.get_mut(&1).is_none());
     }
 
     /// See [`CANVAS_KEYED_RESERVE`]: a pointer taken out of this table and held

@@ -8,6 +8,12 @@
 use crate::dirty_region::damage_tracker::{DamageTracker, MAX_DAMAGE_RECTS, ResolvedDamage};
 use smallvec::SmallVec;
 
+/// Up to [`MAX_DAMAGE_RECTS`] discrete damage rects, `(x, y, width, height)`,
+/// inline. Named because the shape appears in a return type, in the callers
+/// that pass it to the partial-update driver call, and in the tests that assert
+/// coverage over it.
+pub(crate) type DamageRects = SmallVec<[(i32, i32, i32, i32); MAX_DAMAGE_RECTS]>;
+
 /// The damage produced by a single rendering operation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum DamageEffect {
@@ -70,13 +76,27 @@ impl FrameDamageAccumulator {
                     self.rects.push([x, y, width, height]);
                     return;
                 }
-                // Past the cap: collapse the list + new rect into
-                // a single AABB.  Subsequent additions will keep
-                // hitting this branch (because `rects.len()` is
-                // now 1 but the `<` check doesn't kick in - wait,
-                // it would; let's preserve overflow as sticky by
-                // directly unioning into the single slot rather
-                // than re-appending).  Re-check after collapse.
+                // Past the cap: union everything held *and the incoming rect*
+                // into slot 0, so the list is one rect again.
+                //
+                // **The overflow is not sticky, and that is the better
+                // behaviour rather than an oversight** — the comment this
+                // replaces talked itself into "sticky" mid-sentence and then
+                // described code that was never written. Because the collapse
+                // leaves `rects.len() == 1`, the next few adds take the branch
+                // above and append discretely again, so a frame with many
+                // scattered updates keeps reporting up to `MAX_DAMAGE_RECTS`
+                // useful regions with slot 0 as a growing AABB of everything
+                // already folded in. Unioning into slot 0 forever instead would
+                // degrade to one near-full-surface rect after the fifth update
+                // and stay there for the rest of the frame.
+                //
+                // What the cycle cannot do is under-report, and that is the
+                // property worth pinning: slot 0 always covers every rect
+                // folded into it, and the discrete slots cover themselves.
+                // `coverage_holds_for_every_rect_count_around_the_cap` asserts
+                // it for every count either side of the cap, because an
+                // under-reported region is what leaves a stale pixel on screen.
                 let mut left = x;
                 let mut top = y;
                 let mut right = x + width;
@@ -127,7 +147,7 @@ impl FrameDamageAccumulator {
     pub(crate) fn resolve_rects(
         &self,
         surface_size: (i32, i32),
-    ) -> Option<SmallVec<[(i32, i32, i32, i32); MAX_DAMAGE_RECTS]>> {
+    ) -> Option<DamageRects> {
         let mut tracker = DamageTracker::new(surface_size);
         for r in &self.rects {
             tracker.mark_rect((r[0], r[1], r[2], r[3]));
@@ -425,6 +445,162 @@ mod tests {
             height: 50,
         });
         assert!(!acc.has_damage());
+    }
+
+    // ---- Overflow past MAX_DAMAGE_RECTS ------------------------------
+    //
+    // The collapse branch had no test. It is the one place the accumulator
+    // discards information, so it is the one place it could under-report — and
+    // an under-reported damage region means the compositor is told a changed
+    // pixel did not change, which leaves the old one on screen.
+    //
+    // Every test below states the invariant the same way: whatever
+    // `resolve_rects` returns must *cover* every rect that was added. That is
+    // the accumulator's whole contract, and it holds regardless of how the
+    // collapse chooses to group things.
+
+    /// Does the resolved damage cover `rect` entirely?
+    fn covered(
+        resolved: &Option<DamageRects>,
+        rect: (i32, i32, i32, i32),
+    ) -> bool {
+        match resolved {
+            // FullSurface covers everything by definition.
+            None => true,
+            Some(rects) => rects.iter().any(|r| {
+                r.0 <= rect.0
+                    && r.1 <= rect.1
+                    && r.0 + r.2 >= rect.0 + rect.2
+                    && r.1 + r.3 >= rect.1 + rect.3
+            }),
+        }
+    }
+
+    /// `n` rects marching diagonally, each 10x10, 100 apart — so no two touch
+    /// and a lost rect cannot be hidden by an overlapping neighbour.
+    fn diagonal_rects(n: usize) -> Vec<(i32, i32, i32, i32)> {
+        (0..n)
+            .map(|i| (i as i32 * 100, i as i32 * 100, 10, 10))
+            .collect()
+    }
+
+    #[test]
+    fn the_rect_that_triggers_the_collapse_is_not_lost() {
+        let inputs = diagonal_rects(MAX_DAMAGE_RECTS + 1);
+        let mut acc = FrameDamageAccumulator::new();
+        for &(x, y, width, height) in &inputs {
+            acc.add(DamageEffect::OnscreenRect {
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+        let resolved = acc.resolve_rects((4096, 4096));
+        for rect in inputs {
+            assert!(
+                covered(&resolved, rect),
+                "rect {rect:?} was dropped by the collapse; resolved = {resolved:?}"
+            );
+        }
+    }
+
+    /// Two collapses, so the second one has to union a slot that is *already*
+    /// a collapsed AABB rather than a plain rect.
+    #[test]
+    fn rects_survive_more_than_one_collapse() {
+        let inputs = diagonal_rects(MAX_DAMAGE_RECTS * 2 + 1);
+        let mut acc = FrameDamageAccumulator::new();
+        for &(x, y, width, height) in &inputs {
+            acc.add(DamageEffect::OnscreenRect {
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+        let resolved = acc.resolve_rects((4096, 4096));
+        for rect in inputs {
+            assert!(
+                covered(&resolved, rect),
+                "rect {rect:?} was dropped across two collapses; resolved = {resolved:?}"
+            );
+        }
+    }
+
+    /// Held for every count either side of the cap, so an off-by-one in the
+    /// `<` comparison shows up rather than hiding between two tested sizes.
+    #[test]
+    fn coverage_holds_for_every_rect_count_around_the_cap() {
+        for n in 1..=(MAX_DAMAGE_RECTS * 3) {
+            let inputs = diagonal_rects(n);
+            let mut acc = FrameDamageAccumulator::new();
+            for &(x, y, width, height) in &inputs {
+                acc.add(DamageEffect::OnscreenRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+            let resolved = acc.resolve_rects((4096, 4096));
+            for rect in inputs {
+                assert!(
+                    covered(&resolved, rect),
+                    "{n} rects: {rect:?} not covered; resolved = {resolved:?}"
+                );
+            }
+        }
+    }
+
+    /// The collapse must stay bounded — that is the reason it exists. Past the
+    /// cap the accumulator must never hold more than `MAX_DAMAGE_RECTS`.
+    #[test]
+    fn the_accumulator_never_holds_more_than_the_cap() {
+        let mut acc = FrameDamageAccumulator::new();
+        for i in 0..100 {
+            acc.add(DamageEffect::OnscreenRect {
+                x: i * 10,
+                y: i * 10,
+                width: 5,
+                height: 5,
+            });
+            assert!(
+                acc.rects.len() <= MAX_DAMAGE_RECTS,
+                "after {} adds the accumulator held {} rects",
+                i + 1,
+                acc.rects.len()
+            );
+        }
+    }
+
+    /// The collapse must not spill to the heap: `rects` is a `SmallVec` sized
+    /// to the cap precisely so a per-command path never allocates.
+    #[test]
+    fn a_steady_state_damage_accumulation_never_reaches_the_heap() {
+        let mut acc = FrameDamageAccumulator::new();
+
+        migo_alloc_probe::assert_no_steady_state_allocation(
+            migo_alloc_probe::Burst {
+                path: "damage_effect: per-command accumulation past the rect cap",
+                warmup: 4,
+                measured: 64,
+            },
+            |iteration| {
+                // Well past the cap, so every iteration exercises the collapse.
+                for i in 0..32i32 {
+                    acc.add(DamageEffect::OnscreenRect {
+                        x: i * 10 + iteration as i32,
+                        y: i * 10,
+                        width: 5,
+                        height: 5,
+                    });
+                }
+                let held = acc.rects.len();
+                acc.reset();
+                held
+            },
+        );
     }
 
     // ---- intersect_rects tests ----

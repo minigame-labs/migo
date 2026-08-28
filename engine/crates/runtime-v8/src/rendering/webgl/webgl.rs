@@ -325,6 +325,265 @@ mod tests {
         assert!(gl_cmd_has_heap_payload(&spilled));
     }
 
+    /// **The scalar fast path's premise, measured rather than asserted.**
+    ///
+    /// `gl_cmd_has_heap_payload`'s doc claims branching on it "lets
+    /// `queue_gl_fire_and_forget` skip … the heavy `approx_deep_size_bytes`
+    /// match", and that claim is worth doubting: both are matches over the same
+    /// 145-variant enum, so the compiler builds a jump table for each and
+    /// neither is *obviously* cheaper. If they cost the same, the classification
+    /// buys nothing and could be replaced by the size walk it guards — removing
+    /// a duplicate that lives in a different crate from its source of truth and
+    /// whose `_ => false` default silently under-counts any heap-carrying
+    /// variant added later.
+    ///
+    /// Measured on host, they do not cost the same: classifying first is about
+    /// 0.66 ns/call against 2.53 ns for the size walk alone, a factor of ~3.8.
+    /// The asymmetry has a cause — `gl_cmd_has_heap_payload` yields a `bool`
+    /// from discriminant tests the compiler can collapse into a bitmap, while
+    /// `approx_deep_size_bytes` must dereference the payload in every heap arm
+    /// to reach `.capacity()` / `.spilled()`, leaving a far larger body and no
+    /// such collapse.
+    ///
+    /// So the premise holds and the duplicate stays. What does *not* follow is
+    /// that the duplicate can be left unguarded: see
+    /// `heap_payload_classification_agrees_with_the_authoritative_byte_count`
+    /// for the invariant that keeps the two functions from drifting.
+    ///
+    /// Direction only, no absolute values, so the assertion is machine
+    /// independent.
+    #[test]
+    #[ignore = "timing benchmark; run with --ignored"]
+    fn bench_heap_payload_classification_vs_deep_size_walk() {
+        use std::time::Instant;
+
+        // A representative scalar frame: the commands a renderer emits by the
+        // hundred. All take the `_` arm of both functions.
+        let scalars: Vec<GLCmd> = vec![
+            GLCmd::Viewport {
+                canvas_id: 1,
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 1920,
+            },
+            GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0x4000,
+            },
+            GLCmd::Enable {
+                canvas_id: 1,
+                cap: 0x0B71,
+            },
+            GLCmd::DrawArrays {
+                canvas_id: 1,
+                mode: 4,
+                first: 0,
+                count: 6,
+            },
+            GLCmd::UseProgram {
+                canvas_id: 1,
+                program_id: 1,
+            },
+        ];
+
+        const ITERS: usize = 200_000;
+        let base = std::mem::size_of::<GLCmd>();
+
+        // Warm both, so neither pays first-touch icache.
+        let mut sink = 0usize;
+        for cmd in &scalars {
+            sink += usize::from(gl_cmd_has_heap_payload(cmd)) + cmd.approx_deep_size_bytes();
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            for cmd in &scalars {
+                sink += if gl_cmd_has_heap_payload(cmd) {
+                    cmd.approx_deep_size_bytes()
+                } else {
+                    base
+                };
+            }
+        }
+        let classify_then_size = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            for cmd in &scalars {
+                sink += cmd.approx_deep_size_bytes();
+            }
+        }
+        let size_only = t1.elapsed();
+
+        let calls = (ITERS * scalars.len()) as f64;
+        println!(
+            "  classify + size (now) : {:>9} ns  {:>6.2} ns/call",
+            classify_then_size.as_nanos(),
+            classify_then_size.as_nanos() as f64 / calls
+        );
+        println!(
+            "  size only  (proposed) : {:>9} ns  {:>6.2} ns/call",
+            size_only.as_nanos(),
+            size_only.as_nanos() as f64 / calls
+        );
+        println!("  (sink {sink} — keeps the loops from being optimised away)");
+
+        assert!(
+            classify_then_size < size_only,
+            "classifying first ({classify_then_size:?}) is no longer cheaper \
+             than the size walk alone ({size_only:?}). The fast path's premise \
+             has stopped holding — `gl_cmd_has_heap_payload` is then a duplicate \
+             classification that buys nothing, and `queue_gl_fire_and_forget` \
+             should derive `heap` from `approx_deep_size_bytes` instead."
+        );
+    }
+
+    /// **The two functions that classify a command's payload must agree, and
+    /// they live in different crates.**
+    ///
+    /// `gl_cmd_has_heap_payload` (this crate) decides whether
+    /// `queue_gl_fire_and_forget` takes the scalar fast path, where the byte
+    /// budget is charged a flat `size_of::<GLCmd>()`. `GLCmd::
+    /// approx_deep_size_bytes` (in `shared`) is the authoritative count. The
+    /// benchmark above records why the duplicate exists — the classification is
+    /// ~3.8x cheaper, so merging them would slow every scalar command.
+    ///
+    /// One direction of disagreement is harmful. If the classifier says "no
+    /// payload" for a command that has one, the fast path charges the base size,
+    /// the 4 MiB auto-flush guard never trips, and untrusted JS can pin
+    /// unbounded heap until the frame ends. The other direction — claiming a
+    /// payload that turns out empty, as `BufferData { data: None }` does — only
+    /// costs a slow path, so it is allowed.
+    ///
+    /// What this cannot catch, stated rather than implied: `GLCmd` is
+    /// `#[non_exhaustive]` with 145 variants, so a variant added tomorrow is in
+    /// neither this list nor the classifier's, and lands on `_ => false`. No
+    /// test can see that. What it does catch is the realistic drift — someone
+    /// editing one function's arms and not the other's.
+    #[test]
+    fn heap_payload_classification_agrees_with_the_authoritative_byte_count() {
+        let base = std::mem::size_of::<GLCmd>();
+
+        // Every variant that carries an outbound payload, each given a real one.
+        let with_payload: Vec<(&str, GLCmd)> = vec![
+            (
+                "ShaderSource",
+                GLCmd::ShaderSource {
+                    shader_id: 1,
+                    source: "precision mediump float;".repeat(8),
+                    resp: None,
+                },
+            ),
+            (
+                "BufferData",
+                GLCmd::BufferData {
+                    canvas_id: 1,
+                    target: 0x8892,
+                    size: 4096,
+                    data: Some(vec![0u8; 4096]),
+                    usage: 0x88E4,
+                },
+            ),
+            (
+                "Uniform1fv spilled",
+                GLCmd::Uniform1fv {
+                    canvas_id: 1,
+                    location: Some(1),
+                    value: (0..64).map(|n| n as f32).collect(),
+                },
+            ),
+            (
+                "UniformMatrix4fv spilled",
+                GLCmd::UniformMatrix4fv {
+                    canvas_id: 1,
+                    location: Some(1),
+                    transpose: false,
+                    value: (0..64).map(|n| n as f32).collect(),
+                },
+            ),
+        ];
+
+        for (label, cmd) in &with_payload {
+            let bytes = cmd.approx_deep_size_bytes();
+            assert!(
+                bytes > base,
+                "{label}: the fixture carries no payload, so it tests nothing \
+                 ({bytes} == base {base})"
+            );
+            assert!(
+                gl_cmd_has_heap_payload(cmd),
+                "{label}: has {} payload bytes but the classifier calls it \
+                 scalar — the fast path would charge {base} and the 4 MiB \
+                 auto-flush guard would not trip",
+                bytes - base
+            );
+        }
+
+        // And the converse for the commands that make up a frame by count: the
+        // classifier calls them scalar, so the authoritative count must agree
+        // that a flat base charge is exact.
+        let scalars: Vec<(&str, GLCmd)> = vec![
+            (
+                "Viewport",
+                GLCmd::Viewport {
+                    canvas_id: 1,
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+            ),
+            (
+                "DrawArrays",
+                GLCmd::DrawArrays {
+                    canvas_id: 1,
+                    mode: 4,
+                    first: 0,
+                    count: 6,
+                },
+            ),
+            (
+                "BufferData reserving",
+                GLCmd::BufferData {
+                    canvas_id: 1,
+                    target: 0x8892,
+                    size: 4096,
+                    data: None,
+                    usage: 0x88E4,
+                },
+            ),
+            (
+                "UniformMatrix4fv inline",
+                GLCmd::UniformMatrix4fv {
+                    canvas_id: 1,
+                    location: Some(1),
+                    transpose: false,
+                    value: (0..16).map(|n| n as f32).collect(),
+                },
+            ),
+        ];
+
+        for (label, cmd) in &scalars {
+            let bytes = cmd.approx_deep_size_bytes();
+            if !gl_cmd_has_heap_payload(cmd) {
+                assert_eq!(
+                    bytes, base,
+                    "{label}: classified scalar, so the fast path charges \
+                     {base}, but the authoritative count is {bytes}"
+                );
+            } else {
+                // Allowed: claiming a payload that is absent costs only a slow
+                // path. `BufferData { data: None }` is exactly this case.
+                assert_eq!(
+                    bytes, base,
+                    "{label}: classified as carrying a payload and does — then \
+                     it belongs in the list above, not here"
+                );
+            }
+        }
+    }
+
     #[test]
     fn wraps_without_returning_zero() {
         let mut alloc = GlResourceIdAllocator::with_next_for_test(u32::MAX);
