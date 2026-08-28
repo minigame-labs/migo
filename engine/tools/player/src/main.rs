@@ -384,6 +384,8 @@ fn run(
         None => tracing::warn!("frame capture: no frame was presented during the window"),
     }
 
+    report_draw_batching(host_id);
+
     tracing::info!("shutting down host {host_id}");
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     shutdown_before_drop(host, window)?;
@@ -391,6 +393,54 @@ fn run(
     shutdown_before_drop(host, ())?;
     tracing::info!("player done");
     Ok(())
+}
+
+/// Print the draw-call batching headroom for the run that just finished.
+///
+/// **The measurement the batching question was missing.** `GlBatch` executes its
+/// commands in order and merges nothing, and whether that costs anything was
+/// never measured — merging is largely the application's job in WebGL, since
+/// state can change between draws, so the answer depends entirely on how the
+/// game actually draws.
+///
+/// `adjacent_draws` counts draws issued with zero *post-dedup* state changes
+/// since the previous draw of the same frame, which is the upper bound on what a
+/// batching pass could merge. Post-dedup matters: a state command the shadow
+/// swallowed never reached the driver, so draws separated only by those are
+/// adjacent as far as the GPU is concerned.
+///
+/// A ratio near zero closes the question for the workload measured. A high one
+/// does not open it on its own — a merge also needs matching primitive modes and
+/// contiguous vertex or index ranges, which the counter does not check.
+///
+/// Printed unconditionally rather than behind a flag: it is three integers at
+/// shutdown, the pixel gates read a captured PNG rather than stdout, and a
+/// number nobody can see is how this went unmeasured in the first place.
+fn report_draw_batching(host_id: i32) {
+    let Some(stats) = shared::stats::get_stats(host_id) else {
+        tracing::warn!("draw batching: no stats for host {host_id}");
+        return;
+    };
+    use std::sync::atomic::Ordering;
+    let draws = stats.draw_calls.load(Ordering::Relaxed);
+    let changes = stats.state_changes.load(Ordering::Relaxed);
+    let adjacent = stats.adjacent_draws.load(Ordering::Relaxed);
+    let mergeable = stats.mergeable_draws.load(Ordering::Relaxed);
+
+    if draws == 0 {
+        println!("[draw-batching] no draws were dispatched");
+        return;
+    }
+    let pct = |n: u32| f64::from(n) * 100.0 / f64::from(draws);
+    println!(
+        "[draw-batching] draws={draws} state_changes={changes} \
+         ({:.2} per draw) adjacent={adjacent} ({:.1}%) \
+         mergeable={mergeable} ({:.1}% could become one draw without \
+         changing a pixel)",
+        f64::from(changes) / f64::from(draws),
+        pct(adjacent),
+        pct(mergeable),
+    );
 }
 
 /// Report a new offscreen surface the way an embedding host reports a resize.

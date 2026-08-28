@@ -501,7 +501,14 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_arrays(mode, first, count) };
-                crate::render_diagnostics::bump_draw_call();
+                crate::render_diagnostics::bump_draw_call_shaped(
+                    crate::render_frame_state::DrawShape {
+                        mode,
+                        elements: false,
+                        start: first,
+                        len: count,
+                    },
+                );
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
@@ -515,7 +522,21 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_elements(mode, count, index_type, offset) };
-                crate::render_diagnostics::bump_draw_call();
+                crate::render_diagnostics::bump_draw_call_shaped(
+                    crate::render_frame_state::DrawShape {
+                        mode,
+                        elements: true,
+                        // `offset` is a *byte* offset into the index buffer, but
+                        // `count` is a number of indices. Contiguity has to be
+                        // tested in one unit, so convert: a draw of 6 shorts
+                        // ending at byte 12 is continued by one starting at
+                        // byte 12, which is index 6.
+                        start: crate::render_frame_state::indices_from_byte_offset(
+                            offset, index_type,
+                        ),
+                        len: count,
+                    },
+                );
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
@@ -3843,6 +3864,59 @@ mod tests {
                 width: 200,
                 height: 200
             }
+        );
+    }
+
+    /// **`UseProgram` validates before it dedups, and that order is the point.**
+    ///
+    /// The obvious optimisation is to check the shadow first: `update_use_program`
+    /// keys on the *client* `program_id`, which is in hand before any lookup, so
+    /// a redundant `useProgram(sameProgram)` could return without touching the
+    /// `programs` map, without the ownership check, and without the deleted
+    /// check. That is a hash lookup and two branches saved per redundant call,
+    /// and a game that leans on the dedup makes many.
+    ///
+    /// It is also wrong. Those checks are the only thing that turns
+    /// `useProgram(deletedProgram)` and `useProgram(neverCreated)` into errors.
+    /// Skip them when the shadow says "already current" and the same call
+    /// silently succeeds or fails depending on what the shadow happens to hold —
+    /// a game gets an error the first time and nothing the second.
+    ///
+    /// So the order is asserted here rather than left to be rediscovered. The
+    /// dispatch itself needs an EGL context, so this reads the source: crude, and
+    /// chosen over a mock GL whose agreement with a driver would be its own open
+    /// question. What is in doubt is not GL behaviour but whether the lookup is
+    /// still ahead of the dedup.
+    #[test]
+    fn use_program_validates_before_it_consults_the_shadow() {
+        const SRC: &str = include_str!("handler.rs");
+        let arm_start = SRC
+            .find("GLCmd::UseProgram {")
+            .expect("the UseProgram arm");
+        let arm = &SRC[arm_start..arm_start + 1200];
+        let arm_end = arm.find("GLCmd::GetAttribLocation").unwrap_or(arm.len());
+        let arm = &arm[..arm_end];
+
+        let lookup = arm
+            .find("cm.programs.get(&program_id)")
+            .expect("UseProgram no longer resolves the program id at all");
+        let owner = arm
+            .find("check_owner")
+            .expect("UseProgram no longer checks program ownership");
+        let deleted = arm
+            .find("meta.deleted")
+            .expect("UseProgram no longer rejects a deleted program");
+        let dedup = arm
+            .find("st::update_use_program")
+            .expect("UseProgram no longer dedups");
+
+        assert!(
+            lookup < dedup && owner < dedup && deleted < dedup,
+            "the shadow is now consulted before validation (lookup at {lookup}, \
+             owner at {owner}, deleted at {deleted}, dedup at {dedup}). A \
+             redundant useProgram on a deleted or missing program would then \
+             succeed silently, where the first call errored — see this test's \
+             doc for why the saved hash lookup is not worth that"
         );
     }
 }
