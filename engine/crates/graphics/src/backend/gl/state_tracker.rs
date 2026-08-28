@@ -476,6 +476,52 @@ pub(crate) fn update_front_face(state: &mut CanvasGLState, mode: u32) -> bool {
     issue_if(true)
 }
 
+/// Dedup `glScissor`, and promote the tracked state when the test is on.
+///
+/// **This was deliberately absent, and what unblocked it was making the engine's
+/// own scissor writes visible to this shadow.** The `GLCmd::Scissor` arm in
+/// `renderergl/handler.rs` carried a note explaining why deduping here was
+/// unsafe: `dirty_region::apply_scissor` re-pointed the driver's box on the
+/// present path for every partial-damage Canvas2D batch, and its partner
+/// blanket-disabled the test afterwards — both behind this tracker's back. The
+/// classic shape follows: shadow says A, engine set B, content re-asserts A, the
+/// dedup eats it, and every later draw is clipped to B. Silent, and wrong pixels
+/// rather than a slow frame.
+///
+/// Those two now go through `ScissorBorrow` and write `last_scissor_rect` from
+/// the same computation that feeds the driver — see
+/// `dirty_region::the_reported_box_is_always_the_box_the_driver_holds`, which
+/// pins the one arm where "what we told the driver" and "what the driver holds"
+/// differ (a disable does not reset the box). The blit path never touches the
+/// box at all, only the enable bit, and it restores that from what it read. So
+/// every writer of the driver's box now updates this field, which is the
+/// precondition the note asked for.
+pub(crate) fn update_scissor(
+    state: &mut CanvasGLState,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
+    let rect = (x, y, width, height);
+    if state.last_scissor_rect == Some(rect) {
+        return false;
+    }
+    state.last_scissor_rect = Some(rect);
+    // GL retains the box whether or not the test is enabled, so the rect is
+    // recorded either way; `ScissorState` only gains the numbers when the test
+    // is on, which is what the damage classifier reads.
+    if !matches!(state.scissor, crate::ScissorState::Disabled) {
+        state.scissor = crate::ScissorState::Enabled {
+            x,
+            y,
+            width,
+            height,
+        };
+    }
+    issue_if(true)
+}
+
 pub(crate) fn update_line_width(state: &mut CanvasGLState, width: f32) -> bool {
     if state.line_width == Some(width) {
         return false;
@@ -671,6 +717,70 @@ pub(crate) fn fresh_state() -> CanvasGLState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // Scissor dedup — see `update_scissor` for why this arrived late
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn scissor_first_call_issues_and_a_repeat_is_deduped() {
+        let mut s = fresh_state();
+        assert!(update_scissor(&mut s, 10, 20, 300, 400));
+        assert!(
+            !update_scissor(&mut s, 10, 20, 300, 400),
+            "the same box was issued twice"
+        );
+        // Any component differing must reach the driver.
+        assert!(update_scissor(&mut s, 11, 20, 300, 400));
+        assert!(update_scissor(&mut s, 11, 21, 300, 400));
+        assert!(update_scissor(&mut s, 11, 21, 301, 400));
+        assert!(update_scissor(&mut s, 11, 21, 301, 401));
+        assert!(!update_scissor(&mut s, 11, 21, 301, 401));
+    }
+
+    /// GL retains the scissor box whether or not the test is enabled, so the
+    /// rect is tracked either way — but `ScissorState` only carries the numbers
+    /// when the test is on, because that is the form the damage classifier
+    /// reads. A `glScissor` while disabled must not make the state claim the
+    /// test is enabled.
+    #[test]
+    fn scissor_while_disabled_records_the_rect_without_enabling() {
+        let mut s = fresh_state();
+        s.scissor = crate::ScissorState::Disabled;
+
+        assert!(update_scissor(&mut s, 1, 2, 3, 4));
+        assert_eq!(s.last_scissor_rect, Some((1, 2, 3, 4)));
+        assert_eq!(
+            s.scissor,
+            crate::ScissorState::Disabled,
+            "a glScissor call while the test is off was read as enabling it"
+        );
+
+        // Still deduped on the rect, since the driver holds it.
+        assert!(!update_scissor(&mut s, 1, 2, 3, 4));
+    }
+
+    /// The `EnabledUnknownRect` state exists because a game can enable the test
+    /// before ever calling `glScissor`. The first explicit call must promote it
+    /// to a known rect, or the damage classifier keeps falling back to the
+    /// viewport for a box it could have had exactly.
+    #[test]
+    fn scissor_promotes_an_unknown_rect_to_a_known_one() {
+        let mut s = fresh_state();
+        s.scissor = crate::ScissorState::EnabledUnknownRect;
+
+        assert!(update_scissor(&mut s, 5, 6, 7, 8));
+        assert_eq!(
+            s.scissor,
+            crate::ScissorState::Enabled {
+                x: 5,
+                y: 6,
+                width: 7,
+                height: 8
+            },
+            "an explicit scissor call did not promote EnabledUnknownRect"
+        );
+    }
 
     // ---------------------------------------------------------------------
     // Program dedup

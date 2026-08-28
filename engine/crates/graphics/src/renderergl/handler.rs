@@ -1929,42 +1929,20 @@ impl RendererGL {
                 let py = logical_to_physical_i32(cm, y);
                 let pw = logical_to_physical_i32(cm, width);
                 let ph = logical_to_physical_i32(cm, height);
-                // NOT deduped, and the reason is not that nobody looked.
+                // Deduped, which it was not before, and the note that used to
+                // sit here explained why: the engine re-pointed the driver's box
+                // behind this tracker's back on the present path, so a shadow
+                // hit could skip a call the driver needed and clip every later
+                // draw to the engine's rect. Silent wrong pixels.
                 //
-                // `last_scissor_rect` below would serve as the shadow, and the
-                // damage bookkeeping that follows is already separable from the
-                // driver call — so the dedup looks like three lines. It is not,
-                // because the engine re-points the driver's scissor rect behind
-                // this tracker's back: `dirty_region::apply_scissor` sets it on
-                // the present path for every partial-damage Canvas2D batch, and
-                // `drawing_buffer` toggles `SCISSOR_TEST` around the blit.
-                //
-                // That is precisely the shape of the defect
-                // `state_tracker::record_default_framebuffer_bind` exists to
-                // prevent: shadow says A, engine set B, content re-asserts A,
-                // dedup eats it, and every subsequent draw is clipped to B.
-                // Silent, and wrong pixels rather than a slow frame.
-                //
-                // Landing it safely means giving scissor the same treatment the
-                // framebuffer binding got — a `record_engine_scissor_change()`
-                // at `dirty_region::apply_scissor`, at `clear_scissor`, and at
-                // each `drawing_buffer` site that touches the rect — and missing
-                // one of them is the bug. Worth doing when a profile shows
-                // `glScissor` volume that justifies it; there is no such data
-                // today, and a UI that sets scissor once per clip is not
-                // obviously a problem.
-                unsafe { gl.scissor(px, py, pw, ph) };
-                let s = cm.gl_state.entry(canvas_id).or_default();
-                s.last_scissor_rect = Some((px, py, pw, ph));
-                // If scissor test is currently enabled (known or unknown rect),
-                // promote to Enabled with the explicit rect.
-                if !matches!(s.scissor, ScissorState::Disabled) {
-                    s.scissor = ScissorState::Enabled {
-                        x: px,
-                        y: py,
-                        width: pw,
-                        height: ph,
-                    };
+                // What changed is that `dirty_region::apply_scissor` and its
+                // restore now go through `ScissorBorrow` and write
+                // `last_scissor_rect` from the same computation that feeds the
+                // driver, and the blit only ever touches the enable bit — which
+                // it restores from what it read. Every writer of the driver's box
+                // is now visible here. See `state_tracker::update_scissor`.
+                if st::update_scissor(cm.gl_state.entry(canvas_id).or_default(), px, py, pw, ph) {
+                    unsafe { gl.scissor(px, py, pw, ph) };
                 }
                 Ok(DamageEffect::NoDamage)
             }
