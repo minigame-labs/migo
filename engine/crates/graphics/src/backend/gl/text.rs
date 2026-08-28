@@ -775,6 +775,7 @@ impl TextContext {
         None
     }
 
+    #[allow(dead_code)]
     /// Look up (or populate) the shape-cache entry for
     /// `(text, attrs)`.  Returns `None` when no typeface can be
     /// resolved — callers treat this as "fall back to paragraph".
@@ -782,7 +783,6 @@ impl TextContext {
     /// Unused today: its only intended caller, the SkTextBlob fast
     /// path, is disabled pending golden verification (see
     /// `try_fast_path_paint`).
-    #[allow(dead_code)]
     fn obtain_shaped_text(
         &self,
         key: &TextMeasureKey,

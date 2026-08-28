@@ -1557,7 +1557,6 @@ pub(crate) struct BufferMeta {
 #[derive(Debug)]
 pub(crate) struct TextureMeta {
     pub gl_handle: Option<NativeTexture>,
-    #[allow(dead_code)]
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }
@@ -1592,7 +1591,6 @@ impl FramebufferMeta {
 #[derive(Debug)]
 pub(crate) struct RenderbufferMeta {
     pub gl_handle: Option<NativeRenderbuffer>,
-    #[allow(dead_code)]
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }

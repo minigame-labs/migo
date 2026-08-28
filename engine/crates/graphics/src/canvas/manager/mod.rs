@@ -478,6 +478,33 @@ pub(crate) struct CanvasManager {
     /// path only; it adds no work to drawing or presentation.
     pending_onscreen: Option<PendingOnscreenEgl>,
 
+    /// The canvases a context-loss teardown destroyed and the rebuild still owes
+    /// the game, parked here so a failed attempt can resume instead of losing
+    /// them.
+    ///
+    /// **Why a field and not a local.** `tear_down_share_group` returns a
+    /// [`ShareGroupRestorePlan`] precisely so the obligation to re-create those
+    /// canvases is explicit — its doc says a teardown not followed by a matching
+    /// restore "silently strands live JS handles". But `#[must_use]` only catches
+    /// *ignoring* the value, not dropping it on an early return, and
+    /// `try_recover_context` had two `?` between the teardown and the restore
+    /// (`create_pbuffer_context`, `bind_resource`) plus more inside the restore
+    /// itself. Any of them fired and the plan went out of scope with the local.
+    ///
+    /// The next attempt would then tear down an already-empty registry, get an
+    /// empty plan, and the canvases from the first teardown would be stranded for
+    /// the life of the process — JS registers a canvas exactly once, so there is
+    /// no lazy rebuild to fall back on. A game whose EGL recovery hit a transient
+    /// failure mid-rebuild would keep running with ids that resolve to nothing.
+    ///
+    /// Parking it makes a retry resume the *original* debt.
+    /// `register_offscreen` already returns `Ok(())` for an id it holds, so
+    /// re-running a partially applied plan is idempotent.
+    ///
+    /// Mirrors [`Self::pending_onscreen`], which exists for the same reason one
+    /// step earlier in the same function.
+    pending_share_group_restore: Option<ShareGroupRestorePlan>,
+
     /// Makes explicit shutdown and the `Drop` fallback share one idempotent
     /// teardown path.
     teardown_complete: bool,
@@ -952,6 +979,7 @@ impl CanvasManager {
             installed_surface: None,
             frame_rate_request: shared::frame_rate::DEFAULT_FPS,
             pending_onscreen: None,
+            pending_share_group_restore: None,
             teardown_complete: false,
             native_release_confirmed: false,
             programs: HashMap::with_capacity(16),
@@ -2301,9 +2329,23 @@ impl CanvasManager {
         let onscreen_id = CanvasId::from(1u32);
 
         // ---- Phase 1: hard teardown of the dead share group ----
-        // Returns the JS-visible canvases the teardown just destroyed; Phase 2
+        // Records the JS-visible canvases the teardown just destroyed; Phase 2
         // owes their re-creation.
-        let restore = self.tear_down_share_group();
+        //
+        // Parked on `self` rather than held in a local. Everything below can
+        // fail, and a plan that goes out of scope with a local strands every
+        // canvas it recorded — see `pending_share_group_restore`. A retry
+        // resumes the debt recorded here instead of tearing down an
+        // already-empty registry.
+        if self.pending_share_group_restore.is_none() {
+            let plan = self.tear_down_share_group();
+            self.pending_share_group_restore = Some(plan);
+        } else {
+            tracing::warn!(
+                "EGL recovery: resuming the share-group restore a previous attempt \
+                 could not settle"
+            );
+        }
 
         // ---- Phase 2: rebuild the share group ----
         let (resource_ctx, resource_surf) = egl_ops::create_pbuffer_context(
@@ -2359,7 +2401,22 @@ impl CanvasManager {
                 .map_err(|failure| failure.error)?;
             // Settle the teardown's debt: the onscreen 2D context plus every
             // offscreen canvas whose id JS still holds.
-            self.restore_share_group(&restore, onscreen_id)?;
+            //
+            // Taken out to satisfy the borrow, and put straight back if the
+            // restore fails: `restore_share_group` uses `?` per canvas, so a
+            // failure part-way leaves the untouched tail owed. Dropping the plan
+            // here would strand exactly those.
+            let plan = self
+                .pending_share_group_restore
+                .take()
+                .expect("Phase 1 parks a plan before any fallible step");
+            match self.restore_share_group(&plan, onscreen_id) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.pending_share_group_restore = Some(plan);
+                    return Err(e);
+                }
+            }
             // ---- Phase 3: probe the rebuilt context for real usability ----
             Ok(self.probe_context_usable(onscreen_id))
         })();
@@ -3997,6 +4054,7 @@ impl CanvasManager {
         self.dirty_2d.len()
     }
 
+    #[allow(dead_code)]
     /// Save current GL state and set a safe baseline for Canvas2D / Skia
     /// text atlas uploads.
     /// Mark every live 2D context's Skia cache as stale.  Called
@@ -4010,7 +4068,6 @@ impl CanvasManager {
     /// [`Self::mark_all_2d_contexts_stale_bits`] instead. Kept as
     /// the documented full-invalidation escape hatch for a
     /// fall-back path that can't identify which bits are dirty.
-    #[allow(dead_code)]
     pub(crate) fn mark_all_2d_contexts_stale(&mut self) {
         for ctx in self.contexts_2d.values_mut() {
             ctx.mark_state_stale();
@@ -4042,9 +4099,9 @@ impl CanvasManager {
         }
     }
 
+    #[allow(dead_code)]
     /// Narrow-scope variant of [`mark_2d_context_stale`]: the caller
     /// declares which slice of Skia's GL state needs invalidation.
-    #[allow(dead_code)]
     pub(crate) fn mark_2d_context_stale_bits(&mut self, canvas_id: CanvasId, bits: u32) {
         if let Some(ctx) = self.contexts_2d.get_mut(&canvas_id) {
             ctx.mark_state_stale_bits(bits);
@@ -5622,6 +5679,7 @@ impl CanvasManager {
         self.image_registry.wrapper_cache_len()
     }
 
+    #[allow(dead_code)]
     /// Try to pack a small RGBA image into the shared atlas.
     ///
     /// Lazy-initialises [`Self::atlas`] on the first call.  Returns
@@ -5643,7 +5701,6 @@ impl CanvasManager {
     /// Caller must have a current GL context on the calling thread.
     /// The atlas module's `upload` is `unsafe` for the same reason;
     /// this wrapper forwards the obligation.
-    #[allow(dead_code)]
     pub(crate) unsafe fn atlas_upload_small(
         &mut self,
         width: u16,
@@ -5690,9 +5747,9 @@ impl CanvasManager {
         }
     }
 
+    #[allow(dead_code)]
     /// Number of uploads currently waiting for budget.  Exposed so
     /// the debug overlay / metrics probe the backlog depth.
-    #[allow(dead_code)]
     pub(crate) fn deferred_upload_depth(&self) -> usize {
         self.deferred_uploads.len()
     }
@@ -6244,6 +6301,79 @@ mod recovery_source_guards {
         );
     }
 
+    /// **A recovery attempt that fails part-way must not lose the canvases the
+    /// teardown recorded**, because JS registers a canvas exactly once and
+    /// anything dropped here is stranded for the life of the process.
+    ///
+    /// `tear_down_share_group` returns a `#[must_use]`
+    /// `ShareGroupRestorePlan` to make that obligation explicit, and it did not
+    /// hold: `#[must_use]` catches ignoring a value, not dropping one on an early
+    /// return, and the plan was a local with two `?` between its creation and its
+    /// use (`create_pbuffer_context`, `bind_resource`) plus more inside
+    /// `restore_share_group`. Any of those firing lost every canvas the plan
+    /// carried, and the next attempt would tear down an already-empty registry
+    /// and record nothing.
+    ///
+    /// So the plan is parked on `self.pending_share_group_restore` before the
+    /// first fallible step and cleared only when a restore fully succeeds. This
+    /// asserts that shape, since reaching the path needs EGL and a GPU reset.
+    #[test]
+    fn a_failed_recovery_hands_its_restore_debt_to_the_next_attempt() {
+        let body = function_body(MGR, "pub(crate) fn try_recover_context");
+
+        // The plan must be parked, not bound to a local that an early return
+        // would drop.
+        let park = body
+            .find("self.pending_share_group_restore = Some(plan)")
+            .expect(
+                "the restore plan must be parked on `self` before the fallible \
+                 rebuild, or an early return strands every canvas it recorded",
+            );
+        let teardown = body
+            .find("self.tear_down_share_group()")
+            .expect("recovery must tear down the dead share group");
+        assert!(
+            teardown < park,
+            "the plan must be parked immediately after the teardown that produced it"
+        );
+
+        // Everything that can fail must come after the park.
+        for fallible in ["create_pbuffer_context(", "self.bind_resource()?"] {
+            let at = body
+                .find(fallible)
+                .unwrap_or_else(|| panic!("{fallible} is no longer in the recovery path"));
+            assert!(
+                park < at,
+                "{fallible} runs before the restore plan is parked, so its `?` \
+                 would drop the plan"
+            );
+        }
+
+        // A retry must resume the parked plan rather than tearing down again —
+        // the registry is empty by then, so a second teardown records nothing.
+        assert!(
+            body.contains("if self.pending_share_group_restore.is_none()"),
+            "recovery must reuse a parked plan instead of unconditionally tearing \
+             down; a second teardown of an empty registry yields an empty plan"
+        );
+
+        // And a failed restore must give the plan back, because
+        // `restore_share_group` uses `?` per canvas and leaves the tail owed.
+        let restore_at = body
+            .find("self.restore_share_group(")
+            .expect("recovery must restore the recorded canvases");
+        let give_back = body[restore_at..]
+            .find("self.pending_share_group_restore = Some(plan)")
+            .expect(
+                "a failed `restore_share_group` must hand the plan back, or the \
+                 canvases it had not reached yet are stranded",
+            );
+        assert!(
+            give_back > 0,
+            "the plan must be returned after the restore call, not before"
+        );
+    }
+
     /// Every 2D context recovery rebuilds must also get its drawing state back.
     ///
     /// The JS setters de-duplicate against a shadow (`if (this._fillStyle ===
@@ -6402,18 +6532,39 @@ mod recovery_source_guards {
         );
     }
 
+    /// A half-restored share group must never report a recovered context.
+    ///
+    /// Asserts the property rather than one spelling of it. The first version
+    /// searched for the literal `self.restore_share_group(&restore, onscreen_id)?`
+    /// and went red when the call grew a `match` so a failed restore could hand
+    /// its plan back — a change that strengthened the very guarantee this test
+    /// exists for. What matters is that a failure leaves the block before the
+    /// flag is cleared, however the failure is spelled.
     #[test]
     fn offscreen_restore_failure_keeps_the_context_lost() {
         let body = function_body(MGR, "pub(crate) fn try_recover_context");
         let restore = body
-            .find("self.restore_share_group(&restore, onscreen_id)?")
-            .expect("restore failure must propagate into the all-or-nothing block");
+            .find("self.restore_share_group(")
+            .expect("recovery must restore the canvases the teardown destroyed");
         let clears_flag = body
             .find("self.context_lost = false;")
             .expect("successful recovery must clear the lost flag");
         assert!(
             restore < clears_flag,
             "a half-restored share group must never report a recovered context"
+        );
+
+        // The failure has to leave the fallible block. Either spelling does:
+        // a `?` on the call, or an explicit early `return Err`.
+        let after = &body[restore..];
+        let propagates = after
+            .split("self.context_lost")
+            .next()
+            .is_some_and(|between| between.contains("return Err(e)") || between.contains(")?;"));
+        assert!(
+            propagates,
+            "a failed restore no longer leaves the all-or-nothing block, so a \
+             half-restored share group could reach `context_lost = false`"
         );
     }
 

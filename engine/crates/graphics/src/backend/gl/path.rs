@@ -229,6 +229,19 @@ impl CanvasPath {
 /// Normalise Canvas2D arc angles into `(start, sweep)` where `sweep` is
 /// bounded by ±2π, sign indicating sweep direction.  Used by both `arc`
 /// and `ellipse`.
+/// **The order of the two `ccw` arms is load-bearing.**
+///
+/// WHATWG's full-circle condition is asymmetric: clockwise needs
+/// `endAngle - startAngle >= 2π`, anticlockwise needs
+/// `startAngle - endAngle >= 2π` — that is, `delta <= -2π`. The
+/// anticlockwise arm below tests `delta.abs() >= TAU`, which would also catch
+/// `delta >= 2π`; it does not, because the `delta > 0.0` arm takes those first.
+/// So `abs()` only ever sees `delta <= -2π`, which is exactly the spec's
+/// condition.
+///
+/// Swap the two and `arc(…, 0, 3π, ccw = true)` becomes a full circle instead of
+/// the π sweep the spec asks for. `normalise_arc_ccw_past_a_full_turn_is_not_a_
+/// full_circle` pins it.
 fn normalise_arc(start: f32, end: f32, ccw: bool) -> (f32, f32) {
     let delta = end - start;
     let sweep = if ccw {
@@ -308,6 +321,46 @@ mod tests {
         let b = bounds(&p);
         assert!((b.left - 0.0).abs() < 1e-4);
         assert!((b.right - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    /// **The asymmetry in WHATWG's full-circle rule, and the branch order that
+    /// encodes it.**
+    ///
+    /// Clockwise is a full circle when `end - start >= 2π`; anticlockwise when
+    /// `start - end >= 2π`. So `delta = +3π` is a full circle *only* clockwise —
+    /// anticlockwise it is an ordinary sweep to `3π mod 2π = π`, taken the short
+    /// way round, which is `-π`.
+    ///
+    /// The `ccw` arms get this right by ordering alone: `delta > 0.0` is tested
+    /// before `delta.abs() >= TAU`, so the `abs()` test only ever sees negative
+    /// deltas. Nothing else enforces that, and no test covered the case where it
+    /// matters — the three neighbouring tests all use `|delta| <= 2π`.
+    #[test]
+    fn normalise_arc_ccw_past_a_full_turn_is_not_a_full_circle() {
+        // Anticlockwise, more than a full turn in the *positive* direction.
+        let (_, sw) = normalise_arc(0.0, 3.0 * PI, true);
+        assert!(
+            (sw + PI).abs() < 1e-4,
+            "expected a -π sweep, got {sw}; the ccw arms were reordered and \
+             `delta.abs() >= TAU` swallowed a positive delta as a full circle"
+        );
+
+        // Clockwise with the same delta *is* a full circle, per the other half
+        // of the rule.
+        let (_, cw) = normalise_arc(0.0, 3.0 * PI, false);
+        assert!(
+            (cw - TAU).abs() < 1e-4,
+            "clockwise past a full turn must be a full circle, got {cw}"
+        );
+
+        // And the genuinely anticlockwise full turn still is one.
+        let (_, ccw_full) = normalise_arc(0.0, -3.0 * PI, true);
+        assert!(
+            (ccw_full + TAU).abs() < 1e-4,
+            "anticlockwise past a full turn the other way must be a full circle, \
+             got {ccw_full}"
+        );
     }
 
     #[test]

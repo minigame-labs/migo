@@ -637,7 +637,6 @@ impl Canvas2DRenderer {
     /// Apply a Canvas2D shadow to the given paint if the current shadow is
     /// visible.  Exposed so `fill` / `stroke` paths can opt in at draw
     /// time without paying the cost when shadows are off (the common case).
-    #[allow(dead_code)] // wired up in P4b drawing-side refinement
     pub fn maybe_apply_shadow(_paint: &mut skia_safe::Paint, shadow: &Shadow) -> bool {
         if !shadow.is_visible() {
             return false;
@@ -648,7 +647,6 @@ impl Canvas2DRenderer {
 }
 
 /// Unused-import silencer for imports that only matter in the stubs above.
-#[allow(dead_code)]
 fn _force_use_imports() {
     let _ = ProtocolColor::black();
     let _ = TextAlign::Start;

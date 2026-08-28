@@ -158,8 +158,8 @@ impl FrameDamageAccumulator {
         tracker.resolve_rects()
     }
 
-    /// Whether any damage has been recorded (rect or full).
     #[allow(dead_code)]
+    /// Whether any damage has been recorded (rect or full).
     pub(crate) fn has_damage(&self) -> bool {
         !self.rects.is_empty() || self.force_full
     }
@@ -185,8 +185,8 @@ impl FrameDamageAccumulator {
         Some([left, top, right - left, bottom - top])
     }
 
-    /// Whether FullSurface has been triggered.
     #[allow(dead_code)]
+    /// Whether FullSurface has been triggered.
     pub(crate) fn is_full_surface(&self) -> bool {
         self.force_full
     }

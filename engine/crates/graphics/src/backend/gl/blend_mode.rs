@@ -80,7 +80,6 @@ pub fn blend_mode_from_code(op: u8) -> BlendMode {
 ///
 /// Exposed primarily for tracing / debug tooling.
 #[inline]
-#[allow(dead_code)]
 pub fn name_from_code(op: u8) -> &'static str {
     TABLE
         .get(op as usize)

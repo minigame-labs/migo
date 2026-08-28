@@ -331,10 +331,20 @@ impl ImageStore {
         Some(wrapped)
     }
 
-    /// Drop every SkImage wrapper whose DirectContext has been torn
-    /// down.  Called from `Canvas2DContext::Drop` / manager shutdown
-    /// so stale wrappers don't dangle past their backing GrContext.
-    #[allow(dead_code)]
+    /// Drop every SkImage wrapper whose DirectContext has been torn down, so a
+    /// dead `GrDirectContext` is not kept alive by a stale wrapper.
+    ///
+    /// Five call sites: `Canvas2DContext::release_gpu_resources` in
+    /// `backend/gl/surface.rs`, and four teardown paths in
+    /// `canvas/manager/mod.rs` (context loss, share-group rebuild, canvas
+    /// here was stale and actively misleading: an attribute saying "nothing
+    /// calls this" on a function five paths depend on is an invitation to delete
+    /// it, and deleting it would leak a `GrDirectContext` plus its resource
+    /// cache for every destroyed canvas.
+    ///
+    /// Not a dangling-pointer risk either way — `SkImage_Ganesh` holds its
+    /// context by refcount, so a stale wrapper pins a dead context rather than
+    /// outliving it. What skipping this costs is memory, not correctness.
     pub fn purge_wrappers_for_context(&mut self, ctx_id: u32) {
         self.sk_image_cache.retain(|(_, c), _| *c != ctx_id);
     }

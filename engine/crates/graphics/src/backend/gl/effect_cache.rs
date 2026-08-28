@@ -392,7 +392,6 @@ fn build_colors_positions(
 /// Empty the caches.  Never strictly necessary (entries are bounded)
 /// but useful from tests that want deterministic refcount assertions
 /// or from a future `freeGpuResources` integration.
-#[allow(dead_code)]
 pub fn clear_all() {
     SHADOW_CACHE.with(|c| c.borrow_mut().clear());
     DASH_CACHE.with(|c| c.borrow_mut().clear());
