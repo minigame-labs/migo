@@ -104,6 +104,34 @@ def _text_rules() -> tuple[TextRule, ...]:
     )
 
 
+# The prescreen/api-surface tooling's whole job is comparing a *third-party*
+# bundle's identifiers against this build's own published surface -- the
+# legacy short brand token this file's own _text_rules() hex-encodes appears
+# in it only as a literal string being matched, never as a namespace this
+# engine implements (that was removed deliberately; see .gitignore's own note
+# on why the tool itself was un-ignored rather than kept exempt: ignoring it
+# "put it beyond CI, so nothing could hold it to a contract"). The legacy
+# brand namespace rule exists to catch an accidental leak of the old
+# namespace into engine source or docs, not to forbid a compatibility
+# scanner from naming the thing it scans for. Everything else this gate
+# checks (credentials, private keys, local paths, the machine hostname)
+# still applies to these files -- only the brand-namespace rule is narrowed.
+_LEGACY_BRAND_EXEMPT_PATHS = frozenset(
+    {
+        ".gitignore",
+        "PRESCREEN.md",
+        "scripts/dump-api-surface.sh",
+        "scripts/prescreen-game.sh",
+        "scripts/test-prescreen-scanner.sh",
+    }
+)
+_LEGACY_BRAND_EXEMPT_PREFIXES = ("tools/api-surface/fixture/", "tools/api-surface/probe/")
+
+
+def _legacy_brand_exempt(path: str) -> bool:
+    return path in _LEGACY_BRAND_EXEMPT_PATHS or path.startswith(_LEGACY_BRAND_EXEMPT_PREFIXES)
+
+
 def _forbidden_path_reason(path: str) -> str | None:
     parts = PurePosixPath(path).parts
     local_state = {".agents", ".codex", ".gradle", ".idea", ".vscode"}
@@ -194,8 +222,13 @@ def check(root: Path) -> tuple[list[Finding], int, int]:
         if text is None:
             continue
         text_files += 1
-        findings.extend(_scan_text(relative, text, rules))
-        findings.extend(_scan_text(relative, relative, rules))
+        applicable_rules = (
+            tuple(rule for rule in rules if rule.name != "legacy brand namespace")
+            if _legacy_brand_exempt(relative)
+            else rules
+        )
+        findings.extend(_scan_text(relative, text, applicable_rules))
+        findings.extend(_scan_text(relative, relative, applicable_rules))
         if machine_rule is not None:
             findings.extend(_scan_text(relative, text, (machine_rule,)))
 
