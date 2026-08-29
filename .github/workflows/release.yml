@@ -849,8 +849,18 @@ jobs:
   # Release bytes are tested after the hosted builder uploads them. The physical
   # runner never rebuilds the AAR: it installs the exact workflow artifact, pulls
   # the installed APK back, and proves the embedded native hash before measuring.
+  #
+  # OFF by default and NOT a publish dependency. It arrived in #136 needing two
+  # things that were never set up: a runner labelled `self-hosted, android-device`
+  # (none is registered) and the private `migo-test-suite` at ../migo-test-suite
+  # (`run_android_device_evidence.sh` dies without its install.sh/run.sh). With it
+  # gating `publish`, the first tagged release since #136 could not publish at all
+  # -- a gate that can never pass is worse than no gate. v0.9.4 published without
+  # this job. Set repo variable MIGO_DEVICE_EVIDENCE=true once the runner and the
+  # suite exist, then add it back to `publish`'s `needs`.
   release-android-device-evidence:
     needs: [release-android]
+    if: ${{ vars.MIGO_DEVICE_EVIDENCE == 'true' }}
     runs-on: [self-hosted, android-device]
     timeout-minutes: 150
 
@@ -1262,7 +1272,9 @@ jobs:
   #
   # Adding a platform is now additive: one job, one entry in `needs`.
   publish:
-    needs: [release-android, release-android-device-evidence, release-linux, release-ohos, release-windows, release-windows-arm64]
+    # release-android-device-evidence is deliberately absent: it is off by default
+    # (see its own comment). Re-add it here once MIGO_DEVICE_EVIDENCE is set.
+    needs: [release-android, release-linux, release-ohos, release-windows, release-windows-arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
