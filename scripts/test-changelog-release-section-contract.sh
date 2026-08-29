@@ -14,6 +14,13 @@
 # this gate exists to force. Older sections may use other heading shapes
 # (`## Engine — v0.9.0`, `## Linux SDK — ...`); only the current version is
 # held to `## v<version>`.
+#
+# Second rule: within `## [Unreleased]` and the current `## v<version>` section,
+# the `### ` category headings are a subsequence of Keep a Changelog's fixed
+# order (Added, Changed, Deprecated, Removed, Fixed, Security) with no repeats.
+# The v0.9.4 section that #145 assembled PR-by-PR had `### Added` three times,
+# `### Fixed` three times and a paragraph duplicated inside one bullet, because
+# nothing checked that a section was collated rather than concatenated.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,4 +52,55 @@ if (( unreleased_line >= version_line )); then
     exit 1
 fi
 
-echo "CHANGELOG release-section contract: PASS (## v${version} present, ## [Unreleased] staged above it)"
+# Category headings within the two Keep-a-Changelog sections: canonical order,
+# no repeats.
+python3 - "$changelog" "$version" <<'PY'
+import re
+import sys
+
+changelog, version = sys.argv[1], sys.argv[2]
+lines = open(changelog, encoding="utf-8").read().splitlines()
+
+ORDER = ["Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"]
+rank = {name: i for i, name in enumerate(ORDER)}
+
+targets = ("## [Unreleased]", f"## v{version} ")
+errors = []
+section = None
+seen = []
+last_rank = -1
+
+
+def close(section, seen):
+    pass
+
+
+for raw in lines + ["## __eof__"]:
+    if raw.startswith("## "):
+        section = raw if (raw.startswith(targets[0]) or raw.startswith(targets[1]) or raw.rstrip() == f"## v{version}") else None
+        seen = []
+        last_rank = -1
+        continue
+    if section and raw.startswith("### "):
+        cat = raw[4:].strip()
+        if cat not in rank:
+            errors.append(f"{section!r}: unknown category heading '### {cat}' (expected one of {ORDER})")
+            continue
+        if cat in seen:
+            errors.append(f"{section!r}: '### {cat}' appears more than once -- collate its bullets under a single heading")
+            continue
+        if rank[cat] < last_rank:
+            errors.append(
+                f"{section!r}: '### {cat}' is out of order -- Keep a Changelog order is {ORDER}"
+            )
+        seen.append(cat)
+        last_rank = max(last_rank, rank[cat])
+
+if errors:
+    for e in errors:
+        print(f"ERROR: {e}", file=sys.stderr)
+    print(f"CHANGELOG category-heading contract: FAIL ({len(errors)} violation(s))", file=sys.stderr)
+    sys.exit(1)
+PY
+
+echo "CHANGELOG release-section contract: PASS (## v${version} present, ## [Unreleased] staged above it, category headings collated and ordered)"

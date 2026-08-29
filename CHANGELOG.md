@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-op stubs and which fail loudly, rather than covering all of them with one
   sentence true of only some. The two stubs that were failing silently now
   answer `"<api>:fail not supported"` like the other 86.
+- On Android, `requestVsync` resolves its Java method ID once per process
+  instead of hashing the method name and signature against the JNI method cache
+  on every frame. The lookup is off the frame-scheduling path now; the id is a
+  process-lifetime constant.
 
 ### Fixed
 - `migo.getUpdateManager()` no longer invents updates. It was deciding with
@@ -72,40 +76,6 @@ behaviour rather than by reading turned up several that failed silently. The
   Overriding this describes how the app runs games once, and it applies however
   the activity was reached. The default returns `null`, which is exactly the
   previous behaviour.
-  `buildLaunchIntent` travels through an in-process table keyed by a token in
-  the intent, so it reaches the activity only when whatever started it was in
-  the same process. A game opened from a deep link, a notification, a launcher
-  shortcut or `am start` is not: the token is absent and the launch silently ran
-  on a default config, whatever the host had configured everywhere else.
-  Overriding this describes how the app runs games once, and it applies however
-  the activity was reached. The default returns `null`, which is exactly the
-  previous behaviour.
-
-### Fixed
-- `test-android-host-api-contract.sh` froze nothing an embedder reaches by
-  subclassing. It read the surface with `javap -public`, so
-  `MigoGameActivity`'s `onCreateGameListener`, `onLaunchFailed`,
-  `onSessionCreated` and `getGameSession` -- the documented, "zero-boilerplate"
-  integration path -- were outside the freeze along with every other protected
-  member. R8 once marked exactly those methods `final` in the release AAR and
-  external subclasses stopped compiling; this gate could not have seen it. It
-  now reads `-protected`, and the baseline grew by the 13 members that were
-  never pinned.
-
-### Fixed
-- An unparseable `ctx.font` assignment is a no-op again, on both sides of the
-  engine. WHATWG says an invalid value leaves the previous font in effect, and
-  the render thread already did that -- it rejected the shorthand and kept its
-  state. The JS thread did not: it stored the string and `measureText` answered
-  from a best-effort parse of it. So a typo'd font string measured at one size
-  and painted at another, silently. `ctx.font = "definitely not a font"` after
-  `64px "..."` measured 36 px of text the engine painted 221 px of. The check
-  now happens once, in `op_set_font`, ahead of both -- so an invalid value never
-  reaches either side and `ctx.font` never reports one. The strict parser moved
-  to `shared` to make that possible, which is also what finally makes the
-  "one parser, one source of truth" comment in the 2D context true.
-
-### Added
 - `MigoNativeLoader.prepare(context, file)`, for hosts that deliver the engine
   themselves. It runs the same verification the load already does, on the
   thread the caller is on. It does not make the load safer -- what it changes
@@ -126,8 +96,6 @@ behaviour rather than by reading turned up several that failed silently. The
   reading back gets one empty texture. `signal_default_fbo_readback` has
   documented this snapshot since the flag was introduced -- only the code was
   missing. Found by a new WebGL bundle in migo-conformance on its first run.
-
-### Added
 - Android hosts can keep the engine out of their first install. `libmigo.so`
   is ~17 MB of store download and ~45 MB installed per ABI, paid by every
   user whether or not they ever open a mini-game. Two new release assets let
@@ -230,6 +198,11 @@ behaviour rather than by reading turned up several that failed silently. The
 - The BSL `Change Date` is re-stamped to publication + 4 years on every release
   and gated against decaying, exceeding the four-year ceiling BSL 1.1 itself
   imposes, or drifting from `LEGAL.md` and the READMEs.
+- The C ABI header no longer implies that a production host can both clear
+  `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT` and load content: doing so without
+  also supplying a code-signing public key fails with `CodeSignatureInvalid`.
+  The two paths that actually work — signing enabled with a key, or the flag
+  set — are now stated.
 
 ### Removed
 - The `wx` namespace. The engine used to install both `migo` and `wx` at
@@ -239,6 +212,26 @@ behaviour rather than by reading turned up several that failed silently. The
   repository with it — Migo is a pure engine.
 
 ### Fixed
+- `test-android-host-api-contract.sh` froze nothing an embedder reaches by
+  subclassing. It read the surface with `javap -public`, so
+  `MigoGameActivity`'s `onCreateGameListener`, `onLaunchFailed`,
+  `onSessionCreated` and `getGameSession` -- the documented, "zero-boilerplate"
+  integration path -- were outside the freeze along with every other protected
+  member. R8 once marked exactly those methods `final` in the release AAR and
+  external subclasses stopped compiling; this gate could not have seen it. It
+  now reads `-protected`, and the baseline grew by the 13 members that were
+  never pinned.
+- An unparseable `ctx.font` assignment is a no-op again, on both sides of the
+  engine. WHATWG says an invalid value leaves the previous font in effect, and
+  the render thread already did that -- it rejected the shorthand and kept its
+  state. The JS thread did not: it stored the string and `measureText` answered
+  from a best-effort parse of it. So a typo'd font string measured at one size
+  and painted at another, silently. `ctx.font = "definitely not a font"` after
+  `64px "..."` measured 36 px of text the engine painted 221 px of. The check
+  now happens once, in `op_set_font`, ahead of both -- so an invalid value never
+  reaches either side and `ctx.font` never reports one. The strict parser moved
+  to `shared` to make that possible, which is also what finally makes the
+  "one parser, one source of truth" comment in the 2D context true.
 - `login`, `getUserInfo` and `getPhoneNumber` return a Promise, like every
   other API on that surface. They resolved immediately on `undefined`, so
   `await migo.login()` did not wait and content ran on as though sign-in had
@@ -262,13 +255,6 @@ behaviour rather than by reading turned up several that failed silently. The
 - Several WebGL state calls (`bindBuffer`, `blendColor`, `polygonOffset`,
   `bindTexture`) now go through the same redundant-call dedup cache as their
   peers.
-
-### Changed
-- The C ABI header no longer implies that a production host can both clear
-  `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT` and load content: doing so without
-  also supplying a code-signing public key fails with `CodeSignatureInvalid`.
-  The two paths that actually work — signing enabled with a key, or the flag
-  set — are now stated.
 
 ---
 
