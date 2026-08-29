@@ -128,8 +128,6 @@ pub enum StreamError {
     Truncated,
     /// Cursor addition would overflow.
     Overflow,
-    /// Final record ends before `used_words` (trailing unstructured words).
-    TrailingGarbage,
     /// A word that must be strictly 0 or 1 has another value.
     BadBool,
     /// Variable uniform payload exceeds `MAX_STREAM_UNIFORM_WORDS`.
@@ -148,7 +146,6 @@ impl StreamError {
             StreamError::UnknownOpcode(_) => 6,
             StreamError::BadArity => 7,
             StreamError::Truncated => 8,
-            StreamError::TrailingGarbage => 9,
             StreamError::BadBool => 10,
             StreamError::UniformPayloadTooLarge => 11,
             StreamError::Overflow => 12,
@@ -618,10 +615,17 @@ pub fn validate_stream(words: &[u32], used_words: u32) -> Result<ValidatedStream
         cursor = record_end;
     }
 
-    // Final record must end exactly at used_words.
-    if cursor != used {
-        return Err(StreamError::TrailingGarbage);
-    }
+    // The final record must end exactly at `used_words`, and it always does:
+    // `record_end <= used` is enforced before `cursor` is advanced to it, and the
+    // loop exits on `cursor >= used`, so the two can only be equal here. There
+    // was a `TrailingGarbage` error for this case, which nothing could produce --
+    // any word left over is read as the next record's header and rejected as one.
+    // A `debug_assert` states the invariant where a dead error code used to
+    // imply it was still being checked.
+    debug_assert_eq!(
+        cursor, used,
+        "record walk must land exactly on used_words"
+    );
 
     Ok(ValidatedStream {
         words: &words[..used],
@@ -694,7 +698,6 @@ mod tests {
         assert_eq!(StreamError::UnknownOpcode(999).code(), 6);
         assert_eq!(StreamError::BadArity.code(), 7);
         assert_eq!(StreamError::Truncated.code(), 8);
-        assert_eq!(StreamError::TrailingGarbage.code(), 9);
         assert_eq!(StreamError::BadBool.code(), 10);
         assert_eq!(StreamError::UniformPayloadTooLarge.code(), 11);
         assert_eq!(StreamError::Overflow.code(), 12);
@@ -880,39 +883,34 @@ mod tests {
         assert_eq!(result, Err(StreamError::Truncated));
     }
 
-    // ── validate_stream: trailing garbage ────────────────────────────────────
+    // ── validate_stream: words left over after the last record ───────────────
 
+    /// A word after the last complete record is read as the *next* record's
+    /// header and rejected as one -- there is no separate "trailing garbage"
+    /// outcome, and code 9 has been removed because nothing could produce it.
+    ///
+    /// This replaces two tests both named for `TrailingGarbage`: one asserted
+    /// `ZeroWordCount` while its comment explained at length that the name was
+    /// wrong, and the other asserted that an empty stream is *valid*. Neither
+    /// could fail for the reason its name gave.
     #[test]
-    fn validate_trailing_garbage_returns_trailing_garbage() {
-        // TrailingGarbage is emitted when cursor ends up < used_words after
-        // the last complete record — i.e., there are leftover words that do not
-        // form a new valid record start.  The test constructs a stream where:
-        //   - word[2..5]  = valid OP_CLEAR record (wc=3, cursor → 5 after)
-        //   - word[5]     = trailing word with wc=0 in its header low bits,
-        //                   which triggers ZeroWordCount.
-        // Since the spec says the FINAL record must end exactly at used_words,
-        // any remaining words after that record constitute TrailingGarbage.
-        // The validate_stream implementation reports ZeroWordCount in this case
-        // (the trailing word is read as a record header with zero word_count).
-        // We test for the actual error produced: ZeroWordCount.
+    fn a_word_after_the_last_record_is_rejected_as_a_malformed_header() {
         let h = pack_header(OP_CLEAR, 3);
-        // word[5] = 0 → opcode=0, wc=0 → ZeroWordCount before TrailingGarbage path
+        // words[2..5] is a well-formed OP_CLEAR record, so the walk lands on 5;
+        // words[5] = 0 is then read as a header with opcode 0 and word_count 0.
         let words = [MAGIC, STREAM_VERSION, h, 0, 0, 0u32];
-        // Record: cursor advances from 2 to 5; then loop reads word[5]=0 → ZeroWordCount.
         assert_eq!(validate_stream(&words, 6), Err(StreamError::ZeroWordCount));
+
+        // The positive control: the same stream without the leftover word is
+        // valid, so the rejection above is about the extra word and not about
+        // the record.
+        assert!(validate_stream(&words[..5], 5).is_ok());
     }
 
+    /// A header and nothing else is a valid empty stream: the walk starts and
+    /// ends at `used_words`.
     #[test]
-    fn validate_trailing_garbage_explicit_returns_trailing_garbage() {
-        // To emit TrailingGarbage specifically, we need a stream where all
-        // records have been consumed (cursor == used) — which is the normal
-        // valid exit.  True TrailingGarbage requires the encoder to set
-        // used_words such that cursor after the last record != used_words.
-        // With our loop structure (continues while cursor < used), remaining
-        // bytes always get read as the next record header.  Therefore, to
-        // cover the code path, we pass used_words == 2 (no records) and
-        // verify that an empty-record stream is valid (cursor == 2 == used).
-        // This test documents the boundary: used=2 with zero records is OK.
+    fn a_stream_with_no_records_is_valid() {
         let words = [MAGIC, STREAM_VERSION];
         assert!(validate_stream(&words, 2).is_ok());
     }

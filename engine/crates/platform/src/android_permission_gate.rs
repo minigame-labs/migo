@@ -106,6 +106,26 @@ impl PermissionGate {
         true
     }
 
+    /// Record a permission decision, and on a revocation tear the scope's
+    /// resources down once nothing is still using them.
+    ///
+    /// **`cleanup` runs with this host's transition mutex held, and must not
+    /// re-enter the gate for the same host.** It is the only place in this crate
+    /// where a lock spans a call out to Java, and it is deliberate: the mutex is
+    /// what keeps a later grant of the same scope from taking effect while the
+    /// revocation's teardown is still in flight, so releasing it first would let
+    /// a freshly granted operation's resources be destroyed by the revocation it
+    /// raced. The `permissions` mutex -- the one every per-event protected call
+    /// takes -- is released before `cleanup`, so this does not serialise the hot
+    /// path.
+    ///
+    /// The shipped Android implementation satisfies the constraint by
+    /// construction: `NativeExports.revokePermissionResources` reports failure by
+    /// scheduling `GameSession::close` through `sMainHandler::post`, so its
+    /// re-entry lands as a later looper message rather than as a nested native
+    /// call. An embedder that instead called back synchronously would deadlock
+    /// here, which is why the requirement is stated rather than left to be
+    /// inferred from the lock's scope.
     pub(crate) fn update<E>(
         &self,
         host_id: i32,

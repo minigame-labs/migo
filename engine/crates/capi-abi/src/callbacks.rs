@@ -73,8 +73,25 @@ pub struct MigoHostCallbacks {
 // function pointers. Its historical minimum ends after dispatch; all later
 // callbacks were append-only optional fields.
 unsafe impl AbiStruct for MigoHostCallbacks {
-    const MINIMUM_SIZE: usize = 32;
+    // Derived, not written down: `on_ready` is the first append-only field, so
+    // its offset *is* "ends after dispatch". The literal `32` this replaces was
+    // right on LP64 and wrong on ILP32, where the three pointers ahead of
+    // `dispatch` are four bytes each and the true minimum is 20 -- so a 32-bit
+    // host passing a struct that fully contains `dispatch` was refused with
+    // `MIGO_ERROR_INVALID_ARGUMENT`, which reads as a fault in the caller.
+    // `MigoKeyEvent` already derives its minimum this way; this impl was the
+    // outlier.
+    const MINIMUM_SIZE: usize = offset_of!(MigoHostCallbacks, on_ready);
 }
+
+// Pins the LP64 value the literal used to state, so the derivation cannot
+// silently move the minimum on the platform every existing host is built for.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(<MigoHostCallbacks as AbiStruct>::MINIMUM_SIZE == 32);
+// The ILP32 counterpart: an 8-byte header, three 4-byte pointers, then the
+// 4-byte `dispatch`.
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(<MigoHostCallbacks as AbiStruct>::MINIMUM_SIZE == 20);
 
 /// Callback state retained by a Session after caller memory is released.
 #[derive(Clone, Copy, Debug)]

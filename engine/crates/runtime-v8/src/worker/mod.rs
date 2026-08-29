@@ -1712,6 +1712,24 @@ fn spawn_worker_thread(
                     });
                     info!("[Worker] JsRuntime created successfully");
 
+                    // Publish the isolate handle before anything runs JavaScript,
+                    // so the main thread can forcibly terminate this worker
+                    // (WorkerHandle::force_terminate) for the whole life of the
+                    // isolate rather than from the point bootstrap finished.
+                    //
+                    // It used to be published after `initialize_worker_runtime`,
+                    // which meant lazy extension init and the bootstrap script ran
+                    // inside a window where the slot still held `None`: a hang in
+                    // either left `force_terminate` a silent no-op, and
+                    // `WorkerHandle::drop` joins, so the thread that asked for the
+                    // teardown waited forever too. Terminating before any JS has
+                    // run is well defined -- the flag simply makes the first
+                    // execution unwind -- so there is no reason for the window to
+                    // exist.
+                    if let Ok(mut slot) = isolate_handle_slot.lock() {
+                        *slot = Some(rt.v8_isolate().thread_safe_handle());
+                    }
+
                     if let Some(extension_args) = extension_args {
                         if let Err(error) = rt.lazy_init_extensions(extension_args) {
                             error!("[Worker] snapshot state initialization failed: {error}");
@@ -1730,14 +1748,6 @@ fn spawn_worker_thread(
                             worker_initialization_error("runtime bootstrap", &error),
                         );
                         return;
-                    }
-
-                    // Publish the isolate handle so the main thread can forcibly
-                    // terminate this worker (WorkerHandle::force_terminate) even
-                    // if it's stuck in a runaway JS loop that never awaits the
-                    // cooperative Terminate message.
-                    if let Ok(mut slot) = isolate_handle_slot.lock() {
-                        *slot = Some(rt.v8_isolate().thread_safe_handle());
                     }
 
                     // Register near-heap-limit callback for OOM protection

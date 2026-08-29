@@ -930,10 +930,21 @@ impl MountTable {
     }
 
     /// Remove a subpackage overlay by prefix.
+    ///
+    /// The prefix goes through the same normalisation `mount_overlay` applies
+    /// before storing it. Comparing the caller's spelling against the stored one
+    /// meant `"sub/stage1/"` or `"sub//stage1"` matched nothing and reported
+    /// `false` while the overlay stayed mounted, holding its package open and
+    /// leaving the verify cache valid -- one rule with two implementations, and
+    /// the unmount side had the weaker one.
     pub fn unmount_overlay(&self, prefix: &str) -> bool {
+        let Some(normalized_prefix) = normalize_relative_path(prefix) else {
+            tracing::warn!("unmount_overlay rejected invalid prefix: {}", prefix);
+            return false;
+        };
         let mut inner = self.inner.write();
         let before = inner.overlays.len();
-        inner.overlays.retain(|e| e.prefix != prefix);
+        inner.overlays.retain(|e| e.prefix != normalized_prefix);
         let removed = inner.overlays.len() < before;
         if removed {
             self.generation.fetch_add(1, Ordering::Release);

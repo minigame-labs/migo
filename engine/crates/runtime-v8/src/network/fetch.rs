@@ -992,24 +992,29 @@ pub async fn op_fetch_upload(
     // owns the stream and drives it as the HTTP layer asks for data,
     // so peak user-space memory per upload is one chunk, not the
     // whole file.
-    let byte_stream = file_to_byte_stream(file);
-    let body = Body::wrap_stream(byte_stream);
-    let mut file_part = reqwest::multipart::Part::stream_with_length(body, file_size)
-        .file_name(filename)
-        .mime_str(mime)
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-    // If metadata() didn't give us a length we fall back to
-    // chunked encoding; reqwest handles that automatically.
-    if file_size == 0 {
-        file_part = reqwest::multipart::Part::stream(Body::wrap_stream(file_to_byte_stream(
+    //
+    // One `file_name` call for both bodies, because two of them is how the
+    // branches came to disagree: the zero-length branch named the part
+    // `file_path` -- the engine's internal VFS path -- instead of the display
+    // name the caller gave, so every file whose metadata reported no length
+    // leaked the internal path layout to the server.
+    let file_part = if file_size == 0 {
+        // No length from metadata, so fall back to chunked encoding; reqwest
+        // picks that for a part with no declared length.
+        reqwest::multipart::Part::stream(Body::wrap_stream(file_to_byte_stream(
             tokio::fs::File::open(&real_path)
                 .await
                 .map_err(|e| JsErrorBox::generic(format!("uploadFile:fail reopen: {e}")))?,
         )))
-        .file_name(file_path.clone())
-        .mime_str(mime)
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    } else {
+        reqwest::multipart::Part::stream_with_length(
+            Body::wrap_stream(file_to_byte_stream(file)),
+            file_size,
+        )
     }
+    .file_name(filename)
+    .mime_str(mime)
+    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
 
     let mut form = reqwest::multipart::Form::new().part(name, file_part);
 
