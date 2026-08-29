@@ -556,8 +556,9 @@ bash scripts/package-sdk.sh dist/migo-linux-x86_64
 ```
 
 The asset name is derived from the staged prefix with the release version
-inserted, so the same command serves Android, Linux and OpenHarmony
-(`dist/migo-android-arm64` → `migo-<version>-capi-android-arm64.tar.gz`). The
+inserted, so the same command serves all four platforms
+(`dist/migo-android-arm64` → `migo-<version>-capi-android-arm64.tar.gz`,
+`dist/migo-windows-x86_64` → `migo-<version>-capi-windows-x86_64.tar.gz`). The
 `capi` segment distinguishes these from the Android AAR, whose `.aar`
 extension already says "Android, Java/Kotlin", and the version is in the
 name because a file that has been renamed or moved off the release page is
@@ -565,10 +566,14 @@ otherwise unidentifiable. Staged prefixes use `arm64`/`x86_64` — the public
 vocabulary — while `arm64-v8a` and `aarch64` stay where the NDK and the Rust
 target triple need them. `--output-dir` places the pair somewhere else.
 `scripts/test-release-asset-naming-contract.sh` holds the scheme.
-**Windows is not yet packageable this way**: `build-windows-sdk.sh`
-writes no package manifest for the attestation to name, and
-`windows-sdk-0.1.1` was attested against its V8 `component-manifest.json`
-instead.
+
+Windows joined this path in #55: `windows_sdk_write_manifest`
+(`scripts/lib/windows-sdk-package.sh`, called by both
+`build-windows-sdk.sh` and `build-windows-sdk-native.sh`) writes
+`share/migo/windows-<arch>-manifest.json` for `package-sdk.sh` to attest
+against, exactly as the other three build scripts do. v0.9.4 shipped
+`migo-<version>-capi-windows-{x86_64,arm64}.tar.gz` with attestations
+this way.
 
 The archive is **byte-identical for a given commit**: entries sorted,
 owner and group normalised to numeric `0`, permissions derived from the

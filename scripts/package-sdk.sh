@@ -101,10 +101,10 @@ ASSET="migo-${VERSION}-capi-${PREFIX_NAME#migo-}.tar.gz"
 mapfile -t INDEX_CANDIDATES < <(find "$PREFIX/share/migo" -maxdepth 1 -name '*-manifest.json' -type f 2>/dev/null | sort)
 if (( ${#INDEX_CANDIDATES[@]} == 0 )); then
     err "no package manifest under $PREFIX/share/migo"
-    err "The Android, Linux and OpenHarmony build scripts each write one there. The"
-    err "Windows one does not -- windows-sdk-0.1.1 was attested against its V8"
-    err "component-manifest.json instead -- so a Windows prefix cannot be packaged"
-    err "here until build-windows-sdk.sh writes a package manifest of its own."
+    err "Every platform's build script writes exactly one there (Android/Linux/"
+    err "OpenHarmony in build-<os>-sdk.sh, Windows via windows_sdk_write_manifest"
+    err "in scripts/lib/windows-sdk-package.sh). A prefix without one was staged"
+    err "by hand or by a build predating that step."
     exit 1
 fi
 if (( ${#INDEX_CANDIDATES[@]} > 1 )); then
