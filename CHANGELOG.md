@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a session's sandbox `/tmp` directory when the session ends. `GamePaths::clean_temp`
   had no caller outside Android's Java SDK, so every session left its
   `tmp/{id}` subtree under the cache root for the life of the install.
+- Host timestamp jitter no longer drops frames for the rest of a session. The
+  vsync decimator admitted a frame within a fixed 0.25 ms of its deadline, and
+  every useful cadence puts that deadline exactly on a vsync — so a host whose
+  frame-callback timestamps jittered by more than that dropped frames
+  permanently: a replayed 60 Hz stream with 0.4 ms of jitter rendered 14 of 24
+  vsyncs, a 60 fps request running at ~35 and staying there. The tolerance is
+  now half the smaller of the last two delivered-vsync gaps, taking the frame
+  nearest its deadline rather than the first past it. The frame rate the
+  content asked for now also reaches Android's display-mode hint, so a request
+  that is a whole divisor of the panel's rate gets an even cadence; and the
+  requested-rate range and default, which four copies of the rule disagreed on
+  (`2^31` and non-finite handled differently on each side, a 24 fps request
+  silently raised to 30, a ceiling of 120 that left 144 Hz panels unreachable),
+  now live in one module.
 
 ---
 
