@@ -115,8 +115,15 @@ import com.migo.runtime.internal.platform.DisplayCompat;
  */
 public final class MigoRuntime {
 
-    /** Java SDK version. Must match native engine version (major.minor). */
-    public static final String SDK_VERSION = "0.1.0";
+    /**
+     * Java SDK version, from the same {@code release/VERSION} the AAR's
+     * {@code versionName} and the native library's {@code CARGO_PKG_VERSION}
+     * derive from. Held here as an alias of {@link BuildInfo#VERSION} rather
+     * than a literal: a hardcoded value drifted to an early release's number
+     * while the rest of the build moved on, and the skew check below then
+     * compared two frozen strings and never fired.
+     */
+    public static final String SDK_VERSION = BuildInfo.VERSION;
     /** Fallback API floor used when native metadata is unavailable. */
     private static final int FALLBACK_MIN_SDK = 26;
 
@@ -186,10 +193,13 @@ public final class MigoRuntime {
             }
             nativeVersion = reported == null ? "unknown" : reported;
             if (!nativeVersion.equals(SDK_VERSION)) {
-                // A host-delivered binary cannot reach here mismatched: it is
-                // checked against this build's artifact manifest before load.
-                // This remains a warning for the packaged case, where the AAR's
-                // own contents are gated at build time instead.
+                // Both sides now derive from release/VERSION -- the AAR through
+                // BuildInfo.VERSION, the .so through CARGO_PKG_VERSION -- so this
+                // fires only when an AAR is paired with a native library built
+                // from a different tree. A host-delivered binary cannot reach
+                // here mismatched: it is checked against this build's artifact
+                // manifest before load. This stays a warning for the packaged
+                // case, where the AAR's own contents are gated at build time.
                 Log.w("MigoRuntime", "SDK/native version mismatch: SDK=" + SDK_VERSION
                         + " native=" + nativeVersion);
             }
@@ -202,18 +212,22 @@ public final class MigoRuntime {
     // ==================== Version Info ====================
 
     /**
-     * Get the SDK version string.
+     * Get the SDK version string, from {@code release/VERSION} via
+     * {@link BuildInfo#VERSION}.
      *
-     * @return SDK version (e.g., "1.0.0")
+     * @return the SDK version, the same value as {@link #SDK_VERSION}
      */
     public String getVersion() {
         return BuildInfo.VERSION;
     }
 
     /**
-     * Get the native engine version string.
+     * Get the native engine version string, reported by the loaded library
+     * from its {@code CARGO_PKG_VERSION}. Equal to {@link #getVersion()} for a
+     * consistently built pair.
      *
-     * @return Native version (e.g., "0.1.0"), or "unknown" if not loaded
+     * @return the native engine version, or "unknown" / "load_failed" if the
+     *         library is not usable
      */
     public String getNativeVersion() {
         ensureNative();
