@@ -471,7 +471,7 @@ impl Host {
             });
         });
 
-        let mut render = RenderService::new(
+        let render = RenderService::new(
             raf_tx,
             vsync_rx,
             frame_demand_rx,
