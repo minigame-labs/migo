@@ -5,8 +5,9 @@
 # and nothing made the changelog keep up. v0.9.4 shipped with no `## v0.9.4`
 # section at all: the entries that would have been in it sat under
 # `## [Unreleased]` and were never promoted, and 58 PRs' worth of changes
-# (including the removal of the `wx` namespace) had no release note anywhere. A
-# reader asking "what changed in v0.9.4" found the answer was v0.9.3's.
+# (including the removal of the legacy compat namespace) had no release note
+# anywhere. A reader asking "what changed in v0.9.4" found the answer was
+# v0.9.3's.
 #
 # The rule: whatever `release/VERSION` says, `CHANGELOG.md` has a matching
 # `## v<version>` heading. `## [Unreleased]` is the staging area above it and is
