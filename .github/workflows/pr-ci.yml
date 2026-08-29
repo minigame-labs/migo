@@ -192,6 +192,11 @@ jobs:
       - name: CHANGELOG release-section contract
         run: bash scripts/test-changelog-release-section-contract.sh
 
+      # The PR template's `[CLA](CLA.md)` link resolved to `.github/CLA.md`,
+      # which does not exist — a 404 for the first-time contributor it is for.
+      - name: Doc links contract
+        run: bash scripts/test-doc-links-contract.sh
+
       # The prescreen scanner is what a prospective customer runs against their own
       # bundle, so its wrong answers are the expensive kind: a gap it invents gets
       # checked, does not exist, and the rest of the report stops being believed.
