@@ -214,9 +214,7 @@ impl AudioContext {
         if self.state != AudioContextState::Running {
             return false;
         }
-        self.nodes
-            .values()
-            .any(|n| n.is_producing())
+        self.nodes.values().any(|n| n.is_producing())
     }
 
     /// Mark a node as unreachable from JavaScript, and collect whatever that
@@ -635,10 +633,7 @@ impl AudioContext {
     /// rather than waiting for the next `process()` sweep — which never runs
     /// while the context is suspended.
     pub fn remove_finished_node(&mut self, node_id: AudioNodeId) -> &[AudioNodeId] {
-        let finished = self
-            .nodes
-            .get(&node_id)
-            .is_some_and(|n| n.is_finished());
+        let finished = self.nodes.get(&node_id).is_some_and(|n| n.is_finished());
         if !finished {
             self.collected.clear();
             return &self.collected;
@@ -1639,7 +1634,8 @@ mod tests {
         let mut ctx = AudioContext::new(1, 48_000, 2);
 
         // stop(when <= 0) finishes a buffer source immediately -> fully removed.
-        ctx.create_buffer_source(20);        ctx.connect(20, DESTINATION_NODE_ID);
+        ctx.create_buffer_source(20);
+        ctx.connect(20, DESTINATION_NODE_ID);
         assert!(ctx.stop_source(20, 0.0));
         assert_eq!(
             ctx.remove_finished_node(20),

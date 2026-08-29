@@ -666,8 +666,9 @@ impl AudioCmd {
             Self::SetPanningModel { model, .. } | Self::SetDistanceModel { model, .. } => {
                 model.capacity()
             }
-            Self::SetPannerScalar { prop, .. }
-            | Self::SetAnalyserScalar { prop, .. } => prop.capacity(),
+            Self::SetPannerScalar { prop, .. } | Self::SetAnalyserScalar { prop, .. } => {
+                prop.capacity()
+            }
             Self::CreateIIRFilter {
                 feedforward,
                 feedback,
