@@ -101,7 +101,7 @@ itself, because one built-in downloader would be wrong for one of the two.
 +---------------------+--------------------+--------------------+--------------------+
 |                                  Rust Core Engine                                  |
 +------------------------------------------------------------------------------------+
-|                     Platform Layer (Android | Linux | Windows)                     |
+|              Platform Layer (Android | Linux | Windows | OpenHarmony)              |
 +------------------------------------------------------------------------------------+
 ```
 
