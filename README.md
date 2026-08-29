@@ -35,7 +35,7 @@ Reproducible benchmarks against the system WebView — same game, same device, s
 | **OpenHarmony / HarmonyOS NEXT** (aarch64, x86_64) | Released | A C ABI package per architecture (headers, static library, CMake package, manifest) |
 | iOS, macOS | Planned | — |
 
-Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Each ships an `.attestation.json` recording the archive's name, size and sha256 — verify a download against it before use.
+Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Every release carries a `SHA256SUMS.txt` — check a download with `sha256sum -c SHA256SUMS.txt` — and each archive also has an `.attestation.json` recording its name, size and sha256, whose `package_sha256` you can reproduce from source ([BUILD.md](BUILD.md)).
 
 The C ABI in [`include/migo/`](include/migo/) is a **candidate** — it has a working runtime on every platform above but is not frozen. Its own README tracks what remains before it can be.
 
