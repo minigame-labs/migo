@@ -38,6 +38,15 @@ if [[ -n "${MIGO_WIN_V8_ARCHIVE:-}" ]]; then
     V8_ARCHIVE_LINE="set RUSTY_V8_ARCHIVE=${MIGO_WIN_V8_ARCHIVE}"
 fi
 
+# The prebuilt bindings that go with that archive. rusty_v8's build.rs only adds
+# the clang resource directory on Linux, so on Windows bindgen fails to find its
+# builtin headers -- pointing it at the committed `src_binding.rs` skips bindgen
+# entirely. Symmetric with the archive above: a V8-dependent layer needs both.
+V8_BINDING_LINE=""
+if [[ -n "${MIGO_WIN_V8_SRC_BINDING:-}" ]]; then
+    V8_BINDING_LINE="set RUSTY_V8_SRC_BINDING_PATH=${MIGO_WIN_V8_SRC_BINDING}"
+fi
+
 # Optional. Skia's git-sync-deps reaches chromium.googlesource.com, which is
 # unreachable from Windows on this machine while WSL reaches it fine -- the
 # proxy lives on the Windows side but cmd.exe does not inherit it.
@@ -78,6 +87,7 @@ rem same way scripts/dev-setup-skia.sh does it on Linux.
 set INCLUDE=${WIN_HEADERS_DOS};%INCLUDE%
 ${PROXY_LINES}
 ${V8_ARCHIVE_LINE}
+${V8_BINDING_LINE}
 
 cd /d ${WIN_WORKTREE_DOS}\\engine || exit /b 90
 echo [probe] package=${PACKAGE} target=${WIN_TARGET_TRIPLE} sha=${WORKTREE_SHA}
