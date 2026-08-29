@@ -56,8 +56,10 @@ native library and C ABI on four platforms. Main outputs:
 
 ```bash
 # Install rustup from https://rustup.rs/ (or your package manager).
-# The toolchain file pins to stable; Rust 1.80+ required for edition 2024.
-rustup show                       # verify the pin is respected
+# engine/rust-toolchain.toml pins an exact rustc version (not "stable") and
+# rustup installs it on first cargo invocation inside engine/. The workspace is
+# edition 2024, which needs rustc >= 1.85 regardless of the pin.
+cd engine && rustup show          # verify the pin is respected
 ```
 
 Add Android targets:
