@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use jni::{
     JNIEnv,
+    objects::JStaticMethodID,
     signature::{Primitive, ReturnType},
     sys::jvalue,
 };
@@ -12,7 +13,8 @@ use shared::{
     surface::{SafeArea, WindowInfo},
 };
 
-use crate::android::jni::{JAVA_METHOD_CACHE, with_env};
+use crate::android::jni::{JAVA_METHOD_CACHE, JavaMethodCache, with_env};
+use crate::jni_method_id::once_get_or_try_init;
 
 // Binary protocol convention: all integer fields are little-endian (LE).
 // Java side must use ByteBuffer.order(ByteOrder.LITTLE_ENDIAN).
@@ -42,39 +44,54 @@ where
     F: FnOnce(&mut JNIEnv, jni::objects::JValueOwned) -> Result<R, String>,
 {
     with_env(|env| {
-        // Clear any pre-existing JNI exception so a stale exception from a
-        // prior call does not cause cascading failures (see notify_error).
-        clear_jni_exception(env, method_name);
-
         let cache = JAVA_METHOD_CACHE
             .get()
             .ok_or("NativeExports class cache not initialized")?;
-
-        let method_id = cache
+        let method_id = *cache
             .get_method_id(method_name)
             .ok_or("Method ID not found")?;
-
-        let class = cache.class();
-
-        let start = std::time::Instant::now();
-        let result = unsafe { env.call_static_method_unchecked(class, *method_id, ret, args) };
-        let elapsed = start.elapsed();
-        if elapsed.as_secs() >= SLOW_JNI_CALL_SECS {
-            tracing::warn!(
-                "Slow JNI call '{}': {:.1}s (potential ANR risk)",
-                method_name,
-                elapsed.as_secs_f64()
-            );
-        }
-
-        match result {
-            Ok(val) => handle(env, val),
-            Err(e) => {
-                clear_jni_exception(env, method_name);
-                Err(format!("Failed to call method '{method_name}': {e}"))
-            }
-        }
+        invoke_static_method(env, cache, method_id, method_name, ret, handle, args)
     })
+}
+
+/// Invoke a resolved static method: the pre-call exception clear, the slow-call
+/// timer and the error formatting every outbound call shares. Split out of
+/// `call_static_method` so a per-frame call site can resolve its method id once
+/// and still take the identical path for everything after that.
+fn invoke_static_method<R, F>(
+    env: &mut JNIEnv,
+    cache: &JavaMethodCache,
+    method_id: JStaticMethodID,
+    method_name: &str,
+    ret: ReturnType,
+    handle: F,
+    args: &[jvalue],
+) -> Result<R, String>
+where
+    F: FnOnce(&mut JNIEnv, jni::objects::JValueOwned) -> Result<R, String>,
+{
+    // Clear any pre-existing JNI exception so a stale exception from a prior
+    // call does not cause cascading failures (see notify_error).
+    clear_jni_exception(env, method_name);
+
+    let start = std::time::Instant::now();
+    let result = unsafe { env.call_static_method_unchecked(cache.class(), method_id, ret, args) };
+    let elapsed = start.elapsed();
+    if elapsed.as_secs() >= SLOW_JNI_CALL_SECS {
+        tracing::warn!(
+            "Slow JNI call '{}': {:.1}s (potential ANR risk)",
+            method_name,
+            elapsed.as_secs_f64()
+        );
+    }
+
+    match result {
+        Ok(val) => handle(env, val),
+        Err(e) => {
+            clear_jni_exception(env, method_name);
+            Err(format!("Failed to call method '{method_name}': {e}"))
+        }
+    }
 }
 
 /// Internal helper for void JNI calls with pre-constructed arguments.
@@ -204,7 +221,36 @@ jni_void_int!(open_app_authorize_setting, "openAppAuthorizeSetting");
 // R1: request one Choreographer frame callback (Rust render/host -> Java).
 // `NativeExports.requestVsync` posts to the main thread and rechecks the live
 // GameSession, so a late call after teardown is harmless.
-jni_void!(request_vsync, "requestVsync");
+//
+// The render thread issues this once per animating frame -- unlike every call
+// above it, which a user action paces -- so it resolves its method id once
+// rather than hashing "requestVsync" out of the name-keyed cache on every
+// frame. Everything after the lookup is `invoke_static_method`, the same path
+// the generic helper takes.
+pub fn request_vsync(host_id: i32) -> Result<(), String> {
+    static METHOD_ID: OnceLock<JStaticMethodID> = OnceLock::new();
+
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = *once_get_or_try_init(&METHOD_ID, || {
+            cache
+                .get_method_id("requestVsync")
+                .copied()
+                .ok_or_else(|| "Method ID not found for requestVsync".to_string())
+        })?;
+        invoke_static_method(
+            env,
+            cache,
+            method_id,
+            "requestVsync",
+            ReturnType::Primitive(Primitive::Void),
+            |_env, _| Ok(()),
+            &[jvalue { i: host_id }],
+        )
+    })
+}
 
 pub fn get_window_info(host_id: i32) -> Result<WindowInfo, String> {
     call_static_method(

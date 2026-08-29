@@ -6,6 +6,8 @@ mod android_permission_gate;
 #[cfg(any(target_os = "android", test))]
 mod host_owners;
 
+#[cfg(any(target_os = "android", test))]
+mod jni_method_id;
 #[path = "android/jni/profile_contract.rs"]
 pub(crate) mod jni_profile_contract;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
