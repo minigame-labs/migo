@@ -30,7 +30,7 @@ bash scripts/build-aar.sh --product-profile slim release
 
 ```groovy
 dependencies {
-    implementation files('libs/migo-0.9.3-android.aar')
+    implementation files('libs/migo-<version>-android.aar')
 }
 ```
 

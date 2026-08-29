@@ -311,7 +311,7 @@ bash scripts/build-aar.sh release --skip-rust
 
 ### 4. Linux x86_64 SDK
 
-Produces `dist/migo-linux-x86_64/` with `libmigo.so.0.9.0` (soname
+Produces `dist/migo-linux-x86_64/` with `libmigo.so.<version>` (soname
 `libmigo.so.1`), `libmigo.a`, public headers, CMake package, and
 `pkg-config` `.pc`. Builds on Linux only.
 
@@ -529,13 +529,13 @@ asset a release publishes is one step further on:
 
 ```bash
 bash scripts/package-sdk.sh dist/migo-linux-x86_64
-# -> dist/migo-0.9.1-capi-linux-x86_64.tar.gz
-#    dist/migo-0.9.1-capi-linux-x86_64.tar.gz.attestation.json
+# -> dist/migo-<version>-capi-linux-x86_64.tar.gz
+#    dist/migo-<version>-capi-linux-x86_64.tar.gz.attestation.json
 ```
 
 The asset name is derived from the staged prefix with the release version
 inserted, so the same command serves Android, Linux and OpenHarmony
-(`dist/migo-android-arm64` → `migo-0.9.1-capi-android-arm64.tar.gz`). The
+(`dist/migo-android-arm64` → `migo-<version>-capi-android-arm64.tar.gz`). The
 `capi` segment distinguishes these from the Android AAR, whose `.aar`
 extension already says "Android, Java/Kotlin", and the version is in the
 name because a file that has been renamed or moved off the release page is
