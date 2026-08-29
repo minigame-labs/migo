@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+---
+
+## v0.9.5 (2026-08-29)
+
+A correctness and efficiency pass over io, graphics and audio. Redundant GL
+calls that slipped past the state shadow are deduplicated and the shadow itself
+stopped hashing to decide; `measureText` and per-sample `AudioParam` automation
+stop allocating and re-walking on every call; `AnalyserNode`'s scalar
+parameters take effect; `compressImage` shares a two-thread pool instead of
+spawning one thread per image. A symlink race in sub-package and ZIP extraction
+is closed, a WebGL context loss no longer strands a game between frames, and
+`getUpdateManager()` stops inventing updates. Host frame-timestamp jitter no
+longer drops frames for the rest of a session, and `MigoRuntime` reports the
+real engine version.
+
+### Added
 - `AnalyserNode`'s scalar parameters take effect. `minDecibels`, `maxDecibels`
   and `smoothingTimeConstant` were accepted and then ignored, so
   `getByteFrequencyData` / `getFloatFrequencyData` returned unsmoothed data over
@@ -114,6 +135,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`2^31` and non-finite handled differently on each side, a 24 fps request
   silently raised to 30, a ceiling of 120 that left 144 Hz panels unreachable),
   now live in one module.
+- `MigoRuntime.getNativeVersion()` and the public `MigoRuntime.SDK_VERSION`
+  constant report the running engine's version. Both had frozen to an early
+  release's number while the AAR's own `versionName` tracked `release/VERSION`,
+  and since they were the same frozen string the SDK's skew check compared a
+  value against itself and could never fire. The JNI `version()` now derives
+  from `CARGO_PKG_VERSION` and `SDK_VERSION` from `BuildInfo.VERSION`, both of
+  which `scripts/test-release-version-contract.sh` holds equal to
+  `release/VERSION`.
 
 ---
 
