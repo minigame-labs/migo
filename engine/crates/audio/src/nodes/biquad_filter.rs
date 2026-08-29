@@ -4,7 +4,7 @@ use shared::protocol::audio_cmd::AudioNodeId;
 
 use crate::param::AudioParamTimeline;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
 /// BiquadFilter types (Robert Bristow-Johnson's Audio EQ Cookbook)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +67,15 @@ pub struct BiquadFilterNode {
 }
 
 impl BiquadFilterNode {
-    pub fn new(id: AudioNodeId, channels: u32) -> Self {
+    pub fn new(id: AudioNodeId, channels: u32, sample_rate: u32) -> Self {
+        // Nyquist for the rate actually in use. Hardcoding 22050 is only right
+        // at 44.1 kHz; at the 48 kHz most devices run it clamped away the top
+        // 2 kHz of the legal range.
+        let nyquist = (sample_rate.max(2) / 2) as f32;
         let mut node = Self {
             id,
             filter_type: BiquadFilterType::Lowpass,
-            frequency: AudioParamTimeline::new(350.0, 0.0, 22050.0),
+            frequency: AudioParamTimeline::new(350.0, 0.0, nyquist),
             detune: AudioParamTimeline::new(0.0, -153600.0, 153600.0),
             q: AudioParamTimeline::new(1.0, 0.0001, 1000.0),
             gain: AudioParamTimeline::new(0.0, -40.0, 40.0),
@@ -87,7 +91,7 @@ impl BiquadFilterNode {
             last_type: BiquadFilterType::Lowpass,
             last_detune: f32::NAN,
         };
-        node.compute_coefficients(44100.0, 0.0); // Will be recomputed on first process
+        node.compute_coefficients(sample_rate.max(1) as f64, 0.0); // recomputed on first process
         node
     }
 
@@ -271,10 +275,6 @@ impl BiquadFilterNode {
 impl AudioNodeProcessor for BiquadFilterNode {
     fn id(&self) -> AudioNodeId {
         self.id
-    }
-
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::BiquadFilter
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

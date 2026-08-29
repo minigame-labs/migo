@@ -4,7 +4,7 @@ use shared::protocol::audio_cmd::AudioNodeId;
 
 use crate::param::AudioParamTimeline;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
 /// DynamicsCompressorNode: applies dynamic range compression.
 ///
@@ -47,10 +47,6 @@ impl DynamicsCompressorNode {
 impl AudioNodeProcessor for DynamicsCompressorNode {
     fn id(&self) -> AudioNodeId {
         self.id
-    }
-
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::DynamicsCompressor
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

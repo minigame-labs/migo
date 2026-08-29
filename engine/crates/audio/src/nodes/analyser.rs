@@ -2,7 +2,7 @@ use std::any::Any;
 
 use shared::protocol::audio_cmd::AudioNodeId;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
 /// AnalyserNode: provides real-time frequency and time-domain analysis.
 ///
@@ -12,7 +12,6 @@ pub struct AnalyserNode {
     fft_size: usize,
     min_decibels: f32,
     max_decibels: f32,
-    #[allow(dead_code)]
     smoothing_time_constant: f32,
     /// Circular time-domain buffer (mono, downmixed from input)
     time_domain_buffer: Vec<f32>,
@@ -23,12 +22,24 @@ pub struct AnalyserNode {
     fft_im: Vec<f64>,
     /// Pre-computed Blackman window coefficients (recomputed on fft_size change)
     window: Vec<f64>,
+    /// Pre-computed twiddle factors, `exp(-2*PI*i*k/n)` for `k` in `0..n/2`.
+    ///
+    /// The butterfly used to derive each factor from the previous one by complex
+    /// multiplication. That recurrence loses precision as it goes, and the loss
+    /// grows with the transform: by the 32768-point size the spec allows, the
+    /// factors near the end of a pass are visibly off, which shows up as a raised
+    /// noise floor across the whole spectrum. A table is exact at every index and
+    /// is built once per `fftSize` change.
+    twiddles: Vec<(f64, f64)>,
+    /// Previous frame's magnitudes, for `smoothingTimeConstant`.
+    smoothed: Vec<f64>,
 }
 
 impl AnalyserNode {
     pub fn new(id: AudioNodeId, channels: u32) -> Self {
         let fft_size = 2048; // Default per spec
         let window = Self::compute_blackman_window(fft_size);
+        let twiddles = Self::compute_twiddles(fft_size);
         Self {
             id,
             fft_size,
@@ -41,6 +52,8 @@ impl AnalyserNode {
             fft_re: vec![0.0; fft_size],
             fft_im: vec![0.0; fft_size],
             window,
+            twiddles,
+            smoothed: vec![0.0; fft_size / 2],
         }
     }
 
@@ -55,6 +68,10 @@ impl AnalyserNode {
             self.fft_re.resize(size, 0.0);
             self.fft_im.resize(size, 0.0);
             self.window = Self::compute_blackman_window(size);
+            self.twiddles = Self::compute_twiddles(size);
+            // The history is meaningless at a new resolution.
+            self.smoothed.clear();
+            self.smoothed.resize(size / 2, 0.0);
         }
     }
 
@@ -68,7 +85,6 @@ impl AnalyserNode {
         self.max_decibels = v;
     }
 
-    #[allow(dead_code)]
     pub fn set_smoothing_time_constant(&mut self, v: f32) {
         self.smoothing_time_constant = v.clamp(0.0, 1.0);
     }
@@ -97,13 +113,14 @@ impl AnalyserNode {
         result
     }
 
-    /// Radix-2 Cooley-Tukey in-place FFT.
-    fn fft(re: &mut [f64], im: &mut [f64]) {
+    /// Radix-2 Cooley-Tukey in-place FFT, using a pre-computed twiddle table.
+    fn fft(re: &mut [f64], im: &mut [f64], twiddles: &[(f64, f64)]) {
         let n = re.len();
         if n <= 1 {
             return;
         }
         debug_assert!(n.is_power_of_two());
+        debug_assert_eq!(twiddles.len(), n / 2);
 
         // Bit-reversal permutation
         let mut j = 0usize;
@@ -120,35 +137,39 @@ impl AnalyserNode {
             }
         }
 
-        // Butterfly passes
+        // Butterfly passes. Each factor is read from the table rather than derived
+        // from its predecessor, so precision does not decay across a pass.
         let mut len = 2;
         while len <= n {
             let half = len / 2;
-            let angle_step = -std::f64::consts::TAU / len as f64;
-            let w_re = angle_step.cos();
-            let w_im = angle_step.sin();
-
+            let stride = n / len;
             let mut i = 0;
             while i < n {
-                let mut cur_re = 1.0;
-                let mut cur_im = 0.0;
                 for k in 0..half {
+                    let (w_re, w_im) = twiddles[k * stride];
                     let u_re = re[i + k];
                     let u_im = im[i + k];
-                    let v_re = re[i + k + half] * cur_re - im[i + k + half] * cur_im;
-                    let v_im = re[i + k + half] * cur_im + im[i + k + half] * cur_re;
+                    let v_re = re[i + k + half] * w_re - im[i + k + half] * w_im;
+                    let v_im = re[i + k + half] * w_im + im[i + k + half] * w_re;
                     re[i + k] = u_re + v_re;
                     im[i + k] = u_im + v_im;
                     re[i + k + half] = u_re - v_re;
                     im[i + k + half] = u_im - v_im;
-                    let next_re = cur_re * w_re - cur_im * w_im;
-                    cur_im = cur_re * w_im + cur_im * w_re;
-                    cur_re = next_re;
                 }
                 i += len;
             }
             len <<= 1;
         }
+    }
+
+    /// `exp(-2*PI*i*k/n)` for `k` in `0..n/2`, computed directly at every index.
+    fn compute_twiddles(n: usize) -> Vec<(f64, f64)> {
+        (0..n / 2)
+            .map(|k| {
+                let angle = -std::f64::consts::TAU * k as f64 / n as f64;
+                (angle.cos(), angle.sin())
+            })
+            .collect()
     }
 
     /// Pre-compute Blackman window coefficients (called once per fft_size change).
@@ -174,7 +195,31 @@ impl AnalyserNode {
             self.fft_im[i] = 0.0;
         }
 
-        Self::fft(&mut self.fft_re, &mut self.fft_im);
+        Self::fft(&mut self.fft_re, &mut self.fft_im, &self.twiddles);
+        self.apply_smoothing();
+    }
+
+    /// Blend this frame's magnitudes with the previous frame's.
+    ///
+    /// **`smoothingTimeConstant` used to be stored and never read.** It is what
+    /// makes a spectrum visualiser readable rather than a flicker, and the spec
+    /// defines the frequency data as the smoothed magnitudes, not the raw ones --
+    /// so ignoring it was both a missing feature and a wrong answer.
+    fn apply_smoothing(&mut self) {
+        let bins = self.fft_size / 2;
+        if self.smoothed.len() != bins {
+            self.smoothed.clear();
+            self.smoothed.resize(bins, 0.0);
+        }
+        let tau = self.smoothing_time_constant.clamp(0.0, 1.0) as f64;
+        let inv_fft = 1.0 / self.fft_size as f64;
+        for bin in 0..bins {
+            let magnitude = (self.fft_re[bin] * self.fft_re[bin]
+                + self.fft_im[bin] * self.fft_im[bin])
+                .sqrt()
+                * inv_fft;
+            self.smoothed[bin] = tau * self.smoothed[bin] + (1.0 - tau) * magnitude;
+        }
     }
 
     /// Get frequency domain data in bytes (0-255), mapped from dB scale.
@@ -187,12 +232,9 @@ impl AnalyserNode {
         let min_db = self.min_decibels as f64;
         let max_db = self.max_decibels as f64;
         let range = max_db - min_db;
-        let inv_fft = 1.0 / self.fft_size as f64;
 
         for i in 0..freq_bins {
-            let magnitude = (self.fft_re[i] * self.fft_re[i] + self.fft_im[i] * self.fft_im[i])
-                .sqrt()
-                * inv_fft;
+            let magnitude = self.smoothed[i];
             let db = if magnitude > 1e-20 {
                 20.0 * magnitude.log10()
             } else {
@@ -212,12 +254,9 @@ impl AnalyserNode {
 
         let mut result = vec![0.0f32; freq_bins];
         let min_db = self.min_decibels as f64;
-        let inv_fft = 1.0 / self.fft_size as f64;
 
         for i in 0..freq_bins {
-            let magnitude = (self.fft_re[i] * self.fft_re[i] + self.fft_im[i] * self.fft_im[i])
-                .sqrt()
-                * inv_fft;
+            let magnitude = self.smoothed[i];
             let db = if magnitude > 1e-20 {
                 20.0 * magnitude.log10()
             } else {
@@ -232,10 +271,6 @@ impl AnalyserNode {
 impl AudioNodeProcessor for AnalyserNode {
     fn id(&self) -> AudioNodeId {
         self.id
-    }
-
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::Analyser
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -276,5 +311,90 @@ impl AudioNodeProcessor for AnalyserNode {
         }
 
         frames
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fed_with_sine(node: &mut AnalyserNode, frequency: f64, sample_rate: f64, blocks: usize) {
+        let frames = node.fft_size;
+        let mut input = vec![0.0f32; frames];
+        let mut phase = 0.0f64;
+        let step = std::f64::consts::TAU * frequency / sample_rate;
+        for _ in 0..blocks {
+            for sample in input.iter_mut() {
+                *sample = phase.sin() as f32;
+                phase += step;
+            }
+            let mut out = vec![0.0f32; frames];
+            node.process(&input, &mut out, sample_rate as u32, 1, 0.0);
+        }
+    }
+
+    /// A tone must land in the bin it belongs to. This is the property the twiddle
+    /// recurrence degraded: derived factors drift, which smears energy out of the
+    /// correct bin and lifts the floor everywhere else.
+    #[test]
+    fn a_pure_tone_concentrates_in_its_own_bin() {
+        let sample_rate = 48_000.0;
+        let mut node = AnalyserNode::new(1, 1);
+        node.set_fft_size(2048);
+        node.set_smoothing_time_constant(0.0); // measure this frame only
+        // Exactly on bin 64: 64 * 48000 / 2048.
+        let frequency = 64.0 * sample_rate / 2048.0;
+        fed_with_sine(&mut node, frequency, sample_rate, 4);
+
+        let spectrum = node.get_float_frequency_data();
+        let peak = spectrum
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(bin, _)| bin)
+            .unwrap();
+        assert!(
+            (peak as i64 - 64).abs() <= 1,
+            "the tone should peak at bin 64, peaked at {peak}"
+        );
+    }
+
+    /// `smoothingTimeConstant` was stored, marked dead code, and never read. The
+    /// spec defines the frequency data as the *smoothed* magnitudes, so ignoring it
+    /// was a wrong answer and not just a missing nicety.
+    #[test]
+    fn the_smoothing_time_constant_changes_the_result() {
+        let sample_rate = 48_000.0;
+        let frequency = 64.0 * sample_rate / 2048.0;
+
+        let mut unsmoothed = AnalyserNode::new(1, 1);
+        unsmoothed.set_smoothing_time_constant(0.0);
+        fed_with_sine(&mut unsmoothed, frequency, sample_rate, 1);
+        let sharp = unsmoothed.get_float_frequency_data();
+
+        // A high constant keeps most of the previous (silent) frame, so the first
+        // measurement of a tone must come out quieter.
+        let mut smoothed = AnalyserNode::new(1, 1);
+        smoothed.set_smoothing_time_constant(0.95);
+        fed_with_sine(&mut smoothed, frequency, sample_rate, 1);
+        let smooth = smoothed.get_float_frequency_data();
+
+        assert!(
+            smooth[64] < sharp[64] - 1.0,
+            "smoothing must attenuate a newly arrived tone: {} vs {}",
+            smooth[64],
+            sharp[64]
+        );
+    }
+
+    #[test]
+    fn resizing_the_fft_resets_the_smoothing_history_to_match() {
+        let mut node = AnalyserNode::new(1, 1);
+        node.set_fft_size(512);
+        assert_eq!(node.smoothed.len(), 256);
+        assert_eq!(node.twiddles.len(), 256);
+        node.set_fft_size(4096);
+        assert_eq!(node.smoothed.len(), 2048);
+        assert_eq!(node.twiddles.len(), 2048);
     }
 }

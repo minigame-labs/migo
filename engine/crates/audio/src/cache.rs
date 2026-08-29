@@ -72,7 +72,12 @@ impl AudioCache {
 
     /// Insert decoded audio into cache
     pub fn insert(&mut self, url: String, audio: DecodedAudio) -> Arc<DecodedAudio> {
-        let size_bytes = audio.samples.len() * std::mem::size_of::<f32>();
+        // Charged by allocation capacity, not logical length. `limits.rs` charges
+        // retained PCM the same way, and for the same reason: spare `Vec` capacity
+        // is heap this process is holding. The resampler in particular reserves an
+        // estimate and pushes fewer samples, so length under-reports what the
+        // cache actually costs.
+        let size_bytes = audio.samples.capacity() * std::mem::size_of::<f32>();
 
         // Don't cache if single item exceeds max size
         if size_bytes > self.max_size {
@@ -94,7 +99,7 @@ impl AudioCache {
 
         // Remove old entry if exists
         if let Some(old) = self.entries.remove(&url) {
-            self.current_size -= old.size_bytes;
+            self.current_size = self.current_size.saturating_sub(old.size_bytes);
             self.order_index.remove(&old.access_order);
         }
 
@@ -124,7 +129,7 @@ impl AudioCache {
         if let Some((&order, _)) = self.order_index.iter().next() {
             if let Some(url) = self.order_index.remove(&order) {
                 if let Some(entry) = self.entries.remove(&url) {
-                    self.current_size -= entry.size_bytes;
+                    self.current_size = self.current_size.saturating_sub(entry.size_bytes);
                     tracing::debug!("Evicted from cache: {} ({} bytes)", url, entry.size_bytes);
                 }
             }
@@ -134,7 +139,7 @@ impl AudioCache {
     /// Remove specific URL from cache
     pub fn remove(&mut self, url: &str) {
         if let Some(entry) = self.entries.remove(url) {
-            self.current_size -= entry.size_bytes;
+            self.current_size = self.current_size.saturating_sub(entry.size_bytes);
             self.order_index.remove(&entry.access_order);
             tracing::debug!("Removed from cache: {} ({} bytes)", url, entry.size_bytes);
         }
@@ -156,6 +161,57 @@ impl AudioCache {
             current_size: self.current_size,
             max_size: self.max_size,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spare `Vec` capacity is heap the process is holding, and the resampler
+    /// reserves an estimate then pushes fewer samples -- so charging by logical
+    /// length let the cache hold more than its own limit. `limits.rs` already
+    /// charges retained PCM by capacity, and has a test saying so.
+    #[test]
+    fn entries_are_charged_by_allocation_capacity_not_length() {
+        let mut samples = Vec::with_capacity(64);
+        samples.push(0.0f32);
+        let capacity_bytes = samples.capacity() * std::mem::size_of::<f32>();
+        assert!(capacity_bytes > samples.len() * std::mem::size_of::<f32>());
+
+        let mut cache = AudioCache::with_max_size(1024);
+        cache.insert(
+            "a".into(),
+            DecodedAudio {
+                samples,
+                sample_rate: 48_000,
+                channels: 1,
+            },
+        );
+
+        assert_eq!(cache.stats().current_size, capacity_bytes);
+    }
+
+    #[test]
+    fn eviction_is_least_recently_used_and_keeps_the_total_within_the_limit() {
+        let entry = |value: f32| DecodedAudio {
+            samples: vec![value; 8],
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let one_entry_bytes = 8 * std::mem::size_of::<f32>();
+
+        let mut cache = AudioCache::with_max_size(one_entry_bytes * 2);
+        cache.insert("a".into(), entry(1.0));
+        cache.insert("b".into(), entry(2.0));
+        // Touch "a" so "b" becomes the least recently used.
+        assert!(cache.get("a").is_some());
+        cache.insert("c".into(), entry(3.0));
+
+        assert!(cache.get("b").is_none(), "the LRU entry must be evicted");
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("c").is_some());
+        assert!(cache.stats().current_size <= one_entry_bytes * 2);
     }
 }
 

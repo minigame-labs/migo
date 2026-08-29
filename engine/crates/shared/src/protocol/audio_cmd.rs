@@ -174,6 +174,18 @@ pub enum AudioCmd {
     },
 
     // ==================== Nodes ====================
+    /// Idempotently mark an AudioNode as unreachable from JavaScript.
+    ///
+    /// Fire-and-forget so it is safe from a GC finalizer, and a *request* rather
+    /// than a removal: JavaScript drops a whole `source -> gain -> destination`
+    /// chain as one unreachable object graph, so this can arrive while the source
+    /// is still playing through the node. The audio thread drops the node once
+    /// nothing upstream can still feed it.
+    ReleaseNode {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
     /// Create an AudioBufferSourceNode (JS provides node_id, fire-and-forget)
     CreateBufferSource {
         ctx_id: AudioContextId,
@@ -262,7 +274,11 @@ pub enum AudioCmd {
     /// Connect two nodes
     Connect {
         src: AudioNodeId,
+        /// Output port on `src`. Only a ChannelSplitter has more than one.
+        src_output: u32,
         dst: AudioNodeId,
+        /// Input port on `dst`. Only a ChannelMerger has more than one.
+        dst_input: u32,
         resp: AudioResp<()>,
     },
 
@@ -337,6 +353,18 @@ pub enum AudioCmd {
 
     /// Set AnalyserNode fft_size (fire-and-forget)
     SetAnalyserFftSize { node_id: AudioNodeId, fft_size: u32 },
+
+    /// Set one of an AnalyserNode's scalar properties.
+    ///
+    /// `minDecibels`, `maxDecibels` and `smoothingTimeConstant` were JavaScript-only
+    /// state: the setters stored a value that never reached the node doing the
+    /// analysis, so the dB window and the smoothing the spec defines the frequency
+    /// data in terms of were all ignored.
+    SetAnalyserScalar {
+        node_id: AudioNodeId,
+        prop: String,
+        value: f32,
+    },
 
     /// Get AnalyserNode time domain data (byte)
     GetAnalyserByteTimeDomainData {
@@ -638,7 +666,8 @@ impl AudioCmd {
             Self::SetPanningModel { model, .. } | Self::SetDistanceModel { model, .. } => {
                 model.capacity()
             }
-            Self::SetPannerScalar { prop, .. } => prop.capacity(),
+            Self::SetPannerScalar { prop, .. }
+            | Self::SetAnalyserScalar { prop, .. } => prop.capacity(),
             Self::CreateIIRFilter {
                 feedforward,
                 feedback,
@@ -650,6 +679,7 @@ impl AudioCmd {
             Self::InnerAudioLoadUrl { url, .. } => url.capacity(),
             Self::CreateContext { .. }
             | Self::ReleaseContext { .. }
+            | Self::ReleaseNode { .. }
             | Self::ReleaseAllContexts
             | Self::CloseContext { .. }
             | Self::GetContextState { .. }

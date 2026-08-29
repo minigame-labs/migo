@@ -551,6 +551,14 @@ impl Mp3StreamDecoder {
             self.isolate_remaining_frames(out);
         }
 
+        // The resampler defers any output frame whose interpolation neighbour has
+        // not arrived. At the end of a stream it never will, so without this the
+        // tail of every resampled track was dropped -- a step discontinuity at a
+        // loop seam, heard as a click on each repeat.
+        if let Some(resampler) = self.resampler.as_mut() {
+            resampler.flush_into(out);
+        }
+
         (self.sample_rate, self.channels)
     }
 

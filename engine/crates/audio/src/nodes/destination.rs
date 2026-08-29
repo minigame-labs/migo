@@ -2,7 +2,7 @@ use std::any::Any;
 
 use shared::protocol::audio_cmd::AudioNodeId;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
 /// The destination node represents the final output of the audio graph.
 /// It collects mixed audio from all connected source nodes.
@@ -20,10 +20,6 @@ impl DestinationNode {
 impl AudioNodeProcessor for DestinationNode {
     fn id(&self) -> AudioNodeId {
         self.id
-    }
-
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::Destination
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

@@ -21,6 +21,20 @@ enum AutomationEvent {
 }
 
 impl AutomationEvent {
+    /// The value the timeline holds once this event is behind us.
+    ///
+    /// `SetTarget` is asymptotic, so its nominal endpoint is its target: that is
+    /// what a following ramp has to interpolate from.
+    fn end_value(&self) -> Option<f32> {
+        match self {
+            Self::SetValue { value, .. }
+            | Self::LinearRamp { value, .. }
+            | Self::ExponentialRamp { value, .. } => Some(*value),
+            Self::SetTarget { target, .. } => Some(*target),
+            Self::CancelScheduled { .. } => None,
+        }
+    }
+
     fn time(&self) -> f64 {
         match self {
             Self::SetValue { time, .. } => *time,
@@ -149,105 +163,32 @@ impl AudioParamTimeline {
         !self.events.is_empty()
     }
 
-    /// Compute the parameter value at a given context time.
-    /// This evaluates the automation timeline and returns the correct value.
+    /// Compute the parameter value at a given context time (k-rate).
     pub fn compute_value(&self, current_time: f64) -> f32 {
         if self.events.is_empty() {
             return self.current_value;
         }
-
-        let mut value = self.current_value;
-        let mut prev_time = 0.0f64;
-        let mut prev_value = self.current_value;
-
-        for event in &self.events {
-            match event {
-                AutomationEvent::SetValue {
-                    value: set_val,
-                    time,
-                } => {
-                    if current_time >= *time {
-                        value = *set_val;
-                    }
-                    // This event bounds the start of any following ramp, even when
-                    // it is still in the future relative to `current_time`.
-                    prev_time = *time;
-                    prev_value = *set_val;
-                }
-                AutomationEvent::LinearRamp {
-                    value: end_val,
-                    end_time,
-                } => {
-                    if current_time >= *end_time {
-                        value = *end_val;
-                    } else if current_time >= prev_time {
-                        let duration = *end_time - prev_time;
-                        value = if duration > 0.0 {
-                            let t = ((current_time - prev_time) / duration) as f32;
-                            prev_value + (*end_val - prev_value) * t
-                        } else {
-                            *end_val
-                        };
-                    }
-                    // current_time < prev_time: the ramp has not started; hold value.
-                    prev_time = *end_time;
-                    prev_value = *end_val;
-                }
-                AutomationEvent::ExponentialRamp {
-                    value: end_val,
-                    end_time,
-                } => {
-                    if current_time >= *end_time {
-                        value = *end_val;
-                    } else if current_time >= prev_time && prev_value.abs() > f32::EPSILON {
-                        let duration = *end_time - prev_time;
-                        if duration > 0.0 {
-                            let t = ((current_time - prev_time) / duration) as f32;
-                            let ratio = *end_val / prev_value;
-                            value = prev_value * ratio.powf(t);
-                        }
-                    }
-                    prev_time = *end_time;
-                    prev_value = *end_val;
-                }
-                AutomationEvent::SetTarget {
-                    target,
-                    start_time,
-                    time_constant,
-                } => {
-                    if current_time >= *start_time {
-                        let elapsed = current_time - *start_time;
-                        let exp = (-elapsed / *time_constant).exp() as f32;
-                        value = *target + (prev_value - *target) * exp;
-                    }
-                    // SetTarget is asymptotic; treat the target as the segment's
-                    // nominal endpoint for any following ramp.
-                    prev_time = *start_time;
-                    prev_value = *target;
-                }
-                AutomationEvent::CancelScheduled { .. } => {
-                    // Already handled by cancel_scheduled_values
-                }
-            }
-        }
-
-        value.clamp(self.min_value, self.max_value)
+        let mut cursor = self.cursor();
+        self.value_at(current_time, &mut cursor)
     }
 
-    /// Fill a buffer with per-sample automation values.
-    /// This is the high-performance path used during audio processing.
+    /// Fill a buffer with per-sample automation values (a-rate).
     ///
     /// `start_time`: context time at the start of the buffer
-    /// `buffer`: output buffer to fill with parameter values
+    /// `buffer`: one value per **frame**
     /// `sample_rate`: audio sample rate for time calculation
+    ///
+    /// One forward walk of the timeline for the whole buffer. This used to call
+    /// `compute_value` per sample, and each of those re-walked every event from the
+    /// start, so a-rate automation cost `O(frames * events)` per quantum.
     pub fn compute_values(&self, start_time: f64, buffer: &mut [f32], sample_rate: u32) {
         if self.events.is_empty() {
-            // No automation — fill with constant value
+            // No automation -- fill with constant value
             buffer.fill(self.current_value);
             return;
         }
 
-        let inv_sample_rate = 1.0 / sample_rate as f64;
+        let inv_sample_rate = 1.0 / sample_rate.max(1) as f64;
         let end_time = start_time + (buffer.len() as f64) * inv_sample_rate;
 
         // Fast path: nothing is active yet. Only valid when the first event is a
@@ -266,9 +207,10 @@ impl AudioParamTimeline {
             }
         }
 
-        for (i, sample) in buffer.iter_mut().enumerate() {
-            let t = start_time + i as f64 * inv_sample_rate;
-            *sample = self.compute_value(t);
+        let mut cursor = self.cursor();
+        for (index, sample) in buffer.iter_mut().enumerate() {
+            let time = start_time + index as f64 * inv_sample_rate;
+            *sample = self.value_at(time, &mut cursor);
         }
     }
 
@@ -308,6 +250,113 @@ impl AudioParamTimeline {
             .binary_search_by(|e| e.time().partial_cmp(&time).unwrap_or(Ordering::Equal))
             .unwrap_or_else(|pos| pos);
         self.events.insert(pos, event);
+    }
+}
+
+/// Where a timeline walk has got to.
+///
+/// Automation is evaluated at strictly increasing times within a render quantum,
+/// so a walk only ever moves forward. Carrying that position across the quantum is
+/// what turns a-rate evaluation from `O(frames * events)` into `O(frames +
+/// events)`: `compute_values` used to call `compute_value` per sample, and each of
+/// those calls re-walked the whole event list from the beginning.
+#[derive(Debug, Clone, Copy)]
+struct TimelineCursor {
+    /// Index of the first event not yet fully behind us.
+    index: usize,
+    /// Time and value of the last completed event, which bound any ramp in
+    /// progress. Zero and the static value before the first event, matching what
+    /// the timeline holds at context time zero.
+    prev_time: f64,
+    prev_value: f32,
+    /// Value currently held, for times that fall in no segment.
+    held: f32,
+}
+
+impl AudioParamTimeline {
+    fn cursor(&self) -> TimelineCursor {
+        TimelineCursor {
+            index: 0,
+            prev_time: 0.0,
+            prev_value: self.current_value,
+            held: self.current_value,
+        }
+    }
+
+    /// Advance `cursor` to `time` and return the value there.
+    ///
+    /// The single definition of what the timeline means; both the k-rate
+    /// (`compute_value`) and a-rate (`compute_values`) paths go through it, so they
+    /// cannot disagree about a ramp's shape.
+    fn value_at(&self, time: f64, cursor: &mut TimelineCursor) -> f32 {
+        // Retire every segment that is wholly in the past.
+        while let Some(event) = self.events.get(cursor.index) {
+            let finished = match event {
+                AutomationEvent::SetValue { time: at, .. } => time >= *at,
+                AutomationEvent::LinearRamp { end_time, .. }
+                | AutomationEvent::ExponentialRamp { end_time, .. } => time >= *end_time,
+                // Asymptotic: only a later event ends it.
+                AutomationEvent::SetTarget { .. } => self
+                    .events
+                    .get(cursor.index + 1)
+                    .is_some_and(|next| time >= next.time()),
+                AutomationEvent::CancelScheduled { .. } => true,
+            };
+            if !finished {
+                break;
+            }
+            cursor.prev_time = event.time();
+            if let Some(value) = event.end_value() {
+                cursor.prev_value = value;
+                cursor.held = value;
+            }
+            cursor.index += 1;
+        }
+
+        let mut value = cursor.held;
+        if let Some(event) = self.events.get(cursor.index) {
+            match event {
+                AutomationEvent::SetValue { .. } | AutomationEvent::CancelScheduled { .. } => {}
+                AutomationEvent::LinearRamp {
+                    value: end,
+                    end_time,
+                } => {
+                    if time >= cursor.prev_time {
+                        let duration = *end_time - cursor.prev_time;
+                        value = if duration > 0.0 {
+                            let progress = ((time - cursor.prev_time) / duration) as f32;
+                            cursor.prev_value + (*end - cursor.prev_value) * progress
+                        } else {
+                            *end
+                        };
+                    }
+                }
+                AutomationEvent::ExponentialRamp {
+                    value: end,
+                    end_time,
+                } => {
+                    if time >= cursor.prev_time && cursor.prev_value.abs() > f32::EPSILON {
+                        let duration = *end_time - cursor.prev_time;
+                        if duration > 0.0 {
+                            let progress = ((time - cursor.prev_time) / duration) as f32;
+                            value = cursor.prev_value * (*end / cursor.prev_value).powf(progress);
+                        }
+                    }
+                }
+                AutomationEvent::SetTarget {
+                    target,
+                    start_time,
+                    time_constant,
+                } => {
+                    if time >= *start_time {
+                        let elapsed = time - *start_time;
+                        let decay = (-elapsed / *time_constant).exp() as f32;
+                        value = *target + (cursor.prev_value - *target) * decay;
+                    }
+                }
+            }
+        }
+        value.clamp(self.min_value, self.max_value)
     }
 }
 
@@ -378,5 +427,58 @@ mod tests {
         future.set_value_at_time(2.0, 20.0);
         future.gc_events(5.0);
         assert_eq!(future.events.len(), 2, "future events must be kept");
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    /// The a-rate walk and the k-rate evaluation must agree at every point. They
+    /// share `value_at`, and this is what says so: a cursor carried across a buffer
+    /// must produce exactly what a fresh evaluation at each of those times does.
+    #[test]
+    fn the_forward_walk_matches_pointwise_evaluation() {
+        let mut param = AudioParamTimeline::new(0.25, 0.0, 4.0);
+        param.set_value_at_time(1.0, 0.001);
+        param.linear_ramp_to_value_at_time(2.0, 0.003);
+        param.exponential_ramp_to_value_at_time(0.5, 0.005);
+        param.set_target_at_time(3.0, 0.006, 0.001);
+        param.set_value_at_time(0.75, 0.009);
+
+        let sample_rate = 8_000;
+        let mut buffer = vec![0.0f32; 128];
+        param.compute_values(0.0, &mut buffer, sample_rate);
+
+        for (index, &walked) in buffer.iter().enumerate() {
+            let time = index as f64 / sample_rate as f64;
+            let pointwise = param.compute_value(time);
+            assert!(
+                (walked - pointwise).abs() < 1e-6,
+                "sample {index} at t={time}: walk gave {walked}, pointwise {pointwise}"
+            );
+        }
+    }
+
+    /// A cursor only moves forward, so a long event list must not change what a
+    /// short buffer sees -- and the walk must still land on the right segment when
+    /// most of the timeline is already behind it.
+    #[test]
+    fn a_buffer_starting_mid_timeline_lands_on_the_right_segment() {
+        let mut param = AudioParamTimeline::new(0.0, 0.0, 100.0);
+        for i in 0..50 {
+            param.set_value_at_time(i as f32, i as f64 * 0.001);
+        }
+
+        let sample_rate = 8_000;
+        let mut buffer = vec![0.0f32; 8];
+        param.compute_values(0.030, &mut buffer, sample_rate);
+
+        // t = 0.030 is event 30's time, so the value held is 30.
+        assert!(
+            (buffer[0] - 30.0).abs() < 1e-6,
+            "expected the value at t=0.030 to be 30, got {}",
+            buffer[0]
+        );
     }
 }

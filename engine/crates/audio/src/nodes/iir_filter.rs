@@ -2,7 +2,7 @@ use std::any::Any;
 
 use shared::protocol::audio_cmd::AudioNodeId;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
 /// IIRFilterNode: generic IIR filter with user-provided coefficients.
 ///
@@ -116,10 +116,6 @@ impl IIRFilterNode {
 impl AudioNodeProcessor for IIRFilterNode {
     fn id(&self) -> AudioNodeId {
         self.id
-    }
-
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::IIRFilter
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

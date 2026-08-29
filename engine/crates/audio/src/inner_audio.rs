@@ -281,6 +281,19 @@ impl AudioSource {
     }
 }
 
+/// Linearly interpolate channel `ch` between two interleaved source frames.
+///
+/// A free function rather than a method so it can be called while `samples` is
+/// borrowed out of `self.source` on a path that also touches `&mut self`, and so
+/// the interpolation rule has exactly one definition across the three channel
+/// mappings below.
+#[inline]
+fn lerp_frame(samples: &[f32], base0: usize, base1: usize, ch: usize, frac: f32) -> f32 {
+    let a = samples[base0 + ch];
+    let b = samples[base1 + ch];
+    a + (b - a) * frac
+}
+
 /// InnerAudioPlayer - handles playback of a single audio source
 ///
 /// This is stored in the audio thread and processes samples for output.
@@ -764,8 +777,8 @@ impl InnerAudioPlayer {
         // Get samples reference after seek handling
         let samples = self.source.samples();
 
-        // Simple playback rate handling (no interpolation for now, just skip/repeat frames)
-        // We track position in FRAMES (not samples) using 16.16 fixed point
+        // Position is tracked in FRAMES (not samples) as 16.16 fixed point; the
+        // fractional part drives the interpolation below.
         let rate_fixed = (playback_rate * 65536.0) as u64;
         let current_frame = self.position / channels;
         let mut frame_fixed = (current_frame as u64) << 16; // 16.16 fixed point for frame position
@@ -787,10 +800,10 @@ impl InnerAudioPlayer {
                         src_frame,
                         total_frames
                     );
-                    let start = frame_idx * output_channels;
-                    for s in output[start..].iter_mut() {
-                        *s = 0.0;
-                    }
+                    // Contribute nothing for the rest of the block. `output` is the
+                    // shared mix bus that every context and every other player has
+                    // already added into, so writing silence here would delete their
+                    // audio for up to a whole block, not just mute this player.
                     // Keep position at end of available data
                     let final_frame = total_frames.saturating_sub(1);
                     self.position = final_frame * channels;
@@ -823,11 +836,8 @@ impl InnerAudioPlayer {
                     self.shared.set_state(PlaybackState::Stopped);
                     self.push_event(InnerAudioEventType::Ended);
 
-                    // Fill remaining with silence
-                    let start = frame_idx * output_channels;
-                    for s in output[start..].iter_mut() {
-                        *s = 0.0;
-                    }
+                    // Stop contributing; do not clear. See the streaming-stall
+                    // branch above: `output` is the shared additive mix bus.
                     self.position = 0;
                     self.shared.set_position_frames(0);
                     self.frames_since_time_update = 0;
@@ -835,40 +845,42 @@ impl InnerAudioPlayer {
                 }
             }
 
-            let src_sample_start = src_frame * channels;
-
-            // Mix into output (handle channel conversion)
-            let dst_start = frame_idx * output_channels;
-            let total_samples = samples.len();
-
-            if channels == output_channels {
-                // Same channel count - direct mix
-                for ch in 0..channels {
-                    if src_sample_start + ch < total_samples && dst_start + ch < output.len() {
-                        output[dst_start + ch] += samples[src_sample_start + ch] * volume;
-                    }
-                }
-            } else if channels == 1 && output_channels == 2 {
-                // Mono to stereo
-                if src_sample_start < total_samples && dst_start + 1 < output.len() {
-                    let sample = samples[src_sample_start] * volume;
-                    output[dst_start] += sample;
-                    output[dst_start + 1] += sample;
-                }
-            } else if channels == 2 && output_channels == 1 {
-                // Stereo to mono
-                if src_sample_start + 1 < total_samples && dst_start < output.len() {
-                    let sample =
-                        (samples[src_sample_start] + samples[src_sample_start + 1]) * 0.5 * volume;
-                    output[dst_start] += sample;
-                }
+            // Interpolate toward the next source frame. Truncating the
+            // fixed-point position is a zero-order hold, so any playbackRate
+            // other than 1.0 produced broadband aliasing rather than a pitch
+            // shift. The successor wraps to the loop start so the seam does not
+            // flatten into the final frame.
+            let frac = (frame_fixed & 0xFFFF) as f32 / 65536.0;
+            let next_frame = if src_frame + 1 < total_frames {
+                src_frame + 1
+            } else if loop_enabled {
+                0
             } else {
-                // Generic downmix/upmix - just use first channels
-                let copy_channels = channels.min(output_channels);
-                for ch in 0..copy_channels {
-                    if src_sample_start + ch < total_samples && dst_start + ch < output.len() {
-                        output[dst_start + ch] += samples[src_sample_start + ch] * volume;
-                    }
+                src_frame
+            };
+            let base0 = src_frame * channels;
+            let base1 = next_frame * channels;
+            let dst_start = frame_idx * output_channels;
+
+            // `src_frame` and `next_frame` are both below `total_frames`, and
+            // `frame_idx` below `output_frames`, so every index below is in range
+            // by construction.
+            if channels == 1 {
+                // Mono up-mixes to every output channel by duplication.
+                let sample = lerp_frame(samples, base0, base1, 0, frac) * volume;
+                for ch in 0..output_channels {
+                    output[dst_start + ch] += sample;
+                }
+            } else if output_channels == 1 {
+                // Down-mix to mono is the average of the source channels.
+                let mut sum = 0.0;
+                for ch in 0..channels {
+                    sum += lerp_frame(samples, base0, base1, ch, frac);
+                }
+                output[dst_start] += sum / channels as f32 * volume;
+            } else {
+                for ch in 0..channels.min(output_channels) {
+                    output[dst_start + ch] += lerp_frame(samples, base0, base1, ch, frac) * volume;
                 }
             }
 
@@ -961,6 +973,84 @@ mod tests {
             waiting, 1,
             "Waiting must fire once per stall episode, not every audio tick"
         );
+    }
+
+    /// `output` is the mix bus every AudioContext and every other player has
+    /// already added into by the time a player runs, so a player that runs out
+    /// of audio must stop contributing rather than write silence. Clearing the
+    /// tail deleted co-mixed audio for the rest of the block, which is heard as
+    /// a hole in unrelated sounds whenever one track happens to end.
+    #[test]
+    fn a_player_that_ends_mid_block_leaves_co_mixed_audio_alone() {
+        const CO_MIXED: f32 = 7.0;
+
+        let mut player = InnerAudioPlayer::new(1, 2);
+        player.shared.set_sample_rate(48_000);
+        player.shared.set_channels(2);
+        player.shared.set_loaded(true);
+        // Two stereo frames of audio against a four-frame block.
+        player.source.extend_from_slice(&[1.0, 1.0, 1.0, 1.0]);
+        player.shared.set_state(PlaybackState::Playing);
+
+        let mut out = [CO_MIXED; 8];
+        assert!(!player.process(&mut out), "the player has ended");
+
+        assert_eq!(
+            &out[..4],
+            &[CO_MIXED + 1.0; 4],
+            "the player's own frames must be added, not assigned"
+        );
+        assert_eq!(
+            &out[4..],
+            &[CO_MIXED; 4],
+            "frames past the end of this player's audio must keep what other \
+             sources already mixed there"
+        );
+    }
+
+    #[test]
+    fn a_player_stalled_on_stream_data_leaves_co_mixed_audio_alone() {
+        const CO_MIXED: f32 = -3.5;
+
+        let state = StreamingState::new();
+        let (_tx, rx) = mpsc::channel::<StreamMsg>(1);
+        let mut player = InnerAudioPlayer::new(1, 2);
+        player.start_streaming("http://example/x.mp3".into(), rx, state);
+        player.shared.set_sample_rate(48_000);
+        player.shared.set_channels(2);
+        player.shared.set_loaded(true);
+        player.source.extend_from_slice(&[1.0, 1.0]);
+        player.shared.set_state(PlaybackState::Playing);
+        player.position = 2; // already at the buffered edge
+
+        let mut out = [CO_MIXED; 8];
+        assert!(player.process(&mut out), "still playing, waiting for data");
+
+        assert_eq!(
+            out,
+            [CO_MIXED; 8],
+            "a stalled stream must contribute nothing, not silence the bus"
+        );
+    }
+
+    /// A fractional playback rate must interpolate. Truncating the 16.16
+    /// position is a zero-order hold, which on a ramp repeats samples where the
+    /// true signal is a straight line -- broadband aliasing, not a pitch shift.
+    #[test]
+    fn a_fractional_playback_rate_interpolates_between_source_frames() {
+        let mut player = InnerAudioPlayer::new(1, 1); // mono out
+        player.shared.set_sample_rate(48_000);
+        player.shared.set_channels(1);
+        player.shared.set_loaded(true);
+        player
+            .source
+            .extend_from_slice(&(0..16).map(|i| i as f32).collect::<Vec<_>>());
+        player.shared.set_state(PlaybackState::Playing);
+        player.shared.set_playback_rate(0.5);
+
+        let mut out = [0.0f32; 6];
+        assert!(player.process(&mut out));
+        assert_eq!(out, [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
     }
 
     #[test]

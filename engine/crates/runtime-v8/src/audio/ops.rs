@@ -367,6 +367,24 @@ pub fn op_audio_release_context(
         .map_err(AudioError::from)
 }
 
+/// Mark an AudioNode as unreachable from JavaScript, from its GC finalizer.
+///
+/// Fire-and-forget and idempotent. The audio thread treats it as a request, not
+/// a removal: JavaScript drops a `source -> gain -> destination` chain as one
+/// unreachable object graph, so this can arrive while the source is still
+/// playing through the node. The node is dropped once nothing upstream can feed
+/// it, so this cannot cut a sound short.
+#[op2(fast)]
+pub fn op_audio_release_node(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::ReleaseNode { ctx_id, node_id })
+        .map_err(AudioError::from)
+}
+
 /// Resume a suspended AudioContext
 #[op2(async(lazy), fast)]
 pub async fn op_audio_resume_context(
@@ -875,13 +893,17 @@ pub async fn op_audio_connect(
     state: Rc<RefCell<OpState>>,
     #[smi] src: AudioNodeId,
     #[smi] dst: AudioNodeId,
+    #[smi] src_output: u32,
+    #[smi] dst_input: u32,
 ) -> Result<(), AudioError> {
     let tx = get_audio_tx(state);
     let (resp_tx, resp_rx) = oneshot::channel();
 
     tx.send(AudioCmd::Connect {
         src,
+        src_output,
         dst,
+        dst_input,
         resp: resp_tx,
     })
     .map_err(AudioError::from)?;
@@ -1341,6 +1363,31 @@ pub fn op_audio_set_distance_model(
         AudioCmd::SetDistanceModel {
             node_id,
             model: model.to_owned(),
+        },
+        permit,
+    )
+    .map_err(AudioError::from)
+}
+
+/// Set one of an AnalyserNode's scalar properties.
+///
+/// These used to live only in JavaScript, so the analysis the node performed
+/// ignored the dB window and the smoothing the spec defines its output in terms of.
+#[op2(fast)]
+pub fn op_audio_set_analyser_scalar(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] prop: &str,
+    value: f32,
+) -> Result<(), AudioError> {
+    validate_audio_control_string("analyser property", prop).map_err(AudioError::from)?;
+    let tx = get_audio_tx(state);
+    let permit = tx.try_reserve_data(prop.len()).map_err(AudioError::from)?;
+    tx.send_reserved(
+        AudioCmd::SetAnalyserScalar {
+            node_id,
+            prop: prop.to_owned(),
+            value,
         },
         permit,
     )
@@ -2898,8 +2945,58 @@ mod tests {
         assert!(buffer.contains("op_audio_release_buffer(id)"));
 
         assert!(context.contains("op_audio_release_context"));
-        assert!(context.contains("const PENDING_CONTEXT_RELEASES = new Set()"));
-        assert!(context.contains("setTimeout(flushPendingContextReleases"));
+        assert!(
+            context.contains("createReleaseQueue(op_audio_release_context)"),
+            "the context release must go through the shared retrying queue"
+        );
+    }
+
+    /// Every non-source node a game creates -- one gain per sound effect is the
+    /// ordinary shape -- used to stay in the native graph for the context's whole
+    /// life, with its render buffer, processed every quantum forever, because
+    /// nothing told the audio thread the JS object was gone.
+    #[test]
+    fn unreachable_audio_nodes_release_their_native_node() {
+        let node = include_str!("00_audio_node.js");
+
+        assert!(
+            node.contains("new FinalizationRegistry"),
+            "an unreachable AudioNode needs a native cleanup path"
+        );
+        assert!(
+            node.contains("op_audio_release_node(ctxId, nodeId)"),
+            "the finalizer must release the native node"
+        );
+        assert!(
+            node.contains("NODE_FINALIZER.register(this"),
+            "every node must be registered when it is constructed"
+        );
+        // The retry must never hold the object it is trying to free.
+        assert!(
+            !node.contains("pending.set(key, this)"),
+            "a queued release must retain ids, not nodes"
+        );
+    }
+
+    /// The bounded-queue backoff exists once. It used to be transcribed per
+    /// resource kind, which is two places for the same rule to drift.
+    #[test]
+    fn native_releases_share_one_retry_queue() {
+        let node = include_str!("00_audio_node.js");
+        let context = include_str!("01_audio_context.js");
+
+        assert!(
+            node.contains("function createReleaseQueue("),
+            "the retry queue must be defined once"
+        );
+        assert!(
+            !context.contains("function flushPendingContextReleases"),
+            "the context module must not carry a second copy of the backoff"
+        );
+        assert!(
+            context.contains("createReleaseQueue"),
+            "the context release must use the shared queue"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use shared::protocol::audio_cmd::AudioNodeId;
 
 use crate::param::AudioParamTimeline;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
 pub struct GainNode {
     id: AudioNodeId,
@@ -35,10 +35,6 @@ impl GainNode {
 impl AudioNodeProcessor for GainNode {
     fn id(&self) -> AudioNodeId {
         self.id
-    }
-
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::Gain
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

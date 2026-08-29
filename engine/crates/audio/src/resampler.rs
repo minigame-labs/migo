@@ -2,51 +2,68 @@ use shared::error::{EngineError, EngineResult, ErrorCode};
 
 use crate::decoder::DecodedAudio;
 
-/// Simple streaming resampler using linear interpolation
-/// Suitable for real-time streaming where low latency is more important than quality
+/// Streaming linear-interpolation resampler with an exact rational step.
+///
+/// The read position is kept as a whole frame count plus a fraction expressed as
+/// `pos_num / output_rate`, advanced by adding `input_rate` and carrying. That is
+/// exact for every rate pair. The step used to be a 16.16 fixed-point ratio,
+/// which truncates: 44.1 kHz to 48 kHz came out 3.3e-6 short, so a three-minute
+/// track finished about 28 frames early and a resampled loop was never
+/// sample-exact.
 pub struct StreamResampler {
-    channels: u32,
-    /// Fractional read position (16.16 fixed point) into the virtual input, which is
+    channels: usize,
+    input_rate: u64,
+    output_rate: u64,
+    /// Whole-frame read position within the virtual input, which is
     /// `[previous chunk's last frame] ++ current chunk`.
-    position: u64,
-    /// Rate ratio as 16.16 fixed point (input_rate / output_rate).
-    ratio: u64,
-    /// Last input frame of the previous chunk (`channels` samples), used as the virtual
-    /// prefix so interpolation stays continuous across chunk boundaries. Empty before
-    /// the first chunk.
+    pos_frames: u64,
+    /// Fractional read position, as `pos_num / output_rate`.
+    pos_num: u64,
+    /// Last input frame of the previous chunk (`channels` samples), the virtual
+    /// prefix that keeps interpolation continuous across a chunk boundary. Empty
+    /// before the first chunk.
     ///
     /// One buffer, refilled in place. It used to be rebuilt with `to_vec` on every
-    /// call, which on the streaming path meant one allocation per MP3 frame for
-    /// as few as two samples.
+    /// call, which on the streaming path meant one allocation per MP3 frame for as
+    /// few as two samples.
     history: Vec<f32>,
 }
 
 impl StreamResampler {
     pub fn new(input_rate: u32, output_rate: u32, channels: u32) -> Self {
-        // Rate ratio as 16.16 fixed point.
-        let ratio = ((input_rate as u64) << 16) / output_rate as u64;
-
         Self {
-            channels,
-            position: 0,
-            ratio,
+            channels: channels as usize,
+            input_rate: input_rate.max(1) as u64,
+            output_rate: output_rate.max(1) as u64,
+            pos_frames: 0,
+            pos_num: 0,
             history: Vec::with_capacity(channels as usize),
         }
     }
 
+    /// Advance the read position by exactly one output frame.
+    #[inline]
+    fn advance(&mut self) {
+        self.pos_num += self.input_rate;
+        self.pos_frames += self.pos_num / self.output_rate;
+        self.pos_num %= self.output_rate;
+    }
+
     /// Resample `input`, **appending** the result to `output`.
     ///
-    /// Streaming-safe: an output frame whose right-hand interpolation neighbour would
-    /// fall in the *next* chunk is deferred (the read position carries over) rather than
-    /// approximated, so concatenating the per-chunk outputs equals a single-pass resample
-    /// of the whole stream — no sample is skipped or duplicated at a chunk boundary.
+    /// Streaming-safe: an output frame whose right-hand interpolation neighbour
+    /// would fall in the *next* chunk is deferred (the read position carries over)
+    /// rather than approximated, so concatenating the per-chunk outputs equals a
+    /// single-pass resample of the whole stream -- no sample is skipped or
+    /// duplicated at a chunk boundary. Call [`Self::flush_into`] once at the end of
+    /// the stream to emit the frame that has no successor at all.
     ///
     /// Appending into a caller-owned buffer is the only shape offered on purpose.
     /// The convenience wrapper that returned a fresh `Vec` was the streaming
-    /// decoder's per-frame allocation, and an allocating call left available is
-    /// one a future caller will reach for.
+    /// decoder's per-frame allocation, and an allocating call left available is one
+    /// a future caller will reach for.
     pub fn process_into(&mut self, input: &[f32], output: &mut Vec<f32>) {
-        let channels = self.channels as usize;
+        let channels = self.channels;
         if channels == 0 || input.is_empty() {
             return;
         }
@@ -57,10 +74,7 @@ impl StreamResampler {
             return;
         }
 
-        // Virtual input = [previous chunk's last frame] ++ this chunk. Taken out
-        // rather than borrowed so the same allocation can be refilled below,
-        // after the closure that reads it has gone.
-        let mut prefix = std::mem::take(&mut self.history);
+        let prefix = std::mem::take(&mut self.history);
         let has_prefix = !prefix.is_empty();
         let work_len = n_chunk + usize::from(has_prefix);
 
@@ -72,39 +86,65 @@ impl StreamResampler {
             }
         };
 
-        let est_frames = ((n_chunk as u64) << 16) / self.ratio.max(1);
+        let est_frames = (n_chunk as u64 * self.output_rate) / self.input_rate;
         output.reserve((est_frames as usize + 1) * channels);
 
-        loop {
-            let pos_int = (self.position >> 16) as usize;
-            if pos_int + 1 >= work_len {
-                break; // the successor sample belongs to the next chunk — defer it
-            }
-            let frac = (self.position & 0xFFFF) as f32 / 65536.0;
+        while (self.pos_frames as usize) + 1 < work_len {
+            let frame = self.pos_frames as usize;
+            let frac = self.pos_num as f32 / self.output_rate as f32;
             for ch in 0..channels {
-                let s0 = virtual_at(pos_int, ch);
-                let s1 = virtual_at(pos_int + 1, ch);
+                let s0 = virtual_at(frame, ch);
+                let s1 = virtual_at(frame + 1, ch);
                 output.push(s0 + (s1 - s0) * frac);
             }
-            self.position += self.ratio;
+            self.advance();
         }
 
-        // This chunk's last frame becomes virtual index 0 of the next chunk, so rebase the
-        // read position by however many virtual frames we advanced past.
+        // This chunk's last frame becomes virtual index 0 of the next chunk, so
+        // rebase the read position by however many virtual frames were passed.
         let consumed = (work_len - 1) as u64;
-        self.position -= consumed << 16;
+        self.pos_frames = self.pos_frames.saturating_sub(consumed);
 
         let last_frame_start = (n_chunk - 1) * channels;
+        let mut prefix = prefix;
         prefix.clear();
         prefix.extend_from_slice(&input[last_frame_start..last_frame_start + channels]);
         self.history = prefix;
+    }
+
+    /// Emit the output frames that were waiting on a successor that will never
+    /// arrive, holding the final input frame.
+    ///
+    /// **Without this the end of every resampled buffer was silently dropped.**
+    /// `process_into` defers any output frame whose right-hand neighbour is not in
+    /// the chunk yet, which is correct mid-stream and wrong at the end: the last
+    /// frames were deferred forever. A resampled loop therefore restarted a frame
+    /// or two early, which is a step discontinuity at the seam -- an audible click
+    /// on every repeat.
+    pub fn flush_into(&mut self, output: &mut Vec<f32>) {
+        let channels = self.channels;
+        if channels == 0 || self.history.len() < channels {
+            return;
+        }
+        // `history` is the whole remaining virtual input: one frame, at index 0.
+        while self.pos_frames == 0 {
+            let frac = self.pos_num as f32 / self.output_rate as f32;
+            for ch in 0..channels {
+                // No successor, so the final frame is held rather than
+                // interpolated toward silence, which would fade the tail out.
+                let s0 = self.history[ch];
+                output.push(s0 + (s0 - s0) * frac);
+            }
+            self.advance();
+        }
+        self.history.clear();
     }
 }
 
 /// Resample audio to target sample rate if needed.
 ///
-/// Uses linear interpolation — sufficient for game audio (sound effects, BGM).
-/// This avoids pulling in the heavyweight `rubato` crate (~150-200KB SO).
+/// Linear interpolation -- sufficient for game audio (sound effects, BGM) and it
+/// avoids pulling in the heavyweight `rubato` crate (~150-200KB SO).
 pub fn resample_if_needed(
     audio: DecodedAudio,
     target_sample_rate: u32,
@@ -113,14 +153,6 @@ pub fn resample_if_needed(
     if audio.sample_rate == target_sample_rate {
         return Ok(audio);
     }
-
-    tracing::debug!(
-        "Resampling audio from {} Hz to {} Hz ({} channels, {} frames)",
-        audio.sample_rate,
-        target_sample_rate,
-        audio.channels,
-        audio.frame_count()
-    );
 
     let channels = audio.channels as usize;
     let input_frames = audio.frame_count();
@@ -156,12 +188,7 @@ pub fn resample_if_needed(
         resampler.process_into(&audio.samples[pos..end], &mut output_samples);
         pos = end;
     }
-
-    tracing::debug!(
-        "Resampling complete: {} input frames -> {} output frames",
-        input_frames,
-        output_samples.len() / channels
-    );
+    resampler.flush_into(&mut output_samples);
 
     Ok(DecodedAudio {
         samples: output_samples,
@@ -203,8 +230,9 @@ mod tests {
         let step = input_rate as f64 / output_rate as f64; // 0.5 input frame per output frame
         let mut max_err = 0.0f64;
         let mut worst_k = 0usize;
-        // The final 2 frames have no successor sample (end of stream) — skip them.
-        for k in 0..out.frame_count().saturating_sub(2) {
+        // Every frame is asserted now: the tail is emitted rather than deferred
+        // forever, and the last frame holds instead of interpolating toward silence.
+        for k in 0..out.frame_count().saturating_sub(1) {
             let want = k as f64 * step;
             let err = (out.samples[k] as f64 - want).abs();
             if err > max_err {
@@ -240,7 +268,9 @@ mod tests {
         }
 
         let mut single = Vec::new();
-        StreamResampler::new(input_rate, output_rate, channels).process_into(&samples, &mut single);
+        let mut one_pass = StreamResampler::new(input_rate, output_rate, channels);
+        one_pass.process_into(&samples, &mut single);
+        one_pass.flush_into(&mut single);
 
         let audio = DecodedAudio {
             samples,
@@ -282,6 +312,62 @@ mod tests {
         assert!(
             resample_if_needed(audio, 768_000).is_err(),
             "over-budget upsample must be rejected"
+        );
+    }
+
+    /// The step used to be a truncated 16.16 ratio, so 44.1 kHz to 48 kHz came out
+    /// 3.3e-6 short: a three-minute track ended about 28 frames early, and a
+    /// resampled loop was never sample-exact. An exact rational step cannot drift
+    /// no matter how long the stream is.
+    #[test]
+    fn the_rate_ratio_does_not_drift_over_a_long_stream() {
+        let input_rate = 44_100u32;
+        let output_rate = 48_000u32;
+        let input_frames = 44_100 * 180; // three minutes
+
+        let mut resampler = StreamResampler::new(input_rate, output_rate, 1);
+        let mut produced = 0usize;
+        let chunk = vec![0.0f32; 4_410];
+        let mut sink = Vec::new();
+        let mut fed = 0usize;
+        while fed < input_frames {
+            sink.clear();
+            resampler.process_into(&chunk, &mut sink);
+            produced += sink.len();
+            fed += chunk.len();
+        }
+        sink.clear();
+        resampler.flush_into(&mut sink);
+        produced += sink.len();
+
+        let expected = input_frames as u64 * output_rate as u64 / input_rate as u64;
+        let drift = (produced as i64 - expected as i64).abs();
+        assert!(
+            drift <= 1,
+            "produced {produced} frames, expected {expected} ({drift} frames of drift)"
+        );
+    }
+
+    /// A deferred tail is a shortened buffer, and a shortened loop restarts early
+    /// -- a step discontinuity at the seam, audible as a click on every repeat.
+    #[test]
+    fn the_final_frames_are_emitted_rather_than_deferred_forever() {
+        let audio = DecodedAudio {
+            samples: vec![1.0f32; 100],
+            sample_rate: 24_000,
+            channels: 1,
+        };
+        let out = resample_if_needed(audio, 48_000).unwrap();
+
+        assert_eq!(
+            out.frame_count(),
+            200,
+            "2x upsampling 100 frames must yield 200, not 198"
+        );
+        assert_eq!(
+            out.samples.last().copied(),
+            Some(1.0),
+            "the tail must hold the final sample, not fade toward silence"
         );
     }
 }

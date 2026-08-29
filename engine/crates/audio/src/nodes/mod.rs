@@ -34,27 +34,6 @@ use shared::protocol::audio_cmd::AudioNodeId;
 
 use crate::param::AudioParamTimeline;
 
-/// The type of an audio node, used for downcasting and dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioNodeType {
-    BufferSource,
-    Gain,
-    Destination,
-    Oscillator,
-    BiquadFilter,
-    Delay,
-    Analyser,
-    ChannelMerger,
-    ChannelSplitter,
-    ConstantSource,
-    DynamicsCompressor,
-    IIRFilter,
-    Panner,
-    WaveShaper,
-    #[allow(dead_code)]
-    ScriptProcessor,
-}
-
 /// Trait for all audio processing nodes in the audio graph.
 ///
 /// Each node receives mixed input from upstream connections and writes its
@@ -64,9 +43,6 @@ pub enum AudioNodeType {
 pub trait AudioNodeProcessor: Send + 'static {
     /// Get the unique node ID
     fn id(&self) -> AudioNodeId;
-
-    /// Get the type of this node
-    fn node_type(&self) -> AudioNodeType;
 
     /// Downcast support: return self as Any for type-specific operations
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -95,8 +71,17 @@ pub trait AudioNodeProcessor: Send + 'static {
         false
     }
 
-    /// Whether this node is a source node (generates audio, doesn't need input)
-    fn is_source(&self) -> bool {
+    /// Whether this node can still put audio onto its output on some future
+    /// block.
+    ///
+    /// Deliberately not "is a source and has not finished". A source that has never
+    /// been started cannot produce anything, and once JavaScript has dropped the
+    /// object there is nobody left to start it -- treating it as active pinned
+    /// the audio thread to its 5 ms tick and held the output device open for a
+    /// node that would never make a sound. This is also what decides how long a
+    /// released effect node must be kept: exactly as long as something upstream
+    /// can still feed it.
+    fn is_producing(&self) -> bool {
         false
     }
 
@@ -106,6 +91,25 @@ pub trait AudioNodeProcessor: Send + 'static {
         2 // Default stereo
     }
 
+    /// How many separate output ports this node fans out to.
+    ///
+    /// Only `ChannelSplitterNode` has more than one. A node with multiple ports
+    /// emits **one channel per port**, so a connection from it carries a mono
+    /// signal taken from the channel its `output` index names -- which is what
+    /// makes a splitter a splitter rather than a pass-through.
+    fn output_ports(&self) -> u32 {
+        1
+    }
+
+    /// How many separate input ports this node accepts.
+    ///
+    /// Only `ChannelMergerNode` has more than one. A connection into such a node
+    /// lands in the single channel its `input` index names, instead of being mixed
+    /// across the whole bus.
+    fn input_ports(&self) -> u32 {
+        1
+    }
+
     /// Get a named AudioParam for automation, if this node has one.
     /// Returns None if the param name is not recognized.
     fn get_param_mut(&mut self, _name: &str) -> Option<&mut AudioParamTimeline> {
@@ -113,9 +117,17 @@ pub trait AudioNodeProcessor: Send + 'static {
     }
 }
 
-/// Node connection in the audio graph
+/// Node connection in the audio graph.
+///
+/// The port indices are what let a splitter and a merger mean anything. Without
+/// them every connection was a whole-bus mix, so both nodes could only be
+/// pass-throughs: `createChannelSplitter()` returned something that did not split.
 #[derive(Debug, Clone)]
 pub struct NodeConnection {
     pub src: AudioNodeId,
+    /// Output port on `src`. Meaningful only when `src` has more than one.
+    pub src_output: u32,
     pub dst: AudioNodeId,
+    /// Input port on `dst`. Meaningful only when `dst` has more than one.
+    pub dst_input: u32,
 }
