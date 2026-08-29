@@ -40,6 +40,7 @@ use crate::{
     runtime::{
         HostId,
         input_state::{InputRetraction, InputState},
+        session_temp::SessionTemp,
         vsync,
     },
     services::{AudioService, PlatformServices, RenderService},
@@ -257,6 +258,14 @@ pub(crate) struct Host {
     /// deleted 3-second heartbeat's render-drain. Tokio latches one permit, so an
     /// event emitted during a JS poll is not lost.
     render_notify: Arc<tokio::sync::Notify>,
+
+    /// Owns this session's sandbox `/tmp` directory: `clean_temp` when it is set
+    /// on the first module eval, `remove_temp` when this struct drops. `None`
+    /// until then and across a runtime restart, which keeps the same `/tmp`
+    /// because it is the same session. Declared last so its drop runs after
+    /// every field whose own drop might still write there. See
+    /// [`super::session_temp`].
+    session_temp: Option<SessionTemp>,
 }
 
 impl Drop for Host {
@@ -642,6 +651,7 @@ impl Host {
             gpu_caps,
             gpu_init_started,
             render_notify,
+            session_temp: None,
         };
         startup_guard.disarm();
         Ok(host)
@@ -1351,6 +1361,19 @@ impl Host {
         let t_eval_start = Instant::now();
         self.last_game_id = Some(game_id.clone());
         self.last_entry = Some(entry.clone());
+
+        // First module eval for this session: guarantee `/tmp` starts empty and
+        // take ownership of removing it at teardown. A runtime restart re-enters
+        // here with the same session and game id and must keep its `/tmp`, so
+        // this is gated on the guard not yet existing rather than run each time.
+        if self.session_temp.is_none() {
+            self.session_temp = SessionTemp::prepare(
+                self.init_options.files_dir(),
+                self.init_options.cache_dir(),
+                &game_id,
+                self.id,
+            );
+        }
 
         // Before any prelude, and so before any JS the host or the game
         // supplied. This is the point the all-false capability snapshot must

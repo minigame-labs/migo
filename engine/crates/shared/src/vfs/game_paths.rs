@@ -272,6 +272,25 @@ impl GamePaths {
         Ok(())
     }
 
+    /// Remove this session's temporary directory entirely, at session end.
+    ///
+    /// The sibling of [`clean_temp`](Self::clean_temp): that one runs at the
+    /// start and leaves an empty directory, this one runs at teardown and
+    /// leaves nothing. `temp_dir` is `tmp/{session_id}`, and a session id is
+    /// unique within its process, so no live session shares this path — the
+    /// removal is confined to a subtree this session alone owns and never
+    /// touches `tmp/{other_id}`.
+    ///
+    /// Absent is success: teardown runs on every exit path, including a panic
+    /// before the first module eval created the directory.
+    pub fn remove_temp(&self) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&self.temp_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Clean the cache directory (including temp).
     ///
     /// Removes all cached files. User data is preserved.
@@ -625,6 +644,85 @@ mod tests {
                 .starts_with(paths.cache_dir())
         );
         assert!(!paths.integrity_receipt_path().starts_with(paths.code_dir()));
+    }
+
+    /// Unique filesystem root for one test, cleaned up by the caller.
+    fn scratch_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after the epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "migo_game_paths_{tag}_{}_{nanos}",
+            std::process::id()
+        ))
+    }
+
+    /// A session ending must take its own `/tmp` with it, and touch no other
+    /// session's. The desktop platforms have no equivalent of the Android
+    /// sweep, so without this call every session leaves its temp subtree behind
+    /// under the cache root for the life of the install.
+    #[test]
+    fn remove_temp_deletes_this_sessions_directory_and_leaves_a_sibling() {
+        let root = scratch_root("remove_temp");
+        let ending = GamePaths::new(root.join("files"), root.join("cache"), "game", 4).unwrap();
+        let live = GamePaths::new(root.join("files"), root.join("cache"), "game", 5).unwrap();
+        ending.ensure_directories().unwrap();
+        live.ensure_directories().unwrap();
+        std::fs::write(ending.temp_dir().join("scratch.bin"), b"x").unwrap();
+        std::fs::write(live.temp_dir().join("scratch.bin"), b"y").unwrap();
+
+        ending.remove_temp().unwrap();
+
+        assert!(
+            !ending.temp_dir().exists(),
+            "the ending session's temp dir survived"
+        );
+        assert!(
+            live.temp_dir().join("scratch.bin").exists(),
+            "a concurrent session's temp files were removed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A crash leaves a temp subtree behind, and session ids are a per-process
+    /// counter from 1, so the next run's first session inherits the same
+    /// numbered directory. `/tmp` is documented to start empty for a session,
+    /// so the stale contents must be gone before the game can read them.
+    #[test]
+    fn clean_temp_empties_a_directory_left_by_a_previous_session_with_the_same_id() {
+        let root = scratch_root("clean_temp");
+        let paths = GamePaths::new(root.join("files"), root.join("cache"), "game", 1).unwrap();
+        paths.ensure_directories().unwrap();
+        std::fs::write(paths.temp_dir().join("stale.bin"), b"from a dead session").unwrap();
+
+        paths.clean_temp().unwrap();
+
+        assert!(
+            paths.temp_dir().is_dir(),
+            "clean_temp must leave the dir in place"
+        );
+        assert_eq!(
+            std::fs::read_dir(paths.temp_dir()).unwrap().count(),
+            0,
+            "stale files from the previous session survived"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Teardown runs on every exit path including a panic before the first
+    /// module eval, so the directory may never have been created.
+    #[test]
+    fn remove_temp_is_ok_when_the_directory_was_never_created() {
+        let root = scratch_root("remove_temp_absent");
+        let paths = GamePaths::new(root.join("files"), root.join("cache"), "game", 9).unwrap();
+
+        paths
+            .remove_temp()
+            .expect("removing an absent temp dir is not an error");
+
+        assert!(!paths.temp_dir().exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

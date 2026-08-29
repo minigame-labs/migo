@@ -88,3 +88,68 @@ fn tearing_down_a_session_still_drops_its_gpu_image_aliases() {
          ids are meaningless once its EGL context is gone"
     );
 }
+
+/// `on_evaluate_module`, from its signature to the start of the next method.
+fn on_evaluate_module_body() -> &'static str {
+    let start = HOST
+        .find("async fn on_evaluate_module(")
+        .expect("the launch path must remain present");
+    let rest = &HOST[start..];
+    // Bounded by whichever member-indented method declaration comes first, so a
+    // reorder that puts an `async fn` next does not widen the window.
+    let end = [
+        "\n    fn ",
+        "\n    async fn ",
+        "\n    pub fn ",
+        "\n    pub(crate) fn ",
+    ]
+    .iter()
+    .filter_map(|marker| rest[1..].find(marker).map(|offset| offset + 1))
+    .min()
+    .expect("on_evaluate_module must end before the next method");
+    &rest[..end]
+}
+
+/// `/tmp` is documented to start empty for a session and not to outlive it.
+/// Android's Java SDK sweeps it; every other host reaches the engine through
+/// this crate and had no equivalent, so `GamePaths::clean_temp` sat with no
+/// caller and each session's `tmp/{id}` subtree leaked under the cache root.
+///
+/// The owner is a `Host` field so teardown is RAII on every exit path,
+/// including a panic — the same reason the guard is a field and not a line in
+/// `Drop`. Deleting the field is what this catches; the clear/remove behaviour
+/// itself is covered by `session_temp`'s own unit tests.
+#[test]
+fn a_sessions_temp_directory_is_owned_for_removal_at_teardown() {
+    let struct_start = HOST
+        .find("pub(crate) struct Host {")
+        .expect("Host struct must remain present");
+    let struct_body = &HOST[struct_start
+        ..HOST[struct_start..]
+            .find("\n}")
+            .map(|offset| struct_start + offset)
+            .expect("Host struct must close")];
+    assert!(
+        struct_body.contains("session_temp: Option<SessionTemp>"),
+        "Host must own a SessionTemp so a session's /tmp subtree is removed when \
+         the Host drops, on every teardown path"
+    );
+}
+
+/// A runtime restart re-enters `on_evaluate_module` with the same session id and
+/// game id, and `/tmp` must survive it — a restart is the same session. So the
+/// guard is created once, gated on its own absence, not rebuilt each eval.
+#[test]
+fn the_temp_directory_is_prepared_once_and_survives_a_restart() {
+    let body = on_evaluate_module_body();
+    let prepare = body
+        .find("SessionTemp::prepare(")
+        .expect("the first module eval must prepare this session's /tmp");
+    let gate = body
+        .find("self.session_temp.is_none()")
+        .expect("temp preparation must be gated so a restart keeps its /tmp");
+    assert!(
+        gate < prepare,
+        "the is_none() gate must guard the SessionTemp::prepare call"
+    );
+}
