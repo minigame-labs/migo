@@ -181,3 +181,30 @@ require_synced_worktree() {
 win_to_unix_path() {
     printf '/mnt/%s' "$(printf '%s' "$1" | sed 's|\\|/|g; s|^\(.\):|\L\1|')"
 }
+
+# A Windows-reachable HTTP proxy, or empty.
+#
+# A cold Skia build downloads a prebuilt binaries tarball from GitHub, and
+# rusty-skia's fetch runs on the Windows side where a WSL-local proxy
+# (127.0.0.1:10808 as WSL sees it) is not reachable -- the download then hangs
+# rather than failing. The probe passes this through as `MIGO_WIN_PROXY` /
+# `HTTPS_PROXY`. Most local proxy clients (v2rayN, Clash) also listen on the
+# Windows loopback, so try the usual ports and keep the first that answers.
+#
+# Skipped entirely once `$MIGO_WIN_PROXY` is set by the caller, and once the
+# Skia tarball is already cached (a warm `C:\mt` needs no network at all).
+detect_windows_proxy() {
+    if [[ -n "${MIGO_WIN_PROXY:-}" ]]; then
+        printf '%s' "$MIGO_WIN_PROXY"
+        return
+    fi
+    local curl="/mnt/c/Windows/System32/curl.exe" port
+    [[ -x "$curl" ]] || return 0
+    for port in 10808 10809 7890 7897 1080 8080 8888; do
+        if "$curl" -s -o /dev/null --max-time 6 \
+            -x "http://127.0.0.1:$port" https://github.com 2>/dev/null; then
+            printf 'http://127.0.0.1:%s' "$port"
+            return
+        fi
+    done
+}

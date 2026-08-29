@@ -70,4 +70,15 @@ else
     echo "[stage] $(find "$HEADERS_UNIX" -name '*.h' | wc -l) headers staged"
 fi
 
+# The first cold `cargo check` also downloads a prebuilt Skia binaries tarball
+# from github.com. That fetch runs on the Windows side, so it needs a
+# Windows-reachable proxy -- `verify-compile.sh` finds one with
+# `detect_windows_proxy`. Once `C:\mt` is warm the download never repeats.
+proxy="$(detect_windows_proxy)"
+if [[ -n "$proxy" ]]; then
+    echo "[stage] Windows proxy for the Skia binaries fetch: $proxy"
+else
+    echo "[stage] no Windows proxy found; a cold Skia binaries download may stall -- set MIGO_WIN_PROXY"
+fi
+
 echo "[stage] done -- verify-change.sh's windows:compile lane can now run"
