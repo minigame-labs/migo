@@ -24,7 +24,11 @@ import {
 } from "ext:core/ops";
 import { AudioParam } from "ext:host_v8_audio/00_audio_param.js";
 import { AudioBuffer, createDecodedAudioBuffer } from "ext:host_v8_audio/00_audio_buffer.js";
-import { AudioNode, AudioDestinationNode } from "ext:host_v8_audio/00_audio_node.js";
+import {
+  AudioNode,
+  AudioDestinationNode,
+  createReleaseQueue,
+} from "ext:host_v8_audio/00_audio_node.js";
 import { AudioBufferSourceNode } from "ext:host_v8_audio/00_buffer_source_node.js";
 import { GainNode } from "ext:host_v8_audio/00_gain_node.js";
 import { OscillatorNode } from "ext:host_v8_audio/00_oscillator_node.js";
@@ -45,54 +49,15 @@ import { onHide, onShow } from "ext:host_v8_lifecycle/01_lifecycle.js";
 import { allocateHostCallbackId } from "ext:host_v8_base/02_async.js";
 
 const CONTEXT_REGISTRY = new Map();
-const PENDING_CONTEXT_RELEASES = new Set();
-const INITIAL_CONTEXT_RELEASE_RETRY_MS = 4;
-const MAX_CONTEXT_RELEASE_RETRY_MS = 1000;
-let contextReleaseRetryTimer = null;
-let contextReleaseRetryMs = INITIAL_CONTEXT_RELEASE_RETRY_MS;
 
-function schedulePendingContextReleases() {
-  if (contextReleaseRetryTimer !== null || PENDING_CONTEXT_RELEASES.size === 0) {
-    return;
-  }
-  contextReleaseRetryTimer = setTimeout(flushPendingContextReleases, contextReleaseRetryMs);
-}
-
-function flushPendingContextReleases() {
-  contextReleaseRetryTimer = null;
-  for (const ctxId of PENDING_CONTEXT_RELEASES) {
-    try {
-      op_audio_release_context(ctxId);
-      PENDING_CONTEXT_RELEASES.delete(ctxId);
-    } catch {
-      // Queue saturation is transient; retain only the numeric id and retry.
-    }
-  }
-
-  if (PENDING_CONTEXT_RELEASES.size === 0) {
-    contextReleaseRetryMs = INITIAL_CONTEXT_RELEASE_RETRY_MS;
-    return;
-  }
-  contextReleaseRetryMs = Math.min(
-    contextReleaseRetryMs * 2,
-    MAX_CONTEXT_RELEASE_RETRY_MS,
-  );
-  schedulePendingContextReleases();
-}
-
-function releaseNativeAudioContext(ctxId) {
-  if (PENDING_CONTEXT_RELEASES.has(ctxId)) return;
-  try {
-    op_audio_release_context(ctxId);
-  } catch {
-    PENDING_CONTEXT_RELEASES.add(ctxId);
-    schedulePendingContextReleases();
-  }
-}
+// Retry and de-duplication live in `createReleaseQueue`, shared with the node
+// finalizer, so the bounded-queue backoff rule has one definition instead of one
+// per resource kind.
+const releaseNativeAudioContext = createReleaseQueue(op_audio_release_context);
 
 const CONTEXT_FINALIZER = new FinalizationRegistry((ctxId) => {
   CONTEXT_REGISTRY.delete(ctxId);
-  releaseNativeAudioContext(ctxId);
+  releaseNativeAudioContext(ctxId, ctxId);
 });
 
 function forEachLiveContext(callback) {

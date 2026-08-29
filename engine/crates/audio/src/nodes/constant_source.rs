@@ -4,7 +4,7 @@ use shared::protocol::audio_cmd::AudioNodeId;
 
 use crate::param::AudioParamTimeline;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
 /// ConstantSourceNode: outputs a constant value from its `offset` AudioParam.
 ///
@@ -46,20 +46,16 @@ impl AudioNodeProcessor for ConstantSourceNode {
         self.id
     }
 
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::ConstantSource
-    }
-
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 
-    fn is_source(&self) -> bool {
-        true
-    }
-
     fn is_finished(&self) -> bool {
         self.stopped
+    }
+
+    fn is_producing(&self) -> bool {
+        self.started && !self.stopped
     }
 
     fn process(

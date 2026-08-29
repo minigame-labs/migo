@@ -845,6 +845,29 @@ fn release_buffer_scoped(
     }
 }
 
+/// Mark a node unreachable from JavaScript and unregister whatever that made
+/// collectible.
+///
+/// Scoped through the node index like every other node command, so a runtime
+/// cannot release a node it does not own. Unknown ids are a no-op: this comes
+/// from a GC finalizer, which may run after the context is already gone.
+fn release_node_scoped(
+    contexts: &mut HashMap<AudioContextId, AudioContext>,
+    node_index: &mut NodeContextIndex,
+    ctx_id: AudioContextId,
+    node_id: AudioNodeId,
+) {
+    if node_index.get_context(node_id) != Some(ctx_id) {
+        return;
+    }
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return;
+    };
+    for &removed in context.release_node(node_id) {
+        node_index.unregister(removed);
+    }
+}
+
 /// Native ownership boundary for binding and clearing a source buffer.
 /// Node ids and buffer ids are context-local, so both are resolved only after
 /// the claimed owner matches the node index.
@@ -1169,6 +1192,14 @@ impl Drop for AudioThread {
     }
 }
 
+/// Frames the graph renders per `process()` call.
+///
+/// Web Audio's render quantum, and the grain at which `start(when)`,
+/// `stop(when)` and k-rate automation take effect. Kept separate from the ring
+/// block size below, which is about how often the ring is pushed to, not about
+/// scheduling accuracy.
+pub(crate) const RENDER_QUANTUM_FRAMES: usize = 128;
+
 /// Calculate optimal process buffer size based on sample rate.
 /// Higher sample rates need larger buffers for the same latency.
 #[inline]
@@ -1251,6 +1282,41 @@ fn next_command(
         return startup_backlog.next();
     }
     rx.try_recv().ok()
+}
+
+/// Amplitude below which the limiter is transparent. Above it, the curve bends.
+const SOFT_LIMIT_KNEE: f32 = 0.75;
+
+/// Apply one soft limit over a finished mix, in place.
+///
+/// **One pass over the whole mix, not one per contributor.** This used to live
+/// inside `AudioContext::process`, which is additive: it ran once per context,
+/// in `HashMap` iteration order, over a partial sum containing other contexts'
+/// audio -- so the same input produced different output run to run -- and the
+/// InnerAudio players, which mix in after every context, were never limited at
+/// all.
+///
+/// The curve is continuous and smooth at the knee. The previous one was neither:
+/// it left `1.0` untouched and mapped `1.0 + eps` to `0.5`, a 6 dB step at the
+/// threshold, so the "soft" clip introduced a harder edge than the hard clamp it
+/// replaced. Here `u` is how far into the knee the sample is, `u / (1 + u)`
+/// starts at zero with unit slope and asymptotes to one, so the result matches
+/// the input's value and slope at the knee and never leaves [-1, 1].
+fn soft_limit(buffer: &mut [f32]) {
+    // Most blocks never exceed the knee; one scan is cheaper than a branch and a
+    // division per sample.
+    if !buffer.iter().any(|s| s.abs() > SOFT_LIMIT_KNEE) {
+        return;
+    }
+
+    let headroom = 1.0 - SOFT_LIMIT_KNEE;
+    for sample in buffer.iter_mut() {
+        let magnitude = sample.abs();
+        if magnitude > SOFT_LIMIT_KNEE {
+            let u = (magnitude - SOFT_LIMIT_KNEE) / headroom;
+            *sample = sample.signum() * (SOFT_LIMIT_KNEE + headroom * u / (1.0 + u));
+        }
+    }
 }
 
 /// Audio thread main loop — 3-level power management.
@@ -1447,6 +1513,10 @@ fn run_audio_thread(
                     release_buffer_scoped(&mut contexts, ctx_id, buffer_id);
                 }
 
+                AudioCmd::ReleaseNode { ctx_id, node_id } => {
+                    release_node_scoped(&mut contexts, &mut node_index, ctx_id, node_id);
+                }
+
                 AudioCmd::CreateBufferSource { ctx_id, node_id } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         ctx.create_buffer_source(node_id);
@@ -1543,22 +1613,23 @@ fn run_audio_thread(
                     // maps) so a stop on a *suspended* context doesn't linger until
                     // resume/close. A future-dated stop stays reachable and is swept
                     // by context.process() when it actually finishes.
-                    let (found, finished) = match node_index
+                    let found = match node_index
                         .get_context(node_id)
                         .and_then(|ctx_id| contexts.get_mut(&ctx_id))
                     {
                         Some(ctx) => {
                             let found = ctx.stop_source(node_id, when);
-                            let finished = found && ctx.remove_finished_node(node_id);
-                            (found, finished)
+                            if found {
+                                for &removed in ctx.remove_finished_node(node_id) {
+                                    node_index.unregister(removed);
+                                }
+                            }
+                            found
                         }
-                        None => (false, false),
+                        None => false,
                     };
 
                     if found {
-                        if finished {
-                            node_index.unregister(node_id);
-                        }
                         let _ = resp.send(Ok(()));
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -1661,7 +1732,7 @@ fn run_audio_thread(
                 // ==================== Phase 2 Nodes ====================
                 AudioCmd::CreateOscillator { ctx_id, node_id } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
-                        ctx.add_node(Box::new(OscillatorNode::new(node_id)));
+                        ctx.add_node(Box::new(OscillatorNode::new(node_id, sample_rate)));
                         node_index.register(node_id, ctx_id);
                     }
                 }
@@ -1714,7 +1785,7 @@ fn run_audio_thread(
                 AudioCmd::CreateBiquadFilter { ctx_id, node_id } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         let ch = ctx.channels();
-                        ctx.add_node(Box::new(BiquadFilterNode::new(node_id, ch)));
+                        ctx.add_node(Box::new(BiquadFilterNode::new(node_id, ch, sample_rate)));
                         node_index.register(node_id, ctx_id);
                     }
                 }
@@ -1860,6 +1931,27 @@ fn run_audio_thread(
                     }
                 }
 
+                AudioCmd::SetAnalyserScalar {
+                    node_id,
+                    prop,
+                    value,
+                } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<AnalyserNode, _>(node_id, |an| {
+                                match prop.as_str() {
+                                    "minDecibels" => an.set_min_decibels(value),
+                                    "maxDecibels" => an.set_max_decibels(value),
+                                    "smoothingTimeConstant" => {
+                                        an.set_smoothing_time_constant(value)
+                                    }
+                                    _ => {}
+                                }
+                            });
+                        }
+                    }
+                }
+
                 AudioCmd::SetPannerScalar {
                     node_id,
                     prop,
@@ -1954,13 +2046,19 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::Connect { src, dst, resp } => {
+                AudioCmd::Connect {
+                    src,
+                    src_output,
+                    dst,
+                    dst_input,
+                    resp,
+                } => {
                     // Use index to find the context containing the source node
                     let found = node_index
                         .get_context(src)
                         .and_then(|ctx_id| contexts.get_mut(&ctx_id))
                         .map(|ctx| {
-                            ctx.connect(src, dst);
+                            ctx.connect_ports(src, src_output, dst, dst_input);
                             true
                         })
                         .unwrap_or(false);
@@ -2663,21 +2761,39 @@ fn run_audio_thread(
                 {
                     process_buffer.fill(0.0);
 
-                    // Process WebAudio contexts, unregistering from the
-                    // node→context index any source that finished this block
-                    // (context.process() has already dropped it internally).
-                    for ctx in contexts.values_mut() {
-                        if ctx.state() == AudioContextState::Running {
-                            for finished_id in ctx.process(&mut process_buffer) {
-                                node_index.unregister(finished_id);
+                    // Render the block one **render quantum** at a time.
+                    //
+                    // The block handed to the ring is ~21 ms, sized for one
+                    // efficient ring push. Rendering it in one call would make
+                    // that the scheduling grain too: `start(when)` and
+                    // `stop(when)` are compared against the block's start time,
+                    // so a sound could land up to 21 ms from where it was asked
+                    // for, and every k-rate parameter would step once per 21 ms
+                    // instead of gliding. Web Audio's quantum is 128 frames, and
+                    // slicing here buys that 2.67 ms grain for the cost of eight
+                    // call setups per block -- the per-sample work is identical.
+                    let quantum_samples = RENDER_QUANTUM_FRAMES * channels as usize;
+                    for quantum in process_buffer.chunks_mut(quantum_samples) {
+                        // Process WebAudio contexts, unregistering from the
+                        // node→context index any node that became collectible
+                        // this quantum (context.process() has already dropped it).
+                        for ctx in contexts.values_mut() {
+                            if ctx.state() == AudioContextState::Running {
+                                for &finished_id in ctx.process(quantum) {
+                                    node_index.unregister(finished_id);
+                                }
                             }
+                        }
+
+                        // Process InnerAudioContext players
+                        for player in inner_players.values_mut() {
+                            player.process(quantum);
                         }
                     }
 
-                    // Process InnerAudioContext players
-                    for player in inner_players.values_mut() {
-                        player.process(&mut process_buffer);
-                    }
+                    // Every contributor has now added into the block, so the
+                    // limiter runs exactly once, over the complete sum.
+                    soft_limit(&mut process_buffer);
 
                     output.write(&process_buffer);
                 }
@@ -2718,6 +2834,73 @@ fn run_audio_thread(
 mod tests {
     use super::*;
     use migo_alloc_probe::{Burst, assert_no_steady_state_allocation};
+
+    /// The limiter must not introduce an edge of its own. The previous curve left
+    /// `1.0` untouched and sent `1.0 + eps` to `0.5`: a 6 dB discontinuity right
+    /// where signals cross it, heard as a click on every overshoot.
+    #[test]
+    fn the_soft_limit_is_continuous_and_bounded() {
+        let mut probe: Vec<f32> = (0..4_000).map(|i| i as f32 * 0.005 - 10.0).collect();
+        soft_limit(&mut probe);
+
+        for window in probe.windows(2) {
+            let step = (window[1] - window[0]).abs();
+            assert!(
+                step < 0.01,
+                "limiter jumped by {step} between adjacent inputs"
+            );
+        }
+        assert!(
+            probe.iter().all(|s| s.abs() <= 1.0),
+            "the limiter must keep the mix inside [-1, 1]"
+        );
+    }
+
+    #[test]
+    fn the_soft_limit_leaves_signals_below_the_knee_untouched() {
+        let quiet: Vec<f32> = (0..64).map(|i| (i as f32 / 64.0) * 1.5 - 0.75).collect();
+        let mut limited = quiet.clone();
+        soft_limit(&mut limited);
+        assert_eq!(limited, quiet, "must be transparent inside the knee");
+    }
+
+    /// Applying the limiter per contributor made the result depend on how many
+    /// contributors there were and on `HashMap` order. One pass over a finished
+    /// sum is idempotent-in-shape: limiting a sum must not depend on how it was
+    /// accumulated.
+    #[test]
+    fn the_soft_limit_depends_only_on_the_finished_sum() {
+        let mut one_shot = vec![0.4f32, -1.9, 1.2];
+        let mut accumulated = vec![0.0f32; 3];
+        for part in [[0.1f32, -1.0, 0.5], [0.3, -0.9, 0.7]] {
+            for (dst, src) in accumulated.iter_mut().zip(part.iter()) {
+                *dst += src;
+            }
+        }
+
+        soft_limit(&mut one_shot);
+        soft_limit(&mut accumulated);
+
+        for (a, b) in one_shot.iter().zip(accumulated.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} != {b}");
+        }
+    }
+
+    /// The ring block is sliced into render quanta, so a block size that is not a
+    /// whole number of quanta would render a short final quantum every block --
+    /// a periodic hitch in every source's scheduling grain.
+    #[test]
+    fn every_ring_block_is_a_whole_number_of_render_quanta() {
+        for sample_rate in [8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000] {
+            let frames = calculate_process_frames(sample_rate);
+            assert_eq!(
+                frames % RENDER_QUANTUM_FRAMES,
+                0,
+                "{sample_rate} Hz gives a {frames}-frame block, not a multiple of the quantum"
+            );
+            assert!(frames >= RENDER_QUANTUM_FRAMES);
+        }
+    }
 
     fn inner_decode_job(
         id: InnerAudioId,

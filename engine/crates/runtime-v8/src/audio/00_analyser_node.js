@@ -4,6 +4,7 @@ import {
   op_audio_analyser_float_time_domain,
   op_audio_analyser_byte_frequency,
   op_audio_analyser_float_frequency,
+  op_audio_set_analyser_scalar,
 } from "ext:core/ops";
 import { AudioNode } from "ext:host_v8_audio/00_audio_node.js";
 
@@ -43,6 +44,7 @@ class AnalyserNode extends AudioNode {
 
   set minDecibels(value) {
     this.#minDecibels = Number(value);
+    op_audio_set_analyser_scalar(this._nodeId, "minDecibels", this.#minDecibels);
   }
 
   get maxDecibels() {
@@ -51,6 +53,7 @@ class AnalyserNode extends AudioNode {
 
   set maxDecibels(value) {
     this.#maxDecibels = Number(value);
+    op_audio_set_analyser_scalar(this._nodeId, "maxDecibels", this.#maxDecibels);
   }
 
   get smoothingTimeConstant() {
@@ -59,6 +62,13 @@ class AnalyserNode extends AudioNode {
 
   set smoothingTimeConstant(value) {
     this.#smoothingTimeConstant = Math.max(0, Math.min(1, Number(value)));
+    // The value has to reach the node doing the analysis. Storing it here only,
+    // which is what this used to do, left the spec's smoothing unimplemented.
+    op_audio_set_analyser_scalar(
+      this._nodeId,
+      "smoothingTimeConstant",
+      this.#smoothingTimeConstant,
+    );
   }
 
   async getByteTimeDomainData(array) {

@@ -35,18 +35,65 @@ pub struct AudioContext {
     // Generic node storage
     nodes: HashMap<AudioNodeId, Box<dyn AudioNodeProcessor>>,
 
+    // Nodes whose JavaScript object has been collected. They are not dropped on
+    // the spot: an effect node still carries audio from any source playing
+    // through it, and the JS graph becomes unreachable as a whole, so its
+    // finalizers can run while a sound is still in flight. See `prune`.
+    released: std::collections::HashSet<AudioNodeId>,
+
     // Graph connections
     connections: Vec<NodeConnection>,
 
-    // Topologically sorted processing order (cached, invalidated on graph change)
-    processing_order: Vec<AudioNodeId>,
+    // Processing order as dense indices into `dense_ids` (cached, invalidated
+    // on any graph change).
+    processing_order: Vec<u32>,
     graph_dirty: bool,
 
-    // Pre-built reverse adjacency: dst_node → [src_nodes] for O(1) input lookup
-    input_adjacency: HashMap<AudioNodeId, Vec<AudioNodeId>>,
+    // The graph in CSR form, rebuilt whenever it changes.
+    //
+    // Flat `Vec`s rather than `HashMap<AudioNodeId, Vec<AudioNodeId>>`: clearing a
+    // map of vectors hands every inner allocation back, so a rebuild -- which
+    // every fired sound effect causes, because an ended source leaves the graph --
+    // bought a fresh `Vec` per connected node on the audio thread. Node ids churn,
+    // so entry reuse could not have saved it either. These clear without
+    // deallocating, and the render path walks a contiguous slice instead of
+    // chasing a pointer per node.
+    //
+    // Nodes are addressed by a dense index assigned per rebuild; `dense_ids` maps
+    // back to the id `nodes` and `node_buffers` are keyed by.
+    dense_index: HashMap<AudioNodeId, u32>,
+    dense_ids: Vec<AudioNodeId>,
+    in_degree: Vec<u32>,
+    input_start: Vec<u32>,
+    /// Edge ids, grouped by destination. Ids rather than source indices, because a
+    /// connection now carries port information that the mix step needs.
+    input_edges: Vec<u32>,
+    output_start: Vec<u32>,
+    output_edges: Vec<u32>,
+    ready_queue: Vec<u32>,
+    /// Per-edge, indexed by edge id: the source, and the ports if they matter.
+    /// `None` means "the whole bus", which is every connection except one into or
+    /// out of a splitter or merger.
+    edge_src: Vec<u32>,
+    edge_src_port: Vec<Option<usize>>,
+    edge_dst_port: Vec<Option<usize>>,
 
     // Processing buffers: per-node output buffers keyed by node ID
     node_buffers: HashMap<AudioNodeId, Vec<f32>>,
+    // Render buffers of collected nodes, kept for the next node that needs one.
+    //
+    // A game fires sound effects continuously, and each one is a node added and
+    // later collected. Buying its render buffer from the allocator on first
+    // render put one allocation per sound effect on the audio thread; recycling
+    // makes an add/collect cycle free. Bounded so a burst of simultaneous nodes
+    // cannot leave a large pool behind.
+    buffer_pool: Vec<Vec<f32>>,
+    // Ids collected by the last `prune`, reported to the audio thread so it can
+    // clear its node-to-context index. A member rather than a fresh `Vec`:
+    // `prune` runs on the render path and collects a node on every quantum a
+    // sound effect ends on, so returning an owned vector put one allocation per
+    // sound effect on the audio thread.
+    collected: Vec<AudioNodeId>,
     // Scratch buffer for mixing multiple inputs
     mix_buffer: Vec<f32>,
 
@@ -69,16 +116,10 @@ impl AudioContext {
         channels: u32,
         pcm_budget: PcmBudget,
     ) -> Self {
-        let mut nodes: HashMap<AudioNodeId, Box<dyn AudioNodeProcessor>> =
+        let nodes: HashMap<AudioNodeId, Box<dyn AudioNodeProcessor>> =
             HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY);
 
-        // Always create the destination node at ID 0
-        nodes.insert(
-            DESTINATION_NODE_ID,
-            Box::new(DestinationNode::new(DESTINATION_NODE_ID, channels)),
-        );
-
-        Self {
+        let mut context = Self {
             id,
             state: AudioContextState::Running,
             sample_rate,
@@ -87,14 +128,35 @@ impl AudioContext {
             next_buffer_id: 1,
             pcm_budget,
             nodes,
+            released: std::collections::HashSet::new(),
             connections: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             processing_order: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             graph_dirty: true,
-            input_adjacency: HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            dense_index: HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            dense_ids: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            in_degree: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            input_start: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY + 1),
+            input_edges: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            output_start: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY + 1),
+            output_edges: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            ready_queue: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            edge_src: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            edge_src_port: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            edge_dst_port: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             node_buffers: HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            buffer_pool: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            collected: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             mix_buffer: Vec::new(),
             frames_processed: 0,
-        }
+        };
+
+        // The destination goes through the same insertion path as every other
+        // node, so it is provisioned a render buffer like the rest.
+        context.add_node(Box::new(DestinationNode::new(
+            DESTINATION_NODE_ID,
+            channels,
+        )));
+        context
     }
 
     pub fn id(&self) -> AudioContextId {
@@ -135,10 +197,13 @@ impl AudioContext {
         self.state = AudioContextState::Closed;
         self.buffers.clear();
         self.nodes.clear();
+        self.released.clear();
         self.connections.clear();
         self.processing_order.clear();
-        self.input_adjacency.clear();
+        self.in_degree.clear();
+        self.ready_queue.clear();
         self.node_buffers.clear();
+        self.collected.clear();
     }
 
     /// Check if this context has any active source nodes (playing or scheduled).
@@ -151,7 +216,76 @@ impl AudioContext {
         }
         self.nodes
             .values()
-            .any(|n| n.is_source() && !n.is_finished())
+            .any(|n| n.is_producing())
+    }
+
+    /// Mark a node as unreachable from JavaScript, and collect whatever that
+    /// makes collectible right now.
+    ///
+    /// Idempotent and tolerant of unknown ids, because the caller is a GC
+    /// finalizer. The destination is never releasable -- it is created with the
+    /// context and belongs to it.
+    ///
+    /// The release is deliberately a *request*. Removing the node here would cut
+    /// off audio: JavaScript drops a `source -> gain -> destination` chain as one
+    /// unreachable object graph, so `gain`'s finalizer can run while the source
+    /// is still playing through it. `prune` decides when it is actually safe.
+    pub fn release_node(&mut self, node_id: AudioNodeId) -> &[AudioNodeId] {
+        if node_id == DESTINATION_NODE_ID || !self.nodes.contains_key(&node_id) {
+            self.collected.clear();
+            return &self.collected;
+        }
+        self.released.insert(node_id);
+        self.prune()
+    }
+
+    /// Drop every node that can no longer affect the output, and report the ids
+    /// so the audio thread can clear its node-to-context index.
+    ///
+    /// Two rules, one pass. A **finished** source goes the moment it finishes. A
+    /// **released** node goes once nothing upstream can still feed it, which is
+    /// what keeps a `gain` alive for exactly as long as the source playing
+    /// through it and no longer.
+    ///
+    /// The loop is what makes a chain work: releasing `source -> gain -> filter`
+    /// can only collect the filter after the gain it reads from is gone, so each
+    /// pass peels one layer. It terminates because every pass removes a node.
+    fn prune(&mut self) -> &[AudioNodeId] {
+        self.collected.clear();
+        loop {
+            let mut victim = None;
+            for (&id, node) in self.nodes.iter() {
+                if id == DESTINATION_NODE_ID {
+                    continue;
+                }
+                let collectible = node.is_finished()
+                    || (self.released.contains(&id)
+                        && !node.is_producing()
+                        && !self.has_live_input(id));
+                if collectible {
+                    victim = Some(id);
+                    break;
+                }
+            }
+            let Some(id) = victim else { break };
+            self.nodes.remove(&id);
+            self.recycle_render_buffer(id);
+            self.released.remove(&id);
+            self.connections.retain(|c| c.src != id && c.dst != id);
+            self.collected.push(id);
+        }
+        if !self.collected.is_empty() {
+            // The order and the CSR adjacency are rebuilt on the next quantum.
+            self.graph_dirty = true;
+        }
+        &self.collected
+    }
+
+    /// Whether any node that still exists feeds `node_id`.
+    fn has_live_input(&self, node_id: AudioNodeId) -> bool {
+        self.connections
+            .iter()
+            .any(|c| c.dst == node_id && self.nodes.contains_key(&c.src))
     }
 
     // ==================== Buffer Management ====================
@@ -357,27 +491,47 @@ impl AudioContext {
 
     /// Create a buffer source node with JS-provided node_id
     pub fn create_buffer_source(&mut self, node_id: AudioNodeId) {
-        tracing::trace!("create_buffer_source: node_id={}", node_id);
-        self.nodes.insert(
-            node_id,
-            Box::new(BufferSourceNode::new(node_id, self.sample_rate)),
-        );
-        self.graph_dirty = true;
+        self.add_node(Box::new(BufferSourceNode::new(node_id, self.sample_rate)));
     }
 
     /// Create a gain node with JS-provided node_id
     pub fn create_gain(&mut self, node_id: AudioNodeId) {
-        tracing::trace!("create_gain: node_id={}", node_id);
-        self.nodes.insert(node_id, Box::new(GainNode::new(node_id)));
+        self.add_node(Box::new(GainNode::new(node_id)));
+    }
+
+    /// The single insertion point for every node type.
+    ///
+    /// Provisioning the render buffer here rather than on first render is what
+    /// keeps the allocator off the audio thread: this runs on the command path,
+    /// where an allocation is a throughput cost, not a missed deadline.
+    pub fn add_node(&mut self, node: Box<dyn AudioNodeProcessor>) {
+        let node_id = node.id();
+        let buffer = self.take_render_buffer();
+        self.nodes.insert(node_id, node);
+        self.node_buffers.insert(node_id, buffer);
         self.graph_dirty = true;
     }
 
-    /// Add a generic node (used by future node types)
-    pub fn add_node(&mut self, node: Box<dyn AudioNodeProcessor>) {
-        let node_id = node.id();
-        tracing::trace!("add_node: node_id={}, type={:?}", node_id, node.node_type());
-        self.nodes.insert(node_id, node);
-        self.graph_dirty = true;
+    /// A zeroed render buffer, recycled from a collected node when one is spare.
+    fn take_render_buffer(&mut self) -> Vec<f32> {
+        let samples = crate::audio_thread::RENDER_QUANTUM_FRAMES * self.channels.max(1) as usize;
+        match self.buffer_pool.pop() {
+            Some(mut buffer) => {
+                buffer.clear();
+                buffer.resize(samples, 0.0);
+                buffer
+            }
+            None => vec![0.0f32; samples],
+        }
+    }
+
+    /// Take a collected node's render buffer back for reuse.
+    fn recycle_render_buffer(&mut self, node_id: AudioNodeId) {
+        if let Some(buffer) = self.node_buffers.remove(&node_id) {
+            if self.buffer_pool.len() < Self::DEFAULT_NODE_CAPACITY {
+                self.buffer_pool.push(buffer);
+            }
+        }
     }
 
     /// Downcast and operate on a specific node type.
@@ -474,27 +628,22 @@ impl AudioContext {
     }
 
     /// If the node exists and has already finished (e.g. `stop(when <= 0)`
-    /// finishes a buffer source immediately), remove it from every per-node
-    /// structure (node map, output buffer, connections) and return `true`.
+    /// finishes a buffer source immediately), drop it and everything that
+    /// becomes collectible with it, and return `true`.
     ///
     /// Lets the audio thread fully clean up an immediately-finished node now,
     /// rather than waiting for the next `process()` sweep — which never runs
     /// while the context is suspended.
-    pub fn remove_finished_node(&mut self, node_id: AudioNodeId) -> bool {
+    pub fn remove_finished_node(&mut self, node_id: AudioNodeId) -> &[AudioNodeId] {
         let finished = self
             .nodes
             .get(&node_id)
-            .map(|n| n.is_finished())
-            .unwrap_or(false);
+            .is_some_and(|n| n.is_finished());
         if !finished {
-            return false;
+            self.collected.clear();
+            return &self.collected;
         }
-        self.nodes.remove(&node_id);
-        self.node_buffers.remove(&node_id);
-        self.connections
-            .retain(|c| c.src != node_id && c.dst != node_id);
-        self.graph_dirty = true;
-        true
+        self.prune()
     }
 
     pub fn set_loop(&mut self, node_id: AudioNodeId, enabled: bool, start: f64, end: f64) -> bool {
@@ -634,19 +783,33 @@ impl AudioContext {
     // ==================== Graph ====================
 
     pub fn connect(&mut self, src: AudioNodeId, dst: AudioNodeId) {
-        tracing::trace!("connect: src={}, dst={}", src, dst);
-        // Avoid duplicate connections
-        if !self
-            .connections
-            .iter()
-            .any(|c| c.src == src && c.dst == dst)
-        {
-            self.connections.push(NodeConnection { src, dst });
+        self.connect_ports(src, 0, dst, 0);
+    }
+
+    /// Connect one output port of `src` to one input port of `dst`.
+    ///
+    /// The ports are what make a splitter and a merger mean anything: a splitter
+    /// has one port per channel, and a merger accepts one channel per port. A
+    /// duplicate is keyed on the whole quadruple, so the same pair of nodes can be
+    /// wired through several different ports.
+    pub fn connect_ports(
+        &mut self,
+        src: AudioNodeId,
+        src_output: u32,
+        dst: AudioNodeId,
+        dst_input: u32,
+    ) {
+        let duplicate = self.connections.iter().any(|c| {
+            c.src == src && c.dst == dst && c.src_output == src_output && c.dst_input == dst_input
+        });
+        if !duplicate {
+            self.connections.push(NodeConnection {
+                src,
+                src_output,
+                dst,
+                dst_input,
+            });
             self.graph_dirty = true;
-            tracing::trace!(
-                "connect: added connection, total={}",
-                self.connections.len()
-            );
         }
     }
 
@@ -664,73 +827,151 @@ impl AudioContext {
         }
     }
 
-    /// Rebuild the processing order using topological sort (Kahn's algorithm)
-    /// and pre-build the input adjacency map for O(1) input lookup during processing.
+    /// Rebuild the processing order (Kahn's algorithm) and the CSR adjacency the
+    /// render loop reads its inputs from.
+    ///
+    /// **Runs on the audio thread and must not allocate.** It is triggered by any
+    /// graph change, and one fired sound effect is a graph change -- the source is
+    /// dropped when it ends -- so this runs constantly during ordinary play. It
+    /// used to build two fresh `HashMap<AudioNodeId, Vec<_>>` and a `Vec` every
+    /// time; the steady-state allocation gate could not see it, because the graph
+    /// it renders is an oscillator that never finishes and so never has to be
+    /// re-sorted. Every collection here is a member buffer cleared and refilled,
+    /// and none of them owns a nested allocation that clearing would hand back.
     fn rebuild_processing_order(&mut self) {
-        tracing::trace!(
-            "rebuild_processing_order: connections={:?}",
-            self.connections
-        );
-        self.processing_order.clear();
-        self.input_adjacency.clear();
+        let node_count = self.nodes.len();
 
-        // Build adjacency list and in-degree count
-        let mut in_degree: HashMap<AudioNodeId, usize> = HashMap::new();
-        let mut adj: HashMap<AudioNodeId, Vec<AudioNodeId>> = HashMap::new();
-
-        // Initialize all nodes with in-degree 0
+        // Address nodes by a dense index, so the graph is an array and not a map.
+        self.dense_index.clear();
+        self.dense_ids.clear();
         for &node_id in self.nodes.keys() {
-            in_degree.insert(node_id, 0);
-            adj.entry(node_id).or_default();
+            self.dense_index
+                .insert(node_id, self.dense_ids.len() as u32);
+            self.dense_ids.push(node_id);
         }
 
-        // Count in-degrees from connections and build reverse adjacency (dst → [src])
+        // Count edges per endpoint, then prefix-sum into CSR starts. Counting
+        // first is what lets the edge arrays be filled in place afterwards.
+        self.input_start.clear();
+        self.input_start.resize(node_count + 1, 0);
+        self.output_start.clear();
+        self.output_start.resize(node_count + 1, 0);
+        self.edge_src.clear();
+        self.edge_src_port.clear();
+        self.edge_dst_port.clear();
         for conn in &self.connections {
-            if self.nodes.contains_key(&conn.src) && self.nodes.contains_key(&conn.dst) {
-                *in_degree.entry(conn.dst).or_default() += 1;
-                adj.entry(conn.src).or_default().push(conn.dst);
-                self.input_adjacency
-                    .entry(conn.dst)
-                    .or_default()
-                    .push(conn.src);
-            }
+            let (Some(&src), Some(&dst)) = (
+                self.dense_index.get(&conn.src),
+                self.dense_index.get(&conn.dst),
+            ) else {
+                continue;
+            };
+            self.input_start[dst as usize + 1] += 1;
+            self.output_start[src as usize + 1] += 1;
+            // A port index only means anything when the node actually has more
+            // than one, so single-port nodes keep the whole-bus behaviour and pay
+            // nothing for the feature.
+            let src_port = self
+                .nodes
+                .get(&conn.src)
+                .filter(|node| node.output_ports() > 1)
+                .map(|_| conn.src_output as usize);
+            let dst_port = self
+                .nodes
+                .get(&conn.dst)
+                .filter(|node| node.input_ports() > 1)
+                .map(|_| conn.dst_input as usize);
+            self.edge_src.push(src);
+            self.edge_src_port.push(src_port);
+            self.edge_dst_port.push(dst_port);
+        }
+        let edge_count = self.edge_src.len();
+        for i in 0..node_count {
+            self.input_start[i + 1] += self.input_start[i];
+            self.output_start[i + 1] += self.output_start[i];
         }
 
-        // Start with nodes that have no incoming edges (source nodes)
-        let mut queue: Vec<AudioNodeId> = in_degree
-            .iter()
-            .filter(|&(_, &deg)| deg == 0)
-            .map(|(&id, _)| id)
-            .collect();
-        // Sort for deterministic order
-        queue.sort_unstable();
-
-        while let Some(node_id) = queue.pop() {
-            // Skip destination — it's always processed last
-            if node_id == DESTINATION_NODE_ID {
+        // Fill both edge arrays in one pass. `in_degree` is the in-edge fill
+        // cursor and ends up holding each node's real in-degree, which is exactly
+        // what the traversal below needs. `processing_order` is borrowed as the
+        // out-edge cursor rather than adding a seventh member for it, and is
+        // cleared before it takes its own meaning.
+        self.input_edges.clear();
+        self.input_edges.resize(edge_count, 0);
+        self.output_edges.clear();
+        self.output_edges.resize(edge_count, 0);
+        self.in_degree.clear();
+        self.in_degree.resize(node_count, 0);
+        self.processing_order.clear();
+        self.processing_order.resize(node_count, 0);
+        let mut edge_id = 0u32;
+        for conn in &self.connections {
+            let (Some(&src), Some(&dst)) = (
+                self.dense_index.get(&conn.src),
+                self.dense_index.get(&conn.dst),
+            ) else {
                 continue;
-            }
-            self.processing_order.push(node_id);
+            };
+            let in_slot =
+                self.input_start[dst as usize] as usize + self.in_degree[dst as usize] as usize;
+            self.input_edges[in_slot] = edge_id;
+            self.in_degree[dst as usize] += 1;
 
-            if let Some(neighbors) = adj.get(&node_id) {
-                for &next_id in neighbors {
-                    if let Some(deg) = in_degree.get_mut(&next_id) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push(next_id);
-                        }
-                    }
+            let out_slot = self.output_start[src as usize] as usize
+                + self.processing_order[src as usize] as usize;
+            self.output_edges[out_slot] = dst;
+            self.processing_order[src as usize] += 1;
+            edge_id += 1;
+        }
+
+        // Kahn's algorithm. The destination is held back unconditionally so it is
+        // always rendered last, after every contributor has written its buffer.
+        let destination = self.dense_index.get(&DESTINATION_NODE_ID).copied();
+        self.processing_order.clear();
+        self.ready_queue.clear();
+        for node in 0..node_count as u32 {
+            if self.in_degree[node as usize] == 0 && Some(node) != destination {
+                self.ready_queue.push(node);
+            }
+        }
+        // Deterministic order for a deterministic mix.
+        self.ready_queue.sort_unstable();
+
+        while let Some(node) = self.ready_queue.pop() {
+            self.processing_order.push(node);
+            let start = self.output_start[node as usize] as usize;
+            let end = self.output_start[node as usize + 1] as usize;
+            for slot in start..end {
+                let next = self.output_edges[slot];
+                let degree = &mut self.in_degree[next as usize];
+                *degree = degree.saturating_sub(1);
+                if *degree == 0 && Some(next) != destination {
+                    self.ready_queue.push(next);
                 }
             }
         }
 
-        // Always process destination last
-        self.processing_order.push(DESTINATION_NODE_ID);
+        // Anything with in-degree left over sits on a cycle.
+        //
+        // A cycle is legal Web Audio -- a feedback delay is the canonical effect --
+        // and dropping those nodes from the order made them render nothing at all:
+        // the graph went silent instead of echoing, and because they never ran they
+        // never finished, so they were never collected either. There is no
+        // topological order inside a cycle by definition, so they are appended in
+        // index order and read their inputs from the previous quantum's buffers --
+        // exactly the one-quantum delay the spec requires a cycle to contain.
+        let placed = self.processing_order.len() + usize::from(destination.is_some());
+        if placed < node_count {
+            for node in 0..node_count as u32 {
+                if self.in_degree[node as usize] > 0 && Some(node) != destination {
+                    self.processing_order.push(node);
+                }
+            }
+        }
 
-        tracing::trace!(
-            "rebuild_processing_order: order={:?}",
-            self.processing_order
-        );
+        if let Some(destination) = destination {
+            self.processing_order.push(destination);
+        }
         self.graph_dirty = false;
     }
 
@@ -747,10 +988,11 @@ impl AudioContext {
     ///
     /// Returns the ids of source nodes that finished during this block, so the
     /// audio thread can drop its `node → context` index entries for them.
-    pub fn process(&mut self, output: &mut [f32]) -> Vec<AudioNodeId> {
+    pub fn process(&mut self, output: &mut [f32]) -> &[AudioNodeId] {
         if self.state != AudioContextState::Running {
             // Don't touch output — other contexts may have already written to it
-            return Vec::new();
+            self.collected.clear();
+            return &self.collected;
         }
 
         // Rebuild processing order if graph changed
@@ -767,32 +1009,70 @@ impl AudioContext {
             self.mix_buffer.resize(buffer_size, 0.0);
         }
 
-        // Process each node in topological order (index-based to avoid clone)
+        // Process each node in topological order. Indexed rather than iterated so
+        // the loop body can borrow the other members mutably.
         let order_len = self.processing_order.len();
         for order_idx in 0..order_len {
-            let node_id = self.processing_order[order_idx];
+            let node = self.processing_order[order_idx];
+            let node_id = self.dense_ids[node as usize];
 
-            // Gather mixed input from upstream using pre-built adjacency (O(inputs) not O(connections))
+            // Gather mixed input from upstream: a contiguous slice of the CSR
+            // edge array, not a map lookup and a pointer chase per node.
             self.mix_buffer[..buffer_size].fill(0.0);
             let mut has_input = false;
-
-            if let Some(inputs) = self.input_adjacency.get(&node_id) {
-                for &src_id in inputs {
-                    if let Some(src_buf) = self.node_buffers.get(&src_id) {
-                        let len = src_buf.len().min(buffer_size);
+            let input_start = self.input_start[node as usize] as usize;
+            let input_end = self.input_start[node as usize + 1] as usize;
+            let channels = self.channels.max(1) as usize;
+            for slot in input_start..input_end {
+                let edge = self.input_edges[slot] as usize;
+                let src_id = self.dense_ids[self.edge_src[edge] as usize];
+                let Some(src_buf) = self.node_buffers.get(&src_id) else {
+                    continue;
+                };
+                let len = src_buf.len().min(buffer_size);
+                match (self.edge_src_port[edge], self.edge_dst_port[edge]) {
+                    // The ordinary case: a whole bus mixed into a whole bus.
+                    (None, None) => {
                         for i in 0..len {
                             self.mix_buffer[i] += src_buf[i];
                         }
-                        has_input = true;
+                    }
+                    // From a splitter port: one source channel, as mono, spread
+                    // across the destination bus.
+                    (Some(from), None) => {
+                        let from = from.min(channels - 1);
+                        for frame in 0..len / channels {
+                            let sample = src_buf[frame * channels + from];
+                            for ch in 0..channels {
+                                self.mix_buffer[frame * channels + ch] += sample;
+                            }
+                        }
+                    }
+                    // Into a merger port: the source, downmixed to mono, lands in
+                    // exactly one destination channel.
+                    (from, Some(into)) => {
+                        let into = into.min(channels - 1);
+                        for frame in 0..len / channels {
+                            let base = frame * channels;
+                            let sample = match from {
+                                Some(from) => src_buf[base + from.min(channels - 1)],
+                                None => {
+                                    let sum: f32 = src_buf[base..base + channels].iter().sum();
+                                    sum / channels as f32
+                                }
+                            };
+                            self.mix_buffer[base + into] += sample;
+                        }
                     }
                 }
+                has_input = true;
             }
 
-            // Process the node
-            let node_buf = self
-                .node_buffers
-                .entry(node_id)
-                .or_insert_with(|| vec![0.0f32; buffer_size]);
+            // Every node is provisioned a render buffer by `add_node`, on the
+            // command path, so this is a lookup and never an allocation.
+            let Some(node_buf) = self.node_buffers.get_mut(&node_id) else {
+                continue;
+            };
             if node_buf.len() < buffer_size {
                 node_buf.resize(buffer_size, 0.0);
             }
@@ -823,51 +1103,22 @@ impl AudioContext {
             }
         }
 
-        // Soft clip only if needed (check max amplitude first)
-        let mut needs_clip = false;
-        for &sample in output.iter() {
-            if sample > 1.0 || sample < -1.0 {
-                needs_clip = true;
-                break;
-            }
-        }
-
-        if needs_clip {
-            for sample in output.iter_mut() {
-                if *sample > 1.0 {
-                    *sample = 1.0 - 1.0 / (*sample + 1.0);
-                } else if *sample < -1.0 {
-                    *sample = -1.0 + 1.0 / (-*sample + 1.0);
-                }
-            }
-        }
+        // No limiting here on purpose. `output` is the shared mix bus and this
+        // method is additive, so a limiter at this point would be applied once per
+        // context, in `HashMap` iteration order, over a partial sum that already
+        // contains other contexts' audio -- and would still miss the InnerAudio
+        // players that mix in afterwards. The audio thread applies one pass over
+        // the finished mix instead; see `soft_limit`.
 
         // Track processed frames for sample-accurate currentTime
         let frames = buffer_size / self.channels.max(1) as usize;
         self.frames_processed += frames as u64;
 
-        // Clean up finished source nodes. A naturally-ended one-shot source
-        // must be removed from *every* per-node structure — the node map, its
-        // output buffer, and any graph connections — and its id reported so the
-        // audio thread drops its node→context index entry. Missing any of these
-        // leaks one entry per fired sound effect.
-        let mut finished: Vec<AudioNodeId> = Vec::new();
-        for (&id, node) in self.nodes.iter() {
-            if node.is_finished() {
-                finished.push(id);
-            }
-        }
-        if !finished.is_empty() {
-            for &id in &finished {
-                self.nodes.remove(&id);
-                self.node_buffers.remove(&id);
-            }
-            self.connections
-                .retain(|c| !finished.contains(&c.src) && !finished.contains(&c.dst));
-            self.graph_dirty = true; // processing_order + input_adjacency rebuilt next block
-        }
-
-        finished
+        // Drop whatever can no longer affect the output: sources that finished
+        // this block, and released nodes their disappearance just orphaned.
+        // Missing any of this leaked one node, one output buffer and one
+        // node-index entry per fired sound effect.
+        self.prune()
     }
 }
 
@@ -875,6 +1126,7 @@ impl AudioContext {
 mod tests {
     use super::*;
     use crate::limits::{PcmBudget, PcmUsage, PcmUsageSnapshot};
+    use crate::nodes::OscillatorNode;
 
     fn budgeted_context(
         context_bytes: usize,
@@ -1160,16 +1412,238 @@ mod tests {
         );
     }
 
+    /// A gain node per sound effect is the ordinary Web Audio shape, and nothing
+    /// used to remove one: `is_finished()` is false for every effect node, so the
+    /// node, its render buffer and its node-index entry stayed for the context's
+    /// whole life and were processed every quantum forever.
+    #[test]
+    fn releasing_an_idle_effect_node_drops_it_and_its_render_buffer() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        ctx.create_gain(10);
+        ctx.connect(10, DESTINATION_NODE_ID);
+        let mut out = vec![0.0f32; 2 * 128];
+        ctx.process(&mut out);
+        assert!(ctx.node_buffers.contains_key(&10));
+
+        assert_eq!(ctx.release_node(10), [10]);
+        assert!(!ctx.nodes.contains_key(&10));
+        assert!(
+            !ctx.node_buffers.contains_key(&10),
+            "the per-node render buffer must be freed with the node"
+        );
+        assert!(!ctx.connections.iter().any(|c| c.src == 10 || c.dst == 10));
+    }
+
+    /// JavaScript drops `source -> gain -> destination` as one unreachable object
+    /// graph, so the gain's finalizer can run while the source is still playing
+    /// through it. Honouring that release immediately would cut the sound off.
+    #[test]
+    fn a_released_effect_node_survives_until_its_live_source_finishes() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        let mut oscillator = OscillatorNode::new(10, 48_000);
+        oscillator.start(0.0);
+        ctx.add_node(Box::new(oscillator));
+        ctx.create_gain(11);
+        ctx.connect(10, 11);
+        ctx.connect(11, DESTINATION_NODE_ID);
+
+        assert!(
+            ctx.release_node(11).is_empty(),
+            "a gain carrying a playing source must not be dropped"
+        );
+        assert!(ctx.nodes.contains_key(&11));
+
+        // The source stops; both it and the now-orphaned gain go together.
+        ctx.with_node_typed::<OscillatorNode, _>(10, |osc| osc.stop(0.0));
+        let mut out = vec![0.0f32; 2 * 128];
+        let mut removed = ctx.process(&mut out).to_vec();
+        removed.sort_unstable();
+        assert_eq!(removed, vec![10, 11]);
+        assert!(ctx.nodes.is_empty() || ctx.nodes.contains_key(&DESTINATION_NODE_ID));
+    }
+
+    /// Collecting a released chain has to peel one layer at a time: the filter is
+    /// only orphaned once the gain feeding it is gone.
+    #[test]
+    fn releasing_a_whole_chain_collects_every_layer_in_one_prune() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        ctx.create_gain(10);
+        ctx.create_gain(11);
+        ctx.create_gain(12);
+        ctx.connect(10, 11);
+        ctx.connect(11, 12);
+        ctx.connect(12, DESTINATION_NODE_ID);
+
+        // Release the downstream ones first, so only the upstream release can
+        // start the cascade.
+        assert!(ctx.release_node(12).is_empty());
+        assert!(ctx.release_node(11).is_empty());
+        let mut removed = ctx.release_node(10).to_vec();
+        removed.sort_unstable();
+        assert_eq!(removed, vec![10, 11, 12]);
+        assert!(ctx.node_buffers.is_empty() || !ctx.node_buffers.contains_key(&12));
+    }
+
+    /// A source that was never started can never make a sound, and once JS has
+    /// dropped it nobody can start it. Treating it as active pinned the audio
+    /// thread to its 5 ms tick and held the output device open.
+    #[test]
+    fn an_unstarted_source_is_neither_active_nor_undroppable() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        ctx.create_buffer_source(10);
+        ctx.connect(10, DESTINATION_NODE_ID);
+
+        assert!(
+            !ctx.has_active_sources(),
+            "an unstarted source must not keep the audio thread awake"
+        );
+        assert_eq!(ctx.release_node(10), [10]);
+    }
+
+    #[test]
+    fn releasing_the_destination_or_an_unknown_node_is_a_no_op() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        assert!(ctx.release_node(DESTINATION_NODE_ID).is_empty());
+        assert!(ctx.nodes.contains_key(&DESTINATION_NODE_ID));
+        assert!(ctx.release_node(9_999).is_empty());
+    }
+
+    /// `createChannelSplitter()` used to return something that did not split:
+    /// every output port carried the whole bus, because a connection had no port
+    /// index to read a single channel through.
+    #[test]
+    fn a_splitter_output_port_carries_only_its_own_channel() {
+        use crate::nodes::ChannelSplitterNode;
+
+        // A stereo buffer whose channels differ, so which one arrives is visible.
+        let stereo = DecodedAudio {
+            samples: vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+            sample_rate: 48_000,
+            channels: 2,
+        };
+
+        for (port, expected) in [(0u32, 1.0f32), (1, -1.0)] {
+            let mut ctx = AudioContext::new(1, 48_000, 2);
+            let buffer = ctx.add_buffer(stereo.clone()).unwrap();
+            ctx.create_buffer_source(10);
+            assert!(ctx.set_buffer(10, Some(buffer)));
+            ctx.start_source(10, 0.0, 0.0, None);
+            ctx.add_node(Box::new(ChannelSplitterNode::new(11, 2)));
+            ctx.connect(10, 11);
+            ctx.connect_ports(11, port, DESTINATION_NODE_ID, 0);
+
+            let mut out = vec![0.0f32; 2 * 4];
+            ctx.process(&mut out);
+
+            assert!(
+                out.iter().all(|&s| (s - expected).abs() < 1e-6),
+                "output port {port} must carry only channel {port} ({expected}): {out:?}"
+            );
+        }
+    }
+
+    /// `createChannelMerger()` used to sum every input into every channel. Input
+    /// port `j` must land in channel `j` and nowhere else.
+    #[test]
+    fn a_merger_input_port_lands_in_only_its_own_channel() {
+        use crate::nodes::{ChannelMergerNode, ConstantSourceNode};
+
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        ctx.add_node(Box::new(ChannelMergerNode::new(20, 2)));
+
+        // Two constant sources, one per merger input port.
+        let mut left = ConstantSourceNode::new(21);
+        left.start(0.0);
+        left.get_param_mut("offset").unwrap().set_value(1.0);
+        ctx.add_node(Box::new(left));
+        let mut right = ConstantSourceNode::new(22);
+        right.start(0.0);
+        right.get_param_mut("offset").unwrap().set_value(0.25);
+        ctx.add_node(Box::new(right));
+
+        ctx.connect_ports(21, 0, 20, 0);
+        ctx.connect_ports(22, 0, 20, 1);
+        ctx.connect(20, DESTINATION_NODE_ID);
+
+        let mut out = vec![0.0f32; 2 * 4];
+        ctx.process(&mut out);
+
+        for frame in 0..4 {
+            assert!(
+                (out[frame * 2] - 1.0).abs() < 1e-6,
+                "input port 0 must reach only the left channel: {out:?}"
+            );
+            assert!(
+                (out[frame * 2 + 1] - 0.25).abs() < 1e-6,
+                "input port 1 must reach only the right channel: {out:?}"
+            );
+        }
+    }
+
+    /// An ordinary connection must keep mixing the whole bus. The port machinery
+    /// only engages for a node that actually has more than one port, so nothing
+    /// else pays for it or changes behaviour.
+    #[test]
+    fn a_single_port_connection_still_mixes_the_whole_bus() {
+        use crate::nodes::ConstantSourceNode;
+
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        let mut source = ConstantSourceNode::new(30);
+        source.start(0.0);
+        source.get_param_mut("offset").unwrap().set_value(0.5);
+        ctx.add_node(Box::new(source));
+        ctx.create_gain(31);
+        ctx.connect(30, 31);
+        ctx.connect(31, DESTINATION_NODE_ID);
+
+        let mut out = vec![0.0f32; 2 * 4];
+        ctx.process(&mut out);
+        assert!(
+            out.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+            "both channels must carry the signal: {out:?}"
+        );
+    }
+
+    /// A cycle is legal Web Audio -- a feedback delay is the canonical effect.
+    /// Nodes on one used to be dropped from the processing order entirely, so the
+    /// graph went silent instead of echoing, and because they never ran they never
+    /// finished and were never collected either.
+    #[test]
+    fn nodes_on_a_feedback_cycle_are_still_rendered() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+        ctx.add_node(Box::new(crate::nodes::DelayNode::new(10, 0.05, 48_000, 2)));
+        ctx.create_gain(11);
+        ctx.connect(10, 11);
+        ctx.connect(11, 10); // the feedback edge closes the cycle
+        ctx.connect(10, DESTINATION_NODE_ID);
+
+        let mut out = vec![0.0f32; 2 * 128];
+        ctx.process(&mut out);
+
+        for id in [10, 11, DESTINATION_NODE_ID] {
+            let dense = ctx.dense_index[&id];
+            assert!(
+                ctx.processing_order.contains(&dense),
+                "node {id} was dropped from the render order"
+            );
+        }
+        assert_eq!(
+            ctx.processing_order.last().copied(),
+            Some(ctx.dense_index[&DESTINATION_NODE_ID]),
+            "the destination must still be rendered last"
+        );
+    }
+
     #[test]
     fn remove_finished_node_purges_immediate_stop_only() {
         let mut ctx = AudioContext::new(1, 48_000, 2);
 
         // stop(when <= 0) finishes a buffer source immediately -> fully removed.
-        ctx.create_buffer_source(20);
-        ctx.connect(20, DESTINATION_NODE_ID);
+        ctx.create_buffer_source(20);        ctx.connect(20, DESTINATION_NODE_ID);
         assert!(ctx.stop_source(20, 0.0));
-        assert!(
+        assert_eq!(
             ctx.remove_finished_node(20),
+            [20],
             "immediate-finished node removed"
         );
         assert!(!ctx.nodes.contains_key(&20));
@@ -1181,7 +1655,7 @@ mod tests {
         ctx.connect(21, DESTINATION_NODE_ID);
         assert!(ctx.stop_source(21, 1000.0));
         assert!(
-            !ctx.remove_finished_node(21),
+            ctx.remove_finished_node(21).is_empty(),
             "future-dated stop must remain until it actually finishes"
         );
         assert!(ctx.nodes.contains_key(&21));
@@ -1214,7 +1688,7 @@ mod steady_state_allocation {
         const QUANTUM_FRAMES: usize = 128;
 
         let mut ctx = AudioContext::new(1, 48_000, CHANNELS);
-        let mut oscillator = OscillatorNode::new(10);
+        let mut oscillator = OscillatorNode::new(10, 48_000);
         oscillator.start(0.0);
         ctx.add_node(Box::new(oscillator));
         ctx.add_node(Box::new(GainNode::new(11)));
@@ -1233,7 +1707,62 @@ mod steady_state_allocation {
             },
             |_| {
                 output.fill(0.0);
-                ctx.process(&mut output)
+                // The borrow must not escape the burst body; the length is the
+                // only part the gate needs and reading it keeps the call live.
+                ctx.process(&mut output).len()
+            },
+        );
+    }
+
+    /// The same property, on the path the burst above cannot reach.
+    ///
+    /// **Saying why is the point.** The gate above renders an oscillator that
+    /// never finishes, so the graph never changes and `rebuild_processing_order`
+    /// runs exactly once, during the warm-up. That is not what a game does: every
+    /// fired sound effect ends, an ended source is dropped from the graph, and
+    /// that marks the order dirty and rebuilds it on the very next quantum. The
+    /// rebuild used to build two fresh `HashMap`s and a `Vec` every time -- on the
+    /// thread that must never be late -- and the measured window never saw it.
+    ///
+    /// So every iteration here adds, plays out and collects a one-shot source:
+    /// a graph change per quantum, strictly more churn than real playback, and it
+    /// must still never reach the heap.
+    #[test]
+    fn a_graph_change_on_the_render_path_never_reaches_the_heap() {
+        const CHANNELS: u32 = 2;
+        const QUANTUM_FRAMES: usize = 128;
+
+        let mut ctx = AudioContext::new(1, 48_000, CHANNELS);
+        ctx.create_gain(11);
+        ctx.connect(11, DESTINATION_NODE_ID);
+        let mut output = vec![0.0f32; QUANTUM_FRAMES * CHANNELS as usize];
+
+        // The boxed nodes are built before the measured window: `Box::new` is the
+        // burst body's own allocation, not the render path's, and Section 7.3
+        // forbids a body that takes from a pool it does not control.
+        const ITERATIONS: usize = 8 + 64;
+        let mut ready: Vec<Box<dyn AudioNodeProcessor>> = (0..ITERATIONS)
+            .map(|i| {
+                let mut oscillator = OscillatorNode::new(100 + i as AudioNodeId, 48_000);
+                oscillator.start(0.0);
+                oscillator.stop(0.0);
+                Box::new(oscillator) as Box<dyn AudioNodeProcessor>
+            })
+            .collect();
+
+        assert_no_steady_state_allocation(
+            Burst {
+                path: "audio: one graph quantum that adds and collects a source",
+                warmup: 8,
+                measured: 64,
+            },
+            |_| {
+                let node = ready.pop().expect("a prepared node per iteration");
+                let id = node.id();
+                ctx.add_node(node);
+                ctx.connect(id, 11);
+                output.fill(0.0);
+                ctx.process(&mut output).len()
             },
         );
     }

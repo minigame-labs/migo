@@ -1,4 +1,75 @@
-import { op_audio_connect, op_audio_disconnect } from "ext:core/ops";
+import {
+  op_audio_connect,
+  op_audio_disconnect,
+  op_audio_release_node,
+} from "ext:core/ops";
+
+// A native release is fire-and-forget and idempotent, but the audio command
+// queue is bounded, and a *dropped* release is exactly the leak these finalizers
+// exist to prevent. So a rejected send is retried with backoff.
+//
+// Only the numbers needed to name the resource are retained, never a node, a
+// buffer or a context -- a queued retry that held the object would keep alive
+// the very thing it is trying to free.
+const INITIAL_RELEASE_RETRY_MS = 4;
+const MAX_RELEASE_RETRY_MS = 1000;
+
+/// Build a retrying, de-duplicating release queue over one native release op.
+function createReleaseQueue(release) {
+  const pending = new Map();
+  let timer = null;
+  let retryMs = INITIAL_RELEASE_RETRY_MS;
+
+  function schedule() {
+    if (timer !== null || pending.size === 0) return;
+    timer = setTimeout(flush, retryMs);
+  }
+
+  function flush() {
+    timer = null;
+    for (const [key, argument] of pending) {
+      try {
+        release(argument);
+        pending.delete(key);
+      } catch {
+        // Queue saturation is transient; keep the numeric key and retry.
+      }
+    }
+    if (pending.size === 0) {
+      retryMs = INITIAL_RELEASE_RETRY_MS;
+      return;
+    }
+    retryMs = Math.min(retryMs * 2, MAX_RELEASE_RETRY_MS);
+    schedule();
+  }
+
+  return function enqueueRelease(key, argument) {
+    if (pending.has(key)) return;
+    try {
+      release(argument);
+    } catch {
+      pending.set(key, argument);
+      schedule();
+    }
+  };
+}
+
+const releaseNativeNode = createReleaseQueue(({ ctxId, nodeId }) =>
+  op_audio_release_node(ctxId, nodeId)
+);
+
+// Unreachable nodes must tell the audio thread, or every effect node a game
+// creates -- one gain per sound effect is the ordinary shape -- stays in the
+// graph for the context's whole life, along with its render buffer, and gets
+// processed every quantum forever.
+//
+// Registering rather than tracking: a strong module-global map of nodes would
+// pin every node and its context, which is what
+// `web_audio_registries_do_not_strongly_retain_contexts_buffers_or_nodes`
+// forbids. The registry holds a `{ctxId, nodeId}` record of numbers only.
+const NODE_FINALIZER = new FinalizationRegistry((held) => {
+  releaseNativeNode(held.nodeId, held);
+});
 
 class AudioNode {
   #context;
@@ -18,6 +89,15 @@ class AudioNode {
     this.#channelCount = options.channelCount ?? 2;
     this.#channelCountMode = options.channelCountMode ?? "max";
     this.#channelInterpretation = options.channelInterpretation ?? "speakers";
+    // The destination is owned by its context and has no native id of its own to
+    // release; the native side ignores it, and registering it would only add a
+    // finalizer that fires when the context is already being torn down.
+    if (nodeId !== 0) {
+      NODE_FINALIZER.register(this, {
+        ctxId: context._nativeId,
+        nodeId,
+      });
+    }
   }
 
   get context() {
@@ -64,7 +144,15 @@ class AudioNode {
     if (!(destination instanceof AudioNode)) {
       throw new TypeError("destination must be an AudioNode");
     }
-    op_audio_connect(this.#nodeId, destination._nodeId);
+    if (outputIndex < 0 || outputIndex >= this.#numberOfOutputs) {
+      throw new DOMException("outputIndex is out of range", "IndexSizeError");
+    }
+    if (inputIndex < 0 || inputIndex >= destination.numberOfInputs) {
+      throw new DOMException("inputIndex is out of range", "IndexSizeError");
+    }
+    // The indices used to be accepted and dropped, which is why a
+    // ChannelSplitter's outputs were all the same signal.
+    op_audio_connect(this.#nodeId, destination._nodeId, outputIndex, inputIndex);
     this.#connections.push(destination);
     return destination;
   }
@@ -117,6 +205,7 @@ function validateFiniteDouble(value, name) {
 export {
   AudioNode,
   AudioDestinationNode,
+  createReleaseQueue,
   validateScheduledTime,
   validateFiniteDouble,
 };

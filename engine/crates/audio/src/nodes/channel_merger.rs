@@ -2,13 +2,17 @@ use std::any::Any;
 
 use shared::protocol::audio_cmd::AudioNodeId;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
-/// ChannelMergerNode: merges multiple mono inputs into a single multi-channel output.
+/// ChannelMergerNode: gathers one mono input per port into one multi-channel bus.
 ///
-/// For a stereo output (most common case), input 0 goes to left channel
-/// and input 1 goes to right channel. Since our audio graph currently uses
-/// a single mixed input buffer, this node simply passes through the input.
+/// The node itself only has to pass its already-gathered input bus through. The
+/// merge happens at the connection: because `input_ports()` is greater than one,
+/// the graph writes each incoming connection into the single channel its input
+/// index names rather than mixing it across the whole bus.
+///
+/// It used to be a documented pass-through, so `createChannelMerger()` summed
+/// every input into every channel instead of placing them side by side.
 pub struct ChannelMergerNode {
     id: AudioNodeId,
     number_of_inputs: u32,
@@ -18,7 +22,7 @@ impl ChannelMergerNode {
     pub fn new(id: AudioNodeId, number_of_inputs: u32) -> Self {
         Self {
             id,
-            number_of_inputs: number_of_inputs.max(1).min(32),
+            number_of_inputs: number_of_inputs.clamp(1, 32),
         }
     }
 
@@ -33,12 +37,12 @@ impl AudioNodeProcessor for ChannelMergerNode {
         self.id
     }
 
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::ChannelMerger
-    }
-
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    fn input_ports(&self) -> u32 {
+        self.number_of_inputs
     }
 
     fn process(
@@ -49,10 +53,12 @@ impl AudioNodeProcessor for ChannelMergerNode {
         channels: u32,
         _current_time: f64,
     ) -> usize {
-        // Simplified: pass through mixed input
         let len = inputs.len().min(output.len());
         if len > 0 {
             output[..len].copy_from_slice(&inputs[..len]);
+        }
+        if len < output.len() {
+            output[len..].fill(0.0);
         }
         len / channels.max(1) as usize
     }

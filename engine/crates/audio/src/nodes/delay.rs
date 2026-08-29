@@ -4,22 +4,30 @@ use shared::protocol::audio_cmd::AudioNodeId;
 
 use crate::param::AudioParamTimeline;
 
-use super::{AudioNodeProcessor, AudioNodeType};
+use super::AudioNodeProcessor;
 
-/// DelayNode: circular buffer delay line.
+/// DelayNode: fractional-delay circular buffer.
 ///
-/// Delays the input signal by a specified amount of time.
-/// The `delayTime` parameter can be automated for effects like flanging.
+/// Delays the input by `delayTime`, which is an a-rate parameter: it is evaluated
+/// per sample, and the read position is interpolated between the two nearest taps.
+/// Both halves are needed for the flanging the API exists to support. Rounding the
+/// delay to whole samples and sampling the parameter once per block turned a glide
+/// into a staircase -- each step a discontinuity in the delay line, heard as
+/// zipper noise rather than a sweep.
 pub struct DelayNode {
     id: AudioNodeId,
     delay_time: AudioParamTimeline,
-    /// Circular buffer for delay (interleaved stereo)
+    /// Circular buffer, interleaved, `frames * channels` samples.
     buffer: Vec<f32>,
-    /// Write position in the circular buffer (in samples, not frames)
-    write_pos: usize,
+    /// Write position, in frames.
+    write_frame: usize,
+    /// Frames in the circular buffer.
+    frames: usize,
     /// Maximum delay in seconds (set at creation time)
     max_delay: f32,
-    channels: u32,
+    channels: usize,
+    /// Reusable per-sample automation values, like `GainNode`'s.
+    automation: Vec<f32>,
 }
 
 impl DelayNode {
@@ -42,25 +50,41 @@ impl DelayNode {
                 max_delay
             );
         }
-        let buffer_size = (max_delay as f64 * sample_rate as f64) as usize * ch;
+        // One frame of headroom so the interpolator's second tap at the maximum
+        // delay is still inside the buffer rather than wrapping onto the sample
+        // just written.
+        let frames = (max_delay as f64 * sample_rate as f64) as usize + 2;
         Self {
             id,
             delay_time: AudioParamTimeline::new(0.0, 0.0, max_delay),
-            buffer: vec![0.0; buffer_size],
-            write_pos: 0,
+            buffer: vec![0.0; frames * ch],
+            write_frame: 0,
+            frames,
             max_delay,
-            channels,
+            channels: ch,
+            automation: Vec::new(),
         }
+    }
+
+    /// Read channel `ch` a fractional number of frames behind the write cursor.
+    #[inline]
+    fn read_interpolated(&self, delay_frames: f32, ch: usize) -> f32 {
+        let whole = delay_frames.floor();
+        let frac = delay_frames - whole;
+        let back = whole as usize;
+        // `write_frame` still holds the sample written this iteration, so a delay
+        // of zero reads it straight back.
+        let tap0 = (self.write_frame + self.frames - back % self.frames) % self.frames;
+        let tap1 = (tap0 + self.frames - 1) % self.frames;
+        let a = self.buffer[tap0 * self.channels + ch];
+        let b = self.buffer[tap1 * self.channels + ch];
+        a + (b - a) * frac
     }
 }
 
 impl AudioNodeProcessor for DelayNode {
     fn id(&self) -> AudioNodeId {
         self.id
-    }
-
-    fn node_type(&self) -> AudioNodeType {
-        AudioNodeType::Delay
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -80,35 +104,37 @@ impl AudioNodeProcessor for DelayNode {
             return 0;
         }
 
-        let channels = self.channels as usize;
+        let channels = self.channels;
         let frames = len / channels;
-        let buf_len = self.buffer.len();
+        if frames == 0 {
+            return 0;
+        }
 
-        let delay_secs = self
-            .delay_time
-            .compute_value(current_time)
-            .max(0.0)
-            .min(self.max_delay);
-        let delay_samples = (delay_secs as f64 * sample_rate as f64) as usize * channels;
+        // a-rate: one value per frame. The maximum is one frame short of the
+        // buffer so the interpolator's older tap cannot wrap past the newest
+        // sample.
+        let max_delay_frames = (self.frames - 2) as f32;
+        if self.automation.len() < frames {
+            self.automation.resize(frames, 0.0);
+        }
+        self.delay_time
+            .compute_values(current_time, &mut self.automation[..frames], sample_rate);
 
+        let sr = sample_rate.max(1) as f32;
         for frame in 0..frames {
+            let delay_frames = (self.automation[frame].clamp(0.0, self.max_delay) * sr)
+                .clamp(0.0, max_delay_frames);
+
+            let base = frame * channels;
+            let write_base = self.write_frame * channels;
             for ch in 0..channels {
-                let idx = frame * channels + ch;
-
-                // Write input to circular buffer
-                self.buffer[self.write_pos] = inputs[idx];
-
-                // Read from circular buffer with delay
-                let read_pos = if self.write_pos >= delay_samples {
-                    self.write_pos - delay_samples
-                } else {
-                    buf_len + self.write_pos - delay_samples
-                };
-
-                output[idx] = self.buffer[read_pos % buf_len];
-
-                self.write_pos = (self.write_pos + 1) % buf_len;
+                self.buffer[write_base + ch] = inputs[base + ch];
             }
+            for ch in 0..channels {
+                output[base + ch] = self.read_interpolated(delay_frames, ch);
+            }
+
+            self.write_frame = (self.write_frame + 1) % self.frames;
         }
 
         frames
@@ -118,6 +144,95 @@ impl AudioNodeProcessor for DelayNode {
         match name {
             "delayTime" => Some(&mut self.delay_time),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(node: &mut DelayNode, input: &[f32], sample_rate: u32) -> Vec<f32> {
+        let mut out = vec![0.0f32; input.len()];
+        node.process(input, &mut out, sample_rate, 1, 0.0);
+        out
+    }
+
+    #[test]
+    fn a_zero_delay_passes_the_input_through() {
+        let mut node = DelayNode::new(1, 0.1, 48_000, 1);
+        let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        assert_eq!(run(&mut node, &input, 48_000), input);
+    }
+
+    #[test]
+    fn a_whole_sample_delay_shifts_by_exactly_that_many_frames() {
+        let sample_rate = 48_000;
+        let mut node = DelayNode::new(1, 0.1, sample_rate, 1);
+        // Three frames of delay. Exact in seconds is not exact in f32, so the
+        // impulse may straddle two taps by a rounding epsilon.
+        node.delay_time.set_value(3.0 / sample_rate as f32);
+
+        let mut input = vec![0.0f32; 8];
+        input[0] = 1.0;
+        let out = run(&mut node, &input, sample_rate);
+
+        assert!(
+            (out[3] - 1.0).abs() < 1e-4,
+            "the impulse must land three frames later: {out:?}"
+        );
+        let elsewhere: f32 = out
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 3)
+            .map(|(_, s)| s.abs())
+            .sum();
+        assert!(elsewhere < 1e-4, "and nowhere else: {out:?}");
+    }
+
+    /// Rounding the delay to whole samples made a half-sample delay identical to
+    /// either its floor or its ceiling, which is what turned a delayTime sweep into
+    /// a staircase. A fractional delay must land between the two.
+    #[test]
+    fn a_fractional_delay_interpolates_between_taps() {
+        let sample_rate = 48_000;
+        let mut node = DelayNode::new(1, 0.1, sample_rate, 1);
+        node.delay_time.set_value(1.5 / sample_rate as f32);
+
+        let mut input = vec![0.0f32; 8];
+        input[0] = 1.0;
+        let out = run(&mut node, &input, sample_rate);
+
+        assert!(
+            (out[1] - 0.5).abs() < 1e-3 && (out[2] - 0.5).abs() < 1e-3,
+            "a 1.5-frame delay must split the impulse across taps 1 and 2: {out:?}"
+        );
+    }
+
+    /// `delayTime` is a-rate. Sampling it once per block froze the delay at the
+    /// block's start time, so a ramp only stepped at block boundaries.
+    ///
+    /// The probe is exact rather than approximate: a delay that grows by one frame
+    /// per frame keeps the read position pinned to the first sample written, so a
+    /// rising input must come out constant. Evaluated once per block the delay
+    /// would be zero throughout and the output would be the input.
+    #[test]
+    fn delay_time_is_evaluated_per_sample() {
+        let sample_rate = 48_000;
+        let mut node = DelayNode::new(1, 0.1, sample_rate, 1);
+        node.delay_time.set_value_at_time(0.0, 0.0);
+        node.delay_time
+            .linear_ramp_to_value_at_time(8.0 / sample_rate as f32, 8.0 / sample_rate as f64);
+
+        let input: Vec<f32> = (1..=8).map(|i| i as f32).collect();
+        let out = run(&mut node, &input, sample_rate);
+
+        for (i, &sample) in out.iter().enumerate() {
+            assert!(
+                (sample - 1.0).abs() < 1e-3,
+                "frame {i} read {sample}; a per-sample delay must track the write \
+                 cursor and keep reading the first sample. Got {out:?}"
+            );
         }
     }
 }
