@@ -32,6 +32,12 @@ logs/
 .agents/
 .worktrees/
 
+# Lockfile for a maintainer's local skill/plugin marketplace. It pins tools used
+# while working on the repo, not anything the repo builds or ships, and it named
+# a third party's marketplace. It kept arriving bundled into unrelated commits
+# (removed again in #159 and #161); ignoring it stops the fourth time.
+skills-lock.json
+
 # Local agent/tool output and mutation reports are never source inputs.
 **/mutants.out*/
 **/.mutants.out*/
