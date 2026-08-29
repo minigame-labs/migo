@@ -30,10 +30,11 @@ If applicable, add screenshots or logs to help explain the problem.
 
 ## Environment
 
-- **OS**: [e.g., Android 13, iOS 17, Windows 11]
-- **Device**: [e.g., Pixel 7, iPhone 15]
-- **Migo Version**: [e.g., 0.1.0]
-- **Rust Version**: [e.g., 1.75.0]
+- **Platform**: [Android / Linux / Windows / OpenHarmony — the four Migo targets]
+- **OS version**: [e.g., Android 13, HarmonyOS 4.2, Windows 11, Ubuntu 22.04]
+- **Device / SoC**: [e.g., Pixel 7, Mate 30 Pro; desktop CPU/GPU for Linux/Windows]
+- **Migo version**: [e.g., 0.9.x — the AAR / `.so` / `.dll` filename carries it]
+- **Rust version**: [only if building the engine from source; otherwise leave blank]
 
 ## Additional Context
 
