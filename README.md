@@ -10,6 +10,8 @@
 `migo.*` is the one native capability surface this engine ever installs — nothing else, at any scale. This repository stays that: a pure runtime, no adapter code mixed in. Everything else existing content expects belongs in an independent, composable adapter published as its own package:
 
 - **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** — a browser-style BOM/DOM surface (`window`, `document`, `Image`, `XMLHttpRequest`, ...) for engines built assuming a browser environment (Cocos, Egret, Laya, Pixi, raw Canvas/WebGL).
+- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** — aliases `globalThis.wx` onto the runtime's `migo.*` capabilities, so mainstream mini-game-shaped content runs unmodified.
+
 Adapters install only their documented globals and compose freely — pick only what your content actually needs. A future platform (a quick-game-alliance member, etc.) follows the same recipe: a new adapter package, no engine changes.
 
 **Wondering whether your own catalogue runs?** Don't take our word for it and don't send us anything — [PRESCREEN.md](PRESCREEN.md) is the tool we would run, for you to run yourself. It reports which APIs a bundle needs against what this build actually publishes, and whether it paints on a real device. Your content never leaves your machine.
@@ -146,6 +148,7 @@ migo/
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | Host integration examples, one directory per platform |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Reproducible Migo-vs-WebView benchmarks |
 | [migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter) | Browser-style BOM/DOM compat adapter |
+| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | `wx.*` compat adapter for mainstream mini-game content |
 
 ## License
 

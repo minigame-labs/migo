@@ -37,7 +37,9 @@ bash scripts/prescreen-game.sh /path/to/your/bundle --out report.md
 
 If your content is written against the mainstream mini-game global (`wx.*`
 rather than `migo.*`), point it at the adapter as well, or `wx` cannot be
-answered at all:
+answered at all. Build the IIFE bundle from
+[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) (its README
+has the one build command) and pass it:
 
 ```sh
 bash scripts/prescreen-game.sh /path/to/your/bundle \
