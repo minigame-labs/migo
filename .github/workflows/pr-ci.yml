@@ -185,6 +185,13 @@ jobs:
       - name: Doc version-reference contract
         run: bash scripts/test-doc-version-refs-contract.sh
 
+      # v0.9.4 shipped with no `## v0.9.4` section: its notes stayed under
+      # `## [Unreleased]` and 58 PRs, the `wx` removal among them, had no release
+      # note anywhere. This holds `CHANGELOG.md` to a section matching
+      # `release/VERSION`.
+      - name: CHANGELOG release-section contract
+        run: bash scripts/test-changelog-release-section-contract.sh
+
       # The prescreen scanner is what a prospective customer runs against their own
       # bundle, so its wrong answers are the expensive kind: a gap it invents gets
       # checked, does not exist, and the rest of the report stops being believed.
