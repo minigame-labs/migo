@@ -35,8 +35,9 @@
 | **OpenHarmony / HarmonyOS NEXT**（aarch64、x86_64） | 已发布 | 按架构产出的 C ABI 包(头文件、静态库、CMake 包、manifest) |
 | iOS、macOS | 计划中 | — |
 
-已发布产物见 [releases 页面](https://github.com/minigame-labs/migo/releases)。每个产物都带
-`.attestation.json`,记录归档的名称、大小与 sha256 —— 使用前请对照校验。
+已发布产物见 [releases 页面](https://github.com/minigame-labs/migo/releases)。每个 release 都带一份
+`SHA256SUMS.txt`（用 `sha256sum -c SHA256SUMS.txt` 校验下载），每个归档还带 `.attestation.json`,
+记录其名称、大小与 sha256,其中 `package_sha256` 可从源码复现（见 [BUILD.md](BUILD.md)）。
 
 [`include/migo/`](include/migo/) 中的 C ABI 目前是 **candidate**——在上表每个平台上都已有可用运行时，但尚未冻结。冻结前还剩哪些事项，以该目录下的 README 为准。
 
