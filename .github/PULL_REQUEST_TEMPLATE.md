@@ -21,7 +21,7 @@ Closes #
 - [ ] I have added/updated tests as needed
 - [ ] All tests pass locally (`cargo test`)
 - [ ] I have updated documentation as needed
-- [ ] I have read and agree to the [CLA](CLA.md) *(first-time contributors)*
+- [ ] I have read and agree to the [CLA](../CLA.md) *(first-time contributors)*
 
 ## Screenshots (if applicable)
 
