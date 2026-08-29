@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of hashing the method name and signature against the JNI method cache
   on every frame. The lookup is off the frame-scheduling path now; the id is a
   process-lifetime constant.
+- The GitHub Release notes now lead with this file's `## v<version>` section.
+  They previously carried only the asset table, verification steps, and GitHub's
+  raw commit list — the curated record of what changed was in the repo but not
+  on the release page. `write-release-notes.sh` refuses to write notes for a
+  version whose section is missing or empty.
 
 ### Fixed
 - `migo.getUpdateManager()` no longer invents updates. It was deciding with

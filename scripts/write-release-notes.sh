@@ -31,6 +31,27 @@ OUTPUT="$2"
 
 VERSION="$(read_release_version "$REPO_ROOT")"
 
+# The curated record of what changed. `generate_release_notes: true` appends
+# GitHub's commit-derived list below this file's output, but that is a wall of PR
+# titles -- the CHANGELOG section is the part written for a reader. It is not
+# optional: test-changelog-release-section-contract.sh already fails the build if
+# `## v<version>` is missing, so an empty extraction here means that gate was
+# bypassed and the notes should not be written rather than published without it.
+CHANGELOG_SECTION="$(
+    awk -v heading="## v${VERSION} " '
+        index($0 " ", heading) == 1 { found = 1; next }
+        found && (/^## / || /^---[[:space:]]*$/) { exit }
+        found { print }
+    ' "$REPO_ROOT/CHANGELOG.md" |
+        sed -e '/./,$!d' |          # drop leading blank lines
+        sed -e ':a' -e '/^\n*$/{$d;N;ba}'   # drop trailing blank lines
+)"
+if [[ -z "${CHANGELOG_SECTION//[[:space:]]/}" ]]; then
+    echo "[release-notes] CHANGELOG.md has no '## v${VERSION}' section body" >&2
+    echo "[release-notes] (test-changelog-release-section-contract.sh should have caught this)" >&2
+    exit 1
+fi
+
 # One row per payload, in the order the release page shows them (GitHub sorts assets
 # case-insensitively by name). Sidecars, checksums and version.json are deliberately
 # not rows: they are described once in the verification section instead of repeated
@@ -62,6 +83,10 @@ PY
 
 cat > "$OUTPUT" <<NOTES
 Runtime SDKs for Android, Linux, OpenHarmony and Windows.
+
+## What changed in v$VERSION
+
+$CHANGELOG_SECTION
 
 ## Assets
 
