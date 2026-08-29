@@ -22,6 +22,14 @@ MIGO_WIN_V8_ARCHIVE="$(wslpath -w "$V8_DIR_UNIX/rusty_v8.lib")"
 MIGO_WIN_V8_SRC_BINDING="$(wslpath -w "$V8_DIR_UNIX/src_binding.rs")"
 export MIGO_WIN_V8_ARCHIVE MIGO_WIN_V8_SRC_BINDING
 
+# So a cold Skia build can fetch its prebuilt tarball from the Windows side.
+# No-op with a warm `C:\mt` (nothing to download) or a caller-set proxy.
+proxy="$(detect_windows_proxy)"
+if [[ -n "$proxy" ]]; then
+    export MIGO_WIN_PROXY="$proxy"
+    echo "[verify-compile] using Windows proxy $proxy for the Skia binaries fetch"
+fi
+
 bash "$SPIKE_DIR/sync-worktree.sh"
 
 # The crates `verification_targets.py::ANDROID_GATED_CRATES` overlaps with on
