@@ -504,6 +504,29 @@ target_command() {
                 echo "bash scripts/build-ohos-sdk.sh --compile-only x86_64"
             fi
             ;;
+        windows:compile)
+            # Probed like `ohos`, because the source of truth is in WSL and the
+            # MSVC toolchain is on the Windows side: a machine without Visual
+            # Studio, the pinned Windows V8 import library, or the staged Skia
+            # build deps reports NOT PROVEN rather than a FAIL about evidence it
+            # never had.
+            #
+            # `x86_64` only: the lane proves the `cfg(windows)` / `msvc` view of
+            # the tree still compiles, which is the same view for either Windows
+            # architecture, and x86_64 is the one whose Skia target directory is
+            # kept warm here.
+            #
+            # `verify-compile.sh` runs `sync-worktree.sh` first, so the Windows
+            # copy carries the working tree this run is scoped to, not only the
+            # last commit.
+            if [[ -f "/mnt/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" ]] \
+                && [[ -f "$ROOT/engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.lib" ]] \
+                && [[ -x "$ROOT/platforms/windows/spike/verify-compile.sh" ]] \
+                && [[ -f "/mnt/c/migo-win-spike-tmp/bin/ninja.exe" ]] \
+                && [[ -f "/mnt/c/migo-win-spike-tmp/include/EGL/egl.h" ]]; then
+                echo "bash platforms/windows/spike/verify-compile.sh"
+            fi
+            ;;
         android-java:compile)
             # Probed rather than assumed, so a machine without the Android
             # build reports NOT PROVEN like every other absent target. Running
@@ -545,6 +568,15 @@ target_absence_reason() {
             ;;
         android-java:compile)
             echo "no Android Gradle wrapper at platforms/android/gradlew"
+            ;;
+        windows:compile)
+            if [[ ! -f "/mnt/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" ]]; then
+                echo "no Visual Studio Build Tools; see platforms/windows/README.md"
+            elif [[ ! -f "$ROOT/engine/third_party/rusty_v8/x86_64-pc-windows-msvc/rusty_v8.lib" ]]; then
+                echo "no Windows V8 import library; build it with scripts/build-v8-windows.sh x86_64"
+            else
+                echo "Windows Skia build deps not staged; run platforms/windows/spike/stage-deps.sh"
+            fi
             ;;
         *) echo "no local build for this target" ;;
     esac
