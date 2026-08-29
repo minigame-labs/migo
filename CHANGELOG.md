@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `AnalyserNode`'s scalar parameters take effect. `minDecibels`, `maxDecibels`
+  and `smoothingTimeConstant` were accepted and then ignored, so
+  `getByteFrequencyData` / `getFloatFrequencyData` returned unsmoothed data over
+  a fixed range regardless of what content set. They now reach the audio thread
+  through a dedicated op and apply.
 - `scripts/build-aar.sh --jitless` builds an engine that asks V8 to stop
   generating machine code (`--jitless`). HarmonyOS 5.0.0(12) forbids a
   third-party VM from making memory executable, so Migo runs interpreted on
@@ -34,8 +39,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw commit list — the curated record of what changed was in the repo but not
   on the release page. `write-release-notes.sh` refuses to write notes for a
   version whose section is missing or empty.
+- Redundant GL calls stop reaching the driver on two more paths. `glScissor`
+  could not be deduplicated before, because the dirty-region Canvas2D batcher
+  and the DrawingBuffer blit both moved the scissor box outside the state
+  shadow; both now route through it. The texture-unit, `glEnable`/`glDisable`
+  and vertex-attribute shadows were rebuilt from hash maps and sets keyed by GL
+  enum or `(vao, index)` into arrays and bitmasks, so deciding that a call is
+  redundant no longer hashes.
+- `AudioParam` automation is evaluated once per 128-sample block instead of once
+  per sample. A parameter driven by `setValueAtTime`, a ramp, `setTargetAtTime`
+  or `setValueCurveAtTime` walked its whole event timeline for every sample in
+  the block; it now makes one forward pass.
+- `measureText` and the Canvas2D font ops no longer allocate on every call. They
+  cloned the whole text string to keep a character count for a render-thread
+  timeout branch they rarely reach; they now take the count first and move the
+  original.
+- WebGL error reporting under queue pressure follows the spec. Past the
+  per-context cap the queue used to discard the oldest un-retrieved error; it
+  now keeps the oldest, drops the newest, reserves the last slot for a sticky
+  `OUT_OF_MEMORY`, and counts the drops in the render diagnostics.
+- `chacha20` (pulled in transitively by `rand`) is updated off a yanked
+  release. No advisory attached; `cargo audit` stays clean.
 
 ### Fixed
+- A re-linked WebGL program's uniforms reach the driver again. `glLinkProgram`
+  gives a program fresh, zeroed uniform storage; the per-`(program, location)`
+  dedup cache was not cleared across it, so content that re-linked a program and
+  then re-uploaded an unchanged uniform value had that upload silently dropped —
+  the draw used the reset value, with no GL error and nothing in a log.
+- Sub-package and ZIP extraction is no longer open to a symlink race. An entry's
+  path was validated as a string and then resolved again by a separate syscall;
+  a path component could turn into a symlink in between and let the entry write
+  outside its destination directory. Every component is now reached with
+  `openat` under `O_NOFOLLOW` from a held directory descriptor, so a swapped
+  component fails with `ELOOP` at the moment of use rather than after a passed
+  check.
+- `fetch` no longer puts the sandbox's internal path layout in a request to a
+  remote server.
+- Terminating a Worker while it is still starting up is no longer a silent
+  no-op. The handle the host holds was published only after the worker runtime
+  finished initialising, so `terminate()` called in that window did nothing and
+  the worker ran to completion.
+- A game is no longer stranded after a WebGL context loss and restore. The
+  render drain dispatches `webglcontextlost` / `webglcontextrestored` into JS;
+  a handler that resolves a promise or requests a frame leaves a pending task,
+  and the event loop stayed parked on it until some unrelated host command
+  arrived — which, for a game between frames, it never did.
+- The C ABI's minimum `struct_size` for `MigoHostCallbacks` was wrong on ILP32.
+  It used a literal `32`, correct for LP64's pointer width; a 32-bit host
+  passing a struct that fully contained `dispatch` (minimum `20` there) was
+  refused with `MIGO_ERROR_INVALID_ARGUMENT`. The minimum is now derived from
+  the field offset.
 - `migo.getUpdateManager()` no longer invents updates. It was deciding with
   `Math.random() < 0.3` at construction whether to fire
   `onCheckForUpdate({hasUpdate: true})`, so roughly a quarter of launches
