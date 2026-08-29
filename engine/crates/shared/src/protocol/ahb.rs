@@ -651,6 +651,14 @@ mod imp {
             })
         }
 
+        /// # Safety
+        ///
+        /// Mirrors the Android [`from_raw_acquire`] contract so the signature is
+        /// identical on every target: `ptr` must identify a live AHB matching
+        /// `desc`. This build has no AHB to adopt and returns
+        /// [`AhbError::NotAndroid`] without dereferencing `ptr`.
+        ///
+        /// [`from_raw_acquire`]: #method.from_raw_acquire
         pub unsafe fn from_raw_acquire(
             _ptr: *mut c_void,
             _desc: AhbDesc,
@@ -659,6 +667,15 @@ mod imp {
             Err(AhbError::NotAndroid)
         }
 
+        /// # Safety
+        ///
+        /// Mirrors the Android [`from_raw_owned`] contract so the signature is
+        /// identical on every target: `ptr` must identify a live AHB matching
+        /// `desc` and transfer exactly one native reference. This build has no
+        /// AHB to adopt and returns [`AhbError::NotAndroid`] without
+        /// dereferencing `ptr`.
+        ///
+        /// [`from_raw_owned`]: #method.from_raw_owned
         pub unsafe fn from_raw_owned(_ptr: *mut c_void, _desc: AhbDesc) -> Result<Self, AhbError> {
             // The mock has no notion of an external pointer to adopt.
             Err(AhbError::NotAndroid)
