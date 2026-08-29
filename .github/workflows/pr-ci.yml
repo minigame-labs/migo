@@ -186,9 +186,9 @@ jobs:
         run: bash scripts/test-doc-version-refs-contract.sh
 
       # v0.9.4 shipped with no `## v0.9.4` section: its notes stayed under
-      # `## [Unreleased]` and 58 PRs, the `wx` removal among them, had no release
-      # note anywhere. This holds `CHANGELOG.md` to a section matching
-      # `release/VERSION`.
+      # `## [Unreleased]` and 58 PRs, the legacy-namespace removal among them,
+      # had no release note anywhere. This holds `CHANGELOG.md` to a section
+      # matching `release/VERSION`.
       - name: CHANGELOG release-section contract
         run: bash scripts/test-changelog-release-section-contract.sh
 
