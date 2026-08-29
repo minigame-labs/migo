@@ -188,7 +188,8 @@ impl PannerNode {
             return 1.0;
         }
 
-        let cosine = (dot(source_to_listener, orientation) / (listener_length * orientation_length))
+        let cosine = (dot(source_to_listener, orientation)
+            / (listener_length * orientation_length))
             .clamp(-1.0, 1.0);
         let angle = cosine.acos().to_degrees().abs();
         let inner = (self.cone_inner_angle / 2.0).abs();
@@ -401,8 +402,14 @@ mod tests {
             (PannerNode::azimuth([0.0, 0.0, 1.0]).abs() - 180.0).abs() < 1e-9,
             "behind"
         );
-        assert!((PannerNode::azimuth([1.0, 0.0, 0.0]) - 90.0).abs() < 1e-9, "right");
-        assert!((PannerNode::azimuth([-1.0, 0.0, 0.0]) + 90.0).abs() < 1e-9, "left");
+        assert!(
+            (PannerNode::azimuth([1.0, 0.0, 0.0]) - 90.0).abs() < 1e-9,
+            "right"
+        );
+        assert!(
+            (PannerNode::azimuth([-1.0, 0.0, 0.0]) + 90.0).abs() < 1e-9,
+            "left"
+        );
     }
 
     #[test]

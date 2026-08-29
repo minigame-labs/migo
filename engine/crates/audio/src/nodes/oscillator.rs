@@ -117,8 +117,7 @@ impl OscillatorNode {
             OscillatorType::Square | OscillatorType::Triangle => {
                 let naive = if phase < 0.5 { 1.0 } else { -1.0 };
                 // Two edges per cycle: the rise at 0 and the fall at 0.5.
-                let square =
-                    naive + poly_blep(phase, dt) - poly_blep((phase + 0.5).fract(), dt);
+                let square = naive + poly_blep(phase, dt) - poly_blep((phase + 0.5).fract(), dt);
                 if self.osc_type == OscillatorType::Square {
                     square
                 } else {

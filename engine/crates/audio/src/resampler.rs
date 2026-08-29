@@ -128,12 +128,11 @@ impl StreamResampler {
         }
         // `history` is the whole remaining virtual input: one frame, at index 0.
         while self.pos_frames == 0 {
-            let frac = self.pos_num as f32 / self.output_rate as f32;
             for ch in 0..channels {
                 // No successor, so the final frame is held rather than
                 // interpolated toward silence, which would fade the tail out.
-                let s0 = self.history[ch];
-                output.push(s0 + (s0 - s0) * frac);
+                // (`process_into` does `s0 + (s1 - s0) * frac`; here s1 == s0.)
+                output.push(self.history[ch]);
             }
             self.advance();
         }

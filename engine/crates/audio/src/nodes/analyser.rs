@@ -214,10 +214,9 @@ impl AnalyserNode {
         let tau = self.smoothing_time_constant.clamp(0.0, 1.0) as f64;
         let inv_fft = 1.0 / self.fft_size as f64;
         for bin in 0..bins {
-            let magnitude = (self.fft_re[bin] * self.fft_re[bin]
-                + self.fft_im[bin] * self.fft_im[bin])
-                .sqrt()
-                * inv_fft;
+            let magnitude =
+                (self.fft_re[bin] * self.fft_re[bin] + self.fft_im[bin] * self.fft_im[bin]).sqrt()
+                    * inv_fft;
             self.smoothed[bin] = tau * self.smoothed[bin] + (1.0 - tau) * magnitude;
         }
     }
