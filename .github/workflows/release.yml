@@ -824,7 +824,7 @@ jobs:
             "migo-$VERSION-capi-android-arm64.tar.gz" \
             "migo-$VERSION-capi-android-arm64.tar.gz.attestation.json" \
             "migo-$VERSION-capi-android-x86_64.tar.gz" \
-            "migo-$VERSION-capi-android-x86_64.tar.gz.attestation.json"
+            "migo-$VERSION-capi-android-x86_64.tar.gz.attestation.json" \
           ; do
             cp "platforms/android/dist/$asset" dist/release/
           done
