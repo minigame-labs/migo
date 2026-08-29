@@ -84,15 +84,18 @@ cargo install cargo-ndk
 
 ### Skia source-build tooling
 
-Migo uses Skia via `skia-safe 0.93` with the `binary-cache` feature.
-**Android targets have no prebuilt binary** in the upstream
-`rust-skia/skia-binaries` GitHub releases (only Linux/macOS/Windows
-x86_64/arm64 *host* targets do). This means an Android build will:
+Migo compiles Skia from source on **every target, the host included** —
+not just Android. `skia-safe 0.93` is configured with `binary-cache`,
+but migo's feature set carries `embed-freetype`, and none of the
+prebuilt archives in the upstream `rust-skia/skia-binaries` releases
+were built with that tag. Every clean build therefore:
 
-1. Attempt the binary download → receive `HTTP 404` (expected).
-2. Fall back to a **from-source Skia compile** (`STARTING A FULL BUILD`).
+1. Attempts the binary download → receives `HTTP 404` (expected).
+2. Falls back to a **from-source Skia compile** (`STARTING A FULL BUILD`),
+   roughly 30–50 min cold. Incremental Rust-only rebuilds reuse the
+   compiled Skia and take seconds.
 
-The from-source path needs:
+The from-source path needs (host builds included):
 
 | Tool | Minimum version | Why |
 |---|---|---|
@@ -223,9 +226,13 @@ git config --global core.longpaths true
 
 ## Build workflows
 
-### 1. Host Rust tests (fast)
+### 1. Host Rust tests
 
-No NDK needed. Runs on the dev machine in seconds.
+No NDK needed, and the `v8` crate downloads its own prebuilt archive.
+The **first** build still compiles Skia from source, though (see *Skia
+source-build tooling* above — ~30–50 min cold, needs `python3`, `ninja`,
+and the `-dev` headers below); after that, Rust-only rebuilds take
+seconds.
 
 ```bash
 cd engine
@@ -235,8 +242,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-`scripts/ci/run_smoke.sh` runs these checks (plus the Android feature
-gate) in order and is the canonical pre-merge gate.
+Beyond the Skia tooling, the host crates link `fontconfig`, `freetype`,
+`EGL`, `GLES` and `asound`. On Debian/Ubuntu:
+
+```bash
+sudo apt install -y libgl-dev libegl-dev libgles-dev \
+    libfontconfig1-dev libfreetype-dev libasound2-dev
+```
+
+On a minimal Ubuntu / WSL2 host, `scripts/dev-test-host.sh <cargo-args>`
+wires up those headers, the system clang (the NDK's clang breaks the
+host Skia build), and an offline V8 archive — e.g.
+`scripts/dev-test-host.sh test --workspace --lib`.
+
+`scripts/ci/run_smoke.sh` runs the four checks above (plus the Android
+feature gate) in order and is the canonical pre-merge gate.
 
 ### 2. Android shared library (`libmigo.so`)
 
