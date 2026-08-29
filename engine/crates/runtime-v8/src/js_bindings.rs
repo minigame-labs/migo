@@ -489,7 +489,7 @@ impl JsBindings {
 
         self.with_main_context(rt, |scope, _ctx, global| {
             let args = [
-                v8::Integer::new(scope, id as i32).into(),
+                v8::Integer::new_from_unsigned(scope, id).into(),
                 v8::String::new(scope, event_type)
                     .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
                     .into(),
@@ -687,7 +687,7 @@ impl JsBindings {
 
         self.with_main_context(rt, |scope, _ctx, global| {
             let args = [
-                v8::Integer::new(scope, camera_id as i32).into(),
+                v8::Integer::new_from_unsigned(scope, camera_id).into(),
                 v8::String::new(scope, event_type)
                     .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
                     .into(),
@@ -1270,10 +1270,10 @@ impl JsBindings {
             };
 
             let args = [
-                v8::Integer::new(scope, camera_id as i32).into(),
+                v8::Integer::new_from_unsigned(scope, camera_id).into(),
                 ab.into(),
-                v8::Integer::new(scope, width as i32).into(),
-                v8::Integer::new(scope, height as i32).into(),
+                v8::Integer::new_from_unsigned(scope, width).into(),
+                v8::Integer::new_from_unsigned(scope, height).into(),
             ];
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
@@ -1294,7 +1294,7 @@ impl JsBindings {
         if let Some(func_g) = self.video_event_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
                 let args = [
-                    v8::Integer::new(scope, video_id as i32).into(),
+                    v8::Integer::new_from_unsigned(scope, video_id).into(),
                     v8::String::new(scope, event_type)
                         .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
                         .into(),

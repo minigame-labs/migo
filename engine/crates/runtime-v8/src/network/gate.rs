@@ -185,10 +185,17 @@ pub(crate) fn is_host_whitelisted(host: &str, policy: &NetworkPolicy) -> bool {
     if policy.domain_whitelist.is_empty() {
         return true;
     }
-    policy
-        .domain_whitelist
-        .iter()
-        .any(|allowed| host == allowed.as_str() || host.ends_with(&format!(".{allowed}")))
+    policy.domain_whitelist.iter().any(|allowed| {
+        // Suffix-strip rather than build `format!(".{allowed}")`: this runs once
+        // per whitelist entry per request, per redirect hop and per audio stream
+        // URL, and the allocation existed only to hold a leading dot. Requiring
+        // the remainder to end in `.` is what keeps `evilmygame.com` out of
+        // `mygame.com` -- the same rule, without the heap.
+        host == allowed.as_str()
+            || host
+                .strip_suffix(allowed.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 /// Pure, side-effect-free policy evaluator.

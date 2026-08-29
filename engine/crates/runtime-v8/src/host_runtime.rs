@@ -66,9 +66,6 @@ pub struct HostJsRuntime {
     host_id: i32,
     rt: JsRuntime,
     bindings: JsBindings,
-    /// Shared SAB store for transferring SharedArrayBuffers between main and workers.
-    #[allow(dead_code)]
-    pub(crate) sab_store: deno_core::SharedArrayBufferStore,
     /// Shared mount table reference — the module loader holds a clone.
     /// Updated in evaluate_module() so the loader can enforce sandbox.
     loader_mount_ref: SharedMountTableRef,
@@ -363,8 +360,12 @@ impl HostJsRuntime {
             (None, None)
         };
 
-        // Store SAB store in OpState so workers can share it
-        rt.op_state().borrow_mut().put(sab_store.clone());
+        // Store the SAB store in OpState, which is where `worker::spawn` reads
+        // it from. `rt` owns that OpState and `RuntimeOptions` above holds its
+        // own clone, so those two copies are what keep the store alive; the
+        // struct field that used to sit here was a third copy nothing ever read,
+        // carrying an `#[allow(dead_code)]` that made it look load-bearing.
+        rt.op_state().borrow_mut().put(sab_store);
 
         Self {
             #[cfg(feature = "v8-limits")]
@@ -372,7 +373,6 @@ impl HostJsRuntime {
             host_id,
             rt,
             bindings,
-            sab_store,
             loader_mount_ref,
             #[cfg(feature = "v8-limits")]
             oom_terminated,

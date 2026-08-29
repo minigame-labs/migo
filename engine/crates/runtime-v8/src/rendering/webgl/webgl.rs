@@ -4,6 +4,7 @@ use deno_core::{OpState, op2};
 use tracing::{error, warn};
 
 use crate::rendering::image::ImageCacheState;
+use crate::rendering::webgl::error_state::{self, TransformFeedback, codes};
 
 use shared::{
     error::EngineError,
@@ -62,7 +63,7 @@ mod tests {
     };
     use crate::HostJsRuntime;
     use crate::rendering::webgl::{
-        error_state::{self, WebGLErrorState, codes},
+        error_state::{self, TransformFeedback, WebGLErrorState, codes},
         frame_collector::UnifiedFrameCollector,
     };
     use shared::{
@@ -595,7 +596,7 @@ mod tests {
     #[test]
     fn bind_buffer_base_rejects_transform_feedback_target_while_active() {
         let mut state = new_webgl_op_state();
-        error_state::set_transform_feedback_active(&mut state, 7, true);
+        error_state::set_transform_feedback(&mut state, 7, TransformFeedback::Active);
 
         bind_buffer_base_impl(&mut state, 7, 0x8C8E, 0, 9);
 
@@ -615,7 +616,7 @@ mod tests {
     #[test]
     fn bind_buffer_range_rejects_transform_feedback_target_while_active() {
         let mut state = new_webgl_op_state();
-        error_state::set_transform_feedback_active(&mut state, 7, true);
+        error_state::set_transform_feedback(&mut state, 7, TransformFeedback::Active);
 
         bind_buffer_range_impl(&mut state, 7, 0x8C8E, 0, 9, 0, 64);
 
@@ -629,6 +630,33 @@ mod tests {
                 .approx_pending_bytes(),
             0,
             "validator must reject the bind before queueing GL work"
+        );
+    }
+
+    /// Pausing exists so the feedback buffers can be rebound, so a paused
+    /// context must admit the bind that an active one refuses. Both halves are
+    /// asserted here because the refusal tests above pass whether or not the
+    /// phase is tracked at all -- a validator that refused nothing would fail
+    /// them, and one that refused everything would fail only this.
+    #[test]
+    fn a_paused_transform_feedback_admits_the_rebind_an_active_one_refuses() {
+        let mut state = new_webgl_op_state();
+        error_state::set_transform_feedback(&mut state, 7, TransformFeedback::Paused);
+
+        bind_buffer_base_impl(&mut state, 7, 0x8C8E, 0, 9);
+        bind_buffer_range_impl(&mut state, 7, 0x8C8E, 1, 9, 0, 64);
+
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(7),
+            codes::NO_ERROR,
+            "a paused transform feedback refused a rebind of its own buffers"
+        );
+        assert!(
+            state
+                .borrow::<UnifiedFrameCollector>()
+                .approx_pending_bytes()
+                > 0,
+            "the admitted binds must have reached the command stream"
         );
     }
 
@@ -4471,26 +4499,36 @@ pub fn op_buffer_data(
     #[buffer] data: Option<&[u8]>,
     #[smi] usage: u32,
 ) {
-    if data.is_none() && size <= 0 {
-        error!("op_buffer_data: size must > 0 when data is None");
+    // A negative size is `INVALID_VALUE` and the call is a no-op; zero is a
+    // legal request for an empty buffer, and the guard this replaced refused it
+    // along with the invalid case. Both used to leave via `error!`, so
+    // `getError()` reported `NO_ERROR` after a misuse -- content checking the
+    // queue could not see its own bug.
+    if size < 0 {
+        error_state::push_error(state, canvas_id, codes::INVALID_VALUE);
         return;
     }
 
-    let data = match data {
+    let (size, data) = match data {
         Some(bytes) => {
             let Some(owned) = bounded_webgl_upload_copy(state, canvas_id, bytes) else {
                 return;
             };
-            Some(owned)
+            // The payload is the authority when there is one: the render thread
+            // uploads `data` and ignores `size`, so a caller-supplied `size`
+            // that disagrees is a second answer to one question waiting for a
+            // reader who trusts the wrong field.
+            let len = i32::try_from(owned.len()).unwrap_or(i32::MAX);
+            (len, Some(owned))
         }
         None => {
-            let Ok(size) = usize::try_from(size) else {
+            let Ok(requested) = usize::try_from(size) else {
                 return;
             };
-            if !allow_webgl_upload_len(state, canvas_id, size) {
+            if !allow_webgl_upload_len(state, canvas_id, requested) {
                 return;
             }
-            None
+            (size, None)
         }
     };
 
@@ -5178,6 +5216,14 @@ pub fn op_buffer_sub_data(
     #[smi] offset: i32,
     #[buffer] data: &[u8],
 ) {
+    // WebGL 1.0 §5.14.5 makes a negative offset `INVALID_VALUE` and the call a
+    // no-op. Without this the value was sign-extended into the driver's
+    // `GLintptr`, i.e. an enormous positive offset, and the only thing standing
+    // between that and a GPU fault was the driver's own bounds check.
+    if offset < 0 {
+        error_state::push_error(state, canvas_id, codes::INVALID_VALUE);
+        return;
+    }
     let Some(data) = bounded_webgl_upload_copy(state, canvas_id, data) else {
         return;
     };
@@ -6593,7 +6639,7 @@ pub fn op_begin_transform_feedback(
     #[smi] canvas_id: u32,
     #[smi] primitive_mode: u32,
 ) {
-    crate::rendering::webgl::error_state::set_transform_feedback_active(state, canvas_id, true);
+    error_state::set_transform_feedback(state, canvas_id, TransformFeedback::Active);
     queue_gl_fire_and_forget(
         state,
         GLCmd::BeginTransformFeedback {
@@ -6605,17 +6651,19 @@ pub fn op_begin_transform_feedback(
 
 #[op2(fast)]
 pub fn op_end_transform_feedback(state: &mut OpState, #[smi] canvas_id: u32) {
-    crate::rendering::webgl::error_state::set_transform_feedback_active(state, canvas_id, false);
+    error_state::set_transform_feedback(state, canvas_id, TransformFeedback::Inactive);
     queue_gl_fire_and_forget(state, GLCmd::EndTransformFeedback { canvas_id });
 }
 
 #[op2(fast)]
 pub fn op_pause_transform_feedback(state: &mut OpState, #[smi] canvas_id: u32) {
+    error_state::set_transform_feedback(state, canvas_id, TransformFeedback::Paused);
     queue_gl_fire_and_forget(state, GLCmd::PauseTransformFeedback { canvas_id });
 }
 
 #[op2(fast)]
 pub fn op_resume_transform_feedback(state: &mut OpState, #[smi] canvas_id: u32) {
+    error_state::set_transform_feedback(state, canvas_id, TransformFeedback::Active);
     queue_gl_fire_and_forget(state, GLCmd::ResumeTransformFeedback { canvas_id });
 }
 

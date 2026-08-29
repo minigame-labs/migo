@@ -409,26 +409,30 @@ fn spawn_host_thread_inner(
                                 // timer) so a ContextLost or a first audio command during an idle
                                 // stretch is still handled promptly.
                                 debug!("[Host {}] event loop idle, parking on command/render/audio signals", id);
-                                loop {
-                                    tokio::select! {
-                                        biased;
-                                        maybe_msg = host_rx.recv() => {
-                                            match maybe_msg {
-                                                Some(HostCommand::Shutdown) => break 'outer,
-                                                Some(msg) => {
-                                                    host.handle_command(msg).await;
-                                                    break; // back to outer select to re-poll event loop
-                                                }
-                                                None => break 'outer,
-                                            }
+                                // Every arm leaves this park, because every arm can
+                                // create work the event loop is the only thing that
+                                // drives. A render drain dispatches
+                                // `webglcontext{lost,restored}` into JS, and a handler
+                                // that resolves a promise or asks for a frame leaves a
+                                // pending op behind; staying parked here would hold it
+                                // until some *unrelated* host command arrived, and vsync
+                                // does not arrive as one. That stranded a game after a
+                                // GPU context loss until the player touched the screen.
+                                tokio::select! {
+                                    biased;
+                                    maybe_msg = host_rx.recv() => {
+                                        match maybe_msg {
+                                            Some(HostCommand::Shutdown) => break 'outer,
+                                            Some(msg) => host.handle_command(msg).await,
+                                            None => break 'outer,
                                         }
-                                        _ = render_notify.notified() => {
-                                            host.drain_render_events();
-                                        }
-                                        _ = audio_signal.notified() => {
-                                            if let Err(e) = host.audio.check_and_start() {
-                                                error!("[Host {}] failed to start audio thread: {}", host.id, e);
-                                            }
+                                    }
+                                    _ = render_notify.notified() => {
+                                        host.drain_render_events();
+                                    }
+                                    _ = audio_signal.notified() => {
+                                        if let Err(e) = host.audio.check_and_start() {
+                                            error!("[Host {}] failed to start audio thread: {}", host.id, e);
                                         }
                                     }
                                 }

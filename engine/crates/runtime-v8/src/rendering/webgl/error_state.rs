@@ -60,9 +60,25 @@ pub struct WebGLErrorState {
     /// used to keep exactly one sentinel in the queue regardless
     /// of how long the overflow streak is.
     overflow: HashMap<u32, u64>,
-    /// Per-context transform feedback active bit.  Used by host-side
+    /// Per-context transform feedback lifecycle.  Used by host-side
     /// validators for `bindBufferBase/Range`.
-    transform_feedback_active: HashMap<u32, bool>,
+    transform_feedback: HashMap<u32, TransformFeedback>,
+}
+
+/// Where a context's transform feedback object is in its lifecycle.
+///
+/// One value rather than an `active` bit plus a `paused` bit, because
+/// "paused but not active" is not a state WebGL2 has and a pair of bools
+/// can spell it. The distinction is load-bearing: WebGL2 §3.7.15 refuses
+/// `bindBufferBase`/`bindBufferRange` on `TRANSFORM_FEEDBACK_BUFFER` only
+/// while feedback is active **and not paused** — rebinding the feedback
+/// buffers is the reason `pauseTransformFeedback` exists.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TransformFeedback {
+    #[default]
+    Inactive,
+    Active,
+    Paused,
 }
 
 /// Mirror of WebGLContextAttributes IDL dictionary.  Values are the
@@ -132,30 +148,29 @@ impl WebGLErrorState {
     /// Firefox queue them separately; we match the latter so
     /// conformance scripts that count errors behave identically.
     ///
-    /// Bounded at `MAX_ERRORS_PER_CTX`: once the queue fills, new
-    /// codes are dropped and a sticky `OUT_OF_MEMORY` sentinel is
-    /// kept at the tail so the next `getError()` reports the
-    /// truncation.  A global overflow counter is incremented for
-    /// every dropped record; `render_diagnostics` surfaces the
-    /// total to the Java debug overlay.
+    /// Bounded at `MAX_ERRORS_PER_CTX`, with the last slot reserved for a
+    /// sticky `OUT_OF_MEMORY` sentinel so the next `getError()` reports the
+    /// truncation. A global overflow counter is incremented for every dropped
+    /// record; `render_diagnostics` surfaces the total to the Java debug
+    /// overlay.
+    ///
+    /// Reserving the slot rather than evicting for it is the point: the overflow
+    /// path used to `pop_front()` to make room, which threw away the *oldest
+    /// undrained* error -- a real diagnostic the game had not read yet -- in
+    /// order to report that errors were being thrown away. Normal pushes now
+    /// stop one short, so the sentinel always has somewhere to go and nothing
+    /// genuine is ever displaced.
     pub fn push(&mut self, canvas_id: u32, code: u32) {
         let queue = self.queues.entry(canvas_id).or_default();
-        if queue.len() < MAX_ERRORS_PER_CTX {
+        if queue.len() < MAX_ERRORS_PER_CTX - 1 {
             queue.push_back(code);
             return;
         }
-        // Overflow path: drop the new code, bump counters, and
-        // guarantee an OOM sentinel is the last element so the
-        // next drain signals the truncation.
+        // Overflow path: drop the new code, bump counters, and guarantee an OOM
+        // sentinel is the last element so the next drain signals the truncation.
         *self.overflow.entry(canvas_id).or_insert(0) += 1;
         shared::stats::bump_webgl_error_overflow(1);
         if queue.back().copied() != Some(codes::OUT_OF_MEMORY) {
-            // Make room for the sentinel by evicting the oldest
-            // entry.  The spec allows us to drop older errors when
-            // memory pressure forces it; we log at trace level for
-            // diagnostics and keep the sentinel as the ONLY signal
-            // the queue was truncated.
-            queue.pop_front();
             queue.push_back(codes::OUT_OF_MEMORY);
         }
     }
@@ -191,15 +206,18 @@ impl WebGLErrorState {
         self.attrs.get(&canvas_id).copied()
     }
 
-    pub fn set_transform_feedback_active(&mut self, canvas_id: u32, active: bool) {
-        self.transform_feedback_active.insert(canvas_id, active);
+    pub fn set_transform_feedback(&mut self, canvas_id: u32, phase: TransformFeedback) {
+        self.transform_feedback.insert(canvas_id, phase);
     }
 
-    pub fn is_transform_feedback_active(&self, canvas_id: u32) -> bool {
-        self.transform_feedback_active
+    /// Whether feedback is capturing right now, which is the only phase that
+    /// refuses a rebind of the feedback buffers.
+    pub fn transform_feedback_captures(&self, canvas_id: u32) -> bool {
+        self.transform_feedback
             .get(&canvas_id)
             .copied()
-            .unwrap_or(false)
+            .unwrap_or_default()
+            == TransformFeedback::Active
     }
 }
 
@@ -233,15 +251,15 @@ pub fn push_error(state: &mut OpState, canvas_id: u32, code: u32) {
 }
 
 #[inline]
-pub fn set_transform_feedback_active(state: &mut OpState, canvas_id: u32, active: bool) {
+pub fn set_transform_feedback(state: &mut OpState, canvas_id: u32, phase: TransformFeedback) {
     let q = state.borrow_mut::<WebGLErrorState>();
-    q.set_transform_feedback_active(canvas_id, active);
+    q.set_transform_feedback(canvas_id, phase);
 }
 
 #[inline]
-fn is_transform_feedback_active(state: &OpState, canvas_id: u32) -> bool {
+fn transform_feedback_captures(state: &OpState, canvas_id: u32) -> bool {
     let q = state.borrow::<WebGLErrorState>();
-    q.is_transform_feedback_active(canvas_id)
+    q.transform_feedback_captures(canvas_id)
 }
 
 const GL_TRANSFORM_FEEDBACK_BUFFER: u32 = 0x8C8E;
@@ -295,7 +313,7 @@ pub fn validate_bind_buffer_base(
     if !validate_bind_buffer_indexed_target(state, canvas_id, target) {
         return false;
     }
-    if target == GL_TRANSFORM_FEEDBACK_BUFFER && is_transform_feedback_active(state, canvas_id) {
+    if target == GL_TRANSFORM_FEEDBACK_BUFFER && transform_feedback_captures(state, canvas_id) {
         push_error(state, canvas_id, codes::INVALID_OPERATION);
         return false;
     }
@@ -621,39 +639,48 @@ mod tests {
     #[test]
     fn queue_is_bounded_and_overflow_is_counted() {
         let mut q = WebGLErrorState::default();
-        // Fill exactly to the cap with plain INVALID_ENUM; overflow
-        // should still be zero and no sentinel planted yet.
-        for _ in 0..MAX_ERRORS_PER_CTX {
+        // Normal pushes stop one short of the cap, because the last slot is
+        // reserved for the sentinel. Filling to that point must not overflow.
+        for _ in 0..MAX_ERRORS_PER_CTX - 1 {
             q.push(1, codes::INVALID_ENUM);
         }
         assert_eq!(q.overflow_count(1), 0);
-        assert_eq!(q.len(1), MAX_ERRORS_PER_CTX);
+        assert_eq!(q.len(1), MAX_ERRORS_PER_CTX - 1);
 
-        // Push past the cap; each push is dropped, overflow grows,
-        // and the queue length stays pinned at the cap.
+        // Push past it; each push is dropped, overflow grows, and the queue
+        // reaches -- and stays at -- the cap once the sentinel is planted.
         for _ in 0..10 {
             q.push(1, codes::INVALID_VALUE);
         }
         assert_eq!(q.overflow_count(1), 10);
         assert_eq!(q.len(1), MAX_ERRORS_PER_CTX);
 
-        // The sentinel must be the tail so the *next* drain signal
-        // that a truncation happened.  Drain until we hit it.
-        let mut seen_oom = false;
-        for _ in 0..MAX_ERRORS_PER_CTX {
-            let c = q.drain_one(1);
-            if c == codes::OUT_OF_MEMORY {
-                seen_oom = true;
-                break;
-            }
+        // Nothing genuine was displaced to make room for the sentinel: the
+        // oldest error is still the first one drained, and every real error
+        // pushed is still there ahead of the sentinel. This is the property the
+        // reserved slot exists for -- the previous overflow path called
+        // `pop_front()`, so the first error the game had not read yet was thrown
+        // away in order to report that errors were being thrown away, and a test
+        // that only looked for the sentinel could not see it.
+        for i in 0..MAX_ERRORS_PER_CTX - 1 {
+            assert_eq!(
+                q.drain_one(1),
+                codes::INVALID_ENUM,
+                "real error {i} was evicted by the sentinel"
+            );
         }
-        assert!(seen_oom, "overflow must plant an OUT_OF_MEMORY sentinel");
+        assert_eq!(
+            q.drain_one(1),
+            codes::OUT_OF_MEMORY,
+            "overflow must plant an OUT_OF_MEMORY sentinel at the tail"
+        );
+        assert_eq!(q.drain_one(1), codes::NO_ERROR);
     }
 
     #[test]
     fn overflow_only_plants_one_sentinel_per_burst() {
         let mut q = WebGLErrorState::default();
-        for _ in 0..MAX_ERRORS_PER_CTX {
+        for _ in 0..MAX_ERRORS_PER_CTX - 1 {
             q.push(1, codes::INVALID_ENUM);
         }
         // First overflow plants the sentinel.

@@ -714,6 +714,24 @@ impl PackageReader {
         if header.index_offset < chunk_table_end {
             return Err(PackageError::BadIndex("index overlaps chunk table".into()));
         }
+        // `entry_count` sizes an allocation below, and it arrives from the file.
+        // `chunk_count` is already bounded by the chunk-table-past-EOF check
+        // above, but nothing bounded this one, so a 32-byte package declaring
+        // `u32::MAX` entries asked for a ~300 GiB `HashMap` and the allocator
+        // aborted the process -- on Android, the whole app.
+        //
+        // The bound is derived from the file rather than picked: the smallest
+        // possible index record is a 2-byte path length plus the 20-byte
+        // metadata block, so a package cannot honestly declare more entries
+        // than its index region has room for.
+        const MIN_INDEX_RECORD_BYTES: u64 = 22;
+        let index_region = file_len.saturating_sub(header.index_offset);
+        if (header.entry_count as u64) > index_region / MIN_INDEX_RECORD_BYTES {
+            return Err(PackageError::BadIndex(format!(
+                "entry_count {} exceeds what {index_region} index bytes can hold",
+                header.entry_count
+            )));
+        }
 
         // Read chunk table.
         reader.seek(SeekFrom::Start(header.chunk_table_offset))?;
@@ -804,8 +822,37 @@ impl PackageReader {
                     )));
                 }
             } else {
+                let stride = chunks[first_chunk as usize].raw_size;
+                if stride == 0 {
+                    return Err(PackageError::BadIndex(format!(
+                        "entry '{normalized}' first chunk has zero raw_size"
+                    )));
+                }
                 let mut chunk_sum: u64 = 0;
-                for c in &chunks[first_chunk as usize..last as usize] {
+                let span = &chunks[first_chunk as usize..last as usize];
+                for (offset, c) in span.iter().enumerate() {
+                    // `read_range` locates chunk *i* at `i * stride`, taking the
+                    // first chunk's size as the stride for all of them. That is
+                    // true of everything `PackageWriter` emits -- it cuts at a
+                    // fixed size, so only the tail is short -- and was nowhere
+                    // enforced, which left a reader deriving byte offsets from an
+                    // assumption a crafted index could simply violate. Checking
+                    // it here makes the assumption hold by construction instead
+                    // of by provenance.
+                    let is_last = offset + 1 == span.len();
+                    if !is_last && c.raw_size != stride {
+                        return Err(PackageError::BadIndex(format!(
+                            "entry '{normalized}' chunk {} raw_size {} breaks stride {stride}",
+                            first_chunk as usize + offset,
+                            c.raw_size
+                        )));
+                    }
+                    if is_last && c.raw_size > stride {
+                        return Err(PackageError::BadIndex(format!(
+                            "entry '{normalized}' final chunk raw_size {} exceeds stride {stride}",
+                            c.raw_size
+                        )));
+                    }
                     chunk_sum = chunk_sum.checked_add(c.raw_size as u64).ok_or_else(|| {
                         PackageError::BadIndex(format!("entry '{normalized}' chunk sum overflow"))
                     })?;
@@ -813,11 +860,6 @@ impl PackageReader {
                 if chunk_sum != raw_size {
                     return Err(PackageError::BadIndex(format!(
                         "entry '{normalized}' raw_size {raw_size} != chunk raw_size sum {chunk_sum}"
-                    )));
-                }
-                if chunks[first_chunk as usize].raw_size == 0 {
-                    return Err(PackageError::BadIndex(format!(
-                        "entry '{normalized}' first chunk has zero raw_size"
                     )));
                 }
             }
@@ -1396,6 +1438,154 @@ mod tests {
         let mut w = PackageWriter::new(&mut buf).unwrap();
         w.add_entry("a", b"file").unwrap();
         assert!(w.add_entry("a/b.txt", b"child").is_err());
+    }
+
+    // -- Crafted headers (what `PackageWriter` would never emit) --
+
+    /// Assemble a package file byte for byte, so a test can state a header the
+    /// writer cannot produce. The asserts pin the layout the caller described,
+    /// so a mis-specified fixture fails here rather than inside `open`.
+    fn crafted_package(
+        entry_count: u32,
+        chunk_table_offset: u64,
+        index_offset: u64,
+        data: &[u8],
+        chunks: &[(u64, u32, u32)],
+        index: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&chunk_table_offset.to_le_bytes());
+        bytes.extend_from_slice(&index_offset.to_le_bytes());
+        assert_eq!(bytes.len() as u64, HEADER_SIZE);
+        bytes.extend_from_slice(data);
+        assert_eq!(
+            bytes.len() as u64,
+            chunk_table_offset,
+            "fixture: data must end where the chunk table begins"
+        );
+        for (data_offset, compressed_size, raw_size) in chunks {
+            bytes.extend_from_slice(&data_offset.to_le_bytes());
+            bytes.extend_from_slice(&compressed_size.to_le_bytes());
+            bytes.extend_from_slice(&raw_size.to_le_bytes());
+        }
+        assert_eq!(
+            bytes.len() as u64,
+            index_offset,
+            "fixture: chunk table must end where the index begins"
+        );
+        bytes.extend_from_slice(index);
+        bytes
+    }
+
+    fn index_record(path: &str, raw_size: u64, first_chunk: u32, chunk_count: u32) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        record.extend_from_slice(path.as_bytes());
+        record.extend_from_slice(&raw_size.to_le_bytes());
+        record.extend_from_slice(&0u32.to_le_bytes()); // crc32: `open` does not check it
+        record.extend_from_slice(&first_chunk.to_le_bytes());
+        record.extend_from_slice(&chunk_count.to_le_bytes());
+        record
+    }
+
+    fn open_crafted(name: &str, bytes: &[u8]) -> Result<PackageReader, PackageError> {
+        let dir = make_test_dir(name);
+        let path = dir.join("crafted.mpkg");
+        std::fs::write(&path, bytes).unwrap();
+        PackageReader::open(&path, "crafted", "1.0")
+    }
+
+    /// The declared entry count sizes a `HashMap`, so it has to be bounded by
+    /// what the file can actually hold.
+    ///
+    /// Note what failure looks like without the bound: not a failing assertion
+    /// but an aborted test binary, because `HashMap::with_capacity(u32::MAX)`
+    /// asks the allocator for hundreds of gigabytes. That is also what it did in
+    /// production, from a 32-byte file.
+    #[test]
+    fn an_entry_count_larger_than_the_index_region_is_refused() {
+        let bytes = crafted_package(u32::MAX, HEADER_SIZE, HEADER_SIZE, &[], &[], &[]);
+        assert_eq!(
+            bytes.len() as u64,
+            HEADER_SIZE,
+            "the whole file is a header"
+        );
+
+        match open_crafted("entry_count_bound", &bytes) {
+            Err(PackageError::BadIndex(msg)) => {
+                assert!(msg.contains("entry_count"), "wrong rejection: {msg}");
+            }
+            Err(other) => panic!("rejected for an unrelated reason: {other}"),
+            Ok(_) => panic!("a 32-byte package declaring u32::MAX entries was accepted"),
+        }
+    }
+
+    /// `read_range` locates chunk *i* at `i * first_chunk.raw_size`, so a chunk
+    /// table whose interior chunks disagree about that stride puts every offset
+    /// after the first one in the wrong place.
+    ///
+    /// The pre-existing sum check cannot see this: 10 + 20 + 10 totals the same
+    /// 40 that a well-formed 20 + 20 would, which is why the fixture is three
+    /// chunks and not two -- with two, the first chunk's size *is* the second
+    /// one's offset, so the stride assumption holds no matter what the sizes are.
+    #[test]
+    fn a_chunk_table_that_breaks_its_own_stride_is_refused() {
+        let chunks = [
+            (HEADER_SIZE, 1u32, 10u32),
+            (HEADER_SIZE + 1, 1, 20),
+            (HEADER_SIZE + 2, 1, 10),
+        ];
+        let chunk_table_offset = HEADER_SIZE + 3;
+        let index_offset = chunk_table_offset + 3 * 16;
+        let index = index_record("a.js", 40, 0, 3);
+        let bytes = crafted_package(
+            1,
+            chunk_table_offset,
+            index_offset,
+            &[0, 0, 0],
+            &chunks,
+            &index,
+        );
+
+        match open_crafted("chunk_stride", &bytes) {
+            Err(PackageError::BadIndex(msg)) => {
+                assert!(msg.contains("stride"), "wrong rejection: {msg}");
+            }
+            Err(other) => panic!("rejected for an unrelated reason: {other}"),
+            Ok(_) => panic!("a chunk table that breaks its own stride was accepted"),
+        }
+    }
+
+    /// The positive control for both fixtures above: the same assembly path,
+    /// with a uniform stride and an honest entry count, opens. Without this a
+    /// `crafted_package` that produced garbage would satisfy every rejection
+    /// assertion here while proving nothing about either guard.
+    #[test]
+    fn a_crafted_package_with_a_uniform_stride_opens() {
+        let chunks = [
+            (HEADER_SIZE, 1u32, 20u32),
+            (HEADER_SIZE + 1, 1, 20),
+            (HEADER_SIZE + 2, 1, 10),
+        ];
+        let chunk_table_offset = HEADER_SIZE + 3;
+        let index_offset = chunk_table_offset + 3 * 16;
+        let index = index_record("a.js", 50, 0, 3);
+        let bytes = crafted_package(
+            1,
+            chunk_table_offset,
+            index_offset,
+            &[0, 0, 0],
+            &chunks,
+            &index,
+        );
+
+        let reader = open_crafted("uniform_stride", &bytes)
+            .expect("a uniform stride with an honest entry count must open");
+        assert_eq!(reader.entry_count(), 1);
     }
 
     // -- Roundtrip --
