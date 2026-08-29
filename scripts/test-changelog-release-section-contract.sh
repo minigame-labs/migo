@@ -53,6 +53,23 @@ if (( unreleased_line >= version_line )); then
     exit 1
 fi
 
+# The version section must have a body. `scripts/write-release-notes.sh` extracts
+# everything between `## v<version>` and the next `## `/`---` and puts it at the
+# top of the GitHub Release; an empty section publishes a release whose only
+# "what changed" is GitHub's raw commit list, and the extractor now exits 1
+# rather than do that. Catch it here, at PR time, instead of at the tag.
+section_body="$(
+    awk -v h="## v${version} " -v hbare="## v${version}" '
+        index($0 " ", h) == 1 || $0 == hbare { f = 1; next }
+        f && (/^## / || /^---[[:space:]]*$/) { exit }
+        f && /[^[:space:]]/ { print }
+    ' "$changelog"
+)"
+if [[ -z "$section_body" ]]; then
+    echo "ERROR: the '## v${version}' section has no body -- write the release notes there." >&2
+    exit 1
+fi
+
 # Category headings within the two Keep-a-Changelog sections: canonical order,
 # no repeats.
 python3 - "$changelog" "$version" <<'PY'
