@@ -177,6 +177,23 @@ jobs:
       - name: Example content namespace contract
         run: bash scripts/test-content-namespace-contract.sh
 
+      # Mirrors of pr-ci.yml's doc contract gates -- the release gate parity
+      # contract requires the tag workflow to be at least as strict as the PR
+      # one, and a release page is exactly where a stale `migo-X.Y.Z` in a
+      # README, a missing `## v<version>` changelog section, a 404 doc link or
+      # a wrong Rust version costs a reader.
+      - name: Doc version-reference contract
+        run: bash scripts/test-doc-version-refs-contract.sh
+
+      - name: CHANGELOG release-section contract
+        run: bash scripts/test-changelog-release-section-contract.sh
+
+      - name: Doc links contract
+        run: bash scripts/test-doc-links-contract.sh
+
+      - name: Doc Rust-version contract
+        run: bash scripts/test-doc-rust-version-contract.sh
+
       # The prescreen scanner is what a prospective customer runs against their own
       # bundle, so its wrong answers are the expensive kind: a gap it invents gets
       # checked, does not exist, and the rest of the report stops being believed.
