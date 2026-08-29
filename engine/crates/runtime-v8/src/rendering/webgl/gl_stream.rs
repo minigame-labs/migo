@@ -622,10 +622,7 @@ pub fn validate_stream(words: &[u32], used_words: u32) -> Result<ValidatedStream
     // any word left over is read as the next record's header and rejected as one.
     // A `debug_assert` states the invariant where a dead error code used to
     // imply it was still being checked.
-    debug_assert_eq!(
-        cursor, used,
-        "record walk must land exactly on used_words"
-    );
+    debug_assert_eq!(cursor, used, "record walk must land exactly on used_words");
 
     Ok(ValidatedStream {
         words: &words[..used],

@@ -131,9 +131,29 @@ run_windows_batch() {
     ( cd "$batch_dir_unix" && cmd.exe /c "$(basename "$batch_unix")" )
 }
 
-# Aborts if the Windows-side worktree's HEAD does not match the WSL repo's
-# HEAD, so a probe can never silently report a clean pass for a tree that is
-# missing recent commits.
+# A content digest of the WSL tree exactly as `verify-change.sh` scopes it:
+# HEAD, plus the tracked diff against it, plus every untracked-not-ignored
+# file's bytes. `sync-worktree.sh` writes this into the Windows copy; a probe
+# recomputes it and refuses to run if it has drifted. Both sides call this one
+# function so the two can never disagree about what "synced" means.
+#
+# Untracked files are hashed with their path, so a rename registers; the diff
+# already carries tracked renames and deletions.
+SYNC_FINGERPRINT_FILE="$WIN_WORKTREE_UNIX/.migo-sync-fingerprint"
+
+compute_sync_fingerprint() {
+    {
+        git -C "$REPO_ROOT" rev-parse HEAD
+        git -C "$REPO_ROOT" diff HEAD --binary
+        ( cd "$REPO_ROOT" \
+            && git ls-files --others --exclude-standard -z \
+            | xargs -0 -r sha256sum )
+    } | sha256sum | cut -d' ' -f1
+}
+
+# Aborts if the Windows-side worktree does not reflect the WSL tree as it is
+# right now, so a probe can never silently report a clean pass for a stale
+# checkout.
 require_synced_worktree() {
     local win_sha repo_sha
     win_sha="$(git -C "$WIN_WORKTREE_UNIX" rev-parse HEAD)"
@@ -142,14 +162,17 @@ require_synced_worktree() {
         echo "error: $WIN_WORKTREE_UNIX is at $win_sha but $REPO_ROOT (WSL) is at $repo_sha -- worktree is stale, run sync-worktree.sh" >&2
         exit 91
     fi
-    # Matching HEADs are not enough. The Windows copy is cloned over file://,
-    # so it only ever contains committed refs -- an uncommitted edit in WSL
-    # leaves both HEADs identical while the copy lacks the change entirely,
-    # and the probe would report a clean pass for a tree that never had it.
-    # That is precisely the "edited and forgot to sync" case this guard exists
-    # for, and comparing shas alone misses half of it.
-    if ! git -C "$REPO_ROOT" diff --quiet || ! git -C "$REPO_ROOT" diff --cached --quiet; then
-        echo "error: $REPO_ROOT has uncommitted changes; the Windows copy at $WIN_WORKTREE_UNIX only carries committed refs, so a probe would not see them. Commit first, then run sync-worktree.sh" >&2
+    # Matching HEADs are not enough. `sync-worktree.sh` overlays the WSL
+    # working tree onto the checkout -- uncommitted edits included -- so what
+    # the probe must confirm is that that overlay still matches, not that the
+    # WSL tree is clean. A bare sha comparison misses every unstaged change;
+    # forbidding a dirty tree, as this guard used to, made the probe unusable
+    # for the case a developer actually has.
+    local recorded current
+    recorded="$(cat "$SYNC_FINGERPRINT_FILE" 2>/dev/null || true)"
+    current="$(compute_sync_fingerprint)"
+    if [[ "$recorded" != "$current" ]]; then
+        echo "error: $WIN_WORKTREE_UNIX reflects a different tree than $REPO_ROOT (WSL) has now -- run sync-worktree.sh" >&2
         exit 92
     fi
 }
@@ -157,4 +180,31 @@ require_synced_worktree() {
 # DOS path as WSL sees it. Used to inspect Windows-side build state from here.
 win_to_unix_path() {
     printf '/mnt/%s' "$(printf '%s' "$1" | sed 's|\\|/|g; s|^\(.\):|\L\1|')"
+}
+
+# A Windows-reachable HTTP proxy, or empty.
+#
+# A cold Skia build downloads a prebuilt binaries tarball from GitHub, and
+# rusty-skia's fetch runs on the Windows side where a WSL-local proxy
+# (127.0.0.1:10808 as WSL sees it) is not reachable -- the download then hangs
+# rather than failing. The probe passes this through as `MIGO_WIN_PROXY` /
+# `HTTPS_PROXY`. Most local proxy clients (v2rayN, Clash) also listen on the
+# Windows loopback, so try the usual ports and keep the first that answers.
+#
+# Skipped entirely once `$MIGO_WIN_PROXY` is set by the caller, and once the
+# Skia tarball is already cached (a warm `C:\mt` needs no network at all).
+detect_windows_proxy() {
+    if [[ -n "${MIGO_WIN_PROXY:-}" ]]; then
+        printf '%s' "$MIGO_WIN_PROXY"
+        return
+    fi
+    local curl="/mnt/c/Windows/System32/curl.exe" port
+    [[ -x "$curl" ]] || return 0
+    for port in 10808 10809 7890 7897 1080 8080 8888; do
+        if "$curl" -s -o /dev/null --max-time 6 \
+            -x "http://127.0.0.1:$port" https://github.com 2>/dev/null; then
+            printf 'http://127.0.0.1:%s' "$port"
+            return
+        fi
+    done
 }

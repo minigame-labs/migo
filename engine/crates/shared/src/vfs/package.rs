@@ -1509,7 +1509,11 @@ mod tests {
     #[test]
     fn an_entry_count_larger_than_the_index_region_is_refused() {
         let bytes = crafted_package(u32::MAX, HEADER_SIZE, HEADER_SIZE, &[], &[], &[]);
-        assert_eq!(bytes.len() as u64, HEADER_SIZE, "the whole file is a header");
+        assert_eq!(
+            bytes.len() as u64,
+            HEADER_SIZE,
+            "the whole file is a header"
+        );
 
         match open_crafted("entry_count_bound", &bytes) {
             Err(PackageError::BadIndex(msg)) => {

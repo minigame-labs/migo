@@ -56,8 +56,10 @@ native library and C ABI on four platforms. Main outputs:
 
 ```bash
 # Install rustup from https://rustup.rs/ (or your package manager).
-# The toolchain file pins to stable; Rust 1.80+ required for edition 2024.
-rustup show                       # verify the pin is respected
+# engine/rust-toolchain.toml pins an exact rustc version (not "stable") and
+# rustup installs it on first cargo invocation inside engine/. The workspace is
+# edition 2024, which needs rustc >= 1.85 regardless of the pin.
+cd engine && rustup show          # verify the pin is respected
 ```
 
 Add Android targets:
@@ -82,15 +84,18 @@ cargo install cargo-ndk
 
 ### Skia source-build tooling
 
-Migo uses Skia via `skia-safe 0.93` with the `binary-cache` feature.
-**Android targets have no prebuilt binary** in the upstream
-`rust-skia/skia-binaries` GitHub releases (only Linux/macOS/Windows
-x86_64/arm64 *host* targets do). This means an Android build will:
+Migo compiles Skia from source on **every target, the host included** —
+not just Android. `skia-safe 0.93` is configured with `binary-cache`,
+but migo's feature set carries `embed-freetype`, and none of the
+prebuilt archives in the upstream `rust-skia/skia-binaries` releases
+were built with that tag. Every clean build therefore:
 
-1. Attempt the binary download → receive `HTTP 404` (expected).
-2. Fall back to a **from-source Skia compile** (`STARTING A FULL BUILD`).
+1. Attempts the binary download → receives `HTTP 404` (expected).
+2. Falls back to a **from-source Skia compile** (`STARTING A FULL BUILD`),
+   roughly 30–50 min cold. Incremental Rust-only rebuilds reuse the
+   compiled Skia and take seconds.
 
-The from-source path needs:
+The from-source path needs (host builds included):
 
 | Tool | Minimum version | Why |
 |---|---|---|
@@ -221,9 +226,13 @@ git config --global core.longpaths true
 
 ## Build workflows
 
-### 1. Host Rust tests (fast)
+### 1. Host Rust tests
 
-No NDK needed. Runs on the dev machine in seconds.
+No NDK needed, and the `v8` crate downloads its own prebuilt archive.
+The **first** build still compiles Skia from source, though (see *Skia
+source-build tooling* above — ~30–50 min cold, needs `python3`, `ninja`,
+and the `-dev` headers below); after that, Rust-only rebuilds take
+seconds.
 
 ```bash
 cd engine
@@ -233,8 +242,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-`scripts/ci/run_smoke.sh` runs these checks (plus the Android feature
-gate) in order and is the canonical pre-merge gate.
+Beyond the Skia tooling, the host crates link `fontconfig`, `freetype`,
+`EGL`, `GLES` and `asound`. On Debian/Ubuntu:
+
+```bash
+sudo apt install -y libgl-dev libegl-dev libgles-dev \
+    libfontconfig1-dev libfreetype-dev libasound2-dev
+```
+
+On a minimal Ubuntu / WSL2 host, `scripts/dev-test-host.sh <cargo-args>`
+wires up those headers, the system clang (the NDK's clang breaks the
+host Skia build), and an offline V8 archive — e.g.
+`scripts/dev-test-host.sh test --workspace --lib`.
+
+`scripts/ci/run_smoke.sh` runs the four checks above (plus the Android
+feature gate) in order and is the canonical pre-merge gate.
 
 ### 2. Android shared library (`libmigo.so`)
 
@@ -311,7 +333,7 @@ bash scripts/build-aar.sh release --skip-rust
 
 ### 4. Linux x86_64 SDK
 
-Produces `dist/migo-linux-x86_64/` with `libmigo.so.0.9.0` (soname
+Produces `dist/migo-linux-x86_64/` with `libmigo.so.<version>` (soname
 `libmigo.so.1`), `libmigo.a`, public headers, CMake package, and
 `pkg-config` `.pc`. Builds on Linux only.
 
@@ -529,13 +551,14 @@ asset a release publishes is one step further on:
 
 ```bash
 bash scripts/package-sdk.sh dist/migo-linux-x86_64
-# -> dist/migo-0.9.1-capi-linux-x86_64.tar.gz
-#    dist/migo-0.9.1-capi-linux-x86_64.tar.gz.attestation.json
+# -> dist/migo-<version>-capi-linux-x86_64.tar.gz
+#    dist/migo-<version>-capi-linux-x86_64.tar.gz.attestation.json
 ```
 
 The asset name is derived from the staged prefix with the release version
-inserted, so the same command serves Android, Linux and OpenHarmony
-(`dist/migo-android-arm64` → `migo-0.9.1-capi-android-arm64.tar.gz`). The
+inserted, so the same command serves all four platforms
+(`dist/migo-android-arm64` → `migo-<version>-capi-android-arm64.tar.gz`,
+`dist/migo-windows-x86_64` → `migo-<version>-capi-windows-x86_64.tar.gz`). The
 `capi` segment distinguishes these from the Android AAR, whose `.aar`
 extension already says "Android, Java/Kotlin", and the version is in the
 name because a file that has been renamed or moved off the release page is
@@ -543,10 +566,14 @@ otherwise unidentifiable. Staged prefixes use `arm64`/`x86_64` — the public
 vocabulary — while `arm64-v8a` and `aarch64` stay where the NDK and the Rust
 target triple need them. `--output-dir` places the pair somewhere else.
 `scripts/test-release-asset-naming-contract.sh` holds the scheme.
-**Windows is not yet packageable this way**: `build-windows-sdk.sh`
-writes no package manifest for the attestation to name, and
-`windows-sdk-0.1.1` was attested against its V8 `component-manifest.json`
-instead.
+
+Windows joined this path in #55: `windows_sdk_write_manifest`
+(`scripts/lib/windows-sdk-package.sh`, called by both
+`build-windows-sdk.sh` and `build-windows-sdk-native.sh`) writes
+`share/migo/windows-<arch>-manifest.json` for `package-sdk.sh` to attest
+against, exactly as the other three build scripts do. v0.9.4 shipped
+`migo-<version>-capi-windows-{x86_64,arm64}.tar.gz` with attestations
+this way.
 
 The archive is **byte-identical for a given commit**: entries sorted,
 owner and group normalised to numeric `0`, permissions derived from the

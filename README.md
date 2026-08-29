@@ -10,6 +10,8 @@
 `migo.*` is the one native capability surface this engine ever installs — nothing else, at any scale. This repository stays that: a pure runtime, no adapter code mixed in. Everything else existing content expects belongs in an independent, composable adapter published as its own package:
 
 - **[migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter)** — a browser-style BOM/DOM surface (`window`, `document`, `Image`, `XMLHttpRequest`, ...) for engines built assuming a browser environment (Cocos, Egret, Laya, Pixi, raw Canvas/WebGL).
+- **[migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter)** — aliases `globalThis.wx` onto the runtime's `migo.*` capabilities, so mainstream mini-game-shaped content runs unmodified.
+
 Adapters install only their documented globals and compose freely — pick only what your content actually needs. A future platform (a quick-game-alliance member, etc.) follows the same recipe: a new adapter package, no engine changes.
 
 **Wondering whether your own catalogue runs?** Don't take our word for it and don't send us anything — [PRESCREEN.md](PRESCREEN.md) is the tool we would run, for you to run yourself. It reports which APIs a bundle needs against what this build actually publishes, and whether it paints on a real device. Your content never leaves your machine.
@@ -35,7 +37,7 @@ Reproducible benchmarks against the system WebView — same game, same device, s
 | **OpenHarmony / HarmonyOS NEXT** (aarch64, x86_64) | Released | A C ABI package per architecture (headers, static library, CMake package, manifest) |
 | iOS, macOS | Planned | — |
 
-Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Each ships an `.attestation.json` recording the archive's name, size and sha256 — verify a download against it before use.
+Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Every release carries a `SHA256SUMS.txt` — check a download with `sha256sum -c SHA256SUMS.txt` — and each archive also has an `.attestation.json` recording its name, size and sha256, whose `package_sha256` you can reproduce from source ([BUILD.md](BUILD.md)).
 
 The C ABI in [`include/migo/`](include/migo/) is a **candidate** — it has a working runtime on every platform above but is not frozen. Its own README tracks what remains before it can be.
 
@@ -101,7 +103,7 @@ itself, because one built-in downloader would be wrong for one of the two.
 +---------------------+--------------------+--------------------+--------------------+
 |                                  Rust Core Engine                                  |
 +------------------------------------------------------------------------------------+
-|                     Platform Layer (Android | Linux | Windows)                     |
+|              Platform Layer (Android | Linux | Windows | OpenHarmony)              |
 +------------------------------------------------------------------------------------+
 ```
 
@@ -146,6 +148,7 @@ migo/
 | [migo-examples](https://github.com/minigame-labs/migo-examples) | Host integration examples, one directory per platform |
 | [migo-bench](https://github.com/minigame-labs/migo-bench) | Reproducible Migo-vs-WebView benchmarks |
 | [migo-web-adapter](https://github.com/minigame-labs/migo-web-adapter) | Browser-style BOM/DOM compat adapter |
+| [migo-wx-adapter](https://github.com/minigame-labs/migo-wx-adapter) | `wx.*` compat adapter for mainstream mini-game content |
 
 ## License
 

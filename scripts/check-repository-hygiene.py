@@ -116,10 +116,23 @@ def _text_rules() -> tuple[TextRule, ...]:
 # scanner from naming the thing it scans for. Everything else this gate
 # checks (credentials, private keys, local paths, the machine hostname)
 # still applies to these files -- only the brand-namespace rule is narrowed.
+#
+# CHANGELOG.md and the two READMEs are exempt for the mirror-image reason: the
+# release that removed the namespace has to be able to say so (the removal is
+# the single biggest breaking change in v0.9.4), and both READMEs have to be
+# able to name the org's public compatibility adapter -- the `migo-<brand>-adapter`
+# package, which is how content written for the removed namespace still runs. A
+# gate that forbids the token in the file whose job is to record its removal is
+# a gate that cannot be satisfied. Prose using it as a live namespace would
+# still be wrong there, but nothing here can tell that apart from a citation, so
+# for those three files it is a review responsibility.
 _LEGACY_BRAND_EXEMPT_PATHS = frozenset(
     {
         ".gitignore",
         "PRESCREEN.md",
+        "CHANGELOG.md",
+        "README.md",
+        "README.zh-CN.md",
         "scripts/dump-api-surface.sh",
         "scripts/prescreen-game.sh",
         "scripts/test-prescreen-scanner.sh",

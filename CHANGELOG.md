@@ -8,6 +8,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `scripts/build-aar.sh --jitless` builds an engine that asks V8 to stop
+  generating machine code (`--jitless`). HarmonyOS 5.0.0(12) forbids a
+  third-party VM from making memory executable, so Migo runs interpreted on
+  NEXT whether it asks to or not; this is the build that produces the size of
+  that penalty rather than guessing at it. Off by default, selected by no
+  release path, and the artifact is named so it cannot be mistaken for one. The
+  measured numbers are in `migo-bench/JITLESS.md`.
+
+### Changed
+- `migo.compressImage` no longer starts one OS thread per call. A batch — a
+  screenshot sheet, an avatar pipeline — got a thread per image, each with a
+  1 MB stack, all competing with the render thread. It now uses a shared,
+  daemon pool of two.
+- `PRESCREEN.md` and the prescreen report now say which published names are
+  no-op stubs and which fail loudly, rather than covering all of them with one
+  sentence true of only some. The two stubs that were failing silently now
+  answer `"<api>:fail not supported"` like the other 86.
+- On Android, `requestVsync` resolves its Java method ID once per process
+  instead of hashing the method name and signature against the JNI method cache
+  on every frame. The lookup is off the frame-scheduling path now; the id is a
+  process-lifetime constant.
+
+### Fixed
+- `migo.getUpdateManager()` no longer invents updates. It was deciding with
+  `Math.random() < 0.3` at construction whether to fire
+  `onCheckForUpdate({hasUpdate: true})`, so roughly a quarter of launches
+  showed the game's own "new version — restart?" prompt and then `applyUpdate()`
+  restarted nothing. This runtime has no update channel; the manager now says so
+  instead of pretending.
+- Non-Android hosts (Linux, Windows, OpenHarmony, bare C embedders) now remove
+  a session's sandbox `/tmp` directory when the session ends. `GamePaths::clean_temp`
+  had no caller outside Android's Java SDK, so every session left its
+  `tmp/{id}` subtree under the cache root for the life of the install.
+- Host timestamp jitter no longer drops frames for the rest of a session. The
+  vsync decimator admitted a frame within a fixed 0.25 ms of its deadline, and
+  every useful cadence puts that deadline exactly on a vsync — so a host whose
+  frame-callback timestamps jittered by more than that dropped frames
+  permanently: a replayed 60 Hz stream with 0.4 ms of jitter rendered 14 of 24
+  vsyncs, a 60 fps request running at ~35 and staying there. The tolerance is
+  now half the smaller of the last two delivered-vsync gaps, taking the frame
+  nearest its deadline rather than the first past it. The frame rate the
+  content asked for now also reaches Android's display-mode hint, so a request
+  that is a whole divisor of the panel's rate gets an even cadence; and the
+  requested-rate range and default, which four copies of the rule disagreed on
+  (`2^31` and non-finite handled differently on each side, a 24 fps request
+  silently raised to 30, a ceiling of 120 that left 144 Hz panels unreachable),
+  now live in one module.
+
+---
+
+## v0.9.4 (2026-08-24)
+
+Android delivery gets more flexible — the engine can be kept out of the first
+install and handed over at first launch — and Android cold start moves ahead of
+the system WebView on every benchmark game. A sweep of the game-facing API by
+behaviour rather than by reading turned up several that failed silently. The
+`wx` namespace is gone.
+
+### Added
 - `MigoGameActivity.onCreateRuntimeConfig()`. A config handed to
   `buildLaunchIntent` travels through an in-process table keyed by a token in
   the intent, so it reaches the activity only when whatever started it was in
@@ -17,32 +76,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Overriding this describes how the app runs games once, and it applies however
   the activity was reached. The default returns `null`, which is exactly the
   previous behaviour.
-
-### Fixed
-- `test-android-host-api-contract.sh` froze nothing an embedder reaches by
-  subclassing. It read the surface with `javap -public`, so
-  `MigoGameActivity`'s `onCreateGameListener`, `onLaunchFailed`,
-  `onSessionCreated` and `getGameSession` -- the documented, "zero-boilerplate"
-  integration path -- were outside the freeze along with every other protected
-  member. R8 once marked exactly those methods `final` in the release AAR and
-  external subclasses stopped compiling; this gate could not have seen it. It
-  now reads `-protected`, and the baseline grew by the 13 members that were
-  never pinned.
-
-### Fixed
-- An unparseable `ctx.font` assignment is a no-op again, on both sides of the
-  engine. WHATWG says an invalid value leaves the previous font in effect, and
-  the render thread already did that -- it rejected the shorthand and kept its
-  state. The JS thread did not: it stored the string and `measureText` answered
-  from a best-effort parse of it. So a typo'd font string measured at one size
-  and painted at another, silently. `ctx.font = "definitely not a font"` after
-  `64px "..."` measured 36 px of text the engine painted 221 px of. The check
-  now happens once, in `op_set_font`, ahead of both -- so an invalid value never
-  reaches either side and `ctx.font` never reports one. The strict parser moved
-  to `shared` to make that possible, which is also what finally makes the
-  "one parser, one source of truth" comment in the 2D context true.
-
-### Added
 - `MigoNativeLoader.prepare(context, file)`, for hosts that deliver the engine
   themselves. It runs the same verification the load already does, on the
   thread the caller is on. It does not make the load safer -- what it changes
@@ -63,8 +96,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reading back gets one empty texture. `signal_default_fbo_readback` has
   documented this snapshot since the flag was introduced -- only the code was
   missing. Found by a new WebGL bundle in migo-conformance on its first run.
-
-### Added
 - Android hosts can keep the engine out of their first install. `libmigo.so`
   is ~17 MB of store download and ~45 MB installed per ABI, paid by every
   user whether or not they ever open a mini-game. Two new release assets let
@@ -149,6 +180,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pending. It does that three times on every single launch, in the window
   before the game registers its first `requestAnimationFrame`; a warning on
   the guaranteed path is how a log teaches its reader to skip warnings.
+- On arm64, `libmigo.so` is about 1.85 MiB smaller. `.rela.dyn` was 2.17 MB,
+  99.8% of it single-word `R_AARCH64_RELATIVE` entries at 24 bytes each;
+  `--pack-dyn-relocs=android` group-encodes them, and bionic has decoded that
+  format since API 23. `.text` is byte-for-byte identical. A first size-budget
+  gate holds the engine to a ceiling from here on, with the unchanged previous
+  release as its red case.
+- The thirteen rustflags `engine/.cargo/config.toml` declares for each Android
+  target now reach the AAR link. Cargo replaces rather than merges
+  `[target.<triple>].rustflags` when `RUSTFLAGS` is set in the environment, and
+  the AAR build sets it — so on the one build that ships, the config's flags
+  were silently discarded.
+- `createVideoDecoder`'s stub answers `"createVideoDecoder:fail not supported"`
+  instead of accepting `start()` and then never delivering a frame or an event.
+  Content that polled `getFrameData()` or waited on a listener waited forever,
+  with nothing in the log.
+- The BSL `Change Date` is re-stamped to publication + 4 years on every release
+  and gated against decaying, exceeding the four-year ceiling BSL 1.1 itself
+  imposes, or drifting from `LEGAL.md` and the READMEs.
+- The C ABI header no longer implies that a production host can both clear
+  `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT` and load content: doing so without
+  also supplying a code-signing public key fails with `CodeSignatureInvalid`.
+  The two paths that actually work — signing enabled with a key, or the flag
+  set — are now stated.
+
+### Removed
+- The `wx` namespace. The engine used to install both `migo` and `wx` at
+  bootstrap; it now installs only `migo`. Content written for a mini-game
+  platform gets that platform's global from an external compatibility adapter
+  (`migo-wx-adapter`), which is where that surface belongs. `adapter/` left the
+  repository with it — Migo is a pure engine.
+
+### Fixed
+- `test-android-host-api-contract.sh` froze nothing an embedder reaches by
+  subclassing. It read the surface with `javap -public`, so
+  `MigoGameActivity`'s `onCreateGameListener`, `onLaunchFailed`,
+  `onSessionCreated` and `getGameSession` -- the documented, "zero-boilerplate"
+  integration path -- were outside the freeze along with every other protected
+  member. R8 once marked exactly those methods `final` in the release AAR and
+  external subclasses stopped compiling; this gate could not have seen it. It
+  now reads `-protected`, and the baseline grew by the 13 members that were
+  never pinned.
+- An unparseable `ctx.font` assignment is a no-op again, on both sides of the
+  engine. WHATWG says an invalid value leaves the previous font in effect, and
+  the render thread already did that -- it rejected the shorthand and kept its
+  state. The JS thread did not: it stored the string and `measureText` answered
+  from a best-effort parse of it. So a typo'd font string measured at one size
+  and painted at another, silently. `ctx.font = "definitely not a font"` after
+  `64px "..."` measured 36 px of text the engine painted 221 px of. The check
+  now happens once, in `op_set_font`, ahead of both -- so an invalid value never
+  reaches either side and `ctx.font` never reports one. The strict parser moved
+  to `shared` to make that possible, which is also what finally makes the
+  "one parser, one source of truth" comment in the 2D context true.
+- `login`, `getUserInfo` and `getPhoneNumber` return a Promise, like every
+  other API on that surface. They resolved immediately on `undefined`, so
+  `await migo.login()` did not wait and content ran on as though sign-in had
+  finished.
+- Concurrent first `setStorage` calls no longer lose the SQLite WAL pragma
+  race. Ten writes issued together intermittently failed one; the same ten
+  issued sequentially never did.
+- A throwing content callback no longer swallows the callbacks queued after it.
+  A `success` handler that threw stopped `complete` from running, so content
+  that hid a loading spinner there left it on screen.
+- The image-cache cumulative trim-bytes counter saturates instead of wrapping.
+- Three engine frame-loop internals are non-enumerable on `globalThis`, like
+  their siblings — a `for...in` over the global no longer walks them.
+- `libc++_shared.so` is no longer packed next to `libmigo.so`. Nothing loaded
+  it: `librusty_v8.a` carries Chromium's libc++ statically and `libmigo.so`
+  declares no `DT_NEEDED` for the shared one. Two megabytes per ABI, gone.
+- `minimp3`'s safe wrapper is dropped, taking `slice-ring-buffer`
+  (RUSTSEC-2025-0044, four double-frees reachable through safe APIs, no fixed
+  version) out of the tree. Only the raw `mp3dec_*` C entry points were ever
+  called. `cargo audit` is clean.
+- Several WebGL state calls (`bindBuffer`, `blendColor`, `polygonOffset`,
+  `bindTexture`) now go through the same redundant-call dedup cache as their
+  peers.
 
 ---
 

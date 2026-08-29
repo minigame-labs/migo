@@ -60,10 +60,11 @@
 
 ### 前置条件
 
-- Rust 1.80+（edition 2024）
+- 通过 `rustup` 安装 Rust —— `engine/rust-toolchain.toml` 已钉定确切版本（edition 2024 要求 rustc ≥ 1.85）
 - Android NDK r23+（推荐 r23b 或 r25c）—— Android 目标需要
 - JDK 17+（AAR 构建需要）
-- `cargo-ndk`、`python3`、`ninja`、`git`（Android 构建会从源码编译 Skia）
+- `python3`、`ninja`、`git`（Skia 始终从源码编译，主机构建也不例外）
+- `cargo-ndk`（Android 目标需要）
 
 ### 克隆
 
@@ -79,8 +80,14 @@ cd engine
 cargo build
 cargo test
 cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+首次构建会从源码编译 Skia（约 30–50 分钟；需要 `python3`、`ninja` 及若干
+`-dev` 头文件 —— 见 [`BUILD.md`](BUILD.md)）。在精简的 Ubuntu / WSL2 主机上，
+`bash scripts/dev-test-host.sh test --workspace --lib` 会替你配好这些。
+（此处**不能**用 `--all-features`：`graphics` crate 的 `profile-*` 与
+`*_icudtl` 特性互斥。）
 
 ### 构建 Android AAR（如适用）
 

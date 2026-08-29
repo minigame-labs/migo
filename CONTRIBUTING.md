@@ -61,10 +61,11 @@ Feature requests are welcome. Please include:
 
 ### Prerequisites
 
-- Rust 1.80+ (edition 2024)
+- Rust via `rustup` — `engine/rust-toolchain.toml` pins the exact version (edition 2024 needs rustc ≥ 1.85)
 - Android NDK r23+ (r23b or r25c recommended) — Android targets
 - JDK 17+ (for AAR builds)
-- `cargo-ndk`, `python3`, `ninja`, `git` (Android builds compile Skia from source)
+- `python3`, `ninja`, `git` (Skia is always compiled from source, host builds included)
+- `cargo-ndk` (Android targets)
 
 ### Clone
 
@@ -80,8 +81,15 @@ cd engine
 cargo build
 cargo test
 cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+The first build compiles Skia from source (~30–50 min; needs `python3`,
+`ninja` and a few `-dev` headers — see [`BUILD.md`](BUILD.md)). On a
+minimal Ubuntu / WSL2 host, `bash scripts/dev-test-host.sh test --workspace --lib`
+sets that up for you. (`--all-features` does **not** work here: the
+`graphics` crate has mutually exclusive `profile-*` and `*_icudtl`
+features.)
 
 ### Build Android AAR (if applicable)
 

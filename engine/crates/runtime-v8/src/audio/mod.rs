@@ -56,6 +56,7 @@ use crate::audio::ops::{
     // Context resume/suspend ops
     op_audio_resume_context,
     op_audio_set_analyser_fft_size,
+    op_audio_set_analyser_scalar,
     op_audio_set_biquad_filter_type,
     op_audio_set_buffer,
     op_audio_set_distance_model,
@@ -65,7 +66,6 @@ use crate::audio::ops::{
     op_audio_set_loop,
     op_audio_set_node_param,
     op_audio_set_oscillator_type,
-    op_audio_set_analyser_scalar,
     op_audio_set_panner_scalar,
     op_audio_set_panning_model,
     op_audio_set_started_buffer,

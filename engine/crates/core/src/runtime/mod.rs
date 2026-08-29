@@ -5,6 +5,7 @@ mod input_state;
 
 pub mod registry;
 mod restart_boundary;
+mod session_temp;
 pub mod thread;
 pub mod vsync;
 

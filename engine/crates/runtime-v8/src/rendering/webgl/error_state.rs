@@ -213,7 +213,10 @@ impl WebGLErrorState {
     /// Whether feedback is capturing right now, which is the only phase that
     /// refuses a rebind of the feedback buffers.
     pub fn transform_feedback_captures(&self, canvas_id: u32) -> bool {
-        self.transform_feedback.get(&canvas_id).copied().unwrap_or_default()
+        self.transform_feedback
+            .get(&canvas_id)
+            .copied()
+            .unwrap_or_default()
             == TransformFeedback::Active
     }
 }

@@ -1027,8 +1027,7 @@ mod tests {
         assert!(player.process(&mut out), "still playing, waiting for data");
 
         assert_eq!(
-            out,
-            [CO_MIXED; 8],
+            out, [CO_MIXED; 8],
             "a stalled stream must contribute nothing, not silence the bus"
         );
     }

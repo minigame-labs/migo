@@ -348,7 +348,11 @@ mod tests {
 
     #[test]
     fn without_a_curve_the_node_passes_through_at_every_oversample_setting() {
-        for mode in [OversampleType::None, OversampleType::TwoX, OversampleType::FourX] {
+        for mode in [
+            OversampleType::None,
+            OversampleType::TwoX,
+            OversampleType::FourX,
+        ] {
             let mut node = WaveShaperNode::new(1);
             node.set_oversample(mode);
             let input: Vec<f32> = (0..16).map(|i| i as f32).collect();

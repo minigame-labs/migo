@@ -2891,7 +2891,9 @@ mod tests {
     /// a periodic hitch in every source's scheduling grain.
     #[test]
     fn every_ring_block_is_a_whole_number_of_render_quanta() {
-        for sample_rate in [8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000] {
+        for sample_rate in [
+            8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000,
+        ] {
             let frames = calculate_process_frames(sample_rate);
             assert_eq!(
                 frames % RENDER_QUANTUM_FRAMES,
