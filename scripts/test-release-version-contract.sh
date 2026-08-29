@@ -265,6 +265,58 @@ for relative in sorted(DERIVES):
                 f"should derive from release/VERSION (`{version}`): {line.strip()}"
             )
 
+# ------------------------------------------- the two runtime version reporters
+#
+# Everything above stops at "the AAR's versionName reaches an embedder through
+# BuildInfo.VERSION". Two more places state a version at runtime, neither a build
+# script, and both had frozen to an early release's number without any check
+# noticing:
+#
+#   * the JNI `version()` in platform/.../inbound.rs handed the Java SDK a
+#     literal string, so MigoRuntime.getNativeVersion() reported a version no
+#     build had carried since 0.1.x;
+#   * MigoRuntime.SDK_VERSION -- a public constant an embedder can read -- was a
+#     sibling literal, and the two frozen strings were exactly what the SDK's
+#     own skew check compared, so it could never fire.
+#
+# Both now derive: the JNI one from CARGO_PKG_VERSION (the workspace mirror
+# checked above), the Java one from BuildInfo.VERSION (the generated file the
+# AAR's versionName feeds). Checked by what they read, like every consumer above.
+RUNTIME_REPORTERS = {
+    "engine/crates/platform/src/android/jni/inbound.rs": (
+        'env.new_string(env!("CARGO_PKG_VERSION"))',
+        "the version string NativeBridge.version() hands the Java SDK",
+    ),
+    "platforms/android/library/src/main/java/com/migo/runtime/MigoRuntime.java": (
+        "public static final String SDK_VERSION = BuildInfo.VERSION;",
+        "MigoRuntime.SDK_VERSION, a public constant and the SDK's skew-check baseline",
+    ),
+}
+for relative, (marker, what) in sorted(RUNTIME_REPORTERS.items()):
+    path = root / relative
+    if not path.is_file():
+        errors.append(f"{relative} not found; it states {what} and this gate cannot check it")
+        continue
+    text = path.read_text(encoding="utf-8")
+    if marker not in code_only(text, relative):
+        errors.append(
+            f"{relative} no longer derives its version (`{marker}` is gone). It states "
+            f"{what}, so whatever it uses instead is what a running app and an embedder see"
+        )
+    for number, line in enumerate(text.splitlines(), start=1):
+        code = line
+        if "//" in code:
+            code = code.split("//", 1)[0]
+        if not SETS_A_VERSION.search(code):
+            continue
+        for found in LITERAL.findall(code):
+            if found == version:
+                continue
+            errors.append(
+                f"{relative}:{number}: `{found}` is a version literal where the version "
+                f"must derive from release/VERSION (`{version}`): {line.strip()}"
+            )
+
 # ------------------------------------------------ one definition of the reader
 
 # Every consumer above is checked for an assignment that *calls* the reader, which

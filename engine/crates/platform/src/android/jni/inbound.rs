@@ -233,12 +233,20 @@ pub fn on_load(vm: JavaVM) -> jint {
     jni::sys::JNI_VERSION_1_6
 }
 
+/// The engine version `NativeBridge.version()` hands back to the Java SDK.
+///
+/// Taken from `CARGO_PKG_VERSION`, which is `[workspace.package] version` --
+/// the mirror `scripts/test-release-version-contract.sh` holds equal to
+/// `release/VERSION`. It was a hardcoded literal for a long time, which made
+/// `MigoRuntime.getNativeVersion()` report a version no build had carried since
+/// the 0.1.x line and left `MigoRuntime`'s SDK-vs-native skew check comparing
+/// that constant against an identically frozen Java one, so it could never fire.
 pub(crate) extern "system" fn version<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
     jni_safe!("version", std::ptr::null_mut(), {
-        match env.new_string("0.1.0") {
+        match env.new_string(env!("CARGO_PKG_VERSION")) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }
