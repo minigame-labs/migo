@@ -164,6 +164,15 @@ platforms/windows/SPIKE-REPORT.md
 # notes above: they are for the maintainer's machine, not for consumers.
 *.local.md
 
+# Brand/logo exploration. Concept art and a preview page for comparing logo
+# directions -- a maintainer-local design artifact, not part of the runtime or
+# its docs, and it arrived bundled into an unrelated PR (#159). Kept on disk,
+# out of the published tree, until a brand direction is settled and introduced
+# deliberately.
+brand/
+scripts/test-logo-preview.mjs
+scripts/test-logo-preview-v2.mjs
+
 # OpenHarmony host build inputs staged by scripts/build-ohos-host.sh
 platforms/openharmony/entry/src/main/cpp/libs/
 platforms/openharmony/entry/src/main/cpp/migo-include/
