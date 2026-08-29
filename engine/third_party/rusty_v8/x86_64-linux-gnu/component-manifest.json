@@ -1,6 +1,6 @@
 {
   "schema": "migo-v8-component-manifest/v1",
-  "component_id": "6fa9bb8448a38de198ce4ec7b97922f3d1d75ff37c84ec25e1adc6ba54468749",
+  "component_id": "26fcb7ccb48972875329b0def52f1ee574fb511b36cf54b24713ea8e6061d7f8",
   "target": {
     "triple": "x86_64-unknown-linux-gnu",
     "os": "linux",
@@ -18,7 +18,7 @@
   },
   "toolchain": {
     "rustc": "rustc 1.89.0 (29483883e 2025-08-04) | binary: rustc | commit-hash: 29483883eed69d5fb4db01964cdf2af4d86e9cb2 | commit-date: 2025-08-04 | host: x86_64-unknown-linux-gnu | release: 1.89.0 | LLVM version: 20.1.7",
-    "compiler": "Android (8481493, based on r416183c2) clang version 12.0.9 (https://android.googlesource.com/toolchain/llvm-project c935d99d7cf2016289302412d708641d52d2f7ee) | Target: x86_64-unknown-linux-gnu | Thread model: posix | InstalledDir: <ANDROID_NDK_HOME>/toolchains/llvm/prebuilt/linux-x86_64/bin",
+    "compiler": "Android (8481493, based on r416183c2) clang version 12.0.9 (https://android.googlesource.com/toolchain/llvm-project c935d99d7cf2016289302412d708641d52d2f7ee) | Target: x86_64-unknown-linux-gnu | Thread model: posix | InstalledDir: ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin",
     "sdk": "Debian bullseye amd64 sysroot; sysroots.json sha256=fad7d0037e5f1da91f66f28fb666522e4d2884322e3c89db8387dad2b275291d",
     "linker": "Ubuntu LLD 18.1.3 (compatible with GNU linkers)"
   },
