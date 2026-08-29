@@ -177,6 +177,14 @@ jobs:
       - name: Example content namespace contract
         run: bash scripts/test-content-namespace-contract.sh
 
+      # `release/VERSION` gates every build consumer, but a hand-written
+      # `migo-0.9.3-android.aar` in a README is not a build consumer -- it just
+      # drifts, and it did: the Android quick-start's Gradle line 404'd against
+      # the release page. This keeps instructional docs on the `<version>`
+      # placeholder CHANGELOG.md and README.md already use.
+      - name: Doc version-reference contract
+        run: bash scripts/test-doc-version-refs-contract.sh
+
       # The prescreen scanner is what a prospective customer runs against their own
       # bundle, so its wrong answers are the expensive kind: a gap it invents gets
       # checked, does not exist, and the rest of the report stops being believed.
