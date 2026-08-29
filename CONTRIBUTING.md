@@ -61,7 +61,7 @@ Feature requests are welcome. Please include:
 
 ### Prerequisites
 
-- Rust 1.80+ (edition 2024)
+- Rust via `rustup` — `engine/rust-toolchain.toml` pins the exact version (edition 2024 needs rustc ≥ 1.85)
 - Android NDK r23+ (r23b or r25c recommended) — Android targets
 - JDK 17+ (for AAR builds)
 - `cargo-ndk`, `python3`, `ninja`, `git` (Android builds compile Skia from source)

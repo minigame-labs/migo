@@ -60,7 +60,7 @@
 
 ### 前置条件
 
-- Rust 1.80+（edition 2024）
+- 通过 `rustup` 安装 Rust —— `engine/rust-toolchain.toml` 已钉定确切版本（edition 2024 要求 rustc ≥ 1.85）
 - Android NDK r23+（推荐 r23b 或 r25c）—— Android 目标需要
 - JDK 17+（AAR 构建需要）
 - `cargo-ndk`、`python3`、`ninja`、`git`（Android 构建会从源码编译 Skia）
