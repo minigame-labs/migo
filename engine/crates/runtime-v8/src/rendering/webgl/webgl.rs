@@ -152,6 +152,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn buffer_data_with_a_payload_uploads_and_ignores_the_size_sentinel() {
+        // `02_webgl_context.js` calls `_rawBufferData(id, target, -1, u8, usage)`
+        // on the data path -- `size` is deliberately unused there. A guard that
+        // rejected `size < 0` before checking for a payload turned every
+        // `bufferData(target, ArrayBuffer, usage)` into a silent no-op with a
+        // spurious `INVALID_VALUE`, which shipped in v0.9.5 and blacked out
+        // every WebGL draw. This op had no test at all.
+        let canvas_id = 3;
+        let mut state = new_webgl_op_state();
+        let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+
+        super::buffer_data_impl(
+            &mut state,
+            canvas_id,
+            0x8892,
+            -1,
+            Some(&payload[..]),
+            0x88E4,
+        );
+
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(canvas_id),
+            codes::NO_ERROR,
+            "a data upload must not record an error for the unused size field"
+        );
+        assert!(
+            state
+                .borrow::<UnifiedFrameCollector>()
+                .approx_pending_bytes()
+                > 0,
+            "the buffer upload must reach the command stream"
+        );
+    }
+
+    #[test]
+    fn buffer_data_with_no_payload_still_rejects_a_negative_size() {
+        // The size-only variant -- `bufferData(target, SIZE, usage)` -- keeps
+        // its INVALID_VALUE guard; the JS binding never reaches here with a
+        // negative size, so a negative one is genuine misuse.
+        let canvas_id = 5;
+        let mut state = new_webgl_op_state();
+
+        super::buffer_data_impl(&mut state, canvas_id, 0x8892, -1, None, 0x88E4);
+
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(canvas_id),
+            codes::INVALID_VALUE
+        );
+        assert_eq!(
+            state
+                .borrow::<UnifiedFrameCollector>()
+                .approx_pending_bytes(),
+            0
+        );
+    }
+
     fn new_test_host_state() -> (HostOpState, crossbeam_channel::Receiver<RenderCommand>) {
         let (render_tx, render_rx) = CommandSender::new();
         let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
@@ -4499,16 +4556,19 @@ pub fn op_buffer_data(
     #[buffer] data: Option<&[u8]>,
     #[smi] usage: u32,
 ) {
-    // A negative size is `INVALID_VALUE` and the call is a no-op; zero is a
-    // legal request for an empty buffer, and the guard this replaced refused it
-    // along with the invalid case. Both used to leave via `error!`, so
-    // `getError()` reported `NO_ERROR` after a misuse -- content checking the
-    // queue could not see its own bug.
-    if size < 0 {
-        error_state::push_error(state, canvas_id, codes::INVALID_VALUE);
-        return;
-    }
+    buffer_data_impl(state, canvas_id, target, size, data, usage);
+}
 
+/// The body of [`op_buffer_data`], as a plain function so the size/payload
+/// handling can be unit-tested without the op glue.
+pub(crate) fn buffer_data_impl(
+    state: &mut OpState,
+    canvas_id: u32,
+    target: u32,
+    size: i32,
+    data: Option<&[u8]>,
+    usage: u32,
+) {
     let (size, data) = match data {
         Some(bytes) => {
             let Some(owned) = bounded_webgl_upload_copy(state, canvas_id, bytes) else {
@@ -4517,11 +4577,24 @@ pub fn op_buffer_data(
             // The payload is the authority when there is one: the render thread
             // uploads `data` and ignores `size`, so a caller-supplied `size`
             // that disagrees is a second answer to one question waiting for a
-            // reader who trusts the wrong field.
+            // reader who trusts the wrong field. `02_webgl_context.js` passes
+            // `size = -1` on this path precisely because the field is unused;
+            // the negative-size check below must not run here, or every
+            // `bufferData(target, ArrayBuffer, usage)` -- the common WebGL
+            // upload -- is silently dropped with a spurious `INVALID_VALUE`.
             let len = i32::try_from(owned.len()).unwrap_or(i32::MAX);
             (len, Some(owned))
         }
         None => {
+            // A negative size is `INVALID_VALUE` and the call is a no-op; zero
+            // is a legal request for an empty buffer, and the guard this
+            // replaced refused it along with the invalid case. Both used to
+            // leave via `error!`, so `getError()` reported `NO_ERROR` after a
+            // misuse -- content checking the queue could not see its own bug.
+            if size < 0 {
+                error_state::push_error(state, canvas_id, codes::INVALID_VALUE);
+                return;
+            }
             let Ok(requested) = usize::try_from(size) else {
                 return;
             };
