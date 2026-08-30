@@ -737,18 +737,6 @@ public final class GameSession implements Closeable {
     }
 
     /**
-     * Set or clear the ad handler for this session.
-     * <p>
-     * Bridge this to your ad SDK (Pangle, GDT, Kuaishou Union, ...). The
-     * runtime links no ad SDK and decides nothing about whether an advert was
-     * watched -- with no handler installed, content's ad callbacks still fire
-     * but no advert is shown and incentivised video reports an unfinished view.
-     * <p>
-     * Call this before {@link #startGame(String)} for best compatibility.
-     *
-     * @param handler host ad handler, or null to clear
-     */
-    /**
      * Set or clear the permission handler for this session.
      * <p>
      * You decide what the game may do. With no handler installed every scope is
@@ -768,6 +756,18 @@ public final class GameSession implements Closeable {
         }
     }
 
+    /**
+     * Set or clear the ad handler for this session.
+     * <p>
+     * Bridge this to your ad SDK (Pangle, GDT, Kuaishou Union, ...). The
+     * runtime links no ad SDK and decides nothing about whether an advert was
+     * watched -- with no handler installed, content's ad callbacks still fire
+     * but no advert is shown and incentivised video reports an unfinished view.
+     * <p>
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host ad handler, or null to clear
+     */
     public void setAdHandler(AdHandler handler) {
         synchronized (lock) {
             if (state.get() == SessionState.DESTROYED) return;

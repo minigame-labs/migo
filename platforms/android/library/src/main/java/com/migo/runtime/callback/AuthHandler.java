@@ -6,6 +6,15 @@ package com.migo.runtime.callback;
  * Register this handler via {@link com.migo.runtime.GameSession#setAuthHandler(AuthHandler)}
  * before the game starts, then bridge to your platform auth SDK.
  *
+ * <h2>Without a handler</h2>
+ * Every call fails rather than stalling or reporting a signed-in user:
+ * {@code migo.login()}, {@code migo.checkSession()}, {@code migo.getUserInfo()}
+ * and {@code migo.getPhoneNumber()} all settle with {@code no auth handler}.
+ * <p>
+ * Failing is the point. The runtime holds no account system and cannot mint a
+ * session, so answering success with nobody authenticated would hand content a
+ * player identity that exists only inside the game.
+ *
  * <p>Contract:
  * <ul>
  *   <li>{@link #login(int, LoginCallback)} must eventually invoke one callback method.</li>
