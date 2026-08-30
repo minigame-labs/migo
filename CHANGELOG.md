@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## v0.9.6 (2026-08-30)
+
+A hotfix for a WebGL regression in v0.9.5.
+
+### Fixed
+- `bufferData(target, ArrayBuffer, usage)` uploads its data again. v0.9.5 added
+  a `size < 0` guard to `bufferData` that ran before the code checked whether a
+  payload was supplied, and the JS binding passes `size = -1` on the data path
+  because the field is unused there. So the most common WebGL upload -- vertex
+  and index buffers -- became a silent no-op that also recorded a spurious
+  `INVALID_VALUE`, and every WebGL draw painted black. The op had no test;
+  `migo-conformance`'s `webgl-basics` bundle caught it on the first run against
+  the v0.9.5 release AAR. The negative-size check now runs only on the
+  size-only form, and `op_buffer_data` has a regression test on both forms.
+
+---
+
 ## v0.9.5 (2026-08-29)
 
 A correctness and efficiency pass over io, graphics and audio. Redundant GL
