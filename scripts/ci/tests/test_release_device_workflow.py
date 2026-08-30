@@ -7,9 +7,10 @@ import yaml
 class ReleaseDeviceWorkflowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.release = yaml.safe_load(
-            Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+        cls.release_text = Path(".github/workflows/release.yml").read_text(
+            encoding="utf-8"
         )
+        cls.release = yaml.safe_load(cls.release_text)
         cls.device = yaml.safe_load(
             Path(".github/workflows/device-test.yml").read_text(encoding="utf-8")
         )
@@ -21,12 +22,29 @@ class ReleaseDeviceWorkflowTest(unittest.TestCase):
             raise AssertionError(f"expected exactly one step named {name!r}")
         return matches[0]
 
-    def test_tag_publish_is_blocked_on_exact_android_release_evidence(self):
+    def test_android_device_evidence_job_is_shaped_and_wired_correctly(self):
+        # The job was introduced needing a `self-hosted, android-device` runner
+        # (none is registered) and `../migo-test-suite`'s install.sh/run.sh (that
+        # repo ships neither), while gating `publish`. So the first tagged release
+        # after it landed could not publish -- the job queued forever. It is now
+        # opt-in: it runs, and gates the release, only where MIGO_DEVICE_EVIDENCE
+        # is set. This test still pins its shape so that turning it on is the only
+        # thing left to do; when it is on, publish must depend on it again.
         jobs = self.release["jobs"]
         evidence = jobs["release-android-device-evidence"]
         self.assertEqual(evidence["needs"], ["release-android"])
         self.assertEqual(evidence["runs-on"], ["self-hosted", "android-device"])
-        self.assertIn("release-android-device-evidence", jobs["publish"]["needs"])
+        self.assertEqual(
+            evidence["if"], "${{ vars.MIGO_DEVICE_EVIDENCE == 'true' }}"
+        )
+        # While the job is guarded off, publish must not wait on a job that will
+        # not run. The comment beside `publish.needs` records that it goes back
+        # the moment MIGO_DEVICE_EVIDENCE is set.
+        self.assertNotIn(
+            "release-android-device-evidence", jobs["publish"]["needs"]
+        )
+        publish_src = self.release_text
+        self.assertIn("MIGO_DEVICE_EVIDENCE is set", publish_src)
 
         download = self._step(
             evidence, "Download the hosted builder's Android release bytes"
