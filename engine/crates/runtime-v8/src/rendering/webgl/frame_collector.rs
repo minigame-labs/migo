@@ -1954,6 +1954,50 @@ mod tests {
         );
     }
 
+    /// A GL batch between two draws splits the canvas segment, and the fold
+    /// must not reach across that split -- the draws would then be submitted
+    /// before GL work the content ordered ahead of the second one.
+    ///
+    /// The adjacency argument is about the *command stream*, and a segment
+    /// boundary is a discontinuity in it that the per-canvas check alone does
+    /// not see. Today the property holds structurally -- the fold only ever
+    /// looks at `seg.commands.last_mut()`, so it cannot reach past the segment
+    /// it is in -- which means this characterises the boundary rather than
+    /// guarding a decision. It is here so that a future fold that indexes
+    /// canvases instead of segments fails loudly.
+    #[test]
+    fn a_gl_batch_between_draws_breaks_the_run() {
+        let mut c = UnifiedFrameCollector::new();
+        c.push_canvas2d(1, sprite(0.0));
+        c.push_gl(GLCmd::Clear {
+            canvas_id: shared::protocol::render_cmd::CanvasId::from(2u32),
+            bit_field: 0x4000,
+        });
+        c.push_canvas2d(1, sprite(16.0));
+
+        let packet = c.build_frame_packet(true).unwrap();
+        let mut draw_entries = 0usize;
+        let mut canvas_batches = 0usize;
+        for op in packet.ops() {
+            if let FrameOp::CanvasBatch(p) = op {
+                canvas_batches += 1;
+                for cmd in p.commands.iter() {
+                    match cmd {
+                        Canvas2DCmd::DrawImage { .. } => draw_entries += 1,
+                        Canvas2DCmd::DrawImageBatch { draws } => draw_entries += draws.len(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(draw_entries, 2, "both draws must survive");
+        assert!(
+            canvas_batches >= 2,
+            "the GL batch must still split the 2D work into two segments, \
+             got {canvas_batches}"
+        );
+    }
+
     /// Folding must not stop the collector noticing memory growth, or a
     /// sprite storm could pin the JS heap past the auto-flush budget.
     #[test]
