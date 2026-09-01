@@ -146,6 +146,19 @@ jobs:
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
 
+      # Source-only, so it runs here rather than in the NDK job: everything it
+      # reads is a Rust file. It guards a value that no host test can reach --
+      # `platform/src/android/**` compiles only on Android -- plus the two ways
+      # the host-testable core it delegates to could stop being exercised.
+      - name: Android frame-rate compatibility contract
+        run: bash scripts/test-android-frame-rate-contract.sh
+
+      # Three numbers nothing checked: `compileSdk`/`targetSdk` sat at 34 while
+      # Play began requiring 36, and `minSdk` is a device-reach decision that
+      # must not drift in either direction to make a target bump compile.
+      - name: Android SDK levels contract
+        run: bash scripts/test-android-sdk-levels-contract.sh
+
       - name: Release asset ordering contract
         run: bash scripts/test-release-asset-ordering-contract.sh
 
