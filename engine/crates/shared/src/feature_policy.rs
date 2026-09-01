@@ -103,9 +103,14 @@ impl FeatureKey {
             // and a non-uniform sprite renders byte-identically with the path
             // on and off.
             Self::CanvasDrawAtlas => true,
+            // Deferring the `LINK_STATUS` read is what the GL spec already
+            // allows: linking is asynchronous and the read is the barrier. The
+            // queue is always drained, so the shader binary cache is populated
+            // exactly as before -- only the stall moves. Off restores the
+            // one-link-at-a-time behaviour byte for byte.
+            Self::WebglParallelShaderCompile => true,
             Self::CanvasHotBackingPool
             | Self::PresentSwappy
-            | Self::WebglParallelShaderCompile
             | Self::TextureAstcVariants
             | Self::RuntimeQualityPressure => false,
         }

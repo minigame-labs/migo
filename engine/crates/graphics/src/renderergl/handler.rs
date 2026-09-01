@@ -172,10 +172,10 @@ impl RendererGL {
             // in the batch has been submitted, so the driver has had the whole
             // batch to work on them in parallel.
             let link_ok = unsafe { gl.get_program_link_status(ph) };
-            if link_ok {
-                if let (Some(cache), Some(vs), Some(fs)) = (&cm.shader_cache, &vsrc, &fsrc) {
-                    cache.save(gl, ph, vs, fs, &attrib_key);
-                }
+            if let (true, Some(cache), Some(vs), Some(fs)) =
+                (link_ok, &cm.shader_cache, &vsrc, &fsrc)
+            {
+                cache.save(gl, ph, vs, fs, &attrib_key);
             }
             if let Some(meta) = cm.programs.get_mut(&program_id) {
                 meta.link_pending = false;
@@ -739,6 +739,15 @@ impl RendererGL {
                                 // where the cache save happens instead.
                                 // See `renderergl::link_queue`.
                                 cm.mark_link_pending(program_id);
+                                if !shared::feature_policy::is_enabled(
+                                    shared::feature_policy::FeatureKey::WebglParallelShaderCompile,
+                                ) {
+                                    // Kill switch: resolve immediately, which
+                                    // restores the old one-link-at-a-time
+                                    // behaviour exactly, for a driver where
+                                    // deferring turns out to misbehave.
+                                    Self::drain_pending_links(cm, gl, DrainCause::ContentAsked);
+                                }
                             }
                         }
                     }
