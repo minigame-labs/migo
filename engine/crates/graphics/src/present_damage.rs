@@ -403,6 +403,53 @@ pub fn build_present_plan(
 
 // ── EXT-vs-KHR demotion helper ────────────────────────────────────────────────
 
+/// The region to hand `eglSwapBuffersWithDamage`, which is **not** the region
+/// handed to `eglSetDamageRegionKHR`.
+///
+/// The two extensions answer different questions and this plan carries both
+/// answers, one field apart:
+///
+/// * `repair` (to `eglSetDamageRegionKHR`) is *buffer* damage -- "the region I
+///   am about to rewrite in this back buffer", widened by buffer age so the
+///   aged contents get repaired.
+/// * `current` (to `eglSwapBuffersWithDamage`) is *surface* damage -- "the
+///   region that differs from the frame you last showed", which is what lets
+///   the compositor skip recompositing the rest.
+///
+/// Submitting `repair` to swap is not a visual bug: it is a superset, so the
+/// frame still looks right, and every pixel test passes. It just quietly gives
+/// back most of the compositor saving the call was made for -- which is why the
+/// choice is a named function with a test rather than a field access at the
+/// call site.
+pub fn swap_damage_region(plan: &PresentDamagePlan) -> &DamageRegion {
+    &plan.current
+}
+
+/// Whether this frame should be presented with surface damage, and which rects
+/// to submit if so.
+///
+/// Split out from the EGL call because that call needs a live display and this
+/// decision does not: every way of getting it wrong -- submitting after a
+/// driver rejection, submitting a whole-surface region that says nothing,
+/// submitting an empty one -- is decided here, where a host test can see it.
+///
+/// A full-surface frame deliberately returns `None`. Passing the whole surface
+/// as damage is legal but tells the compositor only what it already assumed,
+/// at the cost of building and passing a rect array to say it.
+pub fn surface_damage_to_submit<'a>(
+    plan: &'a PresentDamagePlan,
+    extension_available: bool,
+    previously_rejected: bool,
+) -> Option<&'a [DamageRect]> {
+    if !extension_available || previously_rejected {
+        return None;
+    }
+    match swap_damage_region(plan).rects() {
+        Some(rects) if !rects.is_empty() => Some(rects),
+        _ => None,
+    }
+}
+
 /// Adjust repair after `eglSetDamageRegionKHR` declaration failure.
 ///
 /// If `EGL_EXT_buffer_age` is independently advertised, the aged buffer
@@ -506,6 +553,70 @@ mod tests {
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> DamageRect {
         DamageRect::new(x, y, w, h).expect("valid rect")
+    }
+
+    #[test]
+    fn surface_damage_is_submitted_only_when_it_says_something_new() {
+        let history = PresentDamageHistory::new();
+        let partial = build_present_plan(
+            DamageRegion::from_rect(r(40, 40, 10, 10)),
+            &history,
+            true,
+            1,
+            true,
+            true,
+        );
+        let full = build_present_plan(DamageRegion::FullSurface, &history, true, 1, true, true);
+
+        assert_eq!(
+            surface_damage_to_submit(&partial, true, false),
+            Some(&[r(40, 40, 10, 10)][..]),
+            "a partial frame is exactly the case the extension exists for"
+        );
+        assert_eq!(
+            surface_damage_to_submit(&full, true, false),
+            None,
+            "a whole-surface region tells the compositor what it already assumed"
+        );
+        assert_eq!(
+            surface_damage_to_submit(&partial, false, false),
+            None,
+            "no extension, no submission"
+        );
+        assert_eq!(
+            surface_damage_to_submit(&partial, true, true),
+            None,
+            "a driver that rejected the call once is not asked again"
+        );
+    }
+
+    /// Swap gets `current`, the damage declaration gets `repair`. They are two
+    /// different regions and the plan holds both, so the only thing standing
+    /// between them is which field the call site reads -- and reading the wrong
+    /// one produces a correct-looking frame.
+    #[test]
+    fn swap_receives_surface_damage_not_the_buffer_repair_region() {
+        // A history with an older frame makes `repair` strictly wider than
+        // `current`: buffer age 2 means the back buffer also needs the region
+        // damaged two frames ago repaired.
+        let mut history = PresentDamageHistory::new();
+        history.push(DamageRegion::from_rect(r(0, 0, 10, 10)));
+        history.push(DamageRegion::from_rect(r(90, 90, 10, 10)));
+
+        let current = DamageRegion::from_rect(r(40, 40, 10, 10));
+        let plan = build_present_plan(current, &history, true, 2, true, true);
+
+        let submitted = swap_damage_region(&plan);
+        assert_eq!(
+            submitted.rects(),
+            Some(&[r(40, 40, 10, 10)][..]),
+            "swap must be told only what changed since the last presented frame"
+        );
+        assert_ne!(
+            submitted.bounding_rect(),
+            plan.repair.bounding_rect(),
+            "this test is worthless unless repair and current actually differ here"
+        );
     }
 
     /// **`DamageRect::new` is the only way to hold one, so its rejections are
