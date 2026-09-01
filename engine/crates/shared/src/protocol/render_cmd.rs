@@ -2061,6 +2061,121 @@ pub struct DrawImageEntry {
     pub dh: f32,
 }
 
+/// Fold an incoming Canvas2D command into the tail of a per-canvas command
+/// run, turning an adjacent sequence of `DrawImage`s into one
+/// `DrawImageBatch`.
+///
+/// Returns `None` when `incoming` was absorbed into `tail`, or
+/// `Some(incoming)` when the caller must push it as its own command.
+///
+/// **Why this is sound.** A `Canvas2DCmd` segment is a totally ordered,
+/// per-canvas stream: every state mutation (`Save`, `SetGlobalAlpha`,
+/// `Translate`, `Clip`, …) is itself a command in that stream. So two
+/// *adjacent* `DrawImage`s are, by construction, executed against
+/// byte-identical 2D state — which is exactly the precondition
+/// `DrawImageBatch`'s handler already assumes when it builds one paint and
+/// reuses it for every entry. The fold preserves order, so alpha-blended
+/// draws still composite in the sequence the content asked for.
+///
+/// **Why it matters.** `DrawImageBatch` was previously reachable only
+/// through `ctx.drawImageBatch()`, a Migo-only API no real content calls;
+/// engines and hand-written games emit one `drawImage` per sprite. Folding
+/// here is what lets a 768-sprite frame arrive as one command instead of
+/// 768 — and it is the only way the `drawAtlas` run batching downstream
+/// ever sees a run to batch.
+#[inline]
+pub fn fold_draw_image_run(tail: &mut Canvas2DCmd, incoming: Canvas2DCmd) -> Option<Canvas2DCmd> {
+    // Only a draw may join a run; anything else (including a state command
+    // that would invalidate the shared-paint assumption) is handed back.
+    let Canvas2DCmd::DrawImage {
+        image_id,
+        sx,
+        sy,
+        sw,
+        sh,
+        dx,
+        dy,
+        dw,
+        dh,
+    } = incoming
+    else {
+        return Some(incoming);
+    };
+    let entry = DrawImageEntry {
+        image_id,
+        sx,
+        sy,
+        sw,
+        sh,
+        dx,
+        dy,
+        dw,
+        dh,
+    };
+
+    match tail {
+        Canvas2DCmd::DrawImageBatch { draws } => {
+            // Same cap the JS-facing op enforces, so a batch built by folding
+            // can never be larger than one the protocol would accept.
+            if draws.len() >= MAX_DRAW_IMAGE_BATCH_ENTRIES {
+                return Some(Canvas2DCmd::from(entry));
+            }
+            draws.push(entry);
+            None
+        }
+        Canvas2DCmd::DrawImage { .. } => {
+            let Canvas2DCmd::DrawImage {
+                image_id,
+                sx,
+                sy,
+                sw,
+                sh,
+                dx,
+                dy,
+                dw,
+                dh,
+            } = *tail
+            else {
+                unreachable!("matched DrawImage on the line above")
+            };
+            *tail = Canvas2DCmd::DrawImageBatch {
+                draws: vec![
+                    DrawImageEntry {
+                        image_id,
+                        sx,
+                        sy,
+                        sw,
+                        sh,
+                        dx,
+                        dy,
+                        dw,
+                        dh,
+                    },
+                    entry,
+                ],
+            };
+            None
+        }
+        _ => Some(Canvas2DCmd::from(entry)),
+    }
+}
+
+impl From<DrawImageEntry> for Canvas2DCmd {
+    fn from(e: DrawImageEntry) -> Self {
+        Canvas2DCmd::DrawImage {
+            image_id: e.image_id,
+            sx: e.sx,
+            sy: e.sy,
+            sw: e.sw,
+            sh: e.sh,
+            dx: e.dx,
+            dy: e.dy,
+            dw: e.dw,
+            dh: e.dh,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Approximate deep-size accounting (for frame-collector budgeting)
 // ---------------------------------------------------------------------------
@@ -2962,5 +3077,118 @@ mod readback_limit_tests {
         assert!(webgl_upload_is_within_limit(MAX_WEBGL_UPLOAD_BYTES));
         assert!(!webgl_upload_is_within_limit(MAX_WEBGL_UPLOAD_BYTES + 1));
         assert!(MAX_WEBGL_SHADER_SOURCE_BYTES < MAX_WEBGL_UPLOAD_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod draw_image_run_tests {
+    use super::*;
+
+    fn draw(image_id: u32, dx: f32) -> Canvas2DCmd {
+        Canvas2DCmd::DrawImage {
+            image_id: ImageId::from(image_id),
+            sx: 0.0,
+            sy: 0.0,
+            sw: 16.0,
+            sh: 16.0,
+            dx,
+            dy: 4.0,
+            dw: 16.0,
+            dh: 16.0,
+        }
+    }
+
+    #[test]
+    fn two_adjacent_draw_images_become_one_batch() {
+        let mut tail = draw(7, 0.0);
+        assert!(fold_draw_image_run(&mut tail, draw(7, 32.0)).is_none());
+
+        let Canvas2DCmd::DrawImageBatch { draws } = &tail else {
+            panic!("adjacent DrawImage pair must fold into a batch, got {tail:?}");
+        };
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].dx, 0.0);
+        assert_eq!(draws[1].dx, 32.0);
+        assert_eq!(draws[0].image_id, ImageId::from(7u32));
+    }
+
+    #[test]
+    fn a_third_draw_image_extends_the_existing_batch_in_order() {
+        let mut tail = draw(7, 0.0);
+        assert!(fold_draw_image_run(&mut tail, draw(7, 32.0)).is_none());
+        assert!(fold_draw_image_run(&mut tail, draw(9, 64.0)).is_none());
+
+        let Canvas2DCmd::DrawImageBatch { draws } = &tail else {
+            panic!("expected batch");
+        };
+        assert_eq!(draws.len(), 3);
+        assert_eq!(
+            draws.iter().map(|d| d.dx).collect::<Vec<_>>(),
+            vec![0.0, 32.0, 64.0],
+            "fold must preserve paint order -- these draws alpha-blend"
+        );
+    }
+
+    /// A different image mid-run is still foldable: `drawAtlas` batching
+    /// happens later, on runs *within* the batch. What must never fold is a
+    /// command that could change the 2D state between two draws.
+    #[test]
+    fn a_state_command_is_never_absorbed() {
+        let mut tail = draw(7, 0.0);
+        let rejected = fold_draw_image_run(&mut tail, Canvas2DCmd::Save);
+        assert!(
+            matches!(rejected, Some(Canvas2DCmd::Save)),
+            "Save must be handed back untouched"
+        );
+        assert!(matches!(tail, Canvas2DCmd::DrawImage { .. }));
+    }
+
+    #[test]
+    fn a_draw_image_after_a_state_command_does_not_fold_into_it() {
+        let mut tail = Canvas2DCmd::SetGlobalAlpha { alpha: 0.5 };
+        let rejected = fold_draw_image_run(&mut tail, draw(7, 0.0));
+        assert!(
+            matches!(rejected, Some(Canvas2DCmd::DrawImage { .. })),
+            "a draw may only join a run of draws"
+        );
+    }
+
+    #[test]
+    fn a_full_batch_stops_absorbing_rather_than_growing_past_the_protocol_limit() {
+        let mut tail = Canvas2DCmd::DrawImageBatch {
+            draws: (0..MAX_DRAW_IMAGE_BATCH_ENTRIES)
+                .map(|_| DrawImageEntry {
+                    image_id: ImageId::from(1u32),
+                    sx: 0.0,
+                    sy: 0.0,
+                    sw: 1.0,
+                    sh: 1.0,
+                    dx: 0.0,
+                    dy: 0.0,
+                    dw: 1.0,
+                    dh: 1.0,
+                })
+                .collect(),
+        };
+        assert!(
+            fold_draw_image_run(&mut tail, draw(7, 0.0)).is_some(),
+            "the fold must respect the same cap the JS-facing op enforces"
+        );
+    }
+
+    /// The union of the folded batch's damage must equal the union of the
+    /// individual draws' damage, or partial present would under-repair.
+    #[test]
+    fn folding_preserves_every_destination_rect() {
+        let mut tail = draw(7, 0.0);
+        fold_draw_image_run(&mut tail, draw(7, 100.0));
+        fold_draw_image_run(&mut tail, draw(7, -50.0));
+
+        let Canvas2DCmd::DrawImageBatch { draws } = &tail else {
+            panic!("expected batch");
+        };
+        let left = draws.iter().map(|d| d.dx).fold(f32::MAX, f32::min);
+        let right = draws.iter().map(|d| d.dx + d.dw).fold(f32::MIN, f32::max);
+        assert_eq!((left, right), (-50.0, 116.0));
     }
 }

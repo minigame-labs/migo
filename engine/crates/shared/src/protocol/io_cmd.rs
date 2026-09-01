@@ -176,8 +176,91 @@ pub struct CompressedImage {
     pub height: u32,
     /// Vulkan format code from the KTX2 header (e.g. 147=ETC2_RGB).
     pub vk_format: u32,
-    /// Raw compressed block data for level 0.
+    /// Every mip level's block data, concatenated base level first.
+    ///
+    /// One allocation rather than one per level: the levels are uploaded in
+    /// order and never individually replaced, so splitting them into separate
+    /// buffers would cost allocations and cache locality for nothing. Use
+    /// [`CompressedImage::levels`] to read them back.
     pub data: Arc<Vec<u8>>,
+    /// Byte length of each level within `data`, base level first.
+    ///
+    /// Never empty, and always sums to `data.len()` -- [`CompressedImage::new`]
+    /// is the only way to build one, so the two cannot disagree.
+    level_lengths: Vec<u32>,
+}
+
+impl CompressedImage {
+    /// Build from the levels of a mip chain, base level first.
+    ///
+    /// Returns `None` for an empty chain or one whose total size does not fit
+    /// the counters -- a texture with no base level is not a texture.
+    pub fn new(width: u32, height: u32, vk_format: u32, levels: &[&[u8]]) -> Option<Self> {
+        if levels.is_empty() {
+            return None;
+        }
+        let mut level_lengths = Vec::with_capacity(levels.len());
+        let mut data = Vec::with_capacity(levels.iter().map(|l| l.len()).sum());
+        for level in levels {
+            level_lengths.push(u32::try_from(level.len()).ok()?);
+            data.extend_from_slice(level);
+        }
+        Some(Self {
+            width,
+            height,
+            vk_format,
+            data: Arc::new(data),
+            level_lengths,
+        })
+    }
+
+    /// Rebuild from bytes that were already concatenated, e.g. by a cache.
+    ///
+    /// Returns `None` unless the lengths account for exactly `data`, which is
+    /// what stops a corrupted cache entry from producing levels that overlap or
+    /// run past the buffer.
+    pub fn from_concatenated(
+        width: u32,
+        height: u32,
+        vk_format: u32,
+        data: Arc<Vec<u8>>,
+        level_lengths: Vec<u32>,
+    ) -> Option<Self> {
+        if level_lengths.is_empty() || level_lengths.contains(&0) {
+            return None;
+        }
+        let total: u64 = level_lengths.iter().map(|&len| u64::from(len)).sum();
+        if total != data.len() as u64 {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            vk_format,
+            data,
+            level_lengths,
+        })
+    }
+
+    /// The mip levels, base level first.
+    pub fn levels(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        let mut offset = 0usize;
+        self.level_lengths.iter().map(move |&len| {
+            let start = offset;
+            offset += len as usize;
+            &self.data[start..offset]
+        })
+    }
+
+    /// How many mip levels this image carries. Always at least 1.
+    pub fn level_count(&self) -> usize {
+        self.level_lengths.len()
+    }
+
+    /// The per-level byte lengths, base level first.
+    pub fn level_lengths(&self) -> &[u32] {
+        &self.level_lengths
+    }
 }
 
 /// Decoded image — one of three on-device representations:
@@ -366,13 +449,53 @@ mod tests {
     }
 
     #[test]
+    fn levels_round_trip_what_they_were_built_from() {
+        let l0 = vec![0xA0; 32];
+        let l1 = vec![0xA1; 8];
+        let l2 = vec![0xA2; 8];
+        let img = CompressedImage::new(8, 8, 147, &[&l0[..], &l1[..], &l2[..]])
+            .expect("a three-level chain");
+
+        assert_eq!(img.level_count(), 3);
+        let levels: Vec<&[u8]> = img.levels().collect();
+        assert_eq!(levels, vec![&l0[..], &l1[..], &l2[..]]);
+        assert_eq!(img.data.len(), 48, "levels share one allocation");
+    }
+
+    #[test]
+    fn a_single_level_image_reports_one_level() {
+        let l0 = vec![0xB0; 16];
+        let img = CompressedImage::new(4, 4, 147, &[&l0[..]]).expect("one level");
+
+        assert_eq!(img.level_count(), 1);
+        assert_eq!(img.levels().next().unwrap(), &l0[..]);
+    }
+
+    #[test]
+    fn an_empty_chain_is_not_an_image() {
+        assert!(CompressedImage::new(4, 4, 147, &[]).is_none());
+    }
+
+    #[test]
+    fn concatenated_bytes_must_match_the_declared_lengths() {
+        let bytes = std::sync::Arc::new(vec![0u8; 40]);
+        // A cache entry whose lengths do not account for its payload would
+        // otherwise yield levels that overlap or run past the buffer.
+        assert!(
+            CompressedImage::from_concatenated(8, 8, 147, bytes.clone(), vec![32, 16]).is_none()
+        );
+        assert!(CompressedImage::from_concatenated(8, 8, 147, bytes.clone(), vec![]).is_none());
+        assert!(
+            CompressedImage::from_concatenated(8, 8, 147, bytes.clone(), vec![32, 0, 8]).is_none()
+        );
+        assert!(CompressedImage::from_concatenated(8, 8, 147, bytes, vec![32, 8]).is_some());
+    }
+
+    #[test]
     fn into_rgba_rejects_compressed() {
-        let img = DecodedImage::Compressed(CompressedImage {
-            width: 4,
-            height: 4,
-            vk_format: 147,
-            data: std::sync::Arc::new(vec![0u8; 32]),
-        });
+        let img = DecodedImage::Compressed(
+            CompressedImage::new(4, 4, 147, &[&[0u8; 32][..]]).expect("one level"),
+        );
         let err = img.into_rgba().expect_err("compressed cannot downgrade");
         assert_eq!(err.code, crate::error::ErrorCode::Unsupported);
     }

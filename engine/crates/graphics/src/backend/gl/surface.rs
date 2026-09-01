@@ -794,21 +794,81 @@ impl Canvas2DContext {
                 // trying to skip in the cache-hit case.
                 let state_snapshot = renderer.state.clone();
                 let paint = renderer.acquire_image_paint(|| build_image_paint(&state_snapshot));
+                let use_atlas = renderer.draw_atlas;
                 let canvas = surface.canvas();
                 let mut any = false;
-                for d in draws {
-                    if let Some(img) =
-                        image_store.resolve_cached_or_wrap(ctx_tag, gr_ctx, d.image_id)
-                    {
-                        let src = SkRect::from_xywh(d.sx, d.sy, d.sw, d.sh);
-                        let dst = SkRect::from_xywh(d.dx, d.dy, d.dw, d.dh);
-                        canvas.draw_image_rect(
-                            &img,
-                            Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
-                            dst,
-                            &paint,
-                        );
-                        any = true;
+
+                // One `drawAtlas` per consecutive same-image, uniformly scaled
+                // run; everything else keeps going through `drawImageRect`.
+                // `partition` never reorders, so the alpha-blend order the
+                // content issued is the order these are submitted in.
+                let runs = if use_atlas {
+                    crate::draw_atlas::partition(draws, 2)
+                } else {
+                    vec![crate::draw_atlas::BatchRun::Individual {
+                        start: 0,
+                        end: draws.len(),
+                    }]
+                };
+
+                for run in runs {
+                    let (start, end) = run.range();
+                    match run {
+                        crate::draw_atlas::BatchRun::Atlas { .. } => {
+                            // Every entry in the run shares one image, so one
+                            // resolve serves all of them.
+                            let Some(img) = image_store.resolve_cached_or_wrap(
+                                ctx_tag,
+                                gr_ctx,
+                                draws[start].image_id,
+                            ) else {
+                                continue;
+                            };
+                            let mut xforms = Vec::with_capacity(end - start);
+                            let mut tex = Vec::with_capacity(end - start);
+                            for d in &draws[start..end] {
+                                let scale = crate::draw_atlas::uniform_scale(d);
+                                // RSXform places the source rect's origin at
+                                // (tx, ty) scaled by `scale` with no rotation,
+                                // which is exactly a uniform sprite blit.
+                                xforms.push(skia_safe::RSXform::new(scale, 0.0, (d.dx, d.dy)));
+                                tex.push(SkRect::from_xywh(d.sx, d.sy, d.sw, d.sh));
+                            }
+                            if !renderer.draw_atlas_reported.replace(true) {
+                                tracing::info!(
+                                    sprites = end - start,
+                                    "Canvas2D drawAtlas path active"
+                                );
+                            }
+                            canvas.draw_atlas(
+                                &img,
+                                &xforms,
+                                &tex,
+                                None,
+                                skia_safe::BlendMode::SrcOver,
+                                skia_safe::SamplingOptions::default(),
+                                None,
+                                &paint,
+                            );
+                            any = true;
+                        }
+                        crate::draw_atlas::BatchRun::Individual { .. } => {
+                            for d in &draws[start..end] {
+                                if let Some(img) =
+                                    image_store.resolve_cached_or_wrap(ctx_tag, gr_ctx, d.image_id)
+                                {
+                                    let src = SkRect::from_xywh(d.sx, d.sy, d.sw, d.sh);
+                                    let dst = SkRect::from_xywh(d.dx, d.dy, d.dw, d.dh);
+                                    canvas.draw_image_rect(
+                                        &img,
+                                        Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
+                                        dst,
+                                        &paint,
+                                    );
+                                    any = true;
+                                }
+                            }
+                        }
                     }
                 }
                 FastPathOutcome::Handled(any)

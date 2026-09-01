@@ -146,6 +146,19 @@ jobs:
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
 
+      # Source-only, so it runs here rather than in the NDK job: everything it
+      # reads is a Rust file. It guards a value that no host test can reach --
+      # `platform/src/android/**` compiles only on Android -- plus the two ways
+      # the host-testable core it delegates to could stop being exercised.
+      - name: Android frame-rate compatibility contract
+        run: bash scripts/test-android-frame-rate-contract.sh
+
+      # Three numbers nothing checked: `compileSdk`/`targetSdk` sat at 34 while
+      # Play began requiring 36, and `minSdk` is a device-reach decision that
+      # must not drift in either direction to make a target bump compile.
+      - name: Android SDK levels contract
+        run: bash scripts/test-android-sdk-levels-contract.sh
+
       - name: Release asset ordering contract
         run: bash scripts/test-release-asset-ordering-contract.sh
 
@@ -698,6 +711,14 @@ jobs:
       # API-26 stub libraries; see scripts/test-android-symbol-floor.sh.
       - name: Android minimum-API symbol floor
         run: bash scripts/test-android-symbol-floor.sh
+
+      # Android 15 brought 16 KB memory pages and Android 16 requires targeting
+      # apps to have 16 KB-aligned native libraries to install on such a device.
+      # Migo's own libraries already are -- but nothing said so, and the pinned
+      # NDK's `libc++_shared.so` is 4 KB-aligned, so the day a build starts
+      # needing it the package would fail to install on hardware we do not own.
+      - name: Android 16 KB page alignment
+        run: bash scripts/test-android-so-page-alignment.sh
 
       # An SDK that ships a runtime library picks that library's version for its
       # host, and the published v0.9.3 AAR shipped ~2 MB of `libc++_shared.so`

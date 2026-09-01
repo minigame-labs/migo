@@ -515,6 +515,11 @@ pub(crate) struct CanvasManager {
 
     // GL object registries
     pub(crate) programs: HashMap<ProgramId, ProgramMeta>,
+    /// Programs whose `glLinkProgram` has been issued but whose `LINK_STATUS`
+    /// has not been read. Insertion-ordered so a drain reads them in the order
+    /// the content linked them, which is also the order the driver is most
+    /// likely to have finished them in.
+    pub(crate) pending_links: Vec<ProgramId>,
     pub(crate) shaders: HashMap<ShaderId, ShaderMeta>,
     pub(crate) buffers: HashMap<BufferId, BufferMeta>,
     pub(crate) textures: HashMap<TextureId, TextureMeta>,
@@ -668,6 +673,23 @@ pub(crate) struct CanvasManager {
     egl_set_damage_region_fn: Option<
         unsafe extern "C" fn(egl::Display, egl::Surface, *const egl::Int, egl::Int) -> egl::Boolean,
     >,
+
+    /// `eglSwapBuffersWithDamageKHR`/`EXT` function pointer, or `None` when
+    /// neither extension is present. This is the *other* half of partial
+    /// presentation: `eglSetDamageRegionKHR` above tells the driver which tiles
+    /// to load, this tells the compositor which region it has to recomposite.
+    /// Having only the first is half the chain, which is what this engine
+    /// shipped until now.
+    #[allow(improper_ctypes_definitions)]
+    egl_swap_buffers_with_damage_fn: Option<
+        unsafe extern "C" fn(egl::Display, egl::Surface, *const egl::Int, egl::Int) -> egl::Boolean,
+    >,
+
+    /// Set once a driver rejects a swap-with-damage call. The plain swap is
+    /// always a correct substitute, and a driver that refused once will refuse
+    /// again, so the retry is not worth a syscall per frame for the rest of the
+    /// session.
+    swap_with_damage_rejected: bool,
 
     /// Unified per-frame damage accumulator for mixed Canvas2D + WebGL frames.
     /// Fed by Canvas2D batches, GL draw/clear, and readback paths.
@@ -895,6 +917,40 @@ impl CanvasManager {
             tracing::info!("EGL_KHR_partial_update available");
         }
 
+        // Surface damage: the compositor-facing half. KHR and EXT are the same
+        // entry point under two names and drivers ship one or the other, so both
+        // are probed rather than assuming the newer one.
+        let egl_swap_buffers_with_damage_fn = [
+            (
+                "EGL_KHR_swap_buffers_with_damage",
+                "eglSwapBuffersWithDamageKHR",
+            ),
+            (
+                "EGL_EXT_swap_buffers_with_damage",
+                "eglSwapBuffersWithDamageEXT",
+            ),
+        ]
+        .iter()
+        .find_map(|(extension, symbol)| {
+            if !egl_extensions.contains(extension) {
+                return None;
+            }
+            egl.get_proc_address(symbol).map(|ptr| {
+                tracing::info!("{} available", extension);
+                unsafe {
+                    std::mem::transmute::<
+                        extern "system" fn(),
+                        unsafe extern "C" fn(
+                            egl::Display,
+                            egl::Surface,
+                            *const egl::Int,
+                            egl::Int,
+                        ) -> egl::Boolean,
+                    >(ptr)
+                }
+            })
+        });
+
         // Query the selected EGL config's multisample state once. The partial
         // DrawingBuffer→surface blit uses identity source/dest coordinates,
         // which is only valid for a single-sample destination; a multisampled
@@ -983,6 +1039,7 @@ impl CanvasManager {
             teardown_complete: false,
             native_release_confirmed: false,
             programs: HashMap::with_capacity(16),
+            pending_links: Vec::new(),
             shaders: HashMap::with_capacity(32),
             buffers: HashMap::with_capacity(32),
             textures: HashMap::with_capacity(64),
@@ -1014,6 +1071,8 @@ impl CanvasManager {
             deferred_uploads: std::collections::VecDeque::new(),
             cancelled_uploads: HashSet::new(),
             egl_set_damage_region_fn,
+            egl_swap_buffers_with_damage_fn,
+            swap_with_damage_rejected: false,
             damage: crate::damage_effect::FrameDamageAccumulator::new(),
             pending_present_plan: None,
             damage_history: crate::present_damage::PresentDamageHistory::new(),
@@ -1102,6 +1161,32 @@ impl CanvasManager {
         self.evaluate_bypass();
 
         Ok(())
+    }
+
+    /// Record that a program's link was issued and its status not yet read.
+    ///
+    /// Idempotent: a program re-linked before its previous link was drained is
+    /// still exactly one pending entry, and the status read that eventually
+    /// happens describes the most recent link -- which is the only one whose
+    /// binary is still installed.
+    pub(crate) fn mark_link_pending(&mut self, program_id: ProgramId) {
+        if let Some(meta) = self.programs.get_mut(&program_id) {
+            if !meta.link_pending {
+                meta.link_pending = true;
+                self.pending_links.push(program_id);
+            }
+        }
+    }
+
+    /// Drop a program from the pending queue without reading its status.
+    ///
+    /// Used when the program is deleted: the handle is gone, so there is
+    /// nothing to query and nothing worth caching.
+    pub(crate) fn forget_pending_link(&mut self, program_id: ProgramId) {
+        if let Some(meta) = self.programs.get_mut(&program_id) {
+            meta.link_pending = false;
+        }
+        self.pending_links.retain(|id| *id != program_id);
     }
 
     /// Force the next `create_onscreen()` to fully recreate the onscreen EGL
@@ -3785,6 +3870,61 @@ impl CanvasManager {
         ret == egl::TRUE
     }
 
+    /// Present with surface damage when the driver offers it.
+    ///
+    /// Returns `true` only when the frame was actually presented by
+    /// `eglSwapBuffersWithDamage`; every other path returns `false` so the
+    /// caller performs an ordinary `eglSwapBuffers`. A rejection is permanent
+    /// for the session: the plain swap is always a correct substitute, and a
+    /// driver that refused once will refuse again.
+    ///
+    /// Which frames qualify is decided by
+    /// [`crate::present_damage::surface_damage_to_submit`], which host tests
+    /// cover; what is left here is the EGL call itself.
+    fn try_swap_with_damage(
+        &mut self,
+        surf: egl::Surface,
+        plan: &crate::present_damage::PresentDamagePlan,
+    ) -> bool {
+        let Some(rects) = crate::present_damage::surface_damage_to_submit(
+            plan,
+            self.egl_swap_buffers_with_damage_fn.is_some(),
+            self.swap_with_damage_rejected,
+        ) else {
+            return false;
+        };
+        let Some(swap_with_damage) = self.egl_swap_buffers_with_damage_fn else {
+            return false;
+        };
+
+        // 4 rects * 4 ints, matching the declaration path's bound: stack only.
+        let mut flat: [egl::Int; 16] = [0; 16];
+        let n = rects.len().min(4);
+        for (i, r) in rects.iter().take(n).enumerate() {
+            let (x, y, width, height) = r.xywh();
+            flat[i * 4] = x;
+            flat[i * 4 + 1] = y;
+            flat[i * 4 + 2] = width;
+            flat[i * 4 + 3] = height;
+        }
+
+        let ok = unsafe { swap_with_damage(self.display, surf, flat.as_ptr(), n as egl::Int) };
+        if ok == egl::TRUE {
+            return true;
+        }
+
+        // EGL_FALSE means the swap did not happen, so the caller still has to
+        // present this frame -- it falls through to the plain swap, which also
+        // re-surfaces a context/surface loss through the normal classification.
+        self.swap_with_damage_rejected = true;
+        tracing::warn!(
+            "eglSwapBuffersWithDamage rejected {} rect(s); falling back to eglSwapBuffers for \
+             the rest of the session",
+            n
+        );
+        false
+    }
+
     /// Damage-region declaration point.
     ///
     /// Builds and caches the frame's [`PresentDamagePlan`], declaring the exact
@@ -3879,26 +4019,35 @@ impl CanvasManager {
         let Some(entry_surf) = entry.ctx.surf else {
             return Ok(ResolvedDamage::FullSurface);
         };
-        let swap = self
-            .egl
-            .swap_buffers(self.display, entry_surf)
-            .map_err(|e| {
-                match classify_egl_swap_failure(e) {
-                    EglSwapFailureClass::ContextLost => {
-                        tracing::warn!("EGL context lost detected during swap_buffers");
-                        self.context_lost = true;
-                    }
-                    EglSwapFailureClass::SurfaceLost => {
-                        tracing::warn!(?e, "EGL native Surface became unavailable during swap");
-                        self.surface_unavailable = true;
-                    }
-                    EglSwapFailureClass::Other => {}
+        // Surface damage first: tell the compositor what actually changed since
+        // the frame it last showed, so it can leave the rest of the screen
+        // composited as-is. `swap_damage_region` is the named choice of which
+        // of the plan's two regions that is -- submitting `repair` here would
+        // look identical on screen and quietly give the saving back.
+        let swapped_with_damage = self.try_swap_with_damage(entry_surf, &plan);
+
+        let swap = if swapped_with_damage {
+            Ok(())
+        } else {
+            self.egl.swap_buffers(self.display, entry_surf)
+        }
+        .map_err(|e| {
+            match classify_egl_swap_failure(e) {
+                EglSwapFailureClass::ContextLost => {
+                    tracing::warn!("EGL context lost detected during swap_buffers");
+                    self.context_lost = true;
                 }
-                ee(
-                    ErrorCode::RenderBackendError,
-                    format!("eglSwapBuffers failed: {e:?}"),
-                )
-            });
+                EglSwapFailureClass::SurfaceLost => {
+                    tracing::warn!(?e, "EGL native Surface became unavailable during swap");
+                    self.surface_unavailable = true;
+                }
+                EglSwapFailureClass::Other => {}
+            }
+            ee(
+                ErrorCode::RenderBackendError,
+                format!("eglSwapBuffers failed: {e:?}"),
+            )
+        });
 
         let commit = commit_present_outcome(
             &mut self.damage,
@@ -5510,19 +5659,26 @@ impl CanvasManager {
                 .with_detail(format!("GPU does not support {}", format.label())));
         }
 
-        // Reject a malformed KTX2 whose level-0 byte length doesn't match its
+        // Reject a malformed KTX2 whose level byte lengths don't match its
         // declared dimensions before the driver would fail the upload with
         // GL_INVALID_VALUE (glCompressedTexImage2D requires an exact size).
-        let expected = format.expected_level0_bytes(compressed.width, compressed.height);
-        if compressed.data.len() as u64 != expected {
+        // Checked over the whole chain: one that fails partway through uploading
+        // leaves a texture that samples garbage rather than reporting an error.
+        let levels: Vec<&[u8]> = compressed.levels().collect();
+        if let Err(reason) = crate::compressed_upload::validate_mip_chain(
+            format,
+            compressed.width,
+            compressed.height,
+            &levels,
+        ) {
             return Err(
                 EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
-                    "compressed KTX2 level0 is {} bytes but {} {}x{} requires {} bytes",
-                    compressed.data.len(),
+                    "compressed KTX2 {} {}x{} with {} level(s): {}",
                     format.label(),
                     compressed.width,
                     compressed.height,
-                    expected
+                    levels.len(),
+                    reason
                 )),
             );
         }
@@ -5532,7 +5688,7 @@ impl CanvasManager {
             format,
             compressed.width,
             compressed.height,
-            &compressed.data,
+            &levels,
             self.device_caps.has_pbo,
         )
         .ok_or_else(|| {

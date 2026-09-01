@@ -107,7 +107,10 @@ def migoReleaseVersion() {
 
 android {
     namespace 'com.migo.runtime'
-    compileSdk 34
+    // Compile against the same level we target: compiling against an older SDK
+    // hides the very behaviour changes `targetSdk` opts into, so the two move
+    // together. `minSdk` does not -- see below.
+    compileSdk 36
 
     // Output AAR file name
     project.archivesBaseName = "migo"
@@ -119,7 +122,13 @@ android {
         // mismatches between Skia and the Rust runtime.  <1.5% of Play
         // Store devices remain below API 26 as of April 2026.
         minSdk 26
-        targetSdk 34
+        // Google Play has required API 36 for new apps and updates since
+        // 2026-08-31 (an extension to 2026-11-01 could be requested). Migo ships
+        // as an AAR, so the host app's own `targetSdk` decides its eligibility --
+        // but the library has to be built and verified against 36 for a host to
+        // be able to move, and the behaviour audit lives with the library.
+        // Raising this does NOT raise `minSdk`: see scripts/test-android-sdk-levels-contract.sh.
+        targetSdk 36
         versionCode 1
         // Read from the repository's single release-version source rather than
         // restated here. This value reaches an embedder through BuildInfo.VERSION,

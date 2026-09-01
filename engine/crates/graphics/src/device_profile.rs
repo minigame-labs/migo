@@ -50,6 +50,7 @@ mod tests {
     #[test]
     fn api23_tier_b_device_uses_conservative_profile() {
         let caps = DeviceCapabilities {
+            has_parallel_shader_compile: false,
             gles_version: (2, 0),
             has_pbo: false,
             has_fence_sync: false,
@@ -72,6 +73,7 @@ mod tests {
     #[test]
     fn api24_tier_a_device_uses_aggressive_profile() {
         let caps = DeviceCapabilities {
+            has_parallel_shader_compile: false,
             gles_version: (3, 0),
             has_pbo: true,
             has_fence_sync: true,
@@ -97,6 +99,7 @@ mod tests {
     #[test]
     fn from_caps_uses_detected_tier_when_caller_input_disagrees() {
         let caps = DeviceCapabilities {
+            has_parallel_shader_compile: false,
             gles_version: (2, 0),
             has_pbo: false,
             has_fence_sync: false,

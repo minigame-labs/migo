@@ -1,7 +1,7 @@
 //! Zero-copy KTX2 container parser for compressed GPU textures.
 //!
-//! Parses the KTX2 fixed-size header and extracts the level 0 (base mip)
-//! compressed texture data pointer without any allocation or copy.
+//! Parses the KTX2 fixed-size header and the level index, and hands out a
+//! borrowed slice per mip level without copying any texture data.
 //!
 //! Only ETC2 and ASTC formats are recognized; everything else maps to
 //! `VkFormat::Unknown(code)`.
@@ -52,12 +52,41 @@ pub struct Ktx2Header {
     pub mip_levels: u32,
 }
 
-/// A parsed KTX2 file with a borrowed slice to the level 0 compressed data.
+/// A parsed KTX2 file with borrowed slices to the compressed level data.
+///
+/// Every level in the index is validated by [`parse_ktx2`] before this exists,
+/// so [`Ktx2File::levels`] cannot fail and cannot hand out bytes that lie
+/// outside the buffer or inside another level.
 #[derive(Debug)]
 pub struct Ktx2File<'a> {
     pub header: Ktx2Header,
     /// Compressed texture data for mip level 0.
+    ///
+    /// Kept as a field because the base level is what a caller that does not do
+    /// mipmapping wants, and because it predates [`Ktx2File::levels`].
     pub data: &'a [u8],
+    /// The whole container, so the level index can be read on demand rather
+    /// than copied into an owned list of slices at parse time.
+    file: &'a [u8],
+}
+
+impl<'a> Ktx2File<'a> {
+    /// The mip levels, base level first.
+    ///
+    /// The KTX2 level index is ordered by level, but the level *data* is
+    /// conventionally stored smallest-level-first so a reader can stream the
+    /// small levels before the large ones. Offsets therefore descend while
+    /// levels ascend, and nothing here may assume otherwise.
+    pub fn levels(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
+        let file = self.file;
+        (0..self.header.mip_levels as usize).map(move |level| {
+            let entry = HEADER_SIZE + level * LEVEL_INDEX_ENTRY_SIZE;
+            // Both reads were bounds-checked against `file` during parsing.
+            let offset = read_u64(file, entry) as usize;
+            let length = read_u64(file, entry + 8) as usize;
+            &file[offset..offset + length]
+        })
+    }
 }
 
 /// KTX2 header layout (offsets from the spec, all little-endian):
@@ -116,11 +145,14 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
     ])
 }
 
-/// Parse a KTX2 container, returning the header and a borrowed slice to the
-/// level 0 compressed data.
+/// Parse a KTX2 container, returning the header and borrowed slices to the
+/// compressed level data.
 ///
-/// Only the base mip level (level 0) is extracted. Supercompression is not
-/// supported -- the data must be stored uncompressed in the container.
+/// Every declared level is validated here, not lazily at upload time. A chain
+/// that is checked level by level while uploading can fail halfway, leaving a
+/// texture with some levels populated and the rest undefined -- which samples as
+/// garbage rather than as an error. Supercompression is not supported: the data
+/// must be stored uncompressed in the container.
 ///
 /// # Errors
 ///
@@ -128,7 +160,9 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
 /// - The magic bytes do not match.
 /// - The file is truncated.
 /// - Supercompression is used (we only handle `None` = 0).
-/// - The level 0 data range falls outside the input buffer.
+/// - The level count exceeds the mip chain the dimensions can have.
+/// - Any level is empty, runs past the buffer, overlaps the header or level
+///   index, or overlaps another level.
 pub fn parse_ktx2(data: &[u8]) -> Result<Ktx2File<'_>, &'static str> {
     // Check magic bytes.
     if data.len() < HEADER_SIZE {
@@ -153,11 +187,11 @@ pub fn parse_ktx2(data: &[u8]) -> Result<Ktx2File<'_>, &'static str> {
         return Err("ktx2: supercompression not supported");
     }
 
-    // Level count 0 means "auto full mip chain" per spec, but we only need
-    // level 0 so treat it as at least 1.
+    // Level count 0 means "auto full mip chain" per spec; a file that declares
+    // it carries one stored level and expects the loader to generate the rest.
     let actual_levels = if level_count == 0 { 1 } else { level_count };
 
-    // Verify that the level index for level 0 fits in the buffer. `level_count`
+    // Verify that the whole level index fits in the buffer. `level_count`
     // is attacker-controlled, so the index span is computed with checked
     // arithmetic: a wrapped product would produce a small `level_index_end`
     // that passes the length check below while describing a span that isn't
@@ -171,33 +205,59 @@ pub fn parse_ktx2(data: &[u8]) -> Result<Ktx2File<'_>, &'static str> {
         return Err("ktx2: file too short for level index");
     }
 
-    // Level 0 entry is the first in the level index. Compare in `u64` before
-    // narrowing: on a 32-bit target `as usize` would truncate a large offset
-    // into a small in-bounds one.
-    let level0_offset = read_u64(data, level_index_start);
-    let level0_length = read_u64(data, level_index_start + 8);
-
-    if level0_length == 0 {
-        return Err("ktx2: level 0 has zero length");
+    // A 2D image of these dimensions cannot have more levels than its longest
+    // side has halvings; rejecting a larger count is the spec's own rule. It
+    // runs after the two structural checks above rather than before them so
+    // that each guard still has inputs only it rejects: a huge `level_count`
+    // is caught as an index that does not fit, which is the more precise thing
+    // to say about it, and the overflow guard stays reachable.
+    let max_levels = u32::BITS - width.max(height).leading_zeros();
+    if actual_levels > max_levels {
+        return Err("ktx2: level count exceeds the mip chain for these dimensions");
     }
 
-    let level0_end = level0_offset
-        .checked_add(level0_length)
-        .ok_or("ktx2: level 0 range overflow")?;
+    // Validate every level. All comparisons happen in `u64` before narrowing:
+    // on a 32-bit target `as usize` would truncate a large offset into a small
+    // in-bounds one.
+    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(actual_levels as usize);
+    for level in 0..actual_levels as usize {
+        let entry = level_index_start + level * LEVEL_INDEX_ENTRY_SIZE;
+        let offset = read_u64(data, entry);
+        let length = read_u64(data, entry + 8);
 
-    if level0_end > data.len() as u64 {
-        return Err("ktx2: level 0 data out of bounds");
+        if length == 0 {
+            return Err("ktx2: level has zero length");
+        }
+
+        let end = offset
+            .checked_add(length)
+            .ok_or("ktx2: level range overflow")?;
+
+        if end > data.len() as u64 {
+            return Err("ktx2: level data out of bounds");
+        }
+
+        // Payload must start after the level index. Without this a crafted file
+        // can point a level at the header or at the index itself, and those
+        // bytes would be handed to the GPU as texture data.
+        if offset < level_index_end as u64 {
+            return Err("ktx2: level data overlaps the header or level index");
+        }
+
+        // Two levels sharing bytes is not a mip chain. It is cheap to check
+        // here and impossible to notice on a GPU, where the result is a texture
+        // whose lower levels are a re-reading of the higher ones.
+        if ranges
+            .iter()
+            .any(|&(other_start, other_end)| offset < other_end && other_start < end)
+        {
+            return Err("ktx2: levels overlap");
+        }
+
+        ranges.push((offset, end));
     }
 
-    // Payload must start after the level index. Without this a crafted file
-    // can point level 0 at the header or at the index itself, and those bytes
-    // would be handed to the GPU as texture data.
-    if level0_offset < level_index_end as u64 {
-        return Err("ktx2: level 0 data overlaps the header or level index");
-    }
-
-    let level0_offset = level0_offset as usize;
-    let level0_end = level0_end as usize;
+    let (level0_offset, level0_end) = ranges[0];
 
     Ok(Ktx2File {
         header: Ktx2Header {
@@ -206,7 +266,8 @@ pub fn parse_ktx2(data: &[u8]) -> Result<Ktx2File<'_>, &'static str> {
             height,
             mip_levels: actual_levels,
         },
-        data: &data[level0_offset..level0_end],
+        data: &data[level0_offset as usize..level0_end as usize],
+        file: data,
     })
 }
 
@@ -227,7 +288,73 @@ pub fn is_ktx2(data: &[u8]) -> bool {
 /// Emits exactly what the parser needs and nothing else: no DFD, no key/value
 /// data, no supercompression global data. Those sections are optional in the
 /// spec, and every consumer in this engine reads only the header, the level
-/// index and the level 0 bytes.
+/// index and the level bytes. It writes a single level: nothing in this engine
+/// generates a mip chain at ingest yet, while `parse_ktx2` has to read the
+/// chains that authored assets arrive with.
+/// Write a non-supercompressed KTX2 container around a whole mip chain.
+///
+/// Levels are given base-first. They are *stored* smallest-first, which is the
+/// layout the spec's mip streaming assumes and what other KTX2 writers emit --
+/// a reader that wants only the small levels then gets them without seeking
+/// past the large one. The level index stays in level order regardless, so the
+/// storage order is invisible to anything but a byte-level diff.
+///
+/// Returns `None` for an empty chain or one longer than the dimensions allow;
+/// both would produce a container [`parse_ktx2`] refuses, and failing here is
+/// how the writer stays the parser's inverse rather than a separate opinion
+/// about what a valid file is.
+pub fn write_ktx2_levels(
+    vk_format: u32,
+    width: u32,
+    height: u32,
+    levels: &[&[u8]],
+) -> Option<Vec<u8>> {
+    if levels.is_empty() || width == 0 || height == 0 {
+        return None;
+    }
+    let max_levels = u32::BITS - width.max(height).leading_zeros();
+    if levels.len() as u64 > u64::from(max_levels) {
+        return None;
+    }
+    if levels.iter().any(|level| level.is_empty()) {
+        return None;
+    }
+
+    let index_size = levels.len() * LEVEL_INDEX_ENTRY_SIZE;
+    let mut buf = vec![0u8; HEADER_SIZE + index_size];
+
+    buf[..12].copy_from_slice(&KTX2_MAGIC);
+    buf[12..16].copy_from_slice(&vk_format.to_le_bytes());
+    // typeSize is 1 for every block-compressed format.
+    buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+    buf[20..24].copy_from_slice(&width.to_le_bytes());
+    buf[24..28].copy_from_slice(&height.to_le_bytes());
+    // pixelDepth 0 = 2D, layerCount 0 = non-array, faceCount 1 = not a cubemap.
+    buf[28..32].copy_from_slice(&0u32.to_le_bytes());
+    buf[32..36].copy_from_slice(&0u32.to_le_bytes());
+    buf[36..40].copy_from_slice(&1u32.to_le_bytes());
+    buf[40..44].copy_from_slice(&(levels.len() as u32).to_le_bytes());
+    // supercompressionScheme 0 = none; the parser rejects anything else.
+    buf[44..48].copy_from_slice(&0u32.to_le_bytes());
+
+    // The dfd/kvd/sgd index entries stay zero: those sections are absent.
+
+    let mut placed = vec![(0u64, 0u64); levels.len()];
+    for level in (0..levels.len()).rev() {
+        let offset = buf.len() as u64;
+        buf.extend_from_slice(levels[level]);
+        placed[level] = (offset, levels[level].len() as u64);
+    }
+    for (level, (offset, length)) in placed.iter().enumerate() {
+        let entry = HEADER_SIZE + level * LEVEL_INDEX_ENTRY_SIZE;
+        buf[entry..entry + 8].copy_from_slice(&offset.to_le_bytes());
+        buf[entry + 8..entry + 16].copy_from_slice(&length.to_le_bytes());
+        // uncompressedByteLength equals byteLength when nothing is supercompressed.
+        buf[entry + 16..entry + 24].copy_from_slice(&length.to_le_bytes());
+    }
+    Some(buf)
+}
+
 pub fn write_ktx2(vk_format: u32, width: u32, height: u32, level0: &[u8]) -> Vec<u8> {
     let level0_offset = (HEADER_SIZE + LEVEL_INDEX_ENTRY_SIZE) as u64;
     let level0_length = level0.len() as u64;
@@ -262,6 +389,50 @@ pub fn write_ktx2(vk_format: u32, width: u32, height: u32, level0: &[u8]) -> Vec
 }
 
 #[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    #[test]
+    fn a_written_mip_chain_reads_back_level_for_level() {
+        let l0 = vec![0xA0u8; 128];
+        let l1 = vec![0xA1u8; 32];
+        let l2 = vec![0xA2u8; 8];
+        let container = write_ktx2_levels(147, 16, 16, &[&l0[..], &l1[..], &l2[..]])
+            .expect("a three-level chain is writable");
+
+        let parsed = parse_ktx2(&container).expect("the runtime parser accepts what we write");
+        assert_eq!(parsed.header.mip_levels, 3);
+        let levels: Vec<&[u8]> = parsed.levels().collect();
+        assert_eq!(levels, vec![&l0[..], &l1[..], &l2[..]]);
+        assert_eq!(parsed.data, &l0[..], "level 0 stays reachable as `data`");
+    }
+
+    #[test]
+    fn a_single_level_chain_matches_the_single_level_writer() {
+        let level0 = vec![0xC3u8; 64];
+        let via_chain = write_ktx2_levels(151, 8, 8, &[&level0[..]]).expect("writable");
+        let via_single = write_ktx2(151, 8, 8, &level0);
+        assert_eq!(
+            via_chain, via_single,
+            "one writer must not produce a different container from the other for \
+             the same input, or the two paths drift apart"
+        );
+    }
+
+    #[test]
+    fn an_empty_chain_is_refused() {
+        assert!(write_ktx2_levels(147, 8, 8, &[]).is_none());
+    }
+
+    #[test]
+    fn more_levels_than_the_dimensions_allow_are_refused() {
+        let l = vec![0u8; 8];
+        // 2x2 has exactly two levels.
+        assert!(write_ktx2_levels(147, 2, 2, &[&l[..], &l[..], &l[..]]).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -271,6 +442,132 @@ mod tests {
     /// layout rather than a second copy of it that could drift from it.
     fn make_test_ktx2(vk_format: u32, width: u32, height: u32, payload: &[u8]) -> Vec<u8> {
         write_ktx2(vk_format, width, height, payload)
+    }
+
+    /// Build a multi-level KTX2 buffer.
+    ///
+    /// `payloads[0]` is the base level. The level *index* is written in level
+    /// order, but the level *data* is stored smallest-level-first, which is what
+    /// real KTX2 writers emit and what the spec's mip-streaming layout is for.
+    /// Offsets in the index therefore descend, so an implementation that assumes
+    /// the index is ordered by offset fails these tests instead of passing them
+    /// by accident.
+    fn make_multi_level_ktx2(
+        vk_format: u32,
+        width: u32,
+        height: u32,
+        payloads: &[&[u8]],
+    ) -> Vec<u8> {
+        let level_count = payloads.len();
+        let index_size = level_count * LEVEL_INDEX_ENTRY_SIZE;
+        let data_start = HEADER_SIZE + index_size;
+
+        let mut buf = vec![0u8; data_start];
+        buf[..12].copy_from_slice(&KTX2_MAGIC);
+        buf[12..16].copy_from_slice(&vk_format.to_le_bytes());
+        buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+        buf[20..24].copy_from_slice(&width.to_le_bytes());
+        buf[24..28].copy_from_slice(&height.to_le_bytes());
+        buf[28..32].copy_from_slice(&0u32.to_le_bytes());
+        buf[32..36].copy_from_slice(&0u32.to_le_bytes());
+        buf[36..40].copy_from_slice(&1u32.to_le_bytes());
+        buf[40..44].copy_from_slice(&(level_count as u32).to_le_bytes());
+        buf[44..48].copy_from_slice(&0u32.to_le_bytes());
+
+        // Append data smallest level first, recording where each one landed.
+        let mut placed = vec![(0u64, 0u64); level_count];
+        for level in (0..level_count).rev() {
+            let offset = buf.len() as u64;
+            buf.extend_from_slice(payloads[level]);
+            placed[level] = (offset, payloads[level].len() as u64);
+        }
+
+        for (level, (offset, length)) in placed.iter().enumerate() {
+            let li = HEADER_SIZE + level * LEVEL_INDEX_ENTRY_SIZE;
+            buf[li..li + 8].copy_from_slice(&offset.to_le_bytes());
+            buf[li + 8..li + 16].copy_from_slice(&length.to_le_bytes());
+            buf[li + 16..li + 24].copy_from_slice(&length.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Overwrite one level index entry, to build the malformed cases.
+    fn patch_level(buf: &mut [u8], level: usize, offset: u64, length: u64) {
+        let li = HEADER_SIZE + level * LEVEL_INDEX_ENTRY_SIZE;
+        buf[li..li + 8].copy_from_slice(&offset.to_le_bytes());
+        buf[li + 8..li + 16].copy_from_slice(&length.to_le_bytes());
+        buf[li + 16..li + 24].copy_from_slice(&length.to_le_bytes());
+    }
+
+    #[test]
+    fn levels_yields_every_mip_in_level_order() {
+        let l0 = vec![0x10; 64];
+        let l1 = vec![0x11; 16];
+        let l2 = vec![0x12; 8];
+        let buf = make_multi_level_ktx2(147, 8, 8, &[&l0, &l1, &l2]);
+
+        let ktx2 = parse_ktx2(&buf).expect("should parse");
+        assert_eq!(ktx2.header.mip_levels, 3);
+
+        let levels: Vec<&[u8]> = ktx2.levels().collect();
+        assert_eq!(levels.len(), 3, "every declared level must be reachable");
+        assert_eq!(levels[0], &l0[..]);
+        assert_eq!(levels[1], &l1[..]);
+        assert_eq!(levels[2], &l2[..]);
+    }
+
+    #[test]
+    fn base_level_still_reachable_through_data_for_single_level_files() {
+        let payload = vec![0xCC; 32];
+        let buf = make_test_ktx2(147, 4, 4, &payload);
+
+        let ktx2 = parse_ktx2(&buf).expect("should parse");
+        assert_eq!(ktx2.data, &payload[..]);
+        assert_eq!(ktx2.levels().count(), 1);
+        assert_eq!(ktx2.levels().next().unwrap(), &payload[..]);
+    }
+
+    #[test]
+    fn rejects_a_level_whose_data_runs_past_the_end() {
+        let l0 = vec![0x10; 64];
+        let l1 = vec![0x11; 16];
+        let mut buf = make_multi_level_ktx2(147, 8, 8, &[&l0, &l1]);
+        let past_the_end = buf.len() as u64;
+        patch_level(&mut buf, 1, past_the_end - 4, 64);
+
+        assert!(
+            parse_ktx2(&buf).is_err(),
+            "a level extending past the buffer must not parse"
+        );
+    }
+
+    #[test]
+    fn rejects_levels_that_overlap() {
+        let l0 = vec![0x10; 64];
+        let l1 = vec![0x11; 16];
+        let buf_ok = make_multi_level_ktx2(147, 8, 8, &[&l0, &l1]);
+        let mut buf = buf_ok.clone();
+        // Point level 1 into the middle of level 0's bytes.
+        let l0_offset = u64::from_le_bytes(buf[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
+        patch_level(&mut buf, 1, l0_offset + 8, 16);
+
+        assert!(
+            parse_ktx2(&buf).is_err(),
+            "overlapping levels are not a mip chain and must not parse"
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_length_level() {
+        let l0 = vec![0x10; 64];
+        let l1 = vec![0x11; 16];
+        let mut buf = make_multi_level_ktx2(147, 8, 8, &[&l0, &l1]);
+        patch_level(&mut buf, 1, HEADER_SIZE as u64, 0);
+
+        assert!(
+            parse_ktx2(&buf).is_err(),
+            "a declared level with no bytes cannot be uploaded"
+        );
     }
 
     #[test]
@@ -357,7 +654,7 @@ mod tests {
 
         assert_eq!(
             parse_ktx2(&buf).unwrap_err(),
-            "ktx2: level 0 data overlaps the header or level index"
+            "ktx2: level data overlaps the header or level index"
         );
     }
 
@@ -372,7 +669,7 @@ mod tests {
 
         assert_eq!(
             parse_ktx2(&buf).unwrap_err(),
-            "ktx2: level 0 data overlaps the header or level index"
+            "ktx2: level data overlaps the header or level index"
         );
     }
 
@@ -401,7 +698,7 @@ mod tests {
 
         let err = parse_ktx2(&buf).unwrap_err();
         assert!(
-            err == "ktx2: level 0 range overflow" || err == "ktx2: level 0 data out of bounds",
+            err == "ktx2: level range overflow" || err == "ktx2: level data out of bounds",
             "unexpected error: {err}"
         );
     }

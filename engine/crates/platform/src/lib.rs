@@ -4,6 +4,10 @@ pub mod android;
 mod android_permission_gate;
 
 #[cfg(any(target_os = "android", test))]
+#[path = "android/frame_rate.rs"]
+mod android_frame_rate;
+
+#[cfg(any(target_os = "android", test))]
 mod host_owners;
 
 #[cfg(any(target_os = "android", test))]
