@@ -468,19 +468,36 @@ impl UnifiedFrameCollector {
         // `drawAtlas` run batching downstream never sees a run at all.
         // See `fold_draw_image_run` for why adjacency is the whole
         // precondition.
-        let cmd = match seg.commands.last_mut() {
-            Some(tail) => match shared::protocol::render_cmd::fold_draw_image_run(tail, cmd) {
-                Some(rejected) => rejected,
-                None => {
-                    self.pending_bytes = self.pending_bytes.saturating_add(bytes);
-                    self.record_pending_peak();
-                    return;
-                }
-            },
-            None => cmd,
-        };
-        let seg = self.canvas2d_segment(canvas_id);
-        seg.commands.push(cmd);
+        // Decide on references first. Every Canvas2D command in the engine goes
+        // through here, and handing a ~140-byte enum to the fold and taking it
+        // back would put that cost on `fillRect` and every state setter too --
+        // paid by the many to serve the few.
+        let foldable = matches!(cmd, Canvas2DCmd::DrawImage { .. })
+            && matches!(
+                seg.commands.last(),
+                Some(Canvas2DCmd::DrawImage { .. } | Canvas2DCmd::DrawImageBatch { .. })
+            );
+        if foldable {
+            let tail = seg
+                .commands
+                .last_mut()
+                .expect("checked non-empty on the line above");
+            let rejected = shared::protocol::render_cmd::fold_draw_image_run(tail, cmd);
+            debug_assert!(
+                rejected.is_none() || matches!(rejected, Some(Canvas2DCmd::DrawImage { .. })),
+                "the fold may only hand back what it was given"
+            );
+            if rejected.is_none() {
+                self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+                self.record_pending_peak();
+                return;
+            }
+            // Only reachable when the batch is already at the protocol cap.
+            seg.commands
+                .push(rejected.expect("checked Some on the line above"));
+        } else {
+            seg.commands.push(cmd);
+        }
 
         self.pending_bytes = self.pending_bytes.saturating_add(bytes);
         self.record_pending_peak();
