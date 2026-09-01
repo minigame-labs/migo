@@ -35,19 +35,27 @@ fail() { echo -e "\033[0;31m$TAG FAIL $*\033[0m" >&2; failures=$((failures + 1))
 info() { echo -e "\033[0;36m$TAG $*\033[0m"; }
 failures=0
 
-# llvm-readelf, not the GNU one: this repository has already had a `find`
-# expression silently substitute GNU readelf, whose output format differs.
+# The NDK comes from the repository's resolver, never from whatever
+# `ANDROID_NDK_HOME` happens to hold: reading the alignment with a different
+# NDK's tool than the one that produced the library is how a gate ends up
+# describing a build nobody shipped. `test-android-ndk-pin-contract.sh`
+# enforces that every script does this.
+# shellcheck source=scripts/lib/android-ndk.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/android-ndk.sh"
+
+# llvm-readelf from the pinned NDK, resolved by the shared helper -- not the
+# GNU one and not whatever `ANDROID_NDK_HOME` happens to hold. The helper
+# carries two lessons this gate would otherwise have to relearn: reading an
+# artifact with a different NDK's tool than the one that built it describes a
+# build nobody shipped, and `find -type f` silently substitutes GNU readelf
+# because r23 ships `llvm-readelf` as a symlink.
 readelf_bin=""
-for candidate in \
-    "${ANDROID_NDK_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
-    "$(command -v llvm-readelf 2>/dev/null || true)"; do
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-        readelf_bin="$candidate"
-        break
-    fi
-done
+if ! readelf_bin="$(android_ndk_readelf \
+    "$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json" 2>/dev/null)"; then
+    readelf_bin=""
+fi
 if [[ -z "$readelf_bin" ]]; then
-    echo "$TAG llvm-readelf not found (set ANDROID_NDK_HOME or install llvm)" >&2
+    echo "$TAG llvm-readelf not found (install the pinned NDK)" >&2
     exit 1
 fi
 
