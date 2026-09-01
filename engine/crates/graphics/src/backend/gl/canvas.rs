@@ -48,6 +48,14 @@ pub struct Canvas2DRenderer {
     /// [`shared::feature_policy::FeatureKey::CanvasDrawAtlas`]; a batch is far
     /// too hot to consult a policy map per draw.
     pub(crate) draw_atlas: bool,
+    /// Whether an atlas run has already been reported.
+    ///
+    /// One line per process, not per batch: the question it answers -- did this
+    /// path actually run, or did every batch fall back? -- is answered once, and
+    /// a per-batch log on a sprite-heavy frame would be its own performance
+    /// problem. Without it an A/B that merges nothing looks exactly like an A/B
+    /// that merges correctly.
+    pub(crate) draw_atlas_reported: std::cell::Cell<bool>,
     pub state: Canvas2DState,
     pub stack: StateStack,
     pub path: CanvasPath,
@@ -121,6 +129,7 @@ impl Canvas2DRenderer {
             draw_atlas: shared::feature_policy::is_enabled(
                 shared::feature_policy::FeatureKey::CanvasDrawAtlas,
             ),
+            draw_atlas_reported: std::cell::Cell::new(false),
             state: Canvas2DState::default(),
             stack: StateStack::new(),
             path: CanvasPath::new(),

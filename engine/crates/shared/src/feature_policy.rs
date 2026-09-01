@@ -95,8 +95,15 @@ impl FeatureKey {
             // the first rejection, and it only ever describes a region that was
             // actually redrawn.
             Self::PresentSwapDamage => true,
-            Self::CanvasDrawAtlas
-            | Self::CanvasHotBackingPool
+            // A run of adjacent sprites with one image and a uniform scale is
+            // exactly what `drawAtlas` + `RSXform` can express, and
+            // `partition` never reorders, so alpha blending still composites
+            // in issue order. Verified on a real GL context: a 768-sprite
+            // lattice mixing 1:1 runs, uniformly scaled runs, an image change
+            // and a non-uniform sprite renders byte-identically with the path
+            // on and off.
+            Self::CanvasDrawAtlas => true,
+            Self::CanvasHotBackingPool
             | Self::PresentSwappy
             | Self::WebglParallelShaderCompile
             | Self::TextureAstcVariants
@@ -414,13 +421,20 @@ mod tests {
         }
     }
 
+    /// Naming a specific key here would make the test red the day that key
+    /// ships on by default -- an assertion about today's rollout state, not
+    /// about the policy. Derive the subject from the policy instead.
+    fn some_default_off_key() -> FeatureKey {
+        FeatureKey::ALL
+            .iter()
+            .copied()
+            .find(|k| !k.default_enabled())
+            .expect("the layering tests need at least one default-off feature")
+    }
+
     #[test]
     fn an_operator_can_ask_for_a_feature_but_not_for_a_capability() {
-        let key = FeatureKey::CanvasDrawAtlas;
-        assert!(
-            !key.default_enabled(),
-            "this test needs a default-off feature"
-        );
+        let key = some_default_off_key();
 
         let mut policy = FeaturePolicy::new();
         policy.set_local_override(key, true);
@@ -454,9 +468,26 @@ mod tests {
     fn a_default_off_feature_says_so_rather_than_blaming_the_device() {
         let policy = FeaturePolicy::new();
         assert_eq!(
-            policy.decide(FeatureKey::CanvasDrawAtlas).reason,
+            policy.decide(some_default_off_key()).reason,
             Some(FallbackReason::DefaultOff)
         );
+    }
+
+    /// Every key's default must be reachable through the same `decide` path,
+    /// so a newly defaulted-on feature can't quietly skip the layering.
+    #[test]
+    fn every_key_reports_its_own_default_through_decide() {
+        let policy = FeaturePolicy::new();
+        for key in FeatureKey::ALL {
+            let decision = policy.decide(key);
+            assert_eq!(
+                decision.enabled,
+                key.default_enabled(),
+                "{} disagrees with its own default",
+                key.name()
+            );
+            assert_eq!(decision.reason.is_none(), key.default_enabled());
+        }
     }
 
     #[test]

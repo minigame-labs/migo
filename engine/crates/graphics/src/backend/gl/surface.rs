@@ -834,6 +834,12 @@ impl Canvas2DContext {
                                 xforms.push(skia_safe::RSXform::new(scale, 0.0, (d.dx, d.dy)));
                                 tex.push(SkRect::from_xywh(d.sx, d.sy, d.sw, d.sh));
                             }
+                            if !renderer.draw_atlas_reported.replace(true) {
+                                tracing::info!(
+                                    sprites = end - start,
+                                    "Canvas2D drawAtlas path active"
+                                );
+                            }
                             canvas.draw_atlas(
                                 &img,
                                 &xforms,

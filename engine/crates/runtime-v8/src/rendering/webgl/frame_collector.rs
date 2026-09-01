@@ -461,6 +461,25 @@ impl UnifiedFrameCollector {
 
         let seg = self.canvas2d_segment(canvas_id);
         seg.mark_dirty_for_cmd(&cmd);
+        // Peephole: a run of adjacent `drawImage` calls is one
+        // `DrawImageBatch`.  Content emits one `drawImage` per sprite, so
+        // without this the render thread pays a full command dispatch
+        // (make-current, split borrow, paint build) per sprite and the
+        // `drawAtlas` run batching downstream never sees a run at all.
+        // See `fold_draw_image_run` for why adjacency is the whole
+        // precondition.
+        let cmd = match seg.commands.last_mut() {
+            Some(tail) => match shared::protocol::render_cmd::fold_draw_image_run(tail, cmd) {
+                Some(rejected) => rejected,
+                None => {
+                    self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+                    self.record_pending_peak();
+                    return;
+                }
+            },
+            None => cmd,
+        };
+        let seg = self.canvas2d_segment(canvas_id);
         seg.commands.push(cmd);
 
         self.pending_bytes = self.pending_bytes.saturating_add(bytes);
@@ -1851,6 +1870,102 @@ mod tests {
             _ => panic!("expected CanvasBatch"),
         };
         assert!(dirty.is_none(), "no draws = no dirty_rect");
+    }
+
+    fn sprite(dx: f32) -> Canvas2DCmd {
+        Canvas2DCmd::DrawImage {
+            image_id: 1,
+            sx: 0.0,
+            sy: 0.0,
+            sw: 16.0,
+            sh: 16.0,
+            dx,
+            dy: 0.0,
+            dw: 16.0,
+            dh: 16.0,
+        }
+    }
+
+    /// Content emits one `drawImage` per sprite. Without folding, a
+    /// 3-sprite frame costs three full render-thread command dispatches
+    /// and the `drawAtlas` batching downstream never sees a run.
+    #[test]
+    fn a_run_of_draw_images_reaches_the_render_thread_as_one_batch() {
+        let mut c = UnifiedFrameCollector::new();
+        c.push_canvas2d(1, sprite(0.0));
+        c.push_canvas2d(1, sprite(16.0));
+        c.push_canvas2d(1, sprite(32.0));
+
+        let packet = c.build_frame_packet(true).unwrap();
+        let FrameOp::CanvasBatch(p) = &packet.ops()[1] else {
+            panic!("expected CanvasBatch");
+        };
+        let cmds = &p.commands;
+        assert_eq!(cmds.len(), 1, "three adjacent draws must fold into one");
+        let Canvas2DCmd::DrawImageBatch { draws } = &cmds[0] else {
+            panic!("expected DrawImageBatch, got {:?}", cmds[0]);
+        };
+        assert_eq!(
+            draws.iter().map(|d| d.dx).collect::<Vec<_>>(),
+            vec![0.0, 16.0, 32.0]
+        );
+    }
+
+    /// The whole soundness argument is adjacency: a state command between
+    /// two draws means they no longer share a paint, so the run must break.
+    #[test]
+    fn a_state_change_between_draws_breaks_the_run() {
+        let mut c = UnifiedFrameCollector::new();
+        c.push_canvas2d(1, sprite(0.0));
+        c.push_canvas2d(1, Canvas2DCmd::SetGlobalAlpha { alpha: 0.5 });
+        c.push_canvas2d(1, sprite(16.0));
+
+        let packet = c.build_frame_packet(true).unwrap();
+        let FrameOp::CanvasBatch(p) = &packet.ops()[1] else {
+            panic!("expected CanvasBatch");
+        };
+        let cmds = &p.commands;
+        assert_eq!(cmds.len(), 3, "the alpha change must stay between them");
+        assert!(matches!(cmds[0], Canvas2DCmd::DrawImage { .. }));
+        assert!(matches!(cmds[1], Canvas2DCmd::SetGlobalAlpha { .. }));
+        assert!(matches!(cmds[2], Canvas2DCmd::DrawImage { .. }));
+    }
+
+    /// Two canvases interleaving draws must not fold across each other --
+    /// each canvas has its own state and its own surface.
+    #[test]
+    fn draws_on_different_canvases_never_fold_together() {
+        let mut c = UnifiedFrameCollector::new();
+        c.push_canvas2d(1, sprite(0.0));
+        c.push_canvas2d(2, sprite(16.0));
+        c.push_canvas2d(1, sprite(32.0));
+
+        let packet = c.build_frame_packet(true).unwrap();
+        let mut per_canvas: Vec<usize> = Vec::new();
+        for op in packet.ops() {
+            if let FrameOp::CanvasBatch(p) = op {
+                per_canvas.push(p.commands.len());
+            }
+        }
+        assert_eq!(
+            per_canvas.iter().sum::<usize>(),
+            3,
+            "canvas 1's two draws are not adjacent -- canvas 2 sits between them"
+        );
+    }
+
+    /// Folding must not stop the collector noticing memory growth, or a
+    /// sprite storm could pin the JS heap past the auto-flush budget.
+    #[test]
+    fn folded_draws_still_count_against_the_flush_budget() {
+        let mut c = UnifiedFrameCollector::new();
+        c.push_canvas2d(1, sprite(0.0));
+        let after_one = c.pending_bytes;
+        c.push_canvas2d(1, sprite(16.0));
+        assert!(
+            c.pending_bytes > after_one,
+            "an absorbed draw still consumes memory"
+        );
     }
 
     #[test]
