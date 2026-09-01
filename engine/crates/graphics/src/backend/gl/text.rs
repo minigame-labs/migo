@@ -1235,12 +1235,12 @@ fn baseline_offset(paragraph: &Paragraph, attrs: &TextAttrs) -> f32 {
     y_baseline_offset(attrs.baseline, ascent, descent)
 }
 
-/// Dummy paint used only so `SkFont::measure_str` returns a width
-/// without forcing an allocation.  The real fill/stroke paint is
-/// applied at draw time on the SkTextBlob itself.
+/// Dummy paint used only so `SkFont::measure_str` returns a width without
+/// forcing an allocation. The real fill/stroke paint is applied at draw time
+/// on the SkTextBlob itself.
 ///
-/// Unused today: same disabled fast path as [`blob_baseline_offset`].
-#[allow(dead_code)]
+/// One process-wide `Paint`, because this is on the shape-cache miss path and
+/// a `Paint` is not a cheap value to build per call.
 fn paint_for_measure() -> &'static Paint {
     use std::sync::OnceLock;
     static PAINT: OnceLock<Paint> = OnceLock::new();
