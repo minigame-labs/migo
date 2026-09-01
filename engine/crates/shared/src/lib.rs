@@ -54,6 +54,7 @@ pub mod css_font;
 pub mod css_font_shorthand;
 pub mod device;
 pub mod error;
+pub mod feature_policy;
 pub mod frame_rate;
 pub mod host_channel;
 pub mod image_id;

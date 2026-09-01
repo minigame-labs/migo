@@ -63,6 +63,30 @@ unsafe impl Send for TextContext {}
 
 /// Shared text layout state.  Owns the font registry, not per-canvas.
 pub struct TextContext {
+    /// Whether simple `fillText` runs may take the `SkTextBlob` path.
+    ///
+    /// Resolved once from
+    /// [`shared::feature_policy::FeatureKey::CanvasTextBlobFastPath`] rather
+    /// than consulted per call: the decision cannot change mid-frame, and
+    /// `fillText` is hot enough that a map lookup per label would be part of
+    /// what the fast path is trying to remove.
+    blob_fast_path: bool,
+    /// How many `fillText` calls the blob path has actually served.
+    ///
+    /// Without this the parity suite is vacuous: a fast path that quietly
+    /// declined every case would make both renders identical and every
+    /// comparison pass. This repository has shipped that shape of silence
+    /// before -- a conformance runner that reported "0 assertions" instead of
+    /// failing -- so the count is part of the feature, not part of the test.
+    fast_path_paints: std::cell::Cell<u64>,
+    /// The shaper the fast path builds its blobs with.
+    ///
+    /// It has to be *a* shaper rather than `TextBlob::from_str`, because that
+    /// helper lays glyphs out on their nominal advances with no kerning and no
+    /// shaping. For a single glyph the two agree; for `AV` or `Hello` they do
+    /// not, and the fast path would render text that is subtly differently
+    /// spaced from every other text in the same frame.
+    shaper: skia_safe::shaper::Shaper,
     font_collection: FontCollection,
     provider: TypefaceFontProvider,
     /// `FontMgr` handle wrapping `provider`.  Cached instead of
@@ -162,6 +186,13 @@ struct ShapedText {
     /// `None` when the text needed full SkParagraph shaping
     /// (non-ASCII, mixed fallback, RTL, etc.).
     blob: Option<TextBlob>,
+    /// Distance from the shaped blob's own origin (the line top) down to the
+    /// baseline, in the same font the blob was built with.
+    ///
+    /// Kept beside the blob rather than recomputed at the draw site: it is a
+    /// property of *this* blob, and deriving it again from any other metrics
+    /// source is exactly how the two paths drift apart.
+    baseline_from_top: f32,
 }
 
 /// Fingerprint of the state that determines the shaped-text metrics.
@@ -281,6 +312,20 @@ impl TextContext {
     /// Create a text context with deterministic fallback fonts installed.
     /// Custom families still need explicit registration via
     /// [`Self::register_family_aliases`] / [`Self::register_family`].
+    /// Turn the `SkTextBlob` paint path on or off for this renderer.
+    ///
+    /// The host-side kill switch: a device or a build that gets it wrong can be
+    /// put back on the complete SkParagraph path without shipping new code, and
+    /// the pixel-parity tests use this same control to render both ways.
+    pub fn set_blob_fast_path(&mut self, enabled: bool) {
+        self.blob_fast_path = enabled;
+    }
+
+    /// How many `fillText` calls the `SkTextBlob` path has served so far.
+    pub fn fast_path_paint_count(&self) -> u64 {
+        self.fast_path_paints.get()
+    }
+
     pub fn new() -> Self {
         let mut fc = FontCollection::new();
         let provider = TypefaceFontProvider::new();
@@ -302,6 +347,14 @@ impl TextContext {
             std::num::NonZeroUsize::new(MEASURE_CACHE_CAP).expect("MEASURE_CACHE_CAP must be > 0");
 
         let mut this = Self {
+            blob_fast_path: shared::feature_policy::FeatureKey::CanvasTextBlobFastPath
+                .default_enabled(),
+            fast_path_paints: std::cell::Cell::new(0),
+            // With no font manager the constructor falls back to the
+            // primitive shaper, which lays glyphs out on nominal advances and
+            // is exactly what this path is trying to stop doing -- the parity
+            // suite catches it as multi-glyph runs that still differ.
+            shaper: skia_safe::shaper::Shaper::new(Some(asset_mgr.clone())),
             font_collection: fc,
             provider,
             asset_font_mgr: asset_mgr,
@@ -750,32 +803,63 @@ impl TextContext {
     ///     typeface for the whole run)
     fn try_fast_path_paint(
         &self,
-        _canvas: &Canvas,
-        _text: &str,
-        _x: f32,
-        _y: f32,
-        _max_width: f32,
-        _state: &Canvas2DState,
-        _paint: &Paint,
+        canvas: &Canvas,
+        text: &str,
+        x: f32,
+        y: f32,
+        max_width: f32,
+        state: &Canvas2DState,
+        paint: &Paint,
     ) -> Option<()> {
-        // The SkTextBlob paint fast path is currently disabled
-        // pending pixel-parity verification with SkParagraph across
-        // every font / size / baseline combination our goldens
-        // cover.  The infrastructure (shape_cache, resolve_primary_
-        // typeface, obtain_shaped_text) is in place so measureText
-        // still benefits from shared shape caching; enabling paint
-        // dispatch here requires regenerating goldens AND confirming
-        // that baseline computation on `Font::metrics()` matches the
-        // paragraph-layout baseline that Canvas 2D tests assume.
+        if !self.blob_fast_path {
+            return None;
+        }
+        // `is_scale_translate` is true for translate/scale matrices and false
+        // as soon as any rotation or skew is present.
+        let inputs = FastPathInputs {
+            text,
+            x,
+            y,
+            max_width,
+            state,
+            paint,
+            ctm_is_scale_translate: canvas.local_to_device_as_3x3().is_scale_translate(),
+        };
+        if !fast_path_is_eligible(&inputs) {
+            return None;
+        }
+
+        let key = TextMeasureKey::new(text, &state.text, self.font_epoch.get());
+        let shaped = self.obtain_shaped_text(&key, text, &state.text)?;
+        let blob = shaped.blob.as_ref()?;
+        let metrics = &shaped.metrics;
+
+        let sk_dir = sk_direction_for(state.text.direction);
+        let align = ResolvedTextAlign::resolve(state.text.align, sk_dir);
+        let x_anchor = x - align.x_anchor_offset(metrics.width);
+
+        // Alphabetic only, and that is what makes the vertical placement
+        // provable rather than lucky.
         //
-        // Intentional conservatism: a wrong-pixel paint that passes
-        // CI today would break silently in production; paying an
-        // extra paragraph pipeline per fill_text is fine until the
-        // fast path is proven equivalent.
-        None
+        // The paragraph path draws its *box top* at `y - offset` and its
+        // baseline lands `ascent` below that; `draw_text_blob` takes the
+        // baseline directly. For `alphabetic`, `offset == ascent`, so the
+        // paragraph's baseline is `y - ascent + ascent == y` -- the ascent
+        // cancels, and the two paths agree no matter which of the engine's two
+        // ascent definitions is used. For every other baseline the offset and
+        // the ascent do not cancel, and the two definitions
+        // (`Paragraph::alphabetic_baseline` vs `SkFont::metrics`) are not the
+        // same number, so those modes stay on the paragraph.
+        // Alphabetic baseline means "put the baseline at `y`", and the blob's
+        // own origin is its line top, so it is drawn one ascent higher. Both
+        // numbers come from the font this blob was built with, so they cancel
+        // exactly -- the placement does not depend on the paragraph's ascent
+        // agreeing with the font's, which it does not.
+        canvas.draw_text_blob(blob, (x_anchor, y - shaped.baseline_from_top), paint);
+        self.fast_path_paints.set(self.fast_path_paints.get() + 1);
+        Some(())
     }
 
-    #[allow(dead_code)]
     /// Look up (or populate) the shape-cache entry for
     /// `(text, attrs)`.  Returns `None` when no typeface can be
     /// resolved — callers treat this as "fall back to paragraph".
@@ -801,24 +885,46 @@ impl TextContext {
         }
         crate::render_diagnostics::miss_shape_cache();
         let tf = self.resolve_primary_typeface(attrs)?;
-        let font = Font::from_typeface(tf, attrs.size.max(0.0));
-        let blob = TextBlob::from_str(text, &font);
-        // Intrinsic width via TextBlob bounds.  When `blob` is
-        // `None` (empty string, zero-advance glyphs), width stays 0
-        // and the caller still benefits from metrics caching.
-        let (width, ascent, descent) = if let Some(b) = &blob {
-            let bounds = b.bounds();
+        let mut font = Font::from_typeface(tf, attrs.size.max(0.0));
+        // Match how the paragraph rasterises and advances, or the fast path
+        // produces text that is the same glyphs at slightly different places.
+        //
+        // `linear_metrics` is the one that matters: without it each glyph's
+        // advance is the hinted, rounded one, and the error accumulates along
+        // the run -- the parity suite saw `Hello` come out a pixel narrow and
+        // `0123456789` three pixels wide, while single glyphs matched exactly.
+        font.set_subpixel(true);
+        font.set_linear_metrics(true);
+        font.set_hinting(skia_safe::FontHinting::Slight);
+        font.set_edging(skia_safe::font::Edging::AntiAlias);
+        // Shaped, not laid out on nominal advances. `TextBlob::from_str` runs no
+        // GSUB/GPOS at all, so any font with kerning pairs places `AV` or
+        // `Hello` differently from the paragraph -- proven by the parity suite,
+        // where single glyphs matched and multi-glyph runs did not.
+        //
+        // `f32::MAX` as the wrap width keeps this one unwrapped run; Canvas2D
+        // `fillText` never wraps. The run handler positions the blob against the
+        // *line top*, so the baseline sits `ascent` below the offset -- see
+        // `ShapedText::baseline_from_top`.
+        let shaped = self
+            .shaper
+            .shape_text_blob(text, &font, true, f32::MAX, (0.0, 0.0));
+        // The run handler's end point is the start of the *next line*, not the
+        // width of this one -- reading it as an advance silently produced a
+        // zero width, which alignment then turned into text drawn at the raw
+        // anchor. Measure the run instead, with the same font settings the
+        // blob was shaped with so the number describes those glyphs.
+        let blob = shaped.map(|(blob, _end)| blob);
+        let advance = font.measure_str(text, Some(paint_for_measure())).0;
+        // The advance the shaper actually produced, not a second measurement
+        // that could disagree with the glyphs that were placed.
+        let (width, ascent, descent) = if blob.is_some() {
             // SkFont::metrics gives the font-level ascent / descent
             // used by browser measureText's `fontBoundingBox*`.
             let (_line_height, font_mx) = font.metrics();
             let ascent = (-font_mx.ascent).max(0.0);
             let descent = font_mx.descent.max(0.0);
-            let _ = bounds;
-            (
-                font.measure_str(text, Some(paint_for_measure())).0,
-                ascent,
-                descent,
-            )
+            (advance, ascent, descent)
         } else {
             (0.0, 0.0, 0.0)
         };
@@ -836,7 +942,11 @@ impl TextContext {
             alphabetic_baseline: 0.0,
             ideographic_baseline: descent * -1.0,
         };
-        let entry = ShapedText { metrics, blob };
+        let entry = ShapedText {
+            metrics,
+            blob,
+            baseline_from_top: ascent,
+        };
         self.shape_cache
             .borrow_mut()
             .put(*key, Verified::new(text, entry.clone()));
@@ -1033,26 +1143,95 @@ fn log_paragraph_diagnostics(
 
 /// Compute the Y shift needed so that `paragraph.paint(x, y_anchor)` lands
 /// with the Canvas2D caller-supplied `y` sitting on the requested baseline.
+/// Whether a `fillText` call is one the single-typeface `SkTextBlob` path can
+/// reproduce exactly.
+///
+/// Every rule here exists because SkParagraph does something the blob cannot,
+/// not because the blob would look slightly different. The blob carries one
+/// typeface, one direction, no filters and no post-layout transform; anything
+/// that needs more is not a candidate, and the paragraph path is not a
+/// degraded mode -- it is the complete one.
+///
+/// Free-standing, and returning a plain `bool` per call rather than reading any
+/// renderer state, so the rules can be enumerated by tests without a font
+/// manager, a canvas, or a GPU.
+struct FastPathInputs<'a> {
+    text: &'a str,
+    x: f32,
+    y: f32,
+    max_width: f32,
+    state: &'a Canvas2DState,
+    paint: &'a Paint,
+    /// True for translate/scale transforms, false once any rotation or skew
+    /// is present.
+    ctm_is_scale_translate: bool,
+}
+
+fn fast_path_is_eligible(inputs: &FastPathInputs<'_>) -> bool {
+    let FastPathInputs {
+        text,
+        x,
+        y,
+        max_width,
+        state,
+        paint,
+        ctm_is_scale_translate,
+    } = *inputs;
+    // Under a rotated or skewed transform Skia rasterises glyphs through a
+    // different path than it does axis-aligned, and the two paths land a pixel
+    // apart along the run's edge. Scale and translation are fine and are
+    // covered by the parity suite; rotation is not, so it goes to the
+    // paragraph, which is where rotated text was rendered before this existed.
+    if !ctm_is_scale_translate {
+        return false;
+    }
+    // An empty run has no blob at all, and the paragraph path already produces
+    // exactly nothing for it; routing it here would only add a cache entry.
+    if text.is_empty() {
+        return false;
+    }
+    // Non-ASCII may need font fallback across several typefaces, or BiDi
+    // reordering -- a single blob cannot express either.
+    if !text.is_ascii() {
+        return false;
+    }
+    if state.text.direction == ProtocolDirection::Rtl {
+        return false;
+    }
+    // See `try_fast_path_paint`: only the alphabetic baseline makes the two
+    // paths' vertical placement identical by construction.
+    if state.text.baseline != shared::protocol::render_cmd::TextBaseline::Alphabetic {
+        return false;
+    }
+    // A shadow is a draw-looper/filter the paragraph path installs around the
+    // whole layer; a blob drawn with the same paint would simply lose it.
+    if state.shadow.is_visible() {
+        return false;
+    }
+    // `maxWidth` is honoured as a post-layout horizontal scale around the
+    // paragraph, which changes glyph positions -- reproduce it there.
+    if max_width.is_finite() && max_width > 0.0 {
+        return false;
+    }
+    // Stroked text goes through the paragraph so stroke geometry, joins and
+    // dashes stay in one implementation.
+    if paint.style() != skia_safe::paint::Style::Fill {
+        return false;
+    }
+    if !x.is_finite() || !y.is_finite() {
+        return false;
+    }
+    if !state.text.size.is_finite() || state.text.size <= 0.0 {
+        return false;
+    }
+    true
+}
+
 fn baseline_offset(paragraph: &Paragraph, attrs: &TextAttrs) -> f32 {
     let ascent = paragraph.alphabetic_baseline();
     let height = paragraph.height();
     let descent = (height - ascent).max(0.0);
     y_baseline_offset(attrs.baseline, ascent, descent)
-}
-
-/// Counterpart of [`baseline_offset`] for the TextBlob fast path.
-/// Derives the ascent / descent from the cached
-/// [`TextMetrics`] rather than from a live paragraph.
-///
-/// Unused today: the TextBlob fast path is disabled pending golden
-/// verification (see `try_fast_path_paint`).
-#[allow(dead_code)]
-fn blob_baseline_offset(metrics: &TextMetrics, attrs: &TextAttrs) -> f32 {
-    y_baseline_offset(
-        attrs.baseline,
-        metrics.font_bounding_box_ascent,
-        metrics.font_bounding_box_descent,
-    )
 }
 
 /// Dummy paint used only so `SkFont::measure_str` returns a width
