@@ -1122,12 +1122,16 @@ fn try_ktx2_as_compressed(
     if vk_format == 0 || !gpu_supports_vk_format(vk_format, gpu_caps) {
         return None;
     }
-    Some(shared::protocol::io_cmd::CompressedImage {
-        width: ktx2.header.width,
-        height: ktx2.header.height,
+    // Every level the container declares, not just the base: `parse_ktx2` has
+    // already validated the whole chain, and dropping the smaller levels here
+    // is what would leave the sampler with nothing to minify from.
+    let levels: Vec<&[u8]> = ktx2.levels().collect();
+    shared::protocol::io_cmd::CompressedImage::new(
+        ktx2.header.width,
+        ktx2.header.height,
         vk_format,
-        data: Arc::new(ktx2.data.to_vec()),
-    })
+        &levels,
+    )
 }
 
 fn mount_relative_path(path: &str, mt: &MountTable) -> Option<String> {

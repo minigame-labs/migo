@@ -137,7 +137,7 @@ impl DerivedKey {
 // File format:
 // [MDRV magic: 4][version: 1][key_len: 2][key_bytes: key_len][kind: 1][width: 4][height: 4][vk_format: 4][data_len: 4][payload: data_len]
 const DERIVED_MAGIC: [u8; 4] = *b"MDRV";
-const DERIVED_VERSION: u8 = 3; // Bumped from 2 to include variant_kind in the key/header.
+const DERIVED_VERSION: u8 = 4; // Bumped from 3: compressed entries carry a mip-level table.
 const KIND_RGBA: u8 = 0;
 const KIND_COMPRESSED: u8 = 1;
 
@@ -303,12 +303,37 @@ fn parse_derived_entry(data: &[u8], expected_key: &DerivedKey) -> Option<Decoded
                 rgba: Arc::new(payload.to_vec()),
             }))
         }
-        KIND_COMPRESSED => Some(DecodedImage::Compressed(CompressedImage {
-            width,
-            height,
-            vk_format,
-            data: Arc::new(payload.to_vec()),
-        })),
+        KIND_COMPRESSED => {
+            // The level table follows the payload: count, then one length per
+            // level. `from_concatenated` rejects a table that does not account
+            // for exactly the payload, so a truncated or corrupted entry is a
+            // cache miss rather than a texture with overlapping levels.
+            let table_start = payload_start + data_len;
+            if data.len() < table_start + 4 {
+                return None;
+            }
+            let level_count =
+                u32::from_le_bytes(data[table_start..table_start + 4].try_into().ok()?) as usize;
+            let lengths_end = table_start
+                .checked_add(4)?
+                .checked_add(level_count.checked_mul(4)?)?;
+            if data.len() < lengths_end {
+                return None;
+            }
+            let mut level_lengths = Vec::with_capacity(level_count);
+            for i in 0..level_count {
+                let at = table_start + 4 + i * 4;
+                level_lengths.push(u32::from_le_bytes(data[at..at + 4].try_into().ok()?));
+            }
+            CompressedImage::from_concatenated(
+                width,
+                height,
+                vk_format,
+                Arc::new(payload.to_vec()),
+                level_lengths,
+            )
+            .map(DecodedImage::Compressed)
+        }
         _ => None,
     }
 }
@@ -350,6 +375,10 @@ fn serialize_derived_entry(
             buf.write_all(&img.vk_format.to_le_bytes())?;
             buf.write_all(&(img.data.len() as u32).to_le_bytes())?;
             buf.write_all(&img.data)?;
+            buf.write_all(&(img.level_count() as u32).to_le_bytes())?;
+            for length in img.level_lengths() {
+                buf.write_all(&length.to_le_bytes())?;
+            }
         }
     }
     Ok(())
@@ -536,15 +565,23 @@ mod tests {
             target_width: 0,
             target_height: 0,
         };
-        let img = DecodedImage::Compressed(CompressedImage {
-            width: 256,
-            height: 256,
-            vk_format: 147,
-            data: Arc::new(vec![0xAA; 1024]),
-        });
+        // A multi-level chain, so the level table this format carries is
+        // actually exercised: with one level a broken table still round-trips.
+        let l0 = vec![0xAA; 1024];
+        let l1 = vec![0xBB; 256];
+        let l2 = vec![0xCC; 64];
+        let img = DecodedImage::Compressed(
+            CompressedImage::new(256, 256, 147, &[&l0[..], &l1[..], &l2[..]]).expect("chain"),
+        );
         save_derived(&dir, &key, &img);
         let loaded = load_derived(&dir, &key).expect("hit");
-        assert!(matches!(loaded, DecodedImage::Compressed(c) if c.vk_format == 147));
+        let DecodedImage::Compressed(c) = loaded else {
+            panic!("expected a compressed entry");
+        };
+        assert_eq!(c.vk_format, 147);
+        assert_eq!(c.level_count(), 3, "every level must survive the cache");
+        let levels: Vec<&[u8]> = c.levels().collect();
+        assert_eq!(levels, vec![&l0[..], &l1[..], &l2[..]]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

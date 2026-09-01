@@ -96,12 +96,15 @@ impl CompressedFormat {
         }
     }
 
-    /// Exact byte length a tightly-packed level-0 image of `width`x`height`
-    /// must have in this format. A malformed KTX2 can declare dimensions that
-    /// don't match its level-0 byte length; validating against this lets the
-    /// caller reject it with a structured error instead of letting the driver
-    /// fail the upload with GL_INVALID_VALUE.
-    pub fn expected_level0_bytes(self, width: u32, height: u32) -> u64 {
+    /// Exact byte length a tightly-packed `width`x`height` level must have in
+    /// this format. A malformed KTX2 can declare dimensions that don't match a
+    /// level's byte length; validating against this lets the caller reject it
+    /// with a structured error instead of letting the driver fail the upload
+    /// with GL_INVALID_VALUE.
+    ///
+    /// Applies to every mip level, not just the base: each level is its own
+    /// tightly-packed block grid over its own halved dimensions.
+    pub fn expected_level_bytes(self, width: u32, height: u32) -> u64 {
         let (bw, bh) = self.block_dims();
         let blocks_x = (width as u64).div_ceil(bw as u64);
         let blocks_y = (height as u64).div_ceil(bh as u64);
@@ -160,7 +163,8 @@ impl CompressedFormatSupport {
 /// * `format` -- the compressed format of the data.
 /// * `width` -- texture width in pixels (must match the data).
 /// * `height` -- texture height in pixels (must match the data).
-/// * `data` -- raw compressed block data (e.g., from a KTX2 level 0).
+/// * `levels` -- the mip chain's block data, base level first. A single-element
+///   slice uploads just the base level and leaves filtering unmipmapped.
 /// * `supports_pbo` -- whether the context has pixel-buffer objects (ES3 or
 ///   `GL_NV_pixel_buffer_object`). When false (bare ES2) the PBO binding is
 ///   left untouched, since querying `PIXEL_UNPACK_BUFFER_BINDING` would raise
@@ -174,9 +178,16 @@ pub fn upload_compressed_texture(
     format: CompressedFormat,
     width: u32,
     height: u32,
-    data: &[u8],
+    levels: &[&[u8]],
     supports_pbo: bool,
 ) -> Option<glow::NativeTexture> {
+    // Checked before a texture exists, so a malformed chain costs nothing and
+    // cannot leave a half-populated texture behind.
+    if let Err(reason) = validate_mip_chain(format, width, height, levels) {
+        tracing::warn!("compressed upload rejected: {reason}");
+        return None;
+    }
+
     unsafe {
         let tex = gl.create_texture().ok()?;
 
@@ -203,7 +214,7 @@ pub fn upload_compressed_texture(
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_MIN_FILTER,
-            glow::LINEAR as i32,
+            min_filter_for_levels(levels.len()) as i32,
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
@@ -229,16 +240,37 @@ pub fn upload_compressed_texture(
         // only" idiom for compressed textures the way NULL pixels work for
         // glTexImage2D). Pass the real `data.len()` and upload straight from
         // client memory.
-        gl.compressed_tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            internal_format as i32,
-            width as i32,
-            height as i32,
-            0,
-            data.len() as i32,
-            data,
-        );
+        // The sampler needs a complete chain: TEXTURE_MAX_LEVEL bounds it at the
+        // last level actually uploaded, so a partial chain (an asset that ships
+        // only the top few mips) is complete rather than incomplete -- and an
+        // incomplete texture samples black while reporting nothing.
+        //
+        // MAX_LEVEL is ES3; on ES2 the enum would raise GL_INVALID_ENUM, so it
+        // is only set when there is a chain to bound.
+        if levels.len() > 1 {
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAX_LEVEL,
+                (levels.len() - 1) as i32,
+            );
+        }
+
+        let mut level_width = width;
+        let mut level_height = height;
+        for (level, data) in levels.iter().enumerate() {
+            gl.compressed_tex_image_2d(
+                glow::TEXTURE_2D,
+                level as i32,
+                internal_format as i32,
+                level_width as i32,
+                level_height as i32,
+                0,
+                data.len() as i32,
+                data,
+            );
+            level_width = (level_width / 2).max(1);
+            level_height = (level_height / 2).max(1);
+        }
 
         let err = gl.get_error();
 
@@ -253,11 +285,12 @@ pub fn upload_compressed_texture(
 
         if err != glow::NO_ERROR {
             tracing::warn!(
-                "compressed upload failed: format={} {}x{} {} bytes, GL error=0x{:X}",
+                "compressed upload failed: format={} {}x{} {} level(s), {} bytes, GL error=0x{:X}",
                 format.label(),
                 width,
                 height,
-                data.len(),
+                levels.len(),
+                levels.iter().map(|l| l.len()).sum::<usize>(),
                 err,
             );
             gl.delete_texture(tex);
@@ -265,20 +298,137 @@ pub fn upload_compressed_texture(
         }
 
         tracing::debug!(
-            "compressed upload: format={} {}x{} {} bytes",
+            "compressed upload: format={} {}x{} {} level(s), {} bytes",
             format.label(),
             width,
             height,
-            data.len(),
+            levels.len(),
+            levels.iter().map(|l| l.len()).sum::<usize>(),
         );
 
         Some(tex)
     }
 }
 
+/// Check a whole mip chain before any of it is uploaded.
+///
+/// Validating level by level while uploading can fail halfway, and a compressed
+/// texture with some levels populated and the rest undefined does not report an
+/// error -- it samples garbage, or black once the sampler reaches a missing
+/// level. There is no partial-success state worth having here, so the whole
+/// chain is checked first and the upload either happens or does not.
+pub fn validate_mip_chain(
+    format: CompressedFormat,
+    width: u32,
+    height: u32,
+    levels: &[&[u8]],
+) -> Result<(), &'static str> {
+    if levels.is_empty() {
+        return Err("compressed upload: no levels supplied");
+    }
+    if width == 0 || height == 0 {
+        return Err("compressed upload: zero dimensions");
+    }
+
+    let mut level_width = width;
+    let mut level_height = height;
+    for (index, level) in levels.iter().enumerate() {
+        if level.len() as u64 != format.expected_level_bytes(level_width, level_height) {
+            return Err("compressed upload: level size does not match its dimensions");
+        }
+        // A chain ends at 1x1. Declaring another level past it means the
+        // dimensions and the level list disagree about what this texture is.
+        if index + 1 < levels.len() && level_width == 1 && level_height == 1 {
+            return Err("compressed upload: more levels than the dimensions allow");
+        }
+        level_width = (level_width / 2).max(1);
+        level_height = (level_height / 2).max(1);
+    }
+    Ok(())
+}
+
+/// The minification filter for a texture that was given `level_count` levels.
+///
+/// A texture whose min filter samples mips but carries only level 0 is
+/// *incomplete*, and GL does not report that: it samples black. So mipmapped
+/// filtering is selected only when levels beyond the base were actually
+/// uploaded, which makes the filter a fact about the data rather than a wish.
+pub fn min_filter_for_levels(level_count: usize) -> u32 {
+    if level_count > 1 {
+        glow::LINEAR_MIPMAP_LINEAR
+    } else {
+        glow::LINEAR
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chain_of_halving_levels_validates() {
+        let f = CompressedFormat::Etc2Rgb;
+        let l0 = vec![0u8; f.expected_level_bytes(8, 8) as usize];
+        let l1 = vec![0u8; f.expected_level_bytes(4, 4) as usize];
+        let l2 = vec![0u8; f.expected_level_bytes(2, 2) as usize];
+        let l3 = vec![0u8; f.expected_level_bytes(1, 1) as usize];
+
+        assert_eq!(
+            validate_mip_chain(f, 8, 8, &[&l0[..], &l1[..], &l2[..], &l3[..]]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_partial_chain_validates_too() {
+        // Stopping before 1x1 is legal: the sampler just needs the levels it is
+        // told about, and an asset may ship only the top few.
+        let f = CompressedFormat::Astc4x4;
+        let l0 = vec![0u8; f.expected_level_bytes(16, 16) as usize];
+        let l1 = vec![0u8; f.expected_level_bytes(8, 8) as usize];
+
+        assert_eq!(validate_mip_chain(f, 16, 16, &[&l0[..], &l1[..]]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_a_level_with_the_wrong_byte_count() {
+        let f = CompressedFormat::Etc2Rgb;
+        let l0 = vec![0u8; f.expected_level_bytes(8, 8) as usize];
+        let l1 = vec![0u8; f.expected_level_bytes(4, 4) as usize + 1];
+
+        assert!(
+            validate_mip_chain(f, 8, 8, &[&l0[..], &l1[..]]).is_err(),
+            "a level whose size does not match its dimensions must not be uploaded"
+        );
+    }
+
+    #[test]
+    fn rejects_more_levels_than_the_dimensions_allow() {
+        let f = CompressedFormat::Etc2Rgb;
+        let l = vec![0u8; f.expected_level_bytes(1, 1) as usize];
+        // A 2x2 base has exactly two levels: 2x2 and 1x1.
+        let levels = [&l[..], &l[..], &l[..]];
+
+        assert!(
+            validate_mip_chain(f, 2, 2, &levels).is_err(),
+            "a chain longer than the dimensions allow is malformed"
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_chain() {
+        assert!(validate_mip_chain(CompressedFormat::Etc2Rgb, 8, 8, &[]).is_err());
+    }
+
+    #[test]
+    fn min_filter_uses_mipmaps_only_when_levels_were_supplied() {
+        // A texture whose min filter samples mips but has only level 0 is
+        // incomplete, and an incomplete texture samples black -- a silent,
+        // whole-asset failure rather than an error.
+        assert_eq!(min_filter_for_levels(1), glow::LINEAR);
+        assert_eq!(min_filter_for_levels(2), glow::LINEAR_MIPMAP_LINEAR);
+        assert_eq!(min_filter_for_levels(9), glow::LINEAR_MIPMAP_LINEAR);
+    }
 
     #[test]
     fn gl_internal_format_values() {
@@ -299,17 +449,17 @@ mod tests {
     }
 
     #[test]
-    fn expected_level0_bytes_block_math() {
+    fn expected_level_bytes_block_math() {
         // ETC2 RGB: 4x4 block, 8 B/block.
-        assert_eq!(CompressedFormat::Etc2Rgb.expected_level0_bytes(8, 8), 32);
-        assert_eq!(CompressedFormat::Etc2Rgb.expected_level0_bytes(1, 1), 8);
+        assert_eq!(CompressedFormat::Etc2Rgb.expected_level_bytes(8, 8), 32);
+        assert_eq!(CompressedFormat::Etc2Rgb.expected_level_bytes(1, 1), 8);
         // ETC2 RGBA / ASTC 4x4: 4x4 block, 16 B/block.
-        assert_eq!(CompressedFormat::Etc2Rgba.expected_level0_bytes(8, 8), 64);
-        assert_eq!(CompressedFormat::Astc4x4.expected_level0_bytes(8, 8), 64);
+        assert_eq!(CompressedFormat::Etc2Rgba.expected_level_bytes(8, 8), 64);
+        assert_eq!(CompressedFormat::Astc4x4.expected_level_bytes(8, 8), 64);
         // ASTC 6x6: ceil(7/6)=2 per axis -> 4 blocks * 16 = 64.
-        assert_eq!(CompressedFormat::Astc6x6.expected_level0_bytes(7, 7), 64);
+        assert_eq!(CompressedFormat::Astc6x6.expected_level_bytes(7, 7), 64);
         // ASTC 8x8: exact single block vs partial-edge round-up.
-        assert_eq!(CompressedFormat::Astc8x8.expected_level0_bytes(8, 8), 16);
-        assert_eq!(CompressedFormat::Astc8x8.expected_level0_bytes(9, 9), 64);
+        assert_eq!(CompressedFormat::Astc8x8.expected_level_bytes(8, 8), 16);
+        assert_eq!(CompressedFormat::Astc8x8.expected_level_bytes(9, 9), 64);
     }
 }

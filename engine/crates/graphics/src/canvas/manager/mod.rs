@@ -5510,19 +5510,26 @@ impl CanvasManager {
                 .with_detail(format!("GPU does not support {}", format.label())));
         }
 
-        // Reject a malformed KTX2 whose level-0 byte length doesn't match its
+        // Reject a malformed KTX2 whose level byte lengths don't match its
         // declared dimensions before the driver would fail the upload with
         // GL_INVALID_VALUE (glCompressedTexImage2D requires an exact size).
-        let expected = format.expected_level0_bytes(compressed.width, compressed.height);
-        if compressed.data.len() as u64 != expected {
+        // Checked over the whole chain: one that fails partway through uploading
+        // leaves a texture that samples garbage rather than reporting an error.
+        let levels: Vec<&[u8]> = compressed.levels().collect();
+        if let Err(reason) = crate::compressed_upload::validate_mip_chain(
+            format,
+            compressed.width,
+            compressed.height,
+            &levels,
+        ) {
             return Err(
                 EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
-                    "compressed KTX2 level0 is {} bytes but {} {}x{} requires {} bytes",
-                    compressed.data.len(),
+                    "compressed KTX2 {} {}x{} with {} level(s): {}",
                     format.label(),
                     compressed.width,
                     compressed.height,
-                    expected
+                    levels.len(),
+                    reason
                 )),
             );
         }
@@ -5532,7 +5539,7 @@ impl CanvasManager {
             format,
             compressed.width,
             compressed.height,
-            &compressed.data,
+            &levels,
             self.device_caps.has_pbo,
         )
         .ok_or_else(|| {
