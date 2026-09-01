@@ -74,6 +74,7 @@ pub(crate) mod damage_effect;
 pub mod device_caps;
 pub mod device_profile;
 pub mod dirty_region;
+pub mod draw_atlas;
 pub mod egl_platform;
 pub mod frame_capture;
 pub mod frame_scheduler;

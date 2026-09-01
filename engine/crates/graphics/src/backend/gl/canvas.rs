@@ -41,6 +41,13 @@ pub struct DrawEnv<'e, R: PatternResolver> {
 
 /// Owns the Canvas2D state for one `CanvasRenderingContext2D`.
 pub struct Canvas2DRenderer {
+    /// Whether consecutive same-image sprite runs may be merged into one
+    /// `SkCanvas::drawAtlas`.
+    ///
+    /// Resolved once from
+    /// [`shared::feature_policy::FeatureKey::CanvasDrawAtlas`]; a batch is far
+    /// too hot to consult a policy map per draw.
+    pub(crate) draw_atlas: bool,
     pub state: Canvas2DState,
     pub stack: StateStack,
     pub path: CanvasPath,
@@ -101,8 +108,19 @@ impl Default for Canvas2DRenderer {
 }
 
 impl Canvas2DRenderer {
+    /// Turn sprite-run merging on or off for this renderer.
+    ///
+    /// The host-side kill switch, and what the pixel-parity tests use to render
+    /// a batch both ways.
+    pub fn set_draw_atlas(&mut self, enabled: bool) {
+        self.draw_atlas = enabled;
+    }
+
     pub fn new() -> Self {
         Self {
+            draw_atlas: shared::feature_policy::is_enabled(
+                shared::feature_policy::FeatureKey::CanvasDrawAtlas,
+            ),
             state: Canvas2DState::default(),
             stack: StateStack::new(),
             path: CanvasPath::new(),

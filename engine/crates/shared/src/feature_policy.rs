@@ -292,6 +292,41 @@ impl FeaturePolicy {
     }
 }
 
+/// The process-wide policy, built once from the environment.
+///
+/// `MIGO_FEATURES` takes the same `name=on|off` list as
+/// [`FeaturePolicy::apply_override_list`], so an operator can put a build back
+/// on a known-good path, and an A/B run can render the same content both ways
+/// without two builds.
+///
+/// A malformed list is reported and then ignored *in full*: applying the part
+/// that parsed would leave the process in a state the operator did not ask for
+/// and cannot see, which is worse than not applying it at all.
+pub fn process_policy() -> &'static FeaturePolicy {
+    static POLICY: std::sync::OnceLock<FeaturePolicy> = std::sync::OnceLock::new();
+    POLICY.get_or_init(|| {
+        let mut policy = FeaturePolicy::new();
+        match std::env::var("MIGO_FEATURES") {
+            Ok(list) if !list.trim().is_empty() => {
+                let mut parsed = FeaturePolicy::new();
+                match parsed.apply_override_list(&list) {
+                    Ok(()) => policy = parsed,
+                    Err(reason) => {
+                        tracing::warn!("MIGO_FEATURES ignored in full: {reason}");
+                    }
+                }
+            }
+            _ => {}
+        }
+        policy
+    })
+}
+
+/// Whether `key` runs in this process.
+pub fn is_enabled(key: FeatureKey) -> bool {
+    process_policy().is_enabled(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -347,8 +347,9 @@ impl TextContext {
             std::num::NonZeroUsize::new(MEASURE_CACHE_CAP).expect("MEASURE_CACHE_CAP must be > 0");
 
         let mut this = Self {
-            blob_fast_path: shared::feature_policy::FeatureKey::CanvasTextBlobFastPath
-                .default_enabled(),
+            blob_fast_path: shared::feature_policy::is_enabled(
+                shared::feature_policy::FeatureKey::CanvasTextBlobFastPath,
+            ),
             fast_path_paints: std::cell::Cell::new(0),
             // With no font manager the constructor falls back to the
             // primitive shaper, which lays glyphs out on nominal advances and
