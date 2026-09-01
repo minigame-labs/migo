@@ -291,6 +291,70 @@ pub fn is_ktx2(data: &[u8]) -> bool {
 /// index and the level bytes. It writes a single level: nothing in this engine
 /// generates a mip chain at ingest yet, while `parse_ktx2` has to read the
 /// chains that authored assets arrive with.
+/// Write a non-supercompressed KTX2 container around a whole mip chain.
+///
+/// Levels are given base-first. They are *stored* smallest-first, which is the
+/// layout the spec's mip streaming assumes and what other KTX2 writers emit --
+/// a reader that wants only the small levels then gets them without seeking
+/// past the large one. The level index stays in level order regardless, so the
+/// storage order is invisible to anything but a byte-level diff.
+///
+/// Returns `None` for an empty chain or one longer than the dimensions allow;
+/// both would produce a container [`parse_ktx2`] refuses, and failing here is
+/// how the writer stays the parser's inverse rather than a separate opinion
+/// about what a valid file is.
+pub fn write_ktx2_levels(
+    vk_format: u32,
+    width: u32,
+    height: u32,
+    levels: &[&[u8]],
+) -> Option<Vec<u8>> {
+    if levels.is_empty() || width == 0 || height == 0 {
+        return None;
+    }
+    let max_levels = u32::BITS - width.max(height).leading_zeros();
+    if levels.len() as u64 > u64::from(max_levels) {
+        return None;
+    }
+    if levels.iter().any(|level| level.is_empty()) {
+        return None;
+    }
+
+    let index_size = levels.len() * LEVEL_INDEX_ENTRY_SIZE;
+    let mut buf = vec![0u8; HEADER_SIZE + index_size];
+
+    buf[..12].copy_from_slice(&KTX2_MAGIC);
+    buf[12..16].copy_from_slice(&vk_format.to_le_bytes());
+    // typeSize is 1 for every block-compressed format.
+    buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+    buf[20..24].copy_from_slice(&width.to_le_bytes());
+    buf[24..28].copy_from_slice(&height.to_le_bytes());
+    // pixelDepth 0 = 2D, layerCount 0 = non-array, faceCount 1 = not a cubemap.
+    buf[28..32].copy_from_slice(&0u32.to_le_bytes());
+    buf[32..36].copy_from_slice(&0u32.to_le_bytes());
+    buf[36..40].copy_from_slice(&1u32.to_le_bytes());
+    buf[40..44].copy_from_slice(&(levels.len() as u32).to_le_bytes());
+    // supercompressionScheme 0 = none; the parser rejects anything else.
+    buf[44..48].copy_from_slice(&0u32.to_le_bytes());
+
+    // The dfd/kvd/sgd index entries stay zero: those sections are absent.
+
+    let mut placed = vec![(0u64, 0u64); levels.len()];
+    for level in (0..levels.len()).rev() {
+        let offset = buf.len() as u64;
+        buf.extend_from_slice(levels[level]);
+        placed[level] = (offset, levels[level].len() as u64);
+    }
+    for (level, (offset, length)) in placed.iter().enumerate() {
+        let entry = HEADER_SIZE + level * LEVEL_INDEX_ENTRY_SIZE;
+        buf[entry..entry + 8].copy_from_slice(&offset.to_le_bytes());
+        buf[entry + 8..entry + 16].copy_from_slice(&length.to_le_bytes());
+        // uncompressedByteLength equals byteLength when nothing is supercompressed.
+        buf[entry + 16..entry + 24].copy_from_slice(&length.to_le_bytes());
+    }
+    Some(buf)
+}
+
 pub fn write_ktx2(vk_format: u32, width: u32, height: u32, level0: &[u8]) -> Vec<u8> {
     let level0_offset = (HEADER_SIZE + LEVEL_INDEX_ENTRY_SIZE) as u64;
     let level0_length = level0.len() as u64;
@@ -322,6 +386,50 @@ pub fn write_ktx2(vk_format: u32, width: u32, height: u32, level0: &[u8]) -> Vec
     buf[level0_offset as usize..].copy_from_slice(level0);
 
     buf
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    #[test]
+    fn a_written_mip_chain_reads_back_level_for_level() {
+        let l0 = vec![0xA0u8; 128];
+        let l1 = vec![0xA1u8; 32];
+        let l2 = vec![0xA2u8; 8];
+        let container = write_ktx2_levels(147, 16, 16, &[&l0[..], &l1[..], &l2[..]])
+            .expect("a three-level chain is writable");
+
+        let parsed = parse_ktx2(&container).expect("the runtime parser accepts what we write");
+        assert_eq!(parsed.header.mip_levels, 3);
+        let levels: Vec<&[u8]> = parsed.levels().collect();
+        assert_eq!(levels, vec![&l0[..], &l1[..], &l2[..]]);
+        assert_eq!(parsed.data, &l0[..], "level 0 stays reachable as `data`");
+    }
+
+    #[test]
+    fn a_single_level_chain_matches_the_single_level_writer() {
+        let level0 = vec![0xC3u8; 64];
+        let via_chain = write_ktx2_levels(151, 8, 8, &[&level0[..]]).expect("writable");
+        let via_single = write_ktx2(151, 8, 8, &level0);
+        assert_eq!(
+            via_chain, via_single,
+            "one writer must not produce a different container from the other for \
+             the same input, or the two paths drift apart"
+        );
+    }
+
+    #[test]
+    fn an_empty_chain_is_refused() {
+        assert!(write_ktx2_levels(147, 8, 8, &[]).is_none());
+    }
+
+    #[test]
+    fn more_levels_than_the_dimensions_allow_are_refused() {
+        let l = vec![0u8; 8];
+        // 2x2 has exactly two levels.
+        assert!(write_ktx2_levels(147, 2, 2, &[&l[..], &l[..], &l[..]]).is_none());
+    }
 }
 
 #[cfg(test)]

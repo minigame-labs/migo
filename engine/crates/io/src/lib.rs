@@ -23,6 +23,7 @@ pub mod image_ops;
 mod ingest_transcode;
 pub mod ktx2;
 pub mod kv_store;
+pub mod mipmap;
 pub mod mmap_reader;
 pub mod package_ingest;
 pub mod pools;

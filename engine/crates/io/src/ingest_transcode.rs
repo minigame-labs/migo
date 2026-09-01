@@ -17,7 +17,7 @@ use crate::etc2::{
     encode_etc2_rgba,
 };
 use crate::fast_image_decoder::decode_image_fast;
-use crate::ktx2::write_ktx2;
+use crate::ktx2::write_ktx2_levels;
 
 /// A transcoded sidecar: the entry name to store it under and its KTX2 bytes.
 pub(crate) struct TranscodedSidecar {
@@ -77,19 +77,34 @@ pub(crate) fn transcode_image(name: &str, bytes: &[u8]) -> Option<TranscodedSide
     // alpha is all 255 still take the smaller format.
     let has_alpha = image.rgba.chunks_exact(4).any(|px| px[3] != 0xFF);
 
-    let (vk_format, blocks) = if has_alpha {
-        (
-            VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
-            encode_etc2_rgba(&image.rgba, image.width, image.height).ok()?,
-        )
+    let vk_format = if has_alpha {
+        VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK
     } else {
-        (
-            VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK,
-            encode_etc2_rgb(&image.rgba, image.width, image.height).ok()?,
-        )
+        VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK
     };
 
-    let container = write_ktx2(vk_format, image.width, image.height, &blocks);
+    // The whole chain, not just the base level. A texture that ships one level
+    // is sampled with that level at every scale: a minified sprite reads pixels
+    // far apart in a full-resolution image, which aliases *and* thrashes the
+    // texture cache. The extra levels cost about a third of the base level in
+    // package bytes, once, instead of that cost every frame.
+    //
+    // The chain stops where the encoder would need padding (see `rgba_mip_chain`),
+    // so it is often partial -- which the uploader handles by bounding
+    // `TEXTURE_MAX_LEVEL` to what it was actually given.
+    let chain = crate::mipmap::rgba_mip_chain(&image.rgba, image.width, image.height, 4);
+    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(chain.len());
+    for (level_rgba, level_width, level_height) in &chain {
+        let blocks = if has_alpha {
+            encode_etc2_rgba(level_rgba, *level_width, *level_height).ok()?
+        } else {
+            encode_etc2_rgb(level_rgba, *level_width, *level_height).ok()?
+        };
+        encoded.push(blocks);
+    }
+    let levels: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+
+    let container = write_ktx2_levels(vk_format, image.width, image.height, &levels)?;
     Some(TranscodedSidecar {
         name: sidecar_name(name),
         bytes: container,
@@ -132,6 +147,40 @@ mod tests {
         assert_eq!(sidecar_name("a.b/c.jpeg"), "a.b/c.ktx2");
         // A directory dot with no file extension must not be truncated.
         assert_eq!(sidecar_name("a.b/c"), "a.b/c.ktx2");
+    }
+
+    #[test]
+    fn a_sidecar_carries_the_whole_mip_chain_not_just_the_base() {
+        // Without this the chain code could quietly emit one level and every
+        // other test here would still pass: they only ask whether the sidecar
+        // parses, and a one-level sidecar parses fine.
+        let png = png(64, 64);
+        let sidecar = transcode_image("a.png", &png).expect("64x64 transcodes");
+        let parsed = crate::ktx2::parse_ktx2(&sidecar.bytes).expect("parses");
+
+        // 64 -> 32 -> 16 -> 8 -> 4, stopping where ETC2 would need padding.
+        assert_eq!(parsed.header.mip_levels, 5);
+        let levels: Vec<&[u8]> = parsed.levels().collect();
+        assert_eq!(levels.len(), 5);
+
+        // Each level is a quarter of the previous one's blocks, which is the
+        // arithmetic that makes a chain cost about a third extra rather than
+        // double.
+        for pair in levels.windows(2) {
+            assert_eq!(
+                pair[1].len() * 4,
+                pair[0].len(),
+                "each level must be a quarter of the one above it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sidecar_too_small_to_halve_still_ships_its_base_level() {
+        let png = png(4, 4);
+        let sidecar = transcode_image("tiny.png", &png).expect("4x4 transcodes");
+        let parsed = crate::ktx2::parse_ktx2(&sidecar.bytes).expect("parses");
+        assert_eq!(parsed.header.mip_levels, 1);
     }
 
     #[test]
