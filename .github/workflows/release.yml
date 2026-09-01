@@ -699,6 +699,14 @@ jobs:
       - name: Android minimum-API symbol floor
         run: bash scripts/test-android-symbol-floor.sh
 
+      # Android 15 brought 16 KB memory pages and Android 16 requires targeting
+      # apps to have 16 KB-aligned native libraries to install on such a device.
+      # Migo's own libraries already are -- but nothing said so, and the pinned
+      # NDK's `libc++_shared.so` is 4 KB-aligned, so the day a build starts
+      # needing it the package would fail to install on hardware we do not own.
+      - name: Android 16 KB page alignment
+        run: bash scripts/test-android-so-page-alignment.sh
+
       # An SDK that ships a runtime library picks that library's version for its
       # host, and the published v0.9.3 AAR shipped ~2 MB of `libc++_shared.so`
       # that no shipped .so ever named in DT_NEEDED. Needs the freshly built
