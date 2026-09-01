@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::android_frame_rate::game_compatibility;
 use jni::sys::jobject;
 use shared::surface::Surface;
 use std::{ffi::c_void, fmt, ptr::NonNull, sync::OnceLock};
@@ -26,13 +27,6 @@ unsafe extern "C" {
     pub(crate) fn ANativeWindow_getHeight(window: *mut ANativeWindow) -> i32;
     pub(crate) fn ANativeWindow_getWidth(window: *mut ANativeWindow) -> i32;
 }
-
-/// `ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE`: content presenting at
-/// a fixed rate, which a game asking for N fps is. It is what tells
-/// SurfaceFlinger it may switch modes to serve the rate evenly; the `DEFAULT`
-/// value means the opposite ("this content can adapt"), and would leave a 60fps
-/// game on a 90Hz panel exactly where it is.
-const FRAME_RATE_COMPATIBILITY_FIXED_SOURCE: i8 = 1;
 
 type SetFrameRateFn = unsafe extern "C" fn(*mut ANativeWindow, f32, i8) -> i32;
 
@@ -75,8 +69,7 @@ pub fn request_frame_rate(window: *mut ANativeWindow, fps: u32) {
     let Some(set_frame_rate) = native_window_set_frame_rate() else {
         return;
     };
-    let status =
-        unsafe { set_frame_rate(window, fps as f32, FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) };
+    let status = unsafe { set_frame_rate(window, fps as f32, game_compatibility().as_abi()) };
     if status != 0 {
         tracing::debug!(
             "ANativeWindow_setFrameRate({fps}) declined: status={status} (the frame \
