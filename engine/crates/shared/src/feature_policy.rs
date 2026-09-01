@@ -87,10 +87,24 @@ impl FeatureKey {
     /// nobody measured behaves like the build that was measured.
     pub const fn default_enabled(self) -> bool {
         match self {
-            // Proven by host pixel-parity goldens across the font/size/
-            // alignment/baseline matrix, with every ineligible case falling
-            // back to SkParagraph.
-            Self::CanvasTextBlobFastPath => true,
+            // Off, and the reason is a measurement, not a doubt about
+            // correctness: it is proven pixel-identical to SkParagraph across
+            // the font/size/alignment/baseline matrix, with every ineligible
+            // case falling back. It simply does not pay.
+            //
+            // Mate 30 Pro, canvasmark, two AARs from one tree differing only in
+            // this default, three interleaved rounds each: CPU median 65 off vs
+            // 74 on, and PSS 97.4 MB off vs 102.8 MB on. No startup or fps
+            // difference either way. So the fast path costs ~5.4 MB (+5.5%) and
+            // buys nothing on a text-heavy 2D workload -- and memory is the
+            // claim this project actually makes.
+            //
+            // The suspected cost is the shape cache: it holds `TextBlob`s
+            // alongside the paragraph cache Skia already keeps, so a workload
+            // with many distinct strings pays for two. Turning this on again
+            // needs that duplication removed *and* a measured CPU win, not just
+            // the parity proof it already has.
+            Self::CanvasTextBlobFastPath => false,
             // Surface damage is a compositor hint with a plain-swap fallback on
             // the first rejection, and it only ever describes a region that was
             // actually redrawn.
@@ -370,13 +384,21 @@ mod tests {
         }
     }
 
+    /// Same reason as [`some_default_off_key`]: naming a key here makes the
+    /// test an assertion about today's rollout, and it goes red the day that
+    /// key's default flips -- which is exactly what happened when the text
+    /// fast path was measured and turned off.
+    fn some_default_on_key() -> FeatureKey {
+        FeatureKey::ALL
+            .iter()
+            .copied()
+            .find(|k| k.default_enabled())
+            .expect("the layering tests need at least one default-on feature")
+    }
+
     #[test]
     fn each_layer_denies_with_its_own_reason() {
-        let key = FeatureKey::CanvasTextBlobFastPath;
-        assert!(
-            key.default_enabled(),
-            "this test needs a default-on feature"
-        );
+        let key = some_default_on_key();
 
         let cases: [(fn(&mut FeaturePolicy, FeatureKey), FallbackReason); 6] = [
             (
