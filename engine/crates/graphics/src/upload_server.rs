@@ -250,6 +250,7 @@ mod tests {
     #[test]
     fn device_defaults_follow_conservative_render_profile() {
         let caps = DeviceCapabilities {
+            has_parallel_shader_compile: false,
             gles_version: (2, 0),
             has_pbo: false,
             has_fence_sync: false,
@@ -276,6 +277,7 @@ mod tests {
     #[test]
     fn conservative_profile_rejects_second_concurrent_upload() {
         let caps = DeviceCapabilities {
+            has_parallel_shader_compile: false,
             gles_version: (2, 0),
             has_pbo: false,
             has_fence_sync: false,
@@ -323,6 +325,7 @@ mod tests {
     #[test]
     fn aggressive_profile_allows_multiple_concurrent_uploads() {
         let caps = DeviceCapabilities {
+            has_parallel_shader_compile: false,
             gles_version: (3, 0),
             has_pbo: true,
             has_fence_sync: true,
@@ -372,6 +375,7 @@ mod tests {
     #[test]
     fn oversized_single_job_rejected_by_byte_budget() {
         let caps = DeviceCapabilities {
+            has_parallel_shader_compile: false,
             gles_version: (2, 0),
             has_pbo: false,
             has_fence_sync: false,

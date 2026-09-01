@@ -40,6 +40,11 @@ pub struct DeviceCapabilities {
     pub has_partial_update: bool,
     /// Runtime-detected support for compressed texture formats (ETC2/ASTC).
     pub compressed_format_support: crate::compressed_upload::CompressedFormatSupport,
+    /// `GL_KHR_parallel_shader_compile` — `GL_COMPLETION_STATUS_KHR` can be
+    /// queried on a program without stalling on the compile. Without it there
+    /// is no way to ask "is this link done?" that does not block, so the link
+    /// queue drains at the end of the batch instead of across frames.
+    pub has_parallel_shader_compile: bool,
 }
 
 /// Coarse device classification that gates optimisation paths.
@@ -105,6 +110,9 @@ impl DeviceCapabilities {
         let compressed_format_support =
             crate::compressed_upload::CompressedFormatSupport::detect(gl);
 
+        let has_parallel_shader_compile =
+            has_extension(&gl_extensions, "GL_KHR_parallel_shader_compile");
+
         Self {
             gles_version,
             has_pbo,
@@ -115,6 +123,7 @@ impl DeviceCapabilities {
             has_ext_buffer_age,
             has_partial_update,
             compressed_format_support,
+            has_parallel_shader_compile,
         }
     }
 

@@ -515,6 +515,11 @@ pub(crate) struct CanvasManager {
 
     // GL object registries
     pub(crate) programs: HashMap<ProgramId, ProgramMeta>,
+    /// Programs whose `glLinkProgram` has been issued but whose `LINK_STATUS`
+    /// has not been read. Insertion-ordered so a drain reads them in the order
+    /// the content linked them, which is also the order the driver is most
+    /// likely to have finished them in.
+    pub(crate) pending_links: Vec<ProgramId>,
     pub(crate) shaders: HashMap<ShaderId, ShaderMeta>,
     pub(crate) buffers: HashMap<BufferId, BufferMeta>,
     pub(crate) textures: HashMap<TextureId, TextureMeta>,
@@ -1034,6 +1039,7 @@ impl CanvasManager {
             teardown_complete: false,
             native_release_confirmed: false,
             programs: HashMap::with_capacity(16),
+            pending_links: Vec::new(),
             shaders: HashMap::with_capacity(32),
             buffers: HashMap::with_capacity(32),
             textures: HashMap::with_capacity(64),
@@ -1155,6 +1161,32 @@ impl CanvasManager {
         self.evaluate_bypass();
 
         Ok(())
+    }
+
+    /// Record that a program's link was issued and its status not yet read.
+    ///
+    /// Idempotent: a program re-linked before its previous link was drained is
+    /// still exactly one pending entry, and the status read that eventually
+    /// happens describes the most recent link -- which is the only one whose
+    /// binary is still installed.
+    pub(crate) fn mark_link_pending(&mut self, program_id: ProgramId) {
+        if let Some(meta) = self.programs.get_mut(&program_id) {
+            if !meta.link_pending {
+                meta.link_pending = true;
+                self.pending_links.push(program_id);
+            }
+        }
+    }
+
+    /// Drop a program from the pending queue without reading its status.
+    ///
+    /// Used when the program is deleted: the handle is gone, so there is
+    /// nothing to query and nothing worth caching.
+    pub(crate) fn forget_pending_link(&mut self, program_id: ProgramId) {
+        if let Some(meta) = self.programs.get_mut(&program_id) {
+            meta.link_pending = false;
+        }
+        self.pending_links.retain(|id| *id != program_id);
     }
 
     /// Force the next `create_onscreen()` to fully recreate the onscreen EGL

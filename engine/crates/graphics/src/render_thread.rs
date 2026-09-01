@@ -24,6 +24,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::renderergl::link_queue::DrainCause;
 use crate::{
     CanvasHandler, CanvasManager, RendererGL,
     canvas2d_dispatcher::Renderer2d,
@@ -468,6 +469,13 @@ fn execute_gl_batch(
     for cid in &touched_canvases {
         cm.mark_2d_context_stale(cid);
     }
+
+    // Every link this batch issued has now been submitted, so this is the
+    // cheapest point at which the deferred `LINK_STATUS` reads can happen: the
+    // driver has had the whole batch to compile them in parallel. With
+    // `KHR_parallel_shader_compile` the ones still compiling stay queued for a
+    // later batch instead of stalling this one.
+    RendererGL::drain_pending_links(cm, gl, DrainCause::BatchEnd);
 
     // `commands` is a loan from the command pool; it returns itself here.
     batch_hit_onscreen

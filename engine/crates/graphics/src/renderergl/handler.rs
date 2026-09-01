@@ -14,6 +14,7 @@ use crate::ScissorState;
 use crate::backend::gl::state_tracker as st;
 use crate::canvas::gl_object::GlObject;
 use crate::damage_effect::DamageEffect;
+use crate::renderergl::link_queue::{self, DrainCause};
 use crate::webgl_gpu_budget::GpuAllocationError;
 
 #[inline]
@@ -117,6 +118,71 @@ impl RendererGL {
 
     fn current_owner_canvas(cm: &CanvasManager) -> Option<CanvasId> {
         cm.current_canvas_id()
+    }
+
+    /// Read `LINK_STATUS` for the programs whose link was deferred, and offer
+    /// each successfully linked binary to the shader cache.
+    ///
+    /// `cause` decides whether a still-compiling program may be left for a
+    /// later drain; see [`crate::renderergl::link_queue`].
+    pub(crate) fn drain_pending_links(
+        cm: &mut CanvasManager,
+        gl: &glow::Context,
+        cause: DrainCause,
+    ) {
+        if cm.pending_links.is_empty() {
+            return;
+        }
+        let parallel = cm.device_caps.has_parallel_shader_compile;
+
+        // Taken out so the per-program work can borrow `cm` mutably; anything
+        // left pending goes back at the end, in order.
+        let queue = std::mem::take(&mut cm.pending_links);
+        let mut still_pending = Vec::new();
+
+        for program_id in queue {
+            let Some(meta) = cm.programs.get(&program_id) else {
+                continue; // deleted between link and drain
+            };
+            if meta.deleted || !meta.link_pending {
+                continue;
+            }
+            let Some(ph) = meta.gl_handle else {
+                continue;
+            };
+
+            let completion_done = parallel.then(|| unsafe {
+                gl.get_program_parameter_i32(ph, link_queue::COMPLETION_STATUS_KHR) != 0
+            });
+            if link_queue::probe(cause, completion_done) == link_queue::LinkProbe::LeavePending {
+                still_pending.push(program_id);
+                continue;
+            }
+
+            let (vsrc, fsrc) = Self::get_program_shader_sources(cm, meta);
+            let attrib_key = {
+                let mut ab = meta.attrib_bindings.clone();
+                ab.sort();
+                ab.iter()
+                    .map(|(i, n)| format!("{i}={n};"))
+                    .collect::<String>()
+            };
+
+            // This is the stall the deferral existed to move: by now every link
+            // in the batch has been submitted, so the driver has had the whole
+            // batch to work on them in parallel.
+            let link_ok = unsafe { gl.get_program_link_status(ph) };
+            if link_ok {
+                if let (Some(cache), Some(vs), Some(fs)) = (&cm.shader_cache, &vsrc, &fsrc) {
+                    cache.save(gl, ph, vs, fs, &attrib_key);
+                }
+            }
+            if let Some(meta) = cm.programs.get_mut(&program_id) {
+                meta.link_pending = false;
+            }
+        }
+
+        cm.pending_links = still_pending;
     }
 
     /// Look up the vertex and fragment shader sources for a program's
@@ -618,6 +684,7 @@ impl RendererGL {
                                     deleted: false,
                                     attached_shaders: Vec::new(),
                                     attrib_bindings: Vec::new(),
+                                    link_pending: false,
                                 },
                             );
                         }
@@ -663,16 +730,15 @@ impl RendererGL {
 
                             if !cache_hit {
                                 unsafe { gl.link_program(ph) };
-
-                                // Save to cache on successful link (best-effort).
-                                let link_ok = unsafe { gl.get_program_link_status(ph) };
-                                if link_ok {
-                                    if let (Some(cache), Some(vs), Some(fs)) =
-                                        (&cm.shader_cache, &vsrc, &fsrc)
-                                    {
-                                        cache.save(gl, ph, vs, fs, &attrib_key);
-                                    }
-                                }
+                                // Deliberately NOT reading LINK_STATUS here.
+                                // That read is what blocks on the driver's
+                                // compile, and reading it now serialises a
+                                // startup burst of links into one-at-a-time.
+                                // The queue is drained at the end of the batch
+                                // (or earlier if the content asks), which is
+                                // where the cache save happens instead.
+                                // See `renderergl::link_queue`.
+                                cm.mark_link_pending(program_id);
                             }
                         }
                     }
@@ -740,6 +806,13 @@ impl RendererGL {
                     return Ok(DamageEffect::NoDamage);
                 };
 
+                if pname == glow::LINK_STATUS || pname == glow::INFO_LOG_LENGTH {
+                    // The answer is only available by stalling, so this is the
+                    // moment the deferred read has to happen -- and the cache
+                    // save that rides along with it.
+                    Self::drain_pending_links(cm, gl, DrainCause::ContentAsked);
+                }
+
                 let v: i32 = unsafe {
                     match pname {
                         glow::LINK_STATUS => {
@@ -760,6 +833,8 @@ impl RendererGL {
 
             GLCmd::GetProgramInfoLog { program_id, resp } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
+                // An info log is only meaningful once the link has finished.
+                Self::drain_pending_links(cm, gl, DrainCause::ContentAsked);
                 if let Some(meta) = cm.programs.get(&program_id) {
                     if meta.deleted {
                         let _ = resp.send(Ok(None));
@@ -783,6 +858,10 @@ impl RendererGL {
             }
 
             GLCmd::DeleteProgram { program_id } => {
+                // The handle is about to go: there is nothing left to query and
+                // nothing worth caching, so drop the queue entry rather than
+                // letting a later drain look up a dead program.
+                cm.forget_pending_link(program_id);
                 if let Some(mut meta) = cm.programs.remove(&program_id) {
                     // Drop the binding shadow and this program's cached uniform
                     // values, so a client that reuses the name does not inherit

@@ -1531,6 +1531,12 @@ pub(crate) struct ProgramMeta {
     /// re-links) loads a stale cached binary with the wrong locations, and
     /// every vertex attribute reads the wrong stream.
     pub attrib_bindings: Vec<(u32, String)>,
+    /// `glLinkProgram` has been issued and nobody has read `LINK_STATUS` yet.
+    ///
+    /// The read is what blocks, so it is deferred until either the content asks
+    /// or the batch ends -- see `renderergl::link_queue`. While this is set the
+    /// program's binary has not been offered to the shader cache.
+    pub link_pending: bool,
 }
 
 #[derive(Debug)]
