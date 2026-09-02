@@ -1694,6 +1694,9 @@ dependencies = [
 [[package]]
 name = "migo-capi-abi"
 version = "0.9.6"
+dependencies = [
+ "migo-frame-wire",
+]
 
 [[package]]
 name = "migo-contention-probe"

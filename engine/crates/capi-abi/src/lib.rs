@@ -2,6 +2,7 @@
 
 pub mod callbacks;
 pub mod config;
+pub mod external_frames;
 mod header;
 pub mod input;
 pub mod surface;
