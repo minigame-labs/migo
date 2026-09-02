@@ -219,6 +219,11 @@ const LOW_MEMORY_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
 /// their larger cap until their own next canvas create or destroy. The overshoot is
 /// bounded by what those contexts had already been granted.
 #[inline]
+/// The resource-count cap that goes with [`per_ctx_resource_cache_bytes`].
+pub(crate) fn skia_max_resources() -> usize {
+    SKIA_RESOURCE_CACHE_MAX_RESOURCES
+}
+
 pub(crate) fn per_ctx_resource_cache_bytes() -> usize {
     per_ctx_share(SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }

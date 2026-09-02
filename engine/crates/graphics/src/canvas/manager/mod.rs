@@ -1247,6 +1247,17 @@ impl CanvasManager {
                         "shared 2D context: GrDirectContext creation failed",
                     )
                 })?;
+            // The shared context is one context serving many surfaces, so it
+            // takes a whole context's share of the Skia budget -- not a
+            // per-canvas slice, and not Skia's own default, which is what it
+            // got until this call existed. `LiveContextCount` deliberately does
+            // not count canvases that share it, so the divisor stays the number
+            // of contexts.
+            let mut gr_ctx = gr_ctx;
+            gr_ctx.set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
+                max_resources: crate::backend::gl::surface::skia_max_resources(),
+                max_resource_bytes: crate::backend::gl::surface::per_ctx_resource_cache_bytes(),
+            });
             let ctx_tag = crate::backend::gl::surface::alloc_shared_ctx_tag();
             tracing::info!("Canvas2D shared offscreen GrDirectContext created");
             self.shared_2d = Some(Shared2DContext {
