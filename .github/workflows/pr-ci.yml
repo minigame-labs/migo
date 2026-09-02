@@ -396,6 +396,15 @@ jobs:
       - name: OpenHarmony API floor declaration contract
         run: bash scripts/test-ohos-api-floor-declaration-contract.sh
 
+      # Two Apple numbers that look like one: the deployment target the binary
+      # loads on, and the lowest OS a given runtime lane is eligible for. The
+      # superseded design collapsed them and paid user coverage for a build
+      # simplification. This also sweeps the tree so the consumer added later
+      # cannot quietly carry its own copy -- the check that survives, since the
+      # per-file checks only see the consumers that exist today.
+      - name: Apple deployment floor contract
+        run: bash scripts/test-apple-deployment-floor-contract.sh
+
       - name: OpenHarmony host and package metadata contracts
         run: |
           bash scripts/test-ohos-host-contract.sh

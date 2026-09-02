@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "The single source for every Apple deployment target and lane minimum.",
+    "Every consumer derives from this file; scripts/test-apple-deployment-floor-contract.sh",
+    "fails the build when one of them carries its own copy of a number.",
+    "",
+    "Two different decisions live here and must not be collapsed:",
+    "  deployment_target - the lowest OS the shipped binary loads and runs on.",
+    "  lanes.*.min_os    - the lowest OS on which a given runtime lane is even",
+    "                      eligible. A user below a lane minimum is not a user",
+    "                      who cannot run Migo; they run a lane that does not",
+    "                      need what they lack.",
+    "Collapsing them is what the superseded v3 design did: it raised the",
+    "deployment target to iOS 17 to buy a single memory tier, and paid 2.4",
+    "points of user coverage for a build simplification.",
+    "",
+    "Reasoning: docs/apple-final-implementation-plan.md section 4."
+  ],
+  "platforms": {
+    "ios": {
+      "deployment_target": "15.0",
+      "swiftpm_platform": ".iOS(.v15)",
+      "xcode_variable": "IPHONEOS_DEPLOYMENT_TARGET",
+      "reason": "The lowest target the current Xcode can still upload to App Store Connect. Nothing below this can be shipped at all, so the floor is set by the toolchain rather than chosen.",
+      "coverage_note": "Approximately 99.5% of iOS devices in service. Every API above this floor is weak-linked and capability-gated."
+    },
+    "macos": {
+      "deployment_target": "11.0",
+      "swiftpm_platform": ".macOS(.v11)",
+      "xcode_variable": "MACOSX_DEPLOYMENT_TARGET",
+      "reason": "The lowest target that still supports the aarch64-apple-darwin Rust target. Raising it to 13 was considered and rejected: the only thing it buys is dropping the CVDisplayLink branch, and that branch is needed up to macOS 13 anyway, so the purchase is nothing and the price is coverage."
+    }
+  },
+  "lanes": {
+    "ios_webkit_full": {
+      "min_os": "15.0",
+      "platform": "ios",
+      "reason": "The compatibility and safety baseline. It has no requirement the deployment floor does not already meet, so it is available to every user who can install at all."
+    },
+    "ios_performance_plus": {
+      "min_os": "15.2",
+      "platform": "ios",
+      "reason": "SharedArrayBuffer behind crossOriginIsolated is what makes the synchronous readPixels/getImageData path possible at all, and WebKit gated it on 15.2. On 15.0 and 15.1 the lane is not slower, it is structurally impossible.",
+      "additional_requirements": [
+        "A runtime probe confirming crossOriginIsolated and a working Atomics.wait round trip. The OS version is necessary, not sufficient.",
+        "Device memory tier: see contracts/apple/profile-policy.json once the policy lands."
+      ]
+    },
+    "macos_v8_native": {
+      "min_os": "11.0",
+      "platform": "macos",
+      "reason": "In-process V8 with JIT. Requires the com.apple.security.cs.allow-jit entitlement to be present and the signature to validate; a signing failure selects a fallback lane rather than lowering this floor."
+    }
+  }
+}
