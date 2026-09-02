@@ -24,6 +24,27 @@ MigoGLX 针对的是 **Emscripten 导出**：JS glue 是 WASM 和 WebGL 之间�
 正确用法是：拿这里的每调用成本 × 真实内容的每帧调用数，再和帧预算比。
 现有的 bunnymark / endless-runner 已经能给出后者的量级。
 
+## 2026-09-02 的进展与两个先于性能的发现
+
+emsdk 装成过一次，`src/main.c` **编译成功并在 Migo 上跑到了 `main()`**
+（13.6 KB wasm + 26.4 KB glue）。在拿到 glue 性能数字之前，先撞上两件事——
+**它们都不是 MigoGLX 能解决的问题，而是任何 Unity/Emscripten 导出会首先遇到的兼容地板**：
+
+1. **Emscripten 用 `fetch` / `XHR` 加载自己的 `.wasm`，Migo 两个都没有。**
+   原样导出直接 abort：`both async and sync fetching of the wasm failed`。
+   本 fixture 用 `-sSINGLE_FILE=1` 绕开（wasm 内嵌成 data URI）——**这对测每调用成本
+   没问题，对测启动是错的**：base64 解码取代了流式编译。
+2. **Emscripten 用 `document.querySelector('#canvas')` 找渲染目标，Migo 没有 DOM。**
+   但 Migo 的 canvas 暴露了 `getContext`，而那正是 Emscripten GL 层唯一真正调用的东西，
+   所以一个两方法的 `document` 替身就够（见 `shim.js`）。
+
+**这个次序对项目决策有意义**：MigoGLX 是关于 glue 有多快的；而在它之前，
+导出连载入和拿到画布都做不到。先解决地板，再谈天花板。
+
+之后 emsdk 的续装与 API 33 镜像都被网络反复打断（emsdk 三次、镜像两次），
+`upstream/` 被清空且下载缓存已删，当晚未能重建。**测量本身没有做完**，
+装置、shim 与上述两条发现都已就位，网络正常的会话可以直接接着跑。
+
 ## 构建
 
 ```bash
