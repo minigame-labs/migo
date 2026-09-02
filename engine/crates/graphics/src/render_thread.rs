@@ -395,10 +395,38 @@ fn execute_canvas_batch(
     // The borrow is a value, so this cannot be skipped without the compiler
     // noticing an unused `#[must_use]` — the pairing is no longer a convention.
     if let Some(borrow) = scissor_borrow {
-        debug_assert!(
-            cm.current_canvas_id() == Some(canvas_id),
-            "restore_scissor target mismatch: expected canvas {canvas_id:?} to be current"
-        );
+        // `restore_scissor` issues raw GL against whatever context is current
+        // and writes this canvas's shadow to match. Restoring with the wrong
+        // context current would set scissor on one context while recording it
+        // for another -- both wrong, and invisible.
+        //
+        // This was a `debug_assert`, which is exactly the wrong instrument: the
+        // invariant is broken by *binding* decisions, and binding differs
+        // between configurations, so the one build that can violate it is the
+        // one the assertion is compiled out of. Shared-context Canvas2D broke it
+        // and only a host fixture noticed. Re-establish instead of asserting.
+        if cm.current_canvas_id() != Some(canvas_id) {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    ?canvas_id,
+                    "scissor restore had to rebind its canvas; reported once"
+                );
+            }
+            if cm.make_current_needed(canvas_id).is_err() {
+                // Cannot reach the context the borrow belongs to. Restoring
+                // against another one would corrupt both, so drop the restore
+                // and poison the shadow: the next draw re-establishes scissor
+                // from scratch rather than trusting a record we never applied.
+                cm.gl_state.entry(canvas_id).or_default().last_scissor_rect = None;
+                tracing::warn!(
+                    ?canvas_id,
+                    "scissor restore skipped: its canvas could not be made current"
+                );
+                return batch_dirty;
+            }
+        }
         let state = cm.gl_state.entry(canvas_id).or_default();
         dirty_region::restore_scissor(gl, state, borrow);
     }
