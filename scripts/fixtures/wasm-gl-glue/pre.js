@@ -31,4 +31,33 @@ Module["preRun"].push(function () {
     } catch (e) {
         console.error("[pre] getContext threw: " + e);
     }
+    // Ask GL.createContext itself why it refuses: findCanvasEventTarget
+    // succeeds (the document stand-in returns the canvas), so the failure is
+    // downstream of target resolution.
+    // Emscripten wraps `getContext` to work around a Safari bug, and the
+    // wrapper decides which version it got with
+    // `gl instanceof WebGLRenderingContext`. Migo exposes no such global
+    // constructor, so the check is false for a perfectly good context and
+    // `createContext` returns 0. Give it a constructor whose prototype the
+    // WebGL1 context is not on, so `instanceof` answers correctly for both.
+    {
+        const g2 = __migoCanvas.getContext("webgl2");
+        console.error("[pre] WebGLRenderingContext global? "
+            + (typeof globalThis.WebGLRenderingContext)
+            + "; WebGL2RenderingContext? " + (typeof globalThis.WebGL2RenderingContext)
+            + "; webgl2 ctx instanceof WebGLRenderingContext = "
+            + (typeof globalThis.WebGLRenderingContext !== "undefined"
+                ? (g2 instanceof globalThis.WebGLRenderingContext) : "n/a")
+            + "; ctor=" + (g2 && g2.constructor && g2.constructor.name));
+    }
+    if (typeof globalThis.WebGLRenderingContext === "undefined") {
+        globalThis.WebGLRenderingContext = function WebGLRenderingContext() {};
+        console.error("[pre] installed a WebGLRenderingContext stand-in");
+    }
+    if (typeof GL !== "undefined" && GL.createContext) {
+        const h = GL.createContext(__migoCanvas, { majorVersion: 2, minorVersion: 0 });
+        console.error("[pre] GL.createContext => " + h);
+    } else {
+        console.error("[pre] GL not visible from preRun");
+    }
 });

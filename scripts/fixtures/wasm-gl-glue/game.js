@@ -21,8 +21,11 @@
   // version they report doesn't seem to be useful.
   if (typeof process !== 'undefined' && !process.versions?.bun && typeof Deno == "undefined") {
     var currentNodeVersion = process.versions?.node ? humanReadableVersionToPacked(process.versions.node) : TARGET_NOT_SUPPORTED;
-    if (currentNodeVersion < 180300) {
-      throw new Error(`This emscripten-generated code requires node v${ packedVersionToHumanReadable(180300) } (detected v${packedVersionToHumanReadable(currentNodeVersion)})`);
+    if (currentNodeVersion < TARGET_NOT_SUPPORTED) {
+      throw new Error('not compiled for this environment (did you build to HTML and try to run it not on the web, or set ENVIRONMENT to something - like node - and run it someplace else - like on the web?)');
+    }
+    if (currentNodeVersion < 2147483647) {
+      throw new Error(`This emscripten-generated code requires node v${ packedVersionToHumanReadable(2147483647) } (detected v${packedVersionToHumanReadable(currentNodeVersion)})`);
     }
   }
 
@@ -110,6 +113,35 @@ Module["preRun"].push(function () {
     } catch (e) {
         console.error("[pre] getContext threw: " + e);
     }
+    // Ask GL.createContext itself why it refuses: findCanvasEventTarget
+    // succeeds (the document stand-in returns the canvas), so the failure is
+    // downstream of target resolution.
+    // Emscripten wraps `getContext` to work around a Safari bug, and the
+    // wrapper decides which version it got with
+    // `gl instanceof WebGLRenderingContext`. Migo exposes no such global
+    // constructor, so the check is false for a perfectly good context and
+    // `createContext` returns 0. Give it a constructor whose prototype the
+    // WebGL1 context is not on, so `instanceof` answers correctly for both.
+    {
+        const g2 = __migoCanvas.getContext("webgl2");
+        console.error("[pre] WebGLRenderingContext global? "
+            + (typeof globalThis.WebGLRenderingContext)
+            + "; WebGL2RenderingContext? " + (typeof globalThis.WebGL2RenderingContext)
+            + "; webgl2 ctx instanceof WebGLRenderingContext = "
+            + (typeof globalThis.WebGLRenderingContext !== "undefined"
+                ? (g2 instanceof globalThis.WebGLRenderingContext) : "n/a")
+            + "; ctor=" + (g2 && g2.constructor && g2.constructor.name));
+    }
+    if (typeof globalThis.WebGLRenderingContext === "undefined") {
+        globalThis.WebGLRenderingContext = function WebGLRenderingContext() {};
+        console.error("[pre] installed a WebGLRenderingContext stand-in");
+    }
+    if (typeof GL !== "undefined" && GL.createContext) {
+        const h = GL.createContext(__migoCanvas, { majorVersion: 2, minorVersion: 0 });
+        console.error("[pre] GL.createContext => " + h);
+    } else {
+        console.error("[pre] GL not visible from preRun");
+    }
 });
 // end include: pre.js
 
@@ -124,13 +156,6 @@ var quit_ = (status, toThrow) => {
 // before the page load. In non-MODULARIZE modes generate it here.
 var _scriptName = globalThis.document?.currentScript?.src;
 
-if (typeof __filename != 'undefined') { // Node
-  _scriptName = __filename;
-} else
-if (ENVIRONMENT_IS_WORKER) {
-  _scriptName = self.location.href;
-}
-
 // `/` should be present at the end if `scriptDirectory` is not empty
 var scriptDirectory = '';
 function locateFile(path) {
@@ -143,51 +168,55 @@ function locateFile(path) {
 // Hooks that are implemented differently in different runtime environments.
 var readAsync, readBinary;
 
-if (ENVIRONMENT_IS_NODE) {
-  const isNode = globalThis.process?.versions?.node && globalThis.process?.type != 'renderer';
-  if (!isNode) throw new Error('not compiled for this environment (did you build to HTML and try to run it not on the web, or set ENVIRONMENT to something - like node - and run it someplace else - like on the web?)');
+if (ENVIRONMENT_IS_SHELL) {
 
-  // These modules will usually be used on Node.js. Load them eagerly to avoid
-  // the complexity of lazy-loading.
-  var fs = require('node:fs');
-
-  scriptDirectory = __dirname + '/';
-
-// include: node_shell_read.js
-readBinary = (filename) => {
-  // We need to re-wrap `file://` strings to URLs.
-  filename = isFileURI(filename) ? new URL(filename) : filename;
-  var ret = fs.readFileSync(filename);
-  assert(Buffer.isBuffer(ret));
-  return ret;
-};
-
-readAsync = async (filename, binary = true) => {
-  // See the comment in the `readBinary` function.
-  filename = isFileURI(filename) ? new URL(filename) : filename;
-  var ret = fs.readFileSync(filename, binary ? undefined : 'utf8');
-  assert(binary ? Buffer.isBuffer(ret) : typeof ret == 'string');
-  return ret;
-};
-// end include: node_shell_read.js
-  if (process.argv.length > 1) {
-    thisProgram = process.argv[1].replace(/\\/g, '/');
-  }
-
-  programArgs = process.argv.slice(2);
-
-  // MODULARIZE will export the module in the proper place outside, we don't need to export here
-  if (typeof module != 'undefined') {
-    module['exports'] = Module;
-  }
-
-  quit_ = (status, toThrow) => {
-    process.exitCode = status;
-    throw toThrow;
+  readBinary = (f) => {
+    if (globalThis.readbuffer) {
+      return new Uint8Array(readbuffer(f));
+    }
+    let data = read(f, 'binary');
+    assert(typeof data == 'object');
+    return data;
   };
 
-} else
-if (ENVIRONMENT_IS_SHELL) {
+  readAsync = async (f) => readBinary(f);
+
+  globalThis.clearTimeout ??= (id) => {};
+
+  // v8 and jsc both use `arguments`. spidermonkey uses `scriptArgs`
+  programArgs = globalThis.arguments ?? globalThis.scriptArgs;
+
+  if (globalThis.quit) {
+    quit_ = (status, toThrow) => {
+      // Unlike node which has process.exitCode, d8 has no such mechanism. So we
+      // have no way to set the exit code and then let the program exit with
+      // that code when it naturally stops running (say, when all setTimeouts
+      // have completed). For that reason, we must call `quit` - the only way to
+      // set the exit code - but quit also halts immediately.  To increase
+      // consistency with node (and the web) we schedule the actual quit call
+      // using a setTimeout to give the current stack and any exception handlers
+      // a chance to run.  This enables features such as addOnPostRun (which
+      // expected to be able to run code after main returns).
+      setTimeout(() => {
+        if (!(toThrow instanceof ExitStatus)) {
+          let toLog = toThrow;
+          if (toThrow && typeof toThrow == 'object' && toThrow.stack) {
+            toLog = [toThrow, toThrow.stack];
+          }
+          err(`exiting due to exception: ${toLog}`);
+        }
+        quit(status);
+      });
+      throw toThrow;
+    };
+  }
+
+  if (globalThis.print) {
+    // Use `print` to implement console.log/error/warn as needed.
+    globalThis.console ??= /** @type{!Console} */({});
+    console.log ??= /** @type{!function(this:Console, ...*): undefined} */ (print);
+    console.warn ??= console.error ??= /** @type{!function(this:Console, ...*): undefined} */ (globalThis.printErr ?? print);
+  }
 
 } else
 
@@ -206,37 +235,8 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
 
   {
 // include: web_or_worker_shell_read.js
-if (ENVIRONMENT_IS_WORKER) {
-    readBinary = (url) => {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', url, false);
-      xhr.responseType = 'arraybuffer';
-      xhr.send(null);
-      return new Uint8Array(/** @type{!ArrayBuffer} */(xhr.response));
-    };
-  }
-
-  readAsync = async (url) => {
-    // Fetch has some additional restrictions over XHR, like it can't be used on a file:// url.
-    // See https://github.com/github/fetch/pull/92#issuecomment-140665932
-    // Cordova or Electron apps are typically loaded from a file:// url.
-    // So use XHR on webview if URL is a file URL.
-    if (isFileURI(url)) {
-      return new Promise((resolve, reject) => {
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', url, true);
-        xhr.responseType = 'arraybuffer';
-        xhr.onload = () => {
-          if (xhr.status == 200 || (xhr.status == 0 && xhr.response)) { // file URLs can return 0
-            resolve(xhr.response);
-            return;
-          }
-          reject(xhr.status);
-        };
-        xhr.onerror = reject;
-        xhr.send(null);
-      });
-    }
+readAsync = async (url) => {
+    assert(!isFileURI(url), "readAsync does not work with file:// URLs");
     var response = await fetch(url, { credentials: 'same-origin' });
     if (response.ok) {
       return response.arrayBuffer();
@@ -266,7 +266,9 @@ var NODEFS = 'NODEFS is no longer included by default; build with -lnodefs.js';
 // perform assertions in shell.js after we set up out() and err(), as otherwise
 // if an assertion fails it cannot print the message
 
-assert(!ENVIRONMENT_IS_SHELL, 'shell environment detected but not enabled at build time (add `shell` to `-sENVIRONMENT` to enable)');
+assert(!ENVIRONMENT_IS_WORKER, 'worker environment detected but not enabled at build time (add `worker` to `-sENVIRONMENT` to enable)');
+
+assert(!ENVIRONMENT_IS_NODE, 'node environment detected but not enabled at build time (add `node` to `-sENVIRONMENT` to enable)');
 
 // end include: shell.js
 
@@ -822,7 +824,6 @@ async function createWasm() {
       warnOnce.shown ||= {};
       if (!warnOnce.shown[text]) {
         warnOnce.shown[text] = 1;
-        if (ENVIRONMENT_IS_NODE) text = 'warning: ' + text;
         err(text);
       }
     };
@@ -1012,8 +1013,6 @@ async function createWasm() {
           if (globalThis.scheduler) {
             // Some modern browsers implement scheduler.postTask, but not all.
             MainLoop.setImmediate = scheduler.postTask.bind(scheduler);
-          } else if (globalThis.setImmediate) {
-            MainLoop.setImmediate = setImmediate;
           } else {
             // Emulate setImmediate. (note: not a complete polyfill, we don't emulate clearImmediate() to keep code size to minimum, since not needed)
             var setImmediates = [];
@@ -1582,7 +1581,7 @@ async function createWasm() {
   var specialHTMLTargets = [0, globalThis.document ?? 0, globalThis.window ?? 0];
   var findEventTarget = (target) => {
       target = maybeCStringToJsString(target);
-      var domElement = specialHTMLTargets[target] || globalThis.document?.querySelector(target);
+      var domElement = specialHTMLTargets[target] || document.querySelector(target);
       return domElement;
     };
   var findCanvasEventTarget = findEventTarget;
@@ -2157,6 +2156,7 @@ Module['FS_createPreloadedFile'] = FS.createPreloadedFile;
   'ydayFromDate',
   'arraySum',
   'addDays',
+  'base64Decode',
   'getSocketFromFD',
   'getSocketAddress',
   'FS_createPreloadedFile',

@@ -2797,6 +2797,39 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
 // GL batch flush is now handled by the unified frame-end hook in
 // 02_2d_context.js (op_frame_end_unified). No separate GL hook needed.
 
+// `WebGL2RenderingContext extends WebGLRenderingContext` is an implementation
+// convenience -- WebGL2 really is a superset and sharing the method table is the
+// right call. But the WebIDL says the two interfaces are *siblings*: in a
+// browser `gl2 instanceof WebGLRenderingContext` is **false**, and code relies
+// on that to tell the versions apart.
+//
+// Emscripten does exactly this. To work around a Safari bug it wraps
+// `canvas.getContext` and validates the result with
+// `(ver == 'webgl') == (gl instanceof WebGLRenderingContext)`. With plain
+// prototype inheritance that reads `false == true` for a perfectly good WebGL2
+// context, so the wrapper returns null and `emscripten_webgl_create_context`
+// returns 0. The symptom is "no WebGL2 context" from content that is not
+// wrong -- every Unity/Emscripten export using WebGL2 hits it, and nothing in
+// the engine logs anything.
+//
+// So keep the inheritance and correct the *observable* relation: a WebGL2
+// context is not an instance of WebGLRenderingContext, exactly as the IDL says.
+// Written with `isPrototypeOf`, never `instanceof`: `WebGL2RenderingContext`
+// *inherits* this very trap from its base, so an `instanceof` inside it
+// recurses until the stack ends (observed: "Maximum call stack size exceeded"
+// before any frame rendered). `WebGL2RenderingContext` also gets its own trap
+// so it does not answer through this one.
+Object.defineProperty(WebGLRenderingContext, Symbol.hasInstance, {
+    value: (instance) =>
+        WebGLRenderingContext.prototype.isPrototypeOf(instance)
+        && !WebGL2RenderingContext.prototype.isPrototypeOf(instance),
+    configurable: true,
+});
+Object.defineProperty(WebGL2RenderingContext, Symbol.hasInstance, {
+    value: (instance) => WebGL2RenderingContext.prototype.isPrototypeOf(instance),
+    configurable: true,
+});
+
 export {
     WebGLRenderingContext,
     WebGL2RenderingContext,
