@@ -38,6 +38,20 @@ emsdk 装成过一次，`src/main.c` **编译成功并在 Migo 上跑到了 `mai
    但 Migo 的 canvas 暴露了 `getContext`，而那正是 Emscripten GL 层唯一真正调用的东西，
    所以一个两方法的 `document` 替身就够（见 `shim.js`）。
 
+### 四层地板里，只有一层是引擎的
+
+排查到底一共四层，**但它们的归属不同**：
+
+| # | 地板 | 归属 |
+|---|---|---|
+| 1 | `fetch`/`XHR` 载 `.wasm` | **adapter**（`migo.*` 是引擎唯一能力面，网络 API 属 adapter） |
+| 2 | `document.querySelector('#canvas')` | **adapter**（引擎里没有也不该有 `document`） |
+| 3 | Emscripten 判 Migo 为 "shell" 环境 | **构建参数**（`-sENVIRONMENT=web,shell`），双方都不用改 |
+| 4 | `gl2 instanceof WebGLRenderingContext` 返回 `true` | 🔴 **引擎**——违反 WebIDL，已修 |
+
+前三层是「宿主要给什么」，第四层是「引擎给错了什么」。只有第四层是缺陷，
+已修并由 `migo-conformance/tests/webgl-context-identity` 钉住（真机 92/92）。
+
 **这个次序对项目决策有意义**：MigoGLX 是关于 glue 有多快的；而在它之前，
 导出连载入和拿到画布都做不到。先解决地板，再谈天花板。
 
