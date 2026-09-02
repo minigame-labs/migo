@@ -5,8 +5,8 @@ Lane 1: `WKWebView` runs the content's JavaScript and WebKit renders it.
 Most of this lane already exists outside this directory. The content-facing
 surface is `migo-web-adapter`, which maps `migo.*` onto a DOM canvas and is
 already shipped for the web. What is left here is the host side: the
-`wx.*`/`migo.*` low-frequency bridge for platform capability, permissions,
-payment and files; the WebView lifecycle; per-game origin, CSP, navigation
+`migo.*` low-frequency bridge for platform capability, permissions, payment and
+files; the WebView lifecycle; per-game origin, CSP, navigation
 policy, permission allowlist and storage quota; and recovery from
 `webViewWebContentProcessDidTerminate:` as a new runtime generation rather than
 as an ordinary navigation failure.

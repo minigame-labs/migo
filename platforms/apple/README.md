@@ -36,10 +36,11 @@ renderer it will never drive.
 
 There is no fourth product. In-process JavaScriptCore was evaluated and
 rejected: the JIT boundary on iOS is the process, so an in-process engine is
-the interpreted-only tier that WeChat measured at 13 FPS against 49 for the
-same content out of process. Its only wins are package size and one fewer
-process, and `MigoAppleWebKit` already serves the light content that would have
-been its audience at zero additional cost.
+the interpreted-only tier. Published measurements from the largest shipping
+mini-game host put the same content at 13 FPS in-process against 49 out of
+process. Its only wins are package size and one fewer process, and
+`MigoAppleWebKit` already serves the light content that would have been its
+audience at zero additional cost.
 
 ## Why iOS needs a native surface at all
 

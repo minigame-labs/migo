@@ -1,0 +1,21 @@
+[package]
+name = "migo-frame-wire"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+[lib]
+name = "frame_wire"
+
+[features]
+# The packet builder. Off by default so the shipping crate contains only the
+# reader: the encoder that matters in production is JavaScript in another
+# process, and a Rust encoder linked into the consumer is a second definition
+# of the format sitting inside the thing that validates it.
+test-support = []
+
+# Deliberately almost dependency-free. This crate reads bytes produced by
+# content JavaScript running in another process; every dependency it takes is
+# another thing inside the parser's trust boundary.
+[dependencies]
+crc32fast = "1"

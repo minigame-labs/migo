@@ -1,0 +1,7 @@
+{
+  "cases": [
+    { "name": "minimal-present", "bytes": 80, "sha256": "556fbd2aef7f6b41bf9864552dce50b18c666a0f4cbe40479710cfd7e92329b9", "accepted": true },
+    { "name": "typical-frame", "bytes": 248, "sha256": "a332b3d6db4feb760781686fe9614dba674923b4936bb766cf222b2e9a8a3126", "accepted": true },
+    { "name": "continued-no-present", "bytes": 112, "sha256": "8a3e0f2b2ebc99c36b95e618dc3d94b2f011036cb5b4c7d651431d595e23a5dd", "accepted": true }
+  ]
+}
