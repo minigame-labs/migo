@@ -262,11 +262,28 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
         // SAFETY: `cm.gl` is not mutated for the duration of this block, and
         // the guard drops before `cm` is used mutably again.
         let _gl_scope = unsafe { begin_canvas2d_gl_scope(&*gl_ref, None) };
-        // Any one of them submits the context they all share.
-        if let Some(first) = shared_ids.first()
-            && let Some(ctx) = cm.contexts_2d.get_mut(first)
-        {
-            ctx.flush_and_submit();
+        // Submit per canvas, invalidate once for the group.
+        //
+        // The two halves have opposite best shapes and the earlier versions of
+        // this got each one wrong in turn. `reset_gl_state` discards the whole
+        // context's cached GL state, so doing it per canvas made every canvas
+        // after the first redraw from a cache its predecessor had just thrown
+        // away. But collapsing the *submit* to one call per frame was worse in
+        // a different way: all 240 render passes then reach the driver only
+        // after the last canvas is recorded, so the GPU idles through the whole
+        // recording phase. Measured at 240 canvases on a Mate 30 Pro: same CPU
+        // (116% vs 118%), 22 fps against 25 -- a pipelining loss, not a CPU one.
+        //
+        // So: submit as each canvas finishes, which is what lets the GPU start
+        // early, and invalidate once at the end because the only thing that
+        // dirties this context behind Skia's back is the scope guard's restore
+        // on drop.
+        for id in &shared_ids {
+            if let Some(ctx) = cm.contexts_2d.get_mut(id) {
+                ctx.flush_and_submit();
+            }
+        }
+        if let Some(ctx) = cm.contexts_2d.get_mut(&group_head) {
             ctx.reset_gl_state();
         }
         flushed_ids.extend_from_slice(&shared_ids);
