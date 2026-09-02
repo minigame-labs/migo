@@ -234,7 +234,47 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
 
     let dirty_ids: Vec<CanvasId> = cm.dirty_2d.drain().collect();
     let mut flushed_ids = Vec::with_capacity(dirty_ids.len());
+
+    // Canvases that share one `GrDirectContext` are flushed as a group, once.
+    //
+    // Everything the per-canvas loop below does is per-*context* work wearing a
+    // per-canvas name: `flush_and_submit` submits the whole `GrDirectContext`,
+    // `reset_gl_state` discards that context's entire cached GL state, and the
+    // scope guard reads back five raw GL bindings. Run once per canvas on a
+    // shared context, 80 canvases means 80 full submits and 80 state
+    // invalidations per frame -- so every canvas after the first redraws from a
+    // cache another canvas just threw away. Measured on a Mate 30 Pro, that is
+    // what turned an 80-canvas frame from 60 fps into 54.
+    //
+    // Grouping is not an optimisation of the sharing; it is what sharing means.
+    let shared_ids: Vec<CanvasId> = dirty_ids
+        .iter()
+        .copied()
+        .filter(|id| cm.canvas_uses_shared_2d(*id))
+        .collect();
+    if !shared_ids.is_empty() {
+        cm.bind_shared_2d_context()?;
+        // No dedup shadow: the shadow exists so a WebGL batch cannot serve
+        // state Skia changed, and nothing but offscreen 2D drawing ever binds
+        // this context. See `CanvasManager::bind_shared_2d_context`.
+        let gl_ref = &*cm.gl as *const glow::Context;
+        // SAFETY: `cm.gl` is not mutated for the duration of this block, and
+        // the guard drops before `cm` is used mutably again.
+        let _gl_scope = unsafe { begin_canvas2d_gl_scope(&*gl_ref, None) };
+        // Any one of them submits the context they all share.
+        if let Some(first) = shared_ids.first()
+            && let Some(ctx) = cm.contexts_2d.get_mut(first)
+        {
+            ctx.flush_and_submit();
+            ctx.reset_gl_state();
+        }
+        flushed_ids.extend_from_slice(&shared_ids);
+    }
+
     for id in dirty_ids {
+        if cm.canvas_uses_shared_2d(id) {
+            continue; // flushed as part of the shared group above
+        }
         if !cm.contexts_2d.contains_key(&id) {
             continue;
         }
