@@ -57,12 +57,35 @@ pub(super) fn init_skia_for_canvas(
             ),
         }
     };
+    let entry_is_onscreen = {
+        let entry = cm
+            .canvases
+            .get(&canvas_id)
+            .expect("looked up on the line above");
+        entry.info.is_onscreen
+    };
 
-    // Scoped so the immutable borrow for the loader ends before `cm` is used
-    // mutably below. Skia resolves its GL entry points through the same EGL
-    // implementation this manager was built with, rather than through whichever
-    // one Skia itself linked.
-    let created = {
+    // An offscreen canvas can share one `GrDirectContext` with every other
+    // offscreen canvas instead of owning one. That context is 96% of what an
+    // offscreen canvas costs in `Graphics` -- 4.66 MB of 4.86 MB, measured; see
+    // `docs/performance/android/multicanvas-fixed-cost.md`.
+    //
+    // Only offscreen. The onscreen canvas renders into the DrawingBuffer FBO
+    // that the present blit reads, and it is one canvas, so it has nothing to
+    // share with and everything to lose from being moved off its own context.
+    let share_offscreen = !entry_is_onscreen
+        && shared::feature_policy::is_enabled(
+            shared::feature_policy::FeatureKey::CanvasSharedDirectContext,
+        );
+
+    let created = if share_offscreen {
+        let (gr_ctx, interface, ctx_tag) = cm.bind_shared_2d_context(canvas_id)?;
+        Canvas2DContext::new_shared_offscreen(&gr_ctx, interface, width, height, ctx_tag)
+    } else {
+        // Scoped so the immutable borrow for the loader ends before `cm` is used
+        // mutably below. Skia resolves its GL entry points through the same EGL
+        // implementation this manager was built with, rather than through whichever
+        // one Skia itself linked.
         let load_gl = |symbol: &str| cm.gl_proc_address(symbol);
         Canvas2DContext::new(fbo_id, width, height, kind, &load_gl)
     };
@@ -211,7 +234,65 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
 
     let dirty_ids: Vec<CanvasId> = cm.dirty_2d.drain().collect();
     let mut flushed_ids = Vec::with_capacity(dirty_ids.len());
+
+    // Canvases that share one `GrDirectContext` are flushed as a group, once.
+    //
+    // Everything the per-canvas loop below does is per-*context* work wearing a
+    // per-canvas name: `flush_and_submit` submits the whole `GrDirectContext`,
+    // `reset_gl_state` discards that context's entire cached GL state, and the
+    // scope guard reads back five raw GL bindings. Run once per canvas on a
+    // shared context, 80 canvases means 80 full submits and 80 state
+    // invalidations per frame -- so every canvas after the first redraws from a
+    // cache another canvas just threw away. Measured on a Mate 30 Pro, that is
+    // what turned an 80-canvas frame from 60 fps into 54.
+    //
+    // Grouping is not an optimisation of the sharing; it is what sharing means.
+    let shared_ids: Vec<CanvasId> = dirty_ids
+        .iter()
+        .copied()
+        .filter(|id| cm.canvas_uses_shared_2d(*id))
+        .collect();
+    if !shared_ids.is_empty() {
+        let group_head = *shared_ids.first().expect("checked non-empty above");
+        cm.bind_shared_2d_context(group_head)?;
+        // No dedup shadow: the shadow exists so a WebGL batch cannot serve
+        // state Skia changed, and nothing but offscreen 2D drawing ever binds
+        // this context. See `CanvasManager::bind_shared_2d_context`.
+        let gl_ref = &*cm.gl as *const glow::Context;
+        // SAFETY: `cm.gl` is not mutated for the duration of this block, and
+        // the guard drops before `cm` is used mutably again.
+        let _gl_scope = unsafe { begin_canvas2d_gl_scope(&*gl_ref, None) };
+        // Submit per canvas, invalidate once for the group.
+        //
+        // The two halves have opposite best shapes and the earlier versions of
+        // this got each one wrong in turn. `reset_gl_state` discards the whole
+        // context's cached GL state, so doing it per canvas made every canvas
+        // after the first redraw from a cache its predecessor had just thrown
+        // away. But collapsing the *submit* to one call per frame was worse in
+        // a different way: all 240 render passes then reach the driver only
+        // after the last canvas is recorded, so the GPU idles through the whole
+        // recording phase. Measured at 240 canvases on a Mate 30 Pro: same CPU
+        // (116% vs 118%), 22 fps against 25 -- a pipelining loss, not a CPU one.
+        //
+        // So: submit as each canvas finishes, which is what lets the GPU start
+        // early, and invalidate once at the end because the only thing that
+        // dirties this context behind Skia's back is the scope guard's restore
+        // on drop.
+        for id in &shared_ids {
+            if let Some(ctx) = cm.contexts_2d.get_mut(id) {
+                ctx.flush_and_submit();
+            }
+        }
+        if let Some(ctx) = cm.contexts_2d.get_mut(&group_head) {
+            ctx.reset_gl_state();
+        }
+        flushed_ids.extend_from_slice(&shared_ids);
+    }
+
     for id in dirty_ids {
+        if cm.canvas_uses_shared_2d(id) {
+            continue; // flushed as part of the shared group above
+        }
         if !cm.contexts_2d.contains_key(&id) {
             continue;
         }
@@ -243,6 +324,11 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
 
     match saved {
         BoundContext::Resource => cm.bind_resource()?,
+        // Restoring the shared 2D context is a rebind, not a recreate: the
+        // context already exists if it was ever bound.
+        BoundContext::Shared2D(id) => {
+            cm.bind_shared_2d_context(id)?;
+        }
         BoundContext::Canvas(id) => {
             if cm.canvases.contains_key(&id) {
                 cm.make_current_needed(id)?;

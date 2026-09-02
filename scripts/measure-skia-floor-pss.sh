@@ -69,10 +69,20 @@ while [[ "$t" -lt "$SECS" ]]; do
 done
 
 "${ADB[@]}" exec-out screencap -p > "$WORK/frame.png" 2>/dev/null || true
-read -r COLOUR DISTINCT <<<"$(python3 "$SCRIPT_DIR/lib/dominant_pixel.py" "$WORK/frame.png" 2>/dev/null)"
+# `read` returns non-zero at EOF, so under `set -e` an empty screencap (a
+# blanked screen is enough) killed the script *after* the samples were already
+# collected -- throwing away a completed measurement because the liveness
+# screenshot failed. Liveness is a cross-check, not the measurement.
+COLOUR="unavailable"; DISTINCT="0"
+read -r COLOUR DISTINCT < <(python3 "$SCRIPT_DIR/lib/dominant_pixel.py" "$WORK/frame.png" 2>/dev/null) \
+    || { COLOUR="unavailable"; DISTINCT="0"; }
 
 "${ADB[@]}" logcat -d --pid="$PID" > "$WORK/logcat.txt" 2>/dev/null || true
-FRAMES="$(grep -oE "frame [0-9]+" "$WORK/logcat.txt" | grep -oE "[0-9]+" | sort -n | tail -1)"
+# Same reason the screencap read is guarded: with `pipefail`, a `grep` that
+# matches nothing fails the whole pipeline, and `set -e` then discarded a
+# measurement whose samples were already on disk. A fixture that logs no frame
+# counter is a liveness gap to report, not a reason to throw the numbers away.
+FRAMES="$(grep -oE "frame [0-9]+" "$WORK/logcat.txt" | grep -oE "[0-9]+" | sort -n | tail -1 || true)"
 FRAMES="${FRAMES:-0}"
 
 echo "device temp after run: $(( $(temp_millideg) / 1000 ))C" >&2

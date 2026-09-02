@@ -34,6 +34,9 @@ pub enum FeatureKey {
     CanvasTextBlobFastPath,
     /// Merge eligible consecutive `drawImage` runs into one `SkCanvas::drawAtlas`.
     CanvasDrawAtlas,
+    /// Offscreen Canvas2D surfaces share one `GrDirectContext` instead of each
+    /// owning one.
+    CanvasSharedDirectContext,
     /// Bound how many cold offscreen canvases keep a GPU backing.
     CanvasHotBackingPool,
     /// Submit surface damage to the compositor via `eglSwapBuffersWithDamage`.
@@ -50,9 +53,10 @@ pub enum FeatureKey {
 
 impl FeatureKey {
     /// Every key, so exhaustive reporting cannot drift from the enum.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::CanvasTextBlobFastPath,
         Self::CanvasDrawAtlas,
+        Self::CanvasSharedDirectContext,
         Self::CanvasHotBackingPool,
         Self::PresentSwapDamage,
         Self::PresentSwappy,
@@ -66,6 +70,7 @@ impl FeatureKey {
         match self {
             Self::CanvasTextBlobFastPath => "canvas_text_blob_fast_path",
             Self::CanvasDrawAtlas => "canvas_draw_atlas",
+            Self::CanvasSharedDirectContext => "canvas_shared_direct_context",
             Self::CanvasHotBackingPool => "canvas_hot_backing_pool",
             Self::PresentSwapDamage => "present_swap_damage",
             Self::PresentSwappy => "present_swappy",
@@ -123,7 +128,39 @@ impl FeatureKey {
             // exactly as before -- only the stall moves. Off restores the
             // one-link-at-a-time behaviour byte for byte.
             Self::WebglParallelShaderCompile => true,
-            Self::CanvasHotBackingPool
+            // Off, and it is a trade rather than a doubt.
+            //
+            // Measured on a Mate 30 Pro with two AARs from one tree differing
+            // only in this default, 80 offscreen canvases repainting every
+            // frame, three interleaved rounds:
+            //
+            //   PSS        650 [648-652] MB -> 286 [286-287] MB   (-56%)
+            //   game-ready 1089 [1081-1094] ms -> 452 [441-462] ms (-59%)
+            //   CPU        125 -> 124                              (tied)
+            //   fps        60 [60-60] -> 54 [54-55]                (-9%)
+            //
+            // The 9% is not a defect. Three separate implementation faults were
+            // found and fixed while chasing it -- per-canvas context resets,
+            // a `BoundContext` that did not name the canvas it was serving (a
+            // real correctness bug: the assert that would have caught it is
+            // compiled out of release), and submitting only at frame end, which
+            // left the GPU idle through recording. None of them moved the
+            // number. What remains is inherent: one context with N surfaces
+            // must rebind and revalidate per canvas, where N contexts each
+            // serving one surface cache exactly the right state. CPU is tied;
+            // the cost is on the GPU.
+            //
+            // So the engine does not choose. Whether -56% memory is worth -9%
+            // fps depends on how many offscreen canvases the content keeps and
+            // whether it is memory- or frame-bound, which the host knows and
+            // this crate does not. Turn it on for shop-UI / label-cache shapes
+            // under memory pressure; leave it off for content already at vsync.
+            //
+            // Full write-up, including why 60 fps read as a tie until the
+            // measurement was taken above the vsync cap:
+            // docs/performance/android/shared-direct-context.md
+            Self::CanvasSharedDirectContext
+            | Self::CanvasHotBackingPool
             | Self::PresentSwappy
             | Self::TextureAstcVariants
             | Self::RuntimeQualityPressure => false,
