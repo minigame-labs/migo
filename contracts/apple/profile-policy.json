@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "Which runtime lane a Session gets, and why. The single source for the",
+    "decision order, the device tiers, the reason codes and the failure",
+    "outcomes; scripts/test-apple-profile-policy-contract.sh checks the Swift",
+    "mirrors against it.",
+    "",
+    "Two rules hold over everything below and are not negotiable:",
+    "",
+    "  1. The profile is frozen before any content code runs, and never changes",
+    "     for the life of the Session. The lanes do not share a JavaScript heap,",
+    "     a renderer, or resource ownership, so there is no lossless switch at",
+    "     runtime. What reads as 'falling back' is either a choice made before",
+    "     user code ran, or a reload under a new runtime generation.",
+    "",
+    "  2. Every decision carries a reason. The question production actually",
+    "     asks is never 'which lane' but 'why did this device, on this content,",
+    "     end up there' -- and by the time it is asked, the inputs are gone.",
+    "",
+    "Reasoning: docs/apple-final-implementation-plan.md sections 4 and 15."
+  ],
+
+  "decision_order": [
+    {
+      "step": 1,
+      "input": "host_request",
+      "note": "An explicit host choice is honoured or refused outright. The low-level C ABI takes a resolved profile and never guesses; only the Host Kit offers 'auto'."
+    },
+    {
+      "step": 2,
+      "input": "build_support",
+      "note": "Whether this binary contains the lane at all. Reported from what the artifact actually compiled, never from what the enum can name."
+    },
+    {
+      "step": 3,
+      "input": "os_version",
+      "note": "Against lanes.*.min_os in deployment-floor.json. Necessary, never sufficient."
+    },
+    {
+      "step": 4,
+      "input": "device_tier",
+      "note": "See device_tiers below."
+    },
+    {
+      "step": 5,
+      "input": "content_manifest",
+      "note": "What the content declares it needs, and which profiles it declares it was built for. Content that never declared a lane does not get it."
+    },
+    {
+      "step": 6,
+      "input": "capability_probe",
+      "note": "The runtime checks that cannot be inferred from a version number: crossOriginIsolated, a working Atomics.wait round trip, ANGLE device creation. A probe that cannot run is a failure, not a pass."
+    },
+    {
+      "step": 7,
+      "input": "denylist",
+      "note": "OS build and GPU combinations known to be broken. Data, shipped separately from the binary."
+    },
+    {
+      "step": 8,
+      "input": "remote_policy",
+      "note": "The kill switch. Takes effect on the next Session, never mid-run."
+    },
+    {
+      "step": 9,
+      "input": "recent_telemetry",
+      "note": "Repeated failures on this device and content demote the lane. Advisory: it can only make the choice more conservative."
+    },
+    {
+      "step": 10,
+      "input": "initialization",
+      "note": "The last gate, and the only one that runs after resources are committed. It must complete before any content code executes, so a failure here still selects rather than falls back."
+    }
+  ],
+
+  "device_tiers": {
+    "_comment": [
+      "Tiers gate the fast lane. They do not gate the product: a device below",
+      "T1 runs ios_webkit_full, which is a supported configuration and not a",
+      "degraded one. Collapsing 'this device cannot run Performance+' into",
+      "'this device is unsupported' is the mistake that cost 2.4 points of",
+      "coverage in the superseded design."
+    ],
+    "T0": {
+      "lane": "ios_webkit_full",
+      "conditions": "iOS below the Performance+ minimum, or under 3 GB of RAM, or denylisted, or a failed capability probe",
+      "memory_budget_bytes": 1073741824,
+      "note": "1 GiB. Matches the cap the largest shipping mini-game host applies to 2 GB devices."
+    },
+    "T1": {
+      "lane": "ios_performance_plus",
+      "conditions": "at or above the Performance+ minimum OS, at least 3 GB of RAM, capability probe passed",
+      "memory_budget_bytes": 1610612736,
+      "note": "1.5 GiB, the same reference point for 3 GB and larger devices."
+    },
+    "T2": {
+      "lane": "ios_performance_plus",
+      "conditions": "T1, plus a GPU family that supports the higher texture and resolution variants",
+      "memory_budget_bytes": 1610612736,
+      "note": "Same budget as T1. The tier buys asset quality, not headroom -- raising the budget with the quality is how a device gets terminated for looking better."
+    }
+  },
+
+  "reason_codes": [
+    "hostRequested",
+    "contentManifestRequires",
+    "osBelowLaneMinimum",
+    "deviceTierBelowLaneMinimum",
+    "capabilityProbeFailed",
+    "denylisted",
+    "remoteKillSwitch",
+    "initializationFailed",
+    "previousGenerationLost"
+  ],
+
+  "failures": {
+    "_comment": [
+      "What happens to the Session that hit the failure, and what the next one",
+      "gets. Two columns because they are different questions: a running",
+      "Session cannot change lane, so the current column is always about",
+      "stopping cleanly and the next column is where the choice is made."
+    ],
+    "transport_init_failed": {
+      "current_session": "fail before any content code runs",
+      "next_session": "ios_webkit_full",
+      "reason_code": "initializationFailed"
+    },
+    "wire_validation_failed": {
+      "current_session": "terminate the content and record a security event",
+      "next_session": "do not retry the same bundle; disable remotely",
+      "reason_code": "remoteKillSwitch"
+    },
+    "sustained_backpressure": {
+      "current_session": "lower the quality tier and pause the producer; terminate only past a hard limit",
+      "next_session": "ios_webkit_full if the limit was reached",
+      "reason_code": "initializationFailed"
+    },
+    "webcontent_terminated": {
+      "current_session": "void the generation, drop unacknowledged packets, show recovery UI",
+      "next_session": "rebuild the same lane, or ios_webkit_full if it recurs",
+      "reason_code": "previousGenerationLost"
+    },
+    "renderer_init_failed": {
+      "current_session": "fall back before content code runs",
+      "next_session": "ios_webkit_full",
+      "reason_code": "initializationFailed"
+    },
+    "device_or_context_lost": {
+      "current_session": "stop accepting packets, advance the resource epoch, rebuild recoverable resources",
+      "next_session": "same lane; a new Session only on repeated failure",
+      "reason_code": "previousGenerationLost"
+    },
+    "memory_critical": {
+      "current_session": "drop caches, lower the tier, pause uploads; exit in order if still short",
+      "next_session": "same lane at a lower tier",
+      "reason_code": "deviceTierBelowLaneMinimum"
+    },
+    "jit_unavailable": {
+      "current_session": "run correctly and record the capability",
+      "next_session": "macos_webkit_full where JIT was required",
+      "reason_code": "capabilityProbeFailed"
+    },
+    "shader_cache_corrupt": {
+      "current_session": "delete the entry and recompile",
+      "next_session": "same lane; a cache fault is not a lane fault",
+      "reason_code": "initializationFailed"
+    }
+  },
+
+  "feature_flags": {
+    "_comment": "Default state on a fresh install. Anything not 'on' requires device evidence to promote, and every one of them must be switchable off remotely without a client update.",
+    "apple_webkit_full": "on",
+    "apple_perfplus": "off",
+    "apple_perfplus_loopback_transport": "probe",
+    "apple_perfplus_scheme_transport": "probe",
+    "apple_macos_v8_native": "staged",
+    "apple_angle_metal": "staged",
+    "apple_angle_gl_fallback": "gated",
+    "apple_promotion": "host_opt_in",
+    "apple_runtime_quality_pressure": "staged"
+  }
+}

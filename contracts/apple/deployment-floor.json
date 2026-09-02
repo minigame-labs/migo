@@ -44,7 +44,7 @@
       "reason": "SharedArrayBuffer behind crossOriginIsolated is what makes the synchronous readPixels/getImageData path possible at all, and WebKit gated it on 15.2. On 15.0 and 15.1 the lane is not slower, it is structurally impossible.",
       "additional_requirements": [
         "A runtime probe confirming crossOriginIsolated and a working Atomics.wait round trip. The OS version is necessary, not sufficient.",
-        "Device memory tier: see contracts/apple/profile-policy.json once the policy lands."
+        "Device memory tier and the full selection order: contracts/apple/profile-policy.json."
       ]
     },
     "macos_v8_native": {
