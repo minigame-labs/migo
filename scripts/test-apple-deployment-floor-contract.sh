@@ -202,11 +202,31 @@ check_literal "$FLOOR_SWIFT" "let macOS = $(swift_tuple "$macos_floor")" \
 check_literal "$FLOOR_SWIFT" "let performancePlusMinimumIOS = $(swift_tuple "$perfplus_min")" \
     "the runtime mirror of the Performance+ lane minimum"
 
+# The build script is asked, not read.
+#
+# Grepping it for the literal would have been the easy check and the wrong one:
+# it would pass for a script that contains the number in a comment and computes
+# something else, and it would fail for the script that does the right thing --
+# reads the contract at build time and holds no copy at all. What matters is
+# the value the build would actually use, so the gate runs the script's own
+# reporting mode and compares that. It needs no macOS: the mode exists precisely
+# so this check runs everywhere.
 if [ -f "$BUILD_SCRIPT" ]; then
-    check_literal "$BUILD_SCRIPT" "IPHONEOS_DEPLOYMENT_TARGET=$ios_floor" \
-        "the build script must export the contract's iOS floor"
-    check_literal "$BUILD_SCRIPT" "MACOSX_DEPLOYMENT_TARGET=$macos_floor" \
-        "the build script must export the contract's macOS floor"
+    for platform in ios macos; do
+        case "$platform" in
+            ios)   expected="$ios_floor" ;;
+            macos) expected="$macos_floor" ;;
+        esac
+        if ! reported="$(bash "$BUILD_SCRIPT" --print-deployment-target "$platform" 2>&1)"; then
+            fail "build-apple-sdk.sh could not report its $platform deployment target: $reported"
+            continue
+        fi
+        if [ "$reported" != "$expected" ]; then
+            fail "build-apple-sdk.sh would build $platform against $reported, contract says $expected"
+            continue
+        fi
+        info "ok: build-apple-sdk.sh reports $platform $reported"
+    done
 else
     info "skip: $BUILD_SCRIPT does not exist yet"
 fi
