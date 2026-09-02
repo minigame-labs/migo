@@ -34,6 +34,9 @@ pub enum FeatureKey {
     CanvasTextBlobFastPath,
     /// Merge eligible consecutive `drawImage` runs into one `SkCanvas::drawAtlas`.
     CanvasDrawAtlas,
+    /// Offscreen Canvas2D surfaces share one `GrDirectContext` instead of each
+    /// owning one.
+    CanvasSharedDirectContext,
     /// Bound how many cold offscreen canvases keep a GPU backing.
     CanvasHotBackingPool,
     /// Submit surface damage to the compositor via `eglSwapBuffersWithDamage`.
@@ -50,9 +53,10 @@ pub enum FeatureKey {
 
 impl FeatureKey {
     /// Every key, so exhaustive reporting cannot drift from the enum.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::CanvasTextBlobFastPath,
         Self::CanvasDrawAtlas,
+        Self::CanvasSharedDirectContext,
         Self::CanvasHotBackingPool,
         Self::PresentSwapDamage,
         Self::PresentSwappy,
@@ -66,6 +70,7 @@ impl FeatureKey {
         match self {
             Self::CanvasTextBlobFastPath => "canvas_text_blob_fast_path",
             Self::CanvasDrawAtlas => "canvas_draw_atlas",
+            Self::CanvasSharedDirectContext => "canvas_shared_direct_context",
             Self::CanvasHotBackingPool => "canvas_hot_backing_pool",
             Self::PresentSwapDamage => "present_swap_damage",
             Self::PresentSwappy => "present_swappy",
@@ -123,7 +128,12 @@ impl FeatureKey {
             // exactly as before -- only the stall moves. Off restores the
             // one-link-at-a-time behaviour byte for byte.
             Self::WebglParallelShaderCompile => true,
-            Self::CanvasHotBackingPool
+            // Off until it has device evidence of its own. The measurement that
+            // motivates it is in docs/performance/android/multicanvas-fixed-cost.md:
+            // 96% of an offscreen canvas's 4.86 MB of Graphics is its own
+            // `GrDirectContext`, and the EGL context under it is 0.20 MB.
+            Self::CanvasSharedDirectContext
+            | Self::CanvasHotBackingPool
             | Self::PresentSwappy
             | Self::TextureAstcVariants
             | Self::RuntimeQualityPressure => false,

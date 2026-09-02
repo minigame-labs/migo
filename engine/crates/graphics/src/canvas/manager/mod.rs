@@ -83,8 +83,8 @@ mod types;
 pub(crate) use types::{
     BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, CanvasStateTable,
     FramebufferMeta, MAX_UNIFORM_CACHE, ProgramMeta, QueryMeta, RenderbufferMeta, SamplerMeta,
-    ScissorState, ShaderMeta, SyncMeta, TextureMeta, TransformFeedbackMeta, VaoMeta,
-    VertexAttribPointerFp, ee,
+    ScissorState, ShaderMeta, Shared2DContext, SyncMeta, TextureMeta, TransformFeedbackMeta,
+    VaoMeta, VertexAttribPointerFp, ee,
 };
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
@@ -320,6 +320,19 @@ pub(crate) struct CanvasManager {
     pub(super) dpi: PixelRatio,
 
     resource: EglContextHandle,
+
+    /// One EGL context and one `GrDirectContext` shared by every offscreen
+    /// Canvas2D surface, created on first use.
+    ///
+    /// Its own EGL context rather than the resource context, because Skia
+    /// caches GL state per `GrDirectContext`: anything else making that GL
+    /// context current -- a WebGL batch, a contextless shader compile --
+    /// invalidates the cache with no signal. Nothing but offscreen 2D drawing
+    /// ever binds this one, which makes that invariant local and checkable.
+    ///
+    /// See `Canvas2DContext::new_shared_offscreen` and
+    /// `docs/performance/android/multicanvas-fixed-cost.md`.
+    shared_2d: Option<Shared2DContext>,
 
     // current binding
     pub(super) bound: BoundContext,
@@ -1038,6 +1051,7 @@ impl CanvasManager {
             pending_share_group_restore: None,
             teardown_complete: false,
             native_release_confirmed: false,
+            shared_2d: None,
             programs: HashMap::with_capacity(16),
             pending_links: Vec::new(),
             shaders: HashMap::with_capacity(32),
@@ -1161,6 +1175,109 @@ impl CanvasManager {
         self.evaluate_bypass();
 
         Ok(())
+    }
+
+    /// Whether this canvas's Canvas2D surface lives on the shared context.
+    ///
+    /// Answered from the context that exists, not from the feature flag: a
+    /// canvas created while sharing was on must keep being bound to the shared
+    /// context even if the flag is read differently later, or its draws would
+    /// go to a context that does not own its surface.
+    pub(crate) fn canvas_uses_shared_2d(&self, id: CanvasId) -> bool {
+        let Some(shared) = self.shared_2d.as_ref() else {
+            return false;
+        };
+        self.contexts_2d
+            .get(&id)
+            .is_some_and(|ctx| ctx.ctx_tag == shared.ctx_tag)
+    }
+
+    /// Make the shared offscreen-2D EGL context current, creating it and its
+    /// `GrDirectContext` on first use.
+    ///
+    /// Returns the pieces `Canvas2DContext::new_shared_offscreen` needs. The
+    /// pbuffer is 1x1: nothing renders into it, it exists only because
+    /// `eglMakeCurrent` needs a draw surface unless the driver advertises
+    /// `EGL_KHR_surfaceless_context`. Every canvas on this context draws into
+    /// its own Skia render target, so FBO 0 here is never a target -- which is
+    /// what makes one context safe to share, and is exactly the property the
+    /// per-canvas pbuffers do *not* have (see `register_offscreen`).
+    pub(crate) fn bind_shared_2d_context(
+        &mut self,
+    ) -> EngineResult<(
+        skia_safe::gpu::DirectContext,
+        skia_safe::gpu::gl::Interface,
+        u32,
+    )> {
+        if self.shared_2d.is_none() {
+            let (ctx, surf) = egl_ops::create_pbuffer_context(
+                &self.egl,
+                self.display,
+                self.config,
+                Some(self.resource.ctx),
+                1,
+                1,
+                self.gles_major,
+                self.has_robust_context,
+                self.surfaceless,
+            )?;
+            self.egl
+                .make_current(self.display, surf, surf, Some(ctx))
+                .map_err(|e| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        format!("shared 2D context make_current failed: {e:?}"),
+                    )
+                })?;
+            self.bound = BoundContext::Shared2D;
+            let interface = {
+                let load_gl = |symbol: &str| self.gl_proc_address(symbol);
+                skia_safe::gpu::gl::Interface::new_load_with(load_gl).ok_or_else(|| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        "shared 2D context: GL interface assembly failed",
+                    )
+                })?
+            };
+            let gr_ctx = skia_safe::gpu::direct_contexts::make_gl(interface.clone(), None)
+                .ok_or_else(|| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        "shared 2D context: GrDirectContext creation failed",
+                    )
+                })?;
+            let ctx_tag = crate::backend::gl::surface::alloc_shared_ctx_tag();
+            tracing::info!("Canvas2D shared offscreen GrDirectContext created");
+            self.shared_2d = Some(Shared2DContext {
+                egl: EglContextHandle { ctx, surf },
+                gr_ctx,
+                interface,
+                ctx_tag,
+            });
+        }
+
+        let shared = self
+            .shared_2d
+            .as_ref()
+            .expect("created on the line above if absent");
+        let (ctx, surf) = (shared.egl.ctx, shared.egl.surf);
+        let out = (
+            shared.gr_ctx.clone(),
+            shared.interface.clone(),
+            shared.ctx_tag,
+        );
+        if self.bound != BoundContext::Shared2D {
+            self.egl
+                .make_current(self.display, surf, surf, Some(ctx))
+                .map_err(|e| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        format!("shared 2D context make_current failed: {e:?}"),
+                    )
+                })?;
+            self.bound = BoundContext::Shared2D;
+        }
+        Ok(out)
     }
 
     /// Record that a program's link was issued and its status not yet read.
@@ -3332,6 +3449,15 @@ impl CanvasManager {
     }
 
     pub(crate) fn make_current_needed(&mut self, id: CanvasId) -> EngineResult<()> {
+        // A canvas whose 2D surface lives on the shared context must have that
+        // context current, not its own: its pixels are in a Skia render target
+        // that only exists there. Checked before the fast path below, because
+        // `BoundContext::Canvas(id)` is not the right binding for such a canvas
+        // even when it names the right id.
+        if self.canvas_uses_shared_2d(id) {
+            self.bind_shared_2d_context()?;
+            return Ok(());
+        }
         if self.bound == BoundContext::Canvas(id) {
             return Ok(());
         }
@@ -3395,7 +3521,9 @@ impl CanvasManager {
     pub(crate) fn ensure_any_canvas_current(&mut self) -> EngineResult<CanvasId> {
         match self.bound {
             BoundContext::Canvas(id) => Ok(id),
-            BoundContext::Resource => {
+            // The shared 2D context belongs to no canvas, so "any canvas" has
+            // to be chosen the same way it is from the resource context.
+            BoundContext::Shared2D | BoundContext::Resource => {
                 // Prefer onscreen(1) if exists
                 let onscreen = CanvasId::from(1u32);
                 if self.canvases.contains_key(&onscreen) {
@@ -3417,13 +3545,14 @@ impl CanvasManager {
     pub(crate) fn current_canvas_id(&self) -> Option<CanvasId> {
         match self.bound {
             BoundContext::Canvas(id) => Some(id),
-            BoundContext::Resource => None,
+            BoundContext::Shared2D | BoundContext::Resource => None,
         }
     }
 
     fn restore_bound(&mut self, saved: BoundContext) -> EngineResult<()> {
         match saved {
             BoundContext::Resource => self.bind_resource(),
+            BoundContext::Shared2D => self.bind_shared_2d_context().map(|_| ()),
             BoundContext::Canvas(id) => {
                 if self.canvases.contains_key(&id) {
                     self.make_current_needed(id)

@@ -57,12 +57,35 @@ pub(super) fn init_skia_for_canvas(
             ),
         }
     };
+    let entry_is_onscreen = {
+        let entry = cm
+            .canvases
+            .get(&canvas_id)
+            .expect("looked up on the line above");
+        entry.info.is_onscreen
+    };
 
-    // Scoped so the immutable borrow for the loader ends before `cm` is used
-    // mutably below. Skia resolves its GL entry points through the same EGL
-    // implementation this manager was built with, rather than through whichever
-    // one Skia itself linked.
-    let created = {
+    // An offscreen canvas can share one `GrDirectContext` with every other
+    // offscreen canvas instead of owning one. That context is 96% of what an
+    // offscreen canvas costs in `Graphics` -- 4.66 MB of 4.86 MB, measured; see
+    // `docs/performance/android/multicanvas-fixed-cost.md`.
+    //
+    // Only offscreen. The onscreen canvas renders into the DrawingBuffer FBO
+    // that the present blit reads, and it is one canvas, so it has nothing to
+    // share with and everything to lose from being moved off its own context.
+    let share_offscreen = !entry_is_onscreen
+        && shared::feature_policy::is_enabled(
+            shared::feature_policy::FeatureKey::CanvasSharedDirectContext,
+        );
+
+    let created = if share_offscreen {
+        let (gr_ctx, interface, ctx_tag) = cm.bind_shared_2d_context()?;
+        Canvas2DContext::new_shared_offscreen(&gr_ctx, interface, width, height, ctx_tag)
+    } else {
+        // Scoped so the immutable borrow for the loader ends before `cm` is used
+        // mutably below. Skia resolves its GL entry points through the same EGL
+        // implementation this manager was built with, rather than through whichever
+        // one Skia itself linked.
         let load_gl = |symbol: &str| cm.gl_proc_address(symbol);
         Canvas2DContext::new(fbo_id, width, height, kind, &load_gl)
     };
@@ -243,6 +266,11 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
 
     match saved {
         BoundContext::Resource => cm.bind_resource()?,
+        // Restoring the shared 2D context is a rebind, not a recreate: the
+        // context already exists if it was ever bound.
+        BoundContext::Shared2D => {
+            cm.bind_shared_2d_context()?;
+        }
         BoundContext::Canvas(id) => {
             if cm.canvases.contains_key(&id) {
                 cm.make_current_needed(id)?;

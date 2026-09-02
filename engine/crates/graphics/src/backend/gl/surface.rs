@@ -261,18 +261,32 @@ static LIVE_CANVAS_CONTEXTS: std::sync::atomic::AtomicUsize =
 /// then refuses to build a context that is not counted, and the decrement cannot be
 /// forgotten on any exit path — including a construction that fails after the
 /// counter was raised.
-pub(crate) struct LiveContextCount;
+pub(crate) struct LiveContextCount {
+    /// False for a context that shares another's `GrDirectContext`. The count
+    /// exists to divide the Skia resource budget, and the divisor must be the
+    /// number of *contexts*, not the number of canvases -- counting sharers
+    /// would shrink every context's share as sharing made the total cheaper.
+    counted: bool,
+}
 
 impl LiveContextCount {
     fn enrol() -> Self {
         LIVE_CANVAS_CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
+        Self { counted: true }
+    }
+
+    /// Membership for a canvas that borrows someone else's `GrDirectContext`.
+    /// Takes no slot, and releases none on drop.
+    fn shared() -> Self {
+        Self { counted: false }
     }
 }
 
 impl Drop for LiveContextCount {
     fn drop(&mut self) {
-        LIVE_CANVAS_CONTEXTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if self.counted {
+            LIVE_CANVAS_CONTEXTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -281,6 +295,12 @@ impl Drop for LiveContextCount {
 /// having to hash the raw `DirectContext` handle (skia-safe exposes
 /// `DirectContextId: Eq + Copy` but intentionally not `Hash`).
 static CTX_TAG_ALLOC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Tag for the one shared offscreen 2D context. Drawn from the same allocator
+/// so it can never collide with a per-canvas tag.
+pub(crate) fn alloc_shared_ctx_tag() -> u32 {
+    alloc_ctx_tag()
+}
 
 fn alloc_ctx_tag() -> u32 {
     CTX_TAG_ALLOC.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -549,6 +569,88 @@ impl Canvas2DContext {
             kind,
             skia_state_stale: 0,
             ctx_tag: alloc_ctx_tag(),
+        })
+    }
+
+    /// Build an offscreen Canvas2D surface on a `GrDirectContext` that other
+    /// offscreen canvases also use.
+    ///
+    /// **Why.** Measured on a Mate 30 Pro, an offscreen canvas costs 4.86 MB of
+    /// `Graphics` and **96% of that is its own `GrDirectContext`** -- the EGL
+    /// context under it is 0.20 MB and the 128x64 backing is 32 KB. 80 canvases
+    /// therefore hold 398 MB where the pixels account for 2.5 MB. The full
+    /// attribution is in `docs/performance/android/multicanvas-fixed-cost.md`.
+    /// One context with many surfaces is also Skia's own usage model; a context
+    /// per surface was the unusual part.
+    ///
+    /// **Two invariants this depends on, both enforced by the caller:**
+    ///
+    /// 1. The shared `DirectContext` lives on a GL context that *nothing else
+    ///    ever makes current*. Skia caches GL state per `GrDirectContext`, so a
+    ///    WebGL batch or a contextless op running on the same GL context would
+    ///    invalidate that cache silently. The manager gives this its own EGL
+    ///    context rather than reusing the resource context for exactly that
+    ///    reason -- one EGL context for all of them, not one each.
+    /// 2. The surface is a Skia-allocated render target, not a wrap of FBO 0.
+    ///    FBO 0 names whichever EGL surface is current, so with one shared
+    ///    context it would name the same pbuffer for every canvas. The
+    ///    resulting `fbo_id` is read back out of Skia so the raw-GL snapshot
+    ///    path keeps working unchanged.
+    ///
+    /// `gr_ctx` is a refcounted handle, so the clone stored here is the same
+    /// context, and `LiveContextCount` is deliberately *not* enrolled: the Skia
+    /// budget divides by the number of contexts, and there is only one.
+    pub fn new_shared_offscreen(
+        gr_ctx: &DirectContext,
+        interface: sk_gl::Interface,
+        width: u32,
+        height: u32,
+        ctx_tag: u32,
+    ) -> Option<Self> {
+        let mut gr_ctx = gr_ctx.clone();
+        let image_info = skia_safe::ImageInfo::new(
+            (width as i32, height as i32),
+            ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut surface = gpu::surfaces::render_target(
+            &mut gr_ctx,
+            gpu::Budgeted::No,
+            &image_info,
+            /* sample_count */ Some(0),
+            // Same origin as every other Canvas2D surface in this project, so
+            // readback, snapshot and the `drawImage`-from-canvas path all keep
+            // the orientation they already assume.
+            SurfaceOrigin::BottomLeft,
+            /* surface_props */ None,
+            /* should_create_with_mips */ false,
+            /* is_protected */ false,
+        )?;
+
+        // The snapshot path blits from a raw FBO id. Ask Skia which one it
+        // allocated rather than tracking a second copy of that fact.
+        let fbo_id = gpu::surfaces::get_backend_render_target(
+            &mut surface,
+            skia_safe::surface::BackendHandleAccess::FlushRead,
+        )
+        .and_then(|rt| rt.gl_framebuffer_info().map(|info| info.fboid))
+        .unwrap_or(0);
+
+        Some(Self {
+            _counted: LiveContextCount::shared(),
+            gr_ctx,
+            surface,
+            interface,
+            renderer: Canvas2DRenderer::new(),
+            width,
+            height,
+            fbo_id,
+            // A named FBO we own, bottom-left origin -- the same shape as the
+            // onscreen DrawingBuffer, which is what this variant describes.
+            kind: FboKind::DrawingBuffer,
+            skia_state_stale: 0,
+            ctx_tag,
         })
     }
 

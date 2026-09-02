@@ -140,6 +140,11 @@ pub(crate) enum BoundContext {
     Resource,
     /// A specific canvas's context.
     Canvas(shared::protocol::render_cmd::CanvasId),
+    /// The one context every offscreen Canvas2D surface shares. Distinct from
+    /// `Canvas` because it belongs to no single canvas, and distinct from
+    /// `Resource` because nothing else may bind it -- see
+    /// `CanvasManager::bind_shared_2d_context`.
+    Shared2D,
 }
 
 #[cfg(test)]

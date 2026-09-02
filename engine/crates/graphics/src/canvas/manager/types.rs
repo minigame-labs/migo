@@ -1516,6 +1516,18 @@ mod shadow_shape_benches {
     }
 }
 
+/// The EGL context, Skia context and identity tag shared by every offscreen
+/// Canvas2D surface. One of these exists per `CanvasManager`, created lazily.
+pub(crate) struct Shared2DContext {
+    pub egl: super::EglContextHandle,
+    pub gr_ctx: skia_safe::gpu::DirectContext,
+    pub interface: skia_safe::gpu::gl::Interface,
+    /// Identity used by `ImageStore` to key its per-context SkImage wrappers.
+    /// Shared, like the context it names: canvases on this context can and
+    /// should reuse each other's wrappers.
+    pub ctx_tag: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct ProgramMeta {
     pub gl_handle: Option<NativeProgram>,
