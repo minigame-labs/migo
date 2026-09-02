@@ -82,6 +82,9 @@ HOST_CARGO_STEPS=(
     # this project treats as decoration, and here it would have been a step that
     # cannot even run.
     "test -p migo-capi-abi --all-targets"
+    # `--all-targets` for the same reason `capi-abi` needs it: every case lives
+    # in `tests/`, so `--lib` would run exactly zero of them and pass forever.
+    "test -p migo-frame-wire --all-targets"
     "test -p migo-shared"
     "test -p migo-io --lib"
     # `--tests` rather than `--lib` for the two crates that own integration
