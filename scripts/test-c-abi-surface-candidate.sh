@@ -103,18 +103,26 @@ compile_ilp32() {
     echo "C ABI ILP32 lane: PASS"
 }
 
+# Derived from the directory, never from a list kept here by hand.
+#
+# The hand-written list this replaced covered seven headers and was correct
+# for all seven. That is exactly how the shape fails: adding
+# migo/platform/ios.h would have compiled, linked, and passed this gate while
+# the new header was never once compiled standalone -- the same silent
+# coverage loss a hand-maintained table produced for the managed-permission
+# audit. A header that exists but is unlisted now fails loudly instead.
 compile_platforms() {
-    local header
-    for header in \
-        migo/platform/android.h \
-        migo/platform/win32.h \
-        migo/platform/winui.h \
-        migo/platform/macos.h \
-        migo/platform/x11.h \
-        migo/platform/wayland.h \
-        migo/platform/openharmony.h; do
-        compile_header_standalone "$header"
+    local header count=0
+    for header in "$ROOT"/include/migo/platform/*.h; do
+        [ -e "$header" ] || continue
+        compile_header_standalone "migo/platform/$(basename "$header")"
+        count=$((count + 1))
     done
+    if [ "$count" -lt 7 ]; then
+        echo "platform header sweep found only $count headers; the directory" \
+             "should hold every typed platform descriptor" >&2
+        return 1
+    fi
     compile_c "$ROOT/tests/c_abi/platform_contract.c" "$TMP_ROOT/platform_contract.o"
     compile_cpp "$ROOT/tests/c_abi/platform_contract.cc" "$TMP_ROOT/platform_contract_cpp.o"
 }

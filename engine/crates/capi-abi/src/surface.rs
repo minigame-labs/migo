@@ -28,6 +28,8 @@ pub const MIGO_PLATFORM_MACOS_CA_METAL_LAYER: u32 = 5;
 pub const MIGO_PLATFORM_X11_WINDOW: u32 = 6;
 pub const MIGO_PLATFORM_WAYLAND_SURFACE: u32 = 7;
 pub const MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW: u32 = 8;
+pub const MIGO_PLATFORM_IOS_UI_VIEW: u32 = 9;
+pub const MIGO_PLATFORM_IOS_CA_METAL_LAYER: u32 = 10;
 
 pub const MIGO_COLOR_SPACE_UNSPECIFIED: u32 = 0;
 pub const MIGO_COLOR_SPACE_SRGB: u32 = 1;
@@ -264,6 +266,69 @@ pub struct MigoWaylandSurfaceDescriptor {
 // complete record.
 unsafe impl AbiStruct for MigoWaylandSurfaceDescriptor {}
 
+/// The four Apple descriptors below are layout-identical to each other and to
+/// the Android one, and are four separate types for the reason
+/// [`MigoOpenHarmonyNativeWindowDescriptor`] is separate from Android's: the
+/// `platform_kind` in the envelope is what selects the ownership calls, and a
+/// shared type would let a host that set the wrong kind compile and parse
+/// cleanly before handing a `UIView*` to code that calls `nextDrawable` on it.
+///
+/// `ns_view` is an `NSView*`. Never dereferenced here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoMacosNsViewDescriptor {
+    pub header: VersionedHeader,
+    pub platform_kind: u32,
+    pub flags: u32,
+    pub ns_view: *mut c_void,
+}
+
+// SAFETY: every field has an all-zero representation and v1 requires the
+// complete record.
+unsafe impl AbiStruct for MigoMacosNsViewDescriptor {}
+
+/// `ca_metal_layer` is a `CAMetalLayer*`. Never dereferenced here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoMacosMetalLayerDescriptor {
+    pub header: VersionedHeader,
+    pub platform_kind: u32,
+    pub flags: u32,
+    pub ca_metal_layer: *mut c_void,
+}
+
+// SAFETY: every field has an all-zero representation and v1 requires the
+// complete record.
+unsafe impl AbiStruct for MigoMacosMetalLayerDescriptor {}
+
+/// `ui_view` is a `UIView*`. Never dereferenced here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoIosUiViewDescriptor {
+    pub header: VersionedHeader,
+    pub platform_kind: u32,
+    pub flags: u32,
+    pub ui_view: *mut c_void,
+}
+
+// SAFETY: every field has an all-zero representation and v1 requires the
+// complete record.
+unsafe impl AbiStruct for MigoIosUiViewDescriptor {}
+
+/// `ca_metal_layer` is a `CAMetalLayer*`. Never dereferenced here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoIosMetalLayerDescriptor {
+    pub header: VersionedHeader,
+    pub platform_kind: u32,
+    pub flags: u32,
+    pub ca_metal_layer: *mut c_void,
+}
+
+// SAFETY: every field has an all-zero representation and v1 requires the
+// complete record.
+unsafe impl AbiStruct for MigoIosMetalLayerDescriptor {}
+
 /// Canonical surface parameters accepted by the current renderer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceConfiguration {
@@ -328,6 +393,18 @@ pub enum ValidatedPlatformSurface {
     },
     OpenHarmony {
         native_window: NonNull<c_void>,
+    },
+    MacosNsView {
+        ns_view: NonNull<c_void>,
+    },
+    MacosMetalLayer {
+        ca_metal_layer: NonNull<c_void>,
+    },
+    IosUiView {
+        ui_view: NonNull<c_void>,
+    },
+    IosMetalLayer {
+        ca_metal_layer: NonNull<c_void>,
     },
 }
 
@@ -452,6 +529,50 @@ impl SurfaceDescriptorRef {
                 let display = NonNull::new(payload.display).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
                 let surface = NonNull::new(payload.surface).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
                 ValidatedPlatformSurface::Wayland { display, surface }
+            }
+            MIGO_PLATFORM_MACOS_NS_VIEW => {
+                require_payload_size::<MigoMacosNsViewDescriptor>(raw.platform_descriptor_size)?;
+                // SAFETY: the caller contract covers the selected payload.
+                let payload = unsafe {
+                    copy_versioned::<MigoMacosNsViewDescriptor>(raw.platform_descriptor.cast())
+                }?;
+                validate_payload_prefix(payload.platform_kind, payload.flags, raw.platform_kind)?;
+                let ns_view = NonNull::new(payload.ns_view).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
+                ValidatedPlatformSurface::MacosNsView { ns_view }
+            }
+            MIGO_PLATFORM_MACOS_CA_METAL_LAYER => {
+                require_payload_size::<MigoMacosMetalLayerDescriptor>(
+                    raw.platform_descriptor_size,
+                )?;
+                // SAFETY: the caller contract covers the selected payload.
+                let payload = unsafe {
+                    copy_versioned::<MigoMacosMetalLayerDescriptor>(raw.platform_descriptor.cast())
+                }?;
+                validate_payload_prefix(payload.platform_kind, payload.flags, raw.platform_kind)?;
+                let ca_metal_layer =
+                    NonNull::new(payload.ca_metal_layer).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
+                ValidatedPlatformSurface::MacosMetalLayer { ca_metal_layer }
+            }
+            MIGO_PLATFORM_IOS_UI_VIEW => {
+                require_payload_size::<MigoIosUiViewDescriptor>(raw.platform_descriptor_size)?;
+                // SAFETY: the caller contract covers the selected payload.
+                let payload = unsafe {
+                    copy_versioned::<MigoIosUiViewDescriptor>(raw.platform_descriptor.cast())
+                }?;
+                validate_payload_prefix(payload.platform_kind, payload.flags, raw.platform_kind)?;
+                let ui_view = NonNull::new(payload.ui_view).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
+                ValidatedPlatformSurface::IosUiView { ui_view }
+            }
+            MIGO_PLATFORM_IOS_CA_METAL_LAYER => {
+                require_payload_size::<MigoIosMetalLayerDescriptor>(raw.platform_descriptor_size)?;
+                // SAFETY: the caller contract covers the selected payload.
+                let payload = unsafe {
+                    copy_versioned::<MigoIosMetalLayerDescriptor>(raw.platform_descriptor.cast())
+                }?;
+                validate_payload_prefix(payload.platform_kind, payload.flags, raw.platform_kind)?;
+                let ca_metal_layer =
+                    NonNull::new(payload.ca_metal_layer).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
+                ValidatedPlatformSurface::IosMetalLayer { ca_metal_layer }
             }
             // validate_platform_kind and supported_platform_kinds establish
             // that only implemented payloads can reach this match.
@@ -614,8 +735,10 @@ fn validate_platform_kind(kind: u32) -> Result<(), MigoResult> {
         | MIGO_PLATFORM_MACOS_CA_METAL_LAYER
         | MIGO_PLATFORM_X11_WINDOW
         | MIGO_PLATFORM_WAYLAND_SURFACE
-        | MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW => Ok(()),
-        MIGO_PLATFORM_UNKNOWN | 9..=u32::MAX => Err(MIGO_ERROR_INVALID_ARGUMENT),
+        | MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW
+        | MIGO_PLATFORM_IOS_UI_VIEW
+        | MIGO_PLATFORM_IOS_CA_METAL_LAYER => Ok(()),
+        MIGO_PLATFORM_UNKNOWN | 11..=u32::MAX => Err(MIGO_ERROR_INVALID_ARGUMENT),
     }
 }
 
