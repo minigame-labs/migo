@@ -1204,6 +1204,7 @@ impl CanvasManager {
     /// per-canvas pbuffers do *not* have (see `register_offscreen`).
     pub(crate) fn bind_shared_2d_context(
         &mut self,
+        serving: CanvasId,
     ) -> EngineResult<(
         skia_safe::gpu::DirectContext,
         skia_safe::gpu::gl::Interface,
@@ -1229,7 +1230,7 @@ impl CanvasManager {
                         format!("shared 2D context make_current failed: {e:?}"),
                     )
                 })?;
-            self.bound = BoundContext::Shared2D;
+            self.bound = BoundContext::Shared2D(serving);
             let interface = {
                 let load_gl = |symbol: &str| self.gl_proc_address(symbol);
                 skia_safe::gpu::gl::Interface::new_load_with(load_gl).ok_or_else(|| {
@@ -1266,7 +1267,10 @@ impl CanvasManager {
             shared.interface.clone(),
             shared.ctx_tag,
         );
-        if self.bound != BoundContext::Shared2D {
+        // Only the id changes when the shared context is already current: the
+        // expensive part is `eglMakeCurrent`, and switching between two
+        // canvases that share a context does not need one.
+        if !matches!(self.bound, BoundContext::Shared2D(_)) {
             self.egl
                 .make_current(self.display, surf, surf, Some(ctx))
                 .map_err(|e| {
@@ -1275,8 +1279,8 @@ impl CanvasManager {
                         format!("shared 2D context make_current failed: {e:?}"),
                     )
                 })?;
-            self.bound = BoundContext::Shared2D;
         }
+        self.bound = BoundContext::Shared2D(serving);
         Ok(out)
     }
 
@@ -3455,7 +3459,7 @@ impl CanvasManager {
         // `BoundContext::Canvas(id)` is not the right binding for such a canvas
         // even when it names the right id.
         if self.canvas_uses_shared_2d(id) {
-            self.bind_shared_2d_context()?;
+            self.bind_shared_2d_context(id)?;
             return Ok(());
         }
         if self.bound == BoundContext::Canvas(id) {
@@ -3523,7 +3527,8 @@ impl CanvasManager {
             BoundContext::Canvas(id) => Ok(id),
             // The shared 2D context belongs to no canvas, so "any canvas" has
             // to be chosen the same way it is from the resource context.
-            BoundContext::Shared2D | BoundContext::Resource => {
+            BoundContext::Shared2D(id) => Ok(id),
+            BoundContext::Resource => {
                 // Prefer onscreen(1) if exists
                 let onscreen = CanvasId::from(1u32);
                 if self.canvases.contains_key(&onscreen) {
@@ -3545,14 +3550,15 @@ impl CanvasManager {
     pub(crate) fn current_canvas_id(&self) -> Option<CanvasId> {
         match self.bound {
             BoundContext::Canvas(id) => Some(id),
-            BoundContext::Shared2D | BoundContext::Resource => None,
+            BoundContext::Shared2D(id) => Some(id),
+            BoundContext::Resource => None,
         }
     }
 
     fn restore_bound(&mut self, saved: BoundContext) -> EngineResult<()> {
         match saved {
             BoundContext::Resource => self.bind_resource(),
-            BoundContext::Shared2D => self.bind_shared_2d_context().map(|_| ()),
+            BoundContext::Shared2D(id) => self.bind_shared_2d_context(id).map(|_| ()),
             BoundContext::Canvas(id) => {
                 if self.canvases.contains_key(&id) {
                     self.make_current_needed(id)

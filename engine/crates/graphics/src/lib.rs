@@ -140,11 +140,17 @@ pub(crate) enum BoundContext {
     Resource,
     /// A specific canvas's context.
     Canvas(shared::protocol::render_cmd::CanvasId),
-    /// The one context every offscreen Canvas2D surface shares. Distinct from
-    /// `Canvas` because it belongs to no single canvas, and distinct from
-    /// `Resource` because nothing else may bind it -- see
-    /// `CanvasManager::bind_shared_2d_context`.
-    Shared2D,
+    /// The context every offscreen Canvas2D surface shares, together with the
+    /// canvas currently being drawn on it.
+    ///
+    /// The id is not decoration. Sharing makes the *EGL context* common, but
+    /// "which canvas is current" stays meaningful: the scissor bookkeeping and
+    /// the per-canvas GL dedup shadow are keyed by it, and a variant without it
+    /// made `current_canvas_id()` answer `None` while a canvas was very much
+    /// being drawn. That tripped `restore_scissor`'s `debug_assert` -- which is
+    /// compiled out of release, so on a device it would have restored scissor
+    /// state against the wrong record instead of saying so.
+    Shared2D(shared::protocol::render_cmd::CanvasId),
 }
 
 #[cfg(test)]

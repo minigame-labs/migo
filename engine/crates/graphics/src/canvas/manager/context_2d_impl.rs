@@ -79,7 +79,7 @@ pub(super) fn init_skia_for_canvas(
         );
 
     let created = if share_offscreen {
-        let (gr_ctx, interface, ctx_tag) = cm.bind_shared_2d_context()?;
+        let (gr_ctx, interface, ctx_tag) = cm.bind_shared_2d_context(canvas_id)?;
         Canvas2DContext::new_shared_offscreen(&gr_ctx, interface, width, height, ctx_tag)
     } else {
         // Scoped so the immutable borrow for the loader ends before `cm` is used
@@ -253,7 +253,8 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
         .filter(|id| cm.canvas_uses_shared_2d(*id))
         .collect();
     if !shared_ids.is_empty() {
-        cm.bind_shared_2d_context()?;
+        let group_head = *shared_ids.first().expect("checked non-empty above");
+        cm.bind_shared_2d_context(group_head)?;
         // No dedup shadow: the shadow exists so a WebGL batch cannot serve
         // state Skia changed, and nothing but offscreen 2D drawing ever binds
         // this context. See `CanvasManager::bind_shared_2d_context`.
@@ -308,8 +309,8 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
         BoundContext::Resource => cm.bind_resource()?,
         // Restoring the shared 2D context is a rebind, not a recreate: the
         // context already exists if it was ever bound.
-        BoundContext::Shared2D => {
-            cm.bind_shared_2d_context()?;
+        BoundContext::Shared2D(id) => {
+            cm.bind_shared_2d_context(id)?;
         }
         BoundContext::Canvas(id) => {
             if cm.canvases.contains_key(&id) {
