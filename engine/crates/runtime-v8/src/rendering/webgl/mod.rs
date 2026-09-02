@@ -4,7 +4,17 @@ mod context2d;
 pub(crate) mod decode;
 mod font;
 pub(crate) mod frame_collector;
-pub(crate) mod gl_stream;
+/// Re-exported, not defined here any more.
+///
+/// The structural validator moved to `migo-frame-wire` so the cross-process
+/// frame consumer can validate the same words without linking a JavaScript
+/// engine. The path stays valid for every call site in this crate.
+pub(crate) use frame_wire::gl_stream;
+
+/// Test-only: the cases asserting this crate's JavaScript encoder agrees with
+/// the shared wire-format table.
+#[cfg(test)]
+mod gl_stream_js_agreement;
 mod raf;
 mod webgl;
 

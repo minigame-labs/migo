@@ -461,6 +461,21 @@ pub fn stamp_checksum(bytes: &mut [u8]) {
     bytes[OFF_CHECKSUM..OFF_CHECKSUM + 4].copy_from_slice(&value);
 }
 
+/// The command stream carried inside a `COMMAND_STREAM` section.
+///
+/// It lives here, and not in the JavaScript runtime where it was written,
+/// because both readers need it and only one of them has a JavaScript engine.
+/// In-process, `runtime-v8` validates the same words before decoding them; on
+/// the cross-process path, the consumer validates them with no V8 linked at all
+/// -- which is the product claim `MigoApplePerformancePlus` rests on and could
+/// not make if this validator were reachable only through the engine crate.
+///
+/// The file moved unchanged. It had no imports at all, which is what made it
+/// movable and is worth preserving: a pure function over `&[u32]` is the only
+/// shape that can be shared by a trusted in-process caller and an untrusted
+/// cross-process one without either inheriting the other's dependencies.
+pub mod gl_stream;
+
 pub mod ingress;
 pub use ingress::{FrameIngress, IngressDecision, IngressOutcome};
 

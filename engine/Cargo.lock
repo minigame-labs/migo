@@ -1848,6 +1848,7 @@ dependencies = [
  "image",
  "migo-alloc-probe",
  "migo-contention-probe",
+ "migo-frame-wire",
  "migo-io",
  "migo-shared",
  "parking_lot",
