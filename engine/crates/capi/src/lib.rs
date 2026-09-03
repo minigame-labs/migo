@@ -42,6 +42,9 @@ mod platform;
 // or frames produced by one somewhere else.
 mod retirement;
 mod session_engine;
+// The frame transport's entry points, in the product that has a transport.
+#[cfg(feature = "external-frames")]
+mod external_frames;
 mod surface;
 #[cfg(test)]
 mod test_support;

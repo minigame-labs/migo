@@ -135,11 +135,16 @@ pub use runtime::{
 // The host thread and its spawn entry points belong to the embedded execution:
 // they own a JavaScript runtime. A build without one does not get a narrower
 // version of them, it gets a different execution mode.
+/// Re-exported so the C boundary can translate an outcome without depending on
+/// the wire crate directly: the boundary's job is to copy numbers across, not
+/// to know how a packet is parsed.
+#[cfg(feature = "external-frames")]
+pub use frame_wire::{IngressDecision, IngressOutcome};
 /// The external-frame execution. A session with no script runtime in this
 /// process, for the Apple Performance+ product.
 #[cfg(feature = "external-frames")]
 pub use runtime::external::{
-    ExternalFrameSession, SpawnedExternalSession, spawn_external_frame_session,
+    ExternalFrameClock, ExternalFrameSession, SpawnedExternalSession, spawn_external_frame_session,
 };
 pub use runtime::{HostThread, SpawnedSurfaceHost};
 #[cfg(feature = "embedded-v8")]

@@ -269,4 +269,55 @@ typedef struct MigoExternalSessionDescriptor {
     uint32_t max_credits;
 } MigoExternalSessionDescriptor;
 
+
+/* ---------------------------------------------------------------------------
+ * Entry points
+ *
+ * PRESENT ONLY IN THE PERFORMANCE+ PRODUCT. The other Apple products link no
+ * frame transport, so they export none of these and a host that links the wrong
+ * one gets an undefined symbol when it builds -- which is the loud, early
+ * failure. The alternative, a symbol that resolves and always fails, is what
+ * shipped a Windows SDK that loaded, resolved every entry point, and could
+ * attach nothing.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Offer one frame produced outside this process.
+ *
+ * `bytes` is borrowed for the duration of the call only: an accepted packet is
+ * copied once into a buffer the library owns before this returns, so a Swift
+ * transport may hand over a Data's interior pointer and reuse or free its own
+ * storage immediately.
+ *
+ * Returns MIGO_OK when the outcome was written -- including when the outcome
+ * says the packet was rejected. A non-OK result means the call itself could not
+ * be made: a bad handle, a null buffer, or no surface attached yet.
+ */
+MigoResult migo_session_submit_external_frame(MigoSession *session,
+                                              const uint8_t *bytes,
+                                              size_t byte_count,
+                                              MigoFrameIngressOutcome *out_outcome);
+
+/*
+ * Ask for one frame.
+ *
+ * The producer renders when told to: Migo's requestAnimationFrame is fed by
+ * host vsync on every platform, and this is that signal crossing a process
+ * boundary instead of a thread boundary. MIGO_ERROR_INVALID_STATE means the
+ * renderer is not up yet, which is the truthful answer for a session that
+ * cannot produce a frame.
+ */
+MigoResult migo_session_request_external_frame(MigoSession *session);
+
+/*
+ * Drain one pending WebGL error for a canvas.
+ *
+ * `gl.getError()` is a synchronous call the producer makes in another process;
+ * the errors the decoder recorded wait here until it asks. Writes 0
+ * (GL_NO_ERROR) when the queue is empty, which is what WebGL returns.
+ */
+MigoResult migo_session_take_external_gl_error(MigoSession *session,
+                                               uint32_t canvas_id,
+                                               uint32_t *out_code);
+
 #endif /* MIGO_EXTERNAL_FRAMES_H_ */

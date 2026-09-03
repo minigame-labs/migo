@@ -87,10 +87,7 @@ mod tests {
                 let _ = release_rx.recv();
             })
             .expect("spawn retired Host");
-        (
-            SessionEngine::from_join_handle_for_test(id, join),
-            release_tx,
-        )
+        (crate::session_engine::engine_for_test(id, join), release_tx)
     }
 
     #[test]
@@ -134,7 +131,7 @@ mod tests {
                 release_tx.send(()).expect("publish refusal");
             })
             .expect("spawn retired Host");
-        set.retire(SessionEngine::from_join_handle_for_test(9_003, join));
+        set.retire(crate::session_engine::engine_for_test(9_003, join));
 
         ready_tx.send(()).expect("tell the Host it is retired");
         release_rx.recv().expect("refusal published");
