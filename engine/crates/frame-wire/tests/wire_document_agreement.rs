@@ -390,44 +390,58 @@ fn variants_in(file: &str, enum_name: &str) -> Vec<(String, u32)> {
 /// prove it can report every one. A list that silently fell behind its enum
 /// would make that consumer's coverage a claim about whenever someone last
 /// looked.
+/// One enum to check: which file declares it, its name, and what its exported
+/// `ALL` list says. Named because the tuple was complex enough that clippy
+/// asked, and it reads better with a name anyway.
+struct EnumUnderTest {
+    file: &'static str,
+    name: &'static str,
+    exported: Vec<(String, u32)>,
+}
+
 #[test]
 fn the_protocol_enums_export_every_variant_their_source_declares() {
-    let cases: [(&str, &str, Vec<(String, u32)>); 4] = [
-        (
-            "sync.rs",
-            "SyncState",
-            SyncState::ALL
+    let cases = [
+        EnumUnderTest {
+            file: "sync.rs",
+            name: "SyncState",
+            exported: SyncState::ALL
                 .iter()
-                .map(|s| (format!("{s:?}"), s.code()))
+                .map(|state| (format!("{state:?}"), state.code()))
                 .collect(),
-        ),
-        (
-            "sync.rs",
-            "SyncError",
-            SyncError::ALL
+        },
+        EnumUnderTest {
+            file: "sync.rs",
+            name: "SyncError",
+            exported: SyncError::ALL
                 .iter()
-                .map(|e| (format!("{e:?}"), e.code()))
+                .map(|error| (format!("{error:?}"), error.code()))
                 .collect(),
-        ),
-        (
-            "resource.rs",
-            "ResourceState",
-            ResourceState::ALL
+        },
+        EnumUnderTest {
+            file: "resource.rs",
+            name: "ResourceState",
+            exported: ResourceState::ALL
                 .iter()
-                .map(|s| (format!("{s:?}"), s.code()))
+                .map(|state| (format!("{state:?}"), state.code()))
                 .collect(),
-        ),
-        (
-            "resource.rs",
-            "ResourceError",
-            ResourceError::ALL
+        },
+        EnumUnderTest {
+            file: "resource.rs",
+            name: "ResourceError",
+            exported: ResourceError::ALL
                 .iter()
-                .map(|e| (format!("{e:?}"), e.code()))
+                .map(|error| (format!("{error:?}"), error.code()))
                 .collect(),
-        ),
+        },
     ];
 
-    for (file, enum_name, exported) in cases {
+    for EnumUnderTest {
+        file,
+        name: enum_name,
+        exported,
+    } in cases
+    {
         let in_source = variants_in(file, enum_name);
         assert_eq!(
             exported.len(),
