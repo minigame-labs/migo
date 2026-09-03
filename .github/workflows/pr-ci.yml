@@ -436,6 +436,14 @@ jobs:
       - name: Frame wire JavaScript encoder against the golden corpus
         run: bash scripts/test-frame-wire-js-encoder.sh
 
+      # Three tables name the same opcodes: the Rust wire format, the in-process
+      # JavaScript encoder, and the WebContent producer. A record header is
+      # twelve bits of opcode and twenty of word count, so nothing across that
+      # boundary is typed -- a disagreement is a frame that does not draw, on a
+      # device, rather than anything that fails to build.
+      - name: GL opcode table agreement
+        run: bash scripts/test-gl-opcode-agreement.sh
+
       # The G0 decision procedure, months before the first Mac. Its input needs
       # a device; its rules do not, and the alternative is finding out on lab
       # day that the thing turning measurements into a choice has a bug. Each

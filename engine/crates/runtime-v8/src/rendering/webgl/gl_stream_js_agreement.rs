@@ -17,126 +17,76 @@ use frame_wire::gl_stream::*;
 mod js_agreement {
     use super::*;
 
-    // ── JS/Rust constant contract: complete 69-opcode coverage ───────────────
+    // ── JS/Rust constant contract ────────────────────────────────────────────
 
-    /// Asserts the JS stream module contains `const OP_<NAME> = <n>;` for every
-    /// opcode constant defined in this file. This prevents silent divergence
-    /// between the Rust wire-format table and the JS encoder table.
+    /// Every opcode the wire-format table declares appears in the JavaScript
+    /// encoder with the same number.
+    ///
+    /// Both tables are PARSED, not restated. This test used to hold a
+    /// hand-written list of sixty-nine name and value pairs, and a list someone
+    /// has to extend is a list that falls behind: an opcode added to the Rust
+    /// table and forgotten here would have left the test passing on the
+    /// sixty-nine it already knew.
+    ///
+    /// The WebContent producer has a third copy of this table and cannot be
+    /// read from inside this crate; `scripts/test-gl-opcode-agreement.sh`
+    /// checks all three together.
     #[test]
-    fn js_module_contains_all_69_opcode_constants_matching_rust() {
-        let js = include_str!("00_gl_command_stream.js");
+    fn the_javascript_encoder_declares_every_opcode_the_rust_table_does() {
+        const RUST: &str = include_str!("../../../../frame-wire/src/gl_stream.rs");
+        const JS: &str = include_str!("00_gl_command_stream.js");
 
-        // Fixed opcodes 1..=58
-        let fixed: &[(&str, u32)] = &[
-            ("OP_VIEWPORT", OP_VIEWPORT),
-            ("OP_CLEAR", OP_CLEAR),
-            ("OP_CLEAR_COLOR", OP_CLEAR_COLOR),
-            ("OP_CLEAR_DEPTH", OP_CLEAR_DEPTH),
-            ("OP_CLEAR_STENCIL", OP_CLEAR_STENCIL),
-            ("OP_ENABLE", OP_ENABLE),
-            ("OP_DISABLE", OP_DISABLE),
-            ("OP_USE_PROGRAM", OP_USE_PROGRAM),
-            ("OP_BIND_BUFFER", OP_BIND_BUFFER),
-            ("OP_BIND_TEXTURE", OP_BIND_TEXTURE),
-            ("OP_ACTIVE_TEXTURE", OP_ACTIVE_TEXTURE),
-            ("OP_BIND_FRAMEBUFFER", OP_BIND_FRAMEBUFFER),
-            ("OP_BIND_RENDERBUFFER", OP_BIND_RENDERBUFFER),
-            ("OP_BIND_VERTEX_ARRAY", OP_BIND_VERTEX_ARRAY),
-            ("OP_BIND_SAMPLER", OP_BIND_SAMPLER),
-            (
-                "OP_ENABLE_VERTEX_ATTRIB_ARRAY",
-                OP_ENABLE_VERTEX_ATTRIB_ARRAY,
-            ),
-            (
-                "OP_DISABLE_VERTEX_ATTRIB_ARRAY",
-                OP_DISABLE_VERTEX_ATTRIB_ARRAY,
-            ),
-            ("OP_VERTEX_ATTRIB_POINTER", OP_VERTEX_ATTRIB_POINTER),
-            ("OP_VERTEX_ATTRIB_DIVISOR", OP_VERTEX_ATTRIB_DIVISOR),
-            ("OP_BLEND_FUNC", OP_BLEND_FUNC),
-            ("OP_BLEND_FUNC_SEPARATE", OP_BLEND_FUNC_SEPARATE),
-            ("OP_BLEND_EQUATION", OP_BLEND_EQUATION),
-            ("OP_BLEND_EQUATION_SEPARATE", OP_BLEND_EQUATION_SEPARATE),
-            ("OP_BLEND_COLOR", OP_BLEND_COLOR),
-            ("OP_DEPTH_FUNC", OP_DEPTH_FUNC),
-            ("OP_DEPTH_MASK", OP_DEPTH_MASK),
-            ("OP_DEPTH_RANGE", OP_DEPTH_RANGE),
-            ("OP_STENCIL_FUNC", OP_STENCIL_FUNC),
-            ("OP_STENCIL_FUNC_SEPARATE", OP_STENCIL_FUNC_SEPARATE),
-            ("OP_STENCIL_OP", OP_STENCIL_OP),
-            ("OP_STENCIL_OP_SEPARATE", OP_STENCIL_OP_SEPARATE),
-            ("OP_STENCIL_MASK", OP_STENCIL_MASK),
-            ("OP_STENCIL_MASK_SEPARATE", OP_STENCIL_MASK_SEPARATE),
-            ("OP_CULL_FACE", OP_CULL_FACE),
-            ("OP_FRONT_FACE", OP_FRONT_FACE),
-            ("OP_COLOR_MASK", OP_COLOR_MASK),
-            ("OP_SCISSOR", OP_SCISSOR),
-            ("OP_LINE_WIDTH", OP_LINE_WIDTH),
-            ("OP_POLYGON_OFFSET", OP_POLYGON_OFFSET),
-            ("OP_TEX_PARAMETER_I", OP_TEX_PARAMETER_I),
-            ("OP_TEX_PARAMETER_F", OP_TEX_PARAMETER_F),
-            ("OP_GENERATE_MIPMAP", OP_GENERATE_MIPMAP),
-            ("OP_PIXEL_STORE_I", OP_PIXEL_STORE_I),
-            ("OP_HINT", OP_HINT),
-            ("OP_SAMPLER_PARAMETER_I", OP_SAMPLER_PARAMETER_I),
-            ("OP_SAMPLER_PARAMETER_F", OP_SAMPLER_PARAMETER_F),
-            ("OP_DRAW_ARRAYS", OP_DRAW_ARRAYS),
-            ("OP_DRAW_ELEMENTS", OP_DRAW_ELEMENTS),
-            ("OP_DRAW_ARRAYS_INSTANCED", OP_DRAW_ARRAYS_INSTANCED),
-            ("OP_DRAW_ELEMENTS_INSTANCED", OP_DRAW_ELEMENTS_INSTANCED),
-            ("OP_BIND_BUFFER_BASE", OP_BIND_BUFFER_BASE),
-            ("OP_BIND_BUFFER_RANGE", OP_BIND_BUFFER_RANGE),
-            ("OP_READ_BUFFER", OP_READ_BUFFER),
-            ("OP_UNIFORM1I", OP_UNIFORM1I),
-            ("OP_UNIFORM1F", OP_UNIFORM1F),
-            ("OP_UNIFORM2F", OP_UNIFORM2F),
-            ("OP_UNIFORM3F", OP_UNIFORM3F),
-            ("OP_UNIFORM4F", OP_UNIFORM4F),
-        ];
-        // Variable opcodes 256..=266
-        let variable: &[(&str, u32)] = &[
-            ("OP_UNIFORM1IV", OP_UNIFORM1IV),
-            ("OP_UNIFORM1FV", OP_UNIFORM1FV),
-            ("OP_UNIFORM2IV", OP_UNIFORM2IV),
-            ("OP_UNIFORM2FV", OP_UNIFORM2FV),
-            ("OP_UNIFORM3IV", OP_UNIFORM3IV),
-            ("OP_UNIFORM3FV", OP_UNIFORM3FV),
-            ("OP_UNIFORM4IV", OP_UNIFORM4IV),
-            ("OP_UNIFORM4FV", OP_UNIFORM4FV),
-            ("OP_UNIFORM_MATRIX2FV", OP_UNIFORM_MATRIX2FV),
-            ("OP_UNIFORM_MATRIX3FV", OP_UNIFORM_MATRIX3FV),
-            ("OP_UNIFORM_MATRIX4FV", OP_UNIFORM_MATRIX4FV),
-        ];
-
-        for &(name, value) in fixed.iter().chain(variable.iter()) {
-            let expected = format!("const {} = {};", name, value);
-            assert!(
-                js.contains(&expected),
-                "JS module missing '{}' (expected '{}' for Rust value {})",
-                name,
-                expected,
-                value
-            );
+        fn parse(text: &str, prefix: &str, suffix: &str) -> Vec<(String, u32)> {
+            let mut found = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix(prefix) else {
+                    continue;
+                };
+                let Some((name, value)) = rest.split_once(suffix) else {
+                    continue;
+                };
+                if !name.starts_with("OP_") {
+                    continue;
+                }
+                let value = value.trim().trim_end_matches(';');
+                let Ok(number) = value.parse::<u32>() else {
+                    continue;
+                };
+                found.push((name.to_string(), number));
+            }
+            found
         }
 
-        // Magic and version
+        let rust = parse(RUST, "pub const ", ": u32 = ");
+        let js = parse(JS, "const ", " = ");
+
         assert!(
-            js.contains("const MAGIC = 0x4D474C31;"),
-            "JS module missing 'const MAGIC = 0x4D474C31;'"
+            rust.len() >= 60,
+            "only {} opcodes parsed from the Rust table; the pattern no longer matches",
+            rust.len()
         );
-        assert!(
-            js.contains("const STREAM_VERSION = 1;"),
-            "JS module missing 'const STREAM_VERSION = 1;'"
+        assert_eq!(
+            rust.len(),
+            js.len(),
+            "the Rust table declares {} opcodes, the JavaScript encoder {}",
+            rust.len(),
+            js.len()
         );
-        assert!(
-            js.contains("const MAX_STREAM_UNIFORM_WORDS = 512;"),
-            "JS module missing 'const MAX_STREAM_UNIFORM_WORDS = 512;'"
-        );
+
+        for (name, value) in &rust {
+            let found = js
+                .iter()
+                .find(|(js_name, _)| js_name == name)
+                .unwrap_or_else(|| panic!("the JavaScript encoder declares no {name}"));
+            assert_eq!(
+                found.1, *value,
+                "{name} is {} in JavaScript and {value} in Rust",
+                found.1
+            );
+        }
     }
 
-    // ── JS source-guard tests (host-runnable, via include_str!) ──────────────
-
-    /// Buffers must be null at module load (lazy allocation).
     #[test]
     fn js_module_buffers_null_at_module_load() {
         let js = include_str!("00_gl_command_stream.js");
