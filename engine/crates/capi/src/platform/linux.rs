@@ -163,7 +163,16 @@ pub(crate) fn build_target(
         // it.
         ValidatedPlatformSurface::Android { .. }
         | ValidatedPlatformSurface::Win32 { .. }
-        | ValidatedPlatformSurface::OpenHarmony { .. } => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
+        | ValidatedPlatformSurface::OpenHarmony { .. }
+        // The four Apple descriptors. Listed rather than swept up by a
+        // wildcard, which is the arrangement that turned this match red the
+        // day they were added -- and that is the arrangement working. A
+        // wildcard here would have compiled, returned "unsupported" for a
+        // surface this builder may one day support, and told nobody.
+        | ValidatedPlatformSurface::MacosNsView { .. }
+        | ValidatedPlatformSurface::MacosMetalLayer { .. }
+        | ValidatedPlatformSurface::IosUiView { .. }
+        | ValidatedPlatformSurface::IosMetalLayer { .. } => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
     }
 }
 
