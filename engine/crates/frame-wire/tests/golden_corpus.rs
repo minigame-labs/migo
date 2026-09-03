@@ -37,105 +37,201 @@ enum Expect {
     Rejected(WireError),
 }
 
+/// One section of a case's input.
+struct SectionSpec {
+    kind: u32,
+    item_count: u32,
+    payload: Vec<u8>,
+}
+
+/// A case, as an *input specification* plus the verdict a reader must reach.
+///
+/// The bytes are derived from this, never written beside it. The corpus exists
+/// so two independent encoders can be checked against one fixed artefact, and
+/// the second encoder is JavaScript running inside WebContent -- which cannot
+/// read this file. So the specification travels in `index.json` and both
+/// encoders build from it. A corpus whose inputs live only in the Rust test is
+/// a corpus only Rust can be checked against, which is half a contract.
 struct Case {
     name: &'static str,
-    bytes: Vec<u8>,
+    launch_nonce: u128,
+    sequence: u64,
+    runtime_generation: u64,
+    surface_generation: u64,
+    resource_epoch: u64,
+    frame_id: u32,
+    flags: u32,
+    sections: Vec<SectionSpec>,
+    /// A deliberate departure from the canonical encoding, for a case whose
+    /// point is that a reader rejects it. Named so the other encoder knows it
+    /// is *expected* not to reproduce these bytes, rather than silently
+    /// disagreeing with the corpus.
+    deviation: Option<&'static str>,
     expect: Expect,
+}
+
+impl Case {
+    /// The bytes, built from the specification. One code path, so the committed
+    /// artefact and the published input cannot describe different packets.
+    fn encode(&self) -> Vec<u8> {
+        let mut builder = WireFrameBuilder::new();
+        builder.launch_nonce = self.launch_nonce;
+        builder.sequence = self.sequence;
+        builder.runtime_generation = self.runtime_generation;
+        builder.surface_generation = self.surface_generation;
+        builder.resource_epoch = self.resource_epoch;
+        builder.frame_id = self.frame_id;
+        builder.flags = self.flags;
+        match self.deviation {
+            Some("extra_gap_8") => builder.extra_gap = 8,
+            Some(other) => panic!("unknown deviation {other}"),
+            None => {}
+        }
+        for section in &self.sections {
+            builder = builder.section(section.kind, section.item_count, &section.payload);
+        }
+        builder.build()
+    }
+
+    /// The input, as it appears in `index.json`.
+    ///
+    /// The four wide fields are decimal *strings*. JSON numbers are IEEE
+    /// doubles once a JavaScript reader touches them, and `all-section-kinds`
+    /// carries values well past 2^53 precisely so a truncating reader on either
+    /// side fails here rather than on a device. Strings survive; `BigInt` reads
+    /// them back exactly.
+    fn input_json(&self) -> String {
+        let sections: Vec<String> = self
+            .sections
+            .iter()
+            .map(|section| {
+                format!(
+                    "{{ \"kind\": {}, \"item_count\": {}, \"payload_hex\": \"{}\" }}",
+                    section.kind,
+                    section.item_count,
+                    hex(&section.payload)
+                )
+            })
+            .collect();
+        let deviation = match self.deviation {
+            Some(name) => format!(", \"deviation\": \"{name}\""),
+            None => String::new(),
+        };
+        format!(
+            "{{ \"launch_nonce\": \"{}\", \"sequence\": \"{}\", \"runtime_generation\": \"{}\",              \"surface_generation\": \"{}\", \"resource_epoch\": \"{}\", \"frame_id\": {},              \"flags\": {}, \"sections\": [{}]{} }}",
+            self.launch_nonce,
+            self.sequence,
+            self.runtime_generation,
+            self.surface_generation,
+            self.resource_epoch,
+            self.frame_id,
+            self.flags,
+            sections.join(", "),
+            deviation
+        )
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn section(kind: u32, item_count: u32, payload: Vec<u8>) -> SectionSpec {
+    SectionSpec {
+        kind,
+        item_count,
+        payload,
+    }
 }
 
 /// Deterministic by construction: no timestamps, no randomness, no allocator
 /// addresses. A corpus that changes between runs cannot be committed.
 fn cases() -> Vec<Case> {
-    let mut cases = Vec::new();
-
-    // The smallest legal packet: one command stream, present, nothing else.
-    let empty_stream: [u8; 0] = [];
-    let mut minimal = WireFrameBuilder::new();
-    minimal.launch_nonce = 0;
-    minimal.sequence = 1;
-    minimal.runtime_generation = 1;
-    minimal.frame_id = 1;
-    minimal.flags = FLAG_PRESENT;
-    cases.push(Case {
-        name: "minimal-present",
-        bytes: minimal
-            .section(SECTION_KIND_COMMAND_STREAM, 0, &empty_stream)
-            .build(),
-        expect: Expect::Accepted,
-    });
-
-    // A frame shaped like a real one: commands, an inline blob whose length is
-    // not a multiple of 8 (so the encoder's padding is pinned, and so is the
-    // rule that pad bytes are zero), resources at their exact record width, and
-    // an advisory damage section at its own.
     let stream: Vec<u8> = (0..64u8).collect();
     let inline: Vec<u8> = (0..21u8).map(|value| value.wrapping_mul(7)).collect();
     let resources: Vec<u8> = (0..12u8).map(|value| value.wrapping_add(200)).collect();
     let damage: Vec<u8> = (0..16u8).map(|value| value.wrapping_mul(3)).collect();
-    let mut typical = WireFrameBuilder::new();
-    typical.launch_nonce = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
-    typical.sequence = 42;
-    typical.runtime_generation = 3;
-    typical.surface_generation = 9;
-    typical.resource_epoch = 2;
-    typical.frame_id = 41;
-    typical.flags = FLAG_PRESENT;
-    cases.push(Case {
-        name: "typical-frame",
-        bytes: typical
-            .section(SECTION_KIND_COMMAND_STREAM, 16, &stream)
-            .section(SECTION_KIND_INLINE_DATA, 21, &inline)
-            .section(SECTION_KIND_RESOURCE_REFERENCES, 3, &resources)
-            .section(SECTION_KIND_DAMAGE, 1, &damage)
-            .build(),
-        expect: Expect::Accepted,
-    });
-
-    // Every section kind at once, with the wide identity and timeline fields at
-    // values a 32-bit or 64-bit truncation would corrupt. This is the case that
-    // notices a producer writing the header at the wrong width.
     let more: Vec<u8> = (0..32u8).rev().collect();
     let timing: Vec<u8> = (0..12u8).map(|value| value.wrapping_mul(11)).collect();
-    let mut all_kinds = WireFrameBuilder::new();
-    all_kinds.launch_nonce = u128::MAX - 5;
-    all_kinds.sequence = 0x0000_0001_0000_0000;
-    all_kinds.runtime_generation = 0x8000_0000_0000_0001;
-    all_kinds.surface_generation = 0x7FFF_FFFF_FFFF_FFFF;
-    all_kinds.resource_epoch = 0x0000_00FF_0000_00FF;
-    all_kinds.frame_id = 0xFFFF_FFFF;
-    all_kinds.flags = FLAG_PRESENT;
-    cases.push(Case {
-        name: "all-section-kinds",
-        bytes: all_kinds
-            .section(SECTION_KIND_COMMAND_STREAM, 8, &more)
-            .section(SECTION_KIND_INLINE_DATA, 21, &inline)
-            .section(SECTION_KIND_RESOURCE_REFERENCES, 3, &resources)
-            .section(SECTION_KIND_DAMAGE, 1, &damage)
-            .section(SECTION_KIND_TIMING, 12, &timing)
-            .build(),
-        expect: Expect::Accepted,
-    });
 
-    // A packet that is well formed in every respect except that its section
-    // does not start where the canonical layout puts it. Aligned, in order, in
-    // bounds, checksum correct -- and rejected, because the eight bytes of gap
-    // are inside the integrity check and outside every consumer.
-    let mut gapped = WireFrameBuilder::new();
-    gapped.launch_nonce = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
-    gapped.sequence = 43;
-    gapped.runtime_generation = 3;
-    gapped.frame_id = 42;
-    gapped.flags = FLAG_PRESENT;
-    gapped.extra_gap = 8;
-    cases.push(Case {
-        name: "rejected-noncanonical-gap",
-        bytes: gapped
-            .section(SECTION_KIND_COMMAND_STREAM, 8, &more)
-            .build(),
-        expect: Expect::Rejected(WireError::SectionNotCanonical),
-    });
-
-    cases
+    vec![
+        // The smallest legal packet: one command stream, present, nothing else.
+        Case {
+            name: "minimal-present",
+            launch_nonce: 0,
+            sequence: 1,
+            runtime_generation: 1,
+            surface_generation: 0,
+            resource_epoch: 0,
+            frame_id: 1,
+            flags: FLAG_PRESENT,
+            sections: vec![section(SECTION_KIND_COMMAND_STREAM, 0, Vec::new())],
+            deviation: None,
+            expect: Expect::Accepted,
+        },
+        // A frame shaped like a real one: commands, an inline blob whose length
+        // is not a multiple of 8 (so the encoder's padding is pinned, and so is
+        // the rule that pad bytes are zero), resources at their exact record
+        // width, and an advisory damage section at its own.
+        Case {
+            name: "typical-frame",
+            launch_nonce: 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210,
+            sequence: 42,
+            runtime_generation: 3,
+            surface_generation: 9,
+            resource_epoch: 2,
+            frame_id: 41,
+            flags: FLAG_PRESENT,
+            sections: vec![
+                section(SECTION_KIND_COMMAND_STREAM, 16, stream),
+                section(SECTION_KIND_INLINE_DATA, 21, inline.clone()),
+                section(SECTION_KIND_RESOURCE_REFERENCES, 3, resources.clone()),
+                section(SECTION_KIND_DAMAGE, 1, damage.clone()),
+            ],
+            deviation: None,
+            expect: Expect::Accepted,
+        },
+        // Every section kind at once, with the wide identity and timeline
+        // fields at values a 32-bit, 53-bit or 64-bit truncation would corrupt.
+        // This is the case that notices an encoder writing the header at the
+        // wrong width -- including a JavaScript one that reached for `Number`.
+        Case {
+            name: "all-section-kinds",
+            launch_nonce: u128::MAX - 5,
+            sequence: 0x0000_0001_0000_0000,
+            runtime_generation: 0x8000_0000_0000_0001,
+            surface_generation: 0x7FFF_FFFF_FFFF_FFFF,
+            resource_epoch: 0x0000_00FF_0000_00FF,
+            frame_id: 0xFFFF_FFFF,
+            flags: FLAG_PRESENT,
+            sections: vec![
+                section(SECTION_KIND_COMMAND_STREAM, 8, more.clone()),
+                section(SECTION_KIND_INLINE_DATA, 21, inline),
+                section(SECTION_KIND_RESOURCE_REFERENCES, 3, resources),
+                section(SECTION_KIND_DAMAGE, 1, damage),
+                section(SECTION_KIND_TIMING, 12, timing),
+            ],
+            deviation: None,
+            expect: Expect::Accepted,
+        },
+        // Well formed in every respect except that its section does not start
+        // where the canonical layout puts it. Aligned, in order, in bounds,
+        // checksum correct -- and rejected, because the eight bytes of gap are
+        // inside the integrity check and outside every consumer.
+        Case {
+            name: "rejected-noncanonical-gap",
+            launch_nonce: 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210,
+            sequence: 43,
+            runtime_generation: 3,
+            surface_generation: 0,
+            resource_epoch: 0,
+            frame_id: 42,
+            flags: FLAG_PRESENT,
+            sections: vec![section(SECTION_KIND_COMMAND_STREAM, 8, more)],
+            deviation: Some("extra_gap_8"),
+            expect: Expect::Rejected(WireError::SectionNotCanonical),
+        },
+    ]
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -225,37 +321,38 @@ fn the_committed_corpus_matches_this_encoder() {
 
     for case in cases() {
         let path = dir.join(format!("{}.bin", case.name));
-        let digest = sha256_hex(&case.bytes);
-        index_lines.push(match case.expect {
-            Expect::Accepted => format!(
-                "    {{ \"name\": \"{}\", \"bytes\": {}, \"sha256\": \"{}\", \"accepted\": true }}",
-                case.name,
-                case.bytes.len(),
-                digest
-            ),
+        let bytes = case.encode();
+        let digest = sha256_hex(&bytes);
+        let verdict = match case.expect {
+            Expect::Accepted => "\"accepted\": true".to_string(),
             Expect::Rejected(error) => format!(
-                "    {{ \"name\": \"{}\", \"bytes\": {}, \"sha256\": \"{}\", \"accepted\": false, \"wire_error\": {}, \"wire_error_name\": \"{:?}\" }}",
-                case.name,
-                case.bytes.len(),
-                digest,
+                "\"accepted\": false, \"wire_error\": {}, \"wire_error_name\": \"{:?}\"",
                 error.code(),
                 error
             ),
-        });
+        };
+        index_lines.push(format!(
+            "    {{ \"name\": \"{}\", \"bytes\": {}, \"sha256\": \"{}\", {}, \"input\": {} }}",
+            case.name,
+            bytes.len(),
+            digest,
+            verdict,
+            case.input_json()
+        ));
 
         if updating {
-            fs::write(&path, &case.bytes).expect("write corpus case");
+            fs::write(&path, &bytes).expect("write corpus case");
             continue;
         }
 
         match fs::read(&path) {
             Ok(committed) => {
-                if committed != case.bytes {
+                if committed != bytes {
                     mismatches.push(format!(
                         "{}: committed {} bytes, encoder produced {}",
                         case.name,
                         committed.len(),
-                        case.bytes.len()
+                        bytes.len()
                     ));
                 }
                 // The committed bytes must get the committed verdict. Checking
