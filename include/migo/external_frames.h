@@ -73,4 +73,151 @@ typedef struct MigoFrameIngressOutcome {
     uint32_t reserved0;
 } MigoFrameIngressOutcome;
 
+
+/* ---------------------------------------------------------------------------
+ * The synchronous barrier
+ *
+ * A handful of calls cannot be answered on the producer's side because their
+ * return value *is* the answer: readPixels, getImageData, toDataURL. The
+ * producer blocks; the transport carries the request here and the reply back.
+ *
+ * One request may be outstanding per session. A second would need a second
+ * mailbox and a second waiter, and the producer is a single agent that is
+ * blocked while it waits.
+ *
+ * DECLARATIONS ONLY, like the ingress record above. The entry points land with
+ * the session that implements them.
+ * ------------------------------------------------------------------------- */
+
+typedef uint32_t MigoSyncState;
+
+/* No request outstanding. The only state a new one may be posted from. */
+#define MIGO_SYNC_STATE_FREE      UINT32_C(0)
+/* Posted, and the producer is waiting. */
+#define MIGO_SYNC_STATE_PENDING   UINT32_C(1)
+/* Answered; reply_bytes says how much of the reply buffer is the answer. */
+#define MIGO_SYNC_STATE_READY     UINT32_C(2)
+/* Not answered and will not be; error says why. */
+#define MIGO_SYNC_STATE_FAILED    UINT32_C(3)
+/* Withdrawn by the producer before an answer arrived. */
+#define MIGO_SYNC_STATE_CANCELLED UINT32_C(4)
+
+/*
+ * Why a synchronous request failed. Stable across releases: the producer turns
+ * these into exceptions its own code catches.
+ */
+typedef uint32_t MigoSyncError;
+#define MIGO_SYNC_ERROR_ALREADY_PENDING        UINT32_C(1)
+#define MIGO_SYNC_ERROR_REQUEST_ID_MISMATCH    UINT32_C(2)
+#define MIGO_SYNC_ERROR_STALE_GENERATION       UINT32_C(3)
+#define MIGO_SYNC_ERROR_REPLY_TOO_LARGE        UINT32_C(4)
+#define MIGO_SYNC_ERROR_TIMED_OUT              UINT32_C(5)
+#define MIGO_SYNC_ERROR_SESSION_ENDED          UINT32_C(6)
+#define MIGO_SYNC_ERROR_UNSUPPORTED_OPERATION  UINT32_C(7)
+#define MIGO_SYNC_ERROR_LATE_REPLY             UINT32_C(8)
+#define MIGO_SYNC_ERROR_BAD_DEADLINE           UINT32_C(9)
+#define MIGO_SYNC_ERROR_BAD_REPLY_RESERVATION  UINT32_C(10)
+
+/*
+ * Caller-written. The 64-bit members precede the 32-bit ones so the record is
+ * 56 bytes with no interior padding on both LP64 and ILP32 -- one layout,
+ * rather than two that happen to agree today.
+ *
+ * deadline_nanos is a MONOTONIC clock reading, not wall time. A producer that
+ * blocked across a clock adjustment would otherwise wake early or never.
+ */
+typedef struct MigoSyncRequestDescriptor {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t runtime_generation;
+    uint64_t surface_generation;
+    uint64_t resource_epoch;
+    /* The frame the producer had submitted when it blocked. */
+    uint64_t triggering_sequence;
+    uint64_t deadline_nanos;
+    uint32_t operation;
+    /* What the producer reserved; the reply is refused, never truncated. */
+    uint32_t max_reply_bytes;
+} MigoSyncRequestDescriptor;
+
+/* Library-written, append-only. */
+typedef struct MigoSyncOutcome {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    /* Monotonic, never zero: a cleared mailbox holds zero. */
+    uint32_t request_id;
+    MigoSyncState state;
+    /* Non-zero only for READY. */
+    uint32_t reply_bytes;
+    /* Non-zero only for FAILED. */
+    MigoSyncError error;
+} MigoSyncOutcome;
+
+/* ---------------------------------------------------------------------------
+ * The resource lane
+ *
+ * A frame packet is small and bounded; a texture atlas is neither. Large assets
+ * are reserved, uploaded in chunks, verified against a digest declared up
+ * front, and become nameable from a frame only then. The frame ceiling stays
+ * small because this exists.
+ *
+ * Verification happens BEFORE creation. Creating the GPU object as bytes arrive
+ * and fixing it up if the digest turns out wrong trades a bounded failure for
+ * an unbounded one: a texture whose contents are whatever arrived, already
+ * bound by a frame that referenced it.
+ * ------------------------------------------------------------------------- */
+
+typedef uint32_t MigoResourceState;
+#define MIGO_RESOURCE_STATE_RESERVED  UINT32_C(0)
+#define MIGO_RESOURCE_STATE_UPLOADING UINT32_C(1)
+#define MIGO_RESOURCE_STATE_VERIFYING UINT32_C(2)
+/* Verified. A frame may name this resource, and not before. */
+#define MIGO_RESOURCE_STATE_READY     UINT32_C(3)
+#define MIGO_RESOURCE_STATE_FAILED    UINT32_C(4)
+
+typedef uint32_t MigoResourceError;
+#define MIGO_RESOURCE_ERROR_TOO_MANY_RESERVATIONS UINT32_C(1)
+#define MIGO_RESOURCE_ERROR_BAD_SIZE              UINT32_C(2)
+#define MIGO_RESOURCE_ERROR_BAD_CHUNK_COUNT       UINT32_C(3)
+#define MIGO_RESOURCE_ERROR_UNKNOWN_RESERVATION   UINT32_C(4)
+#define MIGO_RESOURCE_ERROR_NON_CONTIGUOUS_CHUNK  UINT32_C(5)
+#define MIGO_RESOURCE_ERROR_CHUNK_OUT_OF_BOUNDS   UINT32_C(6)
+#define MIGO_RESOURCE_ERROR_DIGEST_MISMATCH       UINT32_C(7)
+#define MIGO_RESOURCE_ERROR_TIMED_OUT             UINT32_C(8)
+#define MIGO_RESOURCE_ERROR_EPOCH_ADVANCED        UINT32_C(9)
+#define MIGO_RESOURCE_ERROR_INCOMPLETE            UINT32_C(10)
+#define MIGO_RESOURCE_ERROR_NOT_UPLOADING         UINT32_C(11)
+
+/*
+ * Caller-written. The reservation id is assigned by the library, not chosen
+ * here: an id the producer picked could collide with one already in the table,
+ * and the collision would be a frame naming the wrong texture.
+ */
+typedef struct MigoResourceReservationDescriptor {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t total_bytes;
+    uint64_t deadline_nanos;
+    uint32_t chunk_count;
+    /* Producer-declared format tag; opaque to the protocol. */
+    uint32_t format;
+    /* The digest the uploaded bytes must hash to. */
+    uint8_t  sha256[32];
+} MigoResourceReservationDescriptor;
+
+/* Library-written, append-only. */
+typedef struct MigoResourceOutcome {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    /* Non-zero once a reservation exists. */
+    uint64_t reservation_id;
+    uint64_t received_bytes;
+    MigoResourceState state;
+    /* Non-zero only for FAILED. */
+    MigoResourceError error;
+    /* The chunk index the next upload must carry; chunks are contiguous. */
+    uint32_t next_chunk;
+    uint32_t reserved0;
+} MigoResourceOutcome;
+
 #endif /* MIGO_EXTERNAL_FRAMES_H_ */

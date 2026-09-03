@@ -45,9 +45,103 @@ _Static_assert(MIGO_FRAME_INGRESS_WOULD_BLOCK != UINT32_C(0), "zero is not WOULD
 _Static_assert(MIGO_FRAME_INGRESS_REJECTED != UINT32_C(0), "zero is not REJECTED");
 _Static_assert(MIGO_FRAME_INGRESS_GENERATION_LOST != UINT32_C(0), "zero is not GENERATION_LOST");
 
+
+/* ---------------------------------------------------------------------------
+ * The synchronous barrier
+ *
+ * Same rule as above: 64-bit members ahead of the 32-bit run, so there is one
+ * layout on both pointer widths and these offsets sit outside the
+ * `#if UINTPTR_MAX` split. A field reordered into the 32-bit run would still
+ * measure 56 bytes on LP64 and would move on ILP32.
+ * ------------------------------------------------------------------------- */
+
+_Static_assert(sizeof(MigoSyncRequestDescriptor) == 56,
+               "sync request is 56 bytes on every target");
+_Static_assert(offsetof(MigoSyncRequestDescriptor, runtime_generation) == 8, "");
+_Static_assert(offsetof(MigoSyncRequestDescriptor, surface_generation) == 16, "");
+_Static_assert(offsetof(MigoSyncRequestDescriptor, resource_epoch) == 24, "");
+_Static_assert(offsetof(MigoSyncRequestDescriptor, triggering_sequence) == 32, "");
+_Static_assert(offsetof(MigoSyncRequestDescriptor, deadline_nanos) == 40, "");
+_Static_assert(offsetof(MigoSyncRequestDescriptor, operation) == 48, "");
+_Static_assert(offsetof(MigoSyncRequestDescriptor, max_reply_bytes) == 52, "");
+
+_Static_assert(sizeof(MigoSyncOutcome) == 24, "sync outcome is 24 bytes on every target");
+_Static_assert(offsetof(MigoSyncOutcome, request_id) == 8, "");
+_Static_assert(offsetof(MigoSyncOutcome, state) == 12, "");
+_Static_assert(offsetof(MigoSyncOutcome, reply_bytes) == 16, "");
+_Static_assert(offsetof(MigoSyncOutcome, error) == 20, "");
+
+/*
+ * FREE is zero, and that is deliberate: a zeroed mailbox reads as "no request",
+ * which is the only state where reading stale fields is harmless. Every other
+ * state is non-zero, so a zeroed record can never be mistaken for an answer.
+ */
+_Static_assert(MIGO_SYNC_STATE_FREE == UINT32_C(0), "a zeroed mailbox holds no request");
+_Static_assert(MIGO_SYNC_STATE_PENDING != UINT32_C(0), "zero is not PENDING");
+_Static_assert(MIGO_SYNC_STATE_READY != UINT32_C(0), "zero is not READY");
+_Static_assert(MIGO_SYNC_STATE_FAILED != UINT32_C(0), "zero is not FAILED");
+_Static_assert(MIGO_SYNC_STATE_CANCELLED != UINT32_C(0), "zero is not CANCELLED");
+
+/* Zero is not a failure reason: a FAILED record must say why. */
+_Static_assert(MIGO_SYNC_ERROR_ALREADY_PENDING != UINT32_C(0), "");
+_Static_assert(MIGO_SYNC_ERROR_BAD_REPLY_RESERVATION == UINT32_C(10),
+               "the reason codes are contiguous from one; a gap means a retired code");
+
+/* ---------------------------------------------------------------------------
+ * The resource lane
+ * ------------------------------------------------------------------------- */
+
+_Static_assert(sizeof(MigoResourceReservationDescriptor) == 64,
+               "resource reservation is 64 bytes on every target");
+_Static_assert(offsetof(MigoResourceReservationDescriptor, total_bytes) == 8, "");
+_Static_assert(offsetof(MigoResourceReservationDescriptor, deadline_nanos) == 16, "");
+_Static_assert(offsetof(MigoResourceReservationDescriptor, chunk_count) == 24, "");
+_Static_assert(offsetof(MigoResourceReservationDescriptor, format) == 28, "");
+_Static_assert(offsetof(MigoResourceReservationDescriptor, sha256) == 32, "");
+_Static_assert(sizeof(((MigoResourceReservationDescriptor *)0)->sha256) == 32,
+               "a SHA-256 is thirty-two bytes; a shorter array would compare a prefix");
+
+_Static_assert(sizeof(MigoResourceOutcome) == 40,
+               "resource outcome is 40 bytes on every target");
+_Static_assert(offsetof(MigoResourceOutcome, reservation_id) == 8, "");
+_Static_assert(offsetof(MigoResourceOutcome, received_bytes) == 16, "");
+_Static_assert(offsetof(MigoResourceOutcome, state) == 24, "");
+_Static_assert(offsetof(MigoResourceOutcome, error) == 28, "");
+_Static_assert(offsetof(MigoResourceOutcome, next_chunk) == 32, "");
+_Static_assert(offsetof(MigoResourceOutcome, reserved0) == 36, "");
+
+/*
+ * RESERVED is zero, so a zeroed outcome reads as "declared, nothing arrived" --
+ * the state in which a frame may not name the resource. READY being non-zero is
+ * the load-bearing half: a zeroed record must never say a resource is usable.
+ */
+_Static_assert(MIGO_RESOURCE_STATE_RESERVED == UINT32_C(0), "");
+_Static_assert(MIGO_RESOURCE_STATE_READY != UINT32_C(0),
+               "a zeroed record must not claim a resource is ready to name");
+_Static_assert(MIGO_RESOURCE_STATE_FAILED != UINT32_C(0), "");
+_Static_assert(MIGO_RESOURCE_ERROR_DIGEST_MISMATCH != UINT32_C(0), "");
+
 int migo_external_frames_c_contract(void) {
     MigoFrameIngressOutcome outcome = {0};
     outcome.struct_size = (uint32_t)sizeof outcome;
     outcome.decision = MIGO_FRAME_INGRESS_ACCEPTED;
-    return (int)(outcome.struct_size + outcome.decision);
+
+    MigoSyncRequestDescriptor request = {0};
+    request.struct_size = (uint32_t)sizeof request;
+    request.max_reply_bytes = 4096u;
+
+    MigoSyncOutcome answer = {0};
+    answer.struct_size = (uint32_t)sizeof answer;
+    answer.state = MIGO_SYNC_STATE_READY;
+
+    MigoResourceReservationDescriptor reservation = {0};
+    reservation.struct_size = (uint32_t)sizeof reservation;
+    reservation.chunk_count = 1u;
+
+    MigoResourceOutcome resource = {0};
+    resource.struct_size = (uint32_t)sizeof resource;
+    resource.state = MIGO_RESOURCE_STATE_READY;
+
+    return (int)(outcome.struct_size + outcome.decision + request.struct_size
+                 + answer.struct_size + reservation.struct_size + resource.struct_size);
 }

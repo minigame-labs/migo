@@ -14,7 +14,8 @@ use std::{fs, path::PathBuf};
 use frame_wire::{
     HEADER_BYTES, HEADER_LAYOUT, HeaderField, MAX_SECTIONS, MAX_TOTAL_BYTES, WireError,
     ingress::{INGRESS_ERROR_BASE, INGRESS_ERROR_CODES},
-    sync::{SYNC_LAYOUT, SYNC_RECORD_BYTES},
+    resource::{ResourceError, ResourceState},
+    sync::{SYNC_LAYOUT, SYNC_RECORD_BYTES, SyncError, SyncState},
 };
 
 fn document() -> String {
@@ -354,4 +355,101 @@ fn the_document_sync_record_table_matches_the_exported_layout() {
         document.contains(&format!("### Record — {SYNC_RECORD_BYTES} bytes, fixed")),
         "the sync record heading does not state {SYNC_RECORD_BYTES} bytes"
     );
+}
+
+/// `Name = 12,` lines inside a named enum in `file`.
+fn variants_in(file: &str, enum_name: &str) -> Vec<(String, u32)> {
+    let text = source(file);
+    let start = text
+        .find(&format!("pub enum {enum_name} {{"))
+        .unwrap_or_else(|| panic!("{file} declares no enum {enum_name}"));
+    let body = &text[start..];
+    let end = body.find("\n}").expect("the enum has a closing brace");
+    let mut variants = Vec::new();
+    for line in body[..end].lines().skip(1) {
+        let line = line.trim().trim_end_matches(',');
+        if line.is_empty() || line.starts_with("//") || line.starts_with("#[") {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(" = ") else {
+            continue;
+        };
+        variants.push((
+            name.trim().to_string(),
+            value.trim().parse().expect("the code is a number"),
+        ));
+    }
+    assert!(
+        !variants.is_empty(),
+        "no variants parsed out of {enum_name}"
+    );
+    variants
+}
+
+/// The protocol enums cross to the C ABI, where a consumer iterates `ALL` to
+/// prove it can report every one. A list that silently fell behind its enum
+/// would make that consumer's coverage a claim about whenever someone last
+/// looked.
+#[test]
+fn the_protocol_enums_export_every_variant_their_source_declares() {
+    let cases: [(&str, &str, Vec<(String, u32)>); 4] = [
+        (
+            "sync.rs",
+            "SyncState",
+            SyncState::ALL
+                .iter()
+                .map(|s| (format!("{s:?}"), s.code()))
+                .collect(),
+        ),
+        (
+            "sync.rs",
+            "SyncError",
+            SyncError::ALL
+                .iter()
+                .map(|e| (format!("{e:?}"), e.code()))
+                .collect(),
+        ),
+        (
+            "resource.rs",
+            "ResourceState",
+            ResourceState::ALL
+                .iter()
+                .map(|s| (format!("{s:?}"), s.code()))
+                .collect(),
+        ),
+        (
+            "resource.rs",
+            "ResourceError",
+            ResourceError::ALL
+                .iter()
+                .map(|e| (format!("{e:?}"), e.code()))
+                .collect(),
+        ),
+    ];
+
+    for (file, enum_name, exported) in cases {
+        let in_source = variants_in(file, enum_name);
+        assert_eq!(
+            exported.len(),
+            in_source.len(),
+            "{enum_name}: the source declares {} variants, ALL lists {}",
+            in_source.len(),
+            exported.len()
+        );
+        assert_eq!(
+            exported, in_source,
+            "{enum_name}: ALL is not the source's variants in order"
+        );
+
+        // Contiguous, so `ALL.len()` is a usable count and a retired variant
+        // cannot leave a hole a later one silently fills.
+        let base = in_source[0].1;
+        for (index, (name, code)) in in_source.iter().enumerate() {
+            assert_eq!(
+                *code,
+                base + index as u32,
+                "{enum_name}::{name} is {code}; codes must be contiguous from {base}"
+            );
+        }
+    }
 }

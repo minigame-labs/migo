@@ -153,6 +153,20 @@ pub enum SyncState {
 }
 
 impl SyncState {
+    /// Every state, for consumers that must cover all of them.
+    ///
+    /// Checked against this file's source by
+    /// `tests/wire_document_agreement.rs`: a variant added without being
+    /// listed here breaks that test rather than quietly escaping every
+    /// consumer that iterates this.
+    pub const ALL: &'static [SyncState] = &[
+        Self::Free,
+        Self::Pending,
+        Self::Ready,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
     #[inline]
     pub const fn code(self) -> u32 {
         self as u32
@@ -206,6 +220,25 @@ pub enum SyncError {
 }
 
 impl SyncError {
+    /// Every failure, for the C ABI mirror and its coverage test.
+    ///
+    /// Checked against this file's source by
+    /// `tests/wire_document_agreement.rs`: a variant added without being
+    /// listed here breaks that test rather than quietly escaping every
+    /// consumer that iterates this.
+    pub const ALL: &'static [SyncError] = &[
+        Self::AlreadyPending,
+        Self::RequestIdMismatch,
+        Self::StaleGeneration,
+        Self::ReplyTooLarge,
+        Self::TimedOut,
+        Self::SessionEnded,
+        Self::UnsupportedOperation,
+        Self::LateReply,
+        Self::BadDeadline,
+        Self::BadReplyReservation,
+    ];
+
     #[inline]
     pub const fn code(self) -> u32 {
         self as u32

@@ -177,3 +177,271 @@ fn every_wire_error_code_is_non_zero_and_distinct_from_the_ingress_range() {
         assert_eq!(out.wire_error_code, *code);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The header, the Rust mirror, and the protocol enums, checked against each
+// other rather than each against a reviewer's memory.
+// ---------------------------------------------------------------------------
+
+/// `#define NAME UINT32_C(n)` lines in the public header.
+///
+/// Parsed rather than restated. Three copies of these numbers exist -- the
+/// header a Swift transport compiles against, the Rust constants this crate
+/// exports, and the enums in `frame-wire` that produce them -- and a test that
+/// listed them a fourth time would only prove the fourth copy agrees with
+/// itself.
+fn header_defines(prefix: &str) -> Vec<(String, u32)> {
+    const HEADER: &str = include_str!("../../../../include/migo/external_frames.h");
+    let mut defines = Vec::new();
+    for line in HEADER.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("#define ") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let value = value
+            .trim()
+            .trim_start_matches("UINT32_C(")
+            .trim_end_matches(')');
+        defines.push((name.to_string(), value.parse().expect("a decimal constant")));
+    }
+    assert!(
+        !defines.is_empty(),
+        "the header declares no {prefix}* constants"
+    );
+    defines
+}
+
+/// SCREAMING_SNAKE for a CamelCase variant, so `RequestIdMismatch` lines up
+/// with `MIGO_SYNC_ERROR_REQUEST_ID_MISMATCH`.
+fn shouted(variant: &str) -> String {
+    let mut out = String::new();
+    for (index, character) in variant.char_indices() {
+        if character.is_ascii_uppercase() && index > 0 {
+            out.push('_');
+        }
+        out.push(character.to_ascii_uppercase());
+    }
+    out
+}
+
+#[test]
+fn the_header_and_the_protocol_enums_agree_on_every_sync_constant() {
+    use frame_wire::sync::{SyncError, SyncState};
+
+    let states = header_defines("MIGO_SYNC_STATE_");
+    assert_eq!(states.len(), SyncState::ALL.len());
+    for state in SyncState::ALL {
+        let expected = format!("MIGO_SYNC_STATE_{}", shouted(&format!("{state:?}")));
+        let (_, value) = states
+            .iter()
+            .find(|(name, _)| *name == expected)
+            .unwrap_or_else(|| panic!("the header has no {expected}"));
+        assert_eq!(*value, state.code(), "{expected}");
+    }
+
+    let errors = header_defines("MIGO_SYNC_ERROR_");
+    assert_eq!(errors.len(), SyncError::ALL.len());
+    for error in SyncError::ALL {
+        let expected = format!("MIGO_SYNC_ERROR_{}", shouted(&format!("{error:?}")));
+        let (_, value) = errors
+            .iter()
+            .find(|(name, _)| *name == expected)
+            .unwrap_or_else(|| panic!("the header has no {expected}"));
+        assert_eq!(*value, error.code(), "{expected}");
+    }
+}
+
+#[test]
+fn the_header_and_the_protocol_enums_agree_on_every_resource_constant() {
+    use frame_wire::resource::{ResourceError, ResourceState};
+
+    let states = header_defines("MIGO_RESOURCE_STATE_");
+    assert_eq!(states.len(), ResourceState::ALL.len());
+    for state in ResourceState::ALL {
+        let expected = format!("MIGO_RESOURCE_STATE_{}", shouted(&format!("{state:?}")));
+        let (_, value) = states
+            .iter()
+            .find(|(name, _)| *name == expected)
+            .unwrap_or_else(|| panic!("the header has no {expected}"));
+        assert_eq!(*value, state.code(), "{expected}");
+    }
+
+    let errors = header_defines("MIGO_RESOURCE_ERROR_");
+    assert_eq!(errors.len(), ResourceError::ALL.len());
+    for error in ResourceError::ALL {
+        let expected = format!("MIGO_RESOURCE_ERROR_{}", shouted(&format!("{error:?}")));
+        let (_, value) = errors
+            .iter()
+            .find(|(name, _)| *name == expected)
+            .unwrap_or_else(|| panic!("the header has no {expected}"));
+        assert_eq!(*value, error.code(), "{expected}");
+    }
+}
+
+/// Every state and every reason must survive the write path it is destined for.
+///
+/// A reason the host can reach and the ABI cannot report is a producer left
+/// blocked with no explanation, which on a device is a game that stopped and
+/// said nothing.
+#[test]
+fn every_sync_and_resource_outcome_can_actually_be_reported() {
+    use frame_wire::resource::{ResourceError, ResourceState};
+    use frame_wire::sync::{SyncError, SyncState};
+    use migo_capi_abi::external_frames::{
+        MIGO_RESOURCE_STATE_FAILED, MIGO_SYNC_STATE_FAILED, MigoResourceOutcome, MigoSyncOutcome,
+        write_resource_outcome, write_sync_outcome,
+    };
+
+    for state in SyncState::ALL {
+        let mut out = MigoSyncOutcome {
+            header: migo_capi_abi::VersionedHeader {
+                struct_size: size_of::<MigoSyncOutcome>() as u32,
+                abi_version: 1,
+            },
+            request_id: 0,
+            state: 0,
+            reply_bytes: 0,
+            error: 0,
+        };
+        let (request_id, reply_bytes, error) = match state.code() {
+            MIGO_SYNC_STATE_FAILED => (7, 0, SyncError::TimedOut.code()),
+            0 => (0, 0, 0),
+            _ => (7, 0, 0),
+        };
+        let result =
+            unsafe { write_sync_outcome(&mut out, request_id, state.code(), reply_bytes, error) };
+        assert_eq!(result, MIGO_OK, "{state:?} could not be reported");
+        assert_eq!(out.state, state.code());
+    }
+
+    for error in SyncError::ALL {
+        let mut out = MigoSyncOutcome {
+            header: migo_capi_abi::VersionedHeader {
+                struct_size: size_of::<MigoSyncOutcome>() as u32,
+                abi_version: 1,
+            },
+            request_id: 0,
+            state: 0,
+            reply_bytes: 0,
+            error: 0,
+        };
+        let result =
+            unsafe { write_sync_outcome(&mut out, 3, MIGO_SYNC_STATE_FAILED, 0, error.code()) };
+        assert_eq!(result, MIGO_OK, "{error:?} could not be reported");
+        assert_eq!(out.error, error.code());
+    }
+
+    for state in ResourceState::ALL {
+        let mut out = MigoResourceOutcome {
+            header: migo_capi_abi::VersionedHeader {
+                struct_size: size_of::<MigoResourceOutcome>() as u32,
+                abi_version: 1,
+            },
+            reservation_id: 0,
+            received_bytes: 0,
+            state: 0,
+            error: 0,
+            next_chunk: 0,
+            reserved0: 0,
+        };
+        let error = if state.code() == MIGO_RESOURCE_STATE_FAILED {
+            ResourceError::DigestMismatch.code()
+        } else {
+            0
+        };
+        let result = unsafe { write_resource_outcome(&mut out, 1, 64, state.code(), error, 1) };
+        assert_eq!(result, MIGO_OK, "{state:?} could not be reported");
+        assert_eq!(out.state, state.code());
+    }
+
+    for error in ResourceError::ALL {
+        let mut out = MigoResourceOutcome {
+            header: migo_capi_abi::VersionedHeader {
+                struct_size: size_of::<MigoResourceOutcome>() as u32,
+                abi_version: 1,
+            },
+            reservation_id: 0,
+            received_bytes: 0,
+            state: 0,
+            error: 0,
+            next_chunk: 0,
+            reserved0: 0,
+        };
+        let result = unsafe {
+            write_resource_outcome(&mut out, 1, 0, MIGO_RESOURCE_STATE_FAILED, error.code(), 0)
+        };
+        assert_eq!(result, MIGO_OK, "{error:?} could not be reported");
+        assert_eq!(out.error, error.code());
+    }
+}
+
+/// A contradiction is refused rather than written. A `READY` carrying an error
+/// is a pair the producer -- which is blocked reading this -- has no way to act
+/// on.
+#[test]
+fn contradictory_sync_and_resource_outcomes_are_refused() {
+    use migo_capi_abi::external_frames::{
+        MIGO_RESOURCE_STATE_READY, MIGO_SYNC_STATE_FAILED, MIGO_SYNC_STATE_READY,
+        MigoResourceOutcome, MigoSyncOutcome, write_resource_outcome, write_sync_outcome,
+    };
+
+    let mut sync = MigoSyncOutcome {
+        header: migo_capi_abi::VersionedHeader {
+            struct_size: size_of::<MigoSyncOutcome>() as u32,
+            abi_version: 1,
+        },
+        request_id: 0,
+        state: 0,
+        reply_bytes: 0,
+        error: 0,
+    };
+    assert_ne!(
+        unsafe { write_sync_outcome(&mut sync, 1, MIGO_SYNC_STATE_READY, 16, 4) },
+        MIGO_OK,
+        "READY with an error is a contradiction"
+    );
+    assert_ne!(
+        unsafe { write_sync_outcome(&mut sync, 1, MIGO_SYNC_STATE_FAILED, 16, 4) },
+        MIGO_OK,
+        "FAILED with reply bytes is a contradiction"
+    );
+    assert_ne!(
+        unsafe { write_sync_outcome(&mut sync, 1, MIGO_SYNC_STATE_FAILED, 0, 0) },
+        MIGO_OK,
+        "FAILED must say why"
+    );
+    assert_ne!(
+        unsafe { write_sync_outcome(&mut sync, 1, 99, 0, 0) },
+        MIGO_OK,
+        "an unrecognised state is refused"
+    );
+
+    let mut resource = MigoResourceOutcome {
+        header: migo_capi_abi::VersionedHeader {
+            struct_size: size_of::<MigoResourceOutcome>() as u32,
+            abi_version: 1,
+        },
+        reservation_id: 0,
+        received_bytes: 0,
+        state: 0,
+        error: 0,
+        next_chunk: 0,
+        reserved0: 0,
+    };
+    assert_ne!(
+        unsafe { write_resource_outcome(&mut resource, 1, 64, MIGO_RESOURCE_STATE_READY, 7, 1) },
+        MIGO_OK,
+        "a READY resource carrying an error is one a frame may name and a host was told not to trust"
+    );
+    assert_ne!(
+        unsafe { write_resource_outcome(&mut resource, 1, 0, 99, 0, 0) },
+        MIGO_OK,
+        "an unrecognised state is refused"
+    );
+}

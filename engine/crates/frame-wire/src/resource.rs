@@ -61,6 +61,20 @@ pub enum ResourceState {
 }
 
 impl ResourceState {
+    /// Every state, for consumers that must cover all of them.
+    ///
+    /// Checked against this file's source by
+    /// `tests/wire_document_agreement.rs`: a variant added without being
+    /// listed here breaks that test rather than quietly escaping every
+    /// consumer that iterates this.
+    pub const ALL: &'static [ResourceState] = &[
+        Self::Reserved,
+        Self::Uploading,
+        Self::Verifying,
+        Self::Ready,
+        Self::Failed,
+    ];
+
     #[inline]
     pub const fn code(self) -> u32 {
         self as u32
@@ -97,6 +111,26 @@ pub enum ResourceError {
 }
 
 impl ResourceError {
+    /// Every failure, for the C ABI mirror and its coverage test.
+    ///
+    /// Checked against this file's source by
+    /// `tests/wire_document_agreement.rs`: a variant added without being
+    /// listed here breaks that test rather than quietly escaping every
+    /// consumer that iterates this.
+    pub const ALL: &'static [ResourceError] = &[
+        Self::TooManyReservations,
+        Self::BadSize,
+        Self::BadChunkCount,
+        Self::UnknownReservation,
+        Self::NonContiguousChunk,
+        Self::ChunkOutOfBounds,
+        Self::DigestMismatch,
+        Self::TimedOut,
+        Self::EpochAdvanced,
+        Self::Incomplete,
+        Self::NotUploading,
+    ];
+
     #[inline]
     pub const fn code(self) -> u32 {
         self as u32
