@@ -763,6 +763,11 @@ pub mod gl_stream;
 
 pub mod ingress;
 pub mod pool;
+/// The resource lane: large bytes uploaded out of band and referenceable only
+/// once verified.
+pub mod resource;
+/// The synchronous barrier: the few calls whose return value is the answer.
+pub mod sync;
 pub use ingress::{FrameIngress, IngressDecision, IngressOutcome};
 pub use pool::{CreditWindow, FramePool, PooledFrame};
 

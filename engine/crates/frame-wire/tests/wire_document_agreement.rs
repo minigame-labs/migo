@@ -14,6 +14,7 @@ use std::{fs, path::PathBuf};
 use frame_wire::{
     HEADER_BYTES, HEADER_LAYOUT, HeaderField, MAX_SECTIONS, MAX_TOTAL_BYTES, WireError,
     ingress::{INGRESS_ERROR_BASE, INGRESS_ERROR_CODES},
+    sync::{SYNC_LAYOUT, SYNC_RECORD_BYTES},
 };
 
 fn document() -> String {
@@ -308,5 +309,49 @@ fn the_document_rejection_table_lists_exactly_the_codes_the_crate_defines() {
     assert_eq!(
         documented, expected,
         "the document's rejection table and the crate's codes disagree"
+    );
+}
+
+/// The synchronous barrier's record gets the same treatment as the frame
+/// header, for the same reason: it is a layout two implementations write, and
+/// "checked by eye at review time" is how one of them ends up writing a
+/// different one.
+#[test]
+fn the_document_sync_record_table_matches_the_exported_layout() {
+    let document = document();
+    let rows = table_after(&document, "### Record");
+
+    let declared: Vec<HeaderField> = rows
+        .iter()
+        .map(|cells| {
+            assert!(
+                cells.len() >= 3,
+                "a record row needs offset, size and field: {cells:?}"
+            );
+            HeaderField {
+                offset: cells[0].parse().expect("offset column is a number"),
+                size: cells[1].parse().expect("size column is a number"),
+                name: Box::leak(strip_code_ticks(&cells[2]).into_boxed_str()),
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        declared.len(),
+        SYNC_LAYOUT.len(),
+        "the document declares {} sync fields, the crate exports {}",
+        declared.len(),
+        SYNC_LAYOUT.len()
+    );
+    for (document_field, code_field) in declared.iter().zip(SYNC_LAYOUT) {
+        assert_eq!(
+            document_field, code_field,
+            "sync record mismatch: document says {document_field:?}, code says {code_field:?}"
+        );
+    }
+
+    assert!(
+        document.contains(&format!("### Record — {SYNC_RECORD_BYTES} bytes, fixed")),
+        "the sync record heading does not state {SYNC_RECORD_BYTES} bytes"
     );
 }

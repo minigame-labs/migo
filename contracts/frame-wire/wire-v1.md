@@ -278,6 +278,90 @@ structurally perfect packet; nothing but a checksum over the header notices.
 The checksum is the **last** envelope check to run. It is the only pass over
 the whole packet, and a malformed header should never cost a full CRC.
 
+## The synchronous barrier
+
+Almost everything a producer asks for is answered on its own side: object names
+are allocated locally and written into the command stream without waiting,
+`getError` is a shadow of state the producer already has, and limits and
+extensions are fetched once. What is left is the handful of calls whose *return
+value is the answer* — `readPixels`, `getImageData`, `toDataURL` — and those
+block.
+
+One request may be outstanding per session. A second would need a second
+mailbox and a second waiter, and the producer is a single agent that is blocked
+while it waits; if that ever becomes two, the protocol needs a request queue,
+which is a change worth noticing rather than absorbing.
+
+### Record — 64 bytes, fixed
+
+| Offset | Size | Field | Rule |
+|---:|---:|---|---|
+| 0 | 4 | `state` | `FREE=0 PENDING=1 READY=2 FAILED=3 CANCELLED=4`. First and four bytes wide because the producer reads it with an atomic load out of a shared cell |
+| 4 | 4 | `request_id` | monotonic, never `0`; a cleared mailbox holds `0`, so a reply naming `0` answers nothing |
+| 8 | 8 | `runtime_generation` | must match the session's |
+| 16 | 8 | `surface_generation` | the surface the request was made against |
+| 24 | 8 | `resource_epoch` | the epoch its resource ids belong to |
+| 32 | 8 | `triggering_sequence` | the frame the producer had submitted when it blocked |
+| 40 | 4 | `operation` | which call is being answered |
+| 44 | 4 | `max_reply_bytes` | what the producer reserved; `1..=16777216` |
+| 48 | 4 | `reply_bytes` | how much of the reply buffer is the answer; `<= max_reply_bytes` |
+| 52 | 4 | `error` | stable code, `0` when none |
+| 56 | 8 | `deadline_nanos` | monotonic host clock, strictly in the future. Not wall time: a producer blocked across a clock adjustment would wake early or never |
+
+### Every way a waiter is woken
+
+A blocked producer waits exactly as long as it is told to, so every path ends
+with the waiter settled and told what happened:
+
+- **answered** — `READY`, with `reply_bytes` set;
+- **a reply that does not match the outstanding request** — `FAILED`. Accepting
+  one would hand the producer another call's pixels;
+- **a reply larger than reserved** — `FAILED`, never truncated. A truncated
+  `readPixels` is a wrong answer that looks like a right one;
+- **the deadline passes** — `FAILED` with a timeout;
+- **a generation or epoch moves under the request** — `FAILED`;
+- **the producer withdraws it** — `CANCELLED`, with no error: nothing went wrong;
+- **the session ends** — `FAILED`. A producer inside `Atomics.wait` on a session
+  that has gone stays blocked until its agent is destroyed, which on iOS means
+  until WebKit reclaims the process.
+
+Returning zeros, stale bytes or a partial buffer is not on that list.
+
+## The resource lane
+
+A frame packet is small and bounded; a texture atlas is neither. Large assets
+are reserved, uploaded in chunks, verified against a digest declared up front,
+and become nameable from a frame only then. The frame ceiling stays small
+because this exists.
+
+| Bound | Value |
+|---|---:|
+| Bytes per resource | 64 MiB |
+| Bytes per chunk | 1 MiB |
+| Open reservations per session | 64 |
+
+States are `RESERVED → UPLOADING → VERIFYING → READY \| FAILED`. Chunks are
+**strictly contiguous**, for the same reason frame sequences are: a gap means a
+chunk was lost, and there is no recovery from that which is not "upload it
+again". The reservation id is assigned by the host, not chosen by the producer:
+a producer-chosen id could collide with one already in the table, and the
+collision would be a frame naming the wrong texture.
+
+**Verification happens before creation.** The alternative — create the GPU
+object as bytes arrive, fix it up if the digest turns out wrong — trades a
+bounded failure for an unbounded one: a texture whose contents are whatever
+arrived, already bound by a frame that referenced it, with no way to tell it
+from a correct one except by looking at the screen.
+
+The digest is computed by the host, not by this protocol. This crate has one
+dependency because it parses bytes from another process and each one is inside
+that trust boundary; a SHA-256 implementation would be a second, and the bytes
+are already in the host's hands when they arrive.
+
+Advancing the resource epoch discards every reservation, verified ones
+included. The ids in a rebuilt table name different objects, so a resource that
+survived would be a name pointing at whatever took its place.
+
 ## Rejection codes
 
 Stable, and carried across the C ABI into host telemetry. The list lives in
