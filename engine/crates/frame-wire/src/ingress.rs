@@ -10,7 +10,13 @@
 //! current, which sequence number comes next, whether the resource table is
 //! ready, and how many frames the renderer is already holding.
 
-use crate::{MAX_TOTAL_BYTES, WireError, WireFrame, validate};
+use std::sync::Arc;
+
+use crate::{
+    MAX_TOTAL_BYTES, WireError,
+    pool::{CreditWindow, FramePool, PooledFrame},
+    validate,
+};
 
 /// What the host should do with the packet it just handed over.
 ///
@@ -124,8 +130,10 @@ pub struct FrameIngress {
     resource_epoch: u64,
     resources_ready: bool,
     max_packet_bytes: u32,
-    max_credits: u32,
-    in_flight: u32,
+    /// Shared with every frame in flight, because a completion token has to
+    /// return its credit from wherever the renderer finished.
+    credits: Arc<CreditWindow>,
+    pool: Arc<FramePool>,
     last_accepted_sequence: u64,
 }
 
@@ -144,8 +152,13 @@ impl FrameIngress {
             // producer could name a resource before the table existed.
             resources_ready: false,
             max_packet_bytes: MAX_TOTAL_BYTES,
-            max_credits: DEFAULT_MAX_CREDITS,
-            in_flight: 0,
+            credits: Arc::new(CreditWindow::new(DEFAULT_MAX_CREDITS)),
+            // One more buffer than the credit window: a packet is copied in
+            // while the window's worth are still out with the renderer.
+            pool: Arc::new(FramePool::new(
+                DEFAULT_MAX_CREDITS as usize + 1,
+                MAX_TOTAL_BYTES as usize,
+            )),
             last_accepted_sequence: 0,
         }
     }
@@ -154,7 +167,12 @@ impl FrameIngress {
     /// raise the ceiling, and zero would deadlock the producer rather than
     /// throttle it.
     pub fn with_max_credits(mut self, credits: u32) -> Self {
-        self.max_credits = credits.clamp(1, MAX_CREDITS);
+        let max = credits.clamp(1, MAX_CREDITS);
+        self.credits = Arc::new(CreditWindow::new(max));
+        self.pool = Arc::new(FramePool::new(
+            max as usize + 1,
+            self.max_packet_bytes as usize,
+        ));
         self
     }
 
@@ -165,6 +183,10 @@ impl FrameIngress {
     /// something bigger, including a value that arrived from content.
     pub fn with_max_packet_bytes(mut self, bytes: u32) -> Self {
         self.max_packet_bytes = bytes.clamp(crate::HEADER_BYTES, MAX_TOTAL_BYTES);
+        self.pool = Arc::new(FramePool::new(
+            self.credits.max() as usize + 1,
+            self.max_packet_bytes as usize,
+        ));
         self
     }
 
@@ -180,8 +202,14 @@ impl FrameIngress {
     }
 
     #[inline]
-    pub const fn max_credits(&self) -> u32 {
-        self.max_credits
+    pub fn max_credits(&self) -> u32 {
+        self.credits.max()
+    }
+
+    /// The buffer pool, for the memory ledger and the allocation gate.
+    #[inline]
+    pub fn pool(&self) -> &Arc<FramePool> {
+        &self.pool
     }
 
     #[inline]
@@ -250,22 +278,14 @@ impl FrameIngress {
         self.resources_ready = true;
     }
 
-    /// Saturating, and not because the subtraction is expected to go negative.
-    ///
-    /// `submit` only increments below the limit, so `in_flight` cannot exceed
-    /// `max_credits` on the normal path. It can if a caller lowers the limit
-    /// while frames are outstanding -- and the useful failure there is a
-    /// producer that waits, not an arithmetic panic on the render path or, in
-    /// release, a wrapped counter that reads as four billion free credits and
-    /// turns backpressure off entirely.
     #[inline]
-    pub const fn remaining_credits(&self) -> u32 {
-        self.max_credits.saturating_sub(self.in_flight)
+    pub fn remaining_credits(&self) -> u32 {
+        self.credits.remaining()
     }
 
     #[inline]
-    pub const fn in_flight(&self) -> u32 {
-        self.in_flight
+    pub fn in_flight(&self) -> u32 {
+        self.credits.in_flight()
     }
 
     #[inline]
@@ -280,7 +300,7 @@ impl FrameIngress {
     /// and it buys the property that whether a packet is *legal* never depends
     /// on how busy the renderer is. The alternative answers `WouldBlock` to
     /// malformed bytes and invites the producer to resend them forever.
-    pub fn submit<'a>(&mut self, bytes: &'a [u8]) -> (IngressOutcome, Option<WireFrame<'a>>) {
+    pub fn submit(&mut self, bytes: &[u8]) -> (IngressOutcome, Option<PooledFrame>) {
         // The session ceiling first, before the parser walks anything: it is a
         // length comparison, and a packet above it is refused whatever else is
         // wrong with it.
@@ -375,7 +395,11 @@ impl FrameIngress {
             );
         }
 
-        if self.in_flight >= self.max_credits {
+        let sequence = frame.sequence();
+        // The credit is taken before the copy, so a packet that cannot get one
+        // is never copied. Copying first and releasing on failure would put a
+        // packet-sized memcpy on the path a blocked producer retries.
+        if !self.credits.try_acquire() {
             return (
                 IngressOutcome {
                     decision: IngressDecision::WouldBlock,
@@ -387,26 +411,31 @@ impl FrameIngress {
             );
         }
 
-        self.in_flight += 1;
-        self.last_accepted_sequence = frame.sequence();
+        // The bytes are borrowed from the caller for the duration of this call
+        // only -- on Apple they point into a `Data` the Swift transport owns --
+        // so nothing that outlives the call may reference them. One copy, into
+        // a buffer this side owns and returns to the pool when the renderer is
+        // finished with it.
+        let Some(owned) = PooledFrame::new(bytes, &self.pool, &self.credits, sequence) else {
+            // Only reachable if the pool refuses the length, which the session
+            // ceiling already checked. Releasing here keeps the credit
+            // accounting exact on a path that should not happen.
+            drop(PooledFrame::new(&[], &self.pool, &self.credits, 0));
+            return (
+                IngressOutcome::refused(INGRESS_ERROR_PACKET_TOO_LARGE, self.remaining_credits()),
+                None,
+            );
+        };
+
+        self.last_accepted_sequence = sequence;
         (
             IngressOutcome {
                 decision: IngressDecision::Accepted,
                 remaining_credits: self.remaining_credits(),
-                accepted_sequence: frame.sequence(),
+                accepted_sequence: sequence,
                 wire_error_code: 0,
             },
-            Some(frame),
+            Some(owned),
         )
-    }
-
-    /// The renderer finished with an accepted packet; return its credit.
-    ///
-    /// Saturating rather than wrapping: a double completion is a bug in the
-    /// renderer, and the useful failure is a stalled producer someone
-    /// investigates, not a credit counter that wraps to four billion and turns
-    /// backpressure off.
-    pub fn complete(&mut self) {
-        self.in_flight = self.in_flight.saturating_sub(1);
     }
 }

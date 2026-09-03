@@ -242,6 +242,30 @@ them, because they depend on state the host owns.
   is. The alternative answers "wait" to malformed bytes and invites the producer
   to resend them forever.
 
+## Frame ownership
+
+A packet arrives as borrowed bytes: on Apple the transport hands the C ABI a
+pointer into a `Data` that Swift owns for the duration of one call. The renderer
+is on another thread and finishes later, so **nothing derived from that pointer
+may outlive the call**. An accepted packet is copied exactly once, into a buffer
+this process owns.
+
+The buffer comes from a bounded pool that **grows to the sizes actually seen**
+rather than reserving the ceiling. Reserving `credits + 1` buffers of 4 MiB
+would hold twelve megabytes per session, almost all of it never touched, in the
+lane whose case rests on memory. Allocation therefore happens while the pool
+fills and not afterwards; that is the property the render path needs, and it is
+asserted by a counting allocator rather than described.
+
+The credit travels with the frame. It is taken **before** the copy -- so a
+packet that cannot get one is never copied -- and returned when the frame is
+dropped. Five paths return a credit (the renderer finished, it rejected the
+frame after accepting it, the context was lost, the generation went away, the
+session shut down) and a counter decremented by hand at each of them is five
+places to forget. Forgetting stalls the producer permanently, which presents on
+a device as a hang rather than an error. Ownership makes the five paths one, and
+makes returning a credit twice impossible rather than merely discouraged.
+
 ## Checksum
 
 CRC32 (IEEE) over the entire packet, with `payload_checksum`'s own four bytes

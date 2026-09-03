@@ -762,7 +762,9 @@ pub fn stamp_checksum(bytes: &mut [u8]) {
 pub mod gl_stream;
 
 pub mod ingress;
+pub mod pool;
 pub use ingress::{FrameIngress, IngressDecision, IngressOutcome};
+pub use pool::{CreditWindow, FramePool, PooledFrame};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod builder;

@@ -53,14 +53,26 @@ fuzz_target!(|data: &[u8]| {
     }
     let mut ingress = ingress.with_max_packet_bytes(u32::from(data.len() as u16).max(80));
 
+    // Frames are held across submissions on purpose: a credit belongs to the
+    // frame that holds it, so the interesting states -- the window emptying,
+    // the pool handing back a buffer that is still the right size -- only
+    // appear when several are alive at once.
+    let mut in_flight = Vec::new();
     for chunk in data.chunks(96.max(data.len() / 4 + 1)).take(8) {
         let (outcome, frame) = ingress.submit(chunk);
         std::hint::black_box(outcome.remaining_credits);
         std::hint::black_box(outcome.wire_error_code);
-        if frame.is_some() {
-            ingress.complete();
+        if let Some(frame) = frame {
+            std::hint::black_box(frame.bytes().len());
+            std::hint::black_box(frame.frame().is_ok());
+            in_flight.push(frame);
+        }
+        if in_flight.len() > 1 {
+            in_flight.remove(0);
         }
     }
+    std::hint::black_box(ingress.pool().allocations());
+    drop(in_flight);
     // Timeline moves, including refused ones, on a live instance.
     let _ = ingress.set_surface_generation(u64::from(data.len() as u32));
     let _ = ingress.set_resource_epoch(u64::from(data.last().copied().unwrap_or(0)));

@@ -65,6 +65,11 @@ fn credits_bound_the_number_of_frames_in_flight() {
     let mut ingress = ingress();
     assert_eq!(ingress.remaining_credits(), DEFAULT_MAX_CREDITS);
 
+    // Held, not dropped. A frame owns its credit for as long as it exists, so a
+    // test that let each one fall out of scope would never reach the limit --
+    // and would have been testing nothing while looking like it tested the
+    // window.
+    let mut in_flight = Vec::new();
     let mut sequence = 1;
     for expected_remaining in (0..DEFAULT_MAX_CREDITS).rev() {
         let bytes = packet(sequence);
@@ -72,7 +77,7 @@ fn credits_bound_the_number_of_frames_in_flight() {
         assert_eq!(outcome.decision, IngressDecision::Accepted);
         assert_eq!(outcome.remaining_credits, expected_remaining);
         assert_eq!(outcome.accepted_sequence, sequence);
-        assert!(frame.is_some());
+        in_flight.push(frame.expect("an accepted packet comes back owned"));
         sequence += 1;
     }
 
@@ -85,11 +90,79 @@ fn credits_bound_the_number_of_frames_in_flight() {
     // The blocked packet keeps its number: WouldBlock consumes nothing, so the
     // producer resends the same bytes rather than skipping a sequence it can
     // never fill.
-    ingress.complete();
+    drop(in_flight.pop());
+    assert_eq!(
+        ingress.remaining_credits(),
+        1,
+        "one frame finished, one credit back"
+    );
     let (outcome, frame) = ingress.submit(&bytes);
     assert_eq!(outcome.decision, IngressDecision::Accepted);
     assert_eq!(outcome.accepted_sequence, sequence);
     assert!(frame.is_some());
+}
+
+/// The bytes the renderer sees are this process's own copy.
+///
+/// The caller's slice is borrowed for one call -- on Apple it points into a
+/// `Data` the Swift transport owns -- so a frame that referenced it would be
+/// reading freed memory by the time the renderer got to it.
+#[test]
+fn an_accepted_frame_owns_its_bytes() {
+    let mut ingress = ingress();
+    let original = packet(1);
+    let (outcome, frame) = ingress.submit(&original);
+    assert_eq!(outcome.decision, IngressDecision::Accepted);
+    let frame = frame.expect("accepted");
+
+    assert_eq!(frame.bytes(), original.as_slice());
+    assert_eq!(frame.sequence(), 1);
+    // And the owned copy validates on its own, without trusting the check that
+    // ran on the borrowed slice across a thread boundary.
+    let parsed = frame.frame().expect("the copy is the same packet");
+    assert_eq!(parsed.sequence(), 1);
+
+    // Mutating the caller's buffer afterwards cannot reach the frame.
+    let mut scribbled = original.clone();
+    scribbled[0] ^= 0xFF;
+    assert_eq!(frame.bytes(), original.as_slice());
+}
+
+/// Steady state allocates nothing: the pool hands back the buffer a finished
+/// frame released. Warm-up allocates, and that is the point of measuring after
+/// it rather than pre-allocating the ceiling.
+#[test]
+fn the_buffer_pool_stops_allocating_once_it_is_warm() {
+    let mut ingress = ingress();
+    let mut sequence = 1u64;
+    for _ in 0..(DEFAULT_MAX_CREDITS + 1) {
+        let bytes = packet(sequence);
+        let (_, frame) = ingress.submit(&bytes);
+        drop(frame);
+        sequence += 1;
+    }
+    let warm = ingress.pool().allocations();
+    assert!(
+        warm <= DEFAULT_MAX_CREDITS as usize + 1,
+        "warm-up allocated {warm} buffers"
+    );
+
+    for _ in 0..64 {
+        let bytes = packet(sequence);
+        let (outcome, frame) = ingress.submit(&bytes);
+        assert_eq!(outcome.decision, IngressDecision::Accepted);
+        drop(frame);
+        sequence += 1;
+    }
+    assert_eq!(
+        ingress.pool().allocations(),
+        warm,
+        "a warm pool must not allocate again"
+    );
+    assert!(
+        ingress.pool().idle_bytes() > 0,
+        "the pool retains its buffers"
+    );
 }
 
 #[test]
@@ -145,7 +218,6 @@ fn sequences_must_be_strictly_contiguous() {
         IngressDecision::Accepted,
         "the first accepted sequence is 1"
     );
-    ingress.complete();
 
     for wrong in [1u64, 0, 3, 100, u64::MAX] {
         let bytes = packet(wrong);
@@ -261,7 +333,6 @@ fn advancing_the_resource_epoch_withdraws_readiness() {
         ingress.submit(&admitted).0.decision,
         IngressDecision::Accepted
     );
-    ingress.complete();
 
     // Context loss: the table is rebuilt, so nothing in it is ready.
     assert!(ingress.set_resource_epoch(1));
@@ -291,15 +362,18 @@ fn restating_the_current_epoch_leaves_readiness_alone() {
 fn validity_does_not_depend_on_how_busy_the_renderer_is() {
     let mut ingress = ingress();
     let mut sequence = 1;
+    let mut held = Vec::new();
     for _ in 0..DEFAULT_MAX_CREDITS {
         let bytes = packet(sequence);
-        assert_eq!(ingress.submit(&bytes).0.decision, IngressDecision::Accepted);
+        let (outcome, frame) = ingress.submit(&bytes);
+        assert_eq!(outcome.decision, IngressDecision::Accepted);
+        held.push(frame.expect("accepted"));
         sequence += 1;
     }
     assert_eq!(ingress.remaining_credits(), 0);
 
-    // Out of credit, but malformed bytes are still rejected rather than told to
-    // wait. Answering WouldBlock here invites the producer to resend garbage
+    // Out of credit -- the frames above are still held -- but malformed bytes
+    // are still rejected rather than told to wait. Answering WouldBlock here invites the producer to resend garbage
     // forever.
     let mut bad = packet(sequence);
     bad[4] ^= 0xFF;
@@ -323,18 +397,44 @@ fn validity_does_not_depend_on_how_busy_the_renderer_is() {
     );
 }
 
+/// A credit comes back exactly once, and there is no way to return it twice.
+///
+/// The previous shape of this was a `complete()` the renderer called by hand on
+/// five different paths -- finished, rejected-after-acceptance, context lost,
+/// generation lost, shutdown -- and the failure it guarded against was calling
+/// it twice. Ownership removes both: the credit returns when the frame is
+/// dropped, and a frame can only be dropped once.
 #[test]
-fn double_completion_cannot_turn_backpressure_off() {
+fn a_credit_returns_exactly_once_and_only_when_the_frame_is_finished() {
     let mut ingress = ingress();
     let bytes = packet(1);
-    assert_eq!(ingress.submit(&bytes).0.decision, IngressDecision::Accepted);
+    let (_, frame) = ingress.submit(&bytes);
+    let frame = frame.expect("accepted");
     assert_eq!(ingress.in_flight(), 1);
 
-    ingress.complete();
-    ingress.complete();
-    ingress.complete();
+    // Still one credit out while the frame is merely moved around.
+    let moved = frame;
+    assert_eq!(ingress.in_flight(), 1);
+    let boxed = Box::new(moved);
+    assert_eq!(ingress.in_flight(), 1);
+
+    drop(boxed);
     assert_eq!(ingress.in_flight(), 0);
     assert_eq!(ingress.remaining_credits(), DEFAULT_MAX_CREDITS);
+}
+
+/// A frame outliving the ingress that issued it is safe: the window and the
+/// pool are shared, so the credit still comes back to something that exists.
+#[test]
+fn a_frame_may_outlive_the_ingress_that_accepted_it() {
+    let bytes = packet(1);
+    let frame = {
+        let mut ingress = ingress();
+        let (_, frame) = ingress.submit(&bytes);
+        frame.expect("accepted")
+    };
+    assert_eq!(frame.bytes(), bytes.as_slice());
+    drop(frame);
 }
 
 /// The credit window has a compile-time ceiling, and the setter clamps to it.
