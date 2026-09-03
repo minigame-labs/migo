@@ -526,7 +526,7 @@ pub fn validate_stream(words: &[u32], used_words: u32) -> Result<ValidatedStream
     let used = used_words as usize;
 
     // Validate magic and version using safe indexing.
-    let w0 = *words.get(0).ok_or(StreamError::TooShort)?;
+    let w0 = *words.first().ok_or(StreamError::TooShort)?;
     if w0 != MAGIC {
         return Err(StreamError::BadMagic);
     }

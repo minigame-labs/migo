@@ -138,35 +138,26 @@ fn the_abi_and_the_wire_reader_agree_on_every_decision() {
 
 /// Every wire rejection reason must be expressible in the field that carries
 /// it, and must be distinguishable from "no error".
+///
+/// The lists come from `frame-wire`, which proves them complete against its own
+/// source. Writing them out here instead would make this test cover every
+/// reason as of whenever someone last updated it -- and a reason added later
+/// would be exactly the one that could not be reported.
 #[test]
 fn every_wire_error_code_is_non_zero_and_distinct_from_the_ingress_range() {
-    use frame_wire::WireError;
-    let all = [
-        WireError::ShorterThanHeader,
-        WireError::BadMagic,
-        WireError::UnsupportedVersion,
-        WireError::BadHeaderBytes,
-        WireError::BadTotalBytes,
-        WireError::LengthMismatch,
-        WireError::TooManySections,
-        WireError::SectionTableOutOfBounds,
-        WireError::SectionOutOfBounds,
-        WireError::SectionMisaligned,
-        WireError::SectionsOverlapOrUnordered,
-        WireError::DuplicateSection,
-        WireError::UnknownRequiredSection,
-        WireError::ChecksumMismatch,
-        WireError::UnknownFlags,
-        WireError::ReservedNotZero,
-        WireError::CommandStreamNotWordAligned,
-        WireError::ItemCountExceedsSection,
-        WireError::MissingCommandStream,
-    ];
-    for error in all {
+    use frame_wire::{WireError, ingress::INGRESS_ERROR_BASE};
+
+    assert!(
+        WireError::ALL.len() >= 20,
+        "the envelope has more rejection reasons than this: {}",
+        WireError::ALL.len()
+    );
+
+    for error in WireError::ALL {
         let code = error.code();
         assert_ne!(code, 0, "{error:?} would read as 'no error'");
         assert!(
-            code < 1000,
+            code < INGRESS_ERROR_BASE,
             "{error:?} is {code}, inside the range reserved for identity and \
              ordering failures",
         );
@@ -176,15 +167,13 @@ fn every_wire_error_code_is_non_zero_and_distinct_from_the_ingress_range() {
         assert_eq!(out.wire_error_code, code);
     }
 
-    for code in [
-        frame_wire::ingress::INGRESS_ERROR_FOREIGN_SESSION,
-        frame_wire::ingress::INGRESS_ERROR_STALE_SEQUENCE,
-        frame_wire::ingress::INGRESS_ERROR_STALE_SURFACE,
-        frame_wire::ingress::INGRESS_ERROR_STALE_RESOURCE_EPOCH,
-    ] {
+    for code in frame_wire::ingress::INGRESS_ERROR_CODES {
         assert!(
-            code >= 1000,
-            "identity failures start at 1001, found {code}"
+            *code >= INGRESS_ERROR_BASE,
+            "identity failures start at {INGRESS_ERROR_BASE}, found {code}"
         );
+        let (result, out) = write(MIGO_FRAME_INGRESS_REJECTED, 2, 0, *code);
+        assert_eq!(result, MIGO_OK, "code {code} could not be reported");
+        assert_eq!(out.wire_error_code, *code);
     }
 }

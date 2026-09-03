@@ -1,36 +1,58 @@
-//! Credit accounting, identity and ordering at the ingress door.
+//! Identity, ordering, admission and backpressure: the rules the parser cannot
+//! check because they depend on state the host owns.
 
 use frame_wire::{
-    FrameIngress, IngressDecision, SECTION_KIND_COMMAND_STREAM,
+    FrameIngress, IngressDecision, MAX_TOTAL_BYTES, SECTION_KIND_COMMAND_STREAM,
+    SECTION_KIND_RESOURCE_REFERENCES, WireError,
     builder::WireFrameBuilder,
     ingress::{
-        DEFAULT_MAX_CREDITS, INGRESS_ERROR_FOREIGN_SESSION, INGRESS_ERROR_STALE_RESOURCE_EPOCH,
-        INGRESS_ERROR_STALE_SEQUENCE, INGRESS_ERROR_STALE_SURFACE,
+        DEFAULT_MAX_CREDITS, INGRESS_ERROR_FOREIGN_SESSION, INGRESS_ERROR_NONCONTIGUOUS_SEQUENCE,
+        INGRESS_ERROR_PACKET_TOO_LARGE, INGRESS_ERROR_RESOURCES_NOT_READY,
+        INGRESS_ERROR_STALE_RESOURCE_EPOCH, INGRESS_ERROR_STALE_SURFACE, MAX_CREDITS,
     },
 };
 
-const NONCE: u64 = 0x0123_4567_89AB_CDEF;
-const GENERATION: u32 = 7;
+const NONCE: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+const GENERATION: u64 = 7;
 
-struct Packet(Vec<u8>);
+type Packet = Vec<u8>;
 
 fn packet(sequence: u64) -> Packet {
-    Packet(build(|builder| {
-        let mut builder = builder;
-        builder.sequence = sequence;
-        builder
-    }))
+    build(sequence, NONCE, GENERATION, 0, 0)
 }
 
 fn build(
-    configure: impl FnOnce(WireFrameBuilder<'static>) -> WireFrameBuilder<'static>,
-) -> Vec<u8> {
-    static STREAM: [u8; 8] = [0; 8];
-    let mut builder = WireFrameBuilder::new();
-    builder.session_nonce = NONCE;
-    builder.runtime_generation = GENERATION;
-    configure(builder)
-        .section(SECTION_KIND_COMMAND_STREAM, 2, &STREAM)
+    sequence: u64,
+    launch_nonce: u128,
+    runtime_generation: u64,
+    surface_generation: u64,
+    resource_epoch: u64,
+) -> Packet {
+    let stream = [0u8; 8];
+    let mut frame = WireFrameBuilder::new();
+    frame.sequence = sequence;
+    frame.launch_nonce = launch_nonce;
+    frame.runtime_generation = runtime_generation;
+    frame.surface_generation = surface_generation;
+    frame.resource_epoch = resource_epoch;
+    frame.frame_id = sequence as u32;
+    frame
+        .section(SECTION_KIND_COMMAND_STREAM, 2, &stream)
+        .build()
+}
+
+/// A packet that names resources, for the admission cases.
+fn packet_with_resources(sequence: u64, resource_epoch: u64) -> Packet {
+    let stream = [0u8; 8];
+    let refs = [0u8; 8];
+    let mut frame = WireFrameBuilder::new();
+    frame.sequence = sequence;
+    frame.launch_nonce = NONCE;
+    frame.runtime_generation = GENERATION;
+    frame.resource_epoch = resource_epoch;
+    frame
+        .section(SECTION_KIND_COMMAND_STREAM, 2, &stream)
+        .section(SECTION_KIND_RESOURCE_REFERENCES, 2, &refs)
         .build()
 }
 
@@ -43,59 +65,54 @@ fn credits_bound_the_number_of_frames_in_flight() {
     let mut ingress = ingress();
     assert_eq!(ingress.remaining_credits(), DEFAULT_MAX_CREDITS);
 
-    for sequence in 1..=DEFAULT_MAX_CREDITS as u64 {
+    let mut sequence = 1;
+    for expected_remaining in (0..DEFAULT_MAX_CREDITS).rev() {
         let bytes = packet(sequence);
-        let (outcome, frame) = ingress.submit(&bytes.0);
+        let (outcome, frame) = ingress.submit(&bytes);
         assert_eq!(outcome.decision, IngressDecision::Accepted);
+        assert_eq!(outcome.remaining_credits, expected_remaining);
         assert_eq!(outcome.accepted_sequence, sequence);
         assert!(frame.is_some());
+        sequence += 1;
     }
-    assert_eq!(ingress.remaining_credits(), 0);
 
-    // One past the limit waits. It is not dropped: the packet may carry state
-    // or resource changes a later frame depends on, so "skip it" is not a legal
-    // answer for the producer either.
-    let blocked = packet(DEFAULT_MAX_CREDITS as u64 + 1);
-    let (outcome, frame) = ingress.submit(&blocked.0);
+    let bytes = packet(sequence);
+    let (outcome, frame) = ingress.submit(&bytes);
     assert_eq!(outcome.decision, IngressDecision::WouldBlock);
     assert_eq!(outcome.remaining_credits, 0);
     assert!(frame.is_none());
 
-    // And being told to wait must not consume the sequence number, or the
-    // producer's retry would then be rejected as stale -- a deadlock built out
-    // of two individually reasonable rules.
+    // The blocked packet keeps its number: WouldBlock consumes nothing, so the
+    // producer resends the same bytes rather than skipping a sequence it can
+    // never fill.
     ingress.complete();
-    let (outcome, _) = ingress.submit(&blocked.0);
+    let (outcome, frame) = ingress.submit(&bytes);
     assert_eq!(outcome.decision, IngressDecision::Accepted);
-    assert_eq!(outcome.accepted_sequence, DEFAULT_MAX_CREDITS as u64 + 1);
+    assert_eq!(outcome.accepted_sequence, sequence);
+    assert!(frame.is_some());
 }
 
 #[test]
 fn a_rejected_packet_costs_no_credit() {
     let mut ingress = ingress();
-    let before = ingress.remaining_credits();
+    let mut bytes = packet(1);
+    bytes[0] ^= 0xFF;
 
-    let (outcome, _) = ingress.submit(&[0u8; 4]);
+    let (outcome, frame) = ingress.submit(&bytes);
     assert_eq!(outcome.decision, IngressDecision::Rejected);
-    assert_eq!(ingress.remaining_credits(), before);
-
-    // Otherwise a producer sending garbage would exhaust the window and stall
-    // itself, which reads on device as a hang rather than as bad input.
-    for _ in 0..64 {
-        let (outcome, _) = ingress.submit(&[0u8; 4]);
-        assert_eq!(outcome.decision, IngressDecision::Rejected);
-    }
-    assert_eq!(ingress.remaining_credits(), before);
+    assert_eq!(outcome.wire_error_code, WireError::BadMagic.code());
+    assert_eq!(outcome.remaining_credits, DEFAULT_MAX_CREDITS);
+    assert!(frame.is_none());
+    assert_eq!(ingress.in_flight(), 0);
 }
 
 #[test]
-fn a_packet_addressed_to_another_session_is_rejected() {
+fn a_packet_addressed_to_another_launch_is_rejected() {
     let mut ingress = ingress();
-    let foreign = build(|mut builder| {
-        builder.session_nonce = NONCE ^ 1;
-        builder
-    });
-    let (outcome, frame) = ingress.submit(&foreign);
+    // Only the high half differs: a 64-bit comparison would accept this.
+    let neighbour = NONCE ^ (1u128 << 100);
+    let bytes = build(1, neighbour, GENERATION, 0, 0);
+    let (outcome, frame) = ingress.submit(&bytes);
     assert_eq!(outcome.decision, IngressDecision::Rejected);
     assert_eq!(outcome.wire_error_code, INGRESS_ERROR_FOREIGN_SESSION);
     assert!(frame.is_none());
@@ -104,66 +121,79 @@ fn a_packet_addressed_to_another_session_is_rejected() {
 #[test]
 fn a_packet_from_a_dead_generation_reports_generation_lost_not_an_error() {
     let mut ingress = ingress();
-    let stale = build(|mut builder| {
-        builder.runtime_generation = GENERATION - 1;
-        builder
-    });
-    let (outcome, frame) = ingress.submit(&stale);
-    // Not Rejected. The producer did nothing wrong, and no retry helps: the
-    // WebContent process it was talking to is gone. Reporting this as a
-    // sequencing or format error sends whoever reads the telemetry looking for
-    // a bug that is not there.
+    // Only the high half differs here too.
+    let bytes = build(1, NONCE, GENERATION | (1u64 << 40), 0, 0);
+    let (outcome, frame) = ingress.submit(&bytes);
     assert_eq!(outcome.decision, IngressDecision::GenerationLost);
-    assert_eq!(outcome.wire_error_code, 0);
+    assert_eq!(
+        outcome.wire_error_code, 0,
+        "generation loss is nobody's error"
+    );
     assert!(frame.is_none());
 }
 
+/// Strictly contiguous, not merely increasing. A gap means a packet carrying
+/// state was lost, and there is no recovery from that which does not involve a
+/// new generation.
 #[test]
-fn sequences_must_strictly_increase() {
+fn sequences_must_be_strictly_contiguous() {
     let mut ingress = ingress();
 
-    let first = packet(10);
+    let first = packet(1);
     assert_eq!(
-        ingress.submit(&first.0).0.decision,
-        IngressDecision::Accepted
+        ingress.submit(&first).0.decision,
+        IngressDecision::Accepted,
+        "the first accepted sequence is 1"
     );
+    ingress.complete();
 
-    for sequence in [10u64, 9, 0] {
-        let bytes = packet(sequence);
-        let (outcome, frame) = ingress.submit(&bytes.0);
+    for wrong in [1u64, 0, 3, 100, u64::MAX] {
+        let bytes = packet(wrong);
+        let (outcome, frame) = ingress.submit(&bytes);
         assert_eq!(
             outcome.decision,
             IngressDecision::Rejected,
-            "sequence {sequence} must not be accepted after 10",
+            "sequence {wrong} is not exactly 2"
         );
-        assert_eq!(outcome.wire_error_code, INGRESS_ERROR_STALE_SEQUENCE);
+        assert_eq!(
+            outcome.wire_error_code,
+            INGRESS_ERROR_NONCONTIGUOUS_SEQUENCE
+        );
         assert!(frame.is_none());
+        assert_eq!(ingress.last_accepted_sequence(), 1);
     }
 
-    let next = packet(11);
+    let next = packet(2);
+    assert_eq!(ingress.submit(&next).0.decision, IngressDecision::Accepted);
+}
+
+/// A producer cannot start anywhere it likes: the first packet of a generation
+/// is sequence 1, so a replay of a later frame from a previous generation --
+/// same nonce, same generation number reused -- has nothing to land on.
+#[test]
+fn the_first_packet_of_a_generation_must_be_sequence_one() {
+    let mut ingress = ingress();
+    let bytes = packet(2);
+    let (outcome, _) = ingress.submit(&bytes);
+    assert_eq!(outcome.decision, IngressDecision::Rejected);
     assert_eq!(
-        ingress.submit(&next.0).0.decision,
-        IngressDecision::Accepted
+        outcome.wire_error_code,
+        INGRESS_ERROR_NONCONTIGUOUS_SEQUENCE
     );
 }
 
 #[test]
 fn a_packet_built_against_a_retired_surface_is_rejected() {
     let mut ingress = ingress();
-    ingress.set_surface_generation(4);
+    assert!(ingress.set_surface_generation(4));
 
-    let stale = build(|mut builder| {
-        builder.surface_generation = 3;
-        builder
-    });
-    let (outcome, _) = ingress.submit(&stale);
+    let stale = build(1, NONCE, GENERATION, 3, 0);
+    let (outcome, frame) = ingress.submit(&stale);
     assert_eq!(outcome.decision, IngressDecision::Rejected);
     assert_eq!(outcome.wire_error_code, INGRESS_ERROR_STALE_SURFACE);
+    assert!(frame.is_none());
 
-    let current = build(|mut builder| {
-        builder.surface_generation = 4;
-        builder
-    });
+    let current = build(1, NONCE, GENERATION, 4, 0);
     assert_eq!(
         ingress.submit(&current).0.decision,
         IngressDecision::Accepted
@@ -173,73 +203,191 @@ fn a_packet_built_against_a_retired_surface_is_rejected() {
 #[test]
 fn a_packet_naming_resources_from_before_a_context_loss_is_rejected() {
     let mut ingress = ingress();
+    assert!(ingress.set_resource_epoch(2));
+    ingress.mark_resources_ready();
 
-    // Resource ids are reused after the table is rebuilt, so a stale id is not
-    // an invalid id -- it silently names a different object. The epoch is what
-    // makes that detectable at all.
-    ingress.set_resource_epoch(2);
-    let stale = build(|mut builder| {
-        builder.resource_epoch = 1;
-        builder
-    });
-    let (outcome, _) = ingress.submit(&stale);
+    let stale = build(1, NONCE, GENERATION, 0, 1);
+    let (outcome, frame) = ingress.submit(&stale);
     assert_eq!(outcome.decision, IngressDecision::Rejected);
     assert_eq!(outcome.wire_error_code, INGRESS_ERROR_STALE_RESOURCE_EPOCH);
+    assert!(frame.is_none());
 
-    let current = build(|mut builder| {
-        builder.resource_epoch = 2;
-        builder
-    });
+    let current = build(1, NONCE, GENERATION, 0, 2);
     assert_eq!(
         ingress.submit(&current).0.decision,
         IngressDecision::Accepted
     );
 }
 
+/// Neither timeline may move backwards, and the refusal is observable. A
+/// timeline that can go back is a timeline on which a stale packet becomes
+/// valid again.
 #[test]
-fn validity_does_not_depend_on_how_busy_the_renderer_is() {
-    // Same malformed bytes, once with credit available and once without. The
-    // answer has to be the same, or a producer would learn that retrying
-    // garbage eventually "works" and the failure would surface as a stall.
-    let mut ingress = FrameIngress::new(NONCE, GENERATION).with_max_credits(1);
-    let malformed = [0u8; 80];
+fn the_surface_and_resource_timelines_only_advance() {
+    let mut ingress = ingress();
+    assert!(ingress.set_surface_generation(5));
+    assert!(!ingress.set_surface_generation(4), "backwards is refused");
+    assert_eq!(ingress.surface_generation(), 5, "and changes nothing");
+    assert!(
+        ingress.set_surface_generation(5),
+        "standing still is allowed"
+    );
+    assert!(ingress.set_surface_generation(6));
 
-    let (idle, _) = ingress.submit(&malformed);
-    assert_eq!(idle.decision, IngressDecision::Rejected);
+    assert!(ingress.set_resource_epoch(9));
+    assert!(!ingress.set_resource_epoch(8));
+    assert_eq!(ingress.resource_epoch(), 9);
+    assert!(ingress.set_resource_epoch(10));
+}
 
-    let accepted = packet(1);
+/// Advancing the epoch clears readiness in the same call. A host that had to
+/// remember to clear it separately is a host that will eventually forget, and
+/// the failure would be a frame drawing with ids that name whatever the rebuilt
+/// table put in their place.
+#[test]
+fn advancing_the_resource_epoch_withdraws_readiness() {
+    let mut ingress = ingress();
+    assert!(!ingress.resources_ready(), "nothing is ready at the start");
+
+    let early = packet_with_resources(1, 0);
+    let (outcome, frame) = ingress.submit(&early);
+    assert_eq!(outcome.decision, IngressDecision::Rejected);
+    assert_eq!(outcome.wire_error_code, INGRESS_ERROR_RESOURCES_NOT_READY);
+    assert!(frame.is_none());
+
+    ingress.mark_resources_ready();
+    let admitted = packet_with_resources(1, 0);
     assert_eq!(
-        ingress.submit(&accepted.0).0.decision,
+        ingress.submit(&admitted).0.decision,
         IngressDecision::Accepted
     );
+    ingress.complete();
+
+    // Context loss: the table is rebuilt, so nothing in it is ready.
+    assert!(ingress.set_resource_epoch(1));
+    assert!(!ingress.resources_ready());
+    let after_loss = packet_with_resources(2, 1);
+    let (outcome, _) = ingress.submit(&after_loss);
+    assert_eq!(outcome.wire_error_code, INGRESS_ERROR_RESOURCES_NOT_READY);
+
+    // A frame that names nothing is still fine while the table is rebuilding.
+    let plain = build(2, NONCE, GENERATION, 0, 1);
+    assert_eq!(ingress.submit(&plain).0.decision, IngressDecision::Accepted);
+}
+
+/// Setting the same epoch again is not an advance and must not withdraw
+/// readiness -- otherwise an idempotent host call would silently stall the
+/// producer.
+#[test]
+fn restating_the_current_epoch_leaves_readiness_alone() {
+    let mut ingress = ingress();
+    assert!(ingress.set_resource_epoch(3));
+    ingress.mark_resources_ready();
+    assert!(ingress.set_resource_epoch(3));
+    assert!(ingress.resources_ready());
+}
+
+#[test]
+fn validity_does_not_depend_on_how_busy_the_renderer_is() {
+    let mut ingress = ingress();
+    let mut sequence = 1;
+    for _ in 0..DEFAULT_MAX_CREDITS {
+        let bytes = packet(sequence);
+        assert_eq!(ingress.submit(&bytes).0.decision, IngressDecision::Accepted);
+        sequence += 1;
+    }
     assert_eq!(ingress.remaining_credits(), 0);
 
-    let (busy, _) = ingress.submit(&malformed);
-    assert_eq!(busy.decision, IngressDecision::Rejected);
-    assert_eq!(busy.wire_error_code, idle.wire_error_code);
+    // Out of credit, but malformed bytes are still rejected rather than told to
+    // wait. Answering WouldBlock here invites the producer to resend garbage
+    // forever.
+    let mut bad = packet(sequence);
+    bad[4] ^= 0xFF;
+    let (outcome, _) = ingress.submit(&bad);
+    assert_eq!(outcome.decision, IngressDecision::Rejected);
+    assert_eq!(
+        outcome.wire_error_code,
+        WireError::UnsupportedVersion.code()
+    );
+
+    // So is a foreign packet, and so is a non-contiguous one.
+    let foreign = build(sequence, NONCE ^ 1, GENERATION, 0, 0);
+    assert_eq!(
+        ingress.submit(&foreign).0.wire_error_code,
+        INGRESS_ERROR_FOREIGN_SESSION
+    );
+    let jumped = packet(sequence + 5);
+    assert_eq!(
+        ingress.submit(&jumped).0.wire_error_code,
+        INGRESS_ERROR_NONCONTIGUOUS_SEQUENCE
+    );
 }
 
 #[test]
 fn double_completion_cannot_turn_backpressure_off() {
     let mut ingress = ingress();
-    for _ in 0..16 {
-        ingress.complete();
-    }
-    assert_eq!(ingress.remaining_credits(), DEFAULT_MAX_CREDITS);
-    assert_eq!(ingress.in_flight(), 0);
+    let bytes = packet(1);
+    assert_eq!(ingress.submit(&bytes).0.decision, IngressDecision::Accepted);
+    assert_eq!(ingress.in_flight(), 1);
 
-    // Still bounded afterwards: the saturating subtraction must not have left
-    // the counter somewhere that lets an unbounded number of frames in.
-    for sequence in 1..=DEFAULT_MAX_CREDITS as u64 {
-        let bytes = packet(sequence);
+    ingress.complete();
+    ingress.complete();
+    ingress.complete();
+    assert_eq!(ingress.in_flight(), 0);
+    assert_eq!(ingress.remaining_credits(), DEFAULT_MAX_CREDITS);
+}
+
+/// The credit window has a compile-time ceiling, and the setter clamps to it.
+/// A value that arrives from configuration, a remote policy or a content
+/// manifest can only tighten the window.
+#[test]
+fn the_credit_window_cannot_be_widened_by_a_caller() {
+    for requested in [MAX_CREDITS + 1, 64, u32::MAX] {
+        let ingress = ingress().with_max_credits(requested);
         assert_eq!(
-            ingress.submit(&bytes.0).0.decision,
-            IngressDecision::Accepted
+            ingress.max_credits(),
+            MAX_CREDITS,
+            "requesting {requested} credits must clamp to the ceiling"
         );
     }
-    let overflow = packet(DEFAULT_MAX_CREDITS as u64 + 1);
+    assert_eq!(ingress().with_max_credits(1).max_credits(), 1);
     assert_eq!(
-        ingress.submit(&overflow.0).0.decision,
-        IngressDecision::WouldBlock
+        ingress().with_max_credits(0).max_credits(),
+        1,
+        "zero would deadlock the producer rather than throttle it"
     );
+}
+
+/// The packet ceiling behaves the same way: lowerable, never raisable.
+#[test]
+fn the_packet_ceiling_cannot_be_raised_by_a_caller() {
+    for requested in [MAX_TOTAL_BYTES + 1, u32::MAX] {
+        let ingress = ingress().with_max_packet_bytes(requested);
+        assert_eq!(ingress.max_packet_bytes(), MAX_TOTAL_BYTES);
+    }
+
+    let ingress = ingress().with_max_packet_bytes(4096);
+    assert_eq!(ingress.max_packet_bytes(), 4096);
+}
+
+#[test]
+fn a_packet_above_this_sessions_ceiling_is_refused_before_it_is_parsed() {
+    let stream = vec![0u8; 4096];
+    let mut frame = WireFrameBuilder::new();
+    frame.launch_nonce = NONCE;
+    frame.runtime_generation = GENERATION;
+    let big = frame
+        .section(SECTION_KIND_COMMAND_STREAM, 1024, &stream)
+        .build();
+
+    let mut tight = ingress().with_max_packet_bytes(1024);
+    let (outcome, returned) = tight.submit(&big);
+    assert_eq!(outcome.decision, IngressDecision::Rejected);
+    assert_eq!(outcome.wire_error_code, INGRESS_ERROR_PACKET_TOO_LARGE);
+    assert!(returned.is_none());
+    assert_eq!(outcome.remaining_credits, DEFAULT_MAX_CREDITS);
+
+    // The same bytes are fine for a session that did not tighten.
+    let mut default = ingress();
+    assert_eq!(default.submit(&big).0.decision, IngressDecision::Accepted);
 }

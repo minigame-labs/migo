@@ -14,7 +14,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-migo-frame-wire = { path = "../../crates/frame-wire" }
+migo-frame-wire = { path = "../../crates/frame-wire", default-features = false }
 
 [[bin]]
 name = "envelope"

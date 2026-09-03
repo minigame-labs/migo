@@ -1,7 +1,8 @@
 {
   "cases": [
-    { "name": "minimal-present", "bytes": 80, "sha256": "556fbd2aef7f6b41bf9864552dce50b18c666a0f4cbe40479710cfd7e92329b9", "accepted": true },
-    { "name": "typical-frame", "bytes": 248, "sha256": "a332b3d6db4feb760781686fe9614dba674923b4936bb766cf222b2e9a8a3126", "accepted": true },
-    { "name": "continued-no-present", "bytes": 112, "sha256": "8a3e0f2b2ebc99c36b95e618dc3d94b2f011036cb5b4c7d651431d595e23a5dd", "accepted": true }
+    { "name": "minimal-present", "bytes": 96, "sha256": "7441ccecf1a2f93b88b02a8c4abaa1bd7b8aa67089bb5880ed9cdbda0d9d92a8", "accepted": true },
+    { "name": "typical-frame", "bytes": 264, "sha256": "3cfbb9a1e3d1ca284411609fd44ac92b39aef51cd4f7b89866a084d2e36945e5", "accepted": true },
+    { "name": "all-section-kinds", "bytes": 264, "sha256": "56ab541da70ce6ebeb406022f1e7ddfcf33639fbfdd0fb2797c2b4840dc53f94", "accepted": true },
+    { "name": "rejected-noncanonical-gap", "bytes": 136, "sha256": "88a35739bc5f4ffb2003c7ad68936a596df40c9f12fe9268b09750085fe59c56", "accepted": false, "wire_error": 10, "wire_error_name": "SectionNotCanonical" }
   ]
 }

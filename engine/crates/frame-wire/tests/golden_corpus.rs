@@ -8,12 +8,16 @@
 //!
 //! A diff here is a wire-format change. It is answered with a version decision,
 //! not by regenerating the file.
+//!
+//! One case is a *rejected* one, and that is not decoration. A corpus with
+//! nothing rejected in it never exercises the half of the reader that says no,
+//! and the `accepted` column in the index would be a field no test reads.
 
 use std::{fs, path::PathBuf};
 
 use frame_wire::{
-    FLAG_CONTINUED, FLAG_PRESENT, SECTION_KIND_COMMAND_STREAM, SECTION_KIND_DAMAGE,
-    SECTION_KIND_INLINE_DATA, SECTION_KIND_RESOURCE_REFERENCES, builder::WireFrameBuilder,
+    FLAG_PRESENT, SECTION_KIND_COMMAND_STREAM, SECTION_KIND_DAMAGE, SECTION_KIND_INLINE_DATA,
+    SECTION_KIND_RESOURCE_REFERENCES, SECTION_KIND_TIMING, WireError, builder::WireFrameBuilder,
     validate,
 };
 
@@ -26,9 +30,17 @@ fn corpus_dir() -> PathBuf {
         })
 }
 
+/// What a reader must do with a case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Expect {
+    Accepted,
+    Rejected(WireError),
+}
+
 struct Case {
     name: &'static str,
     bytes: Vec<u8>,
+    expect: Expect,
 }
 
 /// Deterministic by construction: no timestamps, no randomness, no allocator
@@ -39,7 +51,7 @@ fn cases() -> Vec<Case> {
     // The smallest legal packet: one command stream, present, nothing else.
     let empty_stream: [u8; 0] = [];
     let mut minimal = WireFrameBuilder::new();
-    minimal.session_nonce = 0;
+    minimal.launch_nonce = 0;
     minimal.sequence = 1;
     minimal.runtime_generation = 1;
     minimal.frame_id = 1;
@@ -49,17 +61,19 @@ fn cases() -> Vec<Case> {
         bytes: minimal
             .section(SECTION_KIND_COMMAND_STREAM, 0, &empty_stream)
             .build(),
+        expect: Expect::Accepted,
     });
 
     // A frame shaped like a real one: commands, an inline blob whose length is
-    // not a multiple of 8 (so the encoder's padding is pinned), resources, and
-    // an advisory damage section.
+    // not a multiple of 8 (so the encoder's padding is pinned, and so is the
+    // rule that pad bytes are zero), resources at their exact record width, and
+    // an advisory damage section at its own.
     let stream: Vec<u8> = (0..64u8).collect();
     let inline: Vec<u8> = (0..21u8).map(|value| value.wrapping_mul(7)).collect();
     let resources: Vec<u8> = (0..12u8).map(|value| value.wrapping_add(200)).collect();
     let damage: Vec<u8> = (0..16u8).map(|value| value.wrapping_mul(3)).collect();
     let mut typical = WireFrameBuilder::new();
-    typical.session_nonce = 0x0123_4567_89AB_CDEF;
+    typical.launch_nonce = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
     typical.sequence = 42;
     typical.runtime_generation = 3;
     typical.surface_generation = 9;
@@ -74,24 +88,51 @@ fn cases() -> Vec<Case> {
             .section(SECTION_KIND_RESOURCE_REFERENCES, 3, &resources)
             .section(SECTION_KIND_DAMAGE, 1, &damage)
             .build(),
+        expect: Expect::Accepted,
     });
 
-    // A continuation: same frame_id, no present. Pins that CONTINUED is bit 1
-    // and that a non-presenting packet is legal.
+    // Every section kind at once, with the wide identity and timeline fields at
+    // values a 32-bit or 64-bit truncation would corrupt. This is the case that
+    // notices a producer writing the header at the wrong width.
     let more: Vec<u8> = (0..32u8).rev().collect();
-    let mut continued = WireFrameBuilder::new();
-    continued.session_nonce = 0x0123_4567_89AB_CDEF;
-    continued.sequence = 43;
-    continued.runtime_generation = 3;
-    continued.surface_generation = 9;
-    continued.resource_epoch = 2;
-    continued.frame_id = 41;
-    continued.flags = FLAG_CONTINUED;
+    let timing: Vec<u8> = (0..12u8).map(|value| value.wrapping_mul(11)).collect();
+    let mut all_kinds = WireFrameBuilder::new();
+    all_kinds.launch_nonce = u128::MAX - 5;
+    all_kinds.sequence = 0x0000_0001_0000_0000;
+    all_kinds.runtime_generation = 0x8000_0000_0000_0001;
+    all_kinds.surface_generation = 0x7FFF_FFFF_FFFF_FFFF;
+    all_kinds.resource_epoch = 0x0000_00FF_0000_00FF;
+    all_kinds.frame_id = 0xFFFF_FFFF;
+    all_kinds.flags = FLAG_PRESENT;
     cases.push(Case {
-        name: "continued-no-present",
-        bytes: continued
+        name: "all-section-kinds",
+        bytes: all_kinds
+            .section(SECTION_KIND_COMMAND_STREAM, 8, &more)
+            .section(SECTION_KIND_INLINE_DATA, 21, &inline)
+            .section(SECTION_KIND_RESOURCE_REFERENCES, 3, &resources)
+            .section(SECTION_KIND_DAMAGE, 1, &damage)
+            .section(SECTION_KIND_TIMING, 12, &timing)
+            .build(),
+        expect: Expect::Accepted,
+    });
+
+    // A packet that is well formed in every respect except that its section
+    // does not start where the canonical layout puts it. Aligned, in order, in
+    // bounds, checksum correct -- and rejected, because the eight bytes of gap
+    // are inside the integrity check and outside every consumer.
+    let mut gapped = WireFrameBuilder::new();
+    gapped.launch_nonce = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+    gapped.sequence = 43;
+    gapped.runtime_generation = 3;
+    gapped.frame_id = 42;
+    gapped.flags = FLAG_PRESENT;
+    gapped.extra_gap = 8;
+    cases.push(Case {
+        name: "rejected-noncanonical-gap",
+        bytes: gapped
             .section(SECTION_KIND_COMMAND_STREAM, 8, &more)
             .build(),
+        expect: Expect::Rejected(WireError::SectionNotCanonical),
     });
 
     cases
@@ -185,12 +226,22 @@ fn the_committed_corpus_matches_this_encoder() {
     for case in cases() {
         let path = dir.join(format!("{}.bin", case.name));
         let digest = sha256_hex(&case.bytes);
-        index_lines.push(format!(
-            "    {{ \"name\": \"{}\", \"bytes\": {}, \"sha256\": \"{}\", \"accepted\": true }}",
-            case.name,
-            case.bytes.len(),
-            digest
-        ));
+        index_lines.push(match case.expect {
+            Expect::Accepted => format!(
+                "    {{ \"name\": \"{}\", \"bytes\": {}, \"sha256\": \"{}\", \"accepted\": true }}",
+                case.name,
+                case.bytes.len(),
+                digest
+            ),
+            Expect::Rejected(error) => format!(
+                "    {{ \"name\": \"{}\", \"bytes\": {}, \"sha256\": \"{}\", \"accepted\": false, \"wire_error\": {}, \"wire_error_name\": \"{:?}\" }}",
+                case.name,
+                case.bytes.len(),
+                digest,
+                error.code(),
+                error
+            ),
+        });
 
         if updating {
             fs::write(&path, &case.bytes).expect("write corpus case");
@@ -207,9 +258,25 @@ fn the_committed_corpus_matches_this_encoder() {
                         case.bytes.len()
                     ));
                 }
-                validate(&committed).unwrap_or_else(|error| {
-                    panic!("committed case {} no longer validates: {error}", case.name)
-                });
+                // The committed bytes must get the committed verdict. Checking
+                // the encoder's output instead would let a corpus file rot
+                // while the test kept passing on freshly built bytes.
+                match (validate(&committed), case.expect) {
+                    (Ok(_), Expect::Accepted) => {}
+                    (Err(error), Expect::Rejected(expected)) if error == expected => {}
+                    (Ok(_), Expect::Rejected(expected)) => mismatches.push(format!(
+                        "{}: the index says rejected with {expected:?}, the reader accepted it",
+                        case.name
+                    )),
+                    (Err(error), Expect::Accepted) => mismatches.push(format!(
+                        "{}: the index says accepted, the reader rejected it with {error:?}",
+                        case.name
+                    )),
+                    (Err(error), Expect::Rejected(expected)) => mismatches.push(format!(
+                        "{}: the index says rejected with {expected:?}, the reader said {error:?}",
+                        case.name
+                    )),
+                }
             }
             Err(error) => mismatches.push(format!("{}: unreadable ({error})", case.name)),
         }
@@ -231,26 +298,35 @@ fn the_committed_corpus_matches_this_encoder() {
     );
 
     let index = fs::read_to_string(dir.join("index.json")).expect("corpus index");
-    for case in cases() {
+    for line in &index_lines {
+        let trimmed = line.trim().trim_end_matches(',');
         assert!(
-            index.contains(&format!("\"{}\"", case.name)),
-            "case {} is missing from index.json",
-            case.name,
-        );
-        assert!(
-            index.contains(&sha256_hex(&case.bytes)),
-            "case {} has a stale digest in index.json",
-            case.name,
+            index.contains(trimmed),
+            "index.json is missing or stale for this case:\n  {trimmed}"
         );
     }
 }
 
 /// The corpus is worth nothing if it is empty, and an empty directory would
-/// otherwise report a clean pass.
+/// otherwise report a clean pass. It is also worth less than it looks if every
+/// case is an accepted one.
 #[test]
-fn the_corpus_is_not_empty() {
+fn the_corpus_covers_more_than_one_shape_and_both_verdicts() {
+    let cases = cases();
     assert!(
-        cases().len() >= 3,
+        cases.len() >= 4,
         "the corpus must cover more than one shape"
+    );
+    assert!(
+        cases
+            .iter()
+            .any(|case| matches!(case.expect, Expect::Rejected(_))),
+        "a corpus with nothing rejected never exercises the reader saying no"
+    );
+    assert!(
+        cases
+            .iter()
+            .any(|case| matches!(case.expect, Expect::Accepted)),
+        "a corpus with nothing accepted proves only that the reader refuses everything"
     );
 }

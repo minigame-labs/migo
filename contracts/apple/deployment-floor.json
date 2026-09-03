@@ -15,7 +15,7 @@
     "deployment target to iOS 17 to buy a single memory tier, and paid 2.4",
     "points of user coverage for a build simplification.",
     "",
-    "Reasoning and compatibility pointer: docs/superpowers/plans/2026-09-02-apple-performance-v5-final-implementation-plan.md and docs/superpowers/specs/2026-09-02-apple-performance-v5-design.md."
+    "Reasoning: docs/apple-final-implementation-plan.md, the single Apple authority. Its sections 2 and 2.5 adjudicate the three inputs archived under docs/inputs/; do not relitigate a numbered decision there without new evidence."
   ],
   "platforms": {
     "ios": {

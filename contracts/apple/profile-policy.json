@@ -18,7 +18,7 @@
     "     asks is never 'which lane' but 'why did this device, on this content,",
     "     end up there' -- and by the time it is asked, the inputs are gone.",
     "",
-    "Reasoning: docs/apple-final-implementation-plan.md sections 4 and 15."
+    "Reasoning: docs/apple-final-implementation-plan.md sections 4, 6 and 2.5 (E4, which retracts every fixed byte cap this file used to mirror)."
   ],
 
   "decision_order": [
