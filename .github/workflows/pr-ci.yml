@@ -436,6 +436,14 @@ jobs:
       - name: Frame wire JavaScript encoder against the golden corpus
         run: bash scripts/test-frame-wire-js-encoder.sh
 
+      # The G0 decision procedure, months before the first Mac. Its input needs
+      # a device; its rules do not, and the alternative is finding out on lab
+      # day that the thing turning measurements into a choice has a bug. Each
+      # case breaks one evidence rule -- simulator data, half a matrix, arms the
+      # data does not separate -- and checks that the tool refuses.
+      - name: Apple probe decision procedure
+        run: bash scripts/test-apple-probe-decision.sh
+
       - name: OpenHarmony host and package metadata contracts
         run: |
           bash scripts/test-ohos-host-contract.sh
