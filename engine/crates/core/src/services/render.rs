@@ -20,6 +20,12 @@ pub(crate) struct RenderService {
     thread: RenderThread,
 }
 
+/// Only the embedded execution restores a surface today. Restoring one in an
+/// external-frame session means the producer -- in another process -- has to
+/// learn that its surface generation advanced before it builds another packet,
+/// and that announcement travels on the control channel. Restoring without it
+/// would leave a producer drawing against a generation the renderer has retired.
+#[cfg(feature = "embedded-v8")]
 fn surface_for_restore(lease: Option<SurfaceLease>) -> EngineResult<SurfaceLease> {
     lease.ok_or_else(|| {
         EngineError::new(ErrorCode::InvalidOperation)
@@ -33,7 +39,8 @@ fn transition_error(context: &'static str, error: SurfaceTransitionError) -> Eng
         .with_detail(error.to_string())
 }
 
-#[cfg(test)]
+// Covers `surface_for_restore`, which exists only for the embedded execution.
+#[cfg(all(test, feature = "embedded-v8"))]
 mod tests {
     use super::surface_for_restore;
 
@@ -153,6 +160,11 @@ impl RenderService {
     /// built at `RenderThread::spawn` time and lives for the
     /// lifetime of the render service.
     #[inline]
+    /// Handed to the JavaScript runtime's op state so the text fast path can
+    /// measure inline instead of crossing to the render thread. There is no
+    /// such op state in an external-frame session: the producer measures text
+    /// in WebContent, and what crosses is the result.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn text_measurer(&self) -> shared::text_measurer::SharedTextMeasurer {
         self.thread.text_measurer()
     }
@@ -278,6 +290,8 @@ impl RenderService {
     /// This is only valid if the session still retains a live `SurfaceRef`.
     /// After `on_surface_destroyed()`, the handle is cleared and callers must
     /// wait for a fresh `update_surface()` instead of reusing a stale surface.
+    /// See [`surface_for_restore`].
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn restore_surface(&mut self) -> EngineResult<()> {
         self.update_surface(surface_for_restore(self.attachment.live_lease())?, None)
     }

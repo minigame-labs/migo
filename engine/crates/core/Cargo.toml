@@ -73,7 +73,14 @@ migo-io = { path = "../io", default-features = false }
 audio = { package = "migo-audio", path = "../audio", default-features = false, optional = true }
 crossbeam-channel = { workspace = true }
 futures = { workspace = true }
-tokio = { workspace = true }
+# Declared here rather than inherited. This crate uses `tokio::select!`, builds
+# a multi-thread runtime and holds a `Notify`, and until the embedded engine
+# became optional it compiled anyway: `migo-runtime-v8` enabled those features
+# and Cargo unified them across the graph. Feature unification is not a
+# dependency declaration -- it is a property of whoever else happens to be in
+# the build -- and the external-frame product, which links no engine, is exactly
+# the build where the other crate is not there.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

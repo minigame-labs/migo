@@ -135,8 +135,13 @@ pub use runtime::{
 // The host thread and its spawn entry points belong to the embedded execution:
 // they own a JavaScript runtime. A build without one does not get a narrower
 // version of them, it gets a different execution mode.
+/// The external-frame execution. A session with no script runtime in this
+/// process, for the Apple Performance+ product.
+#[cfg(feature = "external-frames")]
+pub use runtime::external::{ExternalFrameSession, spawn_external_frame_session};
+pub use runtime::{HostThread, SpawnedSurfaceHost};
 #[cfg(feature = "embedded-v8")]
-pub use runtime::{HostThread, SpawnedSurfaceHost, spawn_host_thread, spawn_host_thread_tracked};
+pub use runtime::{spawn_host_thread, spawn_host_thread_tracked};
 pub use services::{
     DeviceServiceProvider, FrameClock, HostNotifier, PlatformServices, RuntimeGenerationNotifier,
 };

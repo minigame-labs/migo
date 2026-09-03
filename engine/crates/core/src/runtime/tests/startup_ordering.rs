@@ -1,6 +1,8 @@
 //! Parallel GPU/V8 startup ordering, pinned against the source.
 
 const HOST: &str = include_str!("../host.rs");
+const SHELL: &str = include_str!("../shell.rs");
+const SESSION_THREAD: &str = include_str!("../session_thread.rs");
 const THREAD: &str = include_str!("../thread.rs");
 const RENDER_SERVICE: &str = include_str!("../../services/render.rs");
 const RENDER_THREAD: &str = include_str!("../../../../graphics/src/render_thread.rs");
@@ -21,9 +23,23 @@ fn host_new_body() -> &'static str {
 #[test]
 fn render_starts_before_v8_and_host_never_waits_for_the_gpu() {
     let body = host_new_body();
+    // The render thread is launched by the session shell, which is engine-neutral
+    // and shared with the external-frame execution. That makes "render before V8"
+    // structural rather than an ordering someone has to preserve: the shell
+    // returns before any line of `Host::new` can name a JavaScript runtime, and
+    // the shell has no way to name one.
+    assert!(
+        SHELL.contains("RenderService::new("),
+        "the session shell must be what starts RenderService"
+    );
+    assert!(
+        !SHELL.contains("HostJsRuntime"),
+        "the session shell must stay free of the embedded engine; it is compiled \
+         into the external-frame product, which links none"
+    );
     let render = body
-        .find("RenderService::new(")
-        .expect("Host::new must start RenderService");
+        .find("SessionShell::build(")
+        .expect("Host::new must build the session shell, which starts RenderService");
     let js = body
         .find("HostJsRuntime::new(")
         .expect("Host::new must construct V8 on the host thread");
@@ -123,9 +139,23 @@ fn host_drop_destroys_v8_before_stopping_render() {
 #[test]
 fn startup_registrations_are_guarded_until_host_publication() {
     let body = host_new_body();
-    assert!(HOST.contains("struct HostStartupGuard"));
-    assert!(HOST.contains("impl Drop for HostStartupGuard"));
-    assert!(body.contains("startup_guard.mark_console_registered()"));
+    // The guard moved to the shell with the registrations it protects: both the
+    // vsync sender and the console buffer are registered during the neutral
+    // bring-up, so a guard living beside `Host` would have been guarding
+    // something it could no longer see.
+    assert!(SHELL.contains("struct HostStartupGuard"));
+    assert!(SHELL.contains("impl Drop for HostStartupGuard"));
+    assert!(SHELL.contains("startup_guard.mark_console_registered()"));
+    assert!(
+        SHELL.contains("startup_guard.mark_vsync_registered()"),
+        "the vsync registration must stay inside the guard's protection"
+    );
+    // And it is still handed back armed, so the embedded half's own failure
+    // paths are covered by it rather than by nothing.
+    assert!(
+        body.contains("mut startup_guard,"),
+        "Host::new must take the armed guard from the shell"
+    );
     let disarm = body
         .find("startup_guard.disarm();")
         .expect("successful Host construction must transfer cleanup ownership");
@@ -271,11 +301,23 @@ fn render_init_panic_wakes_gpu_join_as_failure() {
 
 #[test]
 fn caller_ready_signal_stays_after_host_construction() {
+    // Readiness is published by the shared runtime helper, which the embedded
+    // body calls only after `Host::new` has returned. Keeping the order pinned
+    // across the two files is the point: the helper moved, and a caller that
+    // signalled ready before construction finished would turn a construction
+    // failure into a hang rather than into a synchronous error.
     let construct = THREAD
         .find("Host::new(")
         .expect("host thread must construct Host");
-    let ready = THREAD
-        .find("ready_tx.send(())")
-        .expect("host thread must publish readiness");
-    assert!(construct < ready);
+    let publish = THREAD
+        .find("create_runtime_before_ready(")
+        .expect("host thread must publish readiness through the shared helper");
+    assert!(
+        construct < publish,
+        "readiness must be published after Host construction, not before"
+    );
+    assert!(
+        SESSION_THREAD.contains("ready_tx.send(())"),
+        "the shared helper is what actually signals readiness"
+    );
 }

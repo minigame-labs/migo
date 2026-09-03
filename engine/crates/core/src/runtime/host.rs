@@ -36,6 +36,7 @@ use shared::{
     surface::{PixelRatio, SurfaceLease},
 };
 
+use crate::runtime::shell::SessionShell;
 use crate::{
     runtime::{
         HostId,
@@ -98,68 +99,6 @@ impl std::ops::DerefMut for JsRuntimeSlot {
         self.0
             .as_mut()
             .expect("[BUG] JsRuntime accessed after drop")
-    }
-}
-
-/// Cleans process-global registrations if `Host::new` exits before ownership
-/// transfers to the fully assembled `Host` and its normal `Drop` path.
-struct HostStartupGuard {
-    id: HostId,
-    armed: bool,
-    vsync_registered: bool,
-    console_registered: bool,
-}
-
-impl HostStartupGuard {
-    fn new(id: HostId) -> Self {
-        Self {
-            id,
-            armed: true,
-            vsync_registered: false,
-            console_registered: false,
-        }
-    }
-
-    fn mark_vsync_registered(&mut self) {
-        self.vsync_registered = true;
-    }
-
-    fn mark_console_registered(&mut self) {
-        self.console_registered = true;
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-        self.vsync_registered = false;
-        self.console_registered = false;
-    }
-}
-
-impl Drop for HostStartupGuard {
-    fn drop(&mut self) {
-        if self.console_registered {
-            shared::console_log::unregister_console_log(self.id);
-        }
-        if self.vsync_registered {
-            vsync::unregister_vsync_sender(self.id);
-        }
-        // The text texture cache registers itself lazily, from whichever
-        // of the render thread or the JS extension reaches this session
-        // first, so there is no `mark_*_registered` edge to hang this on.
-        // A `Host::new` that failed after either could have created it and
-        // there is no assembled `Host` to run the normal teardown, so
-        // clear it whenever the guard is still armed. Unregistering an id
-        // that was never registered is a no-op.
-        //
-        // The image alias table is registered from one place only — the JS
-        // extension's bring-up — but leaks the same way for the same reason, and
-        // this guard drops after the runtime it would have been registered by,
-        // so nothing can register it again behind us.
-        if self.armed {
-            shared::text_texture_cache::unregister_text_cache(self.id);
-            runtime_v8::unregister_image_cache(self.id);
-            shared::services::forget_downloaded_zips(self.id);
-        }
     }
 }
 
@@ -357,154 +296,45 @@ impl Host {
         surface_control: Arc<shared::surface::SurfaceControl>,
         restart_boundary: crate::runtime::restart_boundary::RestartBoundary,
     ) -> EngineResult<Self> {
-        // ---- Startup timing instrumentation ----
-        let t_start = Instant::now();
-
-        // ---- RAF signal (render thread → JS async op) ----
-        // On Android: eventfd (low-latency epoll wake).
-        // Other platforms: tokio mpsc channel (unchanged behavior).
-        let (raf_tx, raf_rx) = shared::raf_signal::create_raf_pair();
-
-        // ---- R1 RAF demand latch (host op <-> render thread) ----
-        let raf_demand = Arc::new(shared::raf_signal::RafDemand::new());
-        // Allocate the first session ticket up front so pre-signals (free-run
-        // RAF) have a stable ticket to match from the very first frame.
-        raf_demand.begin_session();
-
-        // ---- VSync channel (Choreographer JNI → render thread) ----
-        // Only platforms that actually publish external timestamps get this
-        // receiver. Passing a never-fed `Some(receiver)` on desktop would make
-        // RenderThread wait for frame timestamps nobody sends, freezing the loop.
-        let uses_external_vsync = platform.uses_external_vsync();
-        let mut startup_guard = HostStartupGuard::new(id);
-        let vsync_rx = if uses_external_vsync {
-            let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(2);
-            vsync::register_vsync_sender(id, vsync_tx);
-            startup_guard.mark_vsync_registered();
-            Some(vsync_rx)
-        } else {
-            None
-        };
-
-        // Immutable per-host policy. Audio captures this in a lazy client
-        // factory; JS network ops keep the same snapshot across restarts.
-        let network_policy = {
-            use shared::op_state::NetworkPolicy;
-            let mut policy = NetworkPolicy::default();
-            if let Some(wl) = init_options.extras().get("domain_whitelist") {
-                if let Some(arr) = wl.as_array() {
-                    policy.domain_whitelist = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                }
-            }
-            if let Some(v) = init_options.extras().get("enforce_https") {
-                policy.enforce_https = v.as_bool().unwrap_or(false);
-            }
-            policy
-        };
-
-        // ---- Services ----
-        // AudioService is lazy — no thread spawned until the first
-        // real audio command.  Saves ~80 ms on cold start.
-        let audio = AudioService::new(host_tx.clone(), network_policy.clone());
-        let gpu_caps = shared::device::gpu_caps::GpuCaps::new();
-
-        // Authoritative GL-context-loss state. Created here (before the render
-        // thread) and written exclusively by the render thread (edge-triggered
-        // level + epoch); the host and JS `op_gl_is_context_lost` only read it.
-        // Survives JS runtime restarts (same GL context / render thread) via the
-        // shared `Arc`.
-        let context_lost = Arc::new(shared::op_state::ContextLostState::default());
-
-        // Coalescing render-feedback wake: the render thread's event channel
-        // fires this after every successfully enqueued event, so the host loop
-        // drains + reconciles promptly (Canvas/GL/swap/RAF-backpressure/context)
-        // without a polling timer. Tokio `Notify` coalesces a burst to one permit
-        // and latches a permit if no waiter is registered, so an event emitted
-        // inside a JS poll is delivered on the next select iteration rather than
-        // lost.
-        let render_notify = Arc::new(tokio::sync::Notify::new());
-        let render_wake: Option<Arc<dyn Fn() + Send + Sync>> = {
-            let notify = render_notify.clone();
-            Some(Arc::new(move || {
-                notify.notify_one();
-            }))
-        };
-
-        // R1: one-shot frame arm, one route per platform.
-        //
-        // With an external vsync source this routes to `platform.request_vsync(id)`
-        // (Android posts a single Choreographer frame callback via JNI). Without
-        // one the engine paces frames itself and its clock stops whenever nothing
-        // is animating, so the arm has to wake the render thread instead: a
-        // demand nudge it selects on. The payload is the wakeup — demand itself is
-        // read from the latch — so a nudge already pending is not worth queueing
-        // twice, which is what the single slot and `try_send` express.
-        //
-        // Either way the closure keeps `graphics` decoupled from `platform`: the
-        // render thread and `op_await_next_frame` only invoke `Arc<dyn Fn()>`.
-        let (frame_demand_rx, request_vsync): (
-            Option<crossbeam_channel::Receiver<()>>,
-            Option<Arc<dyn Fn() + Send + Sync>>,
-        ) = if uses_external_vsync {
-            let platform = platform.clone();
-            (None, Some(Arc::new(move || platform.request_vsync(id))))
-        } else {
-            let (nudge_tx, nudge_rx) = crossbeam_channel::bounded::<()>(1);
-            (
-                Some(nudge_rx),
-                Some(Arc::new(move || {
-                    let _ = nudge_tx.try_send(());
-                })),
-            )
-        };
-        let report_surface_loss: Arc<
-            dyn Fn(shared::surface::PublicSurfaceGeneration, shared::surface::SurfaceLossReason)
-                + Send
-                + Sync,
-        > = Arc::new(move |public_generation, reason| {
-            let _ = critical_host_tx.send(HostCommand::SurfaceLost {
-                public_generation,
-                reason,
-            });
-        });
-
-        let render = RenderService::new(
-            raf_tx,
-            vsync_rx,
-            frame_demand_rx,
+        // The engine-neutral half: render thread, frame clock, audio, platform
+        // services, GPU capabilities, background and context-loss state. It is
+        // shared with the external-frame execution, which needs every one of
+        // them and needs no JavaScript runtime at all.
+        let shell = SessionShell::build(
             id,
+            &host_tx,
+            critical_host_tx,
             surface,
             graphics_platform,
-            init_options.pixel_ratio(),
-            init_options.target_fps(),
-            Some(init_options.cache_dir().to_path_buf()),
-            gpu_caps.clone(),
-            context_lost.clone(),
-            render_wake,
-            raf_demand.clone(),
-            // The render thread's own arm route is its clock when the engine paces
-            // frames, so it is deliberately not handed the nudge: a thread nudging
-            // itself is a wakeup that arms nothing.
-            uses_external_vsync.then(|| request_vsync.clone()).flatten(),
+            &platform,
+            &init_options,
             surface_control,
-            report_surface_loss,
         )?;
-        // Preserve the old two-second render-startup budget. V8 construction
-        // below consumes this same deadline while the render thread initializes.
-        let gpu_init_started = Instant::now();
-        let render_events = render.events();
+        let SessionShell {
+            t_start,
+            mut startup_guard,
+            render,
+            render_events,
+            render_notify,
+            gpu_init_started,
+            audio,
+            network_policy,
+            gpu_caps,
+            context_lost,
+            raf_rx,
+            raf_demand,
+            request_vsync,
+            backgrounded,
+            timer_backgrounded,
+        } = shell;
 
         // ---- HostOpState for extensions ----
+        //
+        // From here down is the embedded execution: the op state a V8 isolate
+        // is built around, the isolate itself, and its watchdog. None of it
+        // exists in a build without an engine.
         let device_services = platform.create_device_services(id);
-        let backgrounded = Arc::new(AtomicBool::new(false));
-        let timer_backgrounded = Arc::new(AtomicBool::new(false));
         let webgl_context_created = Arc::new(AtomicBool::new(false));
-        // `context_lost` was created above (before the render thread, which is
-        // its authoritative writer).
-
         let callback_ids = Arc::new(shared::callback_id::CallbackIdAllocator::default());
         let host_state = HostOpState {
             callback_ids: Arc::clone(&callback_ids),
@@ -541,12 +371,6 @@ impl Host {
             code_signing_enabled: false,
             gpu_caps: gpu_caps.clone(),
         };
-
-        // ---- Console log buffer (debug only) ----
-        if init_options.debug_enabled() {
-            shared::console_log::register_console_log(id);
-            startup_guard.mark_console_registered();
-        }
 
         let t_pre_js_done = Instant::now();
         info!(

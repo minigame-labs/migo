@@ -173,6 +173,12 @@ impl FrameIngress {
         self.max_packet_bytes
     }
 
+    /// The producer generation this ingress accepts, and no other.
+    #[inline]
+    pub const fn runtime_generation(&self) -> u64 {
+        self.runtime_generation
+    }
+
     #[inline]
     pub const fn max_credits(&self) -> u32 {
         self.max_credits
