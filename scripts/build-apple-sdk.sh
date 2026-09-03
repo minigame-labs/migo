@@ -238,14 +238,23 @@ fi
 # The WebContent producer bundle
 # ---------------------------------------------------------------------------
 
-if [ -d "$WEBCONTENT_SRC" ]; then
+if [ -d "$WEBCONTENT_SRC/src" ]; then
     info "staging the WebContent producer"
     rm -rf "${WEBCONTENT_DEST:?}"/*
     mkdir -p "$WEBCONTENT_DEST"
+    # `src/` only, and that is not tidiness. The producer directory also holds
+    # its node test suite and the packet emitter the Rust reader is checked
+    # against; copying the whole directory put both inside the shipped app
+    # bundle, where they are dead weight that reads the repository's golden
+    # corpus by relative path -- a path that does not exist on a phone.
+    #
     # Copied rather than bundled while the producer is still source-only. The
     # bundling step lands with the producer itself; doing it now would be a
     # build step over nothing.
-    cp -R "$WEBCONTENT_SRC"/. "$WEBCONTENT_DEST/" || exit 1
+    cp -R "$WEBCONTENT_SRC/src"/. "$WEBCONTENT_DEST/" || exit 1
+elif [ -d "$WEBCONTENT_SRC" ]; then
+    err "$WEBCONTENT_SRC exists but has no src/; the producer bundle would be empty"
+    exit 1
 fi
 
 if [ "$CODE_SIGNING" = "on" ]; then

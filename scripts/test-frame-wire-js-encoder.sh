@@ -48,6 +48,27 @@ if grep -nE '^\s*import\b' "$ENCODER" >/dev/null 2>&1; then
     exit 1
 fi
 
+# The shipped bundle must carry the producer and not its test suite.
+#
+# `build-apple-sdk.sh` used to copy the whole producer directory into the
+# SwiftPM resources, which put this test file and the packet emitter inside the
+# app bundle -- dead weight that reads the repository's golden corpus by
+# relative path, from a phone. Checked here because this is the gate that knows
+# what the producer directory contains.
+SDK_SCRIPT="scripts/build-apple-sdk.sh"
+if [[ -f "$SDK_SCRIPT" ]]; then
+    if ! grep -q 'WEBCONTENT_SRC/src' "$SDK_SCRIPT"; then
+        echo "FAIL: $SDK_SCRIPT does not stage the producer's src/ specifically." >&2
+        echo "      Copying the whole producer directory ships this test suite and the" >&2
+        echo "      packet emitter inside the app bundle." >&2
+        exit 1
+    fi
+    if grep -qE 'cp -R "\$WEBCONTENT_SRC"/\.' "$SDK_SCRIPT"; then
+        echo "FAIL: $SDK_SCRIPT copies the entire producer directory into the bundle." >&2
+        exit 1
+    fi
+fi
+
 node "$TEST"
 
 # --- and the other direction ------------------------------------------------
