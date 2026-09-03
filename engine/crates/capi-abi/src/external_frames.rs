@@ -333,14 +333,28 @@ pub struct MigoExternalSessionDescriptor {
     pub max_credits: u32,
 }
 
-/// The nonce as a `u128`, or `None` if the caller left it zero.
+/// Sixteen caller-supplied bytes as a launch identity, or `None` for all-zero.
+///
+/// One function, because two records carry this field -- the external session
+/// descriptor and `MigoSessionConfig` -- and they have to read it identically.
+/// A second conversion would be a second chance to pick the wrong endianness,
+/// and the symptom would be a session that rejects every packet as foreign with
+/// no indication that the two sides disagree about byte order rather than about
+/// the value.
+///
+/// Little-endian, matching the wire header the nonce is compared against.
 ///
 /// Rejecting all-zero is not paranoia about a weak random source: it is what an
 /// uninitialised struct holds, and a session that accepted it would accept
 /// packets from any other caller who also failed to initialise theirs.
-pub fn launch_nonce_of(descriptor: &MigoExternalSessionDescriptor) -> Option<u128> {
-    let nonce = u128::from_le_bytes(descriptor.launch_nonce);
+pub fn launch_nonce_from_bytes(bytes: [u8; 16]) -> Option<u128> {
+    let nonce = u128::from_le_bytes(bytes);
     (nonce != 0).then_some(nonce)
+}
+
+/// The descriptor's launch identity. See [`launch_nonce_from_bytes`].
+pub fn launch_nonce_of(descriptor: &MigoExternalSessionDescriptor) -> Option<u128> {
+    launch_nonce_from_bytes(descriptor.launch_nonce)
 }
 
 const _: () = assert!(size_of::<MigoExternalSessionDescriptor>() == 32);

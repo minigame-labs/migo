@@ -14,12 +14,12 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use migo_core::HostThread;
+use crate::session_engine::SessionEngine;
 
 /// Retired Hosts, owned until someone joins them.
 #[derive(Default)]
 pub(crate) struct RetirementSet {
-    hosts: Mutex<Vec<HostThread>>,
+    hosts: Mutex<Vec<SessionEngine>>,
 }
 
 impl RetirementSet {
@@ -31,7 +31,7 @@ impl RetirementSet {
     ///
     /// A failed request is logged rather than propagated: the handle still has
     /// to be retained, because dropping it here is what would leak the thread.
-    pub(crate) fn retire(&self, host: HostThread) {
+    pub(crate) fn retire(&self, host: SessionEngine) {
         if let Err(error) = host.request_shutdown() {
             tracing::error!("failed to request shutdown for Host {}: {error}", host.id());
         }
@@ -42,9 +42,9 @@ impl RetirementSet {
     ///
     /// `Err` when one of them is the calling thread: a Host cannot join itself,
     /// and the caller has to be able to refuse instead of deadlocking.
-    pub(crate) fn take(&self) -> Result<Vec<HostThread>, ()> {
+    pub(crate) fn take(&self) -> Result<Vec<SessionEngine>, ()> {
         let mut hosts = self.locked();
-        if hosts.iter().any(HostThread::is_current_thread) {
+        if hosts.iter().any(SessionEngine::is_current_thread) {
             return Err(());
         }
         Ok(std::mem::take(&mut *hosts))
@@ -57,7 +57,7 @@ impl RetirementSet {
 
     /// Private, and the reason this type is a module: a `MutexGuard` that
     /// escaped could be alive across a join.
-    fn locked(&self) -> MutexGuard<'_, Vec<HostThread>> {
+    fn locked(&self) -> MutexGuard<'_, Vec<SessionEngine>> {
         self.hosts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -73,13 +73,13 @@ mod tests {
         thread,
     };
 
-    use migo_core::HostThread;
+    use crate::session_engine::SessionEngine;
 
     use super::RetirementSet;
 
     /// A retired Host that parks until released, so a test can hold one across
     /// an observation and still join it.
-    fn parked_host(id: i32) -> (HostThread, mpsc::Sender<()>) {
+    fn parked_host(id: i32) -> (SessionEngine, mpsc::Sender<()>) {
         let (release_tx, release_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name(format!("Migo-Main-retirement-{id}"))
@@ -87,7 +87,10 @@ mod tests {
                 let _ = release_rx.recv();
             })
             .expect("spawn retired Host");
-        (HostThread::from_join_handle_for_test(id, join), release_tx)
+        (
+            SessionEngine::from_join_handle_for_test(id, join),
+            release_tx,
+        )
     }
 
     #[test]
@@ -131,7 +134,7 @@ mod tests {
                 release_tx.send(()).expect("publish refusal");
             })
             .expect("spawn retired Host");
-        set.retire(HostThread::from_join_handle_for_test(9_003, join));
+        set.retire(SessionEngine::from_join_handle_for_test(9_003, join));
 
         ready_tx.send(()).expect("tell the Host it is retired");
         release_rx.recv().expect("refusal published");

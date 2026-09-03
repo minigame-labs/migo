@@ -44,13 +44,13 @@ FORBIDDEN=(
 
 # The closures that must be free of an engine, as `package:features`.
 #
-# One entry today. `migo-capi:external-frames` joins it when the external
-# session shell exists -- the shell is what makes an engine-free capi build
-# something you can run rather than something that merely compiles. Adding the
-# entry before then would make this gate red for a reason that is not a
-# violation, and a gate that is red for a non-violation is a gate someone turns
-# off.
+# `migo-capi` is the one that matters: it is what the Apple SDK links, so it is
+# what the product claim is about. `migo-core` is kept alongside it because a
+# violation there is the more likely one and the message names the smaller
+# graph, which is easier to read than the same package appearing three levels
+# down in the larger one.
 CLEAN_CLOSURES=(
+    "migo-capi:external-frames"
     "migo-core:external-frames"
 )
 
@@ -63,7 +63,7 @@ CLEAN_CLOSURES=(
 # shape often enough to have a note about it: a guard nobody has seen fail is a
 # guard nobody should trust, and the cheapest way to see it fail is to keep a
 # case in the gate that must fail.
-POSITIVE_CONTROL="migo-core:profile-full"
+POSITIVE_CONTROL="migo-capi:profile-full"
 POSITIVE_CONTROL_EXPECTS=(migo-runtime-v8 deno_core v8)
 
 artifact=""

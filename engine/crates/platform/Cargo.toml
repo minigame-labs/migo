@@ -24,6 +24,12 @@ default = ["profile-full"]
 test-support = []
 profile-full = ["v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "migo-core/profile-full", "graphics/profile-full"]
 profile-slim = ["v8-limits", "code-signing", "migo-core/profile-slim", "graphics/profile-slim"]
+# The external-frame product's profile. The service surface is the slim one --
+# Guideline 4.7.2 makes every native capability something the embedding app has
+# to justify to Apple, so the lane starts small and adds -- but it must not pull
+# `migo-core/profile-slim`, which implies an embedded JavaScript engine. That is
+# the whole distinction: same platform services, no engine.
+external-frames = ["migo-core/external-frames", "graphics/profile-slim"]
 worker-snapshot = ["migo-core/worker-snapshot"]
 v8-jitless = ["migo-core/v8-jitless"]
 v8-limits = ["migo-core/v8-limits"]

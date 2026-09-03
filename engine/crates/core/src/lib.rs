@@ -138,7 +138,9 @@ pub use runtime::{
 /// The external-frame execution. A session with no script runtime in this
 /// process, for the Apple Performance+ product.
 #[cfg(feature = "external-frames")]
-pub use runtime::external::{ExternalFrameSession, spawn_external_frame_session};
+pub use runtime::external::{
+    ExternalFrameSession, SpawnedExternalSession, spawn_external_frame_session,
+};
 pub use runtime::{HostThread, SpawnedSurfaceHost};
 #[cfg(feature = "embedded-v8")]
 pub use runtime::{spawn_host_thread, spawn_host_thread_tracked};

@@ -488,3 +488,52 @@ fn an_all_zero_launch_nonce_is_refused() {
         "the descriptor and the wire header read the nonce the same way"
     );
 }
+
+/// The session configuration reads its nonce the same way the descriptor does.
+///
+/// They are different records filled in by different calls, and they name the
+/// same session: a byte-order disagreement between them would present as a
+/// session that rejects every packet as foreign, with nothing saying that the
+/// two sides disagree about byte order rather than about the value.
+#[test]
+fn the_session_config_and_the_descriptor_read_a_nonce_identically() {
+    use migo_capi_abi::config::MigoSessionConfig;
+    use migo_capi_abi::external_frames::{MigoExternalSessionDescriptor, launch_nonce_of};
+
+    let bytes = [
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23,
+        0x01,
+    ];
+    let expected = Some(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128);
+
+    let descriptor = MigoExternalSessionDescriptor {
+        struct_size: size_of::<MigoExternalSessionDescriptor>() as u32,
+        abi_version: 1,
+        launch_nonce: bytes,
+        max_packet_bytes: 0,
+        max_credits: 0,
+    };
+    assert_eq!(launch_nonce_of(&descriptor), expected);
+
+    let config = MigoSessionConfig {
+        header: migo_capi_abi::VersionedHeader {
+            struct_size: size_of::<MigoSessionConfig>() as u32,
+            abi_version: 1,
+        },
+        flags: 0,
+        launch_nonce: bytes,
+    };
+    let validated = config.validate().expect("a well-formed config");
+    assert_eq!(
+        validated.launch_nonce, expected,
+        "the config and the descriptor must agree byte for byte"
+    );
+
+    // And a v1 caller, whose record ends before this field, gets no identity
+    // rather than a zero one that would look like a value.
+    let zeroed = MigoSessionConfig {
+        launch_nonce: [0u8; 16],
+        ..config
+    };
+    assert_eq!(zeroed.validate().expect("still valid").launch_nonce, None);
+}

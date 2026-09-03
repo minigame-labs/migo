@@ -20,8 +20,8 @@ use std::{mem::size_of, thread};
 
 use graphics::egl_platform::PlatformIdentity;
 use migo_core::{
-    HostThread, PlatformServices, host_ingress, lease_surface_tracked, lease_surface_with_resource,
-    retire_surface, send_critical_command_to_host, spawn_host_thread_tracked,
+    PlatformServices, host_ingress, lease_surface_tracked, lease_surface_with_resource,
+    retire_surface, send_critical_command_to_host,
 };
 use shared::surface::{HostWindowMetrics, HostWindowState};
 use shared::{
@@ -263,7 +263,10 @@ pub unsafe extern "C" fn migo_session_attach_surface(
             ) {
                 return error;
             }
-            let existing_host = state.host.as_ref().map(HostThread::id);
+            let existing_host = state
+                .host
+                .as_ref()
+                .map(crate::session_engine::SessionEngine::id);
             if let Err(error) = validate_platform_context_state(
                 existing_host,
                 state.platform_identity,
@@ -377,15 +380,31 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                     let options = session
                         .engine
                         .session_init_options(configuration.scale_factor());
-                    match spawn_host_thread_tracked(
+                    // The identity an external producer's packets must carry.
+                    // An external-frame product refuses to start without one:
+                    // a session with no identity would accept a packet from
+                    // any process that guessed zero.
+                    #[cfg(feature = "external-frames")]
+                    let Some(launch_nonce) = session.launch_nonce else {
+                        tracing::error!(
+                            "migo_session_attach_surface: an external-frame session needs a \
+                             launch_nonce in its MigoSessionConfig"
+                        );
+                        return MIGO_ERROR_INVALID_STATE;
+                    };
+                    #[cfg(not(feature = "external-frames"))]
+                    let launch_nonce = session.launch_nonce.unwrap_or_default();
+
+                    match crate::session_engine::spawn_tracked(
                         surface,
                         public_generation,
                         graphics_platform,
                         host_kit,
                         options,
+                        launch_nonce,
                     ) {
                         Ok(mut started) => {
-                            let host = started.host.id();
+                            let host = started.engine.id();
                             let ingress = match host_ingress(host) {
                                 Ok(ingress) => ingress,
                                 Err(error) => {
@@ -393,7 +412,7 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                                         "migo_session_attach_surface: ingress capture failed: {error}"
                                     );
                                     let _ = retire_surface(host);
-                                    if let Err(error) = started.host.shutdown_and_join() {
+                                    if let Err(error) = started.engine.shutdown_and_join() {
                                         tracing::error!(
                                             "migo_session_attach_surface: rollback join failed: {error}"
                                         );
@@ -408,7 +427,7 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                                 notifier,
                                 Some(ingress),
                                 window_state,
-                                Some(started.host),
+                                Some(started.engine),
                             )
                         }
                         Err(error) => {
@@ -579,7 +598,11 @@ pub unsafe extern "C" fn migo_surface_update(
             ) {
                 return error;
             }
-            let Some(host) = state.host.as_ref().map(HostThread::id) else {
+            let Some(host) = state
+                .host
+                .as_ref()
+                .map(crate::session_engine::SessionEngine::id)
+            else {
                 return MIGO_ERROR_INVALID_STATE;
             };
             let transition_generation = active.public_generation();
@@ -710,7 +733,11 @@ pub unsafe extern "C" fn migo_surface_begin_detach(
             if !std::ptr::eq(active.as_ref(), attachment_ref) {
                 return MIGO_ERROR_STALE_SURFACE;
             }
-            let Some(host) = state.host.as_ref().map(HostThread::id) else {
+            let Some(host) = state
+                .host
+                .as_ref()
+                .map(crate::session_engine::SessionEngine::id)
+            else {
                 return MIGO_ERROR_INVALID_STATE;
             };
             let notification = release_notification(state.notifier.as_ref());
@@ -1010,7 +1037,7 @@ mod tests {
             .name("Migo-Main-capi-surface-test".to_owned())
             .spawn(|| {})
             .expect("spawn inert test Host");
-        state.host = Some(HostThread::from_join_handle_for_test(i32::MAX, join));
+        state.host = Some(crate::session_engine::engine_for_test(i32::MAX, join));
         state.platform_identity = Some(PlatformIdentity::new::<TestDomain>(
             GraphicsBackendId::of::<TestBackend>(),
             0,

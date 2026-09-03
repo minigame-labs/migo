@@ -70,11 +70,19 @@ pub struct ExternalFrameSession {
     host: HostThread,
     submit: SubmitPath,
     clock: Arc<ExternalFrameClock>,
-    /// The lease for the public attachment handle, when the session was started
-    /// with a Surface. Held for the session's life: it is what keeps the
-    /// embedding host's generation from being reused underneath a renderer that
-    /// is still drawing into it.
-    _surface_resource: Option<shared::surface::SurfaceResourceLease>,
+}
+
+/// A started external session and, when it was given a Surface, the lease for
+/// the embedding host's public attachment handle.
+///
+/// The lease is handed back rather than kept inside the session for the same
+/// reason `SpawnedSurfaceHost` hands one back: the C boundary owns the public
+/// handle's lifetime, and a lease held somewhere the boundary cannot see is a
+/// generation the boundary cannot retire.
+#[must_use = "a spawned session must be shut down and joined"]
+pub struct SpawnedExternalSession {
+    pub session: ExternalFrameSession,
+    pub resource: Option<shared::surface::SurfaceResourceLease>,
 }
 
 /// Why a frame that the ingress accepted still did not reach the renderer.
@@ -410,6 +418,34 @@ impl ExternalFrameSession {
     pub fn shutdown_and_join(&mut self) -> EngineResult<()> {
         self.host.shutdown_and_join()
     }
+
+    /// A session around an already-running thread, for tests that need a handle
+    /// without a renderer.
+    ///
+    /// Mirrors `HostThread::from_join_handle_for_test` so the C boundary's own
+    /// tests can build either execution mode the same way. Test-only: the
+    /// submit path it returns has no renderer, which is a state a real session
+    /// only passes through.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn from_join_handle_for_test(
+        host_id: crate::runtime::HostId,
+        join: std::thread::JoinHandle<()>,
+        launch_nonce: u128,
+    ) -> Self {
+        Self {
+            host: HostThread::from_join_handle_for_test(host_id, join),
+            submit: SubmitPath {
+                ingress: Arc::new(Mutex::new(FrameIngress::new(
+                    launch_nonce,
+                    INITIAL_RUNTIME_GENERATION,
+                ))),
+                errors: Arc::new(ExternalGlErrors::default()),
+                dispatch: Arc::new(OnceLock::new()),
+            },
+            clock: Arc::new(ExternalFrameClock::default()),
+        }
+    }
 }
 
 /// The generation a session's first ingress accepts.
@@ -433,10 +469,11 @@ const INITIAL_RUNTIME_GENERATION: u64 = 1;
 pub fn spawn_external_frame_session(
     launch_nonce: u128,
     surface: Option<SurfaceRef>,
+    public_generation: Option<shared::surface::PublicSurfaceGeneration>,
     graphics_platform: graphics::egl_platform::GraphicsPlatform,
     platform: Arc<dyn PlatformServices>,
     opt: InitOptions,
-) -> EngineResult<ExternalFrameSession> {
+) -> EngineResult<SpawnedExternalSession> {
     // Built here rather than on the session thread so the caller has the handle
     // the moment the spawn returns: a transport that connected before the
     // thread finished bringing up the renderer would otherwise have nowhere to
@@ -457,19 +494,21 @@ pub fn spawn_external_frame_session(
         graphics_platform,
         platform,
         opt,
-        None,
+        public_generation,
         move |ctx| run_external_session(ctx, thread_ingress, thread_clock, thread_dispatch),
     )?;
 
-    Ok(ExternalFrameSession {
-        host: started.host,
-        submit: SubmitPath {
-            ingress,
-            errors,
-            dispatch,
+    Ok(SpawnedExternalSession {
+        session: ExternalFrameSession {
+            host: started.host,
+            submit: SubmitPath {
+                ingress,
+                errors,
+                dispatch,
+            },
+            clock,
         },
-        clock,
-        _surface_resource: started.resource,
+        resource: started.resource,
     })
 }
 

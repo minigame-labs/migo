@@ -111,8 +111,13 @@ const _: () = assert!(offset_of!(MigoCapabilities, platform_kinds) == 16);
 
 // Pointer-free structs: identical on ILP32 and LP64, so they are pinned for
 // every target rather than only the ones that ship today.
-const _: () = assert!(size_of::<MigoSessionConfig>() == 16);
+const _: () = assert!(size_of::<MigoSessionConfig>() == 32);
 const _: () = assert!(offset_of!(MigoSessionConfig, flags) == 8);
+// Appended after v1. It is at the end because that is what makes the growth
+// backward compatible: a caller passing the 16-byte record is zero-extended and
+// gets no identity, which is the right answer for a host with no external
+// producer to authenticate.
+const _: () = assert!(offset_of!(MigoSessionConfig, launch_nonce) == 16);
 
 const _: () = assert!(size_of::<MigoSurfaceMetrics>() == 48);
 const _: () = assert!(offset_of!(MigoSurfaceMetrics, generation) == 8);
