@@ -412,6 +412,21 @@ jobs:
       - name: Apple profile policy contract
         run: bash scripts/test-apple-profile-policy-contract.sh
 
+      # The one claim the whole iOS fast lane rests on: the Performance+ product
+      # links no JavaScript engine. Content JavaScript runs in WebKit's
+      # WebContent process, where the system grants a JIT this process cannot
+      # have; an archive that also embedded an engine would pay twice for
+      # working set and package size and get a JIT for neither.
+      #
+      # It reads the resolved dependency graph, because that is the only thing
+      # that can answer it -- the violation this exists to catch is a
+      # convenience dependency three levels down, and nothing about a crate's
+      # public surface reveals one. The gate carries its own positive control:
+      # the embedded build must still be reported as containing V8, so a clean
+      # result cannot come from a detector that stopped working.
+      - name: Apple Performance+ engine-free dependency closure
+        run: bash scripts/test-apple-performance-rust-closure.sh
+
       - name: OpenHarmony host and package metadata contracts
         run: |
           bash scripts/test-ohos-host-contract.sh

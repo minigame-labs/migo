@@ -9,23 +9,50 @@ name = "migo_core"
 
 [features]
 default = ["profile-full"]
-profile-full = ["runtime-v8/profile-full", "v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "graphics/profile-full"]
-profile-slim = ["runtime-v8/profile-slim", "v8-limits", "code-signing", "graphics/profile-slim"]
-worker-snapshot = ["runtime-v8/worker-snapshot"]
+
+# The embedded JavaScript engine, and the two execution modes that select it.
+#
+# `embedded-v8` exists so the Apple Performance+ product can prove it links no
+# JavaScript engine at all -- on iOS the engine is WebKit's, in another process,
+# and a second one here would pay twice for working set and package size while
+# getting a JIT for neither. The claim is checked against the resolved
+# dependency graph by scripts/test-apple-performance-rust-closure.sh, because a
+# dependency three levels down is a fact about the graph and nothing about a
+# crate's public surface reveals it.
+#
+# Every `profile-*` implies it: a profile is a description of an embedded
+# engine's API surface, so a profile without an engine is not a smaller build,
+# it is a contradiction. The `?` forms below say "if the engine is enabled,
+# configure it this way" and cannot switch it on by themselves -- without them,
+# naming `runtime-v8/anything` in a feature list quietly re-enables the optional
+# dependency and the firewall would be off while still looking on.
+embedded-v8 = ["dep:runtime-v8"]
+
+# Frames produced outside this process, by an external JavaScript agent. Not a
+# second script runtime: there is no engine on this side of that boundary, which
+# is the whole point.
+external-frames = ["dep:migo-frame-wire"]
+
+profile-full = ["embedded-v8", "runtime-v8?/profile-full", "v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "graphics/profile-full"]
+profile-slim = ["embedded-v8", "runtime-v8?/profile-slim", "v8-limits", "code-signing", "graphics/profile-slim"]
+worker-snapshot = ["embedded-v8", "runtime-v8?/worker-snapshot"]
 # Measurement build only; see runtime-v8's manifest for what it costs and why.
-v8-jitless = ["runtime-v8/v8-jitless"]
+v8-jitless = ["embedded-v8", "runtime-v8?/v8-jitless"]
 test-support = []
-v8-limits = ["runtime-v8/v8-limits", "shared/v8-limits"]
-code-signing = ["runtime-v8/code-signing", "shared/code-signing"]
-api-sensors = ["runtime-v8/api-sensors"]
-api-media = ["runtime-v8/api-media", "dep:audio"]
-api-connectivity = ["runtime-v8/api-connectivity"]
-api-commerce = ["runtime-v8/api-commerce"]
-api-system = ["runtime-v8/api-system"]
+v8-limits = ["embedded-v8", "runtime-v8?/v8-limits", "shared/v8-limits"]
+code-signing = ["embedded-v8", "runtime-v8?/code-signing", "shared/code-signing"]
+api-sensors = ["embedded-v8", "runtime-v8?/api-sensors"]
+api-media = ["embedded-v8", "runtime-v8?/api-media", "dep:audio"]
+api-connectivity = ["embedded-v8", "runtime-v8?/api-connectivity"]
+api-commerce = ["embedded-v8", "runtime-v8?/api-commerce"]
+api-system = ["embedded-v8", "runtime-v8?/api-system"]
 
 [dependencies]
 shared = { package = "migo-shared", path = "../shared", default-features = false }
-runtime-v8 = { package = "migo-runtime-v8", path = "../runtime-v8", default-features = false }
+runtime-v8 = { package = "migo-runtime-v8", path = "../runtime-v8", default-features = false, optional = true }
+# The cross-process frame envelope. Reader only: no packet builder in a shipped
+# build, which is what `default-features = false` buys here.
+migo-frame-wire = { path = "../frame-wire", default-features = false, optional = true }
 graphics = { package = "migo-graphics", path = "../graphics", default-features = false }
 migo-io = { path = "../io", default-features = false }
 audio = { package = "migo-audio", path = "../audio", default-features = false, optional = true }

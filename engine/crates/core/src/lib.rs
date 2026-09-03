@@ -122,8 +122,6 @@ pub use runtime::{
     HostId,
     HostIngress,
     HostIngressSendError,
-    HostThread,
-    SpawnedSurfaceHost,
     host_ingress,
     lease_surface,
     lease_surface_tracked,
@@ -133,14 +131,26 @@ pub use runtime::{
     send_critical_command_to_host,
     send_reliable_command_to_host,
     shutdown_host,
-    spawn_host_thread,
-    spawn_host_thread_tracked,
 };
+// The host thread and its spawn entry points belong to the embedded execution:
+// they own a JavaScript runtime. A build without one does not get a narrower
+// version of them, it gets a different execution mode.
+#[cfg(feature = "embedded-v8")]
+pub use runtime::{HostThread, SpawnedSurfaceHost, spawn_host_thread, spawn_host_thread_tracked};
 pub use services::{
     DeviceServiceProvider, FrameClock, HostNotifier, PlatformServices, RuntimeGenerationNotifier,
 };
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
+// Rejected at compile time rather than resolved by precedence. The external
+// lane's product claim is that the archive contains no JavaScript engine; a
+// build carrying both modes has an engine, whichever mode it happens to run,
+// and a dependency-closure gate would rightly call it a violation. Failing here
+// says which flag to drop; failing there says only that V8 is present.
+#[cfg(all(feature = "embedded-v8", feature = "external-frames"))]
+compile_error!(
+    "embedded-v8 and external-frames are mutually exclusive: the external lane exists to      prove no JavaScript engine is linked, and a build with both links one"
+);
 #[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]
 compile_error!("worker-snapshot requires profile-full");
 #[cfg(all(

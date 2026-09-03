@@ -1714,6 +1714,7 @@ dependencies = [
  "migo-alloc-probe",
  "migo-audio",
  "migo-contention-probe",
+ "migo-frame-wire",
  "migo-graphics",
  "migo-io",
  "migo-runtime-v8",
