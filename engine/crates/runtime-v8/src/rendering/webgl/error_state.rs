@@ -251,14 +251,9 @@ pub fn set_transform_feedback(state: &mut OpState, canvas_id: u32, phase: Transf
     q.set_transform_feedback(canvas_id, phase);
 }
 
-#[inline]
-fn transform_feedback_captures(state: &OpState, canvas_id: u32) -> bool {
-    let q = state.borrow::<WebGLErrorState>();
-    q.transform_feedback_captures(canvas_id)
-}
-
-const GL_TRANSFORM_FEEDBACK_BUFFER: u32 = 0x8C8E;
-const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+// `transform_feedback_captures` and the two buffer-target constants moved with
+// the validators: they existed only to serve them, and leaving a second copy
+// here would be a second definition of a GL enum.
 
 // ---- The decoder's view of this runtime -----------------------------
 //

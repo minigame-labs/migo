@@ -92,6 +92,9 @@ tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+# The packet builder, for the external lane's own tests. Test-only by
+# construction: the shipping dependency above takes the reader alone.
+migo-frame-wire = { path = "../frame-wire", features = ["test-support"] }
 # Test-only by construction: a `[dependencies]` entry here would carry a
 # `#[global_allocator]` into every cdylib that links this crate.
 migo-alloc-probe = { path = "../../testing/alloc-probe", default-features = false }

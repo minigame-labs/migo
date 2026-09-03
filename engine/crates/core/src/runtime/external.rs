@@ -29,6 +29,7 @@
 //! the renderer does, so a producer's packet is measured against the timeline
 //! the renderer is actually on.
 
+use std::collections::VecDeque;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -45,7 +46,9 @@ use shared::{
     surface::SurfaceRef,
 };
 
-use frame_wire::FrameIngress;
+use shared::protocol::render_cmd::GLCmd;
+
+use frame_wire::{FrameIngress, IngressDecision, IngressOutcome, PooledFrame, gl_stream};
 
 use crate::runtime::session_thread::{
     HostThread, SessionThreadContext, StartedHost, create_basic_runtime,
@@ -65,13 +68,97 @@ use crate::services::PlatformServices;
 #[must_use = "a spawned session must be shut down and joined"]
 pub struct ExternalFrameSession {
     host: HostThread,
-    ingress: Arc<Mutex<FrameIngress>>,
+    submit: SubmitPath,
     clock: Arc<ExternalFrameClock>,
     /// The lease for the public attachment handle, when the session was started
     /// with a Surface. Held for the session's life: it is what keeps the
     /// embedding host's generation from being reused underneath a renderer that
     /// is still drawing into it.
     _surface_resource: Option<shared::surface::SurfaceResourceLease>,
+}
+
+/// Why a frame that the ingress accepted still did not reach the renderer.
+///
+/// Numbered above the wire and ingress ranges so one telemetry field carries
+/// any of the three without ambiguity.
+pub const EXTERNAL_ERROR_RENDERER_NOT_READY: u32 = 2001;
+pub const EXTERNAL_ERROR_NO_COMMAND_STREAM: u32 = 2002;
+pub const EXTERNAL_ERROR_BAD_COMMAND_STREAM: u32 = 2003;
+pub const EXTERNAL_ERROR_RENDERER_UNREACHABLE: u32 = 2004;
+
+/// The most WebGL errors kept per canvas before the oldest is dropped.
+///
+/// WebGL's own queue is unbounded in the specification and bounded in every
+/// implementation, for the obvious reason: a game in a bad state can generate
+/// one per call. Sixteen is enough for `getError` to drain a burst and small
+/// enough that a runaway producer cannot spend memory here.
+const MAX_PENDING_ERRORS_PER_CANVAS: usize = 16;
+
+/// WebGL errors the decoder recorded, waiting for the producer to ask.
+///
+/// In this lane `getError` is a synchronous call from another process, so the
+/// answers accumulate here until the control channel carries the question.
+/// Bounded per canvas, and the bound drops the *oldest*: the first error is
+/// usually the cause and the rest are consequences, so keeping the newest would
+/// throw away the useful one.
+#[derive(Debug, Default)]
+pub struct ExternalGlErrors {
+    queues: Mutex<Vec<(u32, VecDeque<u32>)>>,
+}
+
+impl ExternalGlErrors {
+    fn push(&self, canvas_id: u32, code: u32) {
+        let mut queues = self.queues.lock();
+        let queue = match queues.iter_mut().find(|(id, _)| *id == canvas_id) {
+            Some((_, queue)) => queue,
+            None => {
+                queues.push((canvas_id, VecDeque::new()));
+                &mut queues.last_mut().expect("just pushed").1
+            }
+        };
+        if queue.len() >= MAX_PENDING_ERRORS_PER_CANVAS {
+            queue.pop_front();
+        }
+        queue.push_back(code);
+    }
+
+    fn take(&self, canvas_id: u32) -> Option<u32> {
+        let mut queues = self.queues.lock();
+        queues
+            .iter_mut()
+            .find(|(id, _)| *id == canvas_id)
+            .and_then(|(_, queue)| queue.pop_front())
+    }
+}
+
+/// The decoder's view of an external session.
+struct ExternalDecodeContext<'a>(&'a ExternalGlErrors);
+
+impl frame_decode::GlDecodeContext for ExternalDecodeContext<'_> {
+    fn push_error(&mut self, canvas_id: u32, code: u32) {
+        self.0.push(canvas_id, code);
+    }
+
+    fn transform_feedback_captures(&self, _canvas_id: u32) -> bool {
+        // The producer runs the WebGL shim and knows its own feedback state; it
+        // is not mirrored here. Answering `false` is what the in-process path
+        // does for a canvas it has no record of, and the render thread rejects
+        // the call for real if it is genuinely illegal.
+        false
+    }
+}
+
+/// What the submit path needs from the session thread, published once the
+/// renderer is up.
+struct RenderDispatch {
+    sender: shared::render_command_sender::CommandSender,
+    /// Accepted frames whose credit the renderer still holds. Bounded by the
+    /// credit window, so this is at most two deep.
+    in_flight: Mutex<VecDeque<PooledFrame>>,
+    /// Reused word buffer for the byte-to-word copy. One per session, behind
+    /// the same lock as the submit path, because submits are serialized by the
+    /// ingress anyway.
+    words: Mutex<Vec<u32>>,
 }
 
 /// The frame clock, reachable from whichever thread the transport runs on.
@@ -136,6 +223,121 @@ impl ExternalFrameClock {
     }
 }
 
+/// Everything the submit path needs, separated from the thread handle.
+///
+/// The handle owns a running thread and cannot be built without one; this can,
+/// which is what makes the acceptance rules testable without a renderer. The
+/// separation is not only for tests: the transport calls into exactly these
+/// three things and has no business reaching a `JoinHandle`.
+struct SubmitPath {
+    ingress: Arc<Mutex<FrameIngress>>,
+    errors: Arc<ExternalGlErrors>,
+    dispatch: Arc<OnceLock<RenderDispatch>>,
+}
+
+impl SubmitPath {
+    /// Offer one packet produced by the external agent.
+    ///
+    /// Called on whichever thread the transport runs on -- on Apple that is the
+    /// one handling the connection, not the session thread -- because a frame
+    /// has to be validated and credited before it is queued, and a channel hop
+    /// to do that would put a scheduling delay on the latency path this lane
+    /// exists to shorten.
+    ///
+    /// The borrowed bytes do not outlive this call. They are copied once into a
+    /// pooled buffer on acceptance, and that buffer carries the credit until
+    /// the renderer asks for another frame.
+    pub fn submit_frame(&self, bytes: &[u8]) -> IngressOutcome {
+        // The lock covers identity, ordering, admission and the copy, and is
+        // released before decoding: decoding is the expensive part and nothing
+        // in it needs the ingress.
+        let (outcome, frame) = self.ingress.lock().submit(bytes);
+        let Some(frame) = frame else {
+            return outcome;
+        };
+
+        match self.render(frame) {
+            Ok(()) => outcome,
+            Err(code) => {
+                // The frame is dropped here, which returns its credit: a packet
+                // that never reached the renderer is not in flight, and holding
+                // its credit would stall the producer for a frame nobody is
+                // working on.
+                IngressOutcome {
+                    decision: IngressDecision::Rejected,
+                    remaining_credits: self.ingress.lock().remaining_credits(),
+                    accepted_sequence: 0,
+                    wire_error_code: code,
+                }
+            }
+        }
+    }
+
+    /// Decode one accepted frame and hand it to the renderer.
+    fn render(&self, frame: PooledFrame) -> Result<(), u32> {
+        let Some(dispatch) = self.dispatch.get() else {
+            // The session thread has not finished bringing the renderer up.
+            return Err(EXTERNAL_ERROR_RENDERER_NOT_READY);
+        };
+
+        let parsed = frame.frame().map_err(|error| error.code())?;
+        let stream = parsed
+            .command_stream()
+            .ok_or(EXTERNAL_ERROR_NO_COMMAND_STREAM)?;
+
+        // Words, copied rather than cast. The packet's own base address carries
+        // no alignment guarantee -- it arrived from a transport that promises
+        // none -- so a pointer cast would work on every machine this is tested
+        // on and fault on one it is not. The scratch buffer is reused, so the
+        // copy costs no allocation after the first frame.
+        let mut scratch = dispatch.words.lock();
+        scratch.clear();
+        scratch.reserve(stream.bytes.len() / 4);
+        scratch.extend(
+            stream
+                .bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])),
+        );
+        let validated = gl_stream::validate_stream(&scratch, scratch.len() as u32)
+            .map_err(|_| EXTERNAL_ERROR_BAD_COMMAND_STREAM)?;
+
+        // A pooled vector, not a fresh one. The render path runs sixty to a
+        // hundred and twenty times a second, and the commands it carries are
+        // the largest allocation in a frame; the pool is what makes the steady
+        // state allocation-free on this side as well as on the wire side.
+        let mut commands: shared::command_vec_pool::PooledVec<GLCmd> =
+            shared::command_vec_pool::PooledVec::take();
+        frame_decode::decode_validated_stream(
+            &mut ExternalDecodeContext(&self.errors),
+            validated,
+            &mut commands,
+        );
+        drop(scratch);
+
+        let packet = shared::FramePacketBuilder::new(u64::from(parsed.frame_id()), 0.0)
+            .push(shared::protocol::FrameOp::BeginFrame)
+            .push(shared::protocol::FrameOp::GlBatch(
+                shared::protocol::render_cmd::GlBatchPayload { commands },
+            ))
+            .push(shared::protocol::FrameOp::Present)
+            .finish();
+
+        dispatch
+            .sender
+            .dispatch(shared::protocol::render_cmd::RenderCommand::FramePacket(
+                packet,
+            ))
+            .map_err(|_| EXTERNAL_ERROR_RENDERER_UNREACHABLE)?;
+
+        // The credit travels with the frame from here: it comes back when the
+        // renderer asks for another one, which is the signal that says it
+        // finished this one.
+        dispatch.in_flight.lock().push_back(frame);
+        Ok(())
+    }
+}
+
 impl ExternalFrameSession {
     #[inline]
     pub fn id(&self) -> crate::runtime::HostId {
@@ -144,32 +346,48 @@ impl ExternalFrameSession {
 
     /// Credits currently available to the producer.
     pub fn remaining_credits(&self) -> u32 {
-        self.ingress.lock().remaining_credits()
+        self.submit.ingress.lock().remaining_credits()
     }
 
     /// The surface generation packets must be addressed to.
     pub fn surface_generation(&self) -> u64 {
-        self.ingress.lock().surface_generation()
+        self.submit.ingress.lock().surface_generation()
     }
 
     /// The resource epoch packets must name ids from.
     pub fn resource_epoch(&self) -> u64 {
-        self.ingress.lock().resource_epoch()
+        self.submit.ingress.lock().resource_epoch()
     }
 
     /// Whether the host has declared this epoch's resources verified.
     pub fn resources_ready(&self) -> bool {
-        self.ingress.lock().resources_ready()
+        self.submit.ingress.lock().resources_ready()
     }
 
     /// The host has verified every resource this epoch admits.
     pub fn mark_resources_ready(&self) {
-        self.ingress.lock().mark_resources_ready();
+        self.submit.ingress.lock().mark_resources_ready();
     }
 
     /// The frame clock, for the transport that drives the producer.
     pub fn clock(&self) -> &Arc<ExternalFrameClock> {
         &self.clock
+    }
+
+    /// WebGL errors the decoder recorded, for the producer's `getError`.
+    pub fn drain_gl_error(&self, canvas_id: u32) -> Option<u32> {
+        self.submit.errors.take(canvas_id)
+    }
+
+    /// Offer one packet produced by the external agent.
+    ///
+    /// Called on whichever thread the transport runs on -- on Apple that is the
+    /// one handling the connection, not the session thread -- because a frame
+    /// has to be validated and credited before it is queued, and a channel hop
+    /// to do that would put a scheduling delay on the latency path this lane
+    /// exists to shorten.
+    pub fn submit_frame(&self, bytes: &[u8]) -> IngressOutcome {
+        self.submit.submit_frame(bytes)
     }
 
     pub fn request_shutdown(&self) -> Result<(), String> {
@@ -217,6 +435,9 @@ pub fn spawn_external_frame_session(
     let thread_ingress = Arc::clone(&ingress);
     let clock = Arc::new(ExternalFrameClock::default());
     let thread_clock = Arc::clone(&clock);
+    let errors = Arc::new(ExternalGlErrors::default());
+    let dispatch: Arc<OnceLock<RenderDispatch>> = Arc::new(OnceLock::new());
+    let thread_dispatch = Arc::clone(&dispatch);
 
     let started: StartedHost = spawn_session_thread(
         surface,
@@ -224,12 +445,16 @@ pub fn spawn_external_frame_session(
         platform,
         opt,
         None,
-        move |ctx| run_external_session(ctx, thread_ingress, thread_clock),
+        move |ctx| run_external_session(ctx, thread_ingress, thread_clock, thread_dispatch),
     )?;
 
     Ok(ExternalFrameSession {
         host: started.host,
-        ingress,
+        submit: SubmitPath {
+            ingress,
+            errors,
+            dispatch,
+        },
         clock,
         _surface_resource: started.resource,
     })
@@ -240,6 +465,7 @@ fn run_external_session(
     ctx: SessionThreadContext,
     ingress: Arc<Mutex<FrameIngress>>,
     clock: Arc<ExternalFrameClock>,
+    dispatch: Arc<OnceLock<RenderDispatch>>,
 ) {
     let SessionThreadContext {
         id,
@@ -313,6 +539,14 @@ fn run_external_session(
         demand: Arc::clone(&raf_demand),
         arm: request_vsync.clone(),
     });
+    // Published together with the clock, and only now: a transport that
+    // submitted before the renderer existed would be told the renderer is not
+    // ready, which is the truthful answer.
+    let _ = dispatch.set(RenderDispatch {
+        sender: render.sender(),
+        in_flight: Mutex::new(VecDeque::new()),
+        words: Mutex::new(Vec::new()),
+    });
 
     // The generation the producer must stamp every packet with. The handle was
     // built before this thread existed, so the two have to agree rather than one
@@ -380,7 +614,18 @@ fn run_external_session(
                 }
                 timestamp = raf_rx.recv(raf_demand.session_ticket()) => {
                     match timestamp {
-                        Some(timestamp) => clock.record(timestamp),
+                        Some(timestamp) => {
+                            // The renderer is asking for another frame, which is
+                            // the signal that it finished the last one. Releasing
+                            // exactly one held frame returns exactly one credit;
+                            // releasing all of them would let the producer run
+                            // ahead of a renderer that is still behind.
+                            if let Some(dispatch) = dispatch.get() {
+                                let finished = dispatch.in_flight.lock().pop_front();
+                                drop(finished);
+                            }
+                            clock.record(timestamp);
+                        }
                         None => {
                             // The render thread is gone. Nothing else will
                             // arrive on this channel, and continuing to select
@@ -523,6 +768,20 @@ fn drain_render_events(
 mod tests {
     use super::*;
 
+    const NONCE: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+
+    /// One valid packet carrying an empty command stream.
+    fn packet(sequence: u64) -> Vec<u8> {
+        let stream: [u8; 0] = [];
+        let mut frame = frame_wire::builder::WireFrameBuilder::new();
+        frame.launch_nonce = NONCE;
+        frame.runtime_generation = INITIAL_RUNTIME_GENERATION;
+        frame.sequence = sequence;
+        frame
+            .section(frame_wire::SECTION_KIND_COMMAND_STREAM, 0, &stream)
+            .build()
+    }
+
     /// The source of this module, for the invariants that are about what it
     /// does *not* contain. A dependency-closure gate proves no engine is
     /// reachable from the built product; this proves the module was written
@@ -596,6 +855,75 @@ mod tests {
             INITIAL_RUNTIME_GENERATION,
             "spawn_external_frame_session builds the ingress with 1 because a fresh \
              RestartBoundary issues 1"
+        );
+    }
+
+    /// A packet offered before the renderer exists is refused, and its credit
+    /// comes straight back.
+    ///
+    /// The alternative -- accept it and hold the credit -- stalls a producer for
+    /// a frame nobody is working on, and the producer cannot tell that apart
+    /// from a renderer that is merely slow.
+    #[test]
+    fn a_frame_offered_before_the_renderer_is_up_is_refused_and_costs_no_credit() {
+        let submit = SubmitPath {
+            ingress: Arc::new(Mutex::new(FrameIngress::new(
+                NONCE,
+                INITIAL_RUNTIME_GENERATION,
+            ))),
+            errors: Arc::new(ExternalGlErrors::default()),
+            dispatch: Arc::new(OnceLock::new()),
+        };
+
+        let bytes = packet(1);
+        let outcome = submit.submit_frame(&bytes);
+        assert_eq!(outcome.decision, IngressDecision::Rejected);
+        assert_eq!(outcome.wire_error_code, EXTERNAL_ERROR_RENDERER_NOT_READY);
+        assert_eq!(
+            outcome.remaining_credits,
+            frame_wire::ingress::MAX_CREDITS,
+            "a frame that never reached the renderer is not in flight"
+        );
+
+        // And the sequence did not advance past it either, so the producer can
+        // resend the same packet once the renderer is up.
+        assert_eq!(submit.ingress.lock().last_accepted_sequence(), 1);
+    }
+
+    #[test]
+    fn the_error_queue_is_bounded_per_canvas_and_keeps_the_oldest() {
+        let errors = ExternalGlErrors::default();
+        for index in 0..(MAX_PENDING_ERRORS_PER_CANVAS + 4) {
+            errors.push(1, 0x0500 + index as u32);
+        }
+        // The first error is usually the cause and the rest are consequences,
+        // so the bound drops the newest arrivals, not the oldest record.
+        assert_eq!(errors.take(1), Some(0x0500 + 4));
+
+        let mut drained = 1;
+        while errors.take(1).is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, MAX_PENDING_ERRORS_PER_CANVAS);
+        assert_eq!(errors.take(1), None, "an empty queue reports no error");
+    }
+
+    #[test]
+    fn errors_are_kept_per_canvas() {
+        let errors = ExternalGlErrors::default();
+        errors.push(1, 0x0500);
+        errors.push(2, 0x0501);
+        assert_eq!(errors.take(2), Some(0x0501));
+        assert_eq!(errors.take(2), None);
+        assert_eq!(
+            errors.take(1),
+            Some(0x0500),
+            "another canvas's queue is untouched"
+        );
+        assert_eq!(
+            errors.take(99),
+            None,
+            "a canvas with no errors reports none"
         );
     }
 
