@@ -427,6 +427,23 @@ jobs:
       - name: Apple Performance+ engine-free dependency closure
         run: bash scripts/test-apple-performance-rust-closure.sh
 
+      # The artefact half of the same claim. A clean dependency graph is
+      # necessary and not sufficient: a vendored object or a linker script could
+      # put engine symbols in an archive whose Cargo graph is spotless. This
+      # builds the Performance+ product for the host and reads its symbol table.
+      #
+      # Linux, months before the first Apple archive, because the property is
+      # about Cargo features rather than about the target: the same features
+      # produce the same closure whichever triple they are built for, and
+      # finding a violation here is finding it without a Mac.
+      - name: Apple Performance+ archive contains no engine symbols
+        run: |
+          cd engine
+          cargo build -p migo-capi --no-default-features --features external-frames
+          cd ..
+          bash scripts/test-apple-performance-rust-closure.sh \
+            --artifact engine/target/debug/libmigo_capi.a
+
       # The other half of the wire contract. The format says two encoders are
       # measured against one fixed corpus; the JavaScript one runs inside
       # WebContent and cannot be checked by any Rust test, so it gets its own

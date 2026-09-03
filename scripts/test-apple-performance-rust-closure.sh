@@ -215,18 +215,35 @@ if [[ -n "$artifact" ]]; then
         if [[ -z "$nm_tool" ]]; then
             problems+=("--artifact was given but no nm is available; this is not a pass")
         else
-            symbols="$("$nm_tool" --defined-only "$artifact" 2>/dev/null || true)"
-            if [[ -z "$symbols" ]]; then
+            # A file, not a shell variable piped into grep.
+            #
+            # The obvious `printf '%s' "$symbols" | grep -q PATTERN` is a false
+            # negative under `set -o pipefail`: `grep -q` exits the moment it
+            # matches, `printf` then dies of SIGPIPE, and the pipeline's status
+            # is the failure -- so the `if` reads "not found" precisely when it
+            # was found. This gate shipped with that bug and reported a clean
+            # archive for one containing seventy-six thousand `_ZN2v8` symbols;
+            # it was caught by auditing the embedded archive on purpose, which
+            # is the only reason to keep a positive control at all.
+            symbol_dump="$(mktemp)"
+            trap 'rm -f "$symbol_dump"' RETURN
+            "$nm_tool" --defined-only "$artifact" >"$symbol_dump" 2>/dev/null || true
+            symbol_count="$(wc -l <"$symbol_dump")"
+            if (( symbol_count == 0 )); then
                 problems+=("$nm_tool listed no defined symbols in $artifact; this is not a pass")
             else
-                # Engine entry points, not the string "v8": a Rust symbol path
-                # containing v8 appears in our own module names.
-                for pattern in '_ZN2v8' 'v8::internal::' 'deno_core::' 'JSGlobalContextCreate' 'JSEvaluateScript'; do
-                    if printf '%s\n' "$symbols" | grep -qF "$pattern"; then
-                        problems+=("$artifact defines $pattern, so it embeds a JavaScript engine")
+                # Mangled names, because that is what `nm` prints. Searching for
+                # `deno_core::` -- the demangled form -- finds nothing in a
+                # symbol table full of `_ZN9deno_core`, which is the other half
+                # of how this check used to pass on an archive full of V8.
+                for pattern in '_ZN2v8' '_ZN9deno_core' 'v8::internal::' 'deno_core::' \
+                    'JSGlobalContextCreate' 'JSEvaluateScript'; do
+                    if grep -qF -- "$pattern" "$symbol_dump"; then
+                        found="$(grep -cF -- "$pattern" "$symbol_dump")"
+                        problems+=("$artifact defines $found symbol(s) matching $pattern, so it embeds a JavaScript engine")
                     fi
                 done
-                notes+=("archive audited with $nm_tool: $(printf '%s\n' "$symbols" | wc -l) defined symbols")
+                notes+=("archive audited with $nm_tool: $symbol_count defined symbols")
             fi
         fi
     fi
