@@ -45,7 +45,10 @@ fn packets_from_the_javascript_encoder_are_accepted_unchanged() {
     let manifest = fs::read_to_string(directory.join("manifest.jsonl"))
         .expect("the emitter writes manifest.jsonl beside the packets");
 
-    let entries: Vec<&str> = manifest.lines().filter(|line| !line.trim().is_empty()).collect();
+    let entries: Vec<&str> = manifest
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     assert!(
         entries.len() >= 16,
         "the manifest holds {} entries; the emitter writes at least 16",
@@ -56,8 +59,8 @@ fn packets_from_the_javascript_encoder_are_accepted_unchanged() {
     let mut total_bytes = 0usize;
     for entry in &entries {
         let name = field(entry, "name");
-        let bytes = fs::read(directory.join(name))
-            .unwrap_or_else(|error| panic!("read {name}: {error}"));
+        let bytes =
+            fs::read(directory.join(name)).unwrap_or_else(|error| panic!("read {name}: {error}"));
         let frame = validate(&bytes)
             .unwrap_or_else(|error| panic!("{name}: the JavaScript encoder produced {error}"));
 
@@ -113,7 +116,11 @@ fn packets_from_the_javascript_encoder_are_accepted_unchanged() {
         total_bytes += bytes.len();
     }
 
-    assert_eq!(validated, entries.len(), "every manifest entry was validated");
+    assert_eq!(
+        validated,
+        entries.len(),
+        "every manifest entry was validated"
+    );
 
     // And the same packets through the ingress, in sequence order, which is the
     // path a real producer takes. The emitter numbers them from 1, so strict
@@ -129,7 +136,9 @@ fn packets_from_the_javascript_encoder_are_accepted_unchanged() {
     // epoch the host never entered -- which is the check working, and is worth
     // saying out loud here because it is the first thing that goes wrong when a
     // real transport is wired up.
-    let epoch: u64 = field(first, "resource_epoch").parse().expect("epoch parses");
+    let epoch: u64 = field(first, "resource_epoch")
+        .parse()
+        .expect("epoch parses");
     assert!(ingress.set_resource_epoch(epoch), "the epoch only advances");
     ingress.mark_resources_ready();
     let bytes = fs::read(directory.join(field(first, "name"))).expect("read the first packet");
