@@ -46,7 +46,7 @@ embedded-v8 = ["dep:runtime-v8"]
 # is between the neutral bring-up above line ~150 and the runtime assembly
 # below it -- not the 49 `self.js.*` call sites, which belong to the embedded
 # execution either way and do not move.
-external-frames = ["dep:migo-frame-wire"]
+external-frames = ["dep:migo-frame-wire", "dep:frame-decode"]
 
 profile-full = ["embedded-v8", "runtime-v8?/profile-full", "v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "graphics/profile-full"]
 profile-slim = ["embedded-v8", "runtime-v8?/profile-slim", "v8-limits", "code-signing", "graphics/profile-slim"]
@@ -68,6 +68,9 @@ runtime-v8 = { package = "migo-runtime-v8", path = "../runtime-v8", default-feat
 # The cross-process frame envelope. Reader only: no packet builder in a shipped
 # build, which is what `default-features = false` buys here.
 migo-frame-wire = { path = "../frame-wire", default-features = false, optional = true }
+# The command decoder, shared with the embedded runtime. Engine-free, which is
+# what puts it inside the Performance+ closure the gate measures.
+frame-decode = { package = "migo-frame-decode", path = "../frame-decode", default-features = false, optional = true }
 graphics = { package = "migo-graphics", path = "../graphics", default-features = false }
 migo-io = { path = "../io", default-features = false }
 audio = { package = "migo-audio", path = "../audio", default-features = false, optional = true }

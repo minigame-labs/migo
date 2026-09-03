@@ -232,15 +232,10 @@ impl WebGLErrorState {
 /// — removing them just to satisfy the lint would force a
 /// rebuild-and-rename every time a new validator is added.
 #[allow(dead_code)]
-pub mod codes {
-    pub const NO_ERROR: u32 = 0;
-    pub const INVALID_ENUM: u32 = 0x0500;
-    pub const INVALID_VALUE: u32 = 0x0501;
-    pub const INVALID_OPERATION: u32 = 0x0502;
-    pub const OUT_OF_MEMORY: u32 = 0x0505;
-    pub const INVALID_FRAMEBUFFER_OPERATION: u32 = 0x0506;
-    pub const CONTEXT_LOST_WEBGL: u32 = 0x9242;
-}
+/// Re-exported rather than redefined. These are the values `gl.getError()`
+/// returns to content, and the decoder that produces them lives in
+/// `frame-decode`; two copies would be two places for a GL enum to be wrong.
+pub use frame_decode::codes;
 
 /// Convenience for host-side validators: push a WebGL error code
 /// without needing to thread `WebGLErrorState` manually.
@@ -265,41 +260,42 @@ fn transform_feedback_captures(state: &OpState, canvas_id: u32) -> bool {
 const GL_TRANSFORM_FEEDBACK_BUFFER: u32 = 0x8C8E;
 const GL_UNIFORM_BUFFER: u32 = 0x8A11;
 
-// ---- Validators (pure param checks, no GL state peek) ---------------
+// ---- The decoder's view of this runtime -----------------------------
+//
+// The validators moved to `frame-decode`, which links no JavaScript engine.
+// They are parameter checks, and the only things they needed from here were
+// somewhere to put a WebGL error and one piece of GL state. This is that
+// somewhere.
+//
+// The wrappers below keep the `&mut OpState` signatures the raw op handlers in
+// `webgl.rs` already call, so moving the checks changed no call site. A caller
+// that has to learn a new shape is a caller that gets rewritten under time
+// pressure, and this move is meant to be invisible to the path that already
+// worked.
 
-/// Validate the `target` argument of `bindBuffer`.  Returns `true`
-/// when the target is legal for WebGL 1.0 or 2.0; on illegal
-/// targets it pushes `INVALID_ENUM` and returns `false`, signalling
-/// the caller to skip GL dispatch.
-///
-/// WebGL 1.0 valid: `ARRAY_BUFFER` (0x8892), `ELEMENT_ARRAY_BUFFER` (0x8893).
-/// WebGL 2.0 adds: `COPY_READ_BUFFER` (0x8F36), `COPY_WRITE_BUFFER` (0x8F37),
-/// `TRANSFORM_FEEDBACK_BUFFER` (0x8C8E), `UNIFORM_BUFFER` (0x8A11),
-/// `PIXEL_PACK_BUFFER` (0x88EB), `PIXEL_UNPACK_BUFFER` (0x88EC).
-#[inline]
-pub fn validate_bind_buffer_target(state: &mut OpState, canvas_id: u32, target: u32) -> bool {
-    match target {
-        0x8892 | 0x8893 // ARRAY_BUFFER / ELEMENT_ARRAY_BUFFER (WebGL 1+)
-        | 0x8F36 | 0x8F37 // COPY_READ/WRITE (WebGL 2)
-        | 0x8C8E | 0x8A11 // TRANSFORM_FEEDBACK / UNIFORM (WebGL 2)
-        | 0x88EB | 0x88EC // PIXEL_PACK/UNPACK (WebGL 2)
-        => true,
-        _ => {
-            push_error(state, canvas_id, codes::INVALID_ENUM);
-            false
-        }
+/// `OpState`, as the shared decoder sees it.
+pub struct OpStateDecodeContext<'a>(pub &'a mut OpState);
+
+impl frame_decode::GlDecodeContext for OpStateDecodeContext<'_> {
+    #[inline]
+    fn push_error(&mut self, canvas_id: u32, code: u32) {
+        push_error(self.0, canvas_id, code);
+    }
+
+    #[inline]
+    fn transform_feedback_captures(&self, canvas_id: u32) -> bool {
+        let queue = self.0.borrow::<WebGLErrorState>();
+        queue.transform_feedback_captures(canvas_id)
     }
 }
 
 #[inline]
-fn validate_bind_buffer_indexed_target(state: &mut OpState, canvas_id: u32, target: u32) -> bool {
-    match target {
-        GL_TRANSFORM_FEEDBACK_BUFFER | GL_UNIFORM_BUFFER => true,
-        _ => {
-            push_error(state, canvas_id, codes::INVALID_ENUM);
-            false
-        }
-    }
+pub fn validate_bind_buffer_target(state: &mut OpState, canvas_id: u32, target: u32) -> bool {
+    frame_decode::validate::validate_bind_buffer_target(
+        &mut OpStateDecodeContext(state),
+        canvas_id,
+        target,
+    )
 }
 
 #[inline]
@@ -307,17 +303,16 @@ pub fn validate_bind_buffer_base(
     state: &mut OpState,
     canvas_id: u32,
     target: u32,
-    _index: u32,
-    _buffer: Option<u32>,
+    index: u32,
+    buffer: Option<u32>,
 ) -> bool {
-    if !validate_bind_buffer_indexed_target(state, canvas_id, target) {
-        return false;
-    }
-    if target == GL_TRANSFORM_FEEDBACK_BUFFER && transform_feedback_captures(state, canvas_id) {
-        push_error(state, canvas_id, codes::INVALID_OPERATION);
-        return false;
-    }
-    true
+    frame_decode::validate::validate_bind_buffer_base(
+        &mut OpStateDecodeContext(state),
+        canvas_id,
+        target,
+        index,
+        buffer,
+    )
 }
 
 #[inline]
@@ -330,43 +325,17 @@ pub fn validate_bind_buffer_range(
     offset: i32,
     size: i32,
 ) -> bool {
-    if buffer.is_some() && offset < 0 {
-        push_error(state, canvas_id, codes::INVALID_VALUE);
-        return false;
-    }
-    if buffer.is_some() && size <= 0 {
-        push_error(state, canvas_id, codes::INVALID_VALUE);
-        return false;
-    }
-    if !validate_bind_buffer_base(state, canvas_id, target, index, buffer) {
-        return false;
-    }
-    if target == GL_TRANSFORM_FEEDBACK_BUFFER
-        && buffer.is_some()
-        && ((offset % 4) != 0 || (size % 4) != 0)
-    {
-        push_error(state, canvas_id, codes::INVALID_VALUE);
-        return false;
-    }
-    true
+    frame_decode::validate::validate_bind_buffer_range(
+        &mut OpStateDecodeContext(state),
+        canvas_id,
+        target,
+        index,
+        buffer,
+        offset,
+        size,
+    )
 }
 
-/// Validate the parameter tuple of `vertexAttribPointer`.  Returns
-/// `true` when the call is legal, `false` after pushing the right
-/// error code.
-///
-/// Rules (WebGL 1.0 s5.14.10, WebGL 2.0 s3.7.8):
-///   * `size` MUST be 1, 2, 3, or 4 → INVALID_VALUE otherwise
-///   * `type` MUST be a legal `GLenum` — `BYTE`, `UNSIGNED_BYTE`,
-///     `SHORT`, `UNSIGNED_SHORT`, `FLOAT`, `HALF_FLOAT` (WebGL 2),
-///     `INT` (WebGL 2), `UNSIGNED_INT` (WebGL 2) → INVALID_ENUM
-///   * `stride` MUST be in `[0, 255]` → INVALID_VALUE
-///   * `offset` MUST be `>= 0` → INVALID_VALUE
-///
-/// Does NOT validate the "ARRAY_BUFFER must be bound" condition —
-/// that requires peeking at render-thread shadow state which isn't
-/// accessible from the JS thread at op dispatch time.  The render
-/// thread will surface it through a later `glGetError` if needed.
 #[inline]
 pub fn validate_vertex_attrib_pointer(
     state: &mut OpState,
@@ -376,33 +345,16 @@ pub fn validate_vertex_attrib_pointer(
     stride: i32,
     offset: i32,
 ) -> bool {
-    if !(1..=4).contains(&size) {
-        push_error(state, canvas_id, codes::INVALID_VALUE);
-        return false;
-    }
-    match type_ {
-        0x1400 | 0x1401 | 0x1402 | 0x1403 | 0x1406 // BYTE/UBYTE/SHORT/USHORT/FLOAT
-        | 0x140B | 0x1404 | 0x1405 // HALF_FLOAT / INT / UNSIGNED_INT
-        => {}
-        _ => {
-            push_error(state, canvas_id, codes::INVALID_ENUM);
-            return false;
-        }
-    }
-    if !(0..=255).contains(&stride) {
-        push_error(state, canvas_id, codes::INVALID_VALUE);
-        return false;
-    }
-    if offset < 0 {
-        push_error(state, canvas_id, codes::INVALID_VALUE);
-        return false;
-    }
-    true
+    frame_decode::validate::validate_vertex_attrib_pointer(
+        &mut OpStateDecodeContext(state),
+        canvas_id,
+        size,
+        type_,
+        stride,
+        offset,
+    )
 }
 
-/// Validate the parameters of a `viewport` / `scissor` call.  Width
-/// and height must be non-negative.  Emits `INVALID_VALUE` on
-/// violation.
 #[inline]
 pub fn validate_viewport_like(
     state: &mut OpState,
@@ -410,11 +362,12 @@ pub fn validate_viewport_like(
     width: i32,
     height: i32,
 ) -> bool {
-    if width < 0 || height < 0 {
-        push_error(state, canvas_id, codes::INVALID_VALUE);
-        return false;
-    }
-    true
+    frame_decode::validate::validate_viewport_like(
+        &mut OpStateDecodeContext(state),
+        canvas_id,
+        width,
+        height,
+    )
 }
 
 /// Record the attrs negotiated for `canvas_id`.  Called once per

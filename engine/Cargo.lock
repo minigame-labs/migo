@@ -1714,6 +1714,7 @@ dependencies = [
  "migo-alloc-probe",
  "migo-audio",
  "migo-contention-probe",
+ "migo-frame-decode",
  "migo-frame-wire",
  "migo-graphics",
  "migo-io",
@@ -1734,6 +1735,14 @@ version = "0.9.6"
 dependencies = [
  "parking_lot",
  "tokio",
+]
+
+[[package]]
+name = "migo-frame-decode"
+version = "0.9.6"
+dependencies = [
+ "migo-frame-wire",
+ "migo-shared",
 ]
 
 [[package]]
@@ -1849,6 +1858,7 @@ dependencies = [
  "image",
  "migo-alloc-probe",
  "migo-contention-probe",
+ "migo-frame-decode",
  "migo-frame-wire",
  "migo-io",
  "migo-shared",

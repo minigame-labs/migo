@@ -1,0 +1,19 @@
+[package]
+name = "migo-frame-decode"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+[lib]
+name = "frame_decode"
+
+# Deliberately engine-free. This crate turns a validated command stream into
+# render commands, and both consumers need it: the in-process runtime, which
+# has a JavaScript engine, and the Apple Performance+ product, which links none
+# because the engine is WebKit's in another process. Living in `runtime-v8` is
+# what made the second one impossible, and a copy would be two decoders that
+# have to agree -- which is the failure the golden corpus exists to catch one
+# layer down.
+[dependencies]
+shared = { package = "migo-shared", path = "../shared", default-features = false }
+migo-frame-wire = { path = "../frame-wire", default-features = false }
