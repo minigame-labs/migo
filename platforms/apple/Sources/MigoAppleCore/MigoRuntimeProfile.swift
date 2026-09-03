@@ -27,6 +27,21 @@ public enum MigoRuntimeProfile: UInt32, Sendable {
     case macosWebKitFull = 4
 }
 
+/// Stable identifiers for dynamic memory-policy inputs.
+///
+/// The observations represented by these identifiers are runtime values. They
+/// are deliberately not represented here as byte constants, and none is a
+/// jetsam limit guarantee.
+public enum MigoMemoryPolicyField: String, Sendable {
+    case contentCap = "content_cap"
+    case hostCap = "host_cap"
+    case measuredDeviceSafeCap = "measured_device_safe_cap"
+    case availableMemoryHeadroom = "available_memory_headroom"
+    case emergencyReserve = "emergency_reserve"
+    case reservationBeforeAlloc = "reservation_before_alloc"
+    case requeryBeforeLargeReservation = "requery_before_large_reservation"
+}
+
 /// The reason a profile was chosen, carried alongside every decision.
 ///
 /// A profile without a reason is unactionable in production: the question that

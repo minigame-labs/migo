@@ -74,6 +74,37 @@
     }
   ],
 
+  "memory_policy": {
+    "_comment": "These inputs combine verified content and host caps, measured device-safe evidence, fresh available-memory advisory headroom, and a versioned emergency reserve. Effective admission uses the most conservative current inputs; the advisory is re-queried before large reservations, and no value is a jetsam limit or guarantee.",
+    "content_cap": {
+      "source": "verified_content_manifest",
+      "value_kind": "runtime_bytes",
+      "note": "Verified content-manifest cap supplied as a runtime input."
+    },
+    "host_cap": {
+      "source": "host_configuration",
+      "value_kind": "runtime_bytes",
+      "note": "Host-provided cap supplied as a runtime input."
+    },
+    "measured_device_safe_cap": {
+      "source": "versioned_device_lab_policy",
+      "value_kind": "runtime_bytes",
+      "note": "Device-model, OS, and build evidence selects this safe cap at runtime."
+    },
+    "available_memory_headroom": {
+      "source": "fresh_available_memory_advisory",
+      "value_kind": "runtime_bytes",
+      "note": "Applied after a fresh os_proc_available_memory() query before a large reservation; never cached as a maximum."
+    },
+    "emergency_reserve": {
+      "source": "versioned_memory_policy",
+      "value_kind": "runtime_bytes",
+      "note": "Versioned policy input reserved for emergency recovery."
+    },
+    "reservation_before_alloc": true,
+    "requery_before_large_reservation": true
+  },
+
   "device_tiers": {
     "_comment": [
       "Tiers gate the fast lane. They do not gate the product: a device below",
@@ -85,20 +116,17 @@
     "T0": {
       "lane": "ios_webkit_full",
       "conditions": "iOS below the Performance+ minimum, or under 3 GB of RAM, or denylisted, or a failed capability probe",
-      "memory_budget_bytes": 1073741824,
-      "note": "1 GiB. Matches the cap the largest shipping mini-game host applies to 2 GB devices."
+      "note": "Compatibility-lane admission and conservative content quality; this tier does not define a runtime memory cap."
     },
     "T1": {
       "lane": "ios_performance_plus",
       "conditions": "at or above the Performance+ minimum OS, at least 3 GB of RAM, capability probe passed",
-      "memory_budget_bytes": 1610612736,
-      "note": "1.5 GiB, the same reference point for 3 GB and larger devices."
+      "note": "Performance+ admission and standard content quality; runtime memory is selected from current observations."
     },
     "T2": {
       "lane": "ios_performance_plus",
       "conditions": "T1, plus a GPU family that supports the higher texture and resolution variants",
-      "memory_budget_bytes": 1610612736,
-      "note": "Same budget as T1. The tier buys asset quality, not headroom -- raising the budget with the quality is how a device gets terminated for looking better."
+      "note": "Performance+ admission with higher asset quality; the quality tier does not change runtime memory policy."
     }
   },
 

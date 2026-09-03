@@ -15,14 +15,14 @@ let package = Package(
         .macOS(.v11),
     ],
     products: [
-        // Three shipping products, and no fourth.
+        // Three product targets, with Performance+ conditional on the G0
+        // real-device selection and the release gates.
         //
-        // Each one carries exactly one JavaScript execution model, because the
-        // reason to split them is the dependency closure: a host that wants the
-        // compatibility baseline should not link ANGLE, Skia and a renderer it
-        // will never call, and a host that wants Performance+ must be able to
-        // prove by inspection that no JavaScript engine is linked into its app
-        // process at all. An umbrella product would make both claims unprovable.
+        // Keep the products separate so the compatibility baseline does not
+        // link ANGLE, Skia, or a renderer it will never call. The Performance+
+        // no-V8 claim belongs to the future release gate: this skeleton and
+        // product baseline have not proved it, and the current dependency
+        // chain may still link V8. An umbrella product would obscure that gate.
         .library(name: "MigoAppleWebKit", targets: ["MigoAppleWebKit"]),
         .library(name: "MigoApplePerformancePlus", targets: ["MigoApplePerformancePlus"]),
         .library(name: "MigoMacV8", targets: ["MigoMacV8"]),
@@ -72,8 +72,9 @@ let package = Package(
             path: "Sources/MigoAppleWebKit"
         ),
 
-        // Lane 2: content JavaScript runs in a Worker inside WebKit's
-        // WebContent process, and rendering comes back here.
+        // Lane 2: content JavaScript stays in WebKit's WebContent process;
+        // G0 selects Window versus Dedicated Worker, transport, clock, and
+        // host shape from the ProbeApp evidence.
         .target(
             name: "MigoApplePerformancePlus",
             dependencies: ["MigoAppleCore", "MigoAppleRenderer", "MigoAppleWebKit"],

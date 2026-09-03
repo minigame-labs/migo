@@ -1,51 +1,47 @@
 # MigoApplePerformancePlus
 
-Lane 2, and the reason the Apple work is worth doing: content JavaScript and
-WebAssembly run with JIT, and Migo still owns the renderer.
+Conditional native-rendering lane. Content JavaScript and WebAssembly remain
+in WebKit's WebContent process while Migo owns the bounded, validated render
+ingress. Performance+ does not currently prove a no-V8 dependency closure: the
+skeleton/product baseline may still link V8. A future release gate must prove
+the final artifact and dependency tree do not link V8.
 
-```
-WebContent process                    this process
-  Worker (game JS/WASM, no DOM)
-    command stream encoder    --WS-->   validator
-    Atomics.wait for sync calls          FrameIngress
-  main thread: relay                     RenderServer
-                                         Skia + ANGLE/Metal -> CAMetalLayer
-                              <--tick--  CADisplayLink (+ batched input)
-```
+## G0 is still a measured choice
 
-Four decisions here are load-bearing, and each one was reached by rejecting an
-alternative that looks reasonable until it is followed through:
+The following axes are unresolved until the ProbeApp evidence selects a winner
+on the supported OS/device matrix:
 
-**Content runs in a Worker, not on the page's main thread.** A Worker global
-has no `document` and no `window`, which is already the environment Migo
-provides on Android and desktop and already the mini-game platform contract, so
-nothing has to be deleted to get there. It also has `[[CanBlock]]`, so
-`Atomics.wait` is legal -- and that is the only thing that makes synchronous
-`getImageData`/`readPixels`/`toDataURL` work at all across a process boundary.
-On the page's main thread `Atomics.wait` throws, which forces either rewriting
-the content or declaring those calls unsupported.
+- JavaScript agent: Window vs Dedicated Worker.
+- App transport: custom scheme vs loopback WebSocket; hybrid is considered
+  only after evidence of a directional bottleneck.
+- Frame clock: feature-detected Worker rAF when available, Window rAF relay, or
+  `CADisplayLink` relay.
+- `WKWebView` host shape: attached visible, transparent overlay, 1×1,
+  off-screen, or occluded.
 
-**The page is served from 127.0.0.1, not a custom scheme.** A custom scheme is
-not a secure context (making it one needs private API, which cannot ship), and
-without a secure context there is no `crossOriginIsolated` and therefore no
-`SharedArrayBuffer`. Independently, WebKit loses the HTTP body on POST to a
-custom scheme, which removes the binary upstream channel as well. The loopback
-origin, with COOP `same-origin` and COEP `require-corp`, buys the secure
-context, SharedArrayBuffer, a binary channel and content delivery in one
-decision. Bind the literal `127.0.0.1`; the `localhost` hostname does not
-connect from WKWebView.
+The implementation must not infer any of these from an old probe label or from a
+simulator result. Correctness/isolation is measured before performance, and
+the winner is judged by latency, p99 jitter, missed-vsync rate, CPU, memory,
+backpressure, cancellation, lifecycle, and occlusion/background behavior.
 
-**Frames are driven by the host's `CADisplayLink`, not by rAF.** A Worker has
-no `requestAnimationFrame` at all -- and Migo's own `requestAnimationFrame` was
-never the browser's: it is `await op_await_next_frame()`, already fed by host
-vsync on every other platform. Moving it here changes where the op resolves and
-nothing else, and it leaves one timeline instead of two to reconcile.
+WebKit bug [191362](https://bugs.webkit.org/show_bug.cgi?id=191362) is
+officially **RESOLVED FIXED**; it is not evidence that custom-scheme request
+bodies fail. Each candidate still needs a real target-OS/device probe for the
+actual payload/API/body type, secure context, cross-origin isolation, CORS,
+copy count, POST body delivery, cancellation, streaming, and backpressure.
 
-**Input is native and rides the same downstream tick.** The WebView is attached
-but out of the visible area, and the content has no DOM, so it can neither
-receive nor use touches. Batching input onto the frame tick costs no extra IPC.
+## Boundary and buffers
 
-The WebView must stay attached to the view hierarchy. iOS kills unattached
-`WKWebView` instances, and occluded ones stop executing JavaScript; attached
-but moved off-screen is the shape that has been observed to keep running, and
-M0-P0.5 is what decides between the candidates.
+If G0 selects Dedicated Worker, `SharedArrayBuffer` is allowed only as a small
+same-WebContent-process Worker↔Window synchronization mailbox for bounded
+control/reply state. It must never carry frame bytes. Frame bytes first move
+from Worker to Window through a bounded transferable `ArrayBuffer` ping-pong or
+pool, and only then enter the G0-selected app transport. If G0 selects Window,
+there is no Worker relay and no Worker mailbox.
+
+The host side validates generation, sequence, lengths, credits, and integrity
+before materialization or GPU effects. Queues and allocations are bounded.
+
+The final product architecture and release gates are defined by the [v5
+implementation plan](../../../../docs/superpowers/plans/2026-09-02-apple-performance-v5-final-implementation-plan.md)
+and [v5 design](../../../../docs/superpowers/specs/2026-09-02-apple-performance-v5-design.md).

@@ -44,8 +44,8 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 CONTRACT="$REPO_ROOT/contracts/apple/deployment-floor.json"
 PACKAGE_SWIFT="$REPO_ROOT/platforms/apple/Package.swift"
@@ -240,7 +240,14 @@ fi
 #
 # --untracked matters locally and is a no-op in CI, which checks out only
 # tracked files. Without it the sweep reports clean on a working tree whose new
-# consumer simply has not been committed yet -- silence read as an answer.
+# consumer simply has not been committed yet -- silence read as an answer. A
+# source archive has no Git metadata, so the same sweep falls back to ripgrep.
+#
+# The repository's ignore rules are part of source discovery. Ignored build
+# products, generated output, and local tooling content are not valid source
+# declarations for this sweep; a new declaration belongs in a non-ignored
+# source path. The fallback asks ripgrep to use the repository's ignore rules
+# even when a source copy has no .git directory.
 
 allowed_to_declare() {
     case "$1" in
@@ -257,21 +264,133 @@ allowed_to_declare() {
 pattern='IPHONEOS_DEPLOYMENT_TARGET|MACOSX_DEPLOYMENT_TARGET|\.iOS\(\.v|\.macOS\(\.v'
 sweep_hits=0
 unexpected=0
+scanner_failed=0
 
-while IFS= read -r relative; do
-    [ -n "$relative" ] || continue
-    sweep_hits=$((sweep_hits + 1))
-    if ! allowed_to_declare "$relative"; then
-        fail "$relative declares an Apple deployment target; derive it from contracts/apple/deployment-floor.json"
-        unexpected=$((unexpected + 1))
+excluded_trees=(
+    '.git'
+    'out'
+    'dist'
+    'platforms/android/.gradle'
+    'platforms/openharmony/.hvigor'
+)
+git_pathspecs=()
+rg_globs=()
+for excluded_tree in "${excluded_trees[@]}"; do
+    git_pathspecs+=(":(exclude,glob)$excluded_tree" ":(exclude,glob)$excluded_tree/**")
+    rg_globs+=(--glob "!/$excluded_tree" --glob "!/$excluded_tree/**")
+done
+
+scan_deployment_target_declarations() (
+    local output status stderr_file git_root_candidate git_root normalized_git_root
+    local cat_status cleanup_status
+
+    stderr_file=""
+    cleanup_scanner_temp() {
+        if [ -n "${stderr_file:-}" ]; then
+            rm -f -- "$stderr_file"
+        fi
+    }
+    abort_scanner() {
+        cleanup_scanner_temp
+        exit 125
+    }
+    disable_scanner_traps() {
+        trap - EXIT HUP INT TERM
+    }
+    remove_scanner_temp() {
+        if ! rm -f -- "$stderr_file"; then
+            return 1
+        fi
+        stderr_file=""
+        disable_scanner_traps
+    }
+    trap cleanup_scanner_temp EXIT
+    trap abort_scanner HUP INT TERM
+
+    if ! stderr_file="$(mktemp "${TMPDIR:-/tmp}/migo-apple-floor-scanner.XXXXXX")"; then
+        err "deployment-target scanner could not create a temporary stderr file" >&2
+        return 125
     fi
-done < <(
-    cd "$REPO_ROOT" && git grep --untracked -lE "$pattern" -- \
-        ':!out' ':!dist' ':!platforms/android/.gradle' ':!platforms/openharmony/.hvigor' \
-        2>/dev/null
+    if [ -z "$stderr_file" ]; then
+        err "deployment-target scanner received an empty temporary stderr path" >&2
+        return 125
+    fi
+
+    git_root=""
+    if git_root_candidate="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)" \
+        && normalized_git_root="$(cd "$git_root_candidate" 2>/dev/null && pwd -P)" \
+        && [ "$normalized_git_root" = "$REPO_ROOT" ]; then
+        git_root="$normalized_git_root"
+    fi
+
+    if [ -n "$git_root" ]; then
+        if output="$(git -C "$REPO_ROOT" grep --untracked -lE "$pattern" -- "${git_pathspecs[@]}" 2>"$stderr_file")"; then
+            status=0
+        else
+            status=$?
+        fi
+    else
+        if output="$(
+            {
+                cd "$REPO_ROOT" || exit 125
+                rg --hidden --no-require-git --files-with-matches \
+                    "${rg_globs[@]}" -e "$pattern" .
+            } 2>"$stderr_file"
+        )"; then
+            status=0
+        else
+            status=$?
+        fi
+        output="${output//$'\n./'/$'\n'}"
+        output="${output#./}"
+    fi
+
+    if [ -s "$stderr_file" ]; then
+        cat -- "$stderr_file" >&2
+        cat_status=$?
+        if remove_scanner_temp; then
+            cleanup_status=0
+        else
+            cleanup_status=$?
+        fi
+        if [ "$cat_status" -ne 0 ] || [ "$cleanup_status" -ne 0 ]; then
+            return 125
+        fi
+        return 125
+    fi
+    if ! remove_scanner_temp; then
+        err "deployment-target scanner could not clean up its temporary stderr file" >&2
+        return 125
+    fi
+
+    # Both scanners use 1 for a successful search with no matches. Let the
+    # zero-hit guard below issue the more precise fail-closed diagnostic.
+    if [ "$status" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$status" -ne 0 ]; then
+        return "$status"
+    fi
+    printf '%s\n' "$output"
 )
 
-if [ "$sweep_hits" -eq 0 ]; then
+if ! sweep_output="$(scan_deployment_target_declarations)"; then
+    fail "deployment-target declaration scan failed"
+    scanner_failed=1
+else
+    while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        sweep_hits=$((sweep_hits + 1))
+        if ! allowed_to_declare "$relative"; then
+            fail "$relative declares an Apple deployment target; derive it from contracts/apple/deployment-floor.json"
+            unexpected=$((unexpected + 1))
+        fi
+    done <<<"$sweep_output"
+fi
+
+if [ "$scanner_failed" -ne 0 ]; then
+    : # The scanner-specific failure above is the authoritative diagnostic.
+elif [ "$sweep_hits" -eq 0 ]; then
     fail "the deployment-target sweep matched nothing; a sweep that finds no declarations is broken, not clean"
 else
     info "sweep: $sweep_hits file(s) name a deployment target, $unexpected outside the derived set"
