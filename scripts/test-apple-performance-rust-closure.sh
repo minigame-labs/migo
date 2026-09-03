@@ -167,6 +167,37 @@ else
     fi
 fi
 
+# --- half one and a half: the build script's product selection ---------------
+#
+# A clean dependency graph for `migo-capi:external-frames` proves nothing if the
+# thing that builds the archive asks for different features. The script used to
+# build default `migo-capi` for every Apple slice, which is `profile-full`,
+# which is an embedded V8 -- so the graph was clean and the artefact was not.
+#
+# Source-level, and that is the honest limit: the artefact half below needs a
+# Mac. What is checked here is that the script cannot silently go back to one
+# build for every product.
+SDK_SCRIPT="scripts/build-apple-sdk.sh"
+if [[ -f "$SDK_SCRIPT" ]]; then
+    # The assignment, not the flag text. Matching the flags anywhere in the file
+    # matched the script's own usage message, so removing them from the code
+    # left this green -- the "a description is not a check" mistake, found by
+    # injecting exactly that.
+    if ! grep -q -- 'cargo_feature_flags=(--no-default-features --features external-frames)' \
+        "$SDK_SCRIPT"; then
+        problems+=("$SDK_SCRIPT does not build the Performance+ product with
+      --no-default-features --features external-frames. Default features mean
+      profile-full, which means an embedded engine.")
+    fi
+    # `cargo build -p migo-capi` must pass the product's feature flags rather
+    # than relying on whatever the default is.
+    if grep -qE 'cargo build -p migo-capi[^\\]*--target' "$SDK_SCRIPT" \
+        && ! grep -q 'cargo_feature_flags\[@\]' "$SDK_SCRIPT"; then
+        problems+=("$SDK_SCRIPT builds migo-capi without passing per-product features")
+    fi
+    notes+=("build script selects features per product")
+fi
+
 # --- half two: the built archive ---------------------------------------------
 #
 # The graph is necessary and not sufficient: a vendored object, a static

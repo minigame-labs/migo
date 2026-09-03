@@ -31,6 +31,7 @@ BUILD_ROOT="${MIGO_APPLE_BUILD_ROOT:-/tmp/migo-apple-build}"
 PLATFORM=""
 CONFIGURATION="Debug"
 CODE_SIGNING="off"
+PRODUCT=""
 PRINT_TARGET=""
 
 err()  { printf '\033[0;31m[apple-sdk] %s\033[0m\n' "$*" >&2; }
@@ -40,6 +41,7 @@ info() { printf '\033[0;36m[apple-sdk] %s\033[0m\n' "$*"; }
 usage() {
     cat <<'USAGE'
 usage: build-apple-sdk.sh --platform <ios|ios-simulator|macos>
+                          [--product <performance-plus|macos-v8>]
                           [--configuration Debug|Release]
                           [--code-signing on|off]
        build-apple-sdk.sh --print-deployment-target <ios|macos>
@@ -49,6 +51,23 @@ usage: build-apple-sdk.sh --platform <ios|ios-simulator|macos>
                              and exit. Runs on any host: it is how the contract
                              gate checks the script's real behaviour instead of
                              grepping it for a number.
+
+Products, and why they are separate builds:
+  performance-plus  --no-default-features --features external-frames.
+                    The iOS fast lane: content JavaScript runs in WebKit's
+                    WebContent process, so this archive links no JavaScript
+                    engine at all. That is the product claim, and building the
+                    default crate and reusing it here would quietly break it.
+  macos-v8          default features. In-process V8 with JIT, which macOS
+                    allows under the public hardened-runtime entitlement.
+
+  There is deliberately no `webkit-host` product. That lane is WKWebView
+  running migo-web-adapter; it drives no native renderer, so it links none of
+  this. A product entry that built something for it would be building
+  something it does not use.
+
+  The default is `macos-v8` for --platform macos and `performance-plus` for the
+  two iOS slices, which is the only combination each platform can actually run.
 
 Slices, and why each exists:
   ios              aarch64-apple-ios          device
@@ -65,6 +84,7 @@ USAGE
 while [ $# -gt 0 ]; do
     case "$1" in
         --platform)      PLATFORM="${2:-}"; shift 2 ;;
+        --product)       PRODUCT="${2:-}"; shift 2 ;;
         --configuration) CONFIGURATION="${2:-}"; shift 2 ;;
         --code-signing)  CODE_SIGNING="${2:-}"; shift 2 ;;
         --print-deployment-target) PRINT_TARGET="${2:-}"; shift 2 ;;
@@ -132,6 +152,41 @@ DEPLOYMENT_TARGET="$(read_deployment_target "$FLOOR_PLATFORM")" || exit 1
 # Host requirements, checked before anything is created
 # ---------------------------------------------------------------------------
 
+# The product decides which Cargo features this archive is built with, and the
+# default is the only one its platform can run: macOS gets in-process V8, iOS
+# gets the engine-free external-frame lane because Apple grants a JIT to
+# WebKit's WebContent process and to nothing else.
+if [ -z "$PRODUCT" ]; then
+    case "$PLATFORM" in
+        macos) PRODUCT="macos-v8" ;;
+        *)     PRODUCT="performance-plus" ;;
+    esac
+fi
+case "$PRODUCT" in
+    performance-plus)
+        # No default features: `profile-full` implies an embedded engine, and
+        # this archive's entire claim is that it has none.
+        cargo_feature_flags=(--no-default-features --features external-frames)
+        ;;
+    macos-v8)
+        cargo_feature_flags=()
+        if [ "$PLATFORM" != "macos" ]; then
+            err "macos-v8 is a macOS product: iOS grants a JIT to WebKit's WebContent"
+            err "process and to no embedded engine, so this archive could not run there."
+            exit 2
+        fi
+        ;;
+    webkit-host)
+        err "there is no webkit-host product to build: that lane is WKWebView running"
+        err "migo-web-adapter, which drives no native renderer and links none of this."
+        exit 2
+        ;;
+    *)
+        err "unknown product: $PRODUCT (expected performance-plus or macos-v8)"
+        exit 2
+        ;;
+esac
+
 if [ "$(uname -s)" != "Darwin" ]; then
     err "Apple slices need macOS: Rust's Apple targets require Xcode's linker"
     err "and SDKs, and xcframework assembly requires xcodebuild."
@@ -170,6 +225,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/libs" "$STAGE/headers/migo"
 
 info "platform            $PLATFORM ($CONFIGURATION)"
+info "product             $PRODUCT (cargo ${cargo_feature_flags[*]:-default features})"
 info "deployment target   $DEPLOYMENT_TARGET (from contracts/apple/deployment-floor.json)"
 info "slices              ${RUST_TARGETS[*]}"
 
@@ -191,7 +247,8 @@ for target in "${RUST_TARGETS[@]}"; do
         ios)   export IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" ;;
         macos) export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" ;;
     esac
-    if ! cargo build -p migo-capi --target "$target" --locked "${cargo_profile_flag[@]}"; then
+    if ! cargo build -p migo-capi --target "$target" --locked \
+        "${cargo_feature_flags[@]}" "${cargo_profile_flag[@]}"; then
         err "cargo build failed for $target"
         exit 1
     fi
