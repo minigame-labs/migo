@@ -316,3 +316,36 @@ const _: () = assert!(offset_of!(MigoResourceOutcome, state) == 24);
 const _: () = assert!(offset_of!(MigoResourceOutcome, error) == 28);
 const _: () = assert!(offset_of!(MigoResourceOutcome, next_chunk) == 32);
 const _: () = assert!(offset_of!(MigoResourceOutcome, reserved0) == 36);
+
+// ---------------------------------------------------------------------------
+// Creating an external-frame session
+// ---------------------------------------------------------------------------
+
+/// Caller-written. See the header for why the launch nonce comes from the host
+/// rather than from here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigoExternalSessionDescriptor {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub launch_nonce: [u8; 16],
+    pub max_packet_bytes: u32,
+    pub max_credits: u32,
+}
+
+/// The nonce as a `u128`, or `None` if the caller left it zero.
+///
+/// Rejecting all-zero is not paranoia about a weak random source: it is what an
+/// uninitialised struct holds, and a session that accepted it would accept
+/// packets from any other caller who also failed to initialise theirs.
+pub fn launch_nonce_of(descriptor: &MigoExternalSessionDescriptor) -> Option<u128> {
+    let nonce = u128::from_le_bytes(descriptor.launch_nonce);
+    (nonce != 0).then_some(nonce)
+}
+
+const _: () = assert!(size_of::<MigoExternalSessionDescriptor>() == 32);
+const _: () = assert!(offset_of!(MigoExternalSessionDescriptor, struct_size) == 0);
+const _: () = assert!(offset_of!(MigoExternalSessionDescriptor, abi_version) == 4);
+const _: () = assert!(offset_of!(MigoExternalSessionDescriptor, launch_nonce) == 8);
+const _: () = assert!(offset_of!(MigoExternalSessionDescriptor, max_packet_bytes) == 24);
+const _: () = assert!(offset_of!(MigoExternalSessionDescriptor, max_credits) == 28);

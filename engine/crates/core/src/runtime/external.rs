@@ -390,8 +390,21 @@ impl ExternalFrameSession {
         self.submit.submit_frame(bytes)
     }
 
+    /// Whether the caller is the session's own thread.
+    ///
+    /// Exposed for the same reason `HostThread` exposes it: joining from inside
+    /// the thread being joined deadlocks, and a C host that owns both a session
+    /// and a callback running on it has no other way to tell.
+    pub fn is_current_thread(&self) -> bool {
+        self.host.is_current_thread()
+    }
+
     pub fn request_shutdown(&self) -> Result<(), String> {
         self.host.request_shutdown()
+    }
+
+    pub fn join(&mut self) -> EngineResult<()> {
+        self.host.join()
     }
 
     pub fn shutdown_and_join(&mut self) -> EngineResult<()> {

@@ -121,6 +121,20 @@ _Static_assert(MIGO_RESOURCE_STATE_READY != UINT32_C(0),
 _Static_assert(MIGO_RESOURCE_STATE_FAILED != UINT32_C(0), "");
 _Static_assert(MIGO_RESOURCE_ERROR_DIGEST_MISMATCH != UINT32_C(0), "");
 
+
+/* ---------------------------------------------------------------------------
+ * Creating an external-frame session
+ * ------------------------------------------------------------------------- */
+
+_Static_assert(sizeof(MigoExternalSessionDescriptor) == 32,
+               "external session descriptor is 32 bytes on every target");
+_Static_assert(offsetof(MigoExternalSessionDescriptor, launch_nonce) == 8,
+               "the nonce follows the versioned prefix");
+_Static_assert(sizeof(((MigoExternalSessionDescriptor *)0)->launch_nonce) == 16,
+               "128 bits: the nonce is guessed against, not collided against");
+_Static_assert(offsetof(MigoExternalSessionDescriptor, max_packet_bytes) == 24, "");
+_Static_assert(offsetof(MigoExternalSessionDescriptor, max_credits) == 28, "");
+
 int migo_external_frames_c_contract(void) {
     MigoFrameIngressOutcome outcome = {0};
     outcome.struct_size = (uint32_t)sizeof outcome;
@@ -142,6 +156,11 @@ int migo_external_frames_c_contract(void) {
     resource.struct_size = (uint32_t)sizeof resource;
     resource.state = MIGO_RESOURCE_STATE_READY;
 
+    MigoExternalSessionDescriptor session = {0};
+    session.struct_size = (uint32_t)sizeof session;
+    session.launch_nonce[0] = 1u;
+
     return (int)(outcome.struct_size + outcome.decision + request.struct_size
-                 + answer.struct_size + reservation.struct_size + resource.struct_size);
+                 + answer.struct_size + reservation.struct_size + resource.struct_size
+                 + session.struct_size + session.launch_nonce[0]);
 }

@@ -220,4 +220,53 @@ typedef struct MigoResourceOutcome {
     uint32_t reserved0;
 } MigoResourceOutcome;
 
+
+/* ---------------------------------------------------------------------------
+ * Creating an external-frame session
+ *
+ * A session in this mode owns a renderer, a surface and a frame clock, and no
+ * script runtime: the content's JavaScript runs in another process. Creating
+ * one is therefore a different call from creating a content session, not a flag
+ * on the same one -- the two do not share a lifecycle, and
+ * migo_session_load_content on a session created this way returns
+ * MIGO_ERROR_INVALID_STATE rather than doing something surprising.
+ *
+ * THE LAUNCH NONCE IS SUPPLIED BY THE HOST, not generated here, and that is the
+ * important part of this record. It is the shared secret that decides whether
+ * bytes arriving from another process belong to this session, so the party that
+ * owns *both* ends -- the transport and the session -- has to be the one that
+ * generates it. On Apple that is the Swift host, with SecRandomCopyBytes. A
+ * library that invented its own would have to hand it back out for the
+ * transport to use, which is one more place for it to be logged.
+ *
+ * Generate it with a cryptographic source. It is 128 bits because it is
+ * guessed against, not collided against, and it must not appear in a URL, a
+ * query string, or a log line.
+ *
+ * DECLARATIONS ONLY, like the records above. The entry point lands with the
+ * session implementation behind it.
+ * ------------------------------------------------------------------------- */
+
+typedef struct MigoExternalSessionDescriptor {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    /*
+     * 128-bit, little-endian, from a cryptographic source. All-zero is
+     * rejected: it is what an uninitialised struct holds, and a session that
+     * accepted it would accept packets from anyone who also sent zeros.
+     */
+    uint8_t  launch_nonce[16];
+    /*
+     * Bytes this session will accept in one packet, or 0 for the library's
+     * ceiling. A value above the ceiling is clamped down, never up: a host on a
+     * memory-tight device can ask for less and nothing can ask for more.
+     */
+    uint32_t max_packet_bytes;
+    /*
+     * Frames the producer may have outstanding, or 0 for the library's default.
+     * Clamped into the compile-time range the same way.
+     */
+    uint32_t max_credits;
+} MigoExternalSessionDescriptor;
+
 #endif /* MIGO_EXTERNAL_FRAMES_H_ */

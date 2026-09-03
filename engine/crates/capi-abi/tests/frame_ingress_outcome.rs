@@ -445,3 +445,46 @@ fn contradictory_sync_and_resource_outcomes_are_refused() {
         "an unrecognised state is refused"
     );
 }
+
+/// An uninitialised descriptor must not produce a usable session identity.
+///
+/// All-zero is what a `MigoExternalSessionDescriptor {0}` holds, and two hosts
+/// that both forgot to fill it in would accept each other's packets. Rejecting
+/// it is cheaper than every downstream check that would otherwise have to
+/// notice.
+#[test]
+fn an_all_zero_launch_nonce_is_refused() {
+    use migo_capi_abi::external_frames::{MigoExternalSessionDescriptor, launch_nonce_of};
+
+    let mut descriptor = MigoExternalSessionDescriptor {
+        struct_size: size_of::<MigoExternalSessionDescriptor>() as u32,
+        abi_version: 1,
+        launch_nonce: [0u8; 16],
+        max_packet_bytes: 0,
+        max_credits: 0,
+    };
+    assert_eq!(
+        launch_nonce_of(&descriptor),
+        None,
+        "a zeroed struct has no identity"
+    );
+
+    // A single bit anywhere is enough to be a value; the strength of the source
+    // is the host's business and cannot be checked from a number.
+    descriptor.launch_nonce[15] = 0x80;
+    assert_eq!(
+        launch_nonce_of(&descriptor),
+        Some(0x8000_0000_0000_0000_0000_0000_0000_0000)
+    );
+
+    // Little-endian, matching the wire header the nonce is compared against.
+    descriptor.launch_nonce = [
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23,
+        0x01,
+    ];
+    assert_eq!(
+        launch_nonce_of(&descriptor),
+        Some(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210),
+        "the descriptor and the wire header read the nonce the same way"
+    );
+}
