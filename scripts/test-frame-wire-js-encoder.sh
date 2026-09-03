@@ -49,3 +49,49 @@ if grep -nE '^\s*import\b' "$ENCODER" >/dev/null 2>&1; then
 fi
 
 node "$TEST"
+
+# --- and the other direction ------------------------------------------------
+#
+# The corpus above pins three shapes byte for byte. It cannot answer "does this
+# encoder ever produce something the reader refuses", because three cases do not
+# cover section counts, ragged payload lengths, the padding those imply, or the
+# wide-field values a real session uses. So the emitter writes a deterministic
+# spread of packets and the Rust reader validates every one, checking each field
+# came back at full width.
+#
+# The Rust side is `#[ignore]`d, because a `cargo test` run has no way to
+# produce its input. That is the visible form of the dependency; this gate is
+# what guarantees it actually runs, which is the half that a test returning
+# early on a missing environment variable would lose.
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "FAIL: cargo is not available, so the reader cannot check the emitter's packets." >&2
+    exit 1
+fi
+
+PACKETS="$(mktemp -d)"
+trap 'rm -rf "$PACKETS"' EXIT
+
+node platforms/apple/WebContent/PerformancePlus/test/emit-packets.mjs "$PACKETS" 128
+
+emitted="$(find "$PACKETS" -name 'packet-*.bin' | wc -l)"
+if (( emitted < 128 )); then
+    echo "FAIL: the emitter wrote $emitted packets, expected 128." >&2
+    exit 1
+fi
+
+# `--nocapture` so the count the test prints is in the log. A run that
+# validated zero packets and passed is the shape this repository keeps finding,
+# and the count below is what makes it visible rather than inferred.
+output="$(cd engine && MIGO_JS_PACKET_DIR="$PACKETS" \
+    cargo test -p migo-frame-wire --test js_interop -- --ignored --nocapture 2>&1)"
+status=$?
+printf '%s\n' "$output" | grep -E 'validated [0-9]+ JavaScript-encoded packets|test result' || true
+if (( status != 0 )); then
+    printf '%s\n' "$output" >&2
+    echo "FAIL: the Rust reader rejected packets built by the JavaScript encoder." >&2
+    exit 1
+fi
+if ! printf '%s\n' "$output" | grep -qE 'validated 128 JavaScript-encoded packets'; then
+    echo "FAIL: the interop test did not report validating 128 packets; it may not have run." >&2
+    exit 1
+fi
