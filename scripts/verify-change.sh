@@ -85,6 +85,10 @@ HOST_CARGO_STEPS=(
     # `--all-targets` for the same reason `capi-abi` needs it: every case lives
     # in `tests/`, so `--lib` would run exactly zero of them and pass forever.
     "test -p migo-frame-wire --all-targets"
+    # The command decoder, which the external-frame product needs and the
+    # embedded runtime now calls through a two-method adapter. `--all-targets`
+    # for the same reason as its neighbours: every case lives in `tests/`.
+    "test -p migo-frame-decode --all-targets"
     "test -p migo-shared"
     "test -p migo-io --lib"
     # `--tests` rather than `--lib` for the two crates that own integration

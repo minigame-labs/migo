@@ -1,10 +1,18 @@
 # Migo Apple platform
 
-SwiftPM package for iOS, iPadOS and macOS. The only authoritative sources are
-the [v5 implementation plan](../../docs/superpowers/plans/2026-09-02-apple-performance-v5-final-implementation-plan.md)
-and the [v5 design](../../docs/superpowers/specs/2026-09-02-apple-performance-v5-design.md).
-The short compatibility pointer at `docs/apple-final-implementation-plan.md`
-must remain a pointer, not a second plan.
+SwiftPM package for iOS, iPadOS and macOS: three products (the WebKit
+compatibility lane, the conditional Performance+ lane, and the macOS native V8
+lane) over one shared renderer target.
+
+The authoritative contracts are [`contracts/apple/`](../../contracts/apple): the
+deployment floor with its per-lane minimums, and the profile-selection policy.
+Each carries its reasoning inline and each has a gate that fails when a consumer
+drifts from it.
+
+The maintainer plan behind them is deliberately **not** in this repository --
+`docs/` is gitignored, so a link into it resolves for nobody who clones this.
+What matters for anyone reading the code is in the contracts above and in the
+comments here.
 
 ## Status: skeleton
 

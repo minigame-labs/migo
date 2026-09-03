@@ -512,7 +512,7 @@ jobs:
       # lints gate again, and the style backlog still just warns.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-frame-wire -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-frame-wire -p migo-frame-decode -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets
 
       # Blocking gate for the crates that need no extra system packages (shared +
       # io + runtime-v8). All their lib tests must pass. Previously-masked failures
@@ -559,6 +559,7 @@ jobs:
           cargo test -p migo-io --lib
           cargo test -p migo-capi-abi --all-targets
           cargo test -p migo-frame-wire --all-targets
+          cargo test -p migo-frame-decode --all-targets
           # The other half of that crate's feature arrangement: the reader must
           # still build with the packet builder excluded, which is how the
           # shipping path takes it. Proving it here makes the exclusion a

@@ -1,8 +1,14 @@
 # ProbeApp
 
-G0 probes only. ProbeApp is never linked into a product. The authoritative
-requirements are the [v5 implementation plan](../../../docs/superpowers/plans/2026-09-02-apple-performance-v5-final-implementation-plan.md)
-and [v5 design](../../../docs/superpowers/specs/2026-09-02-apple-performance-v5-design.md).
+The authoritative contracts are [`contracts/apple/`](../../../contracts/apple): the
+deployment floor with its per-lane minimums, and the profile-selection policy.
+Each carries its reasoning inline and each has a gate that fails when a consumer
+drifts from it.
+
+The maintainer plan behind them is deliberately **not** in this repository --
+`docs/` is gitignored, so a link into it resolves for nobody who clones this.
+What matters for anyone reading the code is in the contracts above and in the
+comments here.
 
 G0 must select a winner, or an explicit capability-specific choice, only from
 real evidence on the current minimum OS and representative devices. It must
