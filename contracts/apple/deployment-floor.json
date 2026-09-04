@@ -15,7 +15,7 @@
     "deployment target to iOS 17 to buy a single memory tier, and paid 2.4",
     "points of user coverage for a build simplification.",
     "",
-    "Reasoning: docs/apple-final-implementation-plan.md, the single Apple authority. Its sections 2 and 2.5 adjudicate the three inputs archived under docs/inputs/; do not relitigate a numbered decision there without new evidence."
+    "Reasoning: the numbers here were adjudicated once, against three competing proposals, and the record of that lives in the maintainers' notes rather than in this distribution. That is deliberate -- the notes carry commercial and scheduling material a consumer has no business reading -- so this file states what it requires and why, and does not send anyone to a path their checkout does not contain. Changing a floor is a decision, not an edit: raising it drops devices, lowering it admits ones nothing has been measured on."
   ],
   "platforms": {
     "ios": {

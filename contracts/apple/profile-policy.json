@@ -18,9 +18,8 @@
     "     asks is never 'which lane' but 'why did this device, on this content,",
     "     end up there' -- and by the time it is asked, the inputs are gone.",
     "",
-    "Reasoning: docs/apple-final-implementation-plan.md sections 4, 6 and 2.5 (E4, which retracts every fixed byte cap this file used to mirror)."
+    "Reasoning: this file once mirrored fixed byte caps copied from another vendor's device tiers, and they were withdrawn -- no public API reports the jetsam limit, so a cached number is not a budget but a guess wearing one. What remains is a policy expressed as inputs and rules, which is why every field here names a signal to read rather than a threshold to trust. The record of that decision is in the maintainers' notes, which are not part of this distribution."
   ],
-
   "decision_order": [
     {
       "step": 1,
@@ -73,7 +72,6 @@
       "note": "The last gate, and the only one that runs after resources are committed. It must complete before any content code executes, so a failure here still selects rather than falls back."
     }
   ],
-
   "memory_policy": {
     "_comment": "These inputs combine verified content and host caps, measured device-safe evidence, fresh available-memory advisory headroom, and a versioned emergency reserve. Effective admission uses the most conservative current inputs; the advisory is re-queried before large reservations, and no value is a jetsam limit or guarantee.",
     "content_cap": {
@@ -104,7 +102,6 @@
     "reservation_before_alloc": true,
     "requery_before_large_reservation": true
   },
-
   "device_tiers": {
     "_comment": [
       "Tiers gate the fast lane. They do not gate the product: a device below",
@@ -129,7 +126,6 @@
       "note": "Performance+ admission with higher asset quality; the quality tier does not change runtime memory policy."
     }
   },
-
   "reason_codes": [
     "hostRequested",
     "contentManifestRequires",
@@ -141,7 +137,6 @@
     "initializationFailed",
     "previousGenerationLost"
   ],
-
   "failures": {
     "_comment": [
       "What happens to the Session that hit the failure, and what the next one",
@@ -195,7 +190,6 @@
       "reason_code": "initializationFailed"
     }
   },
-
   "feature_flags": {
     "_comment": "Default state on a fresh install. Anything not 'on' requires device evidence to promote, and every one of them must be switchable off remotely without a client update.",
     "apple_webkit_full": "on",
