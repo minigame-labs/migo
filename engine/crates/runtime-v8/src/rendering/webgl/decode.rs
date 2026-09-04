@@ -29,7 +29,7 @@ use shared::protocol::render_cmd::{Canvas2DCmd, GLCmd};
 use crate::rendering::webgl::error_state::OpStateDecodeContext;
 use crate::rendering::webgl::error_state::WebGLErrorState;
 use crate::rendering::webgl::frame_collector::UnifiedFrameCollector;
-use crate::rendering::webgl::gl_stream::ValidatedStream;
+use crate::rendering::webgl::stream::ValidatedStream;
 
 /// The op state, as the shared decoder writes into it.
 pub(crate) struct OpStateRenderTarget<'a> {

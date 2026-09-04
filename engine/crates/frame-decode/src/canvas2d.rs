@@ -2,7 +2,7 @@
 //!
 //! The counterpart of the GL decoding in this crate's root, and the same rules
 //! apply: the words were structurally validated by
-//! `frame_wire::gl_stream::validate_stream` before anything here reads them, so
+//! `frame_wire::stream::validate_stream` before anything here reads them, so
 //! a record's word count and its bool positions are already known good, and
 //! this reads fields rather than checking them.
 //!

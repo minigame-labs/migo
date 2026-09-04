@@ -46,7 +46,7 @@ use shared::{
     surface::SurfaceRef,
 };
 
-use frame_wire::{FrameIngress, IngressDecision, IngressOutcome, PooledFrame, gl_stream};
+use frame_wire::{FrameIngress, IngressDecision, IngressOutcome, PooledFrame, stream};
 
 use crate::runtime::session_thread::{
     HostThread, SessionThreadContext, StartedHost, create_basic_runtime,
@@ -305,7 +305,7 @@ impl SubmitPath {
                 .chunks_exact(4)
                 .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])),
         );
-        let validated = gl_stream::validate_stream(&scratch, scratch.len() as u32)
+        let validated = stream::validate_stream(&scratch, scratch.len() as u32)
             .map_err(|_| EXTERNAL_ERROR_BAD_COMMAND_STREAM)?;
 
         // The mixed decoder, not the GL-only one: a producer's frame carries

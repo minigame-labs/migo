@@ -29,7 +29,7 @@ mod js_agreement {
     /// checks all three together.
     #[test]
     fn the_javascript_encoder_declares_every_opcode_the_rust_table_does() {
-        const RUST: &str = include_str!("../../../../frame-wire/src/gl_stream.rs");
+        const RUST: &str = include_str!("../../../../frame-wire/src/gl.rs");
         const JS: &str = include_str!("00_render_command_stream.js");
 
         fn parse(text: &str, prefix: &str, suffix: &str) -> Vec<(String, u32)> {
@@ -156,7 +156,7 @@ mod js_agreement {
 /// a second reading of it.
 mod canvas2d_agreement {
     use frame_wire::canvas2d::{OP2D_BASE, OP2D_END, OP2D_SELECT_CANVAS};
-    use frame_wire::gl_stream::RecordSpec;
+    use frame_wire::stream::RecordSpec;
     use std::collections::HashMap;
 
     const JS: &str = include_str!("00_render_command_stream.js");

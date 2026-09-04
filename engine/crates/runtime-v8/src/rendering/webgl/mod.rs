@@ -6,10 +6,11 @@ mod font;
 pub(crate) mod frame_collector;
 /// Re-exported, not defined here any more.
 ///
-/// The structural validator moved to `migo-frame-wire` so the cross-process
-/// frame consumer can validate the same words without linking a JavaScript
-/// engine. The path stays valid for every call site in this crate.
-pub(crate) use frame_wire::gl_stream;
+/// The structural validator and the WebGL opcode table moved to
+/// `migo-frame-wire` so the cross-process frame consumer can validate the same
+/// words without linking a JavaScript engine. The paths stay valid for every
+/// call site in this crate.
+pub(crate) use frame_wire::{gl, stream};
 
 mod raf;
 /// Test-only: the cases asserting this crate's JavaScript encoder agrees with

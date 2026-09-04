@@ -755,14 +755,16 @@ pub fn stamp_checksum(bytes: &mut [u8]) {
 /// -- which is the product claim `MigoApplePerformancePlus` rests on and could
 /// not make if this validator were reachable only through the engine crate.
 ///
-/// The file moved unchanged. It had no imports at all, which is what made it
-/// movable and is worth preserving: a pure function over `&[u32]` is the only
-/// shape that can be shared by a trusted in-process caller and an untrusted
-/// cross-process one without either inheriting the other's dependencies.
-pub mod gl_stream;
+/// A pure function over `&[u32]` is the only shape that can be shared by a
+/// trusted in-process caller and an untrusted cross-process one without either
+/// inheriting the other's dependencies, so the validator keeps no imports of
+/// its own beyond the two opcode blocks it routes to.
+pub mod stream;
 
-/// The Canvas2D half of the same stream. See its module docs for why one
-/// stream carries both.
+/// The WebGL block: its opcodes and their record shapes.
+pub mod gl;
+
+/// The Canvas2D block. See its module docs for why one stream carries both.
 pub mod canvas2d;
 
 pub mod ingress;

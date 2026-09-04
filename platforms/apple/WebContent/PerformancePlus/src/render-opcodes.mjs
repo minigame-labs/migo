@@ -1,7 +1,7 @@
 // The render command-stream opcode table, as the WebContent producer sees it.
 //
 // Three implementations name these numbers: the Rust table in
-// `engine/crates/frame-wire/src/gl_stream.rs`, the in-process JavaScript
+// `engine/crates/frame-wire/src/gl.rs`, the in-process JavaScript
 // encoder in `engine/crates/runtime-v8/src/rendering/webgl/00_render_command_stream.js`,
 // and this file. `scripts/test-render-opcode-agreement.sh` parses all three and
 // requires them to agree exactly.

@@ -1207,12 +1207,14 @@ mod tests {
     // They FAIL (compile error / link error) until the implementation is in place.
 
     use crate::rendering::webgl::decode::decode_validated_stream;
-    use crate::rendering::webgl::gl_stream::{
-        MAGIC, OP_BIND_BUFFER, OP_BIND_BUFFER_BASE, OP_BIND_BUFFER_RANGE, OP_BIND_FRAMEBUFFER,
+    use crate::rendering::webgl::gl::{
+        OP_BIND_BUFFER, OP_BIND_BUFFER_BASE, OP_BIND_BUFFER_RANGE, OP_BIND_FRAMEBUFFER,
         OP_BIND_RENDERBUFFER, OP_BIND_SAMPLER, OP_BIND_TEXTURE, OP_BIND_VERTEX_ARRAY, OP_CLEAR,
         OP_ENABLE, OP_SCISSOR, OP_UNIFORM_MATRIX3FV, OP_UNIFORM1F, OP_UNIFORM1FV, OP_UNIFORM1I,
-        OP_VERTEX_ATTRIB_POINTER, OP_VIEWPORT, STREAM_VERSION, ValidatedStream, pack_header,
-        validate_stream,
+        OP_VERTEX_ATTRIB_POINTER, OP_VIEWPORT,
+    };
+    use crate::rendering::webgl::stream::{
+        MAGIC, STREAM_VERSION, ValidatedStream, pack_header, validate_stream,
     };
 
     fn make_validated_for_decode(words: &[u32]) -> ValidatedStream<'_> {
@@ -2067,7 +2069,7 @@ mod tests {
         // Build a stream with bad magic
         let bad_words: Vec<u32> = vec![0xDEADBEEF, STREAM_VERSION];
         let used_words = bad_words.len() as u32;
-        let expected_code = crate::rendering::webgl::gl_stream::StreamError::BadMagic.code();
+        let expected_code = crate::rendering::webgl::stream::StreamError::BadMagic.code();
         let result = submit_render_stream_impl(&mut state, &bad_words, used_words);
         assert_eq!(
             result, expected_code,
@@ -4130,7 +4132,7 @@ pub(crate) mod submit_test_counter {
 /// the crossing: a frame that draws its background with 2D, its sprites with GL
 /// and its HUD with 2D again is one submission, not three interleaved paths.
 ///
-/// Pass 1 (structural): `gl_stream::validate_stream`. Malformed batches return a
+/// Pass 1 (structural): `stream::validate_stream`. Malformed batches return a
 /// stable non-zero error code immediately — no collector, no error queue, no vec taken.
 ///
 /// Pass 2 (semantic + decode): `decode::decode_render_stream` cuts the stream
@@ -4153,7 +4155,7 @@ pub(crate) fn submit_render_stream_impl(
     used_words: u32,
 ) -> u32 {
     // Pass 1: pure structural validation — no side effects on failure.
-    let validated = match crate::rendering::webgl::gl_stream::validate_stream(words, used_words) {
+    let validated = match crate::rendering::webgl::stream::validate_stream(words, used_words) {
         Ok(v) => v,
         Err(e) => return e.code(),
     };

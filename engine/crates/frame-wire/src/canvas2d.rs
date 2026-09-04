@@ -40,7 +40,7 @@
 //! block already has a spec table for, and adding them without that shape is
 //! how a fixed-length decoder ends up with a length field it does not check.
 
-use crate::gl_stream::RecordSpec;
+use crate::stream::RecordSpec;
 
 /// The first 2D opcode. Everything at or above this is a 2D record.
 pub const OP2D_BASE: u32 = 512;

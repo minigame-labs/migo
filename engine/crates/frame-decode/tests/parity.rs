@@ -14,10 +14,8 @@
 //! what it does with records it must reject.
 
 use frame_decode::{GlDecodeContext, codes, decode_validated_stream};
-use frame_wire::gl_stream::{
-    MAGIC, OP_BIND_BUFFER_BASE, OP_CLEAR, OP_CLEAR_COLOR, OP_SCISSOR, STREAM_VERSION, pack_header,
-    validate_stream,
-};
+use frame_wire::gl::{OP_BIND_BUFFER_BASE, OP_CLEAR, OP_CLEAR_COLOR, OP_SCISSOR};
+use frame_wire::stream::{MAGIC, STREAM_VERSION, pack_header, validate_stream};
 use shared::protocol::render_cmd::GLCmd;
 
 /// A host with no runtime behind it: the errors go into a list.

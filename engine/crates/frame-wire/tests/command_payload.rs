@@ -6,7 +6,7 @@
 //!
 //!   * [`frame_wire::validate`] checks the envelope: header, section table,
 //!     bounds, checksum. It knows nothing about opcodes.
-//!   * [`frame_wire::gl_stream::validate_stream`] checks the command payload.
+//!   * [`frame_wire::stream::validate_stream`] checks the command payload.
 //!     It knows nothing about packets.
 //!
 //! -- so that adding an opcode cannot break envelope correctness, and neither
@@ -21,9 +21,8 @@
 use frame_wire::{
     SECTION_KIND_COMMAND_STREAM, SECTION_KIND_INLINE_DATA,
     builder::WireFrameBuilder,
-    gl_stream::{
-        MAGIC, OP_CLEAR, OP_CLEAR_COLOR, STREAM_VERSION, StreamError, pack_header, validate_stream,
-    },
+    gl::{OP_CLEAR, OP_CLEAR_COLOR},
+    stream::{MAGIC, STREAM_VERSION, StreamError, pack_header, validate_stream},
     validate,
 };
 

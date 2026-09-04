@@ -19,7 +19,7 @@
 # So the tables are parsed, not restated, and all three are parsed by the same
 # gate:
 #
-#   engine/crates/frame-wire/src/gl_stream.rs                   (the source)
+#   engine/crates/frame-wire/src/gl.rs                   (the source)
 #   engine/crates/runtime-v8/src/rendering/webgl/00_render_command_stream.js
 #   platforms/apple/WebContent/PerformancePlus/src/render-opcodes.mjs
 #
@@ -41,7 +41,9 @@ from pathlib import Path
 # a source that claims a block must agree on all of it, and one that drops a
 # block has to say so on this line rather than by quietly failing to match.
 SOURCES = {
-    "rust": (Path("engine/crates/frame-wire/src/gl_stream.rs"), {"gl"}),
+    # The envelope, which owns the magic and the version and neither block.
+    "rust envelope": (Path("engine/crates/frame-wire/src/stream.rs"), set()),
+    "rust": (Path("engine/crates/frame-wire/src/gl.rs"), {"gl"}),
     "rust 2d": (Path("engine/crates/frame-wire/src/canvas2d.rs"), {"2d"}),
     "in-process js": (
         Path("engine/crates/runtime-v8/src/rendering/webgl/00_render_command_stream.js"),
@@ -69,7 +71,9 @@ PATTERNS = {
 BLOCK_MARKERS = {"OP2D_BASE", "OP2D_END"}
 
 HEADER = {
-    "rust": re.compile(r"^pub const (MAGIC|STREAM_VERSION): u32 = (0x[0-9A-Fa-f_]+|\d+);", re.M),
+    "rust envelope": re.compile(
+        r"^pub const (MAGIC|STREAM_VERSION): u32 = (0x[0-9A-Fa-f_]+|\d+);", re.M
+    ),
     "in-process js": re.compile(r"^\s*const (MAGIC|STREAM_VERSION) = (0x[0-9A-Fa-f]+|\d+);", re.M),
     "webcontent js": re.compile(r"^export const (MAGIC|STREAM_VERSION) = (0x[0-9A-Fa-f]+|\d+);", re.M),
 }
@@ -78,7 +82,12 @@ problems = []
 headers = {}
 text_of = {}
 
-for name, (path, _blocks) in SOURCES.items():
+for name, (path, blocks) in SOURCES.items():
+    if not blocks and name not in HEADER:
+        # A source that declares no block and no header is a path this gate
+        # opens and never reads -- the shape a check takes when it has quietly
+        # stopped being one.
+        problems.append(f"{name}: declares no opcode block and no header, so nothing checks it")
     if not path.is_file():
         problems.append(f"{name}: {path} is missing")
         continue
@@ -183,7 +192,7 @@ for key in ("MAGIC", "STREAM_VERSION"):
     if len(set(values.values())) != 1:
         problems.append(f"{key} disagrees: {values}")
     else:
-        print(f"  - {key} agrees: {hex(values['rust'])}")
+        print(f"  - {key} agrees: {hex(values['rust envelope'])}")
 
 print()
 if problems:

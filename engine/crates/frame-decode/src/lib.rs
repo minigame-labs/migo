@@ -1,6 +1,6 @@
 //! Pass 2: a structurally-valid GL command stream becomes owned `GLCmd`s.
 //!
-//! Pass 1 -- `frame_wire::gl_stream` -- checks the shape of the words: record
+//! Pass 1 -- `frame_wire::stream` -- checks the shape of the words: record
 //! headers, word counts, opcodes in range. This is the pass that reads them,
 //! and it produces exactly the `GLCmd` the corresponding raw op would build:
 //! the same numeric conversions, the same null-id mapping, the same validator
@@ -29,7 +29,7 @@
 
 use shared::protocol::render_cmd::{GLCmd, UniformF32Values, UniformI32Values};
 
-use frame_wire::gl_stream::{
+use frame_wire::gl::{
     OP_ACTIVE_TEXTURE, OP_BIND_BUFFER, OP_BIND_BUFFER_BASE, OP_BIND_BUFFER_RANGE,
     OP_BIND_FRAMEBUFFER, OP_BIND_RENDERBUFFER, OP_BIND_SAMPLER, OP_BIND_TEXTURE,
     OP_BIND_VERTEX_ARRAY, OP_BLEND_COLOR, OP_BLEND_EQUATION, OP_BLEND_EQUATION_SEPARATE,
@@ -44,9 +44,9 @@ use frame_wire::gl_stream::{
     OP_UNIFORM_MATRIX3FV, OP_UNIFORM_MATRIX4FV, OP_UNIFORM1F, OP_UNIFORM1FV, OP_UNIFORM1I,
     OP_UNIFORM1IV, OP_UNIFORM2F, OP_UNIFORM2FV, OP_UNIFORM2IV, OP_UNIFORM3F, OP_UNIFORM3FV,
     OP_UNIFORM3IV, OP_UNIFORM4F, OP_UNIFORM4FV, OP_UNIFORM4IV, OP_USE_PROGRAM,
-    OP_VERTEX_ATTRIB_DIVISOR, OP_VERTEX_ATTRIB_POINTER, OP_VIEWPORT, ValidatedStream, opcode_of,
-    word_count_of,
+    OP_VERTEX_ATTRIB_DIVISOR, OP_VERTEX_ATTRIB_POINTER, OP_VIEWPORT,
 };
+use frame_wire::stream::{ValidatedStream, opcode_of, word_count_of};
 
 /// Canvas2D records. See its module docs for why 2D and GL share one stream.
 pub mod canvas2d;

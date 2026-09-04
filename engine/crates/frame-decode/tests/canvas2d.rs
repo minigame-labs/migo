@@ -7,7 +7,8 @@
 
 use frame_decode::{GlDecodeContext, codes, decode_render_stream};
 use frame_wire::canvas2d::*;
-use frame_wire::gl_stream::{MAGIC, OP_CLEAR, STREAM_VERSION, pack_header, validate_stream};
+use frame_wire::gl::OP_CLEAR;
+use frame_wire::stream::{MAGIC, STREAM_VERSION, pack_header, validate_stream};
 use shared::protocol::FrameOp;
 use shared::protocol::render_cmd::Canvas2DCmd;
 
@@ -256,7 +257,7 @@ fn the_block_is_contiguous_and_fully_specified() {
         "the block ends where it says it does"
     );
     assert!(
-        frame_wire::gl_stream::record_spec(OP2D_MOVE_TO).is_some(),
+        frame_wire::stream::record_spec(OP2D_MOVE_TO).is_some(),
         "the shared validator dispatches 2D opcodes to the 2D table"
     );
 }

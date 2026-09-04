@@ -9,9 +9,8 @@
 
 use frame_decode::{GlDecodeContext, RenderSink, decode_render_stream_into};
 use frame_wire::canvas2d::*;
-use frame_wire::gl_stream::{
-    MAGIC, OP_CLEAR, OP_UNIFORM1FV, STREAM_VERSION, pack_header, validate_stream,
-};
+use frame_wire::gl::{OP_CLEAR, OP_UNIFORM1FV};
+use frame_wire::stream::{MAGIC, STREAM_VERSION, pack_header, validate_stream};
 use shared::command_vec_pool::PooledVec;
 use shared::protocol::render_cmd::{Canvas2DCmd, GLCmd};
 

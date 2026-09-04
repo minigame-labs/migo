@@ -23,7 +23,7 @@ one had not shipped:
 - No `migo_session_submit_external_frame` entry point is exported anywhere, so
   no host can have sent a packet.
 - The only in-repository consumer of the crate is the command-stream validator
-  (`gl_stream`), which does not read the envelope.
+  (`stream`), which does not read the envelope.
 
 So there is no reader in the field to break. **This is the last renumber.** The
 next change to a field offset, a flag bit, or a rejection code is a
