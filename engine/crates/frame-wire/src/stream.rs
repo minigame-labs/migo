@@ -114,7 +114,11 @@ pub enum UniformElementKind {
 }
 
 /// Per-opcode structural specification for Pass 1.
-#[derive(Debug, Clone)]
+// `PartialEq` so the envelope's routing can be asserted against the block
+// tables themselves: the claim is "this opcode gets *the* spec that block
+// holds", and comparing projections of the fields would restate the spec here
+// as a second copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordSpec {
     /// Fixed-arity record: exact word count and optional bool-word indices.
     Fixed {
@@ -132,8 +136,6 @@ pub enum RecordSpec {
         transpose_word_idx: u8,
     },
 }
-
-/// Returns the `RecordSpec` for a given opcode, or `None` if unknown.
 
 // ─── record_spec ─────────────────────────────────────────────────────────────
 
@@ -751,6 +753,67 @@ mod tests {
         let words = [MAGIC, STREAM_VERSION, h1, 0, 0, h2, 0, 0];
         let vs = validate_stream(&words, 8).expect("should be valid");
         assert_eq!(vs.words().len(), 8);
+    }
+
+    // ── The envelope reaches both opcode blocks ───────────────────────────────
+    //
+    // Every case above this point is built from a GL opcode. The envelope's
+    // routing has two arms and only one of them had ever been walked from here,
+    // which is why `use crate::canvas2d::*` sat unused above -- the import was
+    // written for cases that were never added, and the comment beside it
+    // described a coverage that did not exist.
+    //
+    // The 2D arm is the one the Apple product depends on: Canvas2D is what
+    // crosses the process boundary as a stream, and this validator is what
+    // stands between content JavaScript's bytes and the renderer.
+
+    #[test]
+    fn validate_a_2d_record_ok() {
+        // OP2D_SELECT_CANVAS is 2 words (header + id), OP2D_MOVE_TO is 3
+        // (header + x + y).
+        let h1 = pack_header(OP2D_SELECT_CANVAS, 2);
+        let h2 = pack_header(OP2D_MOVE_TO, 3);
+        let words = [MAGIC, STREAM_VERSION, h1, 7, h2, 0, 0];
+        let vs = validate_stream(&words, 7).expect("a well-formed 2D stream must validate");
+        assert_eq!(vs.words().len(), 7);
+    }
+
+    #[test]
+    fn validate_rejects_a_2d_record_whose_length_disagrees_with_its_spec() {
+        // OP2D_MOVE_TO is 3 words; claim 4.
+        let h = pack_header(OP2D_MOVE_TO, 4);
+        let words = [MAGIC, STREAM_VERSION, h, 0, 0, 0];
+        assert_eq!(validate_stream(&words, 6), Err(StreamError::BadArity));
+    }
+
+    // The seam between the two blocks is a single `>=`. Getting it wrong by one
+    // is silent in the worst way: the wrong table answers, and an opcode it
+    // does not know comes back as `UnknownOpcode` for a record that is in fact
+    // well formed -- or, if both tables happen to answer, a record is accepted
+    // at the other block's length and the walk desynchronises from there on.
+    //
+    // Derived from the two tables rather than from a list written here, because
+    // a hand-written list of opcodes is a second copy of the thing it checks.
+    #[test]
+    fn every_opcode_is_routed_to_the_block_that_knows_it() {
+        for opcode in 0..(crate::canvas2d::OP2D_BASE * 2) {
+            let from_gl = crate::gl::record_spec(opcode);
+            let from_2d = crate::canvas2d::record_spec(opcode);
+
+            // Neither block may claim an opcode the other also claims: the
+            // envelope picks exactly one, so an overlap would make which table
+            // supplied a record's length depend on the order of an `if`.
+            assert!(
+                from_gl.is_none() || from_2d.is_none(),
+                "opcode {opcode} is claimed by both the GL and the 2D block"
+            );
+
+            assert_eq!(
+                super::record_spec(opcode),
+                from_gl.or(from_2d),
+                "opcode {opcode} was routed to the block that does not know it"
+            );
+        }
     }
 
     #[test]
