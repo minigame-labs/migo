@@ -10,8 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 ### Changed
+- Canvas2D commands cross the JavaScript/native boundary as a binary command
+  stream rather than one op per call, sharing one buffer and one opcode space
+  with the WebGL stream so the order between the two survives the crossing
+  without a barrier between every pair of commands. A frame that issues three
+  hundred 2D calls now crosses once.
 
 ### Fixed
+- `ctx.fillStyle = "transparent"` no longer paints opaque black. The keyword was
+  missing from the engine's named-colour table, so it fell through to the
+  unknown-name branch, which reads black -- the loudest possible wrong answer for
+  a keyword whose meaning is "do not paint". `strokeStyle` and `shadowColor` had
+  the same fault, and gradient colour stops were unaffected.
 
 ---
 
