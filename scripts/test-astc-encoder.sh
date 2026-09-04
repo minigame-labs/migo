@@ -88,15 +88,19 @@ for blocks in "${fixtures[@]}"; do
     name="$(basename "$blocks" .astc)"
     read -r width height side predicted chosen < "$WORK/$name.size"
     echo "- $name"
-    if ! "$WORK/oracle" "$blocks" "$WORK/$name.rgba" "$width" "$height" \
-        "$TOLERANCE" "$side" "$predicted" "$chosen"; then
-        status=$?
-        if (( status == 4 )); then
-            echo "FAIL: this host cannot decode ASTC, so the encoder is unverified." >&2
-            exit 1
-        fi
-        failed=1
+    # `status=$?` inside `if ! cmd; then` reads the status of the `!`, which is
+    # always 0 -- so the branch below was dead, and a host that could not answer
+    # at all was reported as a host whose decoder disagreed. That is the wrong
+    # reason on a red build, which is worse than no reason: it sends the reader
+    # after the encoder when the fault is the machine.
+    status=0
+    "$WORK/oracle" "$blocks" "$WORK/$name.rgba" "$width" "$height" \
+        "$TOLERANCE" "$side" "$predicted" "$chosen" || status=$?
+    if (( status == 4 )); then
+        echo "FAIL: this host cannot decode ASTC, so the encoder is unverified." >&2
+        exit 1
     fi
+    (( status == 0 )) || failed=1
 done
 
 if (( failed )); then

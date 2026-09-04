@@ -15,11 +15,16 @@
  * Build: cc oracle.c -o oracle -lEGL -lGLESv2
  */
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef EGL_PLATFORM_SURFACELESS_MESA
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#endif
 
 #define GL_COMPRESSED_RGBA_ASTC_4x4_KHR 0x93B0
 #define GL_COMPRESSED_RGBA_ASTC_6x6_KHR 0x93B4
@@ -64,6 +69,27 @@ static unsigned char *slurp(const char *path, long want) {
     return buffer;
 }
 
+/* A build machine has no windowing system, and EGL_DEFAULT_DISPLAY means "the
+ * one the X or Wayland server is on". So the default display is EGL_NO_DISPLAY
+ * exactly where this check most needs to run, and the oracle answered "cannot
+ * answer" for every fixture on the CI runner while passing on a desktop.
+ *
+ * Mesa's surfaceless platform is the same software decoder reached without a
+ * server. It is a fallback rather than the first choice so that a host with a
+ * display still exercises the driver it actually ships.
+ */
+static EGLDisplay open_display(void) {
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (display != EGL_NO_DISPLAY && eglInitialize(display, NULL, NULL)) return display;
+
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (!get_platform_display) return EGL_NO_DISPLAY;
+    display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+    if (display != EGL_NO_DISPLAY && eglInitialize(display, NULL, NULL)) return display;
+    return EGL_NO_DISPLAY;
+}
+
 int main(int argc, char **argv) {
     if (argc < 9) {
         fprintf(stderr,
@@ -91,9 +117,9 @@ int main(int argc, char **argv) {
     unsigned char *blocks = slurp(argv[1], block_bytes);
     unsigned char *source = slurp(argv[2], pixel_bytes);
 
-    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (display == EGL_NO_DISPLAY || !eglInitialize(display, NULL, NULL)) {
-        fprintf(stderr, "no EGL display; the oracle cannot answer\n");
+    EGLDisplay display = open_display();
+    if (display == EGL_NO_DISPLAY) {
+        fprintf(stderr, "no EGL display, with or without a server; the oracle cannot answer\n");
         return 4;
     }
     EGLint config_attributes[] = {
