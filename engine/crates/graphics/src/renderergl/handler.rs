@@ -1201,17 +1201,6 @@ impl RendererGL {
                 Ok(DamageEffect::NoDamage)
             }
 
-            GLCmd::IsEnabled {
-                canvas_id,
-                cap,
-                resp,
-            } => {
-                cm.make_current_needed(canvas_id)?;
-                let val = unsafe { gl.is_enabled(cap) };
-                let _ = resp.send(Ok(val));
-                Ok(DamageEffect::NoDamage)
-            }
-
             GLCmd::GetParameter {
                 canvas_id,
                 pname,

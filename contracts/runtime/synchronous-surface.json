@@ -33,7 +33,18 @@
     "  n_a    - not reachable from content; host lifecycle",
     "reply:",
     "  always   - the variant always carries a reply channel",
-    "  optional - the channel is an Option; see callers_supplying_a_reply"
+    "  optional - the channel is an Option; see callers_supplying_a_reply",
+    "",
+    "REMOVED: GLCmd::IsEnabled. It used to be here classified `no` -- every call",
+    "crossed -- with a note saying it was shadowable in principle and not",
+    "shadowed. It is shadowed now: 02_webgl_context.js keeps the ten toggleable",
+    "capabilities in one integer per context, seeded at the GL initial state and",
+    "reset on context loss, so isEnabled answers without leaving the thread and",
+    "the command has no callers left. It was also the one query where crossing",
+    "gave a worse answer: the GL context is shared with Skia, which toggles",
+    "GL_STENCIL_TEST inside its own batches, and the engine toggles",
+    "GL_SCISSOR_TEST around blits -- so the driver's bit is not content's bit,",
+    "while WebGL defines isEnabled purely in terms of content's own calls."
   ],
   "sources": [
     "engine/crates/shared/src/protocol/render_cmd.rs"
@@ -43,13 +54,7 @@
       "api": "WebGLRenderingContext.getParameter",
       "reply": "always",
       "producer_answers_locally": "partly",
-      "note": "The seven *_BINDING queries come from the facade's own shadow; every other pname crosses."
-    },
-    "GLCmd::IsEnabled": {
-      "api": "WebGLRenderingContext.isEnabled",
-      "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Shadowable in principle and not shadowed. The capability shadow that exists is the renderer's (graphics/backend/gl/state_tracker.rs), which is the wrong side of the boundary to answer this. A producer-side one needs the valid capability set, because enable() with an invalid enum must leave the state unchanged, and a reset on context loss -- so it is a small feature rather than a line, on an API content rarely calls."
+      "note": "The seven *_BINDING queries come from the facade's own shadow, and the ten capability enums come from the same producer-side capability shadow that answers isEnabled -- the spec defines getParameter(BLEND) and isEnabled(BLEND) as one answer, so they must not be able to disagree. Every other pname crosses. The device limits and the four strings are constants of the implementation and could be cached after the first query; the *_BITS values, SAMPLES and SAMPLE_BUFFERS could NOT, because in GL ES they describe the currently bound framebuffer."
     },
     "GLCmd::GetAttribLocation": {
       "api": "WebGLRenderingContext.getAttribLocation",
@@ -90,26 +95,26 @@
     "GLCmd::GetActiveAttrib": {
       "api": "WebGLRenderingContext.getActiveAttrib",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load; Emscripten exports walk every attribute of every program."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load; Emscripten exports walk every attribute of every program. Cached per (program, index) in the facade now, so the walk crosses once per entry instead of once per call, and `_invalidateProgramCaches` drops it on relink -- relinking renumbers the active attributes, so a cache that survived it would hand back plausible records belonging to the previous link."
     },
     "GLCmd::GetActiveUniform": {
       "api": "WebGLRenderingContext.getActiveUniform",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load; the same walk as GetActiveAttrib and usually larger."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load; the same walk as GetActiveAttrib and usually larger. Cached and invalidated the same way."
     },
     "GLCmd::GetUniformBlockIndex": {
       "api": "WebGL2RenderingContext.getUniformBlockIndex",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load. Cacheable the way getUniformLocation is, and not cached."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load. Cached per (program, name) and invalidated on relink -- the note here used to read 'cacheable the way getUniformLocation is, and not cached'."
     },
     "GLCmd::GetTransformFeedbackVarying": {
       "api": "WebGL2RenderingContext.getTransformFeedbackVarying",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load, rare."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load, rare. Cached per (program, index) and dropped on relink, on the same path as GetActiveAttrib and GetActiveUniform -- the class is closed rather than three-quarters done, because the next reader of these three would have to work out why the fourth was different."
     },
     "GLCmd::CheckFramebufferStatus": {
       "api": "WebGLRenderingContext.checkFramebufferStatus",
@@ -174,8 +179,8 @@
     "RenderCommand::GetTextLineHeight": {
       "api": "CanvasRenderingContext2D line metrics",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Per-frame in label-heavy UI, which is why it shares measureText's four-millisecond deadline class."
+      "producer_answers_locally": "partly",
+      "note": "Per-frame in label-heavy UI, which is why it shares measureText's four-millisecond deadline class. Cached in 04_font.js by (family, size, bold, italic) -- a pure function of those -- and invalidated by the __migoFontEpoch counter loadFont already bumps for measureText's cache, so there is one invalidation rule rather than two. The cache is bounded because its key space is content's."
     },
     "CanvasCmd::GetInfo": {
       "api": null,

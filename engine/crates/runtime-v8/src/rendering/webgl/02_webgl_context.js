@@ -40,7 +40,6 @@ import {
     op_webgl_record_attributes,
     op_enable,
     op_disable,
-    op_is_enabled,
     op_get_parameter,
     op_create_texture,
     op_delete_texture,
@@ -304,7 +303,70 @@ const _rawBindBuffer         = _makeOrderedRaw(op_bind_buffer);
 const _rawBufferData         = _makeOrderedRaw(op_buffer_data);
 const _rawGetUniformLocation = _makeOrderedRaw(op_get_uniform_location);
 const _rawGetParameter       = _makeOrderedRaw(op_get_parameter);
-const _rawIsEnabled          = _makeOrderedRaw(op_is_enabled);
+
+// --- Producer-side capability shadow ---------------------------------------
+//
+// `isEnabled` used to be a synchronous round trip: flush the pending stream,
+// hand the question to the render thread, and block this thread until it
+// answered. It is the only WebGL query whose answer this side already knows,
+// because this side is where every `enable` and `disable` was issued.
+//
+// It is also the only one where crossing gives a *worse* answer. The GL context
+// is shared: Skia's Ganesh backend toggles GL_STENCIL_TEST inside its own
+// batches without going through the renderer's tracker (which is why
+// graphics/src/backend/gl/state_tracker.rs always re-issues that one), and the
+// engine itself enables and disables GL_SCISSOR_TEST around blits and damage
+// regions. So the driver bit is not content's bit. WebGL defines `isEnabled`
+// purely in terms of content's own calls plus the initial state, and that is
+// exactly what this table holds.
+//
+// The renderer's `CapabilityShadow` is not the same thing and cannot serve
+// here: it is a de-duplication cache of what the driver was last told, and
+// `invalidate_after_external_gl_use` deliberately forgets all of it whenever
+// Skia has touched the context.
+//
+// Order matches TOGGLEABLE_CAPS in graphics/src/canvas/manager/types.rs. Both
+// lists are the same list, and scripts/test-webgl-capability-table-contract.sh
+// fails if they stop being.
+const _TOGGLEABLE_CAPS = [
+    WebglConstants.BLEND,
+    WebglConstants.CULL_FACE,
+    WebglConstants.DEPTH_TEST,
+    WebglConstants.DITHER,
+    WebglConstants.POLYGON_OFFSET_FILL,
+    WebglConstants.SAMPLE_ALPHA_TO_COVERAGE,
+    WebglConstants.SAMPLE_COVERAGE,
+    WebglConstants.SCISSOR_TEST,
+    WebglConstants.STENCIL_TEST,
+    WebglConstants.RASTERIZER_DISCARD,
+];
+
+// Capability enum -> its bit. A ten-entry Map, so an enum outside the set is
+/// `undefined` rather than a bit that happens to be free: `enable()` with an
+/// invalid enum is GL_INVALID_ENUM and must leave the state alone.
+const _CAP_BIT = new Map();
+for (let i = 0; i < _TOGGLEABLE_CAPS.length; i++) {
+    _CAP_BIT.set(_TOGGLEABLE_CAPS[i], 1 << i);
+}
+
+// GL ES initial state: every capability starts disabled except GL_DITHER.
+// Spelled as a lookup rather than a literal so it cannot drift from the order
+// above -- the bit for DITHER is wherever DITHER is in the list.
+const _CAP_INITIAL = _CAP_BIT.get(WebglConstants.DITHER);
+
+// Bumped whenever the render thread rebuilds the GL context. A context that
+// comes back is at its initial state, so a shadow filled in before the loss
+// describes a context that no longer exists.
+//
+// A generation counter rather than a registry of live contexts: the reset has
+// to reach every context including offscreen ones, and a module-level list of
+// them would keep them alive. Each context compares one integer and refills
+// itself on first use after a loss.
+let _capGeneration = 0;
+
+function _bumpCapabilityGeneration() {
+    _capGeneration++;
+}
 const _rawCreateTexture      = _makeOrderedRaw(op_create_texture);
 const _rawDeleteTexture      = _makeOrderedRaw(op_delete_texture);
 const _rawTexImage2D         = _makeOrderedRaw(op_tex_image_2d);
@@ -404,6 +466,17 @@ const _rawPauseTransformFeedback= _makeOrderedRaw(op_pause_transform_feedback);
 const _rawResumeTransformFeedback= _makeOrderedRaw(op_resume_transform_feedback);
 const _rawTransformFeedbackVaryings= _makeOrderedRaw(op_transform_feedback_varyings);
 const _rawGetTransformFeedbackVarying= _makeOrderedRaw(op_get_transform_feedback_varying);
+
+// The `{size, type, name}` introspection queries share one cache path, but the
+// ops disagree about whether they take a canvas id -- this one does not, and
+// that asymmetry is deliberate rather than an oversight to tidy away. Its
+// renderer arm resolves the owning canvas from the program itself
+// (`cm.programs[program].owner_canvas`) and makes that current, which is a
+// stronger guarantee than trusting the id the caller passed. The difference is
+// absorbed once here, at module scope, rather than by a closure built on every
+// call.
+const _fetchTransformFeedbackVarying = (_canvasId, programId, index) =>
+    _rawGetTransformFeedbackVarying(programId, index);
 const _rawTexImage3D         = _makeOrderedRaw(op_tex_image_3d);
 const _rawTexSubImage3D      = _makeOrderedRaw(op_tex_sub_image_3d);
 const _rawTexStorage3D       = _makeOrderedRaw(op_tex_storage_3d);
@@ -835,6 +908,19 @@ class WebGLRenderingContext {
         this._attribLocationCache = new Map();
         this._uniformLocationCache = new Map();
         this._programParameterCache = new Map();
+        // Program introspection. Every one of these was a synchronous round
+        // trip on a value that cannot change until the program is relinked, and
+        // the note in contracts/runtime/synchronous-surface.json says Emscripten
+        // exports walk every attribute and every uniform of every program at
+        // load -- so the stalls arrive in a batch, during startup, which is the
+        // budget Android has been measuring.
+        // programId -> Map(index -> {size, type, name})
+        this._activeAttribCache = new Map();
+        this._activeUniformCache = new Map();
+        // programId -> Map(name -> block index)
+        this._uniformBlockIndexCache = new Map();
+        // programId -> Map(index -> {size, type, name}), transform feedback
+        this._transformFeedbackVaryingCache = new Map();
         // shaderId -> Map(pname -> value)
         this._shaderParameterCache = new Map();
         this._jsErrorQueue = [];
@@ -852,6 +938,10 @@ class WebGLRenderingContext {
         this._programBinding = null;
         this._framebufferBinding = null;
         this._renderbufferBinding = null;
+
+        // Producer-side capability shadow; see _TOGGLEABLE_CAPS above.
+        this._capBits = _CAP_INITIAL;
+        this._capGeneration = _capGeneration;
 
         // Record the negotiated attributes so `getContextAttributes()`
         // returns real values instead of bare spec defaults.  We do
@@ -886,6 +976,42 @@ class WebGLRenderingContext {
         this._attribLocationCache.delete(programId);
         this._uniformLocationCache.delete(programId);
         this._programParameterCache.delete(programId);
+        // Relinking renumbers the active attributes and uniforms and can change
+        // a uniform block's index, so these go with the rest. Adding a cache
+        // here and forgetting this line is the whole failure mode: the values
+        // stay plausible and belong to the previous link.
+        this._activeAttribCache.delete(programId);
+        this._activeUniformCache.delete(programId);
+        this._uniformBlockIndexCache.delete(programId);
+        this._transformFeedbackVaryingCache.delete(programId);
+    }
+
+    /**
+     * One `{size, type, name}` record, from cache or across the boundary.
+     *
+     * The cached value is the raw record; a fresh object is handed out on every
+     * call. Browsers return a new WebGLActiveInfo each time, and a shared object
+     * would let one caller's mutation reach the next -- a cache that hands out
+     * its own storage is a cache that content can corrupt.
+     */
+    _activeInfo(cache, raw, programId, index) {
+        let inner = cache.get(programId);
+        let record = inner && inner.get(index);
+        if (record === undefined) {
+            const json = raw(this._canvasId, programId, index);
+            if (!json) return null;
+            try {
+                record = JSON.parse(json);
+            } catch (_) {
+                return null;
+            }
+            if (!inner) {
+                inner = new Map();
+                cache.set(programId, inner);
+            }
+            inner.set(index, record);
+        }
+        return { size: record.size, type: record.type, name: record.name };
     }
 
     _pushJsError(code) {
@@ -1160,17 +1286,17 @@ class WebGLRenderingContext {
     getActiveAttrib(program, index) {
         const programId = program?.id;
         if (programId === undefined) return null;
-        const json = _rawGetActiveAttrib(this._canvasId, programId, index >>> 0);
-        if (!json) return null;
-        try { return JSON.parse(json); } catch (_) { return null; }
+        return this._activeInfo(
+            this._activeAttribCache, _rawGetActiveAttrib, programId, index >>> 0,
+        );
     }
 
     getActiveUniform(program, index) {
         const programId = program?.id;
         if (programId === undefined) return null;
-        const json = _rawGetActiveUniform(this._canvasId, programId, index >>> 0);
-        if (!json) return null;
-        try { return JSON.parse(json); } catch (_) { return null; }
+        return this._activeInfo(
+            this._activeUniformCache, _rawGetActiveUniform, programId, index >>> 0,
+        );
     }
 
     enableVertexAttribArray(index) {
@@ -1292,9 +1418,27 @@ class WebGLRenderingContext {
 
     // -- Phase 1A: GL State --
 
+    // Refill the capability shadow if the GL context has been rebuilt since it
+    // was last written. One integer compare on the enable/disable path.
+    _freshCapBits() {
+        if (this._capGeneration !== _capGeneration) {
+            this._capBits = _CAP_INITIAL;
+            this._capGeneration = _capGeneration;
+        }
+    }
+
     enable(cap) {
         // opcode 6: H C U.
         if (typeof cap === "number") {
+            const bit = _CAP_BIT.get(cap);
+            // An enum outside the toggleable set is GL_INVALID_ENUM: the driver
+            // rejects it and the state does not move, so the shadow must not
+            // move either. The command still goes out, so the driver still
+            // raises the error it would have raised.
+            if (bit !== undefined) {
+                this._freshCapBits();
+                this._capBits |= bit;
+            }
             encodeEnable(this._canvasId, cap >>> 0);
             return;
         }
@@ -1305,6 +1449,11 @@ class WebGLRenderingContext {
     disable(cap) {
         // opcode 7: H C U.
         if (typeof cap === "number") {
+            const bit = _CAP_BIT.get(cap);
+            if (bit !== undefined) {
+                this._freshCapBits();
+                this._capBits &= ~bit;
+            }
             encodeDisable(this._canvasId, cap >>> 0);
             return;
         }
@@ -1313,7 +1462,14 @@ class WebGLRenderingContext {
     }
 
     isEnabled(cap) {
-        return Boolean(_rawIsEnabled(this._canvasId, cap));
+        const bit = _CAP_BIT.get(cap);
+        // GL_INVALID_ENUM returns GL_FALSE, which is what crossing to the
+        // driver returned for an unknown enum before this shadow existed.
+        if (bit === undefined) {
+            return false;
+        }
+        this._freshCapBits();
+        return (this._capBits & bit) !== 0;
     }
 
     getParameter(pname) {
@@ -1328,6 +1484,16 @@ class WebGLRenderingContext {
             case 0x8ca6: return this._framebufferBinding; // FRAMEBUFFER_BINDING
             case 0x8ca7: return this._renderbufferBinding; // RENDERBUFFER_BINDING
             default: break;
+        }
+        // A capability queried through getParameter is the same GLboolean
+        // isEnabled returns -- the spec defines them as one answer. Once
+        // isEnabled stopped crossing, leaving this arm to ask the driver made
+        // the two able to disagree: the driver's bit is shared with Skia and
+        // with the engine's own scissor use, so `isEnabled(BLEND)` and
+        // `getParameter(BLEND)` could return different booleans for the same
+        // context. They go through one shadow.
+        if (_CAP_BIT.has(pname)) {
+            return this.isEnabled(pname);
         }
         const json = _rawGetParameter(this._canvasId, pname);
         if (!json) return null;
@@ -2364,7 +2530,22 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
 
     // ---- Uniform Buffer Objects --------------------------------
     getUniformBlockIndex(program, name) {
-        return _rawGetUniformBlockIndex(program._id, name);
+        const programId = program?.id;
+        // The same sentinel a lookup that finds no block returns, so one check
+        // covers both. `-1` would be a third answer this API never otherwise
+        // produces, and a GLuint return type cannot carry it anyway.
+        if (programId === undefined) return WebglConstants.INVALID_INDEX;
+        let inner = this._uniformBlockIndexCache.get(programId);
+        let index = inner && inner.get(name);
+        if (index === undefined) {
+            index = _rawGetUniformBlockIndex(programId, name);
+            if (!inner) {
+                inner = new Map();
+                this._uniformBlockIndexCache.set(programId, inner);
+            }
+            inner.set(name, index);
+        }
+        return index;
     }
     uniformBlockBinding(program, uniformBlockIndex, uniformBlockBinding) {
         _rawUniformBlockBinding(program._id, uniformBlockIndex, uniformBlockBinding);
@@ -2659,13 +2840,12 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
     }
     getTransformFeedbackVarying(program, index) {
         if (!program || !program._id) return null;
-        const json = _rawGetTransformFeedbackVarying(program._id, index);
-        if (!json) return null;
-        try {
-            return JSON.parse(json);
-        } catch (_) {
-            return null;
-        }
+        return this._activeInfo(
+            this._transformFeedbackVaryingCache,
+            _fetchTransformFeedbackVarying,
+            program._id,
+            index,
+        );
     }
 
     // ---- 3D textures -------------------------------------------
@@ -2833,4 +3013,5 @@ Object.defineProperty(WebGL2RenderingContext, Symbol.hasInstance, {
 export {
     WebGLRenderingContext,
     WebGL2RenderingContext,
+    _bumpCapabilityGeneration,
 };

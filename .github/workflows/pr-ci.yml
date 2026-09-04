@@ -476,6 +476,13 @@ jobs:
       - name: Synchronous surface contract
         run: bash scripts/test-synchronous-surface-contract.sh
 
+      # `isEnabled` is answered on the producer side, from a ten-bit shadow of
+      # the capabilities content has enabled. A capability missing from the
+      # JavaScript half of that table is silent: the query answers `false`
+      # forever for something the driver has genuinely turned on.
+      - name: WebGL capability table contract
+        run: bash scripts/test-webgl-capability-table-contract.sh
+
       - name: Apple probe decision procedure
         run: bash scripts/test-apple-probe-decision.sh
 
