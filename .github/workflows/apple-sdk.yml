@@ -48,14 +48,37 @@ permissions:
   contents: read
 
 jobs:
-  performance-plus-ios:
-    # The iOS device slice of the Performance+ product: no default features, no
-    # embedded engine. Not `macos-v8`, which needs a V8 archive built for Apple
-    # and no such archive exists in this repository yet -- that is a separate
-    # fact for a separate day, and asking for it here would fail for a reason
-    # that says nothing about the Apple toolchain.
+  performance-plus:
+    # The Performance+ product -- no default features, no embedded engine -- for
+    # each Apple slice group. Not `macos-v8`, which needs a V8 archive built for
+    # Apple and no such archive exists in this repository yet; asking for it here
+    # would fail for a reason that says nothing about the Apple toolchain.
+    #
+    # Three platforms rather than one, and the second of them is why. `ios` has a
+    # single slice, so it takes the `cp` branch in build-apple-sdk.sh.
+    # `ios-simulator` and `macos` have two each and take the `lipo` branch --
+    # which, like everything else in that script, had never been executed. A
+    # branch nobody has run is the same thing as a gate nobody has seen fail.
+    #
+    # `fail-fast: false` on purpose: this lane exists to produce facts, and the
+    # first platform to break must not cancel the answer for the other two.
     runs-on: macos-15
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ios
+            targets: aarch64-apple-ios
+          - platform: ios-simulator
+            targets: aarch64-apple-ios-sim,x86_64-apple-ios
+          - platform: macos
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+    env:
+      # Inside the workspace so the archive the gate audits has a path the
+      # workflow can name without knowing the script's default.
+      MIGO_APPLE_BUILD_ROOT: ${{ github.workspace }}/build/apple
 
     steps:
       - name: Checkout
@@ -64,16 +87,16 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
-          targets: aarch64-apple-ios
+          targets: ${{ matrix.targets }}
 
-      # Its own cache key, not shared with apple-ci: this job's target directory
-      # holds a compiled Skia and that lane's does not, so one key for both would
-      # have each of them evicting the other's work.
+      # Its own cache key, per platform, and not shared with apple-ci: each
+      # platform's target directory holds a separately compiled Skia, and one key
+      # for all of them would have each evicting the others' work.
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine -> target
-          key: apple-sdk-ios
+          key: apple-sdk-${{ matrix.platform }}
           cache-on-failure: true
 
       - name: Record the toolchain that is answering
@@ -82,15 +105,16 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           bash scripts/build-apple-sdk.sh --print-deployment-target ios
+          bash scripts/build-apple-sdk.sh --print-deployment-target macos
 
       # The build. Debug rather than Release: the question this job answers first
       # is whether the graph compiles and links for the target at all, and a
       # Debug build reaches that answer sooner. Release belongs to the release
       # workflow, once there is a release to cut.
-      - name: Build the Performance+ xcframework for iOS
+      - name: Build the Performance+ xcframework for ${{ matrix.platform }}
         run: >-
           bash scripts/build-apple-sdk.sh
-          --platform ios
+          --platform ${{ matrix.platform }}
           --product performance-plus
           --configuration Debug
           --code-signing off
@@ -98,10 +122,13 @@ jobs:
       # The archive half of the no-engine claim, which until now had no archive.
       # Its Cargo half runs on Linux every PR; this is the first time the same
       # gate has been able to read a symbol table produced by Apple's toolchain.
+      # The staged archive, not one slice's. For the two multi-slice platforms
+      # this is the lipo output, so what is audited is the bytes that go into the
+      # xcframework rather than one of the inputs.
       - name: The built archive contains no engine symbols
         run: >-
           bash scripts/test-apple-performance-rust-closure.sh
-          --artifact engine/target/aarch64-apple-ios/debug/libmigo_capi.a
+          --artifact "$MIGO_APPLE_BUILD_ROOT/${{ matrix.platform }}-Debug/libmigo.a"
 
       # With the artifact present, the shipping Swift package resolves for the
       # first time. `swift build` here is not a formality: the package's targets
@@ -117,7 +144,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: MigoEngine-xcframework-ios-debug
+          name: MigoEngine-xcframework-${{ matrix.platform }}-debug
           path: platforms/apple/Frameworks/MigoEngine.xcframework
           if-no-files-found: warn
           retention-days: 14
