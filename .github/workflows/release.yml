@@ -403,6 +403,19 @@ jobs:
       - name: Apple Performance+ engine-free dependency closure
         run: bash scripts/test-apple-performance-rust-closure.sh
 
+      # The same claim, asked of the bytes rather than the dependency graph.
+      # A closure that resolves clean is necessary and not sufficient: what
+      # ships is an archive, and the question a customer's linker asks is
+      # whether V8's symbols are in it. This builds the external-frames product
+      # and audits the archive it produced.
+      - name: Apple Performance+ archive contains no engine symbols
+        run: |
+          cd engine
+          cargo build -p migo-capi --no-default-features --features external-frames
+          cd ..
+          bash scripts/test-apple-performance-rust-closure.sh \
+            --artifact engine/target/debug/libmigo_capi.a
+
       # The other half of the wire contract. The format says two encoders are
       # measured against one fixed corpus; the JavaScript one runs inside
       # WebContent and cannot be checked by any Rust test, so it gets its own
@@ -417,7 +430,7 @@ jobs:
       # twelve bits of opcode and twenty of word count, so nothing across that
       # boundary is typed -- a disagreement is a frame that does not draw, on a
       # device, rather than anything that fails to build.
-      - name: GL opcode table agreement
+      - name: Render opcode table agreement
         run: bash scripts/test-render-opcode-agreement.sh
 
       # The G0 decision procedure, months before the first Mac. Its input needs

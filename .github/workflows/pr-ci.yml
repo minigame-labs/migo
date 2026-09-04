@@ -458,7 +458,7 @@ jobs:
       # twelve bits of opcode and twenty of word count, so nothing across that
       # boundary is typed -- a disagreement is a frame that does not draw, on a
       # device, rather than anything that fails to build.
-      - name: GL opcode table agreement
+      - name: Render opcode table agreement
         run: bash scripts/test-render-opcode-agreement.sh
 
       # The G0 decision procedure, months before the first Mac. Its input needs
