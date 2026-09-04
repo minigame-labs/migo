@@ -709,13 +709,6 @@ impl UnifiedFrameCollector {
         self.build_frame_packet_inner(false, true)
     }
 
-    /// Reset the buffer for a specific canvas at frame-begin.
-    pub(crate) fn frame_begin(&mut self, _canvas_id: u32) {
-        // Currently a no-op for the unified collector —
-        // segments are cleared by build_frame_packet at frame end.
-        // Kept for API compatibility with op_frame_begin.
-    }
-
     // ── Canvas2D forwarding methods ────────────────────────────────
     // These mirror FrameCommandCollector's API so ops only need a type
     // change in their borrow call. Dedup is intentionally omitted in

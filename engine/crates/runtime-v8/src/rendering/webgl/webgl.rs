@@ -2876,20 +2876,18 @@ mod tests {
         let _ = calls1; // suppress unused warning
     }
 
-    // Mid-frame GL/2D interleave ordering:
+    // Mid-frame GL/2D interleave ordering.
     //
-    // After the first 2D op starts the frame (_frameStarted = true), subsequent
-    // GL encodes followed by more 2D ops must still flush the GL stream BEFORE
-    // writing the 2D op to the collector.  The guarded-flush bug leaves GL#2
-    // buffered until frame-end, so the collector sees [GL#1, 2D#1, 2D#2, GL#2]
-    // instead of the required program order [GL#1, 2D#1, GL#2, 2D#2].
+    // A frame that alternates kinds -- GL, 2D, GL, 2D -- must reach the renderer
+    // in that order, or the 2D work draws over sprites that were issued after
+    // it. The collector sees [GL#1, 2D#1, 2D#2, GL#2] instead the moment
+    // anything can reorder the two paths against each other.
     //
-    // RED:  With the guarded flush (`if (!this._frameStarted)`) this test
-    //       fails: 2D#1 and 2D#2 merge into one CanvasBatch (only 1 CanvasBatch
-    //       in the packet), because GL#2 was not flushed before 2D#2.
-    // GREEN: After moving flushRenderCommandStream() unconditionally to the top of
-    //       _frameBegin(), every 2D op flushes pending GL first, so 2D#1 and
-    //       2D#2 land in separate CanvasBatch segments (2 CanvasBatches).
+    // This was originally the red case for a flush that only fired on the
+    // frame's first 2D command, which left GL#2 in the buffer until frame end.
+    // The two paths are now one buffer, so the property it pins is the stronger
+    // one: the reader cuts a single stream back into batches at the points where
+    // the kind changes, and the number of batches is the number of changes.
     #[test]
     fn task6_mid_frame_gl_2d_gl_2d_preserves_program_order() {
         use shared::protocol::render_cmd::CanvasCmd;
@@ -2928,34 +2926,22 @@ mod tests {
                 r#"
                 const glCtx = new WebGLRenderingContext({ _rid: 130, width: 4, height: 4 }, {});
 
-                // Create a real Canvas so CanvasRenderingContext2D._frameStarted
-                // tracks across calls (createCanvas uses op_create_offscreen_canvas
-                // + op_get_canvas_info; the helper thread responds to GetInfo).
+                // A real Canvas, because the 2D facade needs one (createCanvas
+                // uses op_create_offscreen_canvas + op_get_canvas_info, and the
+                // helper thread answers GetInfo).
                 const canvas = createCanvas(4, 4);
                 const ctx = canvas.getContext('2d');
 
-                // GL#1: encode BEFORE the frame has started (_frameStarted = false).
+                // Four commands, alternating kinds, all into one buffer. What is
+                // under test is that the reader cuts them back into four batches
+                // in this order -- the whole reason 2D and GL share an opcode
+                // space is that the order in the buffer is the order.
                 glCtx.clear(0x4000);
-
-                // 2D#1: _frameBegin fires with _frameStarted=false →
-                //        flushRenderCommandStream() submits GL#1, op_frame_begin,
-                //        _frameStarted=true.  FillRect lands as CanvasBatch-A.
                 ctx.fillRect(1, 1, 1, 1);
-
-                // GL#2: encode AFTER _frameStarted is already true.
-                //        Buggy guarded flush: stays in JS buffer until frame-end.
                 glCtx.clear(0x4100);
-
-                // 2D#2: _frameBegin fires with _frameStarted=true.
-                //        Bug:  no flush → GL#2 stays buffered; FillRect merges
-                //              into the same CanvasBatch as FillRect#1.
-                //        Fix:  unconditional flush → GL#2 submitted first, then
-                //              FillRect lands in a NEW CanvasBatch-B.
                 ctx.fillRect(2, 2, 2, 2);
 
-                // Frame end: flushRenderCommandStream() + op_frame_end_unified().
-                // Bug:  GL#2 flushed here, AFTER 2D#2 → wrong order.
-                // Fix:  GL#2 already flushed before 2D#2 → correct order.
+                // Frame end submits the buffer and builds the packet.
                 "#,
             )
             .expect("mid-frame interleave script should not throw");
@@ -2993,9 +2979,8 @@ mod tests {
 
         // Program order requires TWO separate GlBatch segments (GL#1 and GL#2)
         // interleaved with TWO separate CanvasBatch segments (2D#1 and 2D#2).
-        // The bug merges the two 2D ops into one CanvasBatch (canvas_positions.len()==1)
-        // because GL#2 is not flushed before 2D#2, so 2D#1 and 2D#2 land in
-        // the same Canvas2D collector segment.
+        // One CanvasBatch would mean the two fillRects merged, which can only
+        // happen if the GL work between them was reordered around them.
         assert_eq!(
             gl_positions.len(),
             2,
@@ -3021,6 +3006,396 @@ mod tests {
         assert!(
             gl2 < cb2,
             "GL#2 must precede 2D#2 in the packet (program order); gl2={gl2} cb2={cb2}; ops: {ops:?}"
+        );
+    }
+
+    // ── The Canvas2D command stream, as content drives it ────────────────────
+
+    /// Run a script that draws on a 2D canvas, end the frame, and return the
+    /// packet's ops.
+    ///
+    /// The helper thread answers the `GetInfo` the Canvas constructor makes and
+    /// forwards the first frame packet; without it `createCanvas` blocks.
+    fn run_2d_frame(
+        name: &'static str,
+        source: &str,
+    ) -> shared::command_vec_pool::PooledVec<FrameOp> {
+        use shared::protocol::render_cmd::CanvasCmd;
+
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        let (packet_tx, packet_rx) =
+            std::sync::mpsc::sync_channel::<shared::command_vec_pool::PooledVec<FrameOp>>(1);
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match render_rx.recv_timeout(remaining) {
+                    Ok(RenderCommand::Canvas(CanvasCmd::GetInfo { id: _, resp })) => {
+                        resp.send(Ok((64, 64)));
+                    }
+                    Ok(RenderCommand::FramePacket(packet)) => {
+                        let _ = packet_tx.send(packet.into_ops());
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        runtime
+            .exec_script(name, source)
+            .expect("script must not throw");
+        end_test_frame(&mut runtime);
+        handle.join().expect("helper thread should not panic");
+        packet_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a frame packet within 2s")
+    }
+
+    /// One JavaScript string literal, with nothing in it that could end early.
+    fn js_string(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push('"');
+        for character in text.chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 || (c as u32) > 0x7e => {
+                    out.push_str(&format!("\\u{:04x}", c as u32))
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    use shared::protocol::render_cmd::Canvas2DCmd;
+
+    fn canvas_commands(ops: &[FrameOp]) -> Vec<&Canvas2DCmd> {
+        ops.iter()
+            .filter_map(|op| match op {
+                FrameOp::CanvasBatch(batch) => Some(batch.commands.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The point of the whole exercise, stated as a number.
+    ///
+    /// Three hundred Canvas2D calls used to be three hundred crossings of the
+    /// JavaScript/native boundary — `android-ceiling-review.md`'s G2, and the
+    /// largest remaining per-frame cost in a 2D-heavy scene. They are now three
+    /// hundred records in one buffer and one submission.
+    ///
+    /// The command count is asserted alongside the call count on purpose: a
+    /// buffer that submits once because it dropped 299 commands would satisfy
+    /// the interesting half of this on its own.
+    #[test]
+    fn a_2d_frame_crosses_the_boundary_once() {
+        crate::rendering::webgl::submit_test_counter::reset();
+
+        let ops = run_2d_frame(
+            "canvas2d_one_crossing.js",
+            r#"
+            const ctx = createCanvas(64, 64).getContext('2d');
+            for (let i = 0; i < 100; i++) {
+                ctx.fillRect(i, i, 2, 2);
+                ctx.save();
+                ctx.restore();
+            }
+            "#,
+        );
+
+        let (calls, decoded) = crate::rendering::webgl::submit_test_counter::read();
+        assert_eq!(
+            calls, 1,
+            "300 Canvas2D calls should submit one buffer, not {calls}"
+        );
+        assert_eq!(decoded, 300, "every command must survive the crossing");
+        assert_eq!(canvas_commands(&ops).len(), 300);
+    }
+
+    /// A buffer that fills mid-frame keeps drawing on the same canvas.
+    ///
+    /// The reader begins every stream with no canvas selected, so the record
+    /// that names the canvas has to be re-emitted after a submission. Nothing
+    /// about forgetting it is an error: the records that follow are simply
+    /// refused, and the second half of the frame does not draw.
+    #[test]
+    fn a_frame_that_outgrows_the_buffer_still_names_its_canvas() {
+        crate::rendering::webgl::submit_test_counter::reset();
+
+        // The buffer is 8192 words; a fillRect is five and the selection two, so
+        // this crosses it several times over.
+        let ops = run_2d_frame(
+            "canvas2d_buffer_wrap.js",
+            r#"
+            const ctx = createCanvas(64, 64).getContext('2d');
+            for (let i = 0; i < 5000; i++) ctx.fillRect(i & 63, (i >> 6) & 63, 1, 1);
+            "#,
+        );
+
+        let (calls, decoded) = crate::rendering::webgl::submit_test_counter::read();
+        assert!(calls > 1, "5000 commands should not fit in one buffer");
+        assert_eq!(
+            decoded, 5000,
+            "a command refused for not knowing its canvas is a command that never drew"
+        );
+        let commands = canvas_commands(&ops);
+        assert_eq!(commands.len(), 5000);
+        for op in &ops {
+            if let FrameOp::CanvasBatch(batch) = op {
+                assert_ne!(
+                    batch.canvas_id, 0,
+                    "a batch attributed to canvas zero is one whose selection was lost"
+                );
+            }
+        }
+    }
+
+    /// Arguments survive as the values the caller passed, in the order it
+    /// passed them.
+    #[test]
+    fn the_commands_arrive_in_issue_order_with_their_arguments() {
+        let ops = run_2d_frame(
+            "canvas2d_order_and_values.js",
+            r#"
+            const ctx = createCanvas(64, 64).getContext('2d');
+            ctx.beginPath();
+            ctx.moveTo(1.5, 2.5);
+            ctx.lineTo(-3.25, 4.75);
+            ctx.arc(10, 20, 30, 0, 3.5, true);
+            ctx.fill();
+            ctx.globalAlpha = 0.25;
+            ctx.lineWidth = 7.5;
+            ctx.setTransform(1, 2, 3, 4, 5, 6);
+            ctx.clearRect(0, 0, 8, 9);
+            "#,
+        );
+
+        let commands = canvas_commands(&ops);
+        let shapes: Vec<&str> = commands
+            .iter()
+            .map(|command| match command {
+                Canvas2DCmd::BeginPath => "BeginPath",
+                Canvas2DCmd::MoveTo { .. } => "MoveTo",
+                Canvas2DCmd::LineTo { .. } => "LineTo",
+                Canvas2DCmd::Arc { .. } => "Arc",
+                Canvas2DCmd::Fill => "Fill",
+                Canvas2DCmd::SetGlobalAlpha { .. } => "SetGlobalAlpha",
+                Canvas2DCmd::SetLineWidth { .. } => "SetLineWidth",
+                Canvas2DCmd::SetTransform { .. } => "SetTransform",
+                Canvas2DCmd::ClearRect { .. } => "ClearRect",
+                other => panic!("unexpected command {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                "BeginPath",
+                "MoveTo",
+                "LineTo",
+                "Arc",
+                "Fill",
+                "SetGlobalAlpha",
+                "SetLineWidth",
+                "SetTransform",
+                "ClearRect",
+            ]
+        );
+
+        assert!(matches!(
+            commands[1],
+            Canvas2DCmd::MoveTo { x, y } if *x == 1.5 && *y == 2.5
+        ));
+        assert!(matches!(
+            commands[2],
+            Canvas2DCmd::LineTo { x, y } if *x == -3.25 && *y == 4.75
+        ));
+        assert!(matches!(
+            commands[3],
+            Canvas2DCmd::Arc { x, y, radius, start_angle, end_angle, counterclockwise }
+                if *x == 10.0 && *y == 20.0 && *radius == 30.0
+                    && *start_angle == 0.0 && *end_angle == 3.5 && *counterclockwise
+        ));
+        assert!(matches!(
+            commands[5],
+            Canvas2DCmd::SetGlobalAlpha { alpha } if *alpha == 0.25
+        ));
+        assert!(matches!(
+            commands[7],
+            Canvas2DCmd::SetTransform { a, b, c, d, e, f }
+                if *a == 1.0 && *b == 2.0 && *c == 3.0 && *d == 4.0 && *e == 5.0 && *f == 6.0
+        ));
+    }
+
+    /// The JavaScript colour parser may abstain. It may not disagree.
+    ///
+    /// `fillStyle` is assigned on the hot path — a scene that changes colour per
+    /// shape assigns it as often as it draws — so leaving every assignment on
+    /// the op path would have left the barrier firing between every two records
+    /// and the batching with nothing to batch. So the encoder answers the forms
+    /// it is certain of, and hands the rest to the Rust parser, which stays the
+    /// authority.
+    ///
+    /// That split is only safe while the two agree, and "these two parsers agree"
+    /// is exactly the claim this repository has already watched go wrong once:
+    /// the CSS *font* parser existed in both languages, drifted, and produced a
+    /// `measureText` that disagreed with `fillText`. So the corpus runs through
+    /// the whole path — the JavaScript parser, the wire encoding, the decoder,
+    /// and the op fallback — and requires a bit-identical `Color` either way.
+    #[test]
+    fn the_javascript_colour_parser_never_disagrees_with_the_rust_one() {
+        let mut corpus: Vec<String> = Vec::new();
+
+        // Every named colour the Rust table knows, in the spellings content uses.
+        for name in crate::rendering::webgl::context2d::NAMED_COLORS.keys() {
+            corpus.push((*name).to_string());
+            corpus.push(name.to_uppercase());
+        }
+        corpus.push("transparent".to_string());
+        corpus.push("chartreuseish".to_string());
+
+        // Every channel value, so the u8-to-f32 conversion is checked at each of
+        // its 256 inputs rather than at a handful.
+        for channel in 0..=255u32 {
+            corpus.push(format!("#{channel:02x}{channel:02x}{channel:02x}"));
+            corpus.push(format!("rgb({channel}, {}, {channel})", 255 - channel));
+        }
+        // Short forms, alpha forms, and the shapes at the edge of what the
+        // encoder is willing to claim.
+        for hex in [
+            "#fff",
+            "#FFF",
+            "#0a0",
+            "#1234",
+            "#12345678",
+            "#abcdef",
+            "#ABCDEF01",
+        ] {
+            corpus.push(hex.to_string());
+        }
+        for alpha in 0..=100u32 {
+            corpus.push(format!("rgba(1, 2, 3, {}.{:02})", alpha / 100, alpha % 100));
+        }
+        // The alpha literals where the arithmetic's width decides the answer.
+        //
+        // Rust parses to `f32` and multiplies by 255 in `f32`; JavaScript's
+        // numbers are `f64`, so an encoder that multiplies before narrowing lands
+        // on the other side of an integer here and truncates one lower. Two
+        // decimal places never distinguishes the two -- the corpus above passed
+        // with the narrowing removed -- so these are the eight-decimal literals
+        // nearest the k/255 boundaries, found by sweeping them.
+        for boundary in [
+            "0.02745098",
+            "0.05490196",
+            "0.10980392",
+            "0.16862745",
+            "0.24705882",
+            "0.31372549",
+            "0.972549",
+        ] {
+            corpus.push(format!("rgba(1, 2, 3, {boundary})"));
+        }
+        for odd in [
+            "rgba(0,0,0,0)",
+            "rgba( 10 , 20 , 30 , .5 )",
+            "RGBA(10,20,30,0.5)",
+            "RgB(1,2,3)",
+            "rgb(1,2,3,4)",
+            "rgba(1,2,3)",
+            "rgb(300,0,0)",
+            "rgb(-1,0,0)",
+            "rgb(1.5,0,0)",
+            "rgb(+1,+2,+3)",
+            "rgba(1,2,3,1e-1)",
+            "rgba(1,2,3,Infinity)",
+            "rgba(1,2,3,NaN)",
+            "rgba(1,2,3,-0.5)",
+            "rgba(1,2,3,2)",
+            "#",
+            "#12",
+            "#12345",
+            "#gg0000",
+            "  #ff0000  ",
+            "",
+            "not-a-colour",
+            "hsl(0, 100%, 50%)",
+        ] {
+            corpus.push(odd.to_string());
+        }
+
+        // Adjacent duplicates would be swallowed by the setter's own dedup, and
+        // then the sequence below would not line up with the corpus.
+        corpus.dedup();
+        let mut deduped: Vec<String> = Vec::with_capacity(corpus.len());
+        for entry in corpus {
+            if deduped.last() != Some(&entry) {
+                deduped.push(entry);
+            }
+        }
+        let corpus = deduped;
+
+        let script = {
+            let mut script = String::from("const ctx = createCanvas(64, 64).getContext('2d');\n");
+            for entry in &corpus {
+                script.push_str(&format!("ctx.fillStyle = {};\n", js_string(entry)));
+            }
+            script
+        };
+
+        crate::rendering::webgl::submit_test_counter::reset();
+        let ops = run_2d_frame("canvas2d_colour_corpus.js", &script);
+
+        let commands = canvas_commands(&ops);
+        let seen: Vec<shared::protocol::color::Color> = commands
+            .iter()
+            .map(|command| match command {
+                Canvas2DCmd::SetFillStyle { color } => *color,
+                other => panic!("unexpected command {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            seen.len(),
+            corpus.len(),
+            "every assignment must reach the renderer exactly once"
+        );
+
+        for (entry, got) in corpus.iter().zip(&seen) {
+            let want = crate::rendering::webgl::context2d::parse_color_string(entry);
+            assert_eq!(
+                (
+                    got.r.to_bits(),
+                    got.g.to_bits(),
+                    got.b.to_bits(),
+                    got.a.to_bits()
+                ),
+                (
+                    want.r.to_bits(),
+                    want.g.to_bits(),
+                    want.b.to_bits(),
+                    want.a.to_bits()
+                ),
+                "{entry:?} reached the renderer as {got:?}, the Rust parser reads it as {want:?}"
+            );
+        }
+
+        // A positive control. Every assertion above passes if the encoder
+        // abstains on everything and the op path answers all of it — which would
+        // be correct and pointless. The stream has to be carrying the common
+        // forms, and the count below is what says it is.
+        let (_, decoded) = crate::rendering::webgl::submit_test_counter::read();
+        assert!(
+            decoded as usize > corpus.len() / 2,
+            "only {decoded} of {} colours took the encoded path; the parser is \
+             abstaining on forms it is supposed to answer",
+            corpus.len()
         );
     }
 

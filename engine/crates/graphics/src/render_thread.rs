@@ -2145,11 +2145,11 @@ impl RenderThread {
                                     if was_render {
                                         cm.mark_2d_dirty(canvas_id);
                                         // NOTE: dirty flag is NOT set here. Canvas2D commands
-                                        // may arrive mid-frame (e.g. _frameEnd() before
-                                        // measureText). Setting dirty here would cause the
-                                        // render thread to present a partial frame on the next
-                                        // VSync, producing visible flicker. Instead, the JS
-                                        // frame-end (op_frame_end_all) sends an explicit
+                                        // may arrive mid-frame -- a barrier before a
+                                        // synchronous read is enough to send some. Setting
+                                        // dirty here would cause the render thread to present
+                                        // a partial frame on the next VSync, producing visible
+                                        // flicker. Instead, the JS frame-end sends an explicit
                                         // Invalidate to trigger the present.
                                     }
                                 }

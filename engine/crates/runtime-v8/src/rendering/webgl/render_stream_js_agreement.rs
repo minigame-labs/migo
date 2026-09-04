@@ -12,11 +12,7 @@
 
 #![cfg(test)]
 
-use frame_wire::gl_stream::*;
-
 mod js_agreement {
-    use super::*;
-
     // ── JS/Rust constant contract ────────────────────────────────────────────
 
     /// Every opcode the wire-format table declares appears in the JavaScript
@@ -375,6 +371,240 @@ mod canvas2d_agreement {
                     line.trim()
                 );
             }
+        }
+    }
+}
+
+/// The Canvas2D facade's ordering barrier, checked rather than remembered.
+///
+/// 2D and GL records share one buffer, so between two encoded commands there is
+/// nothing to do. What still needs saying is the boundary between an encoded
+/// command and one that crosses as an op: text, gradients, patterns, dash
+/// arrays, images and the synchronous reads carry strings or variable-length
+/// arrays, have no record shape, and go straight to the collector. An op that
+/// runs while records sit unsubmitted in the buffer reaches the collector first,
+/// and the frame draws in the wrong order.
+///
+/// **The rule is total on purpose.** Flushing before an op is never wrong -- on
+/// an empty buffer it is one comparison -- so there is no list of ops that are
+/// allowed to skip it, and therefore no list to argue with when a new one is
+/// added. A rule with exceptions is a rule whose exceptions grow.
+mod canvas2d_ordering {
+    const JS: &str = include_str!("02_2d_context.js");
+
+    /// Not a function opening, however much the line looks like a call.
+    const KEYWORDS: &[&str] = &["if", "for", "while", "switch", "catch", "return", "else"];
+
+    /// Byte ranges of every function-like body: named functions, class methods,
+    /// property accessors, and the object-literal methods a closure is handed
+    /// back in.
+    ///
+    /// The *innermost* enclosing body is what a barrier has to be in. A barrier
+    /// in the function that builds a closure says nothing about when the closure
+    /// runs, and the one in this file runs on a property read, arbitrarily later.
+    fn function_bodies() -> Vec<(usize, usize)> {
+        let bytes = JS.as_bytes();
+        let mut bodies = Vec::new();
+        let mut offset = 0usize;
+        for line in JS.split_inclusive('\n') {
+            let trimmed = line.trim();
+            // An arrow body is a function body: the barrier that holds for it is
+            // the one inside it, not the one in the function that built it.
+            let arrow = trimmed.ends_with('{') && trimmed.contains("=> {");
+            let opens_body = arrow
+                || trimmed.ends_with('{')
+                    && !trimmed.starts_with("//")
+                    && trimmed.split(['(', ' ']).next().is_some_and(|word| {
+                        !KEYWORDS.contains(&word.trim_start_matches("function "))
+                    })
+                    && (trimmed.starts_with("function ")
+                        || trimmed
+                            .trim_start_matches("get ")
+                            .trim_start_matches("set ")
+                            .trim_start_matches("async ")
+                            .split('(')
+                            .next()
+                            .is_some_and(|name| {
+                                !name.is_empty()
+                                    && !KEYWORDS.contains(&name)
+                                    && name
+                                        .chars()
+                                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                            }))
+                    && trimmed.contains('(');
+            if opens_body {
+                let open = offset + line.find('{').expect("checked it ends with a brace");
+                let mut depth = 0usize;
+                for (at, byte) in bytes[open..].iter().enumerate() {
+                    match byte {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                bodies.push((open, open + at));
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            offset += line.len();
+        }
+        bodies
+    }
+
+    /// Every `op_name(` call, as a byte offset and a name.
+    fn op_calls() -> Vec<(usize, String)> {
+        let bytes = JS.as_bytes();
+        let mut calls = Vec::new();
+        let mut search = 0usize;
+        while let Some(found) = JS[search..].find("op_") {
+            let at = search + found;
+            search = at + 3;
+            // An identifier boundary, so `_migo_op_x` and `key.op_y` do not count.
+            if at > 0
+                && (bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'_' | b'.'))
+            {
+                continue;
+            }
+            let name: String = JS[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !JS[at + name.len()..].starts_with('(') {
+                continue;
+            }
+            calls.push((at, name));
+        }
+        calls
+    }
+
+    fn line_of(offset: usize) -> usize {
+        JS[..offset].lines().count()
+    }
+
+    #[test]
+    fn every_op_in_the_2d_facade_is_ordered() {
+        let bodies = function_bodies();
+        assert!(
+            bodies.len() >= 40,
+            "only {} function bodies parsed out of the 2D facade; the scan no \
+             longer matches",
+            bodies.len()
+        );
+        let calls = op_calls();
+        assert!(
+            calls.len() >= 20,
+            "only {} op calls found in the 2D facade; the scan no longer matches",
+            calls.len()
+        );
+
+        let mut unordered = Vec::new();
+        for (at, name) in &calls {
+            let enclosing = bodies
+                .iter()
+                .filter(|(start, end)| start < at && at < end)
+                .max_by_key(|(start, _)| *start);
+            let Some((start, _)) = enclosing else {
+                unordered.push(format!(
+                    "  02_2d_context.js:{}  {name}() is not inside any function body",
+                    line_of(*at)
+                ));
+                continue;
+            };
+            let before = &JS[*start..*at];
+            let barriered =
+                before.contains("_barrier()") || before.contains("flushRenderCommandStream()");
+            if !barriered {
+                unordered.push(format!("  02_2d_context.js:{}  {name}()", line_of(*at)));
+            }
+        }
+
+        assert!(
+            unordered.is_empty(),
+            "these ops reach the collector with records still unsubmitted in the \
+             stream buffer, so they overtake the commands issued before them:\n{}",
+            unordered.join("\n")
+        );
+    }
+}
+
+/// The two named-colour tables are one table.
+///
+/// The encoder answers named colours itself, and it may only do that while its
+/// table says exactly what the Rust one says. A name in one table and not the
+/// other is not a crash: the encoder abstains, the Rust parser reads it as
+/// black, and the shape is painted the wrong colour with nothing logged.
+///
+/// The corpus case next door catches this only for names someone thought to
+/// write down. This compares the tables themselves, so a name added to either
+/// side is checked whether or not anyone remembers it -- which is how
+/// `transparent` was found: the JavaScript table had it and the Rust one did
+/// not, so `fillStyle = "transparent"` painted opaque black.
+mod canvas2d_colour_table {
+    use crate::rendering::webgl::context2d::NAMED_COLORS;
+
+    const JS: &str = include_str!("02_2d_context.js");
+
+    /// `'name': [r, g, b, a]`, as the JavaScript table declares them.
+    fn javascript_table() -> Vec<(String, [u8; 4])> {
+        let mut found = Vec::new();
+        for entry in JS.split('\'').skip(1).collect::<Vec<_>>().chunks(2) {
+            let [name, rest] = entry else { continue };
+            if !name.chars().all(|c| c.is_ascii_lowercase()) || name.is_empty() {
+                continue;
+            }
+            let Some(open) = rest.find('[') else { continue };
+            if !rest[..open].trim().starts_with(':') {
+                continue;
+            }
+            let Some(close) = rest[open..].find(']') else {
+                continue;
+            };
+            let channels: Vec<u8> = rest[open + 1..open + close]
+                .split(',')
+                .filter_map(|value| value.trim().parse().ok())
+                .collect();
+            if let Ok(channels) = <[u8; 4]>::try_from(channels.as_slice()) {
+                found.push((name.to_string(), channels));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_named_colours_agree_name_for_name() {
+        let javascript = javascript_table();
+        assert!(
+            javascript.len() >= 140,
+            "only {} named colours parsed out of the JavaScript; the pattern no \
+             longer matches",
+            javascript.len()
+        );
+        assert_eq!(
+            javascript.len(),
+            NAMED_COLORS.len(),
+            "the JavaScript table has {} names and the Rust table {}",
+            javascript.len(),
+            NAMED_COLORS.len()
+        );
+
+        for (name, channels) in &javascript {
+            let rust = NAMED_COLORS
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("the Rust table has no {name}"));
+            let js = shared::protocol::color::Color::rgbai(
+                channels[0],
+                channels[1],
+                channels[2],
+                channels[3],
+            );
+            assert_eq!(
+                (rust.r, rust.g, rust.b, rust.a),
+                (js.r, js.g, js.b, js.a),
+                "{name} is {js:?} in JavaScript and {rust:?} in Rust"
+            );
         }
     }
 }

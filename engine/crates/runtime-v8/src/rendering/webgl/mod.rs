@@ -183,9 +183,6 @@ extension!(host_v8_webgl,
         op_tex_image_2d_from_text_cache,
 
         // Frame lifecycle
-        op_frame_begin,
-        op_frame_end,
-        op_frame_end_all,
         op_frame_end_unified,
         op_invalidate,
 

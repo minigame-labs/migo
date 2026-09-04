@@ -31,7 +31,10 @@ use shared::{
 // Color parsing
 // ============================================================================
 
-static NAMED_COLORS: LazyLock<HashMap<&'static str, Color>> = LazyLock::new(|| {
+/// `pub(crate)` so the agreement case can enumerate it. That case needs a
+/// JavaScript runtime to drive the encoder, which lives beside the other
+/// runtime-driven cases rather than here.
+pub(crate) static NAMED_COLORS: LazyLock<HashMap<&'static str, Color>> = LazyLock::new(|| {
     [
         ("aliceblue", Color::rgb(240, 248, 255)),
         ("antiquewhite", Color::rgb(250, 235, 215)),
@@ -181,6 +184,17 @@ static NAMED_COLORS: LazyLock<HashMap<&'static str, Color>> = LazyLock::new(|| {
         ("whitesmoke", Color::rgb(245, 245, 245)),
         ("yellow", Color::rgb(255, 255, 0)),
         ("yellowgreen", Color::rgb(154, 205, 50)),
+        // The one entry that is not a colour name in the CSS colour-keyword
+        // list but a keyword the Canvas 2D specification resolves the same
+        // way: `transparent` is `rgba(0, 0, 0, 0)`.
+        //
+        // It was missing, so `ctx.fillStyle = "transparent"` fell through to
+        // the unknown-name branch and painted opaque black -- the loudest
+        // possible wrong answer for a keyword whose whole meaning is "do not
+        // paint". Found by
+        // `the_javascript_colour_parser_never_disagrees_with_the_rust_one` on
+        // its first run: the JavaScript table had it and this one did not.
+        ("transparent", Color::rgbai(0, 0, 0, 0)),
     ]
     .into_iter()
     .collect()
@@ -212,7 +226,13 @@ fn split_comma_parts(s: &str) -> ([&str; 4], usize) {
     (parts, count)
 }
 
-fn parse_color_string(s: &str) -> Color {
+/// The authority on what a CSS colour string means.
+///
+/// `pub(crate)` for the same reason [`NAMED_COLORS`] is: the JavaScript
+/// encoder answers the common forms itself to keep them off the op path, and
+/// `the_javascript_colour_parser_never_disagrees_with_the_rust_one` requires
+/// the two to produce the same `Color` for every string in the corpus.
+pub(crate) fn parse_color_string(s: &str) -> Color {
     let s = s.trim();
 
     // #hex — no lowercase needed
@@ -919,13 +939,6 @@ pub fn op_tex_image_2d_from_text_cache(
 // Frame lifecycle operations
 // ============================================================================
 
-#[op2(fast)]
-pub fn op_frame_begin(state: &mut OpState, #[smi] canvas_id: u32) {
-    with_collector(state, |collector| {
-        collector.frame_begin(canvas_id);
-    });
-}
-
 /// Build and send one interleaved FramePacket from all accumulated
 /// Canvas2D + GL segments, with Materialize barriers at 2D->GL transitions.
 fn do_frame_end_unified(state: &mut OpState) {
@@ -953,21 +966,9 @@ fn do_frame_end_unified(state: &mut OpState) {
     }
 }
 
-/// Per-canvas frame-end. Delegates to the unified frame-end path.
-#[op2(fast)]
-pub fn op_frame_end(state: &mut OpState, #[smi] _canvas_id: u32) {
-    do_frame_end_unified(state);
-}
-
 /// Unified frame-end: primary frame-end path called from the RAF loop.
 #[op2(fast)]
 pub fn op_frame_end_unified(state: &mut OpState) {
-    do_frame_end_unified(state);
-}
-
-/// Legacy frame-end for Canvas2D only. Delegates to the unified path.
-#[op2(fast)]
-pub fn op_frame_end_all(state: &mut OpState) {
     do_frame_end_unified(state);
 }
 
