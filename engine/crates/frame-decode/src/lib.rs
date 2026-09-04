@@ -84,6 +84,13 @@ pub fn copy_i32_words(words: &[u32]) -> UniformI32Values {
 /// an error into the per-canvas `WebGLErrorState` (just like raw ops) and
 /// are skipped; decoding continues with the next record.
 ///
+/// The GL-only view, and no product's submission path any more: both lanes
+/// carry 2D records in the same stream and go through
+/// [`decode_render_stream_into`]. What keeps this one is that it returns the
+/// commands rather than filing them away, which is what a case checking that
+/// one opcode decodes to the same `GLCmd` as the raw op needs to see. The
+/// per-record work is the same function either way.
+///
 /// Returns the saturating approximate byte count for all accepted commands.
 pub fn decode_validated_stream<C: GlDecodeContext>(
     context: &mut C,
@@ -1011,32 +1018,118 @@ fn decode_record<C: GlDecodeContext>(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Where a decoded mixed stream's work goes.
+///
+/// Two products consume the same stream and want it in different shapes. The
+/// cross-process lane builds [`shared::protocol::FrameOp`]s and hands the frame
+/// to the renderer whole. The in-process runtime already owns a collector that
+/// groups a frame its own way, and it needs each 2D command individually --
+/// dirty rectangles are marked per command -- and each GL batch together with
+/// the byte count the decode measured, because that count is what bounds the
+/// memory a frame may pin.
+///
+/// What must *not* have two versions is the order: which batch ends where, and
+/// where the materialize barriers fall. So that lives once, in
+/// [`decode_render_stream_into`], and this trait is the only thing that varies.
+///
+/// # Why the sink and the decode context are one object at the call site
+///
+/// [`decode_render_stream_into`] takes a single value that is both. The
+/// in-process implementation reaches its error queue and its collector through
+/// the same `OpState`, and `OpState` hands out one mutable borrow at a time: a
+/// separate context and sink would each want that borrow, and the two could not
+/// coexist. Requiring one object costs the cross-process lane nothing -- its
+/// implementation is a two-field struct -- and it is what lets the in-process
+/// lane decode straight into the collector with no intermediate buffer.
+pub trait RenderSink {
+    /// One run of 2D commands on one canvas, in the order they were issued.
+    fn canvas_batch(
+        &mut self,
+        canvas_id: u32,
+        commands: shared::command_vec_pool::PooledVec<shared::protocol::render_cmd::Canvas2DCmd>,
+    );
 
-    #[test]
-    fn spilled_uniform_approx_bytes_counts_allocated_capacity() {
-        let mut value = UniformF32Values::with_capacity(64);
-        value.extend(std::iter::repeat_n(1.0, 17));
-        assert!(value.spilled());
-        assert!(value.capacity() > value.len());
+    /// One run of GL commands, with the approximate heap footprint the decode
+    /// measured while building them.
+    fn gl_batch(
+        &mut self,
+        commands: shared::command_vec_pool::PooledVec<GLCmd>,
+        approx_bytes: usize,
+    );
 
-        let cmd = GLCmd::Uniform1fv {
-            canvas_id: 1,
-            location: Some(2),
-            value,
-        };
-        assert_eq!(cmd_approx_bytes(&cmd), cmd.approx_deep_size_bytes());
+    /// The renderer must flush this canvas's 2D work before what follows.
+    fn materialize(&mut self, canvas_id: u32);
+}
+
+/// The [`RenderSink`] that builds `FrameOp`s, paired with a decode context.
+///
+/// The pairing is what makes [`decode_render_stream`] keep its old signature
+/// while the decoder underneath takes one object.
+struct FrameOpSink<'a, C: GlDecodeContext> {
+    context: &'a mut C,
+    out: &'a mut Vec<shared::protocol::FrameOp>,
+}
+
+impl<C: GlDecodeContext> GlDecodeContext for FrameOpSink<'_, C> {
+    #[inline]
+    fn push_error(&mut self, canvas_id: u32, code: u32) {
+        self.context.push_error(canvas_id, code);
+    }
+
+    #[inline]
+    fn transform_feedback_captures(&self, canvas_id: u32) -> bool {
+        self.context.transform_feedback_captures(canvas_id)
+    }
+}
+
+impl<C: GlDecodeContext> RenderSink for FrameOpSink<'_, C> {
+    fn canvas_batch(
+        &mut self,
+        canvas_id: u32,
+        commands: shared::command_vec_pool::PooledVec<shared::protocol::render_cmd::Canvas2DCmd>,
+    ) {
+        self.out.push(shared::protocol::FrameOp::CanvasBatch(
+            shared::protocol::render_cmd::CanvasBatchPayload {
+                canvas_id,
+                commands,
+                present: false,
+                dirty_rect: None,
+            },
+        ));
+    }
+
+    fn gl_batch(
+        &mut self,
+        commands: shared::command_vec_pool::PooledVec<GLCmd>,
+        _approx_bytes: usize,
+    ) {
+        self.out.push(shared::protocol::FrameOp::GlBatch(
+            shared::protocol::render_cmd::GlBatchPayload { commands },
+        ));
+    }
+
+    fn materialize(&mut self, canvas_id: u32) {
+        self.out
+            .push(shared::protocol::FrameOp::Materialize { canvas_id });
     }
 }
 
 /// Decode a mixed 2D/GL stream into ordered frame operations.
 ///
-/// The general form. [`decode_validated_stream`] is the GL-only view the
-/// in-process runtime still uses, because its collector already groups GL
-/// commands its own way; this is what a producer in another process needs,
-/// where every command -- 2D and GL alike -- arrives as words in one stream.
+/// The `FrameOp` view of [`decode_render_stream_into`], for the lane that hands
+/// a whole frame to the renderer.
+///
+/// Returns the number of commands decoded, for the caller's own accounting.
+pub fn decode_render_stream<C: GlDecodeContext>(
+    context: &mut C,
+    stream: ValidatedStream<'_>,
+    out: &mut Vec<shared::protocol::FrameOp>,
+) -> usize {
+    let mut sink = FrameOpSink { context, out };
+    decode_render_stream_into(&mut sink, stream)
+}
+
+/// Decode a mixed 2D/GL stream into a [`RenderSink`].
 ///
 /// # Order, and the barrier that preserves it
 ///
@@ -1045,18 +1138,16 @@ mod tests {
 /// the 2D work *materialized* before the GL work that draws over it: Canvas2D
 /// content lives in a surface the GL path reads, and a GL batch that ran before
 /// the 2D batch behind it was flushed would sample whatever was there before.
-/// So a 2D→GL boundary emits `Materialize` for every canvas with pending work,
-/// exactly as the in-process collector does.
+/// So a 2D→GL boundary materializes every canvas with pending work, exactly as
+/// the in-process collector does.
 ///
 /// Returns the number of commands decoded, for the caller's own accounting.
-pub fn decode_render_stream<C: GlDecodeContext>(
-    context: &mut C,
+pub fn decode_render_stream_into<T: GlDecodeContext + RenderSink>(
+    target: &mut T,
     stream: ValidatedStream<'_>,
-    out: &mut Vec<shared::protocol::FrameOp>,
 ) -> usize {
     use shared::command_vec_pool::PooledVec;
-    use shared::protocol::FrameOp;
-    use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, GlBatchPayload};
+    use shared::protocol::render_cmd::Canvas2DCmd;
 
     // `words()` is already the used prefix: `validate_stream` bounds the slice
     // it hands back, which is what makes the walk below need no length check of
@@ -1066,6 +1157,10 @@ pub fn decode_render_stream<C: GlDecodeContext>(
 
     let mut decoded = 0usize;
     let mut gl: PooledVec<GLCmd> = PooledVec::take();
+    // Counted as the commands are built rather than walked again afterwards.
+    // The walk is a match per command on the render path, and the sink needs
+    // the number for exactly one batch at a time.
+    let mut gl_bytes = 0usize;
     let mut canvas: PooledVec<Canvas2DCmd> = PooledVec::take();
     // The canvas the 2D records apply to. `None` until a SELECT_CANVAS arrives,
     // and a 2D record before one is a producer that never said where to draw.
@@ -1079,12 +1174,7 @@ pub fn decode_render_stream<C: GlDecodeContext>(
         () => {
             if !canvas.is_empty() {
                 let id = canvas_id.unwrap_or(0);
-                out.push(FrameOp::CanvasBatch(CanvasBatchPayload {
-                    canvas_id: id,
-                    commands: std::mem::replace(&mut canvas, PooledVec::take()),
-                    present: false,
-                    dirty_rect: None,
-                }));
+                target.canvas_batch(id, std::mem::replace(&mut canvas, PooledVec::take()));
                 if !pending_materialize.contains(&id) {
                     pending_materialize.push(id);
                 }
@@ -1094,9 +1184,10 @@ pub fn decode_render_stream<C: GlDecodeContext>(
     macro_rules! flush_gl {
         () => {
             if !gl.is_empty() {
-                out.push(FrameOp::GlBatch(GlBatchPayload {
-                    commands: std::mem::replace(&mut gl, PooledVec::take()),
-                }));
+                target.gl_batch(
+                    std::mem::replace(&mut gl, PooledVec::take()),
+                    std::mem::take(&mut gl_bytes),
+                );
             }
         };
     }
@@ -1122,7 +1213,7 @@ pub fn decode_render_stream<C: GlDecodeContext>(
                 // Reported rather than guessed. Drawing on canvas zero because
                 // the producer forgot to say which is how content ends up
                 // painting over something else.
-                context.push_error(0, codes::INVALID_OPERATION);
+                target.push_error(0, codes::INVALID_OPERATION);
                 continue;
             }
             flush_gl!();
@@ -1138,9 +1229,10 @@ pub fn decode_render_stream<C: GlDecodeContext>(
             flush_canvas!();
         }
         for id in pending_materialize.drain(..) {
-            out.push(FrameOp::Materialize { canvas_id: id });
+            target.materialize(id);
         }
-        if let Some(command) = decode_record(context, opcode, record) {
+        if let Some(command) = decode_record(target, opcode, record) {
+            gl_bytes = gl_bytes.saturating_add(cmd_approx_bytes(&command));
             gl.push(command);
             decoded += 1;
         }
@@ -1152,8 +1244,28 @@ pub fn decode_render_stream<C: GlDecodeContext>(
     // GL has to see it, and the renderer has no other signal that the batch
     // ended.
     for id in pending_materialize.drain(..) {
-        out.push(FrameOp::Materialize { canvas_id: id });
+        target.materialize(id);
     }
 
     decoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spilled_uniform_approx_bytes_counts_allocated_capacity() {
+        let mut value = UniformF32Values::with_capacity(64);
+        value.extend(std::iter::repeat_n(1.0, 17));
+        assert!(value.spilled());
+        assert!(value.capacity() > value.len());
+
+        let cmd = GLCmd::Uniform1fv {
+            canvas_id: 1,
+            location: Some(2),
+            value,
+        };
+        assert_eq!(cmd_approx_bytes(&cmd), cmd.approx_deep_size_bytes());
+    }
 }

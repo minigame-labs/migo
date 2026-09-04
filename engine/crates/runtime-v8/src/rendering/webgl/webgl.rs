@@ -3748,15 +3748,19 @@ pub(crate) mod submit_test_counter {
 
 // ── Task 3: op_gl_submit_stream ──────────────────────────────────────────────
 
-/// Submit a typed GL command stream from JS.
+/// Submit a typed render command stream from JS.
+///
+/// The stream carries both kinds of work. GL records and Canvas2D records share
+/// one opcode space and one buffer precisely so the order between them survives
+/// the crossing: a frame that draws its background with 2D, its sprites with GL
+/// and its HUD with 2D again is one submission, not three interleaved paths.
 ///
 /// Pass 1 (structural): `gl_stream::validate_stream`. Malformed batches return a
 /// stable non-zero error code immediately — no collector, no error queue, no vec taken.
 ///
-/// Pass 2 (semantic + decode): on success, a vec is taken from the pool,
-/// `decode::decode_validated_stream` fills it, and `append_gl_batch` bulk-appends into
-/// the `UnifiedFrameCollector` (handling the empty/all-invalid case by recycling the vec
-/// and creating no segment). Returns `0` on success.
+/// Pass 2 (semantic + decode): `decode::decode_render_stream` cuts the stream
+/// into batches and writes them into the `UnifiedFrameCollector` as it goes.
+/// Returns `0` on success.
 #[op2(fast)]
 #[smi]
 pub fn op_gl_submit_stream(
@@ -3775,24 +3779,20 @@ pub(crate) fn gl_submit_stream_impl(state: &mut OpState, words: &[u32], used_wor
         Err(e) => return e.code(),
     };
 
-    // Take a pooled vec for decoded commands.
-    let mut cmds = shared::command_vec_pool::take_gl_command_vec();
-
-    // Pass 2: semantic decode — fills cmds, returns approx byte count.
-    let approx_bytes =
-        crate::rendering::webgl::decode::decode_validated_stream(state, validated, &mut cmds);
+    // Pass 2: semantic decode straight into the collector. The batches the
+    // decoder cuts are the batches the collector receives, in the order the
+    // frame issued them; nothing is buffered in between.
+    let (_decoded, over_budget) =
+        crate::rendering::webgl::decode::decode_render_stream(state, validated);
 
     // Test-only instrumentation: record call count and decoded command count.
     #[cfg(test)]
-    submit_test_counter::record(cmds.len());
+    submit_test_counter::record(_decoded);
 
-    // Bulk-append into collector.  append_gl_batch handles the empty case
-    // (all-semantic-invalid) by recycling cmds and creating no segment.
-    let need_flush = state
-        .borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
-        .append_gl_batch(cmds, approx_bytes);
-
-    if need_flush {
+    // The soft budget is checked once for the whole submission rather than per
+    // batch: flushing dispatches a frame packet, and doing that between two
+    // commands of one stream would put a bounded-blocking send inside a frame.
+    if over_budget {
         maybe_auto_flush(state);
     }
 
