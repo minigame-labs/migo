@@ -24,6 +24,8 @@ use migo_capi_abi::{MIGO_ABI_VERSION_CURRENT, MIGO_OK, VersionedHeader};
 /// public raw owner or a running Host.
 pub(crate) fn callback_session_pin() -> Arc<MigoSession> {
     Arc::new(MigoSession {
+        // No external producer in these fixtures.
+        launch_nonce: None,
         engine: Arc::new(EngineInner {
             files_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
@@ -76,6 +78,8 @@ pub(crate) fn session_config() -> MigoSessionConfig {
             abi_version: MIGO_ABI_VERSION_CURRENT,
         },
         flags: 0,
+        // No external producer in these tests, so no identity to pair with one.
+        launch_nonce: [0u8; 16],
     }
 }
 

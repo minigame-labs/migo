@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "What one Performance+ probe measurement must record for it to count.",
+    "",
+    "The G0 gate exists because Worker vs Window, the transport, the frame",
+    "clock and the WebView host shape are unresolved, and a design that picks",
+    "one without device evidence has picked it by preference. This file is the",
+    "other half of that discipline: it says what evidence looks like, so a run",
+    "cannot be accepted because it was the only one anybody did.",
+    "",
+    "Two rules shape every required field below:",
+    "",
+    "  1. A MISSING FIELD REJECTS THE RUN, not the record. A record that lost",
+    "     its thermal state is not a slightly worse sample; it is a sample",
+    "     nobody can tell apart from one taken on a hot phone, and averaging it",
+    "     in is how a thermally-throttled arm wins.",
+    "",
+    "  2. EVERY DIMENSION IS RECORDED EVEN WHEN IT IS NOT THE VARIABLE. A run",
+    "     that varies transport still records agent, clock and layout, because",
+    "     'one variable at a time' can only be checked against records that say",
+    "     what all the other variables were."
+  ],
+
+  "decision_rules": {
+    "_comment": [
+      "Enforced by tools/apple-probe-decision/decide.py. These are the",
+      "sentences from the design that would otherwise live only in prose, and",
+      "prose does not fail a build."
+    ],
+    "min_samples_per_arm": 20,
+    "min_arms_per_variable": 2,
+    "simulator_counts_as_evidence": false,
+    "correctness_mismatch_disqualifies_arm": true,
+    "single_variable_comparisons_only": true,
+    "confidence": 0.95,
+    "bootstrap_resamples": 2000,
+    "bootstrap_seed": 20260903,
+    "_seed_comment": "Fixed so a decision is reproducible from the same raw data. A tool that returns a different winner on a second run is not evidence."
+  },
+
+  "primary_metric": {
+    "name": "input_to_present_p95_ms",
+    "direction": "lower_is_better",
+    "_comment": "The number the lane exists to improve. Secondary metrics are recorded and reported but never override it."
+  },
+
+  "record": {
+    "required": [
+      "schema_version",
+      "run_id",
+      "trial_seed",
+      "captured_at",
+
+      "device_class",
+      "hardware_identifier",
+      "ram_bytes",
+      "os_version",
+      "os_build",
+      "webkit_build",
+      "app_build",
+
+      "agent",
+      "layout",
+      "origin",
+      "transport",
+      "clock",
+      "payload_class_bytes",
+      "refresh_hz",
+      "duration_s",
+
+      "thermal_state",
+      "power_state",
+
+      "input_to_present_p50_ms",
+      "input_to_present_p95_ms",
+      "input_to_present_p99_ms",
+      "missed_vsync_ratio",
+      "cpu_seconds",
+      "wakeups",
+      "app_footprint_bytes",
+      "gpu_bytes",
+      "copies_per_frame",
+      "allocations_per_frame",
+
+      "errors",
+      "terminations",
+      "correctness_hash",
+      "correctness_expected_hash"
+    ],
+    "optional": [
+      "webcontent_footprint_bytes",
+      "notes"
+    ],
+    "enums": {
+      "device_class": ["device", "simulator"],
+      "agent": ["window", "dedicated_worker"],
+      "layout": ["attached_visible", "transparent_overlay", "one_by_one", "off_screen", "occluded"],
+      "origin": ["loopback", "custom_scheme"],
+      "transport": ["loopback_websocket", "scheme_request", "hybrid"],
+      "clock": ["worker_raf", "window_raf_relay", "display_link_relay"],
+      "thermal_state": ["nominal", "fair", "serious", "critical"],
+      "power_state": ["plugged", "battery", "low_power"]
+    },
+    "_enum_comment": [
+      "The enums are closed on purpose. An unrecognised value is a run that",
+      "measured something this decision cannot name, and silently bucketing it",
+      "with the nearest known value is how a hybrid transport's numbers end up",
+      "attributed to the loopback one."
+    ]
+  },
+
+  "variables": {
+    "_comment": "The four G0 choices. A decision may be made for one of these only when the matrix isolates it.",
+    "agent": "Window versus Dedicated Worker. Note that Window cannot serve synchronous content at all, so a Window win is an admission rule, never a replacement of the default.",
+    "transport": "Loopback WebSocket versus a custom-scheme binary request path.",
+    "clock": "Worker rAF where feature detection finds it, Window rAF relayed, or a host CADisplayLink relayed.",
+    "layout": "The WKWebView host shape."
+  }
+}

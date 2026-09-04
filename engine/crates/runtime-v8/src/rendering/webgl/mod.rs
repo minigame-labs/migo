@@ -4,8 +4,21 @@ mod context2d;
 pub(crate) mod decode;
 mod font;
 pub(crate) mod frame_collector;
-pub(crate) mod gl_stream;
+/// Re-exported, not defined here any more.
+///
+/// The structural validator and the WebGL opcode table moved to
+/// `migo-frame-wire` so the cross-process frame consumer can validate the same
+/// words without linking a JavaScript engine. The `stream` path stays valid for
+/// every call site in this crate; `gl` is not re-exported because after the
+/// move its only user is a test, and a re-export nothing outside tests reads is
+/// an unused import in every shipped build.
+pub(crate) use frame_wire::stream;
+
 mod raf;
+/// Test-only: the cases asserting this crate's JavaScript encoder agrees with
+/// the shared wire-format table.
+#[cfg(test)]
+mod render_stream_js_agreement;
 mod webgl;
 
 use context2d::*;
@@ -173,9 +186,6 @@ extension!(host_v8_webgl,
         op_tex_image_2d_from_text_cache,
 
         // Frame lifecycle
-        op_frame_begin,
-        op_frame_end,
-        op_frame_end_all,
         op_frame_end_unified,
         op_invalidate,
 
@@ -290,11 +300,11 @@ extension!(host_v8_webgl,
         op_tex_image_3d,
         op_tex_sub_image_3d,
         op_tex_storage_3d,
-        op_gl_submit_stream,
+        op_submit_render_stream,
     ],
     esm = [
         dir "src/rendering/webgl",
-        "00_gl_command_stream.js",
+        "00_render_command_stream.js",
         "01_constants.js",
         "02_2d_context.js",
         "02_webgl_context.js",

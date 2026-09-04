@@ -38,7 +38,13 @@ mod keyboard;
 mod layout;
 mod panic_barrier;
 mod platform;
+// Which execution this product compiled: a JavaScript runtime in this process,
+// or frames produced by one somewhere else.
 mod retirement;
+mod session_engine;
+// The frame transport's entry points, in the product that has a transport.
+#[cfg(feature = "external-frames")]
+mod external_frames;
 mod surface;
 #[cfg(test)]
 mod test_support;
@@ -81,7 +87,9 @@ use migo_capi_abi::{
     MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
     MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult,
 };
-use migo_core::{HostThread, send_command_to_host};
+use migo_core::send_command_to_host;
+
+use crate::session_engine::SessionEngine;
 use panic_barrier::guard;
 use shared::surface::HostWindowState;
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceLossReason};
@@ -202,7 +210,7 @@ struct SessionState {
     callbacks_frozen: bool,
     /// Set once a surface has been attached; the engine host thread owns the
     /// render loop from that point.
-    host: Option<HostThread>,
+    host: Option<SessionEngine>,
     /// Immutable graphics domain committed atomically with `host`.
     platform_identity: Option<PlatformIdentity>,
     /// Target-specific construction owner committed atomically with `host`.
@@ -282,6 +290,14 @@ pub struct MigoSession {
     /// Release observers do not retain the Session, so completion updates this
     /// separate counter through an Arc without taking SessionControl.
     pending_surface_releases: Arc<AtomicUsize>,
+    /// The 128-bit identity an external producer's packets must carry, from the
+    /// session configuration. `None` when the host supplied none, which is the
+    /// ordinary case for a session that runs its own JavaScript.
+    ///
+    /// Immutable for the session's life: it is the value a transport was paired
+    /// with out of band, and a session that could change it mid-flight would be
+    /// a session whose accepted packets stop meaning the same thing.
+    launch_nonce: Option<u128>,
     /// Installed exactly once after the first Host reaches its ready boundary.
     /// Hot input/vsync calls read these cloned senders without a registry lock.
     ingress: OnceLock<migo_core::HostIngress>,
@@ -541,9 +557,10 @@ pub unsafe extern "C" fn migo_session_create(
         let Some(out_session) = (unsafe { out_session.as_mut() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe { MigoSessionConfig::parse(config) } {
-            return error;
-        }
+        let validated = match unsafe { MigoSessionConfig::parse(config) } {
+            Ok(validated) => validated,
+            Err(error) => return error,
+        };
 
         match engine.inner.live_sessions.lock() {
             Ok(mut live) => *live += 1,
@@ -552,6 +569,7 @@ pub unsafe extern "C" fn migo_session_create(
         let session = Arc::new(MigoSession {
             engine: Arc::clone(&engine.inner),
             state: Mutex::new(SessionState::default()),
+            launch_nonce: validated.launch_nonce,
             callback_gate: callback_gate::CallbackGate::new(),
             pending_surface_releases: Arc::new(AtomicUsize::new(0)),
             ingress: OnceLock::new(),
@@ -660,7 +678,7 @@ pub unsafe extern "C" fn migo_session_load_content(
         };
         // Content needs a render target: without one there is no host thread to
         // evaluate it on.
-        let Some(host) = state.host.as_ref().map(HostThread::id) else {
+        let Some(host) = state.host.as_ref().map(SessionEngine::id) else {
             return MIGO_ERROR_INVALID_STATE;
         };
         if state.content_loaded {
@@ -773,7 +791,7 @@ fn drive_visibility_locked(state: &mut SessionState, visible: bool) -> MigoResul
         .host
         .as_ref()
         .filter(|_| can_dispatch)
-        .map(HostThread::id)
+        .map(SessionEngine::id)
     else {
         state.visibility = Some(visible);
         return MIGO_OK;
@@ -893,7 +911,7 @@ pub unsafe extern "C" fn migo_session_set_focus(
             .host
             .as_ref()
             .filter(|_| can_dispatch)
-            .map(HostThread::id)
+            .map(SessionEngine::id)
         else {
             state.focused = Some(focused);
             return MIGO_OK;
@@ -976,7 +994,7 @@ mod tests {
     struct TestPlatformBackend;
     struct TestPlatformDomain;
 
-    fn install_test_host(state: &mut SessionState, host: HostThread) {
+    fn install_test_host(state: &mut SessionState, host: SessionEngine) {
         state.host = Some(host);
         state.platform_identity = Some(PlatformIdentity::new::<TestPlatformDomain>(
             GraphicsBackendId::of::<TestPlatformBackend>(),
@@ -1212,7 +1230,7 @@ mod tests {
                 release_rx.recv().expect("release retired Host");
             })
             .expect("spawn retired Host");
-        let host = migo_core::HostThread::from_join_handle_for_test(8_001, join);
+        let host = crate::session_engine::engine_for_test(8_001, join);
         unsafe { &*engine }.inner.retired_hosts.retire(host);
 
         started_rx.recv().expect("retired Host started");
@@ -1262,7 +1280,7 @@ mod tests {
                     .expect("publish self-join rejection");
             })
             .expect("spawn self-join Host");
-        let host = migo_core::HostThread::from_join_handle_for_test(8_002, join);
+        let host = crate::session_engine::engine_for_test(8_002, join);
         owner_tx.send(host).expect("transfer owner to Host");
 
         assert_eq!(
@@ -1302,7 +1320,7 @@ mod tests {
             .expect("spawn Session Host");
         install_test_host(
             &mut unsafe { &*session }.state.lock().expect("Session state"),
-            migo_core::HostThread::from_join_handle_for_test(8_003, join),
+            crate::session_engine::engine_for_test(8_003, join),
         );
         started_rx.recv().expect("Session Host started");
 
@@ -1354,7 +1372,7 @@ mod tests {
             let mut state = unsafe { &*session }.state.lock().expect("Session state");
             install_test_host(
                 &mut state,
-                migo_core::HostThread::from_join_handle_for_test(8_004, join),
+                crate::session_engine::engine_for_test(8_004, join),
             );
             state.surface_transition = SurfaceTransition::Attaching;
         }
@@ -1370,7 +1388,7 @@ mod tests {
                 .expect("Session state")
                 .host
                 .as_ref()
-                .map(HostThread::id),
+                .map(SessionEngine::id),
             Some(8_004)
         );
         assert_eq!(

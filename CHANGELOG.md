@@ -8,10 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Images with transparency are transcoded to ASTC at package ingest on devices
+  whose GPU decodes it, and stay on ETC2 elsewhere. The block footprint is
+  chosen per image by what it reconstructs: the encoder grades its own output
+  against the source and takes the largest block whose worst channel error stays
+  within budget, so a smooth image lands at 0.25 bytes per pixel — a quarter of
+  ETC2 RGBA, at higher fidelity — while a sprite with a hard alpha edge stays at
+  one byte per pixel rather than losing the edge. Opaque images stay on ETC2 RGB
+  everywhere, because at half a byte per pixel it is smaller than any ASTC
+  footprint. The choice is per image and per device, which is only possible
+  because ingest runs on the device.
+- The runtime reports how many times a frame's drawing crossed from JavaScript
+  into native, on a five-second window, at `info` level: `[boundary] frames=…
+  crossings/frame=… worst=… commands/frame=… commands/crossing=…`. The ratio is
+  what a command stream exists to move, and it was previously only observable
+  from inside a test.
 
 ### Changed
+- Canvas2D commands cross the JavaScript/native boundary as a binary command
+  stream rather than one op per call, sharing one buffer and one opcode space
+  with the WebGL stream so the order between the two survives the crossing
+  without a barrier between every pair of commands. A frame that issues three
+  hundred 2D calls now crosses once.
 
 ### Fixed
+- ASTC 8x8 textures upload again. The engine mapped
+  `VK_FORMAT_ASTC_8x8_UNORM_BLOCK` to `0x93B9`, which is the token for a 10x6
+  block, so `glCompressedTexImage2D` rejected every such texture with
+  `GL_INVALID_VALUE`. It had never fired because nothing produced ASTC 8x8, and
+  the test that covered it asserted the same wrong number, copied from the
+  constant it was checking; the tokens are now derived from the block size the
+  extension assigns them to.
+- `ctx.fillStyle = "transparent"` no longer paints opaque black. The keyword was
+  missing from the engine's named-colour table, so it fell through to the
+  unknown-name branch, which reads black -- the loudest possible wrong answer for
+  a keyword whose meaning is "do not paint". `strokeStyle` and `shadowColor` had
+  the same fault, and gradient colour stops were unaffected.
 
 ---
 

@@ -337,8 +337,16 @@ pub(crate) struct AudioService {
     /// of this profile and nothing could reach it. Behind a bounded transport that
     /// same shape parks the first producer to fill it, so there is no receiver at
     /// all now and a send fails at once. See `shared::audio_channel::disconnected`.
+    // Read only through the accessors the embedded execution uses. An
+    // external-frame session has no op state to hand them to and no host loop
+    // waiting on the start signal, so in that build these are the shape of a
+    // service that is present and idle -- which is what it is, until the
+    // control channel gives the producer a way to ask for a sound.
+    #[cfg(feature = "embedded-v8")]
     tx: shared::audio_channel::AudioCommandSender,
+    #[cfg(feature = "embedded-v8")]
     wakeup: shared::channel::ThreadWakeup,
+    #[cfg(feature = "embedded-v8")]
     start_signal: std::sync::Arc<shared::op_state::AudioHostStartSignal>,
 }
 
@@ -348,27 +356,42 @@ impl AudioService {
         _host_tx: shared::op_state::HostTx,
         _network_policy: shared::op_state::NetworkPolicy,
     ) -> Self {
+        #[cfg(feature = "embedded-v8")]
         let tx = shared::audio_channel::disconnected();
+        #[cfg(feature = "embedded-v8")]
         let start_signal = shared::op_state::AudioHostStartSignal::new();
+        #[cfg(feature = "embedded-v8")]
         start_signal.mark_started();
         Self {
+            #[cfg(feature = "embedded-v8")]
             tx,
+            #[cfg(feature = "embedded-v8")]
             wakeup: shared::channel::ThreadWakeup::new(),
+            #[cfg(feature = "embedded-v8")]
             start_signal,
         }
     }
 
     #[inline]
+    /// Handed to the JavaScript runtime's op state; the audio ops write to it. An external-frame session has no op state and no host
+    /// loop of that shape, so nothing here reaches it.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn sender(&self) -> shared::op_state::AudioSender {
         shared::op_state::AudioSender::new(self.tx.clone(), self.wakeup.clone())
     }
 
     #[inline]
+    /// Selected on by the embedded host loop, which starts the audio thread lazily on the first audio op. An external-frame session has no op state and no host
+    /// loop of that shape, so nothing here reaches it.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn start_signal(&self) -> std::sync::Arc<shared::op_state::AudioHostStartSignal> {
         self.start_signal.clone()
     }
 
     #[inline]
+    /// Called by the embedded host loop when `start_signal` fires. An external-frame session has no op state and no host
+    /// loop of that shape, so nothing here reaches it.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn check_and_start(&mut self) -> shared::error::EngineResult<()> {
         Ok(())
     }
@@ -380,17 +403,33 @@ impl AudioService {
     pub(crate) fn resume(&mut self) {}
 
     #[inline]
+    /// Part of the embedded execution's runtime-restart and teardown
+    /// sequence: an external-frame session has no JavaScript runtime to
+    /// retire, and its audio contexts are not owned by one.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) async fn release_all_contexts(&mut self) -> shared::error::EngineResult<()> {
         Ok(())
     }
 
     #[inline]
+    /// Part of the embedded execution's runtime-restart and teardown
+    /// sequence: an external-frame session has no JavaScript runtime to
+    /// retire, and its audio contexts are not owned by one.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn finish_release_all_contexts(&mut self) {}
 
     #[inline]
+    /// Part of the embedded execution's runtime-restart and teardown
+    /// sequence: an external-frame session has no JavaScript runtime to
+    /// retire, and its audio contexts are not owned by one.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn begin_retire(&self, _runtime_generation: i64) {}
 
     #[inline]
+    /// Part of the embedded execution's runtime-restart and teardown
+    /// sequence: an external-frame session has no JavaScript runtime to
+    /// retire, and its audio contexts are not owned by one.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn finish_runtime_drop(&self, _runtime_generation: i64) {}
 
     #[inline]

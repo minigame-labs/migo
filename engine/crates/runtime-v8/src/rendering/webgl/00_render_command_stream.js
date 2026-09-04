@@ -1,11 +1,19 @@
-// 00_gl_command_stream.js -- Task 4: private lazy-allocated typed GL command
-// stream. Module state is NOT on globalThis / any canvas / any context object.
+// 00_render_command_stream.js -- the private, lazy-allocated typed command
+// stream this runtime's canvas facades encode into. Module state is NOT on
+// globalThis / any canvas / any context object.
+//
+// One buffer carries both blocks: GL records (opcodes 1..=58 fixed, 256..=266
+// variable) and Canvas2D records (512..). The reason is order. A frame draws
+// its background with 2D, its sprites with GL and its HUD with 2D again, and
+// the renderer must see those in the order they were issued. Two buffers would
+// need a merge protocol with timestamps or barriers; one buffer with two opcode
+// ranges needs none, because the order in the buffer *is* the order.
 //
 // Design: S4 (private buffer & hot-path), S5 (wire format + opcodes), S9
 // (primordials). Loaded before 01_constants.js in the ESM list.
 
 import {
-    op_gl_submit_stream,
+    op_submit_render_stream,
 } from "ext:core/ops";
 
 import { primordials } from "ext:core/mod.js";
@@ -143,6 +151,7 @@ function ensureBuffers() {
     _u32_0[1] = STREAM_VERSION;
     _u32_1[0] = MAGIC;
     _u32_1[1] = STREAM_VERSION;
+    _selected2d = -1;
 }
 
 // --- Header pack ---
@@ -167,11 +176,11 @@ function ensureFit(wordCount) {
 
 function _submitAndSwap() {
     if (cursor <= 2) return; // nothing to submit
-    const status = op_gl_submit_stream(_u32, cursor);
+    const status = op_submit_render_stream(_u32, cursor);
     if (status !== 0) {
         // Reset cursor before throwing so the buffer is clean.
         cursor = 2;
-        throw new Error("op_gl_submit_stream returned error: " + status);
+        throw new Error("op_submit_render_stream returned error: " + status);
     }
     // Swap to the other buffer.
     if (_activeIdx === 0) {
@@ -188,6 +197,10 @@ function _submitAndSwap() {
         _u32_0[1] = STREAM_VERSION;
     }
     cursor = 2;
+    // A new buffer is a new stream, and the reader begins every stream with no
+    // canvas selected. Forgetting this reset is the failure that draws a frame's
+    // second half onto whatever canvas the first half named.
+    _selected2d = -1;
 }
 
 // --- Fixed-arity encoder implementations ---
@@ -1079,26 +1092,279 @@ function encodeUniformMatrix4fv(canvasId, location, transpose, payloadU32) {
     return _encodeMatrixUniform(OP_UNIFORM_MATRIX4FV, canvasId, location, transpose, payloadU32);
 }
 
-// --- flushGlCommandStream ---
+// --- Canvas2D opcode constants (512..548) ---
+//
+// One stream carries both blocks, and the reason is order. A frame draws its
+// background with 2D, its sprites with GL and its HUD with 2D again; the
+// renderer must see those in the order they were issued. Two buffers would need
+// a merge protocol. One buffer with two opcode ranges needs none -- the order in
+// the buffer is the order -- and it is also what the cross-process producer has
+// to do anyway, because over there every command is bytes or it does not cross.
+
+const OP2D_SELECT_CANVAS = 512;
+const OP2D_BEGIN_PATH = 513;
+const OP2D_CLOSE_PATH = 514;
+const OP2D_MOVE_TO = 515;
+const OP2D_LINE_TO = 516;
+const OP2D_QUADRATIC_CURVE_TO = 517;
+const OP2D_BEZIER_CURVE_TO = 518;
+const OP2D_ARC = 519;
+const OP2D_ARC_TO = 520;
+const OP2D_RECT = 521;
+const OP2D_ELLIPSE = 522;
+const OP2D_FILL = 523;
+const OP2D_STROKE = 524;
+const OP2D_CLIP = 525;
+const OP2D_FILL_RECT = 526;
+const OP2D_STROKE_RECT = 527;
+const OP2D_CLEAR_RECT = 528;
+const OP2D_SAVE = 529;
+const OP2D_RESTORE = 530;
+const OP2D_SET_TRANSFORM = 531;
+const OP2D_RESET_TRANSFORM = 532;
+const OP2D_TRANSLATE = 533;
+const OP2D_ROTATE = 534;
+const OP2D_SCALE = 535;
+const OP2D_SET_LINE_WIDTH = 536;
+const OP2D_SET_GLOBAL_ALPHA = 537;
+const OP2D_SET_MITER_LIMIT = 538;
+const OP2D_SET_LINE_DASH_OFFSET = 539;
+const OP2D_SET_SHADOW_BLUR = 540;
+const OP2D_SET_SHADOW_OFFSET_X = 541;
+const OP2D_SET_SHADOW_OFFSET_Y = 542;
+const OP2D_SET_LINE_CAP = 543;
+const OP2D_SET_LINE_JOIN = 544;
+const OP2D_SET_COMPOSITE_OPERATION = 545;
+const OP2D_SET_FILL_STYLE = 546;
+const OP2D_SET_STROKE_STYLE = 547;
+const OP2D_SET_SHADOW_COLOR = 548;
+
+// --- 2D canvas selection ---
+//
+// `Canvas2DCmd` carries no canvas id -- the id lives on the batch -- so the
+// stream names the canvas once and the records that follow inherit it. The
+// reader starts every stream with no canvas selected, which is why this resets
+// on submit: a buffer that begins mid-frame must name its canvas again, and a
+// 2D record the reader meets before a selection is one it refuses.
+//
+// -1 is not a canvas id, so it means "nothing selected".
+let _selected2d = -1;
+
+// Open a 2D record, naming the canvas first when the reader would not know it.
+//
+// The fit reserves the selection record unconditionally, even when the canvas is
+// already selected. Two words per buffer is the entire cost, and it buys the
+// property that makes this correct: `ensureFit` may submit and swap, which
+// clears the selection, so a fit sized for the record alone would decide "no
+// selection needed" and then flush that decision away.
+function begin2d(canvasId, wordCount) {
+    ensureBuffers();
+    ensureFit(wordCount + 2);
+    if (_selected2d !== canvasId) {
+        _u32[cursor] = packHeader(OP2D_SELECT_CANVAS, 2);
+        _u32[cursor + 1] = canvasId;
+        cursor += 2;
+        _selected2d = canvasId;
+    }
+    return cursor;
+}
+
+// --- Fixed-arity 2D encoders ---
+//
+// Layouts follow `frame_wire::canvas2d::record_spec`, word counts include the
+// header, and the `f32` fields go through the float overlay so a NaN payload or
+// a signed zero arrives as the bits the caller wrote.
+
+// 513 BEGIN_PATH / 514 CLOSE_PATH / 523 FILL / 524 STROKE / 525 CLIP /
+// 529 SAVE / 530 RESTORE / 532 RESET_TRANSFORM: H (1 word)
+function _encode2dNullary(opcode, canvasId) {
+    const base = begin2d(canvasId, 1);
+    _u32[base] = packHeader(opcode, 1);
+    cursor = base + 1;
+}
+
+// 536..542 the f32 state scalars: H F (2 words)
+function _encode2dScalar(opcode, canvasId, value) {
+    const base = begin2d(canvasId, 2);
+    _u32[base] = packHeader(opcode, 2);
+    _f32[base + 1] = value;
+    cursor = base + 2;
+}
+
+// 543..545 the small enumerations: H U (2 words)
+function _encode2dEnum(opcode, canvasId, value) {
+    const base = begin2d(canvasId, 2);
+    _u32[base] = packHeader(opcode, 2);
+    _u32[base + 1] = value >>> 0;
+    cursor = base + 2;
+}
+
+// H F F (3 words): 515 MOVE_TO, 516 LINE_TO, 533 TRANSLATE, 535 SCALE
+function _encode2dPair(opcode, canvasId, x, y) {
+    const base = begin2d(canvasId, 3);
+    _u32[base] = packHeader(opcode, 3);
+    _f32[base + 1] = x;
+    _f32[base + 2] = y;
+    cursor = base + 3;
+}
+
+// H F F F F (5 words): 521 RECT, 526 FILL_RECT, 527 STROKE_RECT, 528 CLEAR_RECT
+function _encode2dQuad(opcode, canvasId, a, b, c, d) {
+    const base = begin2d(canvasId, 5);
+    _u32[base] = packHeader(opcode, 5);
+    _f32[base + 1] = a;
+    _f32[base + 2] = b;
+    _f32[base + 3] = c;
+    _f32[base + 4] = d;
+    cursor = base + 5;
+}
+
+// H F F F F (5 words): 546 SET_FILL_STYLE, 547 SET_STROKE_STYLE,
+// 548 SET_SHADOW_COLOR. Four floats rather than a packed word: `Color` is four
+// `f32` on the destination, and packing to 8-bit channels here would quantise a
+// value the renderer keeps at full precision.
+function _encode2dColor(opcode, canvasId, r, g, b, a) {
+    const base = begin2d(canvasId, 5);
+    _u32[base] = packHeader(opcode, 5);
+    _f32[base + 1] = r;
+    _f32[base + 2] = g;
+    _f32[base + 3] = b;
+    _f32[base + 4] = a;
+    cursor = base + 5;
+}
+
+function encode2dBeginPath(canvasId) { _encode2dNullary(OP2D_BEGIN_PATH, canvasId); }
+function encode2dClosePath(canvasId) { _encode2dNullary(OP2D_CLOSE_PATH, canvasId); }
+function encode2dFill(canvasId) { _encode2dNullary(OP2D_FILL, canvasId); }
+function encode2dStroke(canvasId) { _encode2dNullary(OP2D_STROKE, canvasId); }
+function encode2dClip(canvasId) { _encode2dNullary(OP2D_CLIP, canvasId); }
+function encode2dSave(canvasId) { _encode2dNullary(OP2D_SAVE, canvasId); }
+function encode2dRestore(canvasId) { _encode2dNullary(OP2D_RESTORE, canvasId); }
+function encode2dResetTransform(canvasId) { _encode2dNullary(OP2D_RESET_TRANSFORM, canvasId); }
+
+function encode2dMoveTo(canvasId, x, y) { _encode2dPair(OP2D_MOVE_TO, canvasId, x, y); }
+function encode2dLineTo(canvasId, x, y) { _encode2dPair(OP2D_LINE_TO, canvasId, x, y); }
+function encode2dTranslate(canvasId, x, y) { _encode2dPair(OP2D_TRANSLATE, canvasId, x, y); }
+function encode2dScale(canvasId, x, y) { _encode2dPair(OP2D_SCALE, canvasId, x, y); }
+
+function encode2dRect(canvasId, x, y, w, h) { _encode2dQuad(OP2D_RECT, canvasId, x, y, w, h); }
+function encode2dFillRect(canvasId, x, y, w, h) { _encode2dQuad(OP2D_FILL_RECT, canvasId, x, y, w, h); }
+function encode2dStrokeRect(canvasId, x, y, w, h) { _encode2dQuad(OP2D_STROKE_RECT, canvasId, x, y, w, h); }
+function encode2dClearRect(canvasId, x, y, w, h) { _encode2dQuad(OP2D_CLEAR_RECT, canvasId, x, y, w, h); }
+
+// 517 QUADRATIC_CURVE_TO: H F F F F (5 words)
+function encode2dQuadraticCurveTo(canvasId, cpx, cpy, x, y) {
+    _encode2dQuad(OP2D_QUADRATIC_CURVE_TO, canvasId, cpx, cpy, x, y);
+}
+
+// 518 BEZIER_CURVE_TO: H F F F F F F (7 words)
+function encode2dBezierCurveTo(canvasId, cp1x, cp1y, cp2x, cp2y, x, y) {
+    const base = begin2d(canvasId, 7);
+    _u32[base] = packHeader(OP2D_BEZIER_CURVE_TO, 7);
+    _f32[base + 1] = cp1x;
+    _f32[base + 2] = cp1y;
+    _f32[base + 3] = cp2x;
+    _f32[base + 4] = cp2y;
+    _f32[base + 5] = x;
+    _f32[base + 6] = y;
+    cursor = base + 7;
+}
+
+// 519 ARC: H F F F F F B (7 words). The direction flag is a real bool on the
+// wire -- the reader rejects anything but 0 or 1 -- so a truthy value is
+// narrowed here rather than passed through.
+function encode2dArc(canvasId, x, y, radius, startAngle, endAngle, counterclockwise) {
+    const base = begin2d(canvasId, 7);
+    _u32[base] = packHeader(OP2D_ARC, 7);
+    _f32[base + 1] = x;
+    _f32[base + 2] = y;
+    _f32[base + 3] = radius;
+    _f32[base + 4] = startAngle;
+    _f32[base + 5] = endAngle;
+    _u32[base + 6] = counterclockwise ? 1 : 0;
+    cursor = base + 7;
+}
+
+// 520 ARC_TO: H F F F F F (6 words)
+function encode2dArcTo(canvasId, x1, y1, x2, y2, radius) {
+    const base = begin2d(canvasId, 6);
+    _u32[base] = packHeader(OP2D_ARC_TO, 6);
+    _f32[base + 1] = x1;
+    _f32[base + 2] = y1;
+    _f32[base + 3] = x2;
+    _f32[base + 4] = y2;
+    _f32[base + 5] = radius;
+    cursor = base + 6;
+}
+
+// 522 ELLIPSE: H F F F F F F F B (9 words)
+function encode2dEllipse(canvasId, x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise) {
+    const base = begin2d(canvasId, 9);
+    _u32[base] = packHeader(OP2D_ELLIPSE, 9);
+    _f32[base + 1] = x;
+    _f32[base + 2] = y;
+    _f32[base + 3] = radiusX;
+    _f32[base + 4] = radiusY;
+    _f32[base + 5] = rotation;
+    _f32[base + 6] = startAngle;
+    _f32[base + 7] = endAngle;
+    _u32[base + 8] = counterclockwise ? 1 : 0;
+    cursor = base + 9;
+}
+
+// 531 SET_TRANSFORM: H F F F F F F (7 words)
+function encode2dSetTransform(canvasId, a, b, c, d, e, f) {
+    const base = begin2d(canvasId, 7);
+    _u32[base] = packHeader(OP2D_SET_TRANSFORM, 7);
+    _f32[base + 1] = a;
+    _f32[base + 2] = b;
+    _f32[base + 3] = c;
+    _f32[base + 4] = d;
+    _f32[base + 5] = e;
+    _f32[base + 6] = f;
+    cursor = base + 7;
+}
+
+// 534 ROTATE: H F (2 words)
+function encode2dRotate(canvasId, angle) { _encode2dScalar(OP2D_ROTATE, canvasId, angle); }
+
+function encode2dSetLineWidth(canvasId, v) { _encode2dScalar(OP2D_SET_LINE_WIDTH, canvasId, v); }
+function encode2dSetGlobalAlpha(canvasId, v) { _encode2dScalar(OP2D_SET_GLOBAL_ALPHA, canvasId, v); }
+function encode2dSetMiterLimit(canvasId, v) { _encode2dScalar(OP2D_SET_MITER_LIMIT, canvasId, v); }
+function encode2dSetLineDashOffset(canvasId, v) { _encode2dScalar(OP2D_SET_LINE_DASH_OFFSET, canvasId, v); }
+function encode2dSetShadowBlur(canvasId, v) { _encode2dScalar(OP2D_SET_SHADOW_BLUR, canvasId, v); }
+function encode2dSetShadowOffsetX(canvasId, v) { _encode2dScalar(OP2D_SET_SHADOW_OFFSET_X, canvasId, v); }
+function encode2dSetShadowOffsetY(canvasId, v) { _encode2dScalar(OP2D_SET_SHADOW_OFFSET_Y, canvasId, v); }
+
+function encode2dSetLineCap(canvasId, v) { _encode2dEnum(OP2D_SET_LINE_CAP, canvasId, v); }
+function encode2dSetLineJoin(canvasId, v) { _encode2dEnum(OP2D_SET_LINE_JOIN, canvasId, v); }
+function encode2dSetCompositeOperation(canvasId, v) { _encode2dEnum(OP2D_SET_COMPOSITE_OPERATION, canvasId, v); }
+
+function encode2dSetFillStyle(canvasId, r, g, b, a) { _encode2dColor(OP2D_SET_FILL_STYLE, canvasId, r, g, b, a); }
+function encode2dSetStrokeStyle(canvasId, r, g, b, a) { _encode2dColor(OP2D_SET_STROKE_STYLE, canvasId, r, g, b, a); }
+function encode2dSetShadowColor(canvasId, r, g, b, a) { _encode2dColor(OP2D_SET_SHADOW_COLOR, canvasId, r, g, b, a); }
+
+// --- flushRenderCommandStream ---
 // If unallocated OR cursor==2 (empty): allocation-free no-op.
 // Else: submit the current buffer, reset, swap.
 // Non-zero status from op throws an internal error.
 
-function flushGlCommandStream() {
+function flushRenderCommandStream() {
     if (_u32 === null || cursor === 2) return;
     _submitAndSwap();
 }
 
-// --- discardGlCommandStream ---
+// --- discardRenderCommandStream ---
 // Context-loss path: drop pending commands without submitting.
 // Reset the active cursor to 2. No swap.
 
-function discardGlCommandStream() {
+function discardRenderCommandStream() {
     if (_u32 === null) return;
     cursor = 2;
     // Rewrite header so the buffer is clean for the next use.
     _u32[0] = MAGIC;
     _u32[1] = STREAM_VERSION;
+    _selected2d = -1;
 }
 
 // --- Exports ---
@@ -1175,7 +1441,44 @@ export {
     encodeUniformMatrix2fv,
     encodeUniformMatrix3fv,
     encodeUniformMatrix4fv,
+    // Canvas2D encoders
+    encode2dBeginPath,
+    encode2dClosePath,
+    encode2dMoveTo,
+    encode2dLineTo,
+    encode2dQuadraticCurveTo,
+    encode2dBezierCurveTo,
+    encode2dArc,
+    encode2dArcTo,
+    encode2dRect,
+    encode2dEllipse,
+    encode2dFill,
+    encode2dStroke,
+    encode2dClip,
+    encode2dFillRect,
+    encode2dStrokeRect,
+    encode2dClearRect,
+    encode2dSave,
+    encode2dRestore,
+    encode2dSetTransform,
+    encode2dResetTransform,
+    encode2dTranslate,
+    encode2dRotate,
+    encode2dScale,
+    encode2dSetLineWidth,
+    encode2dSetGlobalAlpha,
+    encode2dSetMiterLimit,
+    encode2dSetLineDashOffset,
+    encode2dSetShadowBlur,
+    encode2dSetShadowOffsetX,
+    encode2dSetShadowOffsetY,
+    encode2dSetLineCap,
+    encode2dSetLineJoin,
+    encode2dSetCompositeOperation,
+    encode2dSetFillStyle,
+    encode2dSetStrokeStyle,
+    encode2dSetShadowColor,
     // Lifecycle
-    flushGlCommandStream,
-    discardGlCommandStream,
+    flushRenderCommandStream,
+    discardRenderCommandStream,
 };

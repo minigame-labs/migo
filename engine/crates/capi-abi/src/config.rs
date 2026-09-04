@@ -90,6 +90,18 @@ impl MigoEngineConfig {
 pub struct MigoSessionConfig {
     pub header: VersionedHeader,
     pub flags: u64,
+    /// The 128-bit identity an external producer's packets must carry, or all
+    /// zero when there is no external producer.
+    ///
+    /// Appended in the second version of this record, which is why it is at the
+    /// end: `copy_versioned` zero-extends a shorter caller, so a host built
+    /// against v1 keeps working and gets no identity -- which is the correct
+    /// answer for a host that has no producer to authenticate.
+    ///
+    /// Supplied by the host, not generated here. It is the shared secret
+    /// between the transport and the session, and the party that owns both ends
+    /// is the one that must generate it; see `include/migo/external_frames.h`.
+    pub launch_nonce: [u8; 16],
 }
 
 // SAFETY: the repr(C) record contains only zero-valid integer fields and the
@@ -97,7 +109,12 @@ pub struct MigoSessionConfig {
 unsafe impl AbiStruct for MigoSessionConfig {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ValidatedSessionConfig;
+pub struct ValidatedSessionConfig {
+    /// `None` when the caller supplied no identity, either by passing the v1
+    /// record or by leaving the field zero. An external-frame session refuses
+    /// to start without one; an embedded session has no use for it.
+    pub launch_nonce: Option<u128>,
+}
 
 impl MigoSessionConfig {
     /// Copy and validate a caller-owned session configuration.
@@ -119,7 +136,12 @@ impl MigoSessionConfig {
 
     fn validate_fields(self) -> Result<ValidatedSessionConfig, MigoResult> {
         validate_flags(self.flags, 0)?;
-        Ok(ValidatedSessionConfig)
+        Ok(ValidatedSessionConfig {
+            // Read through the one conversion both records share. All-zero is
+            // treated as absent rather than as a value: it is what an
+            // uninitialised struct holds and what a v1 caller zero-extends to.
+            launch_nonce: crate::external_frames::launch_nonce_from_bytes(self.launch_nonce),
+        })
     }
 }
 
@@ -183,7 +205,9 @@ const _: () = assert!(offset_of!(MigoEngineConfig, header) == 0);
 const _: () = assert!(offset_of!(MigoEngineConfig, flags) == 8);
 const _: () = assert!(offset_of!(MigoEngineConfig, reserved0) == 16);
 const _: () = assert!(offset_of!(MigoSessionConfig, header) == 0);
-const _: () = assert!(size_of::<MigoSessionConfig>() == 16);
+const _: () = assert!(size_of::<MigoSessionConfig>() == 32);
+const _: () = assert!(offset_of!(MigoSessionConfig, flags) == 8);
+const _: () = assert!(offset_of!(MigoSessionConfig, launch_nonce) == 16);
 const _: () = assert!(offset_of!(MigoSessionConfig, flags) == 8);
 const _: () = assert!(offset_of!(MigoContentDescriptor, header) == 0);
 const _: () = assert!(offset_of!(MigoContentDescriptor, flags) == 8);

@@ -16,8 +16,21 @@ crate-type = ["staticlib", "rlib"]
 
 [features]
 default = ["profile-full"]
-profile-full = ["migo-core/profile-full", "platform/profile-full"]
-profile-slim = ["migo-core/profile-slim", "platform/profile-slim"]
+
+# The two execution modes, mirroring migo-core's. Mutually exclusive there, so
+# mutually exclusive here: `embedded-v8` links a JavaScript engine and
+# `external-frames` exists to prove a product links none.
+embedded-v8 = ["migo-core/embedded-v8"]
+# The platform services profile is a separate axis from the execution mode, and
+# the external lane still needs one. `slim` is the base the Apple capability
+# tier is defined against: Guideline 4.7.2 makes every native capability a thing
+# the embedding app has to justify to Apple, so the lane starts from the smaller
+# surface and adds rather than starting from everything and removing.
+external-frames = ["migo-core/external-frames", "platform/external-frames"]
+test-support = ["migo-core/test-support"]
+
+profile-full = ["embedded-v8", "migo-core/profile-full", "platform/profile-full"]
+profile-slim = ["embedded-v8", "migo-core/profile-slim", "platform/profile-slim"]
 
 [dependencies]
 migo-core = { path = "../core", default-features = false }

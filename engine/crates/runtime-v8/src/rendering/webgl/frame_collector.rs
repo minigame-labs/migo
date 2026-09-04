@@ -286,6 +286,33 @@ pub(crate) struct UnifiedFrameCollector {
     pending_2d: shared::protocol::CanvasIdSet,
     diagnostics_host_id: Option<i32>,
     diagnostics_stats: Option<Arc<shared::stats::DebugStats>>,
+    /// How many times this frame's commands crossed from JavaScript into
+    /// native, and what they carried.
+    boundary: BoundaryCounts,
+}
+
+/// The JavaScript-to-native crossing count, which is the whole of
+/// `android-ceiling-review.md`'s G2 and the number a command stream exists to
+/// move.
+///
+/// **Counted rather than inferred.** The alternative is reading it off the shape
+/// of the code -- "2D goes through the stream now, so it must be one" -- which
+/// is exactly the reasoning that cannot notice a call site that quietly fell
+/// back to an op. A frame that encodes three hundred commands and crosses three
+/// hundred times looks identical from the outside to one that crosses once.
+///
+/// It is a window rather than a frame: at sixty frames a second a per-frame line
+/// is unreadable and a single frame is a sample, not a summary. The window
+/// closes when the rate gate lets a line through.
+#[derive(Default)]
+struct BoundaryCounts {
+    /// Crossings in the frame being built.
+    crossings: u32,
+    /// Frames, crossings and commands since the last line was emitted.
+    window_frames: u32,
+    window_crossings: u64,
+    window_commands: u64,
+    window_worst_frame: u32,
 }
 
 /// Soft cap on the approximate byte-size of pending commands in the
@@ -307,6 +334,14 @@ pub(crate) struct UnifiedFrameCollector {
 /// gigantic DrawImageBatch can't pin the JS heap unbounded while the
 /// render thread is blocked.
 pub(crate) const AUTO_FLUSH_SOFT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Frames per boundary-counting window.
+///
+/// Five seconds at sixty frames a second, matched to the rate gate so a window
+/// is closed at roughly the moment its line is emitted. They are two clocks and
+/// they will drift; what matters is that neither can run away, and that a line
+/// always describes a window rather than a single frame.
+const BOUNDARY_WINDOW_FRAMES: u32 = 300;
 
 impl UnifiedFrameCollector {
     #[cfg(test)]
@@ -335,7 +370,28 @@ impl UnifiedFrameCollector {
             pending_2d: shared::protocol::CanvasIdSet::new(),
             diagnostics_host_id,
             diagnostics_stats,
+            boundary: BoundaryCounts::default(),
         }
+    }
+
+    /// One call from JavaScript reached the collector.
+    ///
+    /// Called from the two funnels every direct op goes through and once per
+    /// submitted command-stream buffer, so a buffer carrying three hundred
+    /// records counts one -- which is the distinction the number exists to make.
+    #[inline]
+    pub(crate) fn record_boundary_crossing(&mut self) {
+        self.boundary.crossings = self.boundary.crossings.saturating_add(1);
+    }
+
+    /// `(frames, crossings, commands)` accumulated since the window last closed.
+    #[cfg(test)]
+    pub(crate) fn boundary_window_for_test(&self) -> (u32, u64, u64) {
+        (
+            self.boundary.window_frames,
+            self.boundary.window_crossings,
+            self.boundary.window_commands,
+        )
     }
 
     #[inline]
@@ -699,7 +755,57 @@ impl UnifiedFrameCollector {
     pub(crate) fn build_frame_packet(&mut self, present: bool) -> Option<shared::FramePacket> {
         let packet = self.build_frame_packet_inner(present, false);
         self.publish_frame_peak();
+        self.close_boundary_frame(packet.as_ref());
         packet
+    }
+
+    /// Fold the finished frame into the window, and report the window when the
+    /// rate gate allows.
+    ///
+    /// A barrier flush mid-frame does not end a frame, so this is called only
+    /// from the presenting path: the crossings a barrier already counted stay
+    /// counted, which is right -- they crossed.
+    fn close_boundary_frame(&mut self, packet: Option<&shared::FramePacket>) {
+        let commands: u64 = packet
+            .map(|packet| {
+                packet
+                    .ops()
+                    .iter()
+                    .map(|op| match op {
+                        FrameOp::CanvasBatch(batch) => batch.commands.len() as u64,
+                        FrameOp::GlBatch(batch) => batch.commands.len() as u64,
+                        _ => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        let crossings = std::mem::take(&mut self.boundary.crossings);
+        self.boundary.window_frames = self.boundary.window_frames.saturating_add(1);
+        self.boundary.window_crossings = self
+            .boundary
+            .window_crossings
+            .saturating_add(u64::from(crossings));
+        self.boundary.window_commands = self.boundary.window_commands.saturating_add(commands);
+        self.boundary.window_worst_frame = self.boundary.window_worst_frame.max(crossings);
+
+        // The gate is checked before the window is read so a run that never
+        // reaches the interval costs one atomic load per frame and nothing else.
+        shared::info_rate_limited!(
+            std::time::Duration::from_secs(5),
+            "[boundary] frames={} crossings/frame={:.2} worst={} commands/frame={:.1} commands/crossing={:.1}",
+            self.boundary.window_frames,
+            self.boundary.window_crossings as f64 / self.boundary.window_frames.max(1) as f64,
+            self.boundary.window_worst_frame,
+            self.boundary.window_commands as f64 / self.boundary.window_frames.max(1) as f64,
+            self.boundary.window_commands as f64 / self.boundary.window_crossings.max(1) as f64,
+        );
+        if self.boundary.window_frames >= BOUNDARY_WINDOW_FRAMES {
+            self.boundary.window_frames = 0;
+            self.boundary.window_crossings = 0;
+            self.boundary.window_commands = 0;
+            self.boundary.window_worst_frame = 0;
+        }
     }
 
     /// Flush all pending segments as a non-presenting partial FramePacket.
@@ -707,13 +813,6 @@ impl UnifiedFrameCollector {
     /// Materializes ALL trailing pending 2D canvases so the sync op sees results.
     pub(crate) fn flush_as_barrier(&mut self) -> Option<shared::FramePacket> {
         self.build_frame_packet_inner(false, true)
-    }
-
-    /// Reset the buffer for a specific canvas at frame-begin.
-    pub(crate) fn frame_begin(&mut self, _canvas_id: u32) {
-        // Currently a no-op for the unified collector —
-        // segments are cleared by build_frame_packet at frame end.
-        // Kept for API compatibility with op_frame_begin.
     }
 
     // ── Canvas2D forwarding methods ────────────────────────────────
@@ -2696,7 +2795,7 @@ mod steady_state_allocation {
         );
     }
 
-    /// Section 7.3, on the batched half of the same path: `op_gl_submit_stream`
+    /// Section 7.3, on the batched half of the same path: `op_submit_render_stream`
     /// takes a vector from the pool, decodes a stream into it and hands it to
     /// `append_gl_batch`, which appends and recycles. That is one event per
     /// submit, and Pixi reaches it twice a frame with every draw batched behind

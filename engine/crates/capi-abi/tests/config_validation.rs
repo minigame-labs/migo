@@ -95,6 +95,8 @@ fn session_config_has_no_v1_flags() {
     let mut raw = MigoSessionConfig {
         header: header::<MigoSessionConfig>(),
         flags: 0,
+        // Absent, which is what a session with no external producer supplies.
+        launch_nonce: [0u8; 16],
     };
     raw.validate().expect("zero flags");
 

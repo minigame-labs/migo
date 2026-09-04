@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# The JavaScript frame encoder must reproduce the committed corpus exactly.
+#
+# contracts/frame-wire/wire-v1.md says the format has two implementations and
+# that neither is the specification: both are measured against the fixed corpus
+# in contracts/frame-wire/golden. For a while that was aspirational. There was
+# one encoder, so "the corpus is what the Rust builder produces" was a
+# tautology, and the sentence in the contract described a check nobody could run.
+#
+# THE DRIFT THIS EXISTS TO CATCH is the quiet kind. A JavaScript encoder that
+# reads a 128-bit launch nonce through `Number` is correct for every value
+# anyone types by hand and wrong for the value a real session uses -- and the
+# symptom is a renderer in another process rejecting frames as foreign, on a
+# device, with no way to see why. The corpus carries values past 2^53 so that
+# mistake fails here instead.
+#
+# Host-only: node, no device, no Apple toolchain.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+TEST="platforms/apple/WebContent/PerformancePlus/test/golden-corpus.test.mjs"
+ENCODER="platforms/apple/WebContent/PerformancePlus/src/wire-frame-packet.mjs"
+
+for required in "$TEST" "$ENCODER"; do
+    if [[ ! -f "$required" ]]; then
+        echo "FAIL: $required is missing; the cross-language corpus check cannot run." >&2
+        exit 1
+    fi
+done
+
+if ! command -v node >/dev/null 2>&1; then
+    # Not a pass. An environment without node cannot answer this question, and
+    # reporting "skipped" as success is how a check stops being one.
+    echo "FAIL: node is not available, so the JavaScript encoder is unverified." >&2
+    echo "      Install node (any version with BigInt DataView support) or run this on a host that has it." >&2
+    exit 1
+fi
+
+# The encoder must not have grown a dependency. It runs inside WebContent next
+# to untrusted game code; every import is one more thing inside that boundary,
+# and the test harness is the only place allowed to reach the filesystem.
+if grep -nE '^\s*import\b' "$ENCODER" >/dev/null 2>&1; then
+    echo "FAIL: $ENCODER imports something. It runs in WebContent beside untrusted" >&2
+    echo "      content and must stay dependency-free; the test harness does the I/O." >&2
+    grep -nE '^\s*import\b' "$ENCODER" >&2
+    exit 1
+fi
+
+# The shipped bundle must carry the producer and not its test suite.
+#
+# `build-apple-sdk.sh` used to copy the whole producer directory into the
+# SwiftPM resources, which put this test file and the packet emitter inside the
+# app bundle -- dead weight that reads the repository's golden corpus by
+# relative path, from a phone. Checked here because this is the gate that knows
+# what the producer directory contains.
+SDK_SCRIPT="scripts/build-apple-sdk.sh"
+if [[ -f "$SDK_SCRIPT" ]]; then
+    if ! grep -q 'WEBCONTENT_SRC/src' "$SDK_SCRIPT"; then
+        echo "FAIL: $SDK_SCRIPT does not stage the producer's src/ specifically." >&2
+        echo "      Copying the whole producer directory ships this test suite and the" >&2
+        echo "      packet emitter inside the app bundle." >&2
+        exit 1
+    fi
+    if grep -qE 'cp -R "\$WEBCONTENT_SRC"/\.' "$SDK_SCRIPT"; then
+        echo "FAIL: $SDK_SCRIPT copies the entire producer directory into the bundle." >&2
+        exit 1
+    fi
+fi
+
+node "$TEST"
+
+# --- and the other direction ------------------------------------------------
+#
+# The corpus above pins three shapes byte for byte. It cannot answer "does this
+# encoder ever produce something the reader refuses", because three cases do not
+# cover section counts, ragged payload lengths, the padding those imply, or the
+# wide-field values a real session uses. So the emitter writes a deterministic
+# spread of packets and the Rust reader validates every one, checking each field
+# came back at full width.
+#
+# The Rust side is `#[ignore]`d, because a `cargo test` run has no way to
+# produce its input. That is the visible form of the dependency; this gate is
+# what guarantees it actually runs, which is the half that a test returning
+# early on a missing environment variable would lose.
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "FAIL: cargo is not available, so the reader cannot check the emitter's packets." >&2
+    exit 1
+fi
+
+PACKETS="$(mktemp -d)"
+trap 'rm -rf "$PACKETS"' EXIT
+
+node platforms/apple/WebContent/PerformancePlus/test/emit-packets.mjs "$PACKETS" 128
+
+emitted="$(find "$PACKETS" -name 'packet-*.bin' | wc -l)"
+if (( emitted < 128 )); then
+    echo "FAIL: the emitter wrote $emitted packets, expected 128." >&2
+    exit 1
+fi
+
+# `--nocapture` so the count the test prints is in the log. A run that
+# validated zero packets and passed is the shape this repository keeps finding,
+# and the count below is what makes it visible rather than inferred.
+output="$(cd engine && MIGO_JS_PACKET_DIR="$PACKETS" \
+    cargo test -p migo-frame-wire --test js_interop -- --ignored --nocapture 2>&1)"
+status=$?
+printf '%s\n' "$output" | grep -E 'validated [0-9]+ JavaScript-encoded packets|test result' || true
+if (( status != 0 )); then
+    printf '%s\n' "$output" >&2
+    echo "FAIL: the Rust reader rejected packets built by the JavaScript encoder." >&2
+    exit 1
+fi
+if ! printf '%s\n' "$output" | grep -qE 'validated 128 JavaScript-encoded packets'; then
+    echo "FAIL: the interop test did not report validating 128 packets; it may not have run." >&2
+    exit 1
+fi

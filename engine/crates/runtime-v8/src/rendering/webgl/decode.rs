@@ -1,993 +1,140 @@
-// decode.rs — Task 2: Pass 2 semantic decode of a ValidatedStream.
-//
-// This module converts a structurally-valid GL command stream (produced by
-// Pass 1 in gl_stream.rs) into owned GLCmd values.  It uses the same
-// validators and conversions as the raw op handlers in webgl.rs so that
-// the resulting GLCmd / error queue state is identical regardless of whether
-// the command arrived via the typed stream or a direct raw op.
-//
-// Dependencies on webgl.rs helpers are accessed via `super::webgl::*` because
-// this module is a sibling of webgl.rs (both declared from mod.rs) and the
-// helpers are `pub(crate)`.
-
-use std::mem::size_of;
+//! Pass 2 of the render command stream, as this runtime reaches it.
+//!
+//! The decoder itself is in `frame-decode`, which links no JavaScript engine:
+//! turning validated words into render commands is engine-neutral work, and
+//! the Apple Performance+ product needs exactly this with no V8 anywhere in
+//! its dependency closure. It used to live here, which is what made that
+//! product impossible.
+//!
+//! What is left is the adapter. `frame-decode` needs somewhere to push a WebGL
+//! error, one piece of GL state, and somewhere to put the batches it cuts;
+//! here all three are reached through the op state.
+//!
+//! # Why one object is both the context and the sink
+//!
+//! `OpState` hands out one mutable borrow at a time, and both halves of the
+//! decode want it: the error queue lives there and so does the collector. A
+//! separate context and sink could not be held at once, which is why
+//! `decode_render_stream_into` takes a single value implementing both. The
+//! alternative -- decode into a buffer of `FrameOp`s and replay it afterwards --
+//! would put an intermediate vector of every batch in a frame on the path that
+//! this whole exercise exists to make cheaper.
 
 use deno_core::OpState;
-use shared::protocol::render_cmd::{GLCmd, UniformF32Values, UniformI32Values};
+use frame_decode::RenderSink;
+use shared::command_vec_pool::PooledVec;
+use shared::protocol::render_cmd::{Canvas2DCmd, GLCmd};
 
-use crate::rendering::webgl::{
-    error_state,
-    gl_stream::{
-        OP_ACTIVE_TEXTURE, OP_BIND_BUFFER, OP_BIND_BUFFER_BASE, OP_BIND_BUFFER_RANGE,
-        OP_BIND_FRAMEBUFFER, OP_BIND_RENDERBUFFER, OP_BIND_SAMPLER, OP_BIND_TEXTURE,
-        OP_BIND_VERTEX_ARRAY, OP_BLEND_COLOR, OP_BLEND_EQUATION, OP_BLEND_EQUATION_SEPARATE,
-        OP_BLEND_FUNC, OP_BLEND_FUNC_SEPARATE, OP_CLEAR, OP_CLEAR_COLOR, OP_CLEAR_DEPTH,
-        OP_CLEAR_STENCIL, OP_COLOR_MASK, OP_CULL_FACE, OP_DEPTH_FUNC, OP_DEPTH_MASK,
-        OP_DEPTH_RANGE, OP_DISABLE, OP_DISABLE_VERTEX_ATTRIB_ARRAY, OP_DRAW_ARRAYS,
-        OP_DRAW_ARRAYS_INSTANCED, OP_DRAW_ELEMENTS, OP_DRAW_ELEMENTS_INSTANCED, OP_ENABLE,
-        OP_ENABLE_VERTEX_ATTRIB_ARRAY, OP_FRONT_FACE, OP_GENERATE_MIPMAP, OP_HINT, OP_LINE_WIDTH,
-        OP_PIXEL_STORE_I, OP_POLYGON_OFFSET, OP_READ_BUFFER, OP_SAMPLER_PARAMETER_F,
-        OP_SAMPLER_PARAMETER_I, OP_SCISSOR, OP_STENCIL_FUNC, OP_STENCIL_FUNC_SEPARATE,
-        OP_STENCIL_MASK, OP_STENCIL_MASK_SEPARATE, OP_STENCIL_OP, OP_STENCIL_OP_SEPARATE,
-        OP_TEX_PARAMETER_F, OP_TEX_PARAMETER_I, OP_UNIFORM_MATRIX2FV, OP_UNIFORM_MATRIX3FV,
-        OP_UNIFORM_MATRIX4FV, OP_UNIFORM1F, OP_UNIFORM1FV, OP_UNIFORM1I, OP_UNIFORM1IV,
-        OP_UNIFORM2F, OP_UNIFORM2FV, OP_UNIFORM2IV, OP_UNIFORM3F, OP_UNIFORM3FV, OP_UNIFORM3IV,
-        OP_UNIFORM4F, OP_UNIFORM4FV, OP_UNIFORM4IV, OP_USE_PROGRAM, OP_VERTEX_ATTRIB_DIVISOR,
-        OP_VERTEX_ATTRIB_POINTER, OP_VIEWPORT, ValidatedStream, opcode_of, word_count_of,
-    },
-    webgl::{copy_f32_words, copy_i32_words},
-};
+#[cfg(test)]
+use crate::rendering::webgl::error_state::OpStateDecodeContext;
+use crate::rendering::webgl::error_state::WebGLErrorState;
+use crate::rendering::webgl::frame_collector::UnifiedFrameCollector;
+use crate::rendering::webgl::stream::ValidatedStream;
+
+/// The op state, as the shared decoder writes into it.
+pub(crate) struct OpStateRenderTarget<'a> {
+    state: &'a mut OpState,
+    /// Whether any batch pushed the collector past its soft budget.
+    ///
+    /// Recorded rather than acted on: flushing a barrier dispatches a frame
+    /// packet, and doing that in the middle of decoding a stream would put a
+    /// bounded-blocking send between two commands of the same frame. The caller
+    /// flushes once, after the stream is fully decoded.
+    over_budget: bool,
+}
+
+impl<'a> OpStateRenderTarget<'a> {
+    #[inline]
+    fn new(state: &'a mut OpState) -> Self {
+        Self {
+            state,
+            over_budget: false,
+        }
+    }
+}
+
+impl frame_decode::GlDecodeContext for OpStateRenderTarget<'_> {
+    #[inline]
+    fn push_error(&mut self, canvas_id: u32, code: u32) {
+        crate::rendering::webgl::error_state::push_error(self.state, canvas_id, code);
+    }
+
+    #[inline]
+    fn transform_feedback_captures(&self, canvas_id: u32) -> bool {
+        self.state
+            .borrow::<WebGLErrorState>()
+            .transform_feedback_captures(canvas_id)
+    }
+}
+
+impl RenderSink for OpStateRenderTarget<'_> {
+    fn canvas_batch(&mut self, canvas_id: u32, mut commands: PooledVec<Canvas2DCmd>) {
+        // One at a time, not appended wholesale: `push_canvas2d` marks the
+        // segment's dirty rectangle from each command and folds adjacent
+        // `drawImage` runs. A bulk append would skip both, and the partial
+        // update path would go quietly back to repainting whole canvases.
+        let over_budget = match self.state.try_borrow_mut::<UnifiedFrameCollector>() {
+            Some(collector) => {
+                for command in commands.drain(..) {
+                    collector.push_canvas2d(canvas_id, command);
+                }
+                collector.should_auto_flush()
+            }
+            // No collector installed (headless embedder): the commands have
+            // nowhere to go. The loan returns itself on the way out.
+            None => false,
+        };
+        self.over_budget |= over_budget;
+    }
+
+    fn gl_batch(&mut self, commands: PooledVec<GLCmd>, approx_bytes: usize) {
+        let over_budget = match self.state.try_borrow_mut::<UnifiedFrameCollector>() {
+            Some(collector) => collector.append_gl_batch(commands, approx_bytes),
+            None => false,
+        };
+        self.over_budget |= over_budget;
+    }
+
+    fn materialize(&mut self, _canvas_id: u32) {
+        // Deliberately dropped. The collector inserts its own barriers when it
+        // builds the frame packet, at exactly the boundaries this reports --
+        // every Canvas2D segment followed by a GL one, plus the trailing set
+        // when a sync barrier needs them. Pushing these as well would ask the
+        // renderer to flush the same canvas twice per boundary.
+    }
+}
 
 /// Decode a structurally-validated GL command stream into owned `GLCmd` values.
 ///
-/// For each record, builds the same `GLCmd` that the corresponding raw op
-/// would build — identical numeric conversions, identical null-id mapping,
-/// identical validator calls.  Records that fail semantic validation push
-/// an error into the per-canvas `WebGLErrorState` (just like raw ops) and
-/// are skipped; decoding continues with the next record.
-///
 /// Returns the saturating approximate byte count for all accepted commands.
+///
+/// Not on the submission path any more -- that decodes the mixed stream below.
+/// This is the GL-only view, and what is left of it here is the oracle the
+/// per-opcode cases in `webgl.rs` decode against: they check that a record
+/// arriving as words builds the same `GLCmd` the corresponding raw op does, one
+/// opcode at a time, which needs an entry point that returns the commands
+/// rather than one that files them away in a collector. `#[cfg(test)]` rather
+/// than an allow: it says which artifact this belongs to instead of hiding that
+/// the shipping one does not call it.
+#[cfg(test)]
 pub(crate) fn decode_validated_stream(
     state: &mut OpState,
     stream: ValidatedStream<'_>,
     out: &mut Vec<GLCmd>,
 ) -> usize {
-    let words = stream.words();
-    // words[0] = MAGIC, words[1] = VERSION, words[2..] = records.
-    // Pass 1 guarantees: magic, version, all record headers/bodies are valid.
-    let mut cursor: usize = 2;
-    let used = words.len();
-    let mut approx_bytes: usize = 0;
-
-    while cursor < used {
-        // Safe: Pass 1 guarantees header is present and wc > 0.
-        let header = words[cursor];
-        let opcode = opcode_of(header);
-        let wc = word_count_of(header) as usize;
-
-        // Safety: Pass 1 guarantees cursor + wc <= used.
-        let record = &words[cursor..cursor + wc];
-        // record[0] = header
-        // record[1] = canvas_id  (for most opcodes; sampler_parameter* has no canvas field)
-
-        let cmd_opt = decode_record(state, opcode, record);
-        if let Some(cmd) = cmd_opt {
-            approx_bytes = approx_bytes.saturating_add(cmd_approx_bytes(&cmd));
-            out.push(cmd);
-        }
-        cursor += wc;
-    }
-
-    approx_bytes
+    frame_decode::decode_validated_stream(&mut OpStateDecodeContext(state), stream, out)
 }
 
-/// Compute approximate byte cost of a single GLCmd.
-/// Fixed/scalar: size_of::<GLCmd>().
-/// Spilled variable uniform: size_of::<GLCmd>() + owned payload bytes.
-#[inline]
-fn cmd_approx_bytes(cmd: &GLCmd) -> usize {
-    let base = size_of::<GLCmd>();
-    match cmd {
-        GLCmd::Uniform1iv { value, .. }
-        | GLCmd::Uniform2iv { value, .. }
-        | GLCmd::Uniform3iv { value, .. }
-        | GLCmd::Uniform4iv { value, .. } => {
-            if value.spilled() {
-                base.saturating_add(value.capacity() * size_of::<i32>())
-            } else {
-                base
-            }
-        }
-        GLCmd::Uniform1fv { value, .. }
-        | GLCmd::Uniform2fv { value, .. }
-        | GLCmd::Uniform3fv { value, .. }
-        | GLCmd::Uniform4fv { value, .. }
-        | GLCmd::UniformMatrix2fv { value, .. }
-        | GLCmd::UniformMatrix3fv { value, .. }
-        | GLCmd::UniformMatrix4fv { value, .. } => {
-            if value.spilled() {
-                base.saturating_add(value.capacity() * size_of::<f32>())
-            } else {
-                base
-            }
-        }
-        _ => base,
-    }
-}
-
-/// Map a single record to a GLCmd (or None if semantic validation fails).
-/// `record[0]` = header word (includes opcode + word count).
-/// `record[1]` = canvas_id for most ops; sampler_parameter* omit canvas.
-#[allow(clippy::too_many_lines)]
-fn decode_record(state: &mut OpState, opcode: u32, record: &[u32]) -> Option<GLCmd> {
-    // Helper: convert a u32 word to i32 (two's-complement reinterpretation).
-    #[inline]
-    fn i(w: u32) -> i32 {
-        w as i32
-    }
-    // Helper: convert a u32 word to f32 (bit-exact, preserves NaN/-0/Inf).
-    #[inline]
-    fn f(w: u32) -> f32 {
-        f32::from_bits(w)
-    }
-    // Helper: convert a u32 word to bool (Pass 1 guaranteed 0 or 1).
-    #[inline]
-    fn b(w: u32) -> bool {
-        w != 0
-    }
-    // Helper: signed-id → Option<u32>: negative means None.
-    #[inline]
-    fn signed_id(w: u32) -> Option<u32> {
-        if (w as i32) < 0 { None } else { Some(w) }
-    }
-    // Helper: zero-or-positive id → Option<u32>: 0 means None.
-    #[inline]
-    fn nonzero_id(w: u32) -> Option<u32> {
-        if w == 0 { None } else { Some(w) }
-    }
-    // Helper: uniform location: negative means None.
-    #[inline]
-    fn location(w: u32) -> Option<u32> {
-        if (w as i32) < 0 { None } else { Some(w) }
-    }
-
-    // For most opcodes: record[1] = canvas_id, record[2..] = payload.
-    // SAMPLER_PARAMETER_I/F are exceptions (no canvas).
-
-    match opcode {
-        // ── 1: VIEWPORT: H C I I U U ───────────────────────────────────────────
-        OP_VIEWPORT => {
-            let canvas_id = record[1];
-            let x = i(record[2]);
-            let y = i(record[3]);
-            let width = record[4];
-            let height = record[5];
-            Some(GLCmd::Viewport {
-                canvas_id,
-                x,
-                y,
-                width,
-                height,
-            })
-        }
-
-        // ── 2: CLEAR: H C U ────────────────────────────────────────────────────
-        OP_CLEAR => {
-            let canvas_id = record[1];
-            let bit_field = record[2];
-            Some(GLCmd::Clear {
-                canvas_id,
-                bit_field,
-            })
-        }
-
-        // ── 3: CLEAR_COLOR: H C F F F F ────────────────────────────────────────
-        OP_CLEAR_COLOR => {
-            let canvas_id = record[1];
-            Some(GLCmd::ClearColor {
-                canvas_id,
-                r: f(record[2]),
-                g: f(record[3]),
-                b: f(record[4]),
-                a: f(record[5]),
-            })
-        }
-
-        // ── 4: CLEAR_DEPTH: H C F ───────────────────────────────────────────────
-        OP_CLEAR_DEPTH => {
-            let canvas_id = record[1];
-            Some(GLCmd::ClearDepth {
-                canvas_id,
-                depth: f(record[2]),
-            })
-        }
-
-        // ── 5: CLEAR_STENCIL: H C I ─────────────────────────────────────────────
-        OP_CLEAR_STENCIL => {
-            let canvas_id = record[1];
-            Some(GLCmd::ClearStencil {
-                canvas_id,
-                s: i(record[2]),
-            })
-        }
-
-        // ── 6: ENABLE: H C U ────────────────────────────────────────────────────
-        OP_ENABLE => {
-            let canvas_id = record[1];
-            Some(GLCmd::Enable {
-                canvas_id,
-                cap: record[2],
-            })
-        }
-
-        // ── 7: DISABLE: H C U ───────────────────────────────────────────────────
-        OP_DISABLE => {
-            let canvas_id = record[1];
-            Some(GLCmd::Disable {
-                canvas_id,
-                cap: record[2],
-            })
-        }
-
-        // ── 8: USE_PROGRAM: H C U ───────────────────────────────────────────────
-        OP_USE_PROGRAM => {
-            let canvas_id = record[1];
-            Some(GLCmd::UseProgram {
-                canvas_id,
-                program_id: record[2],
-            })
-        }
-
-        // ── 9: BIND_BUFFER: H C U I ─────────────────────────────────────────────
-        // Uses validate_bind_buffer_target; invalid target → error + skip.
-        // buffer < 0 → None.
-        OP_BIND_BUFFER => {
-            let canvas_id = record[1];
-            let target = record[2];
-            let buffer = signed_id(record[3]);
-            if !error_state::validate_bind_buffer_target(state, canvas_id, target) {
-                return None;
-            }
-            Some(GLCmd::BindBuffer {
-                canvas_id,
-                target,
-                buffer,
-            })
-        }
-
-        // ── 10: BIND_TEXTURE: H C U I ───────────────────────────────────────────
-        // texture < 0 → None.
-        OP_BIND_TEXTURE => {
-            let canvas_id = record[1];
-            Some(GLCmd::BindTexture {
-                canvas_id,
-                target: record[2],
-                texture: signed_id(record[3]),
-            })
-        }
-
-        // ── 11: ACTIVE_TEXTURE: H C U ───────────────────────────────────────────
-        OP_ACTIVE_TEXTURE => {
-            let canvas_id = record[1];
-            Some(GLCmd::ActiveTexture {
-                canvas_id,
-                unit: record[2],
-            })
-        }
-
-        // ── 12: BIND_FRAMEBUFFER: H C U I ───────────────────────────────────────
-        // framebuffer < 0 → None.
-        OP_BIND_FRAMEBUFFER => {
-            let canvas_id = record[1];
-            Some(GLCmd::BindFramebuffer {
-                canvas_id,
-                target: record[2],
-                framebuffer: signed_id(record[3]),
-            })
-        }
-
-        // ── 13: BIND_RENDERBUFFER: H C U I ──────────────────────────────────────
-        // renderbuffer < 0 → None.
-        OP_BIND_RENDERBUFFER => {
-            let canvas_id = record[1];
-            Some(GLCmd::BindRenderbuffer {
-                canvas_id,
-                target: record[2],
-                renderbuffer: signed_id(record[3]),
-            })
-        }
-
-        // ── 14: BIND_VERTEX_ARRAY: H C U ────────────────────────────────────────
-        // vao == 0 → None.
-        OP_BIND_VERTEX_ARRAY => {
-            let canvas_id = record[1];
-            Some(GLCmd::BindVertexArray {
-                canvas_id,
-                vao: nonzero_id(record[2]),
-            })
-        }
-
-        // ── 15: BIND_SAMPLER: H C U U ───────────────────────────────────────────
-        // sampler == 0 → None.
-        OP_BIND_SAMPLER => {
-            let canvas_id = record[1];
-            Some(GLCmd::BindSampler {
-                canvas_id,
-                unit: record[2],
-                sampler: nonzero_id(record[3]),
-            })
-        }
-
-        // ── 16: ENABLE_VERTEX_ATTRIB_ARRAY: H C U ───────────────────────────────
-        OP_ENABLE_VERTEX_ATTRIB_ARRAY => {
-            let canvas_id = record[1];
-            Some(GLCmd::EnableVertexAttribArray {
-                canvas_id,
-                index: record[2],
-            })
-        }
-
-        // ── 17: DISABLE_VERTEX_ATTRIB_ARRAY: H C U ──────────────────────────────
-        OP_DISABLE_VERTEX_ATTRIB_ARRAY => {
-            let canvas_id = record[1];
-            Some(GLCmd::DisableVertexAttribArray {
-                canvas_id,
-                index: record[2],
-            })
-        }
-
-        // ── 18: VERTEX_ATTRIB_POINTER: H C U I U B I I ──────────────────────────
-        // Uses validate_vertex_attrib_pointer; invalid → error + skip.
-        OP_VERTEX_ATTRIB_POINTER => {
-            let canvas_id = record[1];
-            let index = record[2];
-            let size = i(record[3]);
-            let type_ = record[4];
-            let normalized = b(record[5]);
-            let stride = i(record[6]);
-            let offset = i(record[7]);
-            if !error_state::validate_vertex_attrib_pointer(
-                state, canvas_id, size, type_, stride, offset,
-            ) {
-                return None;
-            }
-            Some(GLCmd::VertexAttribPointer {
-                canvas_id,
-                index,
-                size,
-                type_,
-                normalized,
-                stride,
-                offset,
-            })
-        }
-
-        // ── 19: VERTEX_ATTRIB_DIVISOR: H C U U ──────────────────────────────────
-        OP_VERTEX_ATTRIB_DIVISOR => {
-            let canvas_id = record[1];
-            Some(GLCmd::VertexAttribDivisor {
-                canvas_id,
-                index: record[2],
-                divisor: record[3],
-            })
-        }
-
-        // ── 20: BLEND_FUNC: H C U U ─────────────────────────────────────────────
-        OP_BLEND_FUNC => {
-            let canvas_id = record[1];
-            Some(GLCmd::BlendFunc {
-                canvas_id,
-                sfactor: record[2],
-                dfactor: record[3],
-            })
-        }
-
-        // ── 21: BLEND_FUNC_SEPARATE: H C U U U U ────────────────────────────────
-        OP_BLEND_FUNC_SEPARATE => {
-            let canvas_id = record[1];
-            Some(GLCmd::BlendFuncSeparate {
-                canvas_id,
-                src_rgb: record[2],
-                dst_rgb: record[3],
-                src_alpha: record[4],
-                dst_alpha: record[5],
-            })
-        }
-
-        // ── 22: BLEND_EQUATION: H C U ───────────────────────────────────────────
-        OP_BLEND_EQUATION => {
-            let canvas_id = record[1];
-            Some(GLCmd::BlendEquation {
-                canvas_id,
-                mode: record[2],
-            })
-        }
-
-        // ── 23: BLEND_EQUATION_SEPARATE: H C U U ────────────────────────────────
-        OP_BLEND_EQUATION_SEPARATE => {
-            let canvas_id = record[1];
-            Some(GLCmd::BlendEquationSeparate {
-                canvas_id,
-                mode_rgb: record[2],
-                mode_alpha: record[3],
-            })
-        }
-
-        // ── 24: BLEND_COLOR: H C F F F F ────────────────────────────────────────
-        OP_BLEND_COLOR => {
-            let canvas_id = record[1];
-            Some(GLCmd::BlendColor {
-                canvas_id,
-                r: f(record[2]),
-                g: f(record[3]),
-                b: f(record[4]),
-                a: f(record[5]),
-            })
-        }
-
-        // ── 25: DEPTH_FUNC: H C U ───────────────────────────────────────────────
-        OP_DEPTH_FUNC => {
-            let canvas_id = record[1];
-            Some(GLCmd::DepthFunc {
-                canvas_id,
-                func: record[2],
-            })
-        }
-
-        // ── 26: DEPTH_MASK: H C B ────────────────────────────────────────────────
-        OP_DEPTH_MASK => {
-            let canvas_id = record[1];
-            Some(GLCmd::DepthMask {
-                canvas_id,
-                flag: b(record[2]),
-            })
-        }
-
-        // ── 27: DEPTH_RANGE: H C F F ─────────────────────────────────────────────
-        OP_DEPTH_RANGE => {
-            let canvas_id = record[1];
-            Some(GLCmd::DepthRange {
-                canvas_id,
-                near: f(record[2]),
-                far: f(record[3]),
-            })
-        }
-
-        // ── 28: STENCIL_FUNC: H C U I U ─────────────────────────────────────────
-        OP_STENCIL_FUNC => {
-            let canvas_id = record[1];
-            Some(GLCmd::StencilFunc {
-                canvas_id,
-                func: record[2],
-                ref_: i(record[3]),
-                mask: record[4],
-            })
-        }
-
-        // ── 29: STENCIL_FUNC_SEPARATE: H C U U I U ──────────────────────────────
-        OP_STENCIL_FUNC_SEPARATE => {
-            let canvas_id = record[1];
-            Some(GLCmd::StencilFuncSeparate {
-                canvas_id,
-                face: record[2],
-                func: record[3],
-                ref_: i(record[4]),
-                mask: record[5],
-            })
-        }
-
-        // ── 30: STENCIL_OP: H C U U U ───────────────────────────────────────────
-        OP_STENCIL_OP => {
-            let canvas_id = record[1];
-            Some(GLCmd::StencilOp {
-                canvas_id,
-                fail: record[2],
-                zfail: record[3],
-                zpass: record[4],
-            })
-        }
-
-        // ── 31: STENCIL_OP_SEPARATE: H C U U U U ────────────────────────────────
-        OP_STENCIL_OP_SEPARATE => {
-            let canvas_id = record[1];
-            Some(GLCmd::StencilOpSeparate {
-                canvas_id,
-                face: record[2],
-                fail: record[3],
-                zfail: record[4],
-                zpass: record[5],
-            })
-        }
-
-        // ── 32: STENCIL_MASK: H C U ─────────────────────────────────────────────
-        OP_STENCIL_MASK => {
-            let canvas_id = record[1];
-            Some(GLCmd::StencilMask {
-                canvas_id,
-                mask: record[2],
-            })
-        }
-
-        // ── 33: STENCIL_MASK_SEPARATE: H C U U ──────────────────────────────────
-        OP_STENCIL_MASK_SEPARATE => {
-            let canvas_id = record[1];
-            Some(GLCmd::StencilMaskSeparate {
-                canvas_id,
-                face: record[2],
-                mask: record[3],
-            })
-        }
-
-        // ── 34: CULL_FACE: H C U ────────────────────────────────────────────────
-        OP_CULL_FACE => {
-            let canvas_id = record[1];
-            Some(GLCmd::CullFace {
-                canvas_id,
-                mode: record[2],
-            })
-        }
-
-        // ── 35: FRONT_FACE: H C U ───────────────────────────────────────────────
-        OP_FRONT_FACE => {
-            let canvas_id = record[1];
-            Some(GLCmd::FrontFace {
-                canvas_id,
-                mode: record[2],
-            })
-        }
-
-        // ── 36: COLOR_MASK: H C B B B B ─────────────────────────────────────────
-        OP_COLOR_MASK => {
-            let canvas_id = record[1];
-            Some(GLCmd::ColorMask {
-                canvas_id,
-                r: b(record[2]),
-                g: b(record[3]),
-                b: b(record[4]),
-                a: b(record[5]),
-            })
-        }
-
-        // ── 37: SCISSOR: H C I I I I ─────────────────────────────────────────────
-        // Uses validate_viewport_like (same as op_scissor); invalid → error + skip.
-        OP_SCISSOR => {
-            let canvas_id = record[1];
-            let x = i(record[2]);
-            let y = i(record[3]);
-            let width = i(record[4]);
-            let height = i(record[5]);
-            if !error_state::validate_viewport_like(state, canvas_id, width, height) {
-                return None;
-            }
-            Some(GLCmd::Scissor {
-                canvas_id,
-                x,
-                y,
-                width,
-                height,
-            })
-        }
-
-        // ── 38: LINE_WIDTH: H C F ────────────────────────────────────────────────
-        OP_LINE_WIDTH => {
-            let canvas_id = record[1];
-            Some(GLCmd::LineWidth {
-                canvas_id,
-                width: f(record[2]),
-            })
-        }
-
-        // ── 39: POLYGON_OFFSET: H C F F ─────────────────────────────────────────
-        OP_POLYGON_OFFSET => {
-            let canvas_id = record[1];
-            Some(GLCmd::PolygonOffset {
-                canvas_id,
-                factor: f(record[2]),
-                units: f(record[3]),
-            })
-        }
-
-        // ── 40: TEX_PARAMETER_I: H C U U I ──────────────────────────────────────
-        OP_TEX_PARAMETER_I => {
-            let canvas_id = record[1];
-            Some(GLCmd::TexParameteri {
-                canvas_id,
-                target: record[2],
-                pname: record[3],
-                param: i(record[4]),
-            })
-        }
-
-        // ── 41: TEX_PARAMETER_F: H C U U F ──────────────────────────────────────
-        OP_TEX_PARAMETER_F => {
-            let canvas_id = record[1];
-            Some(GLCmd::TexParameterf {
-                canvas_id,
-                target: record[2],
-                pname: record[3],
-                param: f(record[4]),
-            })
-        }
-
-        // ── 42: GENERATE_MIPMAP: H C U ───────────────────────────────────────────
-        OP_GENERATE_MIPMAP => {
-            let canvas_id = record[1];
-            Some(GLCmd::GenerateMipmap {
-                canvas_id,
-                target: record[2],
-            })
-        }
-
-        // ── 43: PIXEL_STORE_I: H C U I ───────────────────────────────────────────
-        OP_PIXEL_STORE_I => {
-            let canvas_id = record[1];
-            Some(GLCmd::PixelStorei {
-                canvas_id,
-                pname: record[2],
-                param: i(record[3]),
-            })
-        }
-
-        // ── 44: HINT: H C U U ────────────────────────────────────────────────────
-        OP_HINT => {
-            let canvas_id = record[1];
-            Some(GLCmd::Hint {
-                canvas_id,
-                target: record[2],
-                mode: record[3],
-            })
-        }
-
-        // ── 45: SAMPLER_PARAMETER_I: H U U I ────────────────────────────────────
-        // NOTE: no canvas_id field in wire format; record layout: H sampler pname param.
-        OP_SAMPLER_PARAMETER_I => Some(GLCmd::SamplerParameteri {
-            sampler: record[1],
-            pname: record[2],
-            param: i(record[3]),
-        }),
-
-        // ── 46: SAMPLER_PARAMETER_F: H U U F ────────────────────────────────────
-        // NOTE: no canvas_id field; record layout: H sampler pname param.
-        OP_SAMPLER_PARAMETER_F => Some(GLCmd::SamplerParameterf {
-            sampler: record[1],
-            pname: record[2],
-            param: f(record[3]),
-        }),
-
-        // ── 47: DRAW_ARRAYS: H C U I I ───────────────────────────────────────────
-        OP_DRAW_ARRAYS => {
-            let canvas_id = record[1];
-            Some(GLCmd::DrawArrays {
-                canvas_id,
-                mode: record[2],
-                first: i(record[3]),
-                count: i(record[4]),
-            })
-        }
-
-        // ── 48: DRAW_ELEMENTS: H C U I U I ───────────────────────────────────────
-        OP_DRAW_ELEMENTS => {
-            let canvas_id = record[1];
-            Some(GLCmd::DrawElements {
-                canvas_id,
-                mode: record[2],
-                count: i(record[3]),
-                index_type: record[4],
-                offset: i(record[5]),
-            })
-        }
-
-        // ── 49: DRAW_ARRAYS_INSTANCED: H C U I I I ───────────────────────────────
-        OP_DRAW_ARRAYS_INSTANCED => {
-            let canvas_id = record[1];
-            Some(GLCmd::DrawArraysInstanced {
-                canvas_id,
-                mode: record[2],
-                first: i(record[3]),
-                count: i(record[4]),
-                instance_count: i(record[5]),
-            })
-        }
-
-        // ── 50: DRAW_ELEMENTS_INSTANCED: H C U I U I I ───────────────────────────
-        OP_DRAW_ELEMENTS_INSTANCED => {
-            let canvas_id = record[1];
-            Some(GLCmd::DrawElementsInstanced {
-                canvas_id,
-                mode: record[2],
-                count: i(record[3]),
-                index_type: record[4],
-                offset: i(record[5]),
-                instance_count: i(record[6]),
-            })
-        }
-
-        // ── 51: BIND_BUFFER_BASE: H C U U U ─────────────────────────────────────
-        // Delegates to bind_buffer_base_impl which validates + pushes to collector.
-        // Because the impl already calls queue_gl_fire_and_forget we do NOT push to
-        // `out` here — the command is already in the collector.  Task 3 will change
-        // this flow; for now decode_validated_stream is called before the collector
-        // is set up in the test harness, so we call the impl and separately capture
-        // the GLCmd for tests using the decode-only path.
-        //
-        // Actually: Task 2's contract says decode pushes to `out` for batch append
-        // (Task 3 will do the appending).  We must NOT call bind_buffer_base_impl
-        // here because that would double-push via queue_gl_fire_and_forget.
-        // Instead mirror its exact logic manually.
-        OP_BIND_BUFFER_BASE => {
-            let canvas_id = record[1];
-            let target = record[2];
-            let index = record[3];
-            let buffer_raw = record[4];
-            let buffer = nonzero_id(buffer_raw);
-            if !error_state::validate_bind_buffer_base(state, canvas_id, target, index, buffer) {
-                return None;
-            }
-            Some(GLCmd::BindBufferBase {
-                canvas_id,
-                target,
-                index,
-                buffer,
-            })
-        }
-
-        // ── 52: BIND_BUFFER_RANGE: H C U U U I I ────────────────────────────────
-        // Same as bind_buffer_base: mirror the impl logic manually.
-        OP_BIND_BUFFER_RANGE => {
-            let canvas_id = record[1];
-            let target = record[2];
-            let index = record[3];
-            let buffer_raw = record[4];
-            let buffer = nonzero_id(buffer_raw);
-            let offset = i(record[5]);
-            let size = i(record[6]);
-            if !error_state::validate_bind_buffer_range(
-                state, canvas_id, target, index, buffer, offset, size,
-            ) {
-                return None;
-            }
-            Some(GLCmd::BindBufferRange {
-                canvas_id,
-                target,
-                index,
-                buffer,
-                offset,
-                size,
-            })
-        }
-
-        // ── 53: READ_BUFFER: H C U ───────────────────────────────────────────────
-        OP_READ_BUFFER => {
-            let canvas_id = record[1];
-            Some(GLCmd::ReadBuffer {
-                canvas_id,
-                src: record[2],
-            })
-        }
-
-        // ── 54: UNIFORM1I: H C I I ───────────────────────────────────────────────
-        OP_UNIFORM1I => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let x = i(record[3]);
-            Some(GLCmd::Uniform1i {
-                canvas_id,
-                location: loc,
-                x,
-            })
-        }
-
-        // ── 55: UNIFORM1F: H C I F ───────────────────────────────────────────────
-        OP_UNIFORM1F => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let x = f(record[3]);
-            Some(GLCmd::Uniform1f {
-                canvas_id,
-                location: loc,
-                x,
-            })
-        }
-
-        // ── 56: UNIFORM2F: H C I F F ─────────────────────────────────────────────
-        OP_UNIFORM2F => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            Some(GLCmd::Uniform2f {
-                canvas_id,
-                location: loc,
-                x: f(record[3]),
-                y: f(record[4]),
-            })
-        }
-
-        // ── 57: UNIFORM3F: H C I F F F ───────────────────────────────────────────
-        OP_UNIFORM3F => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            Some(GLCmd::Uniform3f {
-                canvas_id,
-                location: loc,
-                x: f(record[3]),
-                y: f(record[4]),
-                z: f(record[5]),
-            })
-        }
-
-        // ── 58: UNIFORM4F: H C I F F F F ─────────────────────────────────────────
-        OP_UNIFORM4F => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            Some(GLCmd::Uniform4f {
-                canvas_id,
-                location: loc,
-                x: f(record[3]),
-                y: f(record[4]),
-                z: f(record[5]),
-                w: f(record[6]),
-            })
-        }
-
-        // ── Variable vector uniforms (256..263) ───────────────────────────────────
-        // Layout: H C location:I payload...  (word_count = 3 + payload_words)
-        // record[0]=H, record[1]=C, record[2]=location, record[3..]=payload
-        OP_UNIFORM1IV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformI32Values = copy_i32_words(&record[3..]);
-            Some(GLCmd::Uniform1iv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        OP_UNIFORM1FV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformF32Values = copy_f32_words(&record[3..]);
-            Some(GLCmd::Uniform1fv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        OP_UNIFORM2IV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformI32Values = copy_i32_words(&record[3..]);
-            Some(GLCmd::Uniform2iv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        OP_UNIFORM2FV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformF32Values = copy_f32_words(&record[3..]);
-            Some(GLCmd::Uniform2fv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        OP_UNIFORM3IV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformI32Values = copy_i32_words(&record[3..]);
-            Some(GLCmd::Uniform3iv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        OP_UNIFORM3FV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformF32Values = copy_f32_words(&record[3..]);
-            Some(GLCmd::Uniform3fv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        OP_UNIFORM4IV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformI32Values = copy_i32_words(&record[3..]);
-            Some(GLCmd::Uniform4iv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        OP_UNIFORM4FV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let value: UniformF32Values = copy_f32_words(&record[3..]);
-            Some(GLCmd::Uniform4fv {
-                canvas_id,
-                location: loc,
-                value,
-            })
-        }
-
-        // ── Variable matrix uniforms (264..266) ────────────────────────────────────
-        // Layout: H C location:I transpose:B payload...  (word_count = 4 + payload_words)
-        // record[0]=H, record[1]=C, record[2]=location, record[3]=transpose, record[4..]=payload
-        OP_UNIFORM_MATRIX2FV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let transpose = b(record[3]);
-            let value: UniformF32Values = copy_f32_words(&record[4..]);
-            Some(GLCmd::UniformMatrix2fv {
-                canvas_id,
-                location: loc,
-                transpose,
-                value,
-            })
-        }
-
-        OP_UNIFORM_MATRIX3FV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let transpose = b(record[3]);
-            let value: UniformF32Values = copy_f32_words(&record[4..]);
-            Some(GLCmd::UniformMatrix3fv {
-                canvas_id,
-                location: loc,
-                transpose,
-                value,
-            })
-        }
-
-        OP_UNIFORM_MATRIX4FV => {
-            let canvas_id = record[1];
-            let loc = location(record[2]);
-            let transpose = b(record[3]);
-            let value: UniformF32Values = copy_f32_words(&record[4..]);
-            Some(GLCmd::UniformMatrix4fv {
-                canvas_id,
-                location: loc,
-                transpose,
-                value,
-            })
-        }
-
-        // Unreachable: Pass 1 guarantees all opcodes are in the allowed set.
-        _ => {
-            debug_assert!(
-                false,
-                "decode_record: opcode {opcode} slipped through pass 1"
-            );
-            None
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spilled_uniform_approx_bytes_counts_allocated_capacity() {
-        let mut value = UniformF32Values::with_capacity(64);
-        value.extend(std::iter::repeat_n(1.0, 17));
-        assert!(value.spilled());
-        assert!(value.capacity() > value.len());
-
-        let cmd = GLCmd::Uniform1fv {
-            canvas_id: 1,
-            location: Some(2),
-            value,
-        };
-        assert_eq!(cmd_approx_bytes(&cmd), cmd.approx_deep_size_bytes());
-    }
+/// Decode a structurally-validated mixed 2D/GL stream straight into the
+/// collector.
+///
+/// Returns the number of commands decoded and whether the collector crossed its
+/// soft budget while they were added.
+pub(crate) fn decode_render_stream(
+    state: &mut OpState,
+    stream: ValidatedStream<'_>,
+) -> (usize, bool) {
+    let mut target = OpStateRenderTarget::new(state);
+    let decoded = frame_decode::decode_render_stream_into(&mut target, stream);
+    (decoded, target.over_budget)
 }

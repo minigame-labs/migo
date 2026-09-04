@@ -1,18 +1,44 @@
-// gl_stream.rs — Task 1: Rust wire format + pure pass-1 structural validation.
-// No OpState, no error_state, no GLCmd, no collector. PURE.
+//! The record envelope: what every command stream is, whichever block its
+//! opcodes come from.
+//!
+//! A stream is a magic word, a version, and a run of records. A record is one
+//! header word -- twelve bits of opcode, twenty of word count -- followed by
+//! that many words minus one. Nothing here knows what a `Viewport` or a
+//! `FillRect` is; it knows how long each claims to be and whether the claim
+//! fits in the buffer.
+//!
+//! # Why the envelope is its own module
+//!
+//! It used to live in `stream`, beside the WebGL opcode table, because for a
+//! while that was the only block. Then Canvas2D got a block of its own, and the
+//! GL table found itself dispatching into the 2D table -- a layer calling
+//! sideways into its sibling because the layer above them had no name. This is
+//! that layer: the blocks each own their opcodes and their record shapes, and
+//! the envelope is what routes a number to the block that owns it.
+//!
+//! # Pass one of two
+//!
+//! Structural validation only: magic, version, record headers, word counts,
+//! opcodes in range, bool words that are actually 0 or 1. It reads no field for
+//! meaning and allocates nothing. Pass two -- turning validated words into
+//! render commands -- is `migo-frame-decode`, which can then read fields rather
+//! than check them.
+
+use crate::gl::MAX_STREAM_UNIFORM_WORDS;
 
 // ─── Public constants ────────────────────────────────────────────────────────
 
 pub const MAGIC: u32 = 0x4D47_4C31;
 pub const STREAM_VERSION: u32 = 1;
 
-/// Maximum payload words for any single variable-uniform record.
-pub const MAX_STREAM_UNIFORM_WORDS: u32 = 512;
-
 // ─── Header codec ────────────────────────────────────────────────────────────
 
 /// Pack a record header: low 12 bits = opcode, high 20 bits = total word count.
-#[cfg(test)]
+///
+/// Public and unconditional. It was `#[cfg(test)]` while the only writer was
+/// the JavaScript encoder in another language; now that the format lives here,
+/// the writer half belongs to it too -- and the tests that use it are in
+/// another crate, where a `cfg(test)` item is not visible.
 #[inline]
 pub fn pack_header(opcode: u32, word_count: u32) -> u32 {
     (word_count << 12) | (opcode & 0xFFF)
@@ -29,81 +55,6 @@ pub fn opcode_of(h: u32) -> u32 {
 pub fn word_count_of(h: u32) -> u32 {
     h >> 12
 }
-
-// ─── Fixed opcode constants (1..=58) ─────────────────────────────────────────
-
-pub const OP_VIEWPORT: u32 = 1;
-pub const OP_CLEAR: u32 = 2;
-pub const OP_CLEAR_COLOR: u32 = 3;
-pub const OP_CLEAR_DEPTH: u32 = 4;
-pub const OP_CLEAR_STENCIL: u32 = 5;
-pub const OP_ENABLE: u32 = 6;
-pub const OP_DISABLE: u32 = 7;
-pub const OP_USE_PROGRAM: u32 = 8;
-pub const OP_BIND_BUFFER: u32 = 9;
-pub const OP_BIND_TEXTURE: u32 = 10;
-pub const OP_ACTIVE_TEXTURE: u32 = 11;
-pub const OP_BIND_FRAMEBUFFER: u32 = 12;
-pub const OP_BIND_RENDERBUFFER: u32 = 13;
-pub const OP_BIND_VERTEX_ARRAY: u32 = 14;
-pub const OP_BIND_SAMPLER: u32 = 15;
-pub const OP_ENABLE_VERTEX_ATTRIB_ARRAY: u32 = 16;
-pub const OP_DISABLE_VERTEX_ATTRIB_ARRAY: u32 = 17;
-pub const OP_VERTEX_ATTRIB_POINTER: u32 = 18;
-pub const OP_VERTEX_ATTRIB_DIVISOR: u32 = 19;
-pub const OP_BLEND_FUNC: u32 = 20;
-pub const OP_BLEND_FUNC_SEPARATE: u32 = 21;
-pub const OP_BLEND_EQUATION: u32 = 22;
-pub const OP_BLEND_EQUATION_SEPARATE: u32 = 23;
-pub const OP_BLEND_COLOR: u32 = 24;
-pub const OP_DEPTH_FUNC: u32 = 25;
-pub const OP_DEPTH_MASK: u32 = 26;
-pub const OP_DEPTH_RANGE: u32 = 27;
-pub const OP_STENCIL_FUNC: u32 = 28;
-pub const OP_STENCIL_FUNC_SEPARATE: u32 = 29;
-pub const OP_STENCIL_OP: u32 = 30;
-pub const OP_STENCIL_OP_SEPARATE: u32 = 31;
-pub const OP_STENCIL_MASK: u32 = 32;
-pub const OP_STENCIL_MASK_SEPARATE: u32 = 33;
-pub const OP_CULL_FACE: u32 = 34;
-pub const OP_FRONT_FACE: u32 = 35;
-pub const OP_COLOR_MASK: u32 = 36;
-pub const OP_SCISSOR: u32 = 37;
-pub const OP_LINE_WIDTH: u32 = 38;
-pub const OP_POLYGON_OFFSET: u32 = 39;
-pub const OP_TEX_PARAMETER_I: u32 = 40;
-pub const OP_TEX_PARAMETER_F: u32 = 41;
-pub const OP_GENERATE_MIPMAP: u32 = 42;
-pub const OP_PIXEL_STORE_I: u32 = 43;
-pub const OP_HINT: u32 = 44;
-pub const OP_SAMPLER_PARAMETER_I: u32 = 45;
-pub const OP_SAMPLER_PARAMETER_F: u32 = 46;
-pub const OP_DRAW_ARRAYS: u32 = 47;
-pub const OP_DRAW_ELEMENTS: u32 = 48;
-pub const OP_DRAW_ARRAYS_INSTANCED: u32 = 49;
-pub const OP_DRAW_ELEMENTS_INSTANCED: u32 = 50;
-pub const OP_BIND_BUFFER_BASE: u32 = 51;
-pub const OP_BIND_BUFFER_RANGE: u32 = 52;
-pub const OP_READ_BUFFER: u32 = 53;
-pub const OP_UNIFORM1I: u32 = 54;
-pub const OP_UNIFORM1F: u32 = 55;
-pub const OP_UNIFORM2F: u32 = 56;
-pub const OP_UNIFORM3F: u32 = 57;
-pub const OP_UNIFORM4F: u32 = 58;
-
-// ─── Variable opcode constants (256..=266) ────────────────────────────────────
-
-pub const OP_UNIFORM1IV: u32 = 256;
-pub const OP_UNIFORM1FV: u32 = 257;
-pub const OP_UNIFORM2IV: u32 = 258;
-pub const OP_UNIFORM2FV: u32 = 259;
-pub const OP_UNIFORM3IV: u32 = 260;
-pub const OP_UNIFORM3FV: u32 = 261;
-pub const OP_UNIFORM4IV: u32 = 262;
-pub const OP_UNIFORM4FV: u32 = 263;
-pub const OP_UNIFORM_MATRIX2FV: u32 = 264;
-pub const OP_UNIFORM_MATRIX3FV: u32 = 265;
-pub const OP_UNIFORM_MATRIX4FV: u32 = 266;
 
 // ─── StreamError ─────────────────────────────────────────────────────────────
 
@@ -183,300 +134,20 @@ pub enum RecordSpec {
 }
 
 /// Returns the `RecordSpec` for a given opcode, or `None` if unknown.
+
+// ─── record_spec ─────────────────────────────────────────────────────────────
+
+/// The shape of one record, from the block that owns its opcode.
+///
+/// Routing on the range rather than merging the tables keeps each block's spec
+/// next to its own opcode constants, and makes an opcode added to the wrong
+/// range a rejection instead of a record read with the other block's shape.
 pub fn record_spec(opcode: u32) -> Option<RecordSpec> {
-    // Bool word indices reference positions within the record (0 = header).
-    // From §5 table: B fields and their 0-based positions.
-    //
-    // OP_VERTEX_ATTRIB_POINTER (18): H C U I U B I I — 8 words
-    //   layout: [0]=H [1]=C [2]=U [3]=I [4]=U [5]=B [6]=I [7]=I  → bool at index 5
-    //
-    // OP_DEPTH_MASK (26): H C B — 3 words
-    //   layout: [0]=H [1]=C [2]=B  → bool at index 2
-    //
-    // OP_COLOR_MASK (36): H C B B B B — 6 words
-    //   layout: [0]=H [1]=C [2]=B [3]=B [4]=B [5]=B  → bools at 2,3,4,5
-
-    Some(match opcode {
-        OP_VIEWPORT => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_CLEAR => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_CLEAR_COLOR => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_CLEAR_DEPTH => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_CLEAR_STENCIL => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_ENABLE => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_DISABLE => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_USE_PROGRAM => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_BIND_BUFFER => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_BIND_TEXTURE => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_ACTIVE_TEXTURE => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_BIND_FRAMEBUFFER => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_BIND_RENDERBUFFER => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_BIND_VERTEX_ARRAY => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_BIND_SAMPLER => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_ENABLE_VERTEX_ATTRIB_ARRAY => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_DISABLE_VERTEX_ATTRIB_ARRAY => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        // H C U I U B I I — bool at word index 5
-        OP_VERTEX_ATTRIB_POINTER => RecordSpec::Fixed {
-            word_count: 8,
-            bool_words: &[5],
-        },
-        OP_VERTEX_ATTRIB_DIVISOR => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_BLEND_FUNC => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_BLEND_FUNC_SEPARATE => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_BLEND_EQUATION => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_BLEND_EQUATION_SEPARATE => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_BLEND_COLOR => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_DEPTH_FUNC => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        // H C B — bool at word index 2
-        OP_DEPTH_MASK => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[2],
-        },
-        OP_DEPTH_RANGE => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_STENCIL_FUNC => RecordSpec::Fixed {
-            word_count: 5,
-            bool_words: &[],
-        },
-        OP_STENCIL_FUNC_SEPARATE => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_STENCIL_OP => RecordSpec::Fixed {
-            word_count: 5,
-            bool_words: &[],
-        },
-        OP_STENCIL_OP_SEPARATE => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_STENCIL_MASK => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_STENCIL_MASK_SEPARATE => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_CULL_FACE => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_FRONT_FACE => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        // H C B B B B — bools at word indices 2,3,4,5
-        OP_COLOR_MASK => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[2, 3, 4, 5],
-        },
-        OP_SCISSOR => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_LINE_WIDTH => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_POLYGON_OFFSET => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_TEX_PARAMETER_I => RecordSpec::Fixed {
-            word_count: 5,
-            bool_words: &[],
-        },
-        OP_TEX_PARAMETER_F => RecordSpec::Fixed {
-            word_count: 5,
-            bool_words: &[],
-        },
-        OP_GENERATE_MIPMAP => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_PIXEL_STORE_I => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_HINT => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        // OP_SAMPLER_PARAMETER_I/F have no canvas: H U U I/F — 4 words
-        OP_SAMPLER_PARAMETER_I => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_SAMPLER_PARAMETER_F => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_DRAW_ARRAYS => RecordSpec::Fixed {
-            word_count: 5,
-            bool_words: &[],
-        },
-        OP_DRAW_ELEMENTS => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_DRAW_ARRAYS_INSTANCED => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_DRAW_ELEMENTS_INSTANCED => RecordSpec::Fixed {
-            word_count: 7,
-            bool_words: &[],
-        },
-        OP_BIND_BUFFER_BASE => RecordSpec::Fixed {
-            word_count: 5,
-            bool_words: &[],
-        },
-        OP_BIND_BUFFER_RANGE => RecordSpec::Fixed {
-            word_count: 7,
-            bool_words: &[],
-        },
-        OP_READ_BUFFER => RecordSpec::Fixed {
-            word_count: 3,
-            bool_words: &[],
-        },
-        OP_UNIFORM1I => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_UNIFORM1F => RecordSpec::Fixed {
-            word_count: 4,
-            bool_words: &[],
-        },
-        OP_UNIFORM2F => RecordSpec::Fixed {
-            word_count: 5,
-            bool_words: &[],
-        },
-        OP_UNIFORM3F => RecordSpec::Fixed {
-            word_count: 6,
-            bool_words: &[],
-        },
-        OP_UNIFORM4F => RecordSpec::Fixed {
-            word_count: 7,
-            bool_words: &[],
-        },
-
-        // Variable vector uniforms: H C location payload...
-        OP_UNIFORM1IV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Int,
-        },
-        OP_UNIFORM1FV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Float,
-        },
-        OP_UNIFORM2IV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Int,
-        },
-        OP_UNIFORM2FV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Float,
-        },
-        OP_UNIFORM3IV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Int,
-        },
-        OP_UNIFORM3FV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Float,
-        },
-        OP_UNIFORM4IV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Int,
-        },
-        OP_UNIFORM4FV => RecordSpec::VectorUniform {
-            element_kind: UniformElementKind::Float,
-        },
-
-        // Variable matrix uniforms: H C location transpose payload...
-        // transpose is at word index 3 (0=H,1=C,2=loc,3=transpose)
-        OP_UNIFORM_MATRIX2FV => RecordSpec::MatrixUniform {
-            element_kind: UniformElementKind::Float,
-            transpose_word_idx: 3,
-        },
-        OP_UNIFORM_MATRIX3FV => RecordSpec::MatrixUniform {
-            element_kind: UniformElementKind::Float,
-            transpose_word_idx: 3,
-        },
-        OP_UNIFORM_MATRIX4FV => RecordSpec::MatrixUniform {
-            element_kind: UniformElementKind::Float,
-            transpose_word_idx: 3,
-        },
-
-        _ => return None,
-    })
+    if opcode >= crate::canvas2d::OP2D_BASE {
+        crate::canvas2d::record_spec(opcode)
+    } else {
+        crate::gl::record_spec(opcode)
+    }
 }
 
 // ─── ValidatedStream ─────────────────────────────────────────────────────────
@@ -522,7 +193,7 @@ pub fn validate_stream(words: &[u32], used_words: u32) -> Result<ValidatedStream
     let used = used_words as usize;
 
     // Validate magic and version using safe indexing.
-    let w0 = *words.get(0).ok_or(StreamError::TooShort)?;
+    let w0 = *words.first().ok_or(StreamError::TooShort)?;
     if w0 != MAGIC {
         return Err(StreamError::BadMagic);
     }
@@ -634,6 +305,12 @@ pub fn validate_stream(words: &[u32], used_words: u32) -> Result<ValidatedStream
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The envelope's cases need opcodes to build records out of, and every
+    // opcode belongs to a block. Both blocks export a `record_spec` of their
+    // own, so the routing one this module defines is called through `super`
+    // where these cases need it.
+    use crate::canvas2d::*;
+    use crate::gl::*;
 
     // ── Header codec ──────────────────────────────────────────────────────────
 
@@ -1049,183 +726,6 @@ mod tests {
         assert_eq!(validate_stream(&words, used), Err(StreamError::BadBool));
     }
 
-    // ── JS/Rust constant contract: complete 69-opcode coverage ───────────────
-
-    /// Asserts the JS stream module contains `const OP_<NAME> = <n>;` for every
-    /// opcode constant defined in this file. This prevents silent divergence
-    /// between the Rust wire-format table and the JS encoder table.
-    #[test]
-    fn js_module_contains_all_69_opcode_constants_matching_rust() {
-        let js = include_str!("00_gl_command_stream.js");
-
-        // Fixed opcodes 1..=58
-        let fixed: &[(&str, u32)] = &[
-            ("OP_VIEWPORT", OP_VIEWPORT),
-            ("OP_CLEAR", OP_CLEAR),
-            ("OP_CLEAR_COLOR", OP_CLEAR_COLOR),
-            ("OP_CLEAR_DEPTH", OP_CLEAR_DEPTH),
-            ("OP_CLEAR_STENCIL", OP_CLEAR_STENCIL),
-            ("OP_ENABLE", OP_ENABLE),
-            ("OP_DISABLE", OP_DISABLE),
-            ("OP_USE_PROGRAM", OP_USE_PROGRAM),
-            ("OP_BIND_BUFFER", OP_BIND_BUFFER),
-            ("OP_BIND_TEXTURE", OP_BIND_TEXTURE),
-            ("OP_ACTIVE_TEXTURE", OP_ACTIVE_TEXTURE),
-            ("OP_BIND_FRAMEBUFFER", OP_BIND_FRAMEBUFFER),
-            ("OP_BIND_RENDERBUFFER", OP_BIND_RENDERBUFFER),
-            ("OP_BIND_VERTEX_ARRAY", OP_BIND_VERTEX_ARRAY),
-            ("OP_BIND_SAMPLER", OP_BIND_SAMPLER),
-            (
-                "OP_ENABLE_VERTEX_ATTRIB_ARRAY",
-                OP_ENABLE_VERTEX_ATTRIB_ARRAY,
-            ),
-            (
-                "OP_DISABLE_VERTEX_ATTRIB_ARRAY",
-                OP_DISABLE_VERTEX_ATTRIB_ARRAY,
-            ),
-            ("OP_VERTEX_ATTRIB_POINTER", OP_VERTEX_ATTRIB_POINTER),
-            ("OP_VERTEX_ATTRIB_DIVISOR", OP_VERTEX_ATTRIB_DIVISOR),
-            ("OP_BLEND_FUNC", OP_BLEND_FUNC),
-            ("OP_BLEND_FUNC_SEPARATE", OP_BLEND_FUNC_SEPARATE),
-            ("OP_BLEND_EQUATION", OP_BLEND_EQUATION),
-            ("OP_BLEND_EQUATION_SEPARATE", OP_BLEND_EQUATION_SEPARATE),
-            ("OP_BLEND_COLOR", OP_BLEND_COLOR),
-            ("OP_DEPTH_FUNC", OP_DEPTH_FUNC),
-            ("OP_DEPTH_MASK", OP_DEPTH_MASK),
-            ("OP_DEPTH_RANGE", OP_DEPTH_RANGE),
-            ("OP_STENCIL_FUNC", OP_STENCIL_FUNC),
-            ("OP_STENCIL_FUNC_SEPARATE", OP_STENCIL_FUNC_SEPARATE),
-            ("OP_STENCIL_OP", OP_STENCIL_OP),
-            ("OP_STENCIL_OP_SEPARATE", OP_STENCIL_OP_SEPARATE),
-            ("OP_STENCIL_MASK", OP_STENCIL_MASK),
-            ("OP_STENCIL_MASK_SEPARATE", OP_STENCIL_MASK_SEPARATE),
-            ("OP_CULL_FACE", OP_CULL_FACE),
-            ("OP_FRONT_FACE", OP_FRONT_FACE),
-            ("OP_COLOR_MASK", OP_COLOR_MASK),
-            ("OP_SCISSOR", OP_SCISSOR),
-            ("OP_LINE_WIDTH", OP_LINE_WIDTH),
-            ("OP_POLYGON_OFFSET", OP_POLYGON_OFFSET),
-            ("OP_TEX_PARAMETER_I", OP_TEX_PARAMETER_I),
-            ("OP_TEX_PARAMETER_F", OP_TEX_PARAMETER_F),
-            ("OP_GENERATE_MIPMAP", OP_GENERATE_MIPMAP),
-            ("OP_PIXEL_STORE_I", OP_PIXEL_STORE_I),
-            ("OP_HINT", OP_HINT),
-            ("OP_SAMPLER_PARAMETER_I", OP_SAMPLER_PARAMETER_I),
-            ("OP_SAMPLER_PARAMETER_F", OP_SAMPLER_PARAMETER_F),
-            ("OP_DRAW_ARRAYS", OP_DRAW_ARRAYS),
-            ("OP_DRAW_ELEMENTS", OP_DRAW_ELEMENTS),
-            ("OP_DRAW_ARRAYS_INSTANCED", OP_DRAW_ARRAYS_INSTANCED),
-            ("OP_DRAW_ELEMENTS_INSTANCED", OP_DRAW_ELEMENTS_INSTANCED),
-            ("OP_BIND_BUFFER_BASE", OP_BIND_BUFFER_BASE),
-            ("OP_BIND_BUFFER_RANGE", OP_BIND_BUFFER_RANGE),
-            ("OP_READ_BUFFER", OP_READ_BUFFER),
-            ("OP_UNIFORM1I", OP_UNIFORM1I),
-            ("OP_UNIFORM1F", OP_UNIFORM1F),
-            ("OP_UNIFORM2F", OP_UNIFORM2F),
-            ("OP_UNIFORM3F", OP_UNIFORM3F),
-            ("OP_UNIFORM4F", OP_UNIFORM4F),
-        ];
-        // Variable opcodes 256..=266
-        let variable: &[(&str, u32)] = &[
-            ("OP_UNIFORM1IV", OP_UNIFORM1IV),
-            ("OP_UNIFORM1FV", OP_UNIFORM1FV),
-            ("OP_UNIFORM2IV", OP_UNIFORM2IV),
-            ("OP_UNIFORM2FV", OP_UNIFORM2FV),
-            ("OP_UNIFORM3IV", OP_UNIFORM3IV),
-            ("OP_UNIFORM3FV", OP_UNIFORM3FV),
-            ("OP_UNIFORM4IV", OP_UNIFORM4IV),
-            ("OP_UNIFORM4FV", OP_UNIFORM4FV),
-            ("OP_UNIFORM_MATRIX2FV", OP_UNIFORM_MATRIX2FV),
-            ("OP_UNIFORM_MATRIX3FV", OP_UNIFORM_MATRIX3FV),
-            ("OP_UNIFORM_MATRIX4FV", OP_UNIFORM_MATRIX4FV),
-        ];
-
-        for &(name, value) in fixed.iter().chain(variable.iter()) {
-            let expected = format!("const {} = {};", name, value);
-            assert!(
-                js.contains(&expected),
-                "JS module missing '{}' (expected '{}' for Rust value {})",
-                name,
-                expected,
-                value
-            );
-        }
-
-        // Magic and version
-        assert!(
-            js.contains("const MAGIC = 0x4D474C31;"),
-            "JS module missing 'const MAGIC = 0x4D474C31;'"
-        );
-        assert!(
-            js.contains("const STREAM_VERSION = 1;"),
-            "JS module missing 'const STREAM_VERSION = 1;'"
-        );
-        assert!(
-            js.contains("const MAX_STREAM_UNIFORM_WORDS = 512;"),
-            "JS module missing 'const MAX_STREAM_UNIFORM_WORDS = 512;'"
-        );
-    }
-
-    // ── JS source-guard tests (host-runnable, via include_str!) ──────────────
-
-    /// Buffers must be null at module load (lazy allocation).
-    #[test]
-    fn js_module_buffers_null_at_module_load() {
-        let js = include_str!("00_gl_command_stream.js");
-        assert!(
-            js.contains("= null;"),
-            "JS module backing buffer vars must be initialized to null (lazy allocation)"
-        );
-    }
-
-    /// No buffer references on globalThis.
-    #[test]
-    fn js_module_no_globalthis_assignment_of_buffers() {
-        let js = include_str!("00_gl_command_stream.js");
-        assert!(
-            !js.contains("globalThis."),
-            "JS module must not assign buffers to globalThis"
-        );
-    }
-
-    /// Hot encoders must not use rest params or temp words array.
-    #[test]
-    fn js_module_no_rest_params_in_encoders() {
-        let js = include_str!("00_gl_command_stream.js");
-        assert!(
-            !js.contains("...args"),
-            "JS module hot encoders must not use rest args (...args)"
-        );
-        assert!(
-            !js.contains("encodeRecord("),
-            "JS module must not have a generic encodeRecord(...args) dispatcher"
-        );
-    }
-
-    /// No temporary words array allocation in hot path.
-    #[test]
-    fn js_module_no_temp_words_array_in_hot_path() {
-        let js = include_str!("00_gl_command_stream.js");
-        assert!(
-            !js.contains("words = []"),
-            "JS module must not allocate temporary words[] array in hot path"
-        );
-    }
-
-    /// flushGlCommandStream must pass used/cursor to op_gl_submit_stream.
-    #[test]
-    fn js_module_flush_passes_cursor_to_op() {
-        let js = include_str!("00_gl_command_stream.js");
-        assert!(
-            js.contains("op_gl_submit_stream"),
-            "JS module must call op_gl_submit_stream in flushGlCommandStream"
-        );
-        assert!(
-            js.contains("cursor"),
-            "JS module flush must pass cursor (used_words) to op_gl_submit_stream"
-        );
-    }
-
     // ── validate_stream: second record malformed, sentinel unchanged ──────────
 
     #[test]
@@ -1319,7 +819,7 @@ mod tests {
     fn all_fixed_opcodes_1_to_58_have_specs() {
         for op in 1u32..=58 {
             assert!(
-                record_spec(op).is_some(),
+                super::record_spec(op).is_some(),
                 "opcode {} should have a spec",
                 op
             );
@@ -1330,7 +830,7 @@ mod tests {
     fn all_variable_opcodes_256_to_266_have_specs() {
         for op in 256u32..=266 {
             assert!(
-                record_spec(op).is_some(),
+                super::record_spec(op).is_some(),
                 "opcode {} should have a spec",
                 op
             );
@@ -1341,7 +841,7 @@ mod tests {
     fn opcodes_between_59_and_255_return_none() {
         for op in 59u32..=255 {
             assert!(
-                record_spec(op).is_none(),
+                super::record_spec(op).is_none(),
                 "opcode {} should not have a spec",
                 op
             );
@@ -1350,14 +850,14 @@ mod tests {
 
     #[test]
     fn opcode_zero_returns_none() {
-        assert!(record_spec(0).is_none());
+        assert!(super::record_spec(0).is_none());
     }
 
     #[test]
     fn opcodes_above_266_return_none() {
         for op in [267u32, 1000, 4095, u32::MAX] {
             assert!(
-                record_spec(op).is_none(),
+                super::record_spec(op).is_none(),
                 "opcode {} should not have a spec",
                 op
             );
@@ -1429,7 +929,7 @@ mod tests {
             (OP_UNIFORM4F, 7),
         ];
         for &(op, expected_wc) in expected {
-            match record_spec(op) {
+            match super::record_spec(op) {
                 Some(RecordSpec::Fixed { word_count, .. }) => {
                     assert_eq!(word_count, expected_wc, "opcode {} word count mismatch", op);
                 }
@@ -1451,7 +951,7 @@ mod tests {
             OP_UNIFORM4IV,
             OP_UNIFORM4FV,
         ] {
-            match record_spec(op) {
+            match super::record_spec(op) {
                 Some(RecordSpec::VectorUniform { .. }) => {}
                 other => panic!("opcode {} should be VectorUniform, got {:?}", op, other),
             }
@@ -1462,7 +962,7 @@ mod tests {
             OP_UNIFORM_MATRIX3FV,
             OP_UNIFORM_MATRIX4FV,
         ] {
-            match record_spec(op) {
+            match super::record_spec(op) {
                 Some(RecordSpec::MatrixUniform {
                     transpose_word_idx: 3,
                     ..

@@ -6,12 +6,50 @@
  */
 
 import {
-    flushGlCommandStream,
-} from "./00_gl_command_stream.js";
+    flushRenderCommandStream,
+    encode2dBeginPath,
+    encode2dClosePath,
+    encode2dMoveTo,
+    encode2dLineTo,
+    encode2dQuadraticCurveTo,
+    encode2dBezierCurveTo,
+    encode2dArc,
+    encode2dArcTo,
+    encode2dRect,
+    encode2dEllipse,
+    encode2dFill,
+    encode2dStroke,
+    encode2dClip,
+    encode2dFillRect,
+    encode2dStrokeRect,
+    encode2dClearRect,
+    encode2dSave,
+    encode2dRestore,
+    encode2dSetTransform,
+    encode2dResetTransform,
+    encode2dTranslate,
+    encode2dRotate,
+    encode2dScale,
+    encode2dSetLineWidth,
+    encode2dSetGlobalAlpha,
+    encode2dSetMiterLimit,
+    encode2dSetLineDashOffset,
+    encode2dSetShadowBlur,
+    encode2dSetShadowOffsetX,
+    encode2dSetShadowOffsetY,
+    encode2dSetLineCap,
+    encode2dSetLineJoin,
+    encode2dSetCompositeOperation,
+    encode2dSetFillStyle,
+    encode2dSetStrokeStyle,
+    encode2dSetShadowColor,
+} from "./00_render_command_stream.js";
 
 import {
     op_create_context_2d,
     op_measure_text_flat,
+    // Frame lifecycle
+    op_frame_end_unified,
     op_get_image_data,
     op_capture_canvas2d_snapshot,
     op_capture_canvas2d_snapshot_for_cache,
@@ -21,68 +59,26 @@ import {
     op_text_cache_unpin,
     op_tex_image_2d_from_text_cache,
     op_tex_image_2d_from_snapshot,
-    // Frame lifecycle
-    op_frame_begin,
-    op_frame_end,
-    op_frame_end_unified,
-    // Path methods
-    op_begin_path,
-    op_close_path,
-    op_move_to,
-    op_line_to,
-    op_quadratic_curve_to,
-    op_bezier_curve_to,
-    op_arc,
-    op_arc_to,
-    op_rect,
-    op_ellipse,
-    // Drawing methods
-    op_fill,
-    op_stroke,
-    op_clip,
-    // Rectangle methods
-    op_fill_rect,
-    op_stroke_rect,
-    op_clear_rect,
     // Text methods
     op_fill_text,
     op_stroke_text,
     // Style setters
     op_set_fill_style,
     op_set_stroke_style,
-    op_set_line_width,
-    op_set_line_cap,
-    op_set_line_join,
-    op_set_miter_limit,
-    op_set_global_alpha,
     op_set_font,
     op_set_text_align,
     op_set_text_baseline,
     op_set_text_direction,
-    // State methods
-    op_save,
-    op_restore,
-    // Transform methods
-    op_translate,
-    op_rotate,
-    op_scale,
-    op_set_transform,
-    op_reset_transform,
     // Image methods
     op_draw_image,
     op_draw_image_batch,
     // Compositing + gradient + dash
-    op_set_composite_operation,
     op_set_line_dash,
-    op_set_line_dash_offset,
     op_set_fill_style_gradient,
     op_set_stroke_style_gradient,
     op_set_fill_style_pattern,
     op_set_stroke_style_pattern,
-    op_set_shadow_blur,
     op_set_shadow_color,
-    op_set_shadow_offset_x,
-    op_set_shadow_offset_y,
 } from "ext:core/ops";
 
 // Line cap constants
@@ -173,7 +169,7 @@ class CanvasGradient {
     // Called internally when this gradient is assigned to fillStyle.
     _apply() {
         if (this._stops.length < 2) return;
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_fill_style_gradient(
             this._canvasId,
             this._type === 'radial' ? 1 : this._type === 'conic' ? 2 : 0,
@@ -185,7 +181,7 @@ class CanvasGradient {
     // Called internally when this gradient is assigned to strokeStyle.
     _applyStroke() {
         if (this._stops.length < 2) return;
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_stroke_style_gradient(
             this._canvasId,
             this._type === 'radial' ? 1 : this._type === 'conic' ? 2 : 0,
@@ -208,11 +204,11 @@ class CanvasPattern {
         this._repeatY = rep === 'repeat' || rep === 'repeat-y';
     }
     _applyFill() {
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_fill_style_pattern(this._canvasId, this._imageRid, this._repeatX, this._repeatY);
     }
     _applyStroke() {
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_stroke_style_pattern(this._canvasId, this._imageRid, this._repeatX, this._repeatY);
     }
 }
@@ -321,6 +317,129 @@ function _parseColorToRGBA(color) {
     return [0, 0, 0, 255];
 }
 
+// The colour forms this encoder is willing to answer for itself.
+//
+// `parse_color_string` on the Rust side is the authority, and it stays the
+// authority: this returns `null` for anything it is not certain it would agree
+// with, and the caller falls back to the op that runs the Rust parser. So the
+// contract is one-sided and checkable -- **this may abstain, it may not
+// disagree** -- which is what makes a second parser tolerable here at all. The
+// CSS *font* parser was deleted from this file for the opposite reason: it was
+// two implementations both claiming to be right, and they drifted.
+//
+// Abstaining is not a slow path in any sense that matters. It costs exactly
+// what every colour assignment cost before this existed: one stream flush and
+// one op.
+//
+// `canvas2d_colour_agreement` in the Rust tests runs a corpus through the whole
+// path -- this parser, the wire encoding, the decoder, and the Rust parser on
+// the fallback -- and requires the resulting `Color` to be bit-identical either
+// way.
+function _strictColorToRGBA(color) {
+    if (typeof color !== 'string') return null;
+    const s = color.trim();
+    if (s.length === 0) return null;
+
+    if (s.charCodeAt(0) === 35 /* # */) {
+        const hex = s.slice(1);
+        for (let i = 0; i < hex.length; i++) {
+            const c = hex.charCodeAt(i);
+            const isHex = (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+            if (!isHex) return null;
+        }
+        // Short forms double each digit, exactly as `Color::hex` does.
+        if (hex.length === 3 || hex.length === 4) {
+            const r = parseInt(hex[0], 16), g = parseInt(hex[1], 16), b = parseInt(hex[2], 16);
+            const a = hex.length === 4 ? parseInt(hex[3], 16) : 15;
+            return [(r << 4) | r, (g << 4) | g, (b << 4) | b, (a << 4) | a];
+        }
+        if (hex.length === 6 || hex.length === 8) {
+            const r = parseInt(hex.substring(0, 2), 16);
+            const g = parseInt(hex.substring(2, 4), 16);
+            const b = parseInt(hex.substring(4, 6), 16);
+            const a = hex.length === 8 ? parseInt(hex.substring(6, 8), 16) : 255;
+            return [r, g, b, a];
+        }
+        return null;
+    }
+
+    const lower = s.toLowerCase();
+    if (lower.charCodeAt(0) === 114 /* r */ && s.charCodeAt(s.length - 1) === 41 /* ) */) {
+        let inner = null, wantsAlpha = false;
+        if (lower.startsWith('rgba(')) {
+            inner = s.substring(5, s.length - 1);
+            wantsAlpha = true;
+        } else if (lower.startsWith('rgb(')) {
+            inner = s.substring(4, s.length - 1);
+        } else {
+            return null;
+        }
+        const parts = inner.split(',');
+        if (parts.length !== (wantsAlpha ? 4 : 3)) return null;
+        const out = [0, 0, 0, 255];
+        for (let i = 0; i < 3; i++) {
+            const channel = _strictU8(parts[i].trim());
+            if (channel === null) return null;
+            out[i] = channel;
+        }
+        if (wantsAlpha) {
+            const alpha = _strictAlpha(parts[3].trim());
+            if (alpha === null) return null;
+            out[3] = alpha;
+        }
+        return out;
+    }
+
+    // Named colours are answered only on a hit. Both tables read an unknown name
+    // as black, so a miss answered here would agree today -- but only while the
+    // tables are identical, and `the_named_colours_agree_name_for_name` is what
+    // holds that, not this. Abstaining costs a miss path nothing and keeps this
+    // function's own rule intact: it answers what it knows and guesses nothing.
+    if (lower.length > 24) return null;
+    const named = _NAMED_COLORS[lower];
+    return named === undefined ? null : named;
+}
+
+// A channel exactly as Rust's `str::parse::<u8>` would take it: optional `+`,
+// decimal digits, nothing else, and in range. Anything Rust would reject lands
+// on `unwrap_or(0)` there, which this abstains from guessing at.
+function _strictU8(text) {
+    let i = 0;
+    if (text.charCodeAt(0) === 43 /* + */) i = 1;
+    if (i === text.length || text.length - i > 3) return null;
+    let value = 0;
+    for (; i < text.length; i++) {
+        const digit = text.charCodeAt(i) - 48;
+        if (digit < 0 || digit > 9) return null;
+        value = value * 10 + digit;
+    }
+    return value > 255 ? null : value;
+}
+
+// The alpha channel, mirroring `parse::<f32>().unwrap_or(1.0).clamp(0,1) * 255.0
+// as u8`. The arithmetic runs at `f32` through `Math.fround` because the Rust
+// side does: at `f64` the product can land on the other side of an integer and
+// truncate one lower.
+//
+// Only plain decimal literals are accepted. Exponents, infinities and NaN are
+// left to the Rust parser rather than reimplemented.
+function _strictAlpha(text) {
+    let i = 0;
+    if (text.charCodeAt(0) === 43 /* + */) i = 1;
+    let digits = 0, dots = 0;
+    for (let j = i; j < text.length; j++) {
+        const c = text.charCodeAt(j);
+        if (c === 46 /* . */) { dots++; if (dots > 1) return null; continue; }
+        if (c < 48 || c > 57) return null;
+        digits++;
+    }
+    if (digits === 0) return null;
+    let value = Math.fround(parseFloat(text));
+    if (!(value >= 0)) value = 0;
+    if (value > 1) value = 1;
+    return Math.trunc(Math.fround(value * 255));
+}
+
 // G-2: CSS `font` parsing used to live here as `_parseCssFont`
 // and in Rust as a separate implementation.  Both parsers could
 // subtly drift (different weight ladders, different unit
@@ -338,7 +457,7 @@ class CanvasRenderingContext2D {
         this._canvasId = canvas._rid;
 
         // Create native 2D context on the render thread
-        flushGlCommandStream();
+        flushRenderCommandStream();
         this._ctxId = op_create_context_2d(this._canvasId);
         if (this._ctxId < 0) { console.error("Failed to create 2d context"); }
 
@@ -359,9 +478,6 @@ class CanvasRenderingContext2D {
 
         // State stack for save/restore
         this._stateStack = [];
-
-        // Frame tracking
-        this._frameStarted = false;
 
         // Text texture cache state machine:
         //   0 = none, 1 = pending record (cache miss; op_fill_text was
@@ -434,12 +550,12 @@ class CanvasRenderingContext2D {
         if (this._tcState === 0) return;
         const k = this._tcKey;
         if (this._tcState === 2 && k) {
+            this._barrier();
             op_text_cache_unpin(
                 k.text, k.fontRequest, k.fontSize, k.fontWeight,
                 k.italic, k.fillColor, k.textAlign, k.textBaseline,
                 k.canvasW, k.canvasH,
             );
-            this._frameBegin();
             op_fill_text(
                 this._canvasId,
                 k.text,
@@ -468,7 +584,7 @@ class CanvasRenderingContext2D {
     //         fillText hits.
     _consumeTextCacheForTexImage(glCanvasId, target, level, internalformat) {
         if (this._tcState === 0 || this._tcKey === null) return false;
-        flushGlCommandStream();
+        flushRenderCommandStream();
         const k = this._tcKey;
         const isHit = this._tcState === 2;
         this._tcState = 0;
@@ -505,120 +621,96 @@ class CanvasRenderingContext2D {
 
     // ==================== Frame Lifecycle ====================
 
-    _frameBegin() {
-        // Flush any pending GL stream unconditionally before every 2D collector
-        // write so program order is preserved across mid-frame GL/2D interleaves:
-        // a GL encode that happens AFTER _frameStarted is already true must still
-        // be submitted before the next 2D op (design S8 ordering red line #3).
-        // On pure-2D frames this is an empty-cursor no-op costing one branch.
-        flushGlCommandStream();
-        if (!this._frameStarted) {
-            op_frame_begin(this._canvasId);
-            this._frameStarted = true;
-        }
-    }
-
-    _frameEnd() {
-        flushGlCommandStream();
-        // A pending suppressed-hit that never reached its consuming
-        // getImageData by frame end must be committed so the text
-        // isn't silently dropped.
-        this._abandonPendingTextCache();
-        if (this._frameStarted) {
-            op_frame_end(this._canvasId);
-            this._frameStarted = false;
-        }
+    // The ordering barrier, for the commands that still cross as ops.
+    //
+    // 2D and GL records share one buffer, so between two *encoded* commands
+    // there is nothing to do -- the order in the buffer is the order. What still
+    // needs saying is the boundary between an encoded command and one that goes
+    // straight to the collector: text, gradients, patterns, dash arrays, images
+    // and the synchronous reads. Those carry strings or variable-length arrays
+    // and have no record shape, so they arrive by op, and an op that overtakes
+    // the records encoded before it draws the frame out of order.
+    //
+    // Empty-buffer cost is one comparison. `every_op_in_the_2d_facade_is_ordered`
+    // checks that every op call in this file has one of these in front of it,
+    // because a barrier that has to be remembered is one that gets forgotten.
+    _barrier() {
+        flushRenderCommandStream();
     }
 
     // ==================== Path Methods ====================
 
     beginPath() {
-        this._frameBegin();
-        op_begin_path(this._canvasId);
+        encode2dBeginPath(this._canvasId);
     }
 
     closePath() {
-        this._frameBegin();
-        op_close_path(this._canvasId);
+        encode2dClosePath(this._canvasId);
     }
 
     moveTo(x, y) {
-        this._frameBegin();
-        op_move_to(this._canvasId, x, y);
+        encode2dMoveTo(this._canvasId, x, y);
     }
 
     lineTo(x, y) {
-        this._frameBegin();
-        op_line_to(this._canvasId, x, y);
+        encode2dLineTo(this._canvasId, x, y);
     }
 
     quadraticCurveTo(cpx, cpy, x, y) {
-        this._frameBegin();
-        op_quadratic_curve_to(this._canvasId, cpx, cpy, x, y);
+        encode2dQuadraticCurveTo(this._canvasId, cpx, cpy, x, y);
     }
 
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
-        this._frameBegin();
-        op_bezier_curve_to(this._canvasId, cp1x, cp1y, cp2x, cp2y, x, y);
+        encode2dBezierCurveTo(this._canvasId, cp1x, cp1y, cp2x, cp2y, x, y);
     }
 
     arc(x, y, radius, startAngle, endAngle, counterclockwise = false) {
-        this._frameBegin();
-        op_arc(this._canvasId, x, y, radius, startAngle, endAngle, counterclockwise);
+        encode2dArc(this._canvasId, x, y, radius, startAngle, endAngle, counterclockwise);
     }
 
     arcTo(x1, y1, x2, y2, radius) {
-        this._frameBegin();
-        op_arc_to(this._canvasId, x1, y1, x2, y2, radius);
+        encode2dArcTo(this._canvasId, x1, y1, x2, y2, radius);
     }
 
     rect(x, y, width, height) {
-        this._frameBegin();
-        op_rect(this._canvasId, x, y, width, height);
+        encode2dRect(this._canvasId, x, y, width, height);
     }
 
     ellipse(x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise = false) {
-        this._frameBegin();
-        op_ellipse(this._canvasId, x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise);
+        encode2dEllipse(this._canvasId, x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise);
     }
 
     // ==================== Drawing Methods ====================
 
     fill(pathOrFillRule) {
         this._abandonPendingTextCache();
-        this._frameBegin();
-        op_fill(this._canvasId);
+        encode2dFill(this._canvasId);
     }
 
     stroke(path) {
         this._abandonPendingTextCache();
-        this._frameBegin();
-        op_stroke(this._canvasId);
+        encode2dStroke(this._canvasId);
     }
 
     clip(pathOrFillRule) {
-        this._frameBegin();
-        op_clip(this._canvasId);
+        encode2dClip(this._canvasId);
     }
 
     // ==================== Rectangle Methods ====================
 
     fillRect(x, y, width, height) {
         this._abandonPendingTextCache();
-        this._frameBegin();
-        op_fill_rect(this._canvasId, x, y, width, height);
+        encode2dFillRect(this._canvasId, x, y, width, height);
     }
 
     strokeRect(x, y, width, height) {
         this._abandonPendingTextCache();
-        this._frameBegin();
-        op_stroke_rect(this._canvasId, x, y, width, height);
+        encode2dStrokeRect(this._canvasId, x, y, width, height);
     }
 
     clearRect(x, y, width, height) {
         this._abandonPendingTextCache();
-        this._frameBegin();
-        op_clear_rect(this._canvasId, x, y, width, height);
+        encode2dClearRect(this._canvasId, x, y, width, height);
     }
 
     // ==================== Text Methods ====================
@@ -631,6 +723,7 @@ class CanvasRenderingContext2D {
 
         const args = this._buildTextCacheArgs(text);
         if (args !== null) {
+            this._barrier();
             const hit = op_text_cache_peek_pin(
                 args.text, args.fontRequest, args.fontSize, args.fontWeight,
                 args.italic, args.fillColor, args.textAlign, args.textBaseline,
@@ -652,13 +745,13 @@ class CanvasRenderingContext2D {
             this._tcState = 1;
             this._tcKey = args;
         }
-        this._frameBegin();
+        this._barrier();
         op_fill_text(this._canvasId, String(text), x, y, maxWidth);
     }
 
     strokeText(text, x, y, maxWidth = Infinity) {
         this._abandonPendingTextCache();
-        this._frameBegin();
+        this._barrier();
         op_stroke_text(this._canvasId, String(text), x, y, maxWidth);
     }
 
@@ -702,7 +795,7 @@ class CanvasRenderingContext2D {
         // shared `css_font::parse_css_font` implementation, which
         // is also what the render-thread `SetFont` handler uses
         // so the two sides can't disagree.
-        flushGlCommandStream();
+        flushRenderCommandStream();
         const buf = op_measure_text_flat(this._canvasId, s, this._font);
         const f = new Float32Array(buf.buffer, buf.byteOffset, 12);
         const metrics = {
@@ -747,13 +840,21 @@ class CanvasRenderingContext2D {
     set fillStyle(value) {
         if (this._fillStyle === value) return;
         this._fillStyle = value;
-        this._frameBegin();
         if (value instanceof CanvasGradient) {
             value._apply();
         } else if (value instanceof CanvasPattern) {
             value._applyFill();
         } else {
-            op_set_fill_style(this._canvasId, String(value));
+            const rgba = _strictColorToRGBA(value);
+            if (rgba === null) {
+                this._barrier();
+                op_set_fill_style(this._canvasId, String(value));
+            } else {
+                encode2dSetFillStyle(
+                    this._canvasId,
+                    rgba[0] / 255, rgba[1] / 255, rgba[2] / 255, rgba[3] / 255,
+                );
+            }
         }
     }
 
@@ -761,13 +862,21 @@ class CanvasRenderingContext2D {
     set strokeStyle(value) {
         if (this._strokeStyle === value) return;
         this._strokeStyle = value;
-        this._frameBegin();
         if (value instanceof CanvasGradient) {
             value._applyStroke();
         } else if (value instanceof CanvasPattern) {
             value._applyStroke();
         } else {
-            op_set_stroke_style(this._canvasId, String(value));
+            const rgba = _strictColorToRGBA(value);
+            if (rgba === null) {
+                this._barrier();
+                op_set_stroke_style(this._canvasId, String(value));
+            } else {
+                encode2dSetStrokeStyle(
+                    this._canvasId,
+                    rgba[0] / 255, rgba[1] / 255, rgba[2] / 255, rgba[3] / 255,
+                );
+            }
         }
     }
 
@@ -775,32 +884,28 @@ class CanvasRenderingContext2D {
     set lineWidth(value) {
         if (this._lineWidth === value) return;
         this._lineWidth = value;
-        this._frameBegin();
-        op_set_line_width(this._canvasId, value);
+        encode2dSetLineWidth(this._canvasId, value);
     }
 
     get lineCap() { return this._lineCap; }
     set lineCap(value) {
         if (this._lineCap === value) return;
         this._lineCap = value;
-        this._frameBegin();
-        op_set_line_cap(this._canvasId, LINE_CAP_MAP[value] ?? 0);
+        encode2dSetLineCap(this._canvasId, LINE_CAP_MAP[value] ?? 0);
     }
 
     get lineJoin() { return this._lineJoin; }
     set lineJoin(value) {
         if (this._lineJoin === value) return;
         this._lineJoin = value;
-        this._frameBegin();
-        op_set_line_join(this._canvasId, LINE_JOIN_MAP[value] ?? 0);
+        encode2dSetLineJoin(this._canvasId, LINE_JOIN_MAP[value] ?? 0);
     }
 
     get miterLimit() { return this._miterLimit; }
     set miterLimit(value) {
         if (this._miterLimit === value) return;
         this._miterLimit = value;
-        this._frameBegin();
-        op_set_miter_limit(this._canvasId, value);
+        encode2dSetMiterLimit(this._canvasId, value);
     }
 
     get globalAlpha() { return this._globalAlpha; }
@@ -808,8 +913,7 @@ class CanvasRenderingContext2D {
         const clamped = Math.max(0, Math.min(1, value));
         if (this._globalAlpha === clamped) return;
         this._globalAlpha = clamped;
-        this._frameBegin();
-        op_set_global_alpha(this._canvasId, this._globalAlpha);
+        encode2dSetGlobalAlpha(this._canvasId, this._globalAlpha);
     }
 
     get font() { return this._font; }
@@ -827,7 +931,7 @@ class CanvasRenderingContext2D {
         // `measureText` is later measured from, so accepting one
         // the render thread will reject is how the same `ctx.font`
         // comes to measure at one size and paint at another.
-        this._frameBegin();
+        this._barrier();
         if (!op_set_font(this._canvasId, value)) return;
         this._font = value;
     }
@@ -836,7 +940,7 @@ class CanvasRenderingContext2D {
     set textAlign(value) {
         if (this._textAlign === value) return;
         this._textAlign = value;
-        this._frameBegin();
+        this._barrier();
         op_set_text_align(this._canvasId, TEXT_ALIGN_MAP[value] ?? 0);
     }
 
@@ -844,7 +948,7 @@ class CanvasRenderingContext2D {
     set textBaseline(value) {
         if (this._textBaseline === value) return;
         this._textBaseline = value;
-        this._frameBegin();
+        this._barrier();
         op_set_text_baseline(this._canvasId, TEXT_BASELINE_MAP[value] ?? 3);
     }
 
@@ -852,7 +956,7 @@ class CanvasRenderingContext2D {
     set direction(value) {
         if (this._direction === value) return;
         this._direction = value;
-        this._frameBegin();
+        this._barrier();
         op_set_text_direction(this._canvasId, TEXT_DIRECTION_MAP[value] ?? 0);
     }
 
@@ -908,8 +1012,7 @@ class CanvasRenderingContext2D {
             shadowOffsetX: this._shadowOffsetX,
             shadowOffsetY: this._shadowOffsetY,
         });
-        this._frameBegin();
-        op_save(this._canvasId);
+        encode2dSave(this._canvasId);
     }
 
     restore() {
@@ -936,22 +1039,19 @@ class CanvasRenderingContext2D {
                 _shadowOffsetY: state.shadowOffsetY,
             });
         }
-        this._frameBegin();
-        op_restore(this._canvasId);
+        encode2dRestore(this._canvasId);
     }
 
     // ==================== Transform Methods ====================
 
     translate(x, y) {
-        this._frameBegin();
         const m = this._tm;
         m[4] += m[0] * x + m[2] * y;
         m[5] += m[1] * x + m[3] * y;
-        op_translate(this._canvasId, x, y);
+        encode2dTranslate(this._canvasId, x, y);
     }
 
     rotate(angle) {
-        this._frameBegin();
         const cos = Math.cos(angle), sin = Math.sin(angle);
         const m = this._tm;
         const a = m[0], b = m[1], c = m[2], d = m[3];
@@ -959,35 +1059,31 @@ class CanvasRenderingContext2D {
         m[1] = b * cos + d * sin;
         m[2] = a * -sin + c * cos;
         m[3] = b * -sin + d * cos;
-        op_rotate(this._canvasId, angle);
+        encode2dRotate(this._canvasId, angle);
     }
 
     scale(x, y) {
-        this._frameBegin();
         this._tm[0] *= x; this._tm[1] *= x;
         this._tm[2] *= y; this._tm[3] *= y;
-        op_scale(this._canvasId, x, y);
+        encode2dScale(this._canvasId, x, y);
     }
 
     setTransform(a, b, c, d, e, f) {
-        this._frameBegin();
         this._tm[0] = a; this._tm[1] = b;
         this._tm[2] = c; this._tm[3] = d;
         this._tm[4] = e; this._tm[5] = f;
-        op_set_transform(this._canvasId, a, b, c, d, e, f);
+        encode2dSetTransform(this._canvasId, a, b, c, d, e, f);
     }
 
     resetTransform() {
-        this._frameBegin();
         this._tm[0] = 1; this._tm[1] = 0;
         this._tm[2] = 0; this._tm[3] = 1;
         this._tm[4] = 0; this._tm[5] = 0;
-        op_reset_transform(this._canvasId);
+        encode2dResetTransform(this._canvasId);
     }
 
     transform(a, b, c, d, e, f) {
         // Multiply current matrix: CTM = CTM * [a b c d e f]
-        this._frameBegin();
         const m = this._tm;
         const a0 = m[0], b0 = m[1], c0 = m[2], d0 = m[3], e0 = m[4], f0 = m[5];
         m[0] = a0 * a + c0 * b;
@@ -996,7 +1092,7 @@ class CanvasRenderingContext2D {
         m[3] = b0 * c + d0 * d;
         m[4] = a0 * e + c0 * f + e0;
         m[5] = b0 * e + d0 * f + f0;
-        op_set_transform(this._canvasId, m[0], m[1], m[2], m[3], m[4], m[5]);
+        encode2dSetTransform(this._canvasId, m[0], m[1], m[2], m[3], m[4], m[5]);
     }
 
     getTransform() {
@@ -1010,7 +1106,7 @@ class CanvasRenderingContext2D {
         this._abandonPendingTextCache();
         if (!image || !image.loaded) return;
 
-        this._frameBegin();
+        this._barrier();
 
         let sx, sy, sw, sh, dx, dy, dw, dh;
 
@@ -1041,7 +1137,7 @@ class CanvasRenderingContext2D {
             throw new RangeError("drawImageBatch exceeds the implementation limit");
         }
 
-        this._frameBegin();
+        this._barrier();
 
         const validDraws = draws.filter(d => d.image && d.image.loaded);
         if (validDraws.length === 0) return;
@@ -1097,7 +1193,7 @@ class CanvasRenderingContext2D {
         const snapshotInBounds = x >= 0 && y >= 0
             && x + w <= this._canvas.width
             && y + h <= this._canvas.height;
-        flushGlCommandStream();
+        flushRenderCommandStream();
 
         // Text texture cache: only a full-canvas read participates
         // (cocos always does getImageData(0, 0, canvas.w, canvas.h)
@@ -1171,8 +1267,7 @@ class CanvasRenderingContext2D {
         var idx = _COMPOSITE_OPS.indexOf(value);
         if (idx !== -1) {
             this._compositeOp = value;
-            this._frameBegin();
-            op_set_composite_operation(this._canvasId, idx);
+            encode2dSetCompositeOperation(this._canvasId, idx);
         }
     }
 
@@ -1182,31 +1277,36 @@ class CanvasRenderingContext2D {
         const v = +value || 0;
         if (this._shadowBlur === v) return;
         this._shadowBlur = v;
-        this._frameBegin();
-        op_set_shadow_blur(this._canvasId, this._shadowBlur);
+        encode2dSetShadowBlur(this._canvasId, this._shadowBlur);
     }
     get shadowColor() { return this._shadowColor || 'rgba(0,0,0,0)'; }
     set shadowColor(value) {
         if (this._shadowColor === value) return;
         this._shadowColor = value;
-        this._frameBegin();
-        op_set_shadow_color(this._canvasId, String(value));
+        const rgba = _strictColorToRGBA(value);
+        if (rgba === null) {
+            this._barrier();
+            op_set_shadow_color(this._canvasId, String(value));
+        } else {
+            encode2dSetShadowColor(
+                this._canvasId,
+                rgba[0] / 255, rgba[1] / 255, rgba[2] / 255, rgba[3] / 255,
+            );
+        }
     }
     get shadowOffsetX() { return this._shadowOffsetX || 0; }
     set shadowOffsetX(value) {
         const v = +value || 0;
         if (this._shadowOffsetX === v) return;
         this._shadowOffsetX = v;
-        this._frameBegin();
-        op_set_shadow_offset_x(this._canvasId, this._shadowOffsetX);
+        encode2dSetShadowOffsetX(this._canvasId, this._shadowOffsetX);
     }
     get shadowOffsetY() { return this._shadowOffsetY || 0; }
     set shadowOffsetY(value) {
         const v = +value || 0;
         if (this._shadowOffsetY === v) return;
         this._shadowOffsetY = v;
-        this._frameBegin();
-        op_set_shadow_offset_y(this._canvasId, this._shadowOffsetY);
+        encode2dSetShadowOffsetY(this._canvasId, this._shadowOffsetY);
     }
 
     // ==================== Gradient ====================
@@ -1227,7 +1327,7 @@ class CanvasRenderingContext2D {
     setLineDash(segments) {
         if (!Array.isArray(segments)) return;
         this._lineDash = segments.slice();
-        this._frameBegin();
+        this._barrier();
         var buf = new Float32Array(segments);
         op_set_line_dash(this._canvasId, new Uint8Array(buf.buffer));
     }
@@ -1235,8 +1335,7 @@ class CanvasRenderingContext2D {
     get lineDashOffset() { return this._lineDashOffset || 0; }
     set lineDashOffset(value) {
         this._lineDashOffset = +value || 0;
-        this._frameBegin();
-        op_set_line_dash_offset(this._canvasId, this._lineDashOffset);
+        encode2dSetLineDashOffset(this._canvasId, this._lineDashOffset);
     }
 
     // ==================== Other stubs ====================
@@ -1300,7 +1399,7 @@ function _migoMakeSnapshotImageData(snapshotId, w, h) {
                 _populated = true;
                 const sid = imageData.__migo_snapshot_id__ | 0;
                 if (sid !== 0) {
-                    flushGlCommandStream();
+                    flushRenderCommandStream();
                     const real = op_force_readback_snapshot(sid);
                     if (real && real.length === placeholder.length) {
                         placeholder.set(real);
@@ -1348,12 +1447,12 @@ function _migoMakeTextCacheImageData(ctx, k, w, h) {
                 _populated = true;
                 const key = imageData.__migo_text_cache_key__;
                 if (key) {
+                    ctx._barrier();
                     op_text_cache_unpin(
                         key.text, key.fontRequest, key.fontSize, key.fontWeight,
                         key.italic, key.fillColor, key.textAlign, key.textBaseline,
                         key.canvasW, key.canvasH,
                     );
-                    ctx._frameBegin();
                     op_fill_text(
                         ctx._canvasId,
                         key.text,
@@ -1391,7 +1490,7 @@ frameEndHooks.push(() => {
     // Flush any pending GL stream BEFORE building the frame packet so that
     // GL commands encoded in the JS buffer arrive at the render thread in the
     // same FramePacket as the Canvas2D work (design S8 ordering invariant).
-    flushGlCommandStream();
+    flushRenderCommandStream();
     op_frame_end_unified();
 });
 // Reset the per-frame snapshot budget AFTER op_frame_end_unified

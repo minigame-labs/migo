@@ -396,6 +396,89 @@ jobs:
       - name: OpenHarmony API floor declaration contract
         run: bash scripts/test-ohos-api-floor-declaration-contract.sh
 
+      # Two Apple numbers that look like one: the deployment target the binary
+      # loads on, and the lowest OS a given runtime lane is eligible for. The
+      # superseded design collapsed them and paid user coverage for a build
+      # simplification. This also sweeps the tree so the consumer added later
+      # cannot quietly carry its own copy -- the check that survives, since the
+      # per-file checks only see the consumers that exist today.
+      - name: Apple deployment floor contract
+        run: bash scripts/test-apple-deployment-floor-contract.sh
+
+      # The lane a Session gets, and why. Checks the Swift reason-code mirror
+      # against the policy from both directions -- a case with no policy entry
+      # is a value nobody can read in a report, and a policy entry with no case
+      # is a reason the resolver cannot emit. Both compile.
+      - name: Apple profile policy contract
+        run: bash scripts/test-apple-profile-policy-contract.sh
+
+      # The one claim the whole iOS fast lane rests on: the Performance+ product
+      # links no JavaScript engine. Content JavaScript runs in WebKit's
+      # WebContent process, where the system grants a JIT this process cannot
+      # have; an archive that also embedded an engine would pay twice for
+      # working set and package size and get a JIT for neither.
+      #
+      # It reads the resolved dependency graph, because that is the only thing
+      # that can answer it -- the violation this exists to catch is a
+      # convenience dependency three levels down, and nothing about a crate's
+      # public surface reveals one. The gate carries its own positive control:
+      # the embedded build must still be reported as containing V8, so a clean
+      # result cannot come from a detector that stopped working.
+      - name: Apple Performance+ engine-free dependency closure
+        run: bash scripts/test-apple-performance-rust-closure.sh
+
+      # The artefact half of the same claim. A clean dependency graph is
+      # necessary and not sufficient: a vendored object or a linker script could
+      # put engine symbols in an archive whose Cargo graph is spotless. This
+      # builds the Performance+ product for the host and reads its symbol table.
+      #
+      # Linux, months before the first Apple archive, because the property is
+      # about Cargo features rather than about the target: the same features
+      # produce the same closure whichever triple they are built for, and
+      # finding a violation here is finding it without a Mac.
+      - name: Apple Performance+ archive contains no engine symbols
+        run: |
+          cd engine
+          cargo build -p migo-capi --no-default-features --features external-frames
+          cd ..
+          bash scripts/test-apple-performance-rust-closure.sh \
+            --artifact engine/target/debug/libmigo_capi.a
+
+      # The other half of the wire contract. The format says two encoders are
+      # measured against one fixed corpus; the JavaScript one runs inside
+      # WebContent and cannot be checked by any Rust test, so it gets its own
+      # step. The corpus carries 128-bit and 64-bit values on purpose: a
+      # JavaScript encoder that reached for Number instead of BigInt is correct
+      # for every value written by hand and wrong for a real session's identity.
+      - name: Frame wire JavaScript encoder against the golden corpus
+        run: bash scripts/test-frame-wire-js-encoder.sh
+
+      # Three tables name the same opcodes: the Rust wire format, the in-process
+      # JavaScript encoder, and the WebContent producer. A record header is
+      # twelve bits of opcode and twenty of word count, so nothing across that
+      # boundary is typed -- a disagreement is a frame that does not draw, on a
+      # device, rather than anything that fails to build.
+      - name: Render opcode table agreement
+        run: bash scripts/test-render-opcode-agreement.sh
+
+      # The G0 decision procedure, months before the first Mac. Its input needs
+      # a device; its rules do not, and the alternative is finding out on lab
+      # day that the thing turning measurements into a choice has a bug. Each
+      # case breaks one evidence rule -- simulator data, half a matrix, arms the
+      # data does not separate -- and checks that the tool refuses.
+      # A command that waits for an answer is a decision, so it is written down.
+      # The Apple Performance+ lane runs content in an agent whose ability to
+      # block is the whole difference between the two candidate topologies -- a
+      # Window main agent's `[[CanBlock]]` is false, so a synchronous reply
+      # there is not slower, it is impossible. On Android each of these stalls
+      # the JavaScript thread for a round trip, and two are polled every frame.
+      # The list is derived from the protocol enums; the contract classifies it.
+      - name: Synchronous surface contract
+        run: bash scripts/test-synchronous-surface-contract.sh
+
+      - name: Apple probe decision procedure
+        run: bash scripts/test-apple-probe-decision.sh
+
       - name: OpenHarmony host and package metadata contracts
         run: |
           bash scripts/test-ohos-host-contract.sh
@@ -456,7 +539,7 @@ jobs:
       # lints gate again, and the style backlog still just warns.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi -p migo-frame-wire -p migo-frame-decode -p migo-alloc-probe -p migo-contention-probe -p migo-executor-probe --all-targets
 
       # Blocking gate for the crates that need no extra system packages (shared +
       # io + runtime-v8). All their lib tests must pass. Previously-masked failures
@@ -500,8 +583,18 @@ jobs:
         working-directory: engine
         run: |
           cargo test -p migo-shared -p migo-runtime-v8 --tests
-          cargo test -p migo-io --lib
+          # `--tests` so the ASTC fixture emitter in `tests/` is compiled here.
+          # Its cases are `#[ignore]`d and belong to the ASTC gate, but a
+          # binary nothing builds is one that stops building unnoticed.
+          cargo test -p migo-io --tests
           cargo test -p migo-capi-abi --all-targets
+          cargo test -p migo-frame-wire --all-targets
+          cargo test -p migo-frame-decode --all-targets
+          # The other half of that crate's feature arrangement: the reader must
+          # still build with the packet builder excluded, which is how the
+          # shipping path takes it. Proving it here makes the exclusion a
+          # checked fact instead of a comment.
+          cargo build -p migo-frame-wire --no-default-features
           cargo test -p migo-alloc-probe
           cargo test -p migo-contention-probe
           cargo test -p migo-executor-probe
@@ -860,6 +953,7 @@ jobs:
             timeout 300 sudo apt-get install -y -qq \
               ninja-build \
               libgl-dev libegl-dev libgles-dev \
+              libgl1-mesa-dri libegl-mesa0 \
               libfontconfig1-dev libfreetype-dev \
               libasound2-dev || return 1
           }
@@ -882,6 +976,26 @@ jobs:
       # It was run against this set before being added, and it reports genuine
       # clippy lints in the hundreds rather than passing empty. Remove the cap with
       # the dedicated lint-cleanup work, in both jobs at once.
+      # The ASTC encoder, checked by a decoder that is not ours.
+      #
+      # ASTC packs eleven bits of block mode whose layout is a five-row table,
+      # endpoint values as base-three trits interleaved with raw bits, and
+      # weights written from the top of the block downwards in reverse bit
+      # order. A misreading of any of those lands in an encoder and in a decoder
+      # written by the same author from the same specification, so the oracle is
+      # whatever ASTC decoder the GL stack ships -- here Mesa's software one.
+      #
+      # It lives in this job rather than quality-gate because this is the job
+      # that owns a GL stack, which is the rule test-every-gate-is-invoked.sh
+      # states for a gate needing a toolchain: it goes where that toolchain is.
+      #
+      # A host whose decoder does not do ASTC fails rather than skips. That is
+      # deliberate -- it cannot answer the question, and reporting that as
+      # success is how a check stops being one -- and it means this step is also
+      # the thing that tells us if a runner image regresses.
+      - name: ASTC encoder round trip
+        run: bash scripts/test-astc-encoder.sh
+
       - name: Run clippy lints (crates needing host system packages)
         working-directory: engine
         run: cargo clippy -p migo-graphics -p migo-core -p migo-capi -p migo-platform -p migo-audio --all-targets

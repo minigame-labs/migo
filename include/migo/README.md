@@ -31,9 +31,9 @@ Android's runtime is a **static library** a host links into its own `.so`, drive
 - `types.h`, `capabilities.h`, `session.h`, and `surface.h` contain only standard C types.
 - `capabilities.h` answers what the *linked library* supports; the `MIGO_C_ABI_*` macros above can only report what the headers were compiled against.
 - `platform/*.h` contains strongly typed native target descriptors without including any platform SDK header.
-- iOS has no native Surface descriptor because its planned default backend is an embeddable `WKWebView` Host Kit.
+- iOS declares `UIView*` and `CAMetalLayer*` descriptors. It previously declared none, on the assumption that the iOS backend would be an embeddable `WKWebView` container where WebKit owns the drawing surface. That assumption did not survive: the JIT boundary on iOS is drawn around the process, not around the engine, so content JavaScript runs inside WebKit's WebContent process while rendering returns to the host process -- which needs a host-owned Metal surface.
 
-The generic descriptor is not a universal native-window union. It points to one typed Android, Win32, WinUI, macOS, X11, Wayland, or OpenHarmony descriptor, preserving the platform's best native integration model.
+The generic descriptor is not a universal native-window union. It points to one typed Android, Win32, WinUI, macOS, iOS, X11, Wayland, or OpenHarmony descriptor, preserving the platform's best native integration model.
 
 ## Structure initialization and extension
 
@@ -76,6 +76,7 @@ Losing a Surface is not detaching it. After a loss the attachment is still live 
 | Android `ANativeWindow*` | Migo acquires a strong reference before attach succeeds and releases its reference before the release observer reaches `RELEASED`. |
 | OpenHarmony `OHNativeWindow*` | Migo takes its own native-object reference and releases it before `RELEASED`. |
 | macOS `NSView*` / `CAMetalLayer*` | Migo retains the Objective-C object until retirement completes; the two target kinds remain distinct. |
+| iOS `UIView*` / `CAMetalLayer*` | Same rule as macOS, and a separate pair of kinds. The four Apple records are byte-identical, so the kind is the only thing distinguishing a retain of a view from a layer the renderer will call `nextDrawable` on. |
 | WinUI native SwapChainPanel interface | Migo keeps its own COM reference until retirement completes; this is not modeled as an HWND. |
 | Win32 child `HWND` | Host-owned and valid until `RELEASED`; Migo neither destroys it nor owns the message loop. |
 | X11 `Display*` + `Window` | `Display*` is borrowed synchronously during attach. Migo opens a private render connection and never closes or dispatches the host connection. The host connection and `Window` remain valid until `RELEASED`. |

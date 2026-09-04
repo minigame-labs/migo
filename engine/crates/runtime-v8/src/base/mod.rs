@@ -12,6 +12,13 @@ struct InstallSubpackageRequest {
     root: String,
     version: String,
     ensure_persistent: bool,
+    /// What this device's GPU decodes, which chooses the compressed texture
+    /// format the ingest writes.
+    ///
+    /// Snapshotted on the op's thread and carried, rather than read on the
+    /// worker: the worker has no host state, and reading it here is also what
+    /// makes the answer the one that was true when the install was asked for.
+    gpu_caps: shared::device::gpu_caps::GpuCapsSnapshot,
 }
 
 fn install_subpackage_blocking(
@@ -34,6 +41,7 @@ fn install_subpackage_blocking(
         &staged_pkg_path,
         &request.pkg_key,
         &request.version,
+        request.gpu_caps,
     )
     .map_err(|e| format!("ingest failed: {e}"))?;
 
@@ -520,6 +528,7 @@ mod tests {
                     root: "subpackages/stage1".to_string(),
                     version: "1.0".to_string(),
                     ensure_persistent: false,
+                    gpu_caps: Default::default(),
                 },
             ))
             .unwrap();
@@ -563,6 +572,7 @@ mod tests {
                         root: "subpackages/stage2".to_string(),
                         version: "1.0".to_string(),
                         ensure_persistent: false,
+                        gpu_caps: Default::default(),
                     };
                     move || {
                         install_subpackage_blocking(mount_table, cache_dir, request).unwrap();
@@ -648,7 +658,7 @@ async fn op_install_subpackage(
         }
     }
 
-    let (scheduler, mount_table, game_cache_dir, zip_path) = {
+    let (scheduler, mount_table, game_cache_dir, zip_path, gpu_caps) = {
         let st = state.borrow();
         let host = st.borrow::<HostOpState>();
 
@@ -679,7 +689,14 @@ async fn op_install_subpackage(
                     opts.request_id
                 ))
             })?;
-        (st.borrow::<IoSchedulerState>().0.clone(), mt, gcd, zip)
+        let caps = host.gpu_caps.snapshot();
+        (
+            st.borrow::<IoSchedulerState>().0.clone(),
+            mt,
+            gcd,
+            zip,
+            caps,
+        )
     };
 
     let version = if opts.version.is_empty() {
@@ -698,6 +715,7 @@ async fn op_install_subpackage(
             root: opts.root,
             version,
             ensure_persistent: opts.ensure_persistent,
+            gpu_caps,
         },
     )
     .await

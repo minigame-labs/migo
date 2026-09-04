@@ -36,11 +36,24 @@ compile_header_standalone() {
         -o "$TMP_ROOT/${stem}_cpp.o"
 }
 
+# Derived from the directory, for the reason compile_platforms is.
+#
+# The hand-written list this replaced named five headers and the directory held
+# seven: capabilities.h had never been compiled standalone by this gate, and
+# adding external_frames.h would have gone the same way. A public header that
+# does not compile on its own is a header some consumer includes first and
+# cannot build.
 compile_core() {
-    local header
-    for header in migo/types.h migo/surface.h migo/session.h migo/input.h migo/migo.h; do
-        compile_header_standalone "$header"
+    local header count=0
+    for header in "$ROOT"/include/migo/*.h; do
+        [ -e "$header" ] || continue
+        compile_header_standalone "migo/$(basename "$header")"
+        count=$((count + 1))
     done
+    if [ "$count" -lt 5 ]; then
+        echo "core header sweep found only $count headers" >&2
+        return 1
+    fi
     compile_c "$ROOT/tests/c_abi/core_contract.c" "$TMP_ROOT/core_contract.o"
     compile_cpp "$ROOT/tests/c_abi/core_contract.cc" "$TMP_ROOT/core_contract_cpp.o"
     # The old-client lane: a translation unit carrying a previous header's shape,
@@ -53,6 +66,13 @@ compile_core() {
     # a same-type field swap that size and header pins cannot see.
     compile_c "$ROOT/tests/c_abi/old_client_outbound_contract.c" \
         "$TMP_ROOT/old_client_outbound_contract.o"
+    # The externally produced frame record. Its offsets sit outside the
+    # LP64/ILP32 split every other platform record needs, which is the property
+    # being asserted rather than a convenience.
+    compile_c "$ROOT/tests/c_abi/external_frames_contract.c" \
+        "$TMP_ROOT/external_frames_contract.o"
+    compile_cpp "$ROOT/tests/c_abi/external_frames_contract.cc" \
+        "$TMP_ROOT/external_frames_contract_cpp.o"
     require_literal "$INCLUDE_DIR/migo/session.h" \
         "Successful Engine destruction is a thread-completion barrier." \
         "Engine destruction thread-completion barrier"
@@ -97,24 +117,32 @@ compile_ilp32() {
     fi
     local source
     for source in core_contract old_client_contract old_client_outbound_contract \
-                  platform_contract; do
+                  platform_contract external_frames_contract; do
         compile_c_ilp32 "$ROOT/tests/c_abi/$source.c" "$TMP_ROOT/${source}_ilp32.o"
     done
     echo "C ABI ILP32 lane: PASS"
 }
 
+# Derived from the directory, never from a list kept here by hand.
+#
+# The hand-written list this replaced covered seven headers and was correct
+# for all seven. That is exactly how the shape fails: adding
+# migo/platform/ios.h would have compiled, linked, and passed this gate while
+# the new header was never once compiled standalone -- the same silent
+# coverage loss a hand-maintained table produced for the managed-permission
+# audit. A header that exists but is unlisted now fails loudly instead.
 compile_platforms() {
-    local header
-    for header in \
-        migo/platform/android.h \
-        migo/platform/win32.h \
-        migo/platform/winui.h \
-        migo/platform/macos.h \
-        migo/platform/x11.h \
-        migo/platform/wayland.h \
-        migo/platform/openharmony.h; do
-        compile_header_standalone "$header"
+    local header count=0
+    for header in "$ROOT"/include/migo/platform/*.h; do
+        [ -e "$header" ] || continue
+        compile_header_standalone "migo/platform/$(basename "$header")"
+        count=$((count + 1))
     done
+    if [ "$count" -lt 7 ]; then
+        echo "platform header sweep found only $count headers; the directory" \
+             "should hold every typed platform descriptor" >&2
+        return 1
+    fi
     compile_c "$ROOT/tests/c_abi/platform_contract.c" "$TMP_ROOT/platform_contract.o"
     compile_cpp "$ROOT/tests/c_abi/platform_contract.cc" "$TMP_ROOT/platform_contract_cpp.o"
 }

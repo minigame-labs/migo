@@ -5,3 +5,12 @@ license.workspace = true
 edition = "2024"
 
 [lib]
+
+# Test-only, and it must stay that way: this crate is the C boundary and is
+# deliberately dependency-free so an ABI rule is provable without a device, a
+# graphics stack, or anything else. The dev-dependency exists so one test can
+# assert that the four ingress decision numbers here and the four in the wire
+# reader are the same four numbers -- one decision written in two places is
+# exactly the drift that has no other way to be noticed.
+[dev-dependencies]
+migo-frame-wire = { path = "../frame-wire", default-features = false }

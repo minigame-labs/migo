@@ -443,6 +443,12 @@ impl HostJsRuntime {
         f(&mut self.rt, &mut self.bindings)
     }
 
+    /// The op state, for cases that read a counter the runtime keeps there.
+    #[cfg(test)]
+    pub(crate) fn op_state_for_test(&self) -> std::rc::Rc<std::cell::RefCell<deno_core::OpState>> {
+        self.rt.op_state()
+    }
+
     /// Access HostOpState for mutation.
     pub fn update_host_op_state<F>(&mut self, updater: F)
     where

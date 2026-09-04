@@ -1,0 +1,32 @@
+[package]
+name = "migo-frame-wire"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+[lib]
+name = "frame_wire"
+
+[features]
+# On by default, and the default is the point.
+#
+# The obvious arrangement is the opposite: gate the packet builder off, so the
+# shipping crate carries only the reader. It has a trap in it. Every test here
+# is written against the builder, so with the feature off `cargo test -p
+# migo-frame-wire` compiles no test binary and reports success having run
+# nothing -- the silent-green shape this repository keeps finding.
+#
+# So the builder is on by default and the shipping path opts out explicitly:
+# consumers depend on this crate with `default-features = false`, and CI builds
+# `--no-default-features` to prove the reader still stands alone. The exclusion
+# is then a checked fact rather than a property of whichever flags someone
+# happened to type.
+default = ["test-support"]
+test-support = []
+
+# Deliberately almost dependency-free. This crate reads bytes produced by
+# content JavaScript running in another process; every dependency it takes is
+# another thing inside the parser's trust boundary.
+[dependencies]
+crc32fast = "1"
+

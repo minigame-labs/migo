@@ -82,8 +82,20 @@ HOST_CARGO_STEPS=(
     # this project treats as decoration, and here it would have been a step that
     # cannot even run.
     "test -p migo-capi-abi --all-targets"
+    # `--all-targets` for the same reason `capi-abi` needs it: every case lives
+    # in `tests/`, so `--lib` would run exactly zero of them and pass forever.
+    "test -p migo-frame-wire --all-targets"
+    # The command decoder, which the external-frame product needs and the
+    # embedded runtime now calls through a two-method adapter. `--all-targets`
+    # for the same reason as its neighbours: every case lives in `tests/`.
+    "test -p migo-frame-decode --all-targets"
     "test -p migo-shared"
-    "test -p migo-io --lib"
+    # `--tests`, not `--lib`: the ASTC fixture emitter lives in `tests/` and is
+    # `#[ignore]`d, so this runs none of its cases -- but it compiles the binary,
+    # which is the half a gate driving it from outside cannot do. A fixture
+    # emitter that stopped compiling would otherwise be found by
+    # `test-astc-encoder.sh` in CI rather than here.
+    "test -p migo-io --tests"
     # `--tests` rather than `--lib` for the two crates that own integration
     # binaries: `snapshot_roundtrip` and `worker_snapshot_roundtrip` for the
     # runtime, and the five golden-image and decode binaries for graphics. Every

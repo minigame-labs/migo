@@ -64,6 +64,10 @@ impl SurfaceAttachmentSlot {
 
     /// Returns a cloneable read-only lease only when the exact generation is
     /// still live. Used for the explicit restore handoff.
+    /// Used by `RenderService::restore_surface`, which is embedded-only for
+    /// now: see the note there about announcing a new surface generation to a
+    /// producer in another process.
+    #[cfg(feature = "embedded-v8")]
     pub(crate) fn live_lease(&self) -> Option<SurfaceLease> {
         self.current
             .as_ref()

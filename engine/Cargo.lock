@@ -1694,6 +1694,9 @@ dependencies = [
 [[package]]
 name = "migo-capi-abi"
 version = "0.9.6"
+dependencies = [
+ "migo-frame-wire",
+]
 
 [[package]]
 name = "migo-contention-probe"
@@ -1711,6 +1714,8 @@ dependencies = [
  "migo-alloc-probe",
  "migo-audio",
  "migo-contention-probe",
+ "migo-frame-decode",
+ "migo-frame-wire",
  "migo-graphics",
  "migo-io",
  "migo-runtime-v8",
@@ -1730,6 +1735,21 @@ version = "0.9.6"
 dependencies = [
  "parking_lot",
  "tokio",
+]
+
+[[package]]
+name = "migo-frame-decode"
+version = "0.9.6"
+dependencies = [
+ "migo-frame-wire",
+ "migo-shared",
+]
+
+[[package]]
+name = "migo-frame-wire"
+version = "0.9.6"
+dependencies = [
+ "crc32fast",
 ]
 
 [[package]]
@@ -1838,6 +1858,8 @@ dependencies = [
  "image",
  "migo-alloc-probe",
  "migo-contention-probe",
+ "migo-frame-decode",
+ "migo-frame-wire",
  "migo-io",
  "migo-shared",
  "parking_lot",
