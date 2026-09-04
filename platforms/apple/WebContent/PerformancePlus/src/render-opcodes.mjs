@@ -1,9 +1,9 @@
-// The GL command-stream opcode table, as the WebContent producer sees it.
+// The render command-stream opcode table, as the WebContent producer sees it.
 //
 // Three implementations name these numbers: the Rust table in
 // `engine/crates/frame-wire/src/gl_stream.rs`, the in-process JavaScript
-// encoder in `engine/crates/runtime-v8/src/rendering/webgl/00_gl_command_stream.js`,
-// and this file. `scripts/test-gl-opcode-agreement.sh` parses all three and
+// encoder in `engine/crates/runtime-v8/src/rendering/webgl/00_render_command_stream.js`,
+// and this file. `scripts/test-render-opcode-agreement.sh` parses all three and
 // requires them to agree exactly.
 //
 // The Rust table is the source. This file is derived from it, and the gate is
@@ -93,7 +93,7 @@ export const OP_UNIFORM_MATRIX4FV = 266;
 // in; the ranges are what let a reader tell them apart from the opcode alone.
 //
 // Derived from engine/crates/frame-wire/src/canvas2d.rs, and
-// scripts/test-gl-opcode-agreement.sh keeps the three tables in step.
+// scripts/test-render-opcode-agreement.sh keeps the three tables in step.
 
 export const OP2D_SELECT_CANVAS = 512;
 export const OP2D_BEGIN_PATH = 513;

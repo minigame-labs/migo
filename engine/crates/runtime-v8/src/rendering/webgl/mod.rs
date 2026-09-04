@@ -11,11 +11,11 @@ pub(crate) mod frame_collector;
 /// engine. The path stays valid for every call site in this crate.
 pub(crate) use frame_wire::gl_stream;
 
+mod raf;
 /// Test-only: the cases asserting this crate's JavaScript encoder agrees with
 /// the shared wire-format table.
 #[cfg(test)]
-mod gl_stream_js_agreement;
-mod raf;
+mod render_stream_js_agreement;
 mod webgl;
 
 use context2d::*;
@@ -300,11 +300,11 @@ extension!(host_v8_webgl,
         op_tex_image_3d,
         op_tex_sub_image_3d,
         op_tex_storage_3d,
-        op_gl_submit_stream,
+        op_submit_render_stream,
     ],
     esm = [
         dir "src/rendering/webgl",
-        "00_gl_command_stream.js",
+        "00_render_command_stream.js",
         "01_constants.js",
         "02_2d_context.js",
         "02_webgl_context.js",

@@ -3,7 +3,7 @@
 //! These cases live here rather than beside the validator because they are
 //! about *this crate's* JavaScript: the validator moved to `migo-frame-wire` so
 //! the cross-process consumer could use it without linking a JavaScript engine,
-//! and a test that reads `00_gl_command_stream.js` would have dragged that
+//! and a test that reads `00_render_command_stream.js` would have dragged that
 //! coupling along with it. The format is shared; the encoder that has to agree
 //! with it is not.
 //!
@@ -29,12 +29,12 @@ mod js_agreement {
     /// sixty-nine it already knew.
     ///
     /// The WebContent producer has a third copy of this table and cannot be
-    /// read from inside this crate; `scripts/test-gl-opcode-agreement.sh`
+    /// read from inside this crate; `scripts/test-render-opcode-agreement.sh`
     /// checks all three together.
     #[test]
     fn the_javascript_encoder_declares_every_opcode_the_rust_table_does() {
         const RUST: &str = include_str!("../../../../frame-wire/src/gl_stream.rs");
-        const JS: &str = include_str!("00_gl_command_stream.js");
+        const JS: &str = include_str!("00_render_command_stream.js");
 
         fn parse(text: &str, prefix: &str, suffix: &str) -> Vec<(String, u32)> {
             let mut found = Vec::new();
@@ -89,7 +89,7 @@ mod js_agreement {
 
     #[test]
     fn js_module_buffers_null_at_module_load() {
-        let js = include_str!("00_gl_command_stream.js");
+        let js = include_str!("00_render_command_stream.js");
         assert!(
             js.contains("= null;"),
             "JS module backing buffer vars must be initialized to null (lazy allocation)"
@@ -99,7 +99,7 @@ mod js_agreement {
     /// No buffer references on globalThis.
     #[test]
     fn js_module_no_globalthis_assignment_of_buffers() {
-        let js = include_str!("00_gl_command_stream.js");
+        let js = include_str!("00_render_command_stream.js");
         assert!(
             !js.contains("globalThis."),
             "JS module must not assign buffers to globalThis"
@@ -109,7 +109,7 @@ mod js_agreement {
     /// Hot encoders must not use rest params or temp words array.
     #[test]
     fn js_module_no_rest_params_in_encoders() {
-        let js = include_str!("00_gl_command_stream.js");
+        let js = include_str!("00_render_command_stream.js");
         assert!(
             !js.contains("...args"),
             "JS module hot encoders must not use rest args (...args)"
@@ -123,24 +123,24 @@ mod js_agreement {
     /// No temporary words array allocation in hot path.
     #[test]
     fn js_module_no_temp_words_array_in_hot_path() {
-        let js = include_str!("00_gl_command_stream.js");
+        let js = include_str!("00_render_command_stream.js");
         assert!(
             !js.contains("words = []"),
             "JS module must not allocate temporary words[] array in hot path"
         );
     }
 
-    /// flushGlCommandStream must pass used/cursor to op_gl_submit_stream.
+    /// flushRenderCommandStream must pass used/cursor to op_submit_render_stream.
     #[test]
     fn js_module_flush_passes_cursor_to_op() {
-        let js = include_str!("00_gl_command_stream.js");
+        let js = include_str!("00_render_command_stream.js");
         assert!(
-            js.contains("op_gl_submit_stream"),
-            "JS module must call op_gl_submit_stream in flushGlCommandStream"
+            js.contains("op_submit_render_stream"),
+            "JS module must call op_submit_render_stream in flushRenderCommandStream"
         );
         assert!(
             js.contains("cursor"),
-            "JS module flush must pass cursor (used_words) to op_gl_submit_stream"
+            "JS module flush must pass cursor (used_words) to op_submit_render_stream"
         );
     }
 }

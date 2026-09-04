@@ -184,7 +184,7 @@ const {
 
 import { WebglConstants } from "./01_constants.js";
 import {
-    flushGlCommandStream,
+    flushRenderCommandStream,
     encodeViewport,
     encodeClear,
     encodeClearColor,
@@ -254,7 +254,7 @@ import {
     encodeUniformMatrix2fv,
     encodeUniformMatrix3fv,
     encodeUniformMatrix4fv,
-} from "./00_gl_command_stream.js";
+} from "./00_render_command_stream.js";
 
 // -- Ordered-raw op wrappers --
 // Built once at module init. Each wrapper: flush pending stream, then dispatch.
@@ -264,12 +264,12 @@ import {
 //   op_alloc_gl_resource_id, op_gl_is_context_lost, op_webgl_get_context_attributes,
 //   op_webgl_record_attributes, op_webgl_query_compressed_caps.
 //
-// All others: orderedRaw(op) -> flushGlCommandStream() then ReflectApply.
+// All others: orderedRaw(op) -> flushRenderCommandStream() then ReflectApply.
 
 function _makeOrderedRaw(op) {
     // Capture op reference at init time so game code cannot replace it.
     return function orderedRawOp(...args) {
-        flushGlCommandStream();
+        flushRenderCommandStream();
         return ReflectApply(op, undefined, args);
     };
 }
@@ -930,7 +930,7 @@ class WebGLRenderingContext {
             return;
         }
         // Raw fallback: flush pending stream then call original op.
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_viewport(this._canvasId, x, y, width, height);
     }
 
@@ -949,7 +949,7 @@ class WebGLRenderingContext {
             encodeClear(this._canvasId, mask >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_clear(this._canvasId, mask);
     }
 
@@ -985,7 +985,7 @@ class WebGLRenderingContext {
             encodeUseProgram(this._canvasId, programId >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawUseProgram(this._canvasId, program?.id);
     }
 
@@ -1103,7 +1103,7 @@ class WebGLRenderingContext {
             encodeDrawArrays(this._canvasId, mode >>> 0, first | 0, count | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawDrawArrays(this._canvasId, mode, first, count);
     }
 
@@ -1114,7 +1114,7 @@ class WebGLRenderingContext {
             encodeDrawElements(this._canvasId, mode >>> 0, count | 0, type >>> 0, offset | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawDrawElements(this._canvasId, mode, count, type, offset);
     }
 
@@ -1179,7 +1179,7 @@ class WebGLRenderingContext {
             encodeEnableVertexAttribArray(this._canvasId, index >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawEnableVertexAttribArray(this._canvasId, index);
     }
 
@@ -1200,7 +1200,7 @@ class WebGLRenderingContext {
             );
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_vertex_attrib_pointer(
             this._canvasId,
             index,
@@ -1235,7 +1235,7 @@ class WebGLRenderingContext {
             encodeBindBuffer(this._canvasId, target >>> 0, bufferId | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawBindBuffer(this._canvasId, target, buffer?.id || -1);
     }
 
@@ -1285,7 +1285,7 @@ class WebGLRenderingContext {
         if (typeof transpose !== "boolean" ||
             !encodeUniformMatrix3fv(this._canvasId, loc, transpose, payload)) {
             // Payload > 512 words: flush pending stream, then call raw op.
-            flushGlCommandStream();
+            flushRenderCommandStream();
             op_uniform_matrix_3fv(this._canvasId, loc, transpose, payload);
         }
     }
@@ -1298,7 +1298,7 @@ class WebGLRenderingContext {
             encodeEnable(this._canvasId, cap >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawEnable(this._canvasId, cap);
     }
 
@@ -1308,7 +1308,7 @@ class WebGLRenderingContext {
             encodeDisable(this._canvasId, cap >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawDisable(this._canvasId, cap);
     }
 
@@ -1340,7 +1340,7 @@ class WebGLRenderingContext {
         // any errors into the host queue BEFORE we observe the error state.
         // This must happen even when _jsErrorQueue is non-empty, because a
         // later getError() call needs to find the stream-produced host errors.
-        flushGlCommandStream();
+        flushRenderCommandStream();
         // JS-queue priority: return JS errors before host errors (two-level
         // queue semantics per WebGL 1.0 spec s5.14.3).
         if (this._jsErrorQueue.length > 0) {
@@ -1576,7 +1576,7 @@ class WebGLRenderingContext {
                         ctx._canvasId, mode >>> 0, first | 0, count | 0, primcount | 0,
                     );
                 } else {
-                    flushGlCommandStream();
+                    flushRenderCommandStream();
                     op_draw_arrays_instanced(
                         ctx._canvasId, mode, first, count, primcount,
                     );
@@ -1590,7 +1590,7 @@ class WebGLRenderingContext {
                         ctx._canvasId, mode >>> 0, count | 0, type >>> 0, offset | 0, primcount | 0,
                     );
                 } else {
-                    flushGlCommandStream();
+                    flushRenderCommandStream();
                     op_draw_elements_instanced(
                         ctx._canvasId, mode, count, type, offset, primcount,
                     );
@@ -1600,7 +1600,7 @@ class WebGLRenderingContext {
                 if (typeof index === "number" && typeof divisor === "number") {
                     encodeVertexAttribDivisor(ctx._canvasId, index >>> 0, divisor >>> 0);
                 } else {
-                    flushGlCommandStream();
+                    flushRenderCommandStream();
                     op_vertex_attrib_divisor(ctx._canvasId, index, divisor);
                 }
             },
@@ -1628,7 +1628,7 @@ class WebGLRenderingContext {
                 if (typeof vaoId === "number") {
                     encodeBindVertexArray(ctx._canvasId, vaoId >>> 0);
                 } else {
-                    flushGlCommandStream();
+                    flushRenderCommandStream();
                     op_bind_vertex_array(ctx._canvasId, vaoId);
                 }
             },
@@ -1657,7 +1657,7 @@ class WebGLRenderingContext {
             encodeBindTexture(this._canvasId, target >>> 0, texId | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_bind_texture(this._canvasId, target, texId);
     }
 
@@ -1668,7 +1668,7 @@ class WebGLRenderingContext {
             encodeActiveTexture(this._canvasId, unit >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_active_texture(this._canvasId, unit);
     }
 
@@ -1844,7 +1844,7 @@ class WebGLRenderingContext {
             encodeTexParameteri(this._canvasId, target >>> 0, pname >>> 0, param | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawTexParameteri(this._canvasId, target, pname, param);
     }
 
@@ -1864,7 +1864,7 @@ class WebGLRenderingContext {
             encodeGenerateMipmap(this._canvasId, target >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawGenerateMipmap(this._canvasId, target);
     }
 
@@ -1883,7 +1883,7 @@ class WebGLRenderingContext {
             encodePixelStorei(this._canvasId, pname >>> 0, value);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawPixelStorei(this._canvasId, pname, value);
     }
 
@@ -1913,7 +1913,7 @@ class WebGLRenderingContext {
             encodeDisableVertexAttribArray(this._canvasId, index >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawDisableVertexAttribArray(this._canvasId, index);
     }
 
@@ -1932,7 +1932,7 @@ class WebGLRenderingContext {
             encodeClearStencil(this._canvasId, s | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawClearStencil(this._canvasId, s);
     }
 
@@ -1942,7 +1942,7 @@ class WebGLRenderingContext {
         if (typeof sfactor === "number" && typeof dfactor === "number") {
             encodeBlendFunc(this._canvasId, sfactor >>> 0, dfactor >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawBlendFunc(this._canvasId, sfactor, dfactor);
         }
     }
@@ -1951,7 +1951,7 @@ class WebGLRenderingContext {
             typeof srcAlpha === "number" && typeof dstAlpha === "number") {
             encodeBlendFuncSeparate(this._canvasId, srcRGB >>> 0, dstRGB >>> 0, srcAlpha >>> 0, dstAlpha >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawBlendFuncSeparate(this._canvasId, srcRGB, dstRGB, srcAlpha, dstAlpha);
         }
     }
@@ -1959,7 +1959,7 @@ class WebGLRenderingContext {
         if (typeof mode === "number") {
             encodeBlendEquation(this._canvasId, mode >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawBlendEquation(this._canvasId, mode);
         }
     }
@@ -1967,7 +1967,7 @@ class WebGLRenderingContext {
         if (typeof modeRGB === "number" && typeof modeAlpha === "number") {
             encodeBlendEquationSeparate(this._canvasId, modeRGB >>> 0, modeAlpha >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawBlendEquationSeparate(this._canvasId, modeRGB, modeAlpha);
         }
     }
@@ -1983,7 +1983,7 @@ class WebGLRenderingContext {
         if (typeof func === "number") {
             encodeDepthFunc(this._canvasId, func >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawDepthFunc(this._canvasId, func);
         }
     }
@@ -1991,7 +1991,7 @@ class WebGLRenderingContext {
         if (typeof flag === "boolean") {
             encodeDepthMask(this._canvasId, flag);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             op_depth_mask(this._canvasId, flag);
         }
     }
@@ -2006,7 +2006,7 @@ class WebGLRenderingContext {
         if (typeof func === "number" && typeof ref_ === "number" && typeof mask === "number") {
             encodeStencilFunc(this._canvasId, func >>> 0, ref_ | 0, mask >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawStencilFunc(this._canvasId, func, ref_, mask);
         }
     }
@@ -2015,7 +2015,7 @@ class WebGLRenderingContext {
             typeof ref_ === "number" && typeof mask === "number") {
             encodeStencilFuncSeparate(this._canvasId, face >>> 0, func >>> 0, ref_ | 0, mask >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawStencilFuncSeparate(this._canvasId, face, func, ref_, mask);
         }
     }
@@ -2023,7 +2023,7 @@ class WebGLRenderingContext {
         if (typeof fail === "number" && typeof zfail === "number" && typeof zpass === "number") {
             encodeStencilOp(this._canvasId, fail >>> 0, zfail >>> 0, zpass >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawStencilOp(this._canvasId, fail, zfail, zpass);
         }
     }
@@ -2032,7 +2032,7 @@ class WebGLRenderingContext {
             typeof zfail === "number" && typeof zpass === "number") {
             encodeStencilOpSeparate(this._canvasId, face >>> 0, fail >>> 0, zfail >>> 0, zpass >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawStencilOpSeparate(this._canvasId, face, fail, zfail, zpass);
         }
     }
@@ -2040,7 +2040,7 @@ class WebGLRenderingContext {
         if (typeof mask === "number") {
             encodeStencilMask(this._canvasId, mask >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawStencilMask(this._canvasId, mask);
         }
     }
@@ -2048,7 +2048,7 @@ class WebGLRenderingContext {
         if (typeof face === "number" && typeof mask === "number") {
             encodeStencilMaskSeparate(this._canvasId, face >>> 0, mask >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawStencilMaskSeparate(this._canvasId, face, mask);
         }
     }
@@ -2056,7 +2056,7 @@ class WebGLRenderingContext {
         if (typeof mode === "number") {
             encodeCullFace(this._canvasId, mode >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawCullFace(this._canvasId, mode);
         }
     }
@@ -2064,7 +2064,7 @@ class WebGLRenderingContext {
         if (typeof mode === "number") {
             encodeFrontFace(this._canvasId, mode >>> 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawFrontFace(this._canvasId, mode);
         }
     }
@@ -2073,7 +2073,7 @@ class WebGLRenderingContext {
             typeof b === "boolean" && typeof a === "boolean") {
             encodeColorMask(this._canvasId, r, g, b, a);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             op_color_mask(this._canvasId, r, g, b, a);
         }
     }
@@ -2083,7 +2083,7 @@ class WebGLRenderingContext {
             typeof width === "number" && typeof height === "number") {
             encodeScissor(this._canvasId, x | 0, y | 0, width | 0, height | 0);
         } else {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawScissor(this._canvasId, x, y, width, height);
         }
     }
@@ -2129,7 +2129,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toInt32AsUint32(value);
         if (!encodeUniform1iv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform1iv(this._canvasId, loc, payload);
         }
     }
@@ -2137,7 +2137,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toFloat32AsUint32(value);
         if (!encodeUniform1fv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform1fv(this._canvasId, loc, payload);
         }
     }
@@ -2145,7 +2145,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toInt32AsUint32(value);
         if (!encodeUniform2iv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform2iv(this._canvasId, loc, payload);
         }
     }
@@ -2153,7 +2153,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toFloat32AsUint32(value);
         if (!encodeUniform2fv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform2fv(this._canvasId, loc, payload);
         }
     }
@@ -2161,7 +2161,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toInt32AsUint32(value);
         if (!encodeUniform3iv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform3iv(this._canvasId, loc, payload);
         }
     }
@@ -2169,7 +2169,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toFloat32AsUint32(value);
         if (!encodeUniform3fv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform3fv(this._canvasId, loc, payload);
         }
     }
@@ -2177,7 +2177,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toInt32AsUint32(value);
         if (!encodeUniform4iv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform4iv(this._canvasId, loc, payload);
         }
     }
@@ -2185,7 +2185,7 @@ class WebGLRenderingContext {
         const loc = _loc(location);
         const payload = toFloat32AsUint32(value);
         if (!encodeUniform4fv(this._canvasId, loc, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             _rawUniform4fv(this._canvasId, loc, payload);
         }
     }
@@ -2194,7 +2194,7 @@ class WebGLRenderingContext {
         const payload = toFloat32AsUint32(value);
         if (typeof transpose !== "boolean" ||
             !encodeUniformMatrix2fv(this._canvasId, loc, transpose, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             op_uniform_matrix_2fv(this._canvasId, loc, transpose, payload);
         }
     }
@@ -2203,7 +2203,7 @@ class WebGLRenderingContext {
         const payload = toFloat32AsUint32(value);
         if (typeof transpose !== "boolean" ||
             !encodeUniformMatrix4fv(this._canvasId, loc, transpose, payload)) {
-            flushGlCommandStream();
+            flushRenderCommandStream();
             op_uniform_matrix_4fv(this._canvasId, loc, transpose, payload);
         }
     }
@@ -2226,7 +2226,7 @@ class WebGLRenderingContext {
             encodeBindFramebuffer(this._canvasId, target >>> 0, fbId | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawBindFramebuffer(this._canvasId, target, fbId);
     }
     framebufferTexture2D(target, attachment, textarget, texture, level) {
@@ -2254,7 +2254,7 @@ class WebGLRenderingContext {
             encodeBindRenderbuffer(this._canvasId, target >>> 0, rbId | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawBindRenderbuffer(this._canvasId, target, rbId);
     }
     renderbufferStorage(target, internalformat, width, height) {
@@ -2279,7 +2279,7 @@ class WebGLRenderingContext {
             encodeHint(this._canvasId, target >>> 0, mode >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawHint(this._canvasId, target, mode);
     }
 }
@@ -2326,7 +2326,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeBindVertexArray(this._canvasId, vaoId >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawBindVertexArray(this._canvasId, vaoId);
     }
 
@@ -2337,7 +2337,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeVertexAttribDivisor(this._canvasId, index >>> 0, divisor >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawVertexAttribDivisor(this._canvasId, index, divisor);
     }
     drawArraysInstanced(mode, first, count, instanceCount) {
@@ -2347,7 +2347,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeDrawArraysInstanced(this._canvasId, mode >>> 0, first | 0, count | 0, instanceCount | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawDrawArraysInstanced(this._canvasId, mode, first, count, instanceCount);
     }
     drawElementsInstanced(mode, count, type, offset, instanceCount) {
@@ -2358,7 +2358,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeDrawElementsInstanced(this._canvasId, mode >>> 0, count | 0, type >>> 0, offset | 0, instanceCount | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawDrawElementsInstanced(this._canvasId, mode, count, type, offset, instanceCount);
     }
 
@@ -2376,7 +2376,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeBindBufferBase(this._canvasId, target >>> 0, index >>> 0, bufferId >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawBindBufferBase(this._canvasId, target, index, bufferId);
     }
     bindBufferRange(target, index, buffer, offset, size) {
@@ -2387,7 +2387,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeBindBufferRange(this._canvasId, target >>> 0, index >>> 0, bufferId >>> 0, offset | 0, size | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawBindBufferRange(this._canvasId, target, index, bufferId, offset, size);
     }
 
@@ -2437,7 +2437,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeBindSampler(this._canvasId, unit >>> 0, samplerId >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawBindSampler(this._canvasId, unit, samplerId);
     }
     samplerParameteri(sampler, pname, param) {
@@ -2448,7 +2448,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeSamplerParameteri(sampler._id >>> 0, pname >>> 0, param | 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawSamplerParameteri(sampler._id, pname, param);
     }
     samplerParameterf(sampler, pname, param) {
@@ -2496,7 +2496,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             encodeReadBuffer(this._canvasId, src >>> 0);
             return;
         }
-        flushGlCommandStream();
+        flushRenderCommandStream();
         _rawReadBuffer(this._canvasId, src);
     }
 

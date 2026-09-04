@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Three implementations name the same opcodes, or a frame silently does not draw.
 #
-# A GL command stream record is twelve bits of opcode and twenty of word count.
+# A render command stream record is twelve bits of opcode and twenty of word
+# count.
 # Nothing on either side of the process boundary is typed: the producer writes a
 # number and the reader switches on it. So an opcode added to one table and not
 # another is not a type error, not a link error, and not a runtime error --
@@ -19,8 +20,8 @@
 # gate:
 #
 #   engine/crates/frame-wire/src/gl_stream.rs                   (the source)
-#   engine/crates/runtime-v8/src/rendering/webgl/00_gl_command_stream.js
-#   platforms/apple/WebContent/PerformancePlus/src/gl-opcodes.mjs
+#   engine/crates/runtime-v8/src/rendering/webgl/00_render_command_stream.js
+#   platforms/apple/WebContent/PerformancePlus/src/render-opcodes.mjs
 #
 # Host-only: reads three files.
 set -euo pipefail
@@ -45,11 +46,11 @@ SOURCES = {
     "rust": (Path("engine/crates/frame-wire/src/gl_stream.rs"), {"gl"}),
     "rust 2d": (Path("engine/crates/frame-wire/src/canvas2d.rs"), {"2d"}),
     "in-process js": (
-        Path("engine/crates/runtime-v8/src/rendering/webgl/00_gl_command_stream.js"),
+        Path("engine/crates/runtime-v8/src/rendering/webgl/00_render_command_stream.js"),
         {"gl"},
     ),
     "webcontent js": (
-        Path("platforms/apple/WebContent/PerformancePlus/src/gl-opcodes.mjs"),
+        Path("platforms/apple/WebContent/PerformancePlus/src/render-opcodes.mjs"),
         {"gl", "2d"},
     ),
 }

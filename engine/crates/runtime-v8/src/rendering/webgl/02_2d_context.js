@@ -6,8 +6,8 @@
  */
 
 import {
-    flushGlCommandStream,
-} from "./00_gl_command_stream.js";
+    flushRenderCommandStream,
+} from "./00_render_command_stream.js";
 
 import {
     op_create_context_2d,
@@ -173,7 +173,7 @@ class CanvasGradient {
     // Called internally when this gradient is assigned to fillStyle.
     _apply() {
         if (this._stops.length < 2) return;
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_fill_style_gradient(
             this._canvasId,
             this._type === 'radial' ? 1 : this._type === 'conic' ? 2 : 0,
@@ -185,7 +185,7 @@ class CanvasGradient {
     // Called internally when this gradient is assigned to strokeStyle.
     _applyStroke() {
         if (this._stops.length < 2) return;
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_stroke_style_gradient(
             this._canvasId,
             this._type === 'radial' ? 1 : this._type === 'conic' ? 2 : 0,
@@ -208,11 +208,11 @@ class CanvasPattern {
         this._repeatY = rep === 'repeat' || rep === 'repeat-y';
     }
     _applyFill() {
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_fill_style_pattern(this._canvasId, this._imageRid, this._repeatX, this._repeatY);
     }
     _applyStroke() {
-        flushGlCommandStream();
+        flushRenderCommandStream();
         op_set_stroke_style_pattern(this._canvasId, this._imageRid, this._repeatX, this._repeatY);
     }
 }
@@ -338,7 +338,7 @@ class CanvasRenderingContext2D {
         this._canvasId = canvas._rid;
 
         // Create native 2D context on the render thread
-        flushGlCommandStream();
+        flushRenderCommandStream();
         this._ctxId = op_create_context_2d(this._canvasId);
         if (this._ctxId < 0) { console.error("Failed to create 2d context"); }
 
@@ -468,7 +468,7 @@ class CanvasRenderingContext2D {
     //         fillText hits.
     _consumeTextCacheForTexImage(glCanvasId, target, level, internalformat) {
         if (this._tcState === 0 || this._tcKey === null) return false;
-        flushGlCommandStream();
+        flushRenderCommandStream();
         const k = this._tcKey;
         const isHit = this._tcState === 2;
         this._tcState = 0;
@@ -511,7 +511,7 @@ class CanvasRenderingContext2D {
         // a GL encode that happens AFTER _frameStarted is already true must still
         // be submitted before the next 2D op (design S8 ordering red line #3).
         // On pure-2D frames this is an empty-cursor no-op costing one branch.
-        flushGlCommandStream();
+        flushRenderCommandStream();
         if (!this._frameStarted) {
             op_frame_begin(this._canvasId);
             this._frameStarted = true;
@@ -519,7 +519,7 @@ class CanvasRenderingContext2D {
     }
 
     _frameEnd() {
-        flushGlCommandStream();
+        flushRenderCommandStream();
         // A pending suppressed-hit that never reached its consuming
         // getImageData by frame end must be committed so the text
         // isn't silently dropped.
@@ -702,7 +702,7 @@ class CanvasRenderingContext2D {
         // shared `css_font::parse_css_font` implementation, which
         // is also what the render-thread `SetFont` handler uses
         // so the two sides can't disagree.
-        flushGlCommandStream();
+        flushRenderCommandStream();
         const buf = op_measure_text_flat(this._canvasId, s, this._font);
         const f = new Float32Array(buf.buffer, buf.byteOffset, 12);
         const metrics = {
@@ -1097,7 +1097,7 @@ class CanvasRenderingContext2D {
         const snapshotInBounds = x >= 0 && y >= 0
             && x + w <= this._canvas.width
             && y + h <= this._canvas.height;
-        flushGlCommandStream();
+        flushRenderCommandStream();
 
         // Text texture cache: only a full-canvas read participates
         // (cocos always does getImageData(0, 0, canvas.w, canvas.h)
@@ -1300,7 +1300,7 @@ function _migoMakeSnapshotImageData(snapshotId, w, h) {
                 _populated = true;
                 const sid = imageData.__migo_snapshot_id__ | 0;
                 if (sid !== 0) {
-                    flushGlCommandStream();
+                    flushRenderCommandStream();
                     const real = op_force_readback_snapshot(sid);
                     if (real && real.length === placeholder.length) {
                         placeholder.set(real);
@@ -1391,7 +1391,7 @@ frameEndHooks.push(() => {
     // Flush any pending GL stream BEFORE building the frame packet so that
     // GL commands encoded in the JS buffer arrive at the render thread in the
     // same FramePacket as the Canvas2D work (design S8 ordering invariant).
-    flushGlCommandStream();
+    flushRenderCommandStream();
     op_frame_end_unified();
 });
 // Reset the per-frame snapshot budget AFTER op_frame_end_unified

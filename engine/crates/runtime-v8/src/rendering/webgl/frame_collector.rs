@@ -2696,7 +2696,7 @@ mod steady_state_allocation {
         );
     }
 
-    /// Section 7.3, on the batched half of the same path: `op_gl_submit_stream`
+    /// Section 7.3, on the batched half of the same path: `op_submit_render_stream`
     /// takes a vector from the pool, decodes a stream into it and hands it to
     /// `append_gl_batch`, which appends and recycles. That is one event per
     /// submit, and Pixi reaches it twice a frame with every draw batched behind

@@ -418,7 +418,7 @@ jobs:
       # boundary is typed -- a disagreement is a frame that does not draw, on a
       # device, rather than anything that fails to build.
       - name: GL opcode table agreement
-        run: bash scripts/test-gl-opcode-agreement.sh
+        run: bash scripts/test-render-opcode-agreement.sh
 
       # The G0 decision procedure, months before the first Mac. Its input needs
       # a device; its rules do not, and the alternative is finding out on lab

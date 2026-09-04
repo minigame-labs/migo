@@ -2042,9 +2042,9 @@ mod tests {
         assert_eq!(out.len(), 0);
     }
 
-    // ── Task 3 RED: op_gl_submit_stream ──────────────────────────────────────
+    // ── Task 3 RED: op_submit_render_stream ──────────────────────────────────────
 
-    use super::gl_submit_stream_impl;
+    use super::submit_render_stream_impl;
 
     fn count_gl_cmds_in_collector(state: &OpState) -> usize {
         let collector = state.borrow::<UnifiedFrameCollector>();
@@ -2068,7 +2068,7 @@ mod tests {
         let bad_words: Vec<u32> = vec![0xDEADBEEF, STREAM_VERSION];
         let used_words = bad_words.len() as u32;
         let expected_code = crate::rendering::webgl::gl_stream::StreamError::BadMagic.code();
-        let result = gl_submit_stream_impl(&mut state, &bad_words, used_words);
+        let result = submit_render_stream_impl(&mut state, &bad_words, used_words);
         assert_eq!(
             result, expected_code,
             "bad magic must return BadMagic error code"
@@ -2108,7 +2108,7 @@ mod tests {
         #[cfg(test)]
         crate::rendering::webgl::submit_test_counter::reset();
 
-        let result = gl_submit_stream_impl(&mut state, &words, used_words);
+        let result = submit_render_stream_impl(&mut state, &words, used_words);
         assert_eq!(result, 0, "valid stream must return 0");
         assert_eq!(
             count_gl_cmds_in_collector(&state),
@@ -2136,7 +2136,7 @@ mod tests {
         let words: Vec<u32> = vec![MAGIC, STREAM_VERSION, h, canvas_id, bad_target, buffer_id];
         let used_words = words.len() as u32;
 
-        let result = gl_submit_stream_impl(&mut state, &words, used_words);
+        let result = submit_render_stream_impl(&mut state, &words, used_words);
         assert_eq!(result, 0, "semantic errors still return 0");
         assert_eq!(
             count_gl_segments_in_collector(&state),
@@ -2223,7 +2223,7 @@ mod tests {
         let (submit_calls, decoded_cmds) = crate::rendering::webgl::submit_test_counter::read();
         assert_eq!(
             submit_calls, 1,
-            "exactly one op_gl_submit_stream call expected, got {submit_calls}"
+            "exactly one op_submit_render_stream call expected, got {submit_calls}"
         );
         assert_eq!(
             decoded_cmds, 200,
@@ -2427,7 +2427,7 @@ mod tests {
     // getError() calls return JS-error first, then host error.
     //
     // This test verifies:
-    //   (a) flushGlCommandStream runs even when _jsErrorQueue is non-empty.
+    //   (a) flushRenderCommandStream runs even when _jsErrorQueue is non-empty.
     //   (b) JS queue error comes out first.
     //   (c) Host error (from stream decode) comes out second.
     #[test]
@@ -2485,7 +2485,7 @@ mod tests {
         let (submit_calls, _) = crate::rendering::webgl::submit_test_counter::read();
         assert!(
             submit_calls >= 1,
-            "flushGlCommandStream must have been called (submit count >= 1), got {submit_calls}"
+            "flushRenderCommandStream must have been called (submit count >= 1), got {submit_calls}"
         );
     }
 
@@ -2581,7 +2581,7 @@ mod tests {
     // flushing the GL stream first. The GL commands encoded in the JS buffer stay there
     // and are NOT included in the FramePacket. The submit counter does NOT increment.
     //
-    // GREEN (after Task 6): the frame-end hook calls `flushGlCommandStream()` first,
+    // GREEN (after Task 6): the frame-end hook calls `flushRenderCommandStream()` first,
     // which submits the GL stream to the collector (submit counter +1), then calls
     // `op_frame_end_unified()`, which builds a FramePacket containing the GlBatch.
     #[test]
@@ -2603,7 +2603,7 @@ mod tests {
 
                 // Call frame-end. Without Task 6: op_frame_end_unified is called on an
                 // empty collector (stream still in JS buffer) → no FramePacket sent and
-                // submit counter stays 0. With Task 6: flushGlCommandStream() is called
+                // submit counter stays 0. With Task 6: flushRenderCommandStream() is called
                 // first, submitting the stream to the collector (counter +1), then
                 // op_frame_end_unified builds a FramePacket with the GlBatch.
                 "#,
@@ -2616,7 +2616,7 @@ mod tests {
         let (submit_calls, decoded) = crate::rendering::webgl::submit_test_counter::read();
         assert!(
             submit_calls >= 1,
-            "frame-end hook must call flushGlCommandStream() first, \
+            "frame-end hook must call flushRenderCommandStream() first, \
              incrementing the submit counter; got submit_calls={submit_calls}, decoded={decoded}"
         );
 
@@ -2757,7 +2757,7 @@ mod tests {
                 // Resize via Canvas — must flush GL stream first (see design §8 rule 5).
                 // We simulate this by getting the canvas and setting width.
                 const c = { _rid: 103 };
-                // The canvas width setter calls flushGlCommandStream() then op_resize_canvas.
+                // The canvas width setter calls flushRenderCommandStream() then op_resize_canvas.
                 // The private host bridge ends the frame after this script.
                 "#,
             )
@@ -2794,12 +2794,12 @@ mod tests {
                 "task6_context_lost_dispatch.js",
                 r#"
                 // After encoding GL commands, call dispatchWebglContextEvent("webglcontextlost").
-                // This must call discardGlCommandStream() BEFORE dispatching to game listeners.
+                // This must call discardRenderCommandStream() BEFORE dispatching to game listeners.
                 // The submit counter must remain 0 (no submit happened).
                 const glCtx2 = new WebGLRenderingContext({ _rid: 105, width: 1, height: 1 }, {});
                 glCtx2.clear(0x4100); // encode into stream (not yet submitted)
                 // dispatchWebglContextEvent is the module function from 03_canvas.js.
-                // After Task 6, it must call discardGlCommandStream() before dispatching.
+                // After Task 6, it must call discardRenderCommandStream() before dispatching.
                 // We verify indirectly: after calling it, flush should not submit any GL commands.
                 "#,
             )
@@ -2887,7 +2887,7 @@ mod tests {
     // RED:  With the guarded flush (`if (!this._frameStarted)`) this test
     //       fails: 2D#1 and 2D#2 merge into one CanvasBatch (only 1 CanvasBatch
     //       in the packet), because GL#2 was not flushed before 2D#2.
-    // GREEN: After moving flushGlCommandStream() unconditionally to the top of
+    // GREEN: After moving flushRenderCommandStream() unconditionally to the top of
     //       _frameBegin(), every 2D op flushes pending GL first, so 2D#1 and
     //       2D#2 land in separate CanvasBatch segments (2 CanvasBatches).
     #[test]
@@ -2938,7 +2938,7 @@ mod tests {
                 glCtx.clear(0x4000);
 
                 // 2D#1: _frameBegin fires with _frameStarted=false →
-                //        flushGlCommandStream() submits GL#1, op_frame_begin,
+                //        flushRenderCommandStream() submits GL#1, op_frame_begin,
                 //        _frameStarted=true.  FillRect lands as CanvasBatch-A.
                 ctx.fillRect(1, 1, 1, 1);
 
@@ -2953,7 +2953,7 @@ mod tests {
                 //              FillRect lands in a NEW CanvasBatch-B.
                 ctx.fillRect(2, 2, 2, 2);
 
-                // Frame end: flushGlCommandStream() + op_frame_end_unified().
+                // Frame end: flushRenderCommandStream() + op_frame_end_unified().
                 // Bug:  GL#2 flushed here, AFTER 2D#2 → wrong order.
                 // Fix:  GL#2 already flushed before 2D#2 → correct order.
                 "#,
@@ -3746,7 +3746,7 @@ pub(crate) mod submit_test_counter {
     }
 }
 
-// ── Task 3: op_gl_submit_stream ──────────────────────────────────────────────
+// ── Task 3: op_submit_render_stream ──────────────────────────────────────────────
 
 /// Submit a typed render command stream from JS.
 ///
@@ -3763,16 +3763,16 @@ pub(crate) mod submit_test_counter {
 /// Returns `0` on success.
 #[op2(fast)]
 #[smi]
-pub fn op_gl_submit_stream(
+pub fn op_submit_render_stream(
     state: &mut OpState,
     #[buffer] words: &[u32],
     #[smi] used_words: u32,
 ) -> u32 {
-    gl_submit_stream_impl(state, words, used_words)
+    submit_render_stream_impl(state, words, used_words)
 }
 
 /// Inner implementation callable from both the op wrapper and tests.
-pub(crate) fn gl_submit_stream_impl(state: &mut OpState, words: &[u32], used_words: u32) -> u32 {
+pub(crate) fn submit_render_stream_impl(state: &mut OpState, words: &[u32], used_words: u32) -> u32 {
     // Pass 1: pure structural validation — no side effects on failure.
     let validated = match crate::rendering::webgl::gl_stream::validate_stream(words, used_words) {
         Ok(v) => v,

@@ -1,11 +1,19 @@
-// 00_gl_command_stream.js -- Task 4: private lazy-allocated typed GL command
-// stream. Module state is NOT on globalThis / any canvas / any context object.
+// 00_render_command_stream.js -- the private, lazy-allocated typed command
+// stream this runtime's canvas facades encode into. Module state is NOT on
+// globalThis / any canvas / any context object.
+//
+// One buffer carries both blocks: GL records (opcodes 1..=58 fixed, 256..=266
+// variable) and Canvas2D records (512..). The reason is order. A frame draws
+// its background with 2D, its sprites with GL and its HUD with 2D again, and
+// the renderer must see those in the order they were issued. Two buffers would
+// need a merge protocol with timestamps or barriers; one buffer with two opcode
+// ranges needs none, because the order in the buffer *is* the order.
 //
 // Design: S4 (private buffer & hot-path), S5 (wire format + opcodes), S9
 // (primordials). Loaded before 01_constants.js in the ESM list.
 
 import {
-    op_gl_submit_stream,
+    op_submit_render_stream,
 } from "ext:core/ops";
 
 import { primordials } from "ext:core/mod.js";
@@ -167,11 +175,11 @@ function ensureFit(wordCount) {
 
 function _submitAndSwap() {
     if (cursor <= 2) return; // nothing to submit
-    const status = op_gl_submit_stream(_u32, cursor);
+    const status = op_submit_render_stream(_u32, cursor);
     if (status !== 0) {
         // Reset cursor before throwing so the buffer is clean.
         cursor = 2;
-        throw new Error("op_gl_submit_stream returned error: " + status);
+        throw new Error("op_submit_render_stream returned error: " + status);
     }
     // Swap to the other buffer.
     if (_activeIdx === 0) {
@@ -1079,21 +1087,21 @@ function encodeUniformMatrix4fv(canvasId, location, transpose, payloadU32) {
     return _encodeMatrixUniform(OP_UNIFORM_MATRIX4FV, canvasId, location, transpose, payloadU32);
 }
 
-// --- flushGlCommandStream ---
+// --- flushRenderCommandStream ---
 // If unallocated OR cursor==2 (empty): allocation-free no-op.
 // Else: submit the current buffer, reset, swap.
 // Non-zero status from op throws an internal error.
 
-function flushGlCommandStream() {
+function flushRenderCommandStream() {
     if (_u32 === null || cursor === 2) return;
     _submitAndSwap();
 }
 
-// --- discardGlCommandStream ---
+// --- discardRenderCommandStream ---
 // Context-loss path: drop pending commands without submitting.
 // Reset the active cursor to 2. No swap.
 
-function discardGlCommandStream() {
+function discardRenderCommandStream() {
     if (_u32 === null) return;
     cursor = 2;
     // Rewrite header so the buffer is clean for the next use.
@@ -1176,6 +1184,6 @@ export {
     encodeUniformMatrix3fv,
     encodeUniformMatrix4fv,
     // Lifecycle
-    flushGlCommandStream,
-    discardGlCommandStream,
+    flushRenderCommandStream,
+    discardRenderCommandStream,
 };
