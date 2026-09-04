@@ -49,7 +49,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 CONTRACT="$REPO_ROOT/contracts/apple/deployment-floor.json"
 PACKAGE_SWIFT="$REPO_ROOT/platforms/apple/Package.swift"
-FLOOR_SWIFT="$REPO_ROOT/platforms/apple/Sources/MigoAppleCore/MigoDeploymentFloor.swift"
+# The engine-free package carries its own platforms list because it is a package
+# in its own right, built and tested on every PR without the xcframework. Two
+# manifests mean two places the floor can be wrong, which is why both are checked
+# rather than only the shipping one.
+CORE_PACKAGE_SWIFT="$REPO_ROOT/platforms/apple/core/Package.swift"
+FLOOR_SWIFT="$REPO_ROOT/platforms/apple/core/Sources/MigoAppleCore/MigoDeploymentFloor.swift"
 BUILD_SCRIPT="$REPO_ROOT/scripts/build-apple-sdk.sh"
 
 ARTIFACT_DIR=""
@@ -190,6 +195,10 @@ check_literal() {
 
 check_literal "$PACKAGE_SWIFT" "$ios_swiftpm"   "SwiftPM iOS platform must match the contract"
 check_literal "$PACKAGE_SWIFT" "$macos_swiftpm" "SwiftPM macOS platform must match the contract"
+check_literal "$CORE_PACKAGE_SWIFT" "$ios_swiftpm" \
+    "engine-free SwiftPM iOS platform must match the contract"
+check_literal "$CORE_PACKAGE_SWIFT" "$macos_swiftpm" \
+    "engine-free SwiftPM macOS platform must match the contract"
 
 swift_tuple() {
     printf '(major: %s, minor: %s)' "${1%%.*}" "${1##*.}"
@@ -253,7 +262,8 @@ allowed_to_declare() {
     case "$1" in
         contracts/apple/deployment-floor.json) return 0 ;;
         platforms/apple/Package.swift) return 0 ;;
-        platforms/apple/Sources/MigoAppleCore/MigoDeploymentFloor.swift) return 0 ;;
+        platforms/apple/core/Package.swift) return 0 ;;
+        platforms/apple/core/Sources/MigoAppleCore/MigoDeploymentFloor.swift) return 0 ;;
         scripts/build-apple-sdk.sh) return 0 ;;
         scripts/test-apple-deployment-floor-contract.sh) return 0 ;;
         docs/*) return 0 ;;

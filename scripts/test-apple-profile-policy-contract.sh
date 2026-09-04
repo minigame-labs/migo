@@ -33,7 +33,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 POLICY="$REPO_ROOT/contracts/apple/profile-policy.json"
 FLOOR="$REPO_ROOT/contracts/apple/deployment-floor.json"
-PROFILE_SWIFT="$REPO_ROOT/platforms/apple/Sources/MigoAppleCore/MigoRuntimeProfile.swift"
+PROFILE_SWIFT="$REPO_ROOT/platforms/apple/core/Sources/MigoAppleCore/MigoRuntimeProfile.swift"
 
 err()  { printf '\033[0;31m[apple-policy] %s\033[0m\n' "$*" >&2; }
 ok()   { printf '\033[0;32m[apple-policy] %s\033[0m\n' "$*"; }

@@ -451,6 +451,22 @@ jobs:
       - name: Apple engine-free layer cross-compiles from Linux
         run: bash scripts/test-apple-engine-free-closure.sh
 
+      # The Swift package that is the only Swift a compiler ever sees.
+      #
+      # It exists because `platforms/apple/Package.swift` declares a binary
+      # target for an xcframework built by an hour of Skia on a Mac, so until
+      # that artifact exists nothing in that package compiles -- and what sat in
+      # there uncompiled were the two files mirroring contracts/apple/*.json,
+      # whose own gates compare text and would agree perfectly with a file that
+      # does not build.
+      #
+      # Host-independent, so it runs here rather than only on the macOS lane:
+      # what it checks is that the package still declares no binary target and
+      # no dependencies, imports no engine module, and leaves no source
+      # directory that SwiftPM would silently not compile.
+      - name: Apple engine-free Swift package stays engine-free
+        run: bash scripts/test-apple-swift-core-engine-free.sh
+
       # The artefact half of the same claim. A clean dependency graph is
       # necessary and not sufficient: a vendored object or a linker script could
       # put engine symbols in an archive whose Cargo graph is spotless. This
