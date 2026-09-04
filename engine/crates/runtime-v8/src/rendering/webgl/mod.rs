@@ -8,9 +8,11 @@ pub(crate) mod frame_collector;
 ///
 /// The structural validator and the WebGL opcode table moved to
 /// `migo-frame-wire` so the cross-process frame consumer can validate the same
-/// words without linking a JavaScript engine. The paths stay valid for every
-/// call site in this crate.
-pub(crate) use frame_wire::{gl, stream};
+/// words without linking a JavaScript engine. The `stream` path stays valid for
+/// every call site in this crate; `gl` is not re-exported because after the
+/// move its only user is a test, and a re-export nothing outside tests reads is
+/// an unused import in every shipped build.
+pub(crate) use frame_wire::stream;
 
 mod raf;
 /// Test-only: the cases asserting this crate's JavaScript encoder agrees with
