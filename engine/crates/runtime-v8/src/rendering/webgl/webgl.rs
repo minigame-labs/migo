@@ -1207,14 +1207,14 @@ mod tests {
     // They FAIL (compile error / link error) until the implementation is in place.
 
     use crate::rendering::webgl::decode::decode_validated_stream;
+    use crate::rendering::webgl::stream::{
+        MAGIC, STREAM_VERSION, ValidatedStream, pack_header, validate_stream,
+    };
     use frame_wire::gl::{
         OP_BIND_BUFFER, OP_BIND_BUFFER_BASE, OP_BIND_BUFFER_RANGE, OP_BIND_FRAMEBUFFER,
         OP_BIND_RENDERBUFFER, OP_BIND_SAMPLER, OP_BIND_TEXTURE, OP_BIND_VERTEX_ARRAY, OP_CLEAR,
         OP_ENABLE, OP_SCISSOR, OP_UNIFORM_MATRIX3FV, OP_UNIFORM1F, OP_UNIFORM1FV, OP_UNIFORM1I,
         OP_VERTEX_ATTRIB_POINTER, OP_VIEWPORT,
-    };
-    use crate::rendering::webgl::stream::{
-        MAGIC, STREAM_VERSION, ValidatedStream, pack_header, validate_stream,
     };
 
     fn make_validated_for_decode(words: &[u32]) -> ValidatedStream<'_> {
