@@ -15,9 +15,14 @@ const _lineHeightCache = new Map();
 let _lineHeightCacheEpoch = -1;
 
 // Bounded, because the key space belongs to content: a game that measures a
-// thousand sizes must not be able to grow this without limit. Cleared rather
-// than evicted -- an LRU's bookkeeping would cost more than the crossing it is
-// saving, and the working set here is a handful of entries in any real UI.
+// thousand sizes must not be able to grow this without limit.
+//
+// Over the bound, the oldest entry goes rather than the whole table. A Map
+// iterates in insertion order, so evicting one is a `keys().next()` and a
+// delete, and it costs nothing on the hit path. Clearing everything instead
+// would be cheaper still to write and would turn a workload that cycles over
+// slightly more than the bound into a permanent 0% hit rate -- the one case
+// where a cache is pure overhead.
 const _LINE_HEIGHT_CACHE_MAX = 256;
 
 /**
@@ -93,7 +98,7 @@ const getTextLineHeight = (object) => {
     if (height === undefined) {
         height = ops.op_get_text_line_height(fontFamily, fontSize, bold, italic);
         if (_lineHeightCache.size >= _LINE_HEIGHT_CACHE_MAX) {
-            _lineHeightCache.clear();
+            _lineHeightCache.delete(_lineHeightCache.keys().next().value);
         }
         _lineHeightCache.set(key, height);
     }

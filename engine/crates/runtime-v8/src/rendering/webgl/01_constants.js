@@ -49,6 +49,12 @@ const WebglConstants = {
     // built from this table: without the constant, `gl.RASTERIZER_DISCARD` is
     // `undefined`, `gl.enable(undefined)` reaches the driver as a rejected enum,
     // and the shadow would have a hole where the tenth capability belongs.
+    // The value `getUniformBlockIndex` returns when there is no such block --
+    // `op_get_uniform_block_index` already answers `u32::MAX` on that path. It
+    // was not declared here, so content writing the documented check,
+    // `if (index === gl.INVALID_INDEX)`, was comparing against `undefined` and
+    // never taking that branch.
+    INVALID_INDEX: 4294967295,
     RASTERIZER_DISCARD: 35977,
     UNIFORM_BUFFER: 35345,
     UNIFORM_BUFFER_BINDING: 35368,

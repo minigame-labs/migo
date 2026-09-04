@@ -467,10 +467,14 @@ const _rawResumeTransformFeedback= _makeOrderedRaw(op_resume_transform_feedback)
 const _rawTransformFeedbackVaryings= _makeOrderedRaw(op_transform_feedback_varyings);
 const _rawGetTransformFeedbackVarying= _makeOrderedRaw(op_get_transform_feedback_varying);
 
-// The three `{size, type, name}` introspection queries share one cache path,
-// but the ops disagree about whether they take a canvas id -- this one does
-// not. The difference is absorbed once here, at module scope, rather than by a
-// closure built on every call.
+// The `{size, type, name}` introspection queries share one cache path, but the
+// ops disagree about whether they take a canvas id -- this one does not, and
+// that asymmetry is deliberate rather than an oversight to tidy away. Its
+// renderer arm resolves the owning canvas from the program itself
+// (`cm.programs[program].owner_canvas`) and makes that current, which is a
+// stronger guarantee than trusting the id the caller passed. The difference is
+// absorbed once here, at module scope, rather than by a closure built on every
+// call.
 const _fetchTransformFeedbackVarying = (_canvasId, programId, index) =>
     _rawGetTransformFeedbackVarying(programId, index);
 const _rawTexImage3D         = _makeOrderedRaw(op_tex_image_3d);
@@ -2527,7 +2531,10 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
     // ---- Uniform Buffer Objects --------------------------------
     getUniformBlockIndex(program, name) {
         const programId = program?.id;
-        if (programId === undefined) return -1;
+        // The same sentinel a lookup that finds no block returns, so one check
+        // covers both. `-1` would be a third answer this API never otherwise
+        // produces, and a GLuint return type cannot carry it anyway.
+        if (programId === undefined) return WebglConstants.INVALID_INDEX;
         let inner = this._uniformBlockIndexCache.get(programId);
         let index = inner && inner.get(name);
         if (index === undefined) {
