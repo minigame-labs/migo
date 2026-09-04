@@ -285,7 +285,7 @@ excluded_trees=(
 )
 git_pathspecs=()
 rg_globs=()
-for excluded_tree in "${excluded_trees[@]}"; do
+for excluded_tree in ${excluded_trees[@]+"${excluded_trees[@]}"}; do
     git_pathspecs+=(":(exclude,glob)$excluded_tree" ":(exclude,glob)$excluded_tree/**")
     rg_globs+=(--glob "!/$excluded_tree" --glob "!/$excluded_tree/**")
 done
@@ -334,7 +334,7 @@ scan_deployment_target_declarations() (
     fi
 
     if [ -n "$git_root" ]; then
-        if output="$(git -C "$REPO_ROOT" grep --untracked -lE "$pattern" -- "${git_pathspecs[@]}" 2>"$stderr_file")"; then
+        if output="$(git -C "$REPO_ROOT" grep --untracked -lE "$pattern" -- ${git_pathspecs[@]+"${git_pathspecs[@]}"} 2>"$stderr_file")"; then
             status=0
         else
             status=$?
@@ -344,7 +344,7 @@ scan_deployment_target_declarations() (
             {
                 cd "$REPO_ROOT" || exit 125
                 rg --hidden --no-require-git --files-with-matches \
-                    "${rg_globs[@]}" -e "$pattern" .
+                    ${rg_globs[@]+"${rg_globs[@]}"} -e "$pattern" .
             } 2>"$stderr_file"
         )"; then
             status=0

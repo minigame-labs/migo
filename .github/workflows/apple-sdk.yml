@@ -140,6 +140,20 @@ jobs:
           ls -la Frameworks/
           swift build
 
+      # The half of the deployment-floor contract that reads the product rather
+      # than the declaration -- and the half its own header calls the one that
+      # matters, citing the Android library whose floor was declared correctly
+      # for API 26 while the shipped bytes carried a strong reference to an API
+      # 29 symbol. Every declaration agreed; the artifact was wrong.
+      #
+      # It has never had an artifact to read, because no Apple artifact existed.
+      # Now one does, so it reads LC_BUILD_VERSION out of every Mach-O in the
+      # xcframework and checks minos against contracts/apple/deployment-floor.json.
+      - name: The built Mach-O files carry the declared deployment target
+        run: >-
+          bash scripts/test-apple-deployment-floor-contract.sh
+          --artifacts platforms/apple/Frameworks/MigoEngine.xcframework
+
       - name: Keep the xcframework
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
