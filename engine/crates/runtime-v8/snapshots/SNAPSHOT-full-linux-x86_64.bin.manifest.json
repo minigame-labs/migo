@@ -13,9 +13,9 @@
   "rust_sources_sha256": "1a0aa7acee30b9c9675f5be01b34513aaca18d0adcbc402c160445c170f3e540",
   "v8_archive_sha256": "57cb3d0a0e195738d8ecd366cccbd3c2dd89839e1b9461a9fc43725aac79e911",
   "snapshot_size": 2233403,
-  "snapshot_sha256": "53690dcb410e187c2239fcd65ba84429637ba33ecb1a2c176ab2d11c5f2916aa",
+  "snapshot_sha256": "c715c76dcb1aa2fa4cf8b93d888f0682bd3fbfab2026e2ae82a27cac5ba57bbe",
   "js_sources_sha256": "9e37e3bfaa9cce29a4da3e292fed7901a7bd9baa8f0950c93507b7a18633b0fe",
   "deno_core_version": "0.385.0",
-  "git_commit": "961828d",
-  "generated_at": "2026-09-04T05:08:59Z"
+  "git_commit": "b93521f",
+  "generated_at": "2026-09-04T05:40:22Z"
 }

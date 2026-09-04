@@ -12,10 +12,10 @@
   "features_sha256": "2cdc398a325c8559e9c623222b8dccdf72b12a7119b680c6f6f9883eff0cfb94",
   "rust_sources_sha256": "1a0aa7acee30b9c9675f5be01b34513aaca18d0adcbc402c160445c170f3e540",
   "v8_archive_sha256": "ce14223a4d938011b888a3ea32ffd795ae1904d86e71989321e0cec2cfee5413",
-  "snapshot_size": 1502274,
-  "snapshot_sha256": "1b4fe1fed6722e546828b3a88bffd72e4ea5409c3560d3961a4ca3a60f507a91",
+  "snapshot_size": 1502242,
+  "snapshot_sha256": "4b6465f581b693cdefc5453ddad15569e569d1d6973c2aceda4d72dc31fadada",
   "js_sources_sha256": "9e37e3bfaa9cce29a4da3e292fed7901a7bd9baa8f0950c93507b7a18633b0fe",
   "deno_core_version": "0.385.0",
-  "git_commit": "961828d",
-  "generated_at": "2026-09-04T05:09:40Z"
+  "git_commit": "b93521f",
+  "generated_at": "2026-09-04T05:40:57Z"
 }
