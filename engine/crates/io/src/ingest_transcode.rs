@@ -332,6 +332,61 @@ mod tests {
         assert_eq!(parsed.data.len(), (16 / 4) * (16 / 4) * 8);
     }
 
+    /// Every level of an ASTC sidecar is a whole number of blocks.
+    ///
+    /// The footprint sets the mip chain's alignment, and a level that is not a
+    /// whole number of blocks makes `encode_astc` return an error that
+    /// `transcode_image` turns into `None` -- the sidecar vanishes and the
+    /// original carries the asset, with nothing logged and nothing failing.
+    /// This is the correctness that spans three functions and would otherwise
+    /// be held only by reading them together.
+    #[test]
+    fn every_level_of_an_astc_sidecar_is_a_whole_number_of_blocks() {
+        let bytes = smooth_png_with_alpha(64, 64);
+        let sidecar = transcode_image("sky.png", &bytes, with_astc()).expect("transcodes");
+        let parsed = parse_ktx2(&sidecar.bytes).expect("parses");
+        assert_eq!(parsed.header.format, VkFormat::Astc8x8UnormBlock);
+
+        // 64 -> 32 -> 16 -> 8, stopping where a level would stop being a whole
+        // number of 8x8 blocks. Four levels, not the seven a 4x4 block reaches:
+        // a shorter chain is part of what a larger footprint costs.
+        assert_eq!(parsed.header.mip_levels, 4);
+        let levels: Vec<&[u8]> = parsed.levels().collect();
+        assert_eq!(levels.len(), 4);
+        for (index, level) in levels.iter().enumerate() {
+            let side = 64u32 >> index;
+            assert_eq!(
+                level.len(),
+                (side as usize / 8) * (side as usize / 8) * 16,
+                "level {index} ({side}x{side}) is not a whole number of 8x8 blocks"
+            );
+        }
+    }
+
+    /// An aligned image always produces a sidecar, whatever the device decodes.
+    ///
+    /// Every failure inside `transcode_image` becomes `None`, which is
+    /// indistinguishable from "this image was not worth transcoding". So a bug
+    /// in the encoder, the chooser or the chain alignment does not fail: it
+    /// quietly stops compressing textures, and the only symptom is memory.
+    #[test]
+    fn an_aligned_image_always_produces_a_sidecar() {
+        for (width, height) in [(4u32, 4u32), (8, 8), (12, 12), (16, 32), (24, 24), (64, 64)] {
+            for (name, caps) in [("no-astc", no_astc()), ("astc", with_astc())] {
+                let opaque = png(width, height);
+                assert!(
+                    transcode_image("bg.png", &opaque, caps).is_some(),
+                    "{width}x{height} opaque on {name} produced no sidecar"
+                );
+                let alpha = smooth_png_with_alpha(width, height);
+                assert!(
+                    transcode_image("hero.png", &alpha, caps).is_some(),
+                    "{width}x{height} with alpha on {name} produced no sidecar"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_non_aligned_image_is_left_to_the_original() {
         // 14 is not a multiple of 4: ETC2 cannot encode it without padding, so
