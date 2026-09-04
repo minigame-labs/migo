@@ -7,6 +7,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use shared::device::gpu_caps::GpuCapsSnapshot;
 use shared::protocol::io_cmd::MAX_READ_LENGTH;
 use shared::vfs::package::{PackageError, PackageIdentity, PackageWriter};
 
@@ -34,7 +35,11 @@ struct TranscodedSidecar {
     bytes: Vec<u8>,
 }
 #[cfg(not(feature = "rust-image-decode"))]
-fn transcode_image(_name: &str, _bytes: &[u8]) -> Option<TranscodedSidecar> {
+fn transcode_image(
+    _name: &str,
+    _bytes: &[u8],
+    _caps: shared::device::gpu_caps::GpuCapsSnapshot,
+) -> Option<TranscodedSidecar> {
     None
 }
 
@@ -77,11 +82,17 @@ impl<'a, R: Read> Read for CountingReader<'a, R> {
 /// Each entry is split into 64 KiB chunks, each independently
 /// zstd-compressed for random access. Uses [`ExtractBudget::default`]
 /// for zip-bomb defense.
+/// `gpu_caps` selects the compressed sidecar format, and the parameter is here
+/// rather than defaulted because the default is not free: an ingest that does
+/// not know what the device decodes writes the format every device decodes, and
+/// a caller that has the answer and does not pass it silently gives up the
+/// better one. See `ingest_transcode::transcode_image` for the rule.
 pub fn ingest_zip_to_package(
     zip_path: &Path,
     pkg_path: &Path,
     package_name: &str,
     package_version: &str,
+    gpu_caps: GpuCapsSnapshot,
 ) -> Result<PackageIdentity, PackageError> {
     ingest_zip_to_package_with_budget(
         zip_path,
@@ -89,6 +100,7 @@ pub fn ingest_zip_to_package(
         package_name,
         package_version,
         ExtractBudget::default(),
+        gpu_caps,
     )
 }
 
@@ -101,6 +113,7 @@ pub fn ingest_zip_to_package_with_budget(
     package_name: &str,
     package_version: &str,
     budget: ExtractBudget,
+    gpu_caps: GpuCapsSnapshot,
 ) -> Result<PackageIdentity, PackageError> {
     let zip_file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(BufReader::new(zip_file))
@@ -243,7 +256,7 @@ pub fn ingest_zip_to_package_with_budget(
             // still carries the asset), so this never fails ingest. The sidecar
             // counts against the archive budget like any other entry.
             if let Some(bytes) = image_bytes {
-                if let Some(sidecar) = transcode_image(&name, &bytes) {
+                if let Some(sidecar) = transcode_image(&name, &bytes, gpu_caps) {
                     let sidecar_len = sidecar.bytes.len() as u64;
                     if ingested_total.saturating_add(sidecar_len) > budget.max_total_uncompressed {
                         return Err(PackageError::Io(std::io::Error::new(
@@ -285,6 +298,7 @@ pub async fn ingest_zip_to_package_with_scheduler(
     pkg_path: PathBuf,
     package_name: String,
     package_version: String,
+    gpu_caps: GpuCapsSnapshot,
 ) -> Result<PackageIdentity, PackageError> {
     ingest_zip_to_package_with_scheduler_and_budget(
         scheduler,
@@ -293,6 +307,7 @@ pub async fn ingest_zip_to_package_with_scheduler(
         package_name,
         package_version,
         ExtractBudget::default(),
+        gpu_caps,
     )
     .await
 }
@@ -304,6 +319,7 @@ pub async fn ingest_zip_to_package_with_scheduler_and_budget(
     package_name: String,
     package_version: String,
     budget: ExtractBudget,
+    gpu_caps: GpuCapsSnapshot,
 ) -> Result<PackageIdentity, PackageError> {
     let request = package_ingest_request_for(&zip_path);
 
@@ -315,6 +331,7 @@ pub async fn ingest_zip_to_package_with_scheduler_and_budget(
                 &package_name,
                 &package_version,
                 budget,
+                gpu_caps,
             )
         })
         .await
@@ -401,7 +418,7 @@ mod tests {
             zip.finish().unwrap();
         }
         let pkg_path = dir.join("out.mpkg");
-        ingest_zip_to_package(&zip_path, &pkg_path, "g", "1").unwrap();
+        ingest_zip_to_package(&zip_path, &pkg_path, "g", "1", GpuCapsSnapshot::default()).unwrap();
 
         let reader = PackageReader::open(&pkg_path, "g", "1").unwrap();
         let names: Vec<String> = reader.entry_paths().map(|s| s.to_string()).collect();
@@ -433,7 +450,14 @@ mod tests {
         let zip_path = create_test_zip(&dir);
         let pkg_path = dir.join("output.mpkg");
 
-        let identity = ingest_zip_to_package(&zip_path, &pkg_path, "test-game", "1.0.0").unwrap();
+        let identity = ingest_zip_to_package(
+            &zip_path,
+            &pkg_path,
+            "test-game",
+            "1.0.0",
+            GpuCapsSnapshot::default(),
+        )
+        .unwrap();
 
         assert_eq!(identity.name, "test-game");
         assert_eq!(identity.version, "1.0.0");
@@ -460,7 +484,14 @@ mod tests {
         let zip_path = create_test_zip(&dir);
         let pkg_path = dir.join("output.mpkg");
 
-        let _identity = ingest_zip_to_package(&zip_path, &pkg_path, "test-game", "1.0.0").unwrap();
+        let _identity = ingest_zip_to_package(
+            &zip_path,
+            &pkg_path,
+            "test-game",
+            "1.0.0",
+            GpuCapsSnapshot::default(),
+        )
+        .unwrap();
 
         let reader =
             shared::vfs::package::PackageReader::open(&pkg_path, "test-game", "1.0.0").unwrap();
@@ -505,7 +536,14 @@ mod tests {
         // 2. Ingest zip to package in staging.
         let pkg_filename = "stage1.mpkg";
         let staged_pkg = staging.dir().join(pkg_filename);
-        ingest_zip_to_package(&zip_path, &staged_pkg, "stage1", "1.0").unwrap();
+        ingest_zip_to_package(
+            &zip_path,
+            &staged_pkg,
+            "stage1",
+            "1.0",
+            GpuCapsSnapshot::default(),
+        )
+        .unwrap();
 
         // 3. Mount table with base code dir.
         let mt = MountTable::new(code_dir.clone());
@@ -581,7 +619,14 @@ mod tests {
         {
             let staging = StagingArea::create(&cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join(pkg_filename);
-            ingest_zip_to_package(&zip_v1, &staged_pkg, "stage1", "1.0").unwrap();
+            ingest_zip_to_package(
+                &zip_v1,
+                &staged_pkg,
+                "stage1",
+                "1.0",
+                GpuCapsSnapshot::default(),
+            )
+            .unwrap();
             staging
                 .install_package(
                     &mt,
@@ -604,7 +649,14 @@ mod tests {
         {
             let staging = StagingArea::create(&cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join(pkg_filename);
-            ingest_zip_to_package(&zip_v2, &staged_pkg, "stage1", "2.0").unwrap();
+            ingest_zip_to_package(
+                &zip_v2,
+                &staged_pkg,
+                "stage1",
+                "2.0",
+                GpuCapsSnapshot::default(),
+            )
+            .unwrap();
             staging
                 .install_package(
                     &mt,
@@ -662,7 +714,14 @@ mod tests {
         {
             let staging = StagingArea::create(&cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join(pkg_filename);
-            ingest_zip_to_package(&zip_v1, &staged_pkg, "stage1", "1.0").unwrap();
+            ingest_zip_to_package(
+                &zip_v1,
+                &staged_pkg,
+                "stage1",
+                "1.0",
+                GpuCapsSnapshot::default(),
+            )
+            .unwrap();
             staging
                 .install_package(
                     &mt,
@@ -685,7 +744,13 @@ mod tests {
         {
             let staging = StagingArea::create(&cache_dir, "stage1_bad").unwrap();
             let staged_pkg = staging.dir().join(pkg_filename);
-            let result = ingest_zip_to_package(&bad_zip, &staged_pkg, "stage1", "2.0");
+            let result = ingest_zip_to_package(
+                &bad_zip,
+                &staged_pkg,
+                "stage1",
+                "2.0",
+                GpuCapsSnapshot::default(),
+            );
             assert!(result.is_err(), "bad zip should fail ingest");
             // Staging is dropped/cleaned up automatically.
         }
@@ -720,7 +785,14 @@ mod tests {
 
             let staging = StagingArea::create(&game_cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join("stage1.mpkg");
-            ingest_zip_to_package(&zip_path, &staged_pkg, "stage1", "1.0").unwrap();
+            ingest_zip_to_package(
+                &zip_path,
+                &staged_pkg,
+                "stage1",
+                "1.0",
+                GpuCapsSnapshot::default(),
+            )
+            .unwrap();
             let installed = staging
                 .install_package(
                     &mt,
@@ -815,7 +887,14 @@ mod tests {
         {
             let staging = StagingArea::create(&game_cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join("stage1.mpkg");
-            ingest_zip_to_package(&zip_path, &staged_pkg, "stage1", "1.0").unwrap();
+            ingest_zip_to_package(
+                &zip_path,
+                &staged_pkg,
+                "stage1",
+                "1.0",
+                GpuCapsSnapshot::default(),
+            )
+            .unwrap();
             let installed = staging
                 .install_package(
                     &mt,

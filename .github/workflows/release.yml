@@ -504,7 +504,10 @@ jobs:
         working-directory: engine
         run: |
           cargo test -p migo-shared -p migo-runtime-v8 --tests
-          cargo test -p migo-io --lib
+          # `--tests` so the ASTC fixture emitter in `tests/` is compiled here.
+          # Its cases are `#[ignore]`d and belong to the ASTC gate, but a
+          # binary nothing builds is one that stops building unnoticed.
+          cargo test -p migo-io --tests
           cargo test -p migo-capi-abi --all-targets
           cargo test -p migo-frame-wire --all-targets
           cargo test -p migo-frame-decode --all-targets
@@ -677,6 +680,7 @@ jobs:
             timeout 300 sudo apt-get install -y -qq \
               ninja-build \
               libgl-dev libegl-dev libgles-dev \
+              libgl1-mesa-dri libegl-mesa0 \
               libfontconfig1-dev libfreetype-dev \
               libasound2-dev || return 1
           }
@@ -684,6 +688,26 @@ jobs:
             echo "host build dependency install failed; retrying once" >&2
             install_pkgs
           }
+
+      # The ASTC encoder, checked by a decoder that is not ours.
+      #
+      # ASTC packs eleven bits of block mode whose layout is a five-row table,
+      # endpoint values as base-three trits interleaved with raw bits, and
+      # weights written from the top of the block downwards in reverse bit
+      # order. A misreading of any of those lands in an encoder and in a decoder
+      # written by the same author from the same specification, so the oracle is
+      # whatever ASTC decoder the GL stack ships -- here Mesa's software one.
+      #
+      # It lives in this job rather than quality-gate because this is the job
+      # that owns a GL stack, which is the rule test-every-gate-is-invoked.sh
+      # states for a gate needing a toolchain: it goes where that toolchain is.
+      #
+      # A host whose decoder does not do ASTC fails rather than skips. That is
+      # deliberate -- it cannot answer the question, and reporting that as
+      # success is how a check stops being one -- and it means this step is also
+      # the thing that tells us if a runner image regresses.
+      - name: ASTC encoder round trip
+        run: bash scripts/test-astc-encoder.sh
 
       - name: Run clippy lints (crates needing host system packages)
         working-directory: engine

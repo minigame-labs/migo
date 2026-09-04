@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Images with transparency are transcoded to ASTC 4x4 at package ingest on
+  devices whose GPU decodes it, and stay on ETC2 elsewhere. Both are one byte
+  per pixel, so nothing grows; ASTC's second weight plane reconstructs an alpha
+  edge that does not follow the colour edge, which is what a sprite outline is.
+  Opaque images stay on ETC2 RGB everywhere, because at half a byte per pixel it
+  is smaller than any ASTC footprint. The choice is per image and per device,
+  which is only possible because ingest runs on the device.
 - The runtime reports how many times a frame's drawing crossed from JavaScript
   into native, on a five-second window, at `info` level: `[boundary] frames=…
   crossings/frame=… worst=… commands/frame=… commands/crossing=…`. The ratio is
