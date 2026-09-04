@@ -1,0 +1,223 @@
+{
+  "$comment": [
+    "Every command whose caller waits for an answer, and whether the producer",
+    "could have answered it without waiting.",
+    "",
+    "WHY THIS EXISTS. Two decisions rest on this number and neither can be made",
+    "from an impression of it.",
+    "",
+    "The first is Apple E1. Content on the Performance+ lane runs in an agent",
+    "inside WebKit's WebContent process, and the choice between a Dedicated",
+    "Worker and the Window agent is not a performance trade: the Window main",
+    "agent's [[CanBlock]] is false, so Atomics.wait throws there and a",
+    "synchronous reply is not slower, it is impossible. So the size of this",
+    "table is the size of what the Window lane would have to drop. E1 was",
+    "written naming four examples; the derived count is what it should have",
+    "named.",
+    "",
+    "The second is Android, today. A command that waits stalls the JavaScript",
+    "thread for a round trip, and two of these -- ClientWaitSync and",
+    "GetQueryParameter -- are designed to be polled every frame. Adding one more",
+    "is a per-frame cost that nothing else in the build will report.",
+    "",
+    "HOW IT IS CHECKED. The command list is DERIVED, by parsing the protocol",
+    "enums for variants carrying a reply channel; this file supplies only the",
+    "classification, which cannot be derived. A command that appears in the",
+    "source and not here fails the gate, and so does one that appears here and",
+    "not in the source. See scripts/test-synchronous-surface-contract.sh.",
+    "",
+    "producer_answers_locally:",
+    "  yes    - the producer answers without crossing, always",
+    "  partly - answered locally for some inputs; the rest cross",
+    "  no     - every call crosses",
+    "  n_a    - not reachable from content; host lifecycle",
+    "reply:",
+    "  always   - the variant always carries a reply channel",
+    "  optional - the channel is an Option; see callers_supplying_a_reply"
+  ],
+  "sources": [
+    "engine/crates/shared/src/protocol/render_cmd.rs"
+  ],
+  "commands": {
+    "GLCmd::GetParameter": {
+      "api": "WebGLRenderingContext.getParameter",
+      "reply": "always",
+      "producer_answers_locally": "partly",
+      "note": "The seven *_BINDING queries come from the facade's own shadow; every other pname crosses."
+    },
+    "GLCmd::IsEnabled": {
+      "api": "WebGLRenderingContext.isEnabled",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "The capability set is already tracked for the enable/disable dedup, so this one is shadowable and is not."
+    },
+    "GLCmd::GetAttribLocation": {
+      "api": "WebGLRenderingContext.getAttribLocation",
+      "reply": "always",
+      "producer_answers_locally": "partly",
+      "note": "Cached per program and name, so one crossing per distinct name, at load."
+    },
+    "GLCmd::GetUniformLocation": {
+      "api": "WebGLRenderingContext.getUniformLocation",
+      "reply": "always",
+      "producer_answers_locally": "partly",
+      "note": "Cached per program and name, invalidated on deleteProgram."
+    },
+    "GLCmd::GetProgramParameter": {
+      "api": "WebGLRenderingContext.getProgramParameter",
+      "reply": "always",
+      "producer_answers_locally": "partly",
+      "note": "Cached per program and pname."
+    },
+    "GLCmd::GetShaderParameter": {
+      "api": "WebGLRenderingContext.getShaderParameter",
+      "reply": "always",
+      "producer_answers_locally": "partly",
+      "note": "SHADER_TYPE is immutable and cached; COMPILE_STATUS crosses."
+    },
+    "GLCmd::GetProgramInfoLog": {
+      "api": "WebGLRenderingContext.getProgramInfoLog",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Diagnostic, at load, and only on failure paths in practice."
+    },
+    "GLCmd::GetShaderInfoLog": {
+      "api": "WebGLRenderingContext.getShaderInfoLog",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Diagnostic, at load."
+    },
+    "GLCmd::GetActiveAttrib": {
+      "api": "WebGLRenderingContext.getActiveAttrib",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Introspection at load; Emscripten exports walk every attribute of every program."
+    },
+    "GLCmd::GetActiveUniform": {
+      "api": "WebGLRenderingContext.getActiveUniform",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Introspection at load; the same walk as GetActiveAttrib and usually larger."
+    },
+    "GLCmd::GetUniformBlockIndex": {
+      "api": "WebGL2RenderingContext.getUniformBlockIndex",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Introspection at load. Cacheable the way getUniformLocation is, and not cached."
+    },
+    "GLCmd::GetTransformFeedbackVarying": {
+      "api": "WebGL2RenderingContext.getTransformFeedbackVarying",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Introspection at load, rare."
+    },
+    "GLCmd::CheckFramebufferStatus": {
+      "api": "WebGLRenderingContext.checkFramebufferStatus",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Called after framebuffer setup, and by some engines every time a render target changes."
+    },
+    "GLCmd::ClientWaitSync": {
+      "api": "WebGL2RenderingContext.clientWaitSync",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "A fence probe. Designed to be polled every frame, and the deadline it gets is the ten-second one."
+    },
+    "GLCmd::GetQueryParameter": {
+      "api": "WebGL2RenderingContext.getQueryParameter",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Timer and occlusion queries, polled every frame, on the same ten-second deadline."
+    },
+    "GLCmd::ReadPixels": {
+      "api": "WebGLRenderingContext.readPixels",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "The pixels are on the renderer's side by definition. No producer-side answer exists."
+    },
+    "GLCmd::ShaderSource": {
+      "api": "WebGLRenderingContext.shaderSource",
+      "reply": "optional",
+      "producer_answers_locally": "yes",
+      "note": "The runtime always passes resp: None. The channel is unused capability, not a crossing."
+    },
+    "GLCmd::AttachShader": {
+      "api": "WebGLRenderingContext.attachShader",
+      "reply": "optional",
+      "producer_answers_locally": "yes",
+      "note": "As ShaderSource: the runtime always passes resp: None."
+    },
+    "Canvas2DCmd::MeasureText": {
+      "api": "CanvasRenderingContext2D.measureText",
+      "reply": "always",
+      "producer_answers_locally": "partly",
+      "note": "A JS-side cache keyed on font and string, in front of an inline shared measurer when the host installs one. Across a process boundary the measurer is not inline and the cache miss crosses."
+    },
+    "Canvas2DCmd::GetImageData": {
+      "api": "CanvasRenderingContext2D.getImageData",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "The pixels are on the renderer's side. The snapshot path defers the copy but not the answer."
+    },
+    "Canvas2DCmd::ReadSnapshotPixels": {
+      "api": "CanvasRenderingContext2D.getImageData (deferred read of a snapshot)",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "The second half of the snapshot path: the read that happens when content actually touches the pixels."
+    },
+    "RenderCommand::LoadFont": {
+      "api": "migo.loadFont",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Once per font, at load. The answer is whether the face parsed."
+    },
+    "RenderCommand::GetTextLineHeight": {
+      "api": "CanvasRenderingContext2D line metrics",
+      "reply": "always",
+      "producer_answers_locally": "no",
+      "note": "Per-frame in label-heavy UI, which is why it shares measureText's four-millisecond deadline class."
+    },
+    "CanvasCmd::GetInfo": {
+      "api": null,
+      "reply": "always",
+      "producer_answers_locally": "n_a",
+      "note": "Host lifecycle: the canvas size, asked once when a canvas is constructed."
+    },
+    "CanvasCmd::CreateOffscreen": {
+      "api": null,
+      "reply": "always",
+      "producer_answers_locally": "n_a",
+      "note": "Host lifecycle."
+    },
+    "CanvasCmd::DestroyCanvas": {
+      "api": null,
+      "reply": "always",
+      "producer_answers_locally": "n_a",
+      "note": "Host lifecycle; the reply is what makes teardown ordered."
+    },
+    "CanvasCmd::RecreateOnscreen": {
+      "api": null,
+      "reply": "always",
+      "producer_answers_locally": "n_a",
+      "note": "Host lifecycle: surface replacement."
+    },
+    "CanvasCmd::LoadImage": {
+      "api": null,
+      "reply": "always",
+      "producer_answers_locally": "n_a",
+      "note": "Host-side decode; content reaches it through an asynchronous Image."
+    },
+    "CanvasCmd::MakeCurrent": {
+      "api": null,
+      "reply": "always",
+      "producer_answers_locally": "n_a",
+      "note": "Host lifecycle."
+    },
+    "CanvasCmd::SwapBuffers": {
+      "api": null,
+      "reply": "always",
+      "producer_answers_locally": "n_a",
+      "note": "Host lifecycle."
+    }
+  }
+}

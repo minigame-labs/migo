@@ -438,6 +438,16 @@ jobs:
       # day that the thing turning measurements into a choice has a bug. Each
       # case breaks one evidence rule -- simulator data, half a matrix, arms the
       # data does not separate -- and checks that the tool refuses.
+      # A command that waits for an answer is a decision, so it is written down.
+      # The Apple Performance+ lane runs content in an agent whose ability to
+      # block is the whole difference between the two candidate topologies -- a
+      # Window main agent's `[[CanBlock]]` is false, so a synchronous reply
+      # there is not slower, it is impossible. On Android each of these stalls
+      # the JavaScript thread for a round trip, and two are polled every frame.
+      # The list is derived from the protocol enums; the contract classifies it.
+      - name: Synchronous surface contract
+        run: bash scripts/test-synchronous-surface-contract.sh
+
       - name: Apple probe decision procedure
         run: bash scripts/test-apple-probe-decision.sh
 
