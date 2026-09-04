@@ -91,6 +91,15 @@ esac
 if [[ "$SNAPSHOT_KIND" == "worker" && "$PRODUCT_PROFILE" != "full" ]]; then
   die "Worker snapshot requires product profile full"
 fi
+# The slim profile ships on Android only -- `snapshots/README.md` says so, and
+# `check-snapshot-freshness.sh` reports the Linux slim lane as legitimately
+# absent. Refused here rather than left to the operator, because a stray
+# `SNAPSHOT-slim-linux-x86_64.bin` is not an unused file: `build.rs` picks up
+# whatever matches the target, so it would be embedded in the Linux slim product
+# silently. Written after generating one twice by accident in one session.
+if [[ "$OS" == "linux" && "$PRODUCT_PROFILE" == "slim" ]]; then
+  die "there is no Linux slim snapshot: the slim product profile ships on Android only (snapshots/README.md)"
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/engine"
