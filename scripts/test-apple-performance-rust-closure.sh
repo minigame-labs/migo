@@ -91,6 +91,7 @@ resolve() {
         --features "$features" \
         -e normal \
         --prefix none \
+        --color never \
         --format '{p}' 2>&1)
 }
 

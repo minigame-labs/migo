@@ -68,9 +68,18 @@ notes=()
 # `{f}` is the enabled feature list. The `(*)` cargo tree appends to a repeated
 # subtree is display, not data, and comparing it as data reports a difference
 # whenever the two graphs merely print in a different order.
+#
+# `--color never` for the same reason, and it was not hypothetical: CI sets
+# `CARGO_TERM_COLOR: always`, so `(*)` arrives wrapped in escape sequences, the
+# `sed` below does not match it, and the gate reported
+#
+#     cpufeatures features differ: apple-only=[' \x1b[33m\x1b[2m(*)\x1b[39m...']
+#
+# on a graph that was identical. Parsing must not depend on an environment
+# variable, so the flag is passed rather than the escapes stripped.
 resolve() {
-    cargo tree "${PRODUCT_ARGS[@]}" --target "$1" -e normal --prefix none \
-        --format '{p}|{f}' 2>/dev/null \
+    cargo tree ${PRODUCT_ARGS[@]+"${PRODUCT_ARGS[@]}"} --target "$1" -e normal --prefix none \
+        --color never --format '{p}|{f}' 2>/dev/null \
         | sed -e 's/ (\*)$//' -e 's/ v[0-9][^|]*|/|/' -e 's/ ([^)]*)|/|/' \
         | awk -F'|' 'NF {print $1 "\t" $2}' \
         | sort -u

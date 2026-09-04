@@ -99,7 +99,7 @@ notes=()
 # product, and treating it as a violation makes the gate wrong in the direction
 # that gets gates disabled.
 resolve() {
-    (cd engine && cargo tree -p "$1" -e normal --prefix none --format '{p}' 2>&1)
+    (cd engine && cargo tree -p "$1" -e normal --prefix none --color never --format '{p}' 2>&1)
 }
 
 package_names() {
