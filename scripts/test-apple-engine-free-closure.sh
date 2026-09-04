@@ -129,7 +129,7 @@ trap 'rm -f "$build_log"' EXIT
 cross_args=()
 for package in "${ENGINE_FREE[@]}"; do cross_args+=(-p "$package"); done
 
-if (cd engine && cargo check --locked --target "$APPLE_TARGET" "${cross_args[@]}") \
+if (cd engine && cargo check --locked --target "$APPLE_TARGET" ${cross_args[@]+"${cross_args[@]}"}) \
         >"$build_log" 2>&1; then
     notes+=("${ENGINE_FREE[*]} compile for $APPLE_TARGET on $(uname -s)")
 else
@@ -170,7 +170,7 @@ $(printf '%s\n' "$tree" | sed 's/^/      /')")
     fi
 
     mapfile -t found < <(violations_in "$tree")
-    for banned in "${found[@]}"; do
+    for banned in ${found[@]+"${found[@]}"}; do
         [[ -n "$banned" ]] || continue
         why="$(cd engine && cargo tree -p "$package" -e normal --invert "$banned" 2>/dev/null | head -20 || true)"
         problems+=("$banned is reachable from $package:
@@ -187,7 +187,7 @@ else
     missing=()
     for expected in "${POSITIVE_CONTROL_EXPECTS[@]}"; do
         found_one=no
-        for package in "${detected[@]}"; do
+        for package in ${detected[@]+"${detected[@]}"}; do
             [[ "$package" == "$expected" ]] && { found_one=yes; break; }
         done
         [[ "$found_one" == yes ]] || missing+=("$expected")
@@ -247,13 +247,13 @@ else
 fi
 
 printf '\n'
-for note in "${notes[@]}"; do echo "  - $note"; done
+for note in ${notes[@]+"${notes[@]}"}; do echo "  - $note"; done
 printf '\n'
 
 if (( ${#problems[@]} > 0 )); then
     echo "FAIL: the engine-free layer is not Apple-buildable from this host." >&2
     printf '\n' >&2
-    for problem in "${problems[@]}"; do echo "  * $problem" >&2; done
+    for problem in ${problems[@]+"${problems[@]}"}; do echo "  * $problem" >&2; done
     printf '\n' >&2
     cat >&2 <<'WHY'
   Why this matters: every Apple claim this repository can make today is made by

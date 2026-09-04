@@ -98,10 +98,10 @@ else
 
     imports_of() { grep -hoE '^[[:space:]]*(@[A-Za-z_]+[[:space:]]+)?import[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$@" \
         | awk '{print $NF}' | sort -u; }
-    mapfile -t found_imports < <(imports_of "${core_sources[@]}")
+    mapfile -t found_imports < <(imports_of ${core_sources[@]+"${core_sources[@]}"})
 
     control_hit=no
-    for imported in "${found_imports[@]}"; do
+    for imported in ${found_imports[@]+"${found_imports[@]}"}; do
         [[ "$imported" == "XCTest" ]] && control_hit=yes
     done
     if [[ "$control_hit" != yes ]]; then
@@ -110,10 +110,10 @@ else
       these files, so 'no engine import' below is not a finding.")
     else
         notes+=("control: the import scanner reports XCTest, which is present")
-        for imported in "${found_imports[@]}"; do
+        for imported in ${found_imports[@]+"${found_imports[@]}"}; do
             for engine in "${ENGINE_MODULES[@]}"; do
                 if [[ "$imported" == "$engine" ]]; then
-                    where="$(grep -lE "^[[:space:]]*(@[A-Za-z_]+[[:space:]]+)?import[[:space:]]+$engine\$" "${core_sources[@]}" | tr '\n' ' ')"
+                    where="$(grep -lE "^[[:space:]]*(@[A-Za-z_]+[[:space:]]+)?import[[:space:]]+$engine\$" ${core_sources[@]+"${core_sources[@]}"} | tr '\n' ' ')"
                     problems+=("$engine is imported under $CORE ($where).
       Code that calls the C ABI belongs in the shipping package, where the
       artifact it needs is declared; here it makes the lane stop building.")
@@ -159,13 +159,13 @@ done
 notes+=("the contract-mirrored Swift files live where they are compiled")
 
 printf '\n'
-for note in "${notes[@]}"; do echo "  - $note"; done
+for note in ${notes[@]+"${notes[@]}"}; do echo "  - $note"; done
 printf '\n'
 
 if (( ${#problems[@]} > 0 )); then
     echo "FAIL: the engine-free Swift package is no longer engine-free." >&2
     printf '\n' >&2
-    for problem in "${problems[@]}"; do echo "  * $problem" >&2; done
+    for problem in ${problems[@]+"${problems[@]}"}; do echo "  * $problem" >&2; done
     printf '\n' >&2
     cat >&2 <<'WHY'
   Why this matters: this package is the only Swift in the repository that any

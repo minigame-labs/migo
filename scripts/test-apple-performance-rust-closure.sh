@@ -252,13 +252,13 @@ else
 fi
 
 printf '\n'
-for note in "${notes[@]}"; do echo "  - $note"; done
+for note in ${notes[@]+"${notes[@]}"}; do echo "  - $note"; done
 printf '\n'
 
 if (( ${#problems[@]} > 0 )); then
     echo "FAIL: the Performance+ product is not free of an embedded JavaScript engine." >&2
     printf '\n' >&2
-    for problem in "${problems[@]}"; do echo "  * $problem" >&2; done
+    for problem in ${problems[@]+"${problems[@]}"}; do echo "  * $problem" >&2; done
     printf '\n' >&2
     cat >&2 <<'WHY'
   Why this matters: MigoApplePerformancePlus exists because content JavaScript

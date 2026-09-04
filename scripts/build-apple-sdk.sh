@@ -247,8 +247,16 @@ for target in "${RUST_TARGETS[@]}"; do
         ios)   export IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" ;;
         macos) export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" ;;
     esac
+    # `${a[@]+"${a[@]}"}` and not `"${a[@]}"`: macOS ships bash 3.2 as /bin/bash,
+    # and there expanding an EMPTY array under `set -u` is an unbound-variable
+    # error rather than nothing. Both of these are empty on real invocations --
+    # `cargo_profile_flag` for a Debug build, `cargo_feature_flags` for the
+    # macos-v8 product -- so two of the three documented ways to call this script
+    # died here on the only OS that can run it. Nothing caught it because the
+    # script had never run at all, and on Linux's bash 5 the plain form is fine.
     if ! cargo build -p migo-capi --target "$target" --locked \
-        "${cargo_feature_flags[@]}" "${cargo_profile_flag[@]}"; then
+        ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} \
+        ${cargo_profile_flag[@]+"${cargo_profile_flag[@]}"}; then
         err "cargo build failed for $target"
         exit 1
     fi
