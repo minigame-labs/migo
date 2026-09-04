@@ -44,6 +44,12 @@ const WebglConstants = {
     // `gl.UNIFORM_BUFFER` is undefined, so the UBO upload targets `undefined`
     // and the shader never receives a projection -> geometry renders outside
     // the clip volume -> nothing is visible.
+    // WebGL 2.0 capability. Listed here because `enable`/`disable`/`isEnabled`
+    // take it and the producer-side capability shadow in 02_webgl_context.js is
+    // built from this table: without the constant, `gl.RASTERIZER_DISCARD` is
+    // `undefined`, `gl.enable(undefined)` reaches the driver as a rejected enum,
+    // and the shadow would have a hole where the tenth capability belongs.
+    RASTERIZER_DISCARD: 35977,
     UNIFORM_BUFFER: 35345,
     UNIFORM_BUFFER_BINDING: 35368,
     UNIFORM_BUFFER_OFFSET_ALIGNMENT: 35380,
