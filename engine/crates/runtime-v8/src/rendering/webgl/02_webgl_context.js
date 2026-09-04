@@ -466,6 +466,13 @@ const _rawPauseTransformFeedback= _makeOrderedRaw(op_pause_transform_feedback);
 const _rawResumeTransformFeedback= _makeOrderedRaw(op_resume_transform_feedback);
 const _rawTransformFeedbackVaryings= _makeOrderedRaw(op_transform_feedback_varyings);
 const _rawGetTransformFeedbackVarying= _makeOrderedRaw(op_get_transform_feedback_varying);
+
+// The three `{size, type, name}` introspection queries share one cache path,
+// but the ops disagree about whether they take a canvas id -- this one does
+// not. The difference is absorbed once here, at module scope, rather than by a
+// closure built on every call.
+const _fetchTransformFeedbackVarying = (_canvasId, programId, index) =>
+    _rawGetTransformFeedbackVarying(programId, index);
 const _rawTexImage3D         = _makeOrderedRaw(op_tex_image_3d);
 const _rawTexSubImage3D      = _makeOrderedRaw(op_tex_sub_image_3d);
 const _rawTexStorage3D       = _makeOrderedRaw(op_tex_storage_3d);
@@ -908,6 +915,8 @@ class WebGLRenderingContext {
         this._activeUniformCache = new Map();
         // programId -> Map(name -> block index)
         this._uniformBlockIndexCache = new Map();
+        // programId -> Map(index -> {size, type, name}), transform feedback
+        this._transformFeedbackVaryingCache = new Map();
         // shaderId -> Map(pname -> value)
         this._shaderParameterCache = new Map();
         this._jsErrorQueue = [];
@@ -970,6 +979,7 @@ class WebGLRenderingContext {
         this._activeAttribCache.delete(programId);
         this._activeUniformCache.delete(programId);
         this._uniformBlockIndexCache.delete(programId);
+        this._transformFeedbackVaryingCache.delete(programId);
     }
 
     /**
@@ -2823,13 +2833,12 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
     }
     getTransformFeedbackVarying(program, index) {
         if (!program || !program._id) return null;
-        const json = _rawGetTransformFeedbackVarying(program._id, index);
-        if (!json) return null;
-        try {
-            return JSON.parse(json);
-        } catch (_) {
-            return null;
-        }
+        return this._activeInfo(
+            this._transformFeedbackVaryingCache,
+            _fetchTransformFeedbackVarying,
+            program._id,
+            index,
+        );
     }
 
     // ---- 3D textures -------------------------------------------

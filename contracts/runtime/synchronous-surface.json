@@ -113,8 +113,8 @@
     "GLCmd::GetTransformFeedbackVarying": {
       "api": "WebGL2RenderingContext.getTransformFeedbackVarying",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load, rare."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load, rare. Cached per (program, index) and dropped on relink, on the same path as GetActiveAttrib and GetActiveUniform -- the class is closed rather than three-quarters done, because the next reader of these three would have to work out why the fourth was different."
     },
     "GLCmd::CheckFramebufferStatus": {
       "api": "WebGLRenderingContext.checkFramebufferStatus",
