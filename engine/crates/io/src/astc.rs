@@ -1,4 +1,4 @@
-//! ASTC 4x4 LDR encoder for ingest-time texture transcoding.
+//! ASTC LDR encoder for ingest-time texture transcoding: 4x4, 6x6 and 8x8.
 //!
 //! The counterpart of [`crate::etc2`], for the devices and the platform that
 //! want ASTC: Apple GPUs take it as their native compressed format, and on
@@ -26,16 +26,19 @@
 //!
 //! | | |
 //! |---|---|
-//! | footprint | 4x4 -- the only one whose weight grid can equal it without infill |
+//! | footprint | 4x4, 6x6 or 8x8, chosen per image. 4x4 is the only one whose weight grid equals it, so it is the only one that needs no infill |
 //! | partitions | 1 -- partitioning is for blocks with two distinct materials |
 //! | colour endpoint mode | 12, LDR RGBA direct |
-//! | weight grid | 4x4, one weight per texel, so no interpolation error |
+//! | weight grid | always 4x4 -- one weight per texel at the 4x4 footprint, bilinearly expanded by the decoder at 6x6 and 8x8 |
 //! | weight range | 0..3, two bits |
 //! | planes | 2 -- alpha on plane 1 |
 //! | endpoint range | 0..47, one trit and four bits |
 //!
-//! Everything else the format offers -- other footprints, partitioning, HDR,
-//! void extents, the base+offset endpoint modes -- is deliberately absent. This
+//! Everything else the format offers -- partitioning, HDR, void extents, the
+//! base+offset endpoint modes -- is deliberately absent. Partitioning is the
+//! one with quality left in it: a single partition is a single colour line, so
+//! a block holding two materials (a sprite edge, a texture seam) cannot be
+//! expressed, which is what the low PSNR on `sprite-edge-8` is. This
 //! runs on the user's device at package ingest, so it has to be small and fast,
 //! and a restricted encoder that is *checked* beats a general one that is
 //! argued about. `scripts/test-astc-encoder.sh` decodes what this produces with
