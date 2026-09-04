@@ -456,6 +456,19 @@ jobs:
       - name: macOS-facing scripts survive bash 3.2
         run: bash scripts/test-macos-bash32-contract.sh
 
+      # The Apple product cannot be compiled on this runner -- it needs Skia built
+      # by an Apple SDK -- so the cheap way to notice it has drifted is to compare
+      # what Cargo RESOLVES for it against a target that is compiled here daily.
+      #
+      # The drift this catches spent the whole life of the external-frame product
+      # in the tree: `migo-core` calls `enable_io()`, tokio puts that behind
+      # `feature = "net"`, and `migo-core` never declared it. Linux and Android
+      # supplied it from `migo-shared`'s target-gated dependency, so the omission
+      # was invisible -- and iOS, which has neither that gate nor
+      # `migo-runtime-v8`, could never have compiled at all.
+      - name: Apple and Linux Performance+ products resolve alike
+        run: bash scripts/test-apple-product-feature-parity.sh
+
       # The same claim, asked of the bytes rather than the dependency graph.
       # A closure that resolves clean is necessary and not sufficient: what
       # ships is an archive, and the question a customer's linker asks is

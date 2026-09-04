@@ -88,7 +88,26 @@ futures = { workspace = true }
 # dependency declaration -- it is a property of whoever else happens to be in
 # the build -- and the external-frame product, which links no engine, is exactly
 # the build where the other crate is not there.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+#
+# `net` was the half of that fix nobody could see, and it took building for a
+# third platform to find it. `create_basic_runtime` calls `enable_io()` and
+# `max_io_events_per_tick()`, both of which tokio puts behind `cfg_io_driver!`
+# -- `feature = "net"`, per tokio's own src/macros/cfg.rs. When the paragraph
+# above was written, the features it named were the ones `migo-runtime-v8`
+# supplied; `net` was arriving from somewhere else entirely, `migo-shared`'s
+#
+#     [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+#
+# which is a legitimate declaration -- `raf_signal` really does use
+# `tokio::io::unix::AsyncFd` there. So on Linux and Android the external-frame
+# product compiled with no engine and still had an IO driver, and the missing
+# declaration here stayed invisible.
+#
+# iOS is the first target with neither: no `migo-runtime-v8`, and not one of
+# those two operating systems. The Apple Performance+ product -- the entire iOS
+# architecture -- could never have compiled, and the error named `enable_io` as
+# "private field, not a method", which reads like a tokio version problem.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
