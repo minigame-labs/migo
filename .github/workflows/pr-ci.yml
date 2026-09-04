@@ -42,6 +42,11 @@ jobs:
         uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
+          # The iOS device target's standard library, on a Linux runner. It is
+          # what lets the engine-free closure gate below compile for a phone
+          # here rather than only on the macOS lane -- the gate treats a missing
+          # target as a failure, not a skip, so this is load-bearing.
+          targets: aarch64-apple-ios
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -426,6 +431,25 @@ jobs:
       # result cannot come from a detector that stopped working.
       - name: Apple Performance+ engine-free dependency closure
         run: bash scripts/test-apple-performance-rust-closure.sh
+
+      # The other Apple closure, and it asks a different question. The gate
+      # above asks what the Performance+ product links; this one asks whether
+      # the three engine-free crates can be compiled for an iPhone AT ALL from a
+      # machine with no Apple SDK.
+      #
+      # They could not, until `migo-shared`'s filesystem module became optional.
+      # `migo-frame-decode` wanted four types from that crate and inherited its
+      # whole capability set, including `zstd` -- a C library whose build script
+      # shells out to `xcrun`. So every Apple fact about the decoder was only
+      # obtainable on the macOS runner, and the failure named the reader's
+      # toolchain rather than the dependency that caused it.
+      #
+      # It also holds a package-count ceiling per crate. These are parsers for
+      # bytes produced by content JavaScript in another process, so a new
+      # dependency is a widening of a trust boundary and should be a decision
+      # somebody wrote down.
+      - name: Apple engine-free layer cross-compiles from Linux
+        run: bash scripts/test-apple-engine-free-closure.sh
 
       # The artefact half of the same claim. A clean dependency graph is
       # necessary and not sufficient: a vendored object or a linker script could

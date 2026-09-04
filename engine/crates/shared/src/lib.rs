@@ -46,6 +46,9 @@ mod audio_resources_tests;
 pub mod callback_id;
 pub mod channel;
 pub mod cjs_compat;
+// Behind `codec`: it owns `base64` and the encoding sniffers, and the
+// engine-free layer decodes no text.
+#[cfg(feature = "codec")]
 pub mod codec;
 pub mod command_vec_pool;
 pub mod config;
@@ -61,6 +64,9 @@ pub mod image_id;
 pub mod js_escape;
 pub mod log_level;
 pub mod log_throttle;
+// Behind `vfs`, not because it is a filesystem but because it holds
+// `VirtualFS`, `MountTable` and `GamePaths` by value. See the manifest.
+#[cfg(feature = "vfs")]
 pub mod op_state;
 pub mod payload_pool;
 pub mod protocol;
@@ -73,6 +79,7 @@ pub mod surface;
 pub mod text_measurer;
 pub mod text_texture_cache;
 pub mod thread_priority;
+#[cfg(feature = "vfs")]
 pub mod vfs;
 
 #[cfg(test)]

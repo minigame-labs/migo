@@ -61,7 +61,12 @@ deno_core.workspace=true
 # Only enable tokio features actually needed (not "full")
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread", "net", "fs", "io-util"] }
 tracing = { workspace = true }
-shared = { package = "migo-shared", path = "../shared", default-features = false }
+# `vfs` names the filesystem/package module and the `op_state` that holds its
+# handles; `codec` the text codecs. Both are `shared` defaults, and this crate
+# opts out of defaults, so they have to be asked for by name -- otherwise a
+# whole-workspace build unifies them in and a single-crate build does not,
+# which is the shape where one of the two is silently green.
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["vfs", "codec"] }
 migo-io = { path = "../io", default-features = false, features = ["zip-extract"] }
 serde.workspace = true
 reqwest.workspace = true
@@ -94,7 +99,7 @@ migo-alloc-probe = { path = "../../testing/alloc-probe", default-features = fals
 # construction so no shipped build can reach it.
 migo-contention-probe = { path = "../../testing/contention-probe", default-features = false }
 # The gate holds the console registry's own lock, which only this feature exposes.
-shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["contention-probe"] }
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["contention-probe", "vfs", "codec"] }
 # Also a [build-dependencies] entry: the snapshot-fingerprint helper
 # (build_snapshot.rs) is shared verbatim between build.rs and its regression test.
 sha2 = "0.10"
