@@ -347,6 +347,24 @@ CXX_aarch64_pc_windows_msvc = "clang-cl"
 # right SDK and `-arch` for the target. These keys exist only to stop the
 # Linux-host `CC` above from shadowing that default -- they restore cc-rs's
 # behaviour rather than replacing it.
+#
+# ⚠ THESE KEYS ONLY REACH cc-rs, AND THAT IS NOT EVERY C COMPILE IN THE GRAPH.
+# skia-bindings does not ask cc-rs which compiler to use for Skia itself: it
+# hands GN a compiler, GN writes ninja files, and what it hands over is the
+# PLAIN `CC` above. So the keys below fixed `zstd-sys` and left Skia broken, and
+# the first build that ever compiled Skia for an Apple target found out 1429
+# ninja steps in:
+#
+#     clang-18 -isysroot .../iPhoneOS18.5.sdk --target=aarch64-apple-ios ...
+#     /bin/sh: clang-18: command not found
+#
+# Android escapes this because skia-bindings takes its compiler from the NDK
+# there, which is why a bare `CC` has been survivable for years without anyone
+# noticing how broad it is. The Apple fix lives in scripts/build-apple-sdk.sh,
+# which exports a plain `CC`/`CXX` before building -- a real environment
+# variable beats this non-forcing block, and `[env]` has no per-target form for
+# the unqualified name. If another Apple entry point appears that compiles Skia,
+# it needs the same two lines.
 CC_aarch64_apple_darwin = "clang"
 CXX_aarch64_apple_darwin = "clang++"
 CC_x86_64_apple_darwin = "clang"

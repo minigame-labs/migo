@@ -280,6 +280,32 @@ fi
 # cd into engine/ deliberately: rust-toolchain.toml and .cargo/config.toml are
 # both resolved from the working directory, so building with --manifest-path
 # from the repo root would silently use the machine's default toolchain.
+# Apple's clang, for the parts of the build that do not ask cc-rs.
+#
+# `engine/.cargo/config.toml` sets a bare `CC = "clang-18"` for the WSL/Ubuntu
+# host, and cargo's `[env]` reaches EVERY target. That file already knows this
+# and answers it with `CC_<target>` keys for Windows and Apple -- which works,
+# because cc-rs resolves the target-qualified name first. It works only for
+# cc-rs.
+#
+# skia-bindings does not go through cc-rs to pick the compiler for Skia itself:
+# it hands GN a compiler and GN runs ninja, and what it hands over is the plain
+# `CC`. So the first build that ever compiled Skia for an Apple target died 1429
+# steps into ninja with
+#
+#     clang-18 -isysroot .../iPhoneOS18.5.sdk --target=aarch64-apple-ios ...
+#     /bin/sh: clang-18: command not found
+#
+# Android does not have this problem because skia-bindings takes its compiler
+# from the NDK there, which is why a bare `CC` has been survivable for years.
+#
+# Exported rather than added to `[env]`: cargo's `[env]` has no per-target form
+# for the plain name, and a real environment variable beats a non-forcing
+# `[env]` entry. `${CC:-clang}` so a caller who deliberately set one keeps it.
+export CC="${CC:-clang}"
+export CXX="${CXX:-clang++}"
+info "C/C++ compiler      $CC / $CXX"
+
 CAPI_STATICLIB="$(read_capi_staticlib_name)" || exit 1
 info "cargo staticlib      $CAPI_STATICLIB (from cargo metadata)"
 
