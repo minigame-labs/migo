@@ -1,0 +1,121 @@
+name: Apple Toolchain
+
+# The Apple-facing layer of this tree has never been compiled by an Apple
+# compiler.
+#
+# `migo-frame-wire`, `migo-frame-decode` and `migo-capi-abi` exist so that the
+# iOS Performance+ product can receive, validate and decode a frame stream in a
+# process that links no JavaScript engine. Every line of them was written,
+# reviewed and tested on x86_64 Linux. Nothing in this repository has ever
+# asked Apple's clang, Apple's linker or Apple's ABI whether they agree.
+#
+# THE DRIFT THIS EXISTS TO CATCH is the one this repository has already been
+# bitten by once, recorded as "writing a platform arm twice is not testing it
+# twice": the ILP32 assertions in the C ABI lane had never been compiled, and
+# when they finally were, two of them were wrong about pointer width. An Apple
+# arm written today would sit in exactly that state -- present, plausible, and
+# unexamined -- until a Mac arrives, which on the current plan is weeks away.
+# This lane makes the compiler answer now instead.
+#
+# Scope is deliberately the engine-free layer and not the whole product.
+# `migo-capi --features external-frames` cannot build here yet for a reason
+# that has nothing to do with Apple: skia-bindings compiles Skia from source
+# and that is an hour of C++ per cold cache. It is a separate lane to add when
+# there is something Apple-specific in the graphics path to protect; adding it
+# now would buy a long red build and no new fact. The boundary is drawn where
+# the facts are.
+#
+# Two things this lane proves that no Linux runner can:
+#
+#   1. The layer compiles for `aarch64-apple-ios` through Apple's own
+#      toolchain, rather than through rustc's cross-compilation of the parts
+#      that happen not to need a system SDK.
+#   2. Its tests *run* on Apple hardware. The runner is Apple silicon, so
+#      `aarch64-apple-darwin` is native: assertions about layout, alignment and
+#      integer width are executed on the ABI they are about, not reasoned about
+#      from another one.
+#
+# Free for this repository. GitHub bills macOS minutes at 10x, but public
+# repositories are unmetered on standard runners, so this lane costs nothing
+# and does not compete with the Linux gates for quota.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: apple-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  apple-engine-free:
+    # `macos-15` and not `macos-latest`: the label that floats is the label
+    # that changes the toolchain under a green build without a commit. This
+    # image is Apple silicon, which is what makes the native half meaningful --
+    # an Intel runner would test an ABI no shipping Apple device has used
+    # since 2020.
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: engine -> target
+          cache-on-failure: true
+
+      # Report what actually answered, so a future failure can be read without
+      # guessing which toolchain produced it. `xcodebuild -version` is the one
+      # line that distinguishes "the runner image moved" from "our code broke".
+      - name: Record the toolchain that is answering
+        working-directory: engine
+        run: |
+          rustc --version --verbose
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # Native, on Apple silicon. This is the half that executes rather than
+      # merely compiles -- the tests in these three crates assert record
+      # lengths, field offsets and opcode agreement, and until this step they
+      # had only ever asserted them against x86_64 Linux.
+      - name: Run the engine-free layer's tests on Apple silicon
+        working-directory: engine
+        run: >-
+          cargo test --locked
+          -p migo-frame-wire
+          -p migo-frame-decode
+          -p migo-capi-abi
+
+      # The shipping shape of the wire crate. Its own manifest explains why the
+      # builder is a default feature rather than an opt-in -- with the feature
+      # off there is no test binary at all, which reports success having run
+      # nothing -- so the exclusion has to be checked by building it, here as
+      # on Linux.
+      - name: The frame reader still stands alone with no test support
+        working-directory: engine
+        run: cargo check --locked --no-default-features -p migo-frame-wire
+
+      # Cross to the device target. `check` and not `test`: running a binary
+      # for a physical iPhone needs a device, which is the whole reason gate G0
+      # is blocked. What is provable without one is that the code the device
+      # would run compiles for it.
+      - name: Cross-compile the engine-free layer for aarch64-apple-ios
+        working-directory: engine
+        run: >-
+          cargo check --locked --target aarch64-apple-ios
+          -p migo-frame-wire
+          -p migo-frame-decode
+          -p migo-capi-abi
