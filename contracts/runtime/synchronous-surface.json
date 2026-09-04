@@ -54,7 +54,7 @@
       "api": "WebGLRenderingContext.getParameter",
       "reply": "always",
       "producer_answers_locally": "partly",
-      "note": "The seven *_BINDING queries come from the facade's own shadow; every other pname crosses."
+      "note": "The seven *_BINDING queries come from the facade's own shadow, and the ten capability enums come from the same producer-side capability shadow that answers isEnabled -- the spec defines getParameter(BLEND) and isEnabled(BLEND) as one answer, so they must not be able to disagree. Every other pname crosses. The device limits and the four strings are constants of the implementation and could be cached after the first query; the *_BITS values, SAMPLES and SAMPLE_BUFFERS could NOT, because in GL ES they describe the currently bound framebuffer."
     },
     "GLCmd::GetAttribLocation": {
       "api": "WebGLRenderingContext.getAttribLocation",

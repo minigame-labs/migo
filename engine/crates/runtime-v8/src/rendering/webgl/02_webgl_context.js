@@ -1425,6 +1425,16 @@ class WebGLRenderingContext {
             case 0x8ca7: return this._renderbufferBinding; // RENDERBUFFER_BINDING
             default: break;
         }
+        // A capability queried through getParameter is the same GLboolean
+        // isEnabled returns -- the spec defines them as one answer. Once
+        // isEnabled stopped crossing, leaving this arm to ask the driver made
+        // the two able to disagree: the driver's bit is shared with Skia and
+        // with the engine's own scissor use, so `isEnabled(BLEND)` and
+        // `getParameter(BLEND)` could return different booleans for the same
+        // context. They go through one shadow.
+        if (_CAP_BIT.has(pname)) {
+            return this.isEnabled(pname);
+        }
         const json = _rawGetParameter(this._canvasId, pname);
         if (!json) return null;
         try { return JSON.parse(json); } catch (_) { return null; }
