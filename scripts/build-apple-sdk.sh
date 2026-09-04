@@ -249,7 +249,7 @@ for tool in xcodebuild lipo cargo; do
 done
 [ "$missing" -eq 0 ] || exit 1
 
-for target in "${RUST_TARGETS[@]}"; do
+for target in ${RUST_TARGETS[@]+"${RUST_TARGETS[@]}"}; do
     if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
         err "Rust target not installed: $target"
         err "  rustup target add $target"
@@ -311,7 +311,7 @@ info "cargo staticlib      $CAPI_STATICLIB (from cargo metadata)"
 
 cd "$ENGINE_DIR" || exit 1
 
-for target in "${RUST_TARGETS[@]}"; do
+for target in ${RUST_TARGETS[@]+"${RUST_TARGETS[@]}"}; do
     info "cargo build $target"
     case "$FLOOR_PLATFORM" in
         ios)   export IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" ;;

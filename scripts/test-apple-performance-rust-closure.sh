@@ -108,7 +108,7 @@ violations_in() {
     local tree="$1" package banned
     while read -r package; do
         [[ -n "$package" ]] || continue
-        for banned in "${FORBIDDEN[@]}"; do
+        for banned in ${FORBIDDEN[@]+"${FORBIDDEN[@]}"}; do
             [[ "$package" == "$banned" ]] && echo "$package"
         done
     done < <(printf '%s\n' "$tree" | awk 'NF {print $1}' | sort -u)
@@ -135,7 +135,7 @@ collect_lines() {
     done
 }
 
-for target in "${CLEAN_CLOSURES[@]}"; do
+for target in ${CLEAN_CLOSURES[@]+"${CLEAN_CLOSURES[@]}"}; do
     if ! tree="$(resolve "$target")"; then
         problems+=("cargo tree could not resolve $target:
 $(printf '%s\n' "$tree" | sed 's/^/      /')")
@@ -147,7 +147,7 @@ $(printf '%s\n' "$tree" | sed 's/^/      /')")
         problems+=("$target resolved only $count packages; an almost-empty closure is not a clean one")
     fi
     collect_lines found < <(violations_in "$tree")
-    for banned in "${found[@]}"; do
+    for banned in ${found[@]+"${found[@]}"}; do
         [[ -n "$banned" ]] || continue
         why="$(cd engine && cargo tree \
             -p "${target%%:*}" --no-default-features \
@@ -168,9 +168,9 @@ $(printf '%s\n' "$control_tree" | sed 's/^/      /')")
 else
     collect_lines detected < <(violations_in "$control_tree")
     missing=()
-    for expected in "${POSITIVE_CONTROL_EXPECTS[@]}"; do
+    for expected in ${POSITIVE_CONTROL_EXPECTS[@]+"${POSITIVE_CONTROL_EXPECTS[@]}"}; do
         found_one=no
-        for package in "${detected[@]}"; do
+        for package in ${detected[@]+"${detected[@]}"}; do
             [[ "$package" == "$expected" ]] && { found_one=yes; break; }
         done
         [[ "$found_one" == yes ]] || missing+=("$expected")

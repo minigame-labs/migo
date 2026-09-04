@@ -115,14 +115,21 @@ for path in sys.argv[1:]:
         continue
     code = strip_comments(src)
 
-    # empty-array expansion under set -u, which bash only fixed in 4.4
+    # Array expansion under set -u, which bash only fixed in 4.4.
+    #
+    # EVERY expansion, not only the arrays this scanner can see assigned `()`.
+    # The narrower rule shipped first and missed one within the hour: an array
+    # filled by a helper that does `eval "$name=()"` has no literal empty
+    # assignment to find, and `for x in "${found[@]}"` then died on the macOS
+    # runner exactly as before. Deciding "can this be empty here" statically is
+    # not possible, the guarded form costs nothing, and a rule with no exceptions
+    # is one nobody has to reason about.
     if re.search(r"^set -[a-z]*u", src, re.M):
-        empties = set(re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=\(\s*\)\s*$", code, re.M))
-        for name in sorted(empties):
-            for m in re.finditer(r'(?<!\+)"\$\{' + re.escape(name) + r'\[@\]\}"', code):
-                line = code[:m.start()].count(chr(10)) + 1
-                print(f"{path}:{line}:expanding the possibly-empty array {name} unguarded "
-                      f"(bash 4.4 fixed that under set -u); write ${{{name}[@]+\"${{{name}[@]}}\"}}")
+        for m in re.finditer(r'(?<!\+)"\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}"', code):
+            name = m.group(1)
+            line = code[:m.start()].count(chr(10)) + 1
+            print(f"{path}:{line}:expands the array {name} unguarded "
+                  f"(bash 4.4 fixed that under set -u); write ${{{name}[@]+\"${{{name}[@]}}\"}}")
 
     for pattern, what, instead in BASH4:
         for m in re.finditer(pattern, code, re.M):
