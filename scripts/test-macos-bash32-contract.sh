@@ -30,6 +30,19 @@
 # possible, and the guarded form costs nothing:
 #
 #     "${arr[@]}"   ->   ${arr[@]+"${arr[@]}"}
+#
+# IT ALSO CHECKS THE OTHER HALF, AND THAT SECOND HALF EXISTS BECAUSE THE FIRST
+# ONE ALONE LET A DEFECT THROUGH. The first version of this gate covered empty
+# array expansion and nothing else. The very next macOS run died in
+# `test-apple-performance-rust-closure.sh` -- a script this gate already had in
+# scope -- with
+#
+#     mapfile: command not found
+#
+# because `mapfile` is a bash 4.0 builtin. A guard that covers one side of the
+# thing it is guarding is the failure shape this repository keeps meeting, so
+# the check is now the whole documented set of constructs bash 3.2 does not
+# have, rather than the one that happened to bite first.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -76,17 +89,45 @@ fi
 scan() {
     python3 - "$@" <<'PY'
 import re, sys
+
+# Constructs bash 3.2 does not have, with the version that introduced each and
+# the replacement. Comment lines are stripped first so a paragraph explaining a
+# construct is not reported as using it.
+BASH4 = [
+    (r"^\s*(?:mapfile|readarray)\s",     "mapfile/readarray (bash 4.0)",
+     "while IFS= read -r line; do arr+=(\"$line\"); done < <(...)"),
+    (r"^\s*(?:local\s+)?declare\s+-A\b", "associative arrays (bash 4.0)",
+     "an indexed array of key=value entries"),
+    (r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?(?:,,|\^\^)",
+     "case modification ${v,,} / ${v^^} (bash 4.0)", "tr '[:upper:]' '[:lower:]'"),
+    (r"^\s*coproc\b",                    "coproc (bash 4.0)", "a named pipe or a temp file"),
+    (r"[^|&]\|&[^|]",                     "|& pipe-with-stderr (bash 4.0)", "2>&1 |"),
+    (r"^\s*shopt\s+-s\s+globstar",      "globstar (bash 4.0)", "find"),
+]
+
+def strip_comments(src):
+    return "\n".join("" if re.match(r"\s*#", line) else line for line in src.splitlines())
+
 for path in sys.argv[1:]:
     try:
         src = open(path, encoding="utf-8", errors="replace").read()
     except OSError:
         continue
-    if not re.search(r"^set -[a-z]*u", src, re.M):
-        continue
-    empties = set(re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=\(\s*\)\s*$", src, re.M))
-    for name in sorted(empties):
-        for m in re.finditer(r'(?<!\+)"\$\{' + re.escape(name) + r'\[@\]\}"', src):
-            print(f"{path}:{src[:m.start()].count(chr(10)) + 1}:{name}")
+    code = strip_comments(src)
+
+    # empty-array expansion under set -u, which bash only fixed in 4.4
+    if re.search(r"^set -[a-z]*u", src, re.M):
+        empties = set(re.findall(r"^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=\(\s*\)\s*$", code, re.M))
+        for name in sorted(empties):
+            for m in re.finditer(r'(?<!\+)"\$\{' + re.escape(name) + r'\[@\]\}"', code):
+                line = code[:m.start()].count(chr(10)) + 1
+                print(f"{path}:{line}:expanding the possibly-empty array {name} unguarded "
+                      f"(bash 4.4 fixed that under set -u); write ${{{name}[@]+\"${{{name}[@]}}\"}}")
+
+    for pattern, what, instead in BASH4:
+        for m in re.finditer(pattern, code, re.M):
+            line = code[:m.start()].count(chr(10)) + 1
+            print(f"{path}:{line}:uses {what}; use {instead}")
 PY
 }
 
@@ -94,11 +135,10 @@ if (( ${#macos_scripts[@]} > 0 )); then
     mapfile -t offenders < <(scan "${macos_scripts[@]}")
     for offender in ${offenders[@]+"${offenders[@]}"}; do
         [[ -n "$offender" ]] || continue
-        problems+=("$offender expands a possibly-empty array unguarded, and this script runs
-      on macOS, where bash 3.2 turns that into 'unbound variable' under set -u.
-      Write it as \${${offender##*:}[@]+\"\${${offender##*:}[@]}\"}.")
+        problems+=("${offender%%:*}:${offender#*:} -- this script runs on macOS, whose
+      /bin/bash is 3.2.")
     done
-    (( ${#offenders[@]} == 0 )) && notes+=("no unguarded possibly-empty array expansion in the macOS-facing scripts")
+    (( ${#offenders[@]} == 0 )) && notes+=("no bash-4-only construct in the macOS-facing scripts")
 fi
 
 # --- the control --------------------------------------------------------------
@@ -114,13 +154,15 @@ cat > "$control" <<'CONTROL'
 set -euo pipefail
 flags=()
 echo "${flags[@]}"
+mapfile -t lines < /dev/null
 CONTROL
 mapfile -t control_hits < <(scan "$control")
-if (( ${#control_hits[@]} == 0 )); then
-    problems+=("the detector reported nothing for a file that contains the exact pattern.
-      The scan is broken, so every clean result above is meaningless.")
+if (( ${#control_hits[@]} < 2 )); then
+    problems+=("the detector reported ${#control_hits[@]} finding(s) for a file that contains two
+      of them -- an unguarded empty-array expansion and a mapfile. The scan is
+      broken, so every clean result above is meaningless.")
 else
-    notes+=("control: the detector finds the pattern in a file that has it")
+    notes+=("control: the detector finds both planted constructs (${#control_hits[@]} finding(s))")
 fi
 
 printf '\n'

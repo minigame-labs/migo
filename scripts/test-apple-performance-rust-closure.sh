@@ -118,6 +118,23 @@ package_count() {
     printf '%s\n' "$1" | awk 'NF {print $1}' | sort -u | wc -l
 }
 
+# Read a command's lines into a named array, without `mapfile`.
+#
+# That builtin arrived in bash 4.0 and macOS ships 3.2 -- it has since 2007, for
+# licensing reasons, and GitHub's macOS images are no different. This gate did
+# not run there until there was an Apple archive to audit, and its first run on
+# the macOS lane died with `command not found`, exit 127. The workflow reported
+# that as a failed gate; it was a gate that could not run at all.
+collect_lines() {
+    local __target="$1"; shift
+    local __line
+    eval "$__target=()"
+    while IFS= read -r __line; do
+        [ -n "$__line" ] || continue
+        eval "$__target+=(\"\$__line\")"
+    done
+}
+
 for target in "${CLEAN_CLOSURES[@]}"; do
     if ! tree="$(resolve "$target")"; then
         problems+=("cargo tree could not resolve $target:
@@ -129,7 +146,7 @@ $(printf '%s\n' "$tree" | sed 's/^/      /')")
     if (( count < 20 )); then
         problems+=("$target resolved only $count packages; an almost-empty closure is not a clean one")
     fi
-    mapfile -t found < <(violations_in "$tree")
+    collect_lines found < <(violations_in "$tree")
     for banned in "${found[@]}"; do
         [[ -n "$banned" ]] || continue
         why="$(cd engine && cargo tree \
@@ -149,7 +166,7 @@ if ! control_tree="$(resolve "$POSITIVE_CONTROL")"; then
     problems+=("the positive control $POSITIVE_CONTROL does not resolve, so the detector is unverified:
 $(printf '%s\n' "$control_tree" | sed 's/^/      /')")
 else
-    mapfile -t detected < <(violations_in "$control_tree")
+    collect_lines detected < <(violations_in "$control_tree")
     missing=()
     for expected in "${POSITIVE_CONTROL_EXPECTS[@]}"; do
         found_one=no
