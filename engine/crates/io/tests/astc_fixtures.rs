@@ -9,7 +9,11 @@
 
 use std::path::PathBuf;
 
-use migo_io::astc::encode_astc_4x4;
+use migo_io::astc::{Footprint, encode_astc, encode_astc_within, worst_error};
+
+/// The same budget `ingest_transcode` applies, because what this checks is the
+/// choice that path makes.
+const BUDGET: u8 = 8;
 
 /// A fixture: a name, a size, and a function from position to RGBA.
 struct Fixture {
@@ -25,8 +29,8 @@ const FIXTURES: &[Fixture] = &[
     // wrong quantisation table shows up undiluted.
     Fixture {
         name: "flat",
-        width: 8,
-        height: 8,
+        width: 24,
+        height: 24,
         pixel: |_, _| [200, 100, 50, 255],
     },
     // Colour varying along x while alpha varies along y is the case single-plane
@@ -69,8 +73,8 @@ const FIXTURES: &[Fixture] = &[
     // encoder's correctness, and every encoder including a perfect one fails it.
     Fixture {
         name: "extremes",
-        width: 8,
-        height: 8,
+        width: 24,
+        height: 24,
         pixel: |x, _| {
             if x % 4 < 2 {
                 [0, 0, 0, 255]
@@ -89,6 +93,7 @@ fn emit_astc_fixtures() {
             .expect("MIGO_ASTC_FIXTURE_DIR must name a directory to write into"),
     );
     std::fs::create_dir_all(&directory).expect("create the fixture directory");
+    let mut written = 0usize;
 
     for fixture in FIXTURES {
         let mut rgba = Vec::with_capacity((fixture.width * fixture.height * 4) as usize);
@@ -97,23 +102,56 @@ fn emit_astc_fixtures() {
                 rgba.extend_from_slice(&(fixture.pixel)(x, y));
             }
         }
-        let blocks = encode_astc_4x4(&rgba, fixture.width, fixture.height)
+        // What the ingest path would actually choose for this image, so the
+        // gate can hold that one -- and only that one -- to the quality budget.
+        // The others are still emitted, because the prediction check applies to
+        // all of them and a fault in the infill shows up only in the larger
+        // footprints.
+        let (_, chosen) = encode_astc_within(&rgba, fixture.width, fixture.height, BUDGET)
             .unwrap_or_else(|error| panic!("{}: {error}", fixture.name));
-        assert_eq!(
-            blocks.len(),
-            (fixture.width as usize / 4) * (fixture.height as usize / 4) * 16,
-            "{}: one sixteen-byte block per 4x4 tile",
-            fixture.name
-        );
-        std::fs::write(directory.join(format!("{}.astc", fixture.name)), &blocks)
-            .expect("write the blocks");
-        std::fs::write(directory.join(format!("{}.rgba", fixture.name)), &rgba)
-            .expect("write the source pixels");
-        std::fs::write(
-            directory.join(format!("{}.size", fixture.name)),
-            format!("{} {}\n", fixture.width, fixture.height),
-        )
-        .expect("write the dimensions");
+
+        // Every footprint, because they share one block layout and differ only
+        // in the weight infill -- so a fault in the shared part shows up in all
+        // three, and a fault in the infill shows up only in the larger two.
+        // Which of the three is worth shipping is a quality question, and the
+        // numbers this prints are its input.
+        for footprint in [Footprint::X4, Footprint::X6, Footprint::X8] {
+            let side = footprint.texels();
+            let Some(expected) = footprint.encoded_len(fixture.width, fixture.height) else {
+                continue;
+            };
+            let blocks = encode_astc(&rgba, fixture.width, fixture.height, footprint)
+                .unwrap_or_else(|error| panic!("{} at {side}x{side}: {error}", fixture.name));
+            assert_eq!(
+                blocks.len(),
+                expected,
+                "{}: one sixteen-byte block per {side}x{side} tile",
+                fixture.name
+            );
+            let stem = format!("{}-{side}", fixture.name);
+            std::fs::write(directory.join(format!("{stem}.astc")), &blocks)
+                .expect("write the blocks");
+            std::fs::write(directory.join(format!("{stem}.rgba")), &rgba)
+                .expect("write the source pixels");
+            // The encoder's own grade of what it just produced, written out so
+            // the oracle can be compared against it. A predictor nobody checks
+            // is what picks the wrong footprint quietly: the selection in
+            // `encode_astc_within` is only as good as this number, and the only
+            // thing that can judge it is a decoder that is not ours.
+            let predicted =
+                worst_error(&rgba, fixture.width, fixture.height, footprint).expect("aligned");
+            std::fs::write(
+                directory.join(format!("{stem}.size")),
+                format!(
+                    "{} {} {side} {predicted} {}\n",
+                    fixture.width,
+                    fixture.height,
+                    u8::from(footprint == chosen)
+                ),
+            )
+            .expect("write the dimensions");
+            written += 1;
+        }
     }
-    println!("wrote {} ASTC fixtures", FIXTURES.len());
+    println!("wrote {written} ASTC fixtures");
 }

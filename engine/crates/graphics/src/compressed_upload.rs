@@ -22,7 +22,16 @@ const GL_COMPRESSED_RGBA_ASTC_4X4_KHR: u32 = 0x93B0;
 /// `GL_COMPRESSED_RGBA_ASTC_6x6_KHR`
 const GL_COMPRESSED_RGBA_ASTC_6X6_KHR: u32 = 0x93B4;
 /// `GL_COMPRESSED_RGBA_ASTC_8x8_KHR`
-const GL_COMPRESSED_RGBA_ASTC_8X8_KHR: u32 = 0x93B9;
+///
+/// This was `0x93B9`, which is `GL_COMPRESSED_RGBA_ASTC_10x6_KHR`. Uploading an
+/// 8x8 texture under a 10x6 token makes `glCompressedTexImage2D` reject it with
+/// `GL_INVALID_VALUE`, because the byte count it derives from the dimensions no
+/// longer matches what it was handed. It had never fired: nothing in the tree
+/// produced ASTC 8x8 until the encoder in `migo-io` did, so the wrong constant
+/// sat in a path with no producer. The test below now derives the token instead
+/// of restating it -- the old one asserted the same wrong number, which is what
+/// a test copied from the code it checks can always do.
+const GL_COMPRESSED_RGBA_ASTC_8X8_KHR: u32 = 0x93B7;
 
 /// Compressed texture format for GPU upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +89,7 @@ impl CompressedFormat {
     }
 
     /// Compressed-block footprint `(width, height)` in texels.
-    fn block_dims(self) -> (u32, u32) {
+    pub(crate) fn block_dims(self) -> (u32, u32) {
         match self {
             Self::Etc2Rgb | Self::Etc2Rgba | Self::Astc4x4 => (4, 4),
             Self::Astc6x6 => (6, 6),
@@ -430,13 +439,68 @@ mod tests {
         assert_eq!(min_filter_for_levels(9), glow::LINEAR_MIPMAP_LINEAR);
     }
 
+    /// The ASTC tokens are derived from the block size, not restated.
+    ///
+    /// `KHR_texture_compression_astc_hdr` assigns `COMPRESSED_RGBA_ASTC_*_KHR`
+    /// consecutively from `0x93B0` over its fourteen block sizes, in the order
+    /// below. So the token for a footprint is its position in that list, and a
+    /// constant that disagrees is an off-by-something rather than a number
+    /// nobody can check.
+    ///
+    /// The previous version of this test asserted `Astc8x8 == 0x93B9`, copied
+    /// from the constant it was checking. `0x93B9` is the 10x6 token, and the
+    /// test confirmed the mistake for as long as both existed.
     #[test]
-    fn gl_internal_format_values() {
+    fn the_astc_tokens_follow_the_block_size_order_the_extension_defines() {
+        const ASTC_BLOCK_SIZES: [(u32, u32); 14] = [
+            (4, 4),
+            (5, 4),
+            (5, 5),
+            (6, 5),
+            (6, 6),
+            (8, 5),
+            (8, 6),
+            (8, 8),
+            (10, 5),
+            (10, 6),
+            (10, 8),
+            (10, 10),
+            (12, 10),
+            (12, 12),
+        ];
+        const FIRST_ASTC_TOKEN: u32 = 0x93B0;
+
+        for format in [
+            CompressedFormat::Astc4x4,
+            CompressedFormat::Astc6x6,
+            CompressedFormat::Astc8x8,
+        ] {
+            let dims = format.block_dims();
+            let index = ASTC_BLOCK_SIZES
+                .iter()
+                .position(|size| *size == dims)
+                .unwrap_or_else(|| panic!("{dims:?} is not an ASTC block size"));
+            assert_eq!(
+                format.gl_internal_format(),
+                FIRST_ASTC_TOKEN + index as u32,
+                "{} maps to 0x{:X}, but a {}x{} block is token {} of the extension's \
+                 list, which is 0x{:X}",
+                format.label(),
+                format.gl_internal_format(),
+                dims.0,
+                dims.1,
+                index,
+                FIRST_ASTC_TOKEN + index as u32
+            );
+        }
+    }
+
+    /// The two ETC2 tokens, which the ES 3.0 core specification assigns and the
+    /// derivation above does not cover.
+    #[test]
+    fn the_etc2_tokens_are_the_core_ones() {
         assert_eq!(CompressedFormat::Etc2Rgb.gl_internal_format(), 0x9274);
         assert_eq!(CompressedFormat::Etc2Rgba.gl_internal_format(), 0x9278);
-        assert_eq!(CompressedFormat::Astc4x4.gl_internal_format(), 0x93B0);
-        assert_eq!(CompressedFormat::Astc6x6.gl_internal_format(), 0x93B4);
-        assert_eq!(CompressedFormat::Astc8x8.gl_internal_format(), 0x93B9);
     }
 
     #[test]

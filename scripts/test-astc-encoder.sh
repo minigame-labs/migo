@@ -56,7 +56,15 @@ printf '%s\n' "$emit" | grep -E 'wrote [0-9]+ ASTC fixtures' || {
     exit 1
 }
 
-# What the tolerance means, and why it is this small.
+# What the tolerance means, what it applies to, and why it is this small.
+#
+# It applies to the footprint the encoder would *choose* for each image, and to
+# no other. The larger footprints are still emitted, measured and checked
+# against the encoder's prediction -- that check is what makes the choice
+# trustworthy -- but they are not held to the budget, because the whole reason
+# the chooser exists is that a 64-texel block cannot hold a hard alpha edge. A
+# gate that failed on that would be failing on the fact the feature is built on.
+
 #
 # Every fixture here is chosen to be representable: each 4x4 tile lies on one
 # colour line, which is what one partition can hold. So the only error the
@@ -78,9 +86,10 @@ fixtures=("$WORK"/*.astc)
 failed=0
 for blocks in "${fixtures[@]}"; do
     name="$(basename "$blocks" .astc)"
-    read -r width height < "$WORK/$name.size"
+    read -r width height side predicted chosen < "$WORK/$name.size"
     echo "- $name"
-    if ! "$WORK/oracle" "$blocks" "$WORK/$name.rgba" "$width" "$height" "$TOLERANCE"; then
+    if ! "$WORK/oracle" "$blocks" "$WORK/$name.rgba" "$width" "$height" \
+        "$TOLERANCE" "$side" "$predicted" "$chosen"; then
         status=$?
         if (( status == 4 )); then
             echo "FAIL: this host cannot decode ASTC, so the encoder is unverified." >&2

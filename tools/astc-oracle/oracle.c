@@ -7,7 +7,7 @@
  * would land in both. This uses whatever ASTC decoder the GL stack ships, which
  * on this repository's Linux host is Mesa's and on a device is the GPU's.
  *
- * Reads a file of 4x4 ASTC blocks and a file of the RGBA8 pixels they encode,
+ * Reads a file of ASTC blocks and a file of the RGBA8 pixels they encode,
  * uploads the blocks as a compressed texture, samples every texel back, and
  * reports the worst per-channel error and the peak signal-to-noise ratio.
  * Exits non-zero when the worst error exceeds the tolerance it was given.
@@ -22,6 +22,8 @@
 #include <string.h>
 
 #define GL_COMPRESSED_RGBA_ASTC_4x4_KHR 0x93B0
+#define GL_COMPRESSED_RGBA_ASTC_6x6_KHR 0x93B4
+#define GL_COMPRESSED_RGBA_ASTC_8x8_KHR 0x93B7
 
 static const char *VERTEX_SHADER =
     "#version 300 es\n"
@@ -63,16 +65,28 @@ static unsigned char *slurp(const char *path, long want) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6) {
-        fprintf(stderr, "usage: oracle <blocks.bin> <source.rgba> <width> <height> <tolerance>\n");
+    if (argc < 9) {
+        fprintf(stderr,
+                "usage: oracle <blocks.bin> <source.rgba> <width> <height> <tolerance> "
+                "<footprint> <predicted> <chosen>\n");
         return 2;
     }
     int width = atoi(argv[3]), height = atoi(argv[4]), tolerance = atoi(argv[5]);
-    if (width <= 0 || height <= 0 || width % 4 || height % 4) {
-        fprintf(stderr, "dimensions must be positive multiples of four\n");
+    int side = atoi(argv[6]), predicted = atoi(argv[7]), chosen = atoi(argv[8]);
+    GLenum internal_format;
+    switch (side) {
+        case 4: internal_format = GL_COMPRESSED_RGBA_ASTC_4x4_KHR; break;
+        case 6: internal_format = GL_COMPRESSED_RGBA_ASTC_6x6_KHR; break;
+        case 8: internal_format = GL_COMPRESSED_RGBA_ASTC_8x8_KHR; break;
+        default:
+            fprintf(stderr, "footprint must be 4, 6 or 8\n");
+            return 2;
+    }
+    if (width <= 0 || height <= 0 || width % side || height % side) {
+        fprintf(stderr, "dimensions must be positive multiples of the footprint\n");
         return 2;
     }
-    long block_bytes = (long)(width / 4) * (height / 4) * 16;
+    long block_bytes = (long)(width / side) * (height / side) * 16;
     long pixel_bytes = (long)width * height * 4;
     unsigned char *blocks = slurp(argv[1], block_bytes);
     unsigned char *source = slurp(argv[2], pixel_bytes);
@@ -117,7 +131,7 @@ int main(int argc, char **argv) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_ASTC_4x4_KHR, width, height, 0,
+    glCompressedTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0,
                            (GLsizei)block_bytes, blocks);
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
@@ -167,11 +181,32 @@ int main(int argc, char **argv) {
     double mean_squared = squared / (double)(pixel_bytes);
     double psnr = mean_squared > 0.0 ? 10.0 * log10(255.0 * 255.0 / mean_squared) : 99.0;
     printf("  decoder: %s\n", glGetString(GL_RENDERER));
-    printf("  %dx%d  worst channel error %d at (%d,%d) channel %d  PSNR %.2f dB\n",
-           width, height, worst, worst_x, worst_y, worst_channel, psnr);
-    if (worst > tolerance) {
-        fprintf(stderr, "  worst error %d exceeds the tolerance of %d\n", worst, tolerance);
-        return 1;
+    printf("  %dx%d block %dx%d  %.2f bpp  worst %d at (%d,%d) ch%d  PSNR %.2f dB%s\n",
+           width, height, side, side, 16.0 / (double)(side * side), worst, worst_x, worst_y,
+           worst_channel, psnr, chosen ? "   <- chosen" : "");
+    int status = 0;
+    /* The budget applies to the footprint the encoder would actually pick. The
+     * others are measured, printed and prediction-checked, but not held to it:
+     * a 64-texel block cannot hold a hard alpha edge, and that is the fact the
+     * chooser is built on rather than a fault to fail on. */
+    if (chosen && worst > tolerance) {
+        fprintf(stderr,
+                "  the encoder chose this footprint and its worst error %d exceeds the "
+                "budget of %d\n",
+                worst, tolerance);
+        status = 1;
     }
-    return 0;
+    /* The encoder grades its own output and picks a footprint from that grade.
+     * If its model of the decoder is wrong, the grade is wrong, and the
+     * selection silently ships the wrong footprint -- with the pixels to prove
+     * it only on a device. Exact agreement is the bar because the model is not
+     * an estimate: it is the specification's own arithmetic. */
+    if (predicted >= 0 && predicted != worst) {
+        fprintf(stderr,
+                "  the encoder predicted a worst error of %d and the decoder produced %d; "
+                "its model of the decoder is wrong, so its footprint choice is too\n",
+                predicted, worst);
+        status = 1;
+    }
+    return status;
 }

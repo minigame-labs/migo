@@ -48,8 +48,68 @@
 /// Bytes in one encoded ASTC block, whatever the footprint.
 pub const ASTC_BLOCK_BYTES: usize = 16;
 
-/// `VK_FORMAT_ASTC_4x4_UNORM_BLOCK`, the format this encoder produces.
+/// `VK_FORMAT_ASTC_4x4_UNORM_BLOCK`.
 pub const VK_FORMAT_ASTC_4X4_UNORM_BLOCK: u32 = 157;
+/// `VK_FORMAT_ASTC_6x6_UNORM_BLOCK`.
+pub const VK_FORMAT_ASTC_6X6_UNORM_BLOCK: u32 = 163;
+/// `VK_FORMAT_ASTC_8x8_UNORM_BLOCK`.
+pub const VK_FORMAT_ASTC_8X8_UNORM_BLOCK: u32 = 169;
+
+/// The block footprints this encoder produces.
+///
+/// All three share one block layout, because the block mode field describes the
+/// *weight grid* and not the footprint -- the footprint comes from the format
+/// the texture is uploaded as. So the larger two cost only the weight infill
+/// below, and every other part of the encoding is the same code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Footprint {
+    /// 16 texels per block: one byte per pixel, one weight per texel.
+    X4,
+    /// 36 texels per block: 0.44 bytes per pixel, weights interpolated.
+    X6,
+    /// 64 texels per block: 0.25 bytes per pixel, weights interpolated.
+    X8,
+}
+
+impl Footprint {
+    /// Texels along each axis. Blocks are square in every footprint here.
+    pub const fn texels(self) -> u32 {
+        match self {
+            Self::X4 => 4,
+            Self::X6 => 6,
+            Self::X8 => 8,
+        }
+    }
+
+    /// The Vulkan format code a KTX2 container declares for it.
+    pub const fn vk_format(self) -> u32 {
+        match self {
+            Self::X4 => VK_FORMAT_ASTC_4X4_UNORM_BLOCK,
+            Self::X6 => VK_FORMAT_ASTC_6X6_UNORM_BLOCK,
+            Self::X8 => VK_FORMAT_ASTC_8X8_UNORM_BLOCK,
+        }
+    }
+
+    /// Bytes an image of this size occupies, or `None` when it is not a whole
+    /// number of blocks.
+    pub const fn encoded_len(self, width: u32, height: u32) -> Option<usize> {
+        let side = self.texels();
+        if width == 0 || height == 0 || !width.is_multiple_of(side) || !height.is_multiple_of(side)
+        {
+            return None;
+        }
+        Some((width / side) as usize * (height / side) as usize * ASTC_BLOCK_BYTES)
+    }
+}
+
+/// The weight grid, which is 4x4 whatever the footprint.
+///
+/// Dual plane stores two weights per grid location, and the format caps a block
+/// at 64 weights, so 4x4 is the largest square grid the second plane leaves
+/// room for. It is also what makes the three footprints one encoder: the block
+/// mode, the endpoint range and the weight range are identical, and only the
+/// texel-to-grid mapping differs.
+const GRID: u32 = 4;
 
 /// What went wrong, in the two ways it can.
 #[derive(Debug, PartialEq, Eq)]
@@ -313,16 +373,90 @@ fn assemble_block(
     block.to_le_bytes()
 }
 
-/// The endpoints and weights for one 4x4 tile of RGBA pixels.
+/// Where a texel samples the weight grid, as C.2.18 computes it.
+///
+/// Returns the four grid indices the decoder will read and the sixteenths it
+/// will weight them by. Written as the specification writes it -- integer
+/// arithmetic, the same shifts -- because the encoder's fit is only as good as
+/// its model of the decoder, and an approximation here is a systematic error
+/// rather than a rounding one.
+fn infill_taps(footprint: Footprint, s: u32, t: u32) -> [(usize, u32); 4] {
+    let side = footprint.texels();
+    let scale = |b: u32| (1024 + b / 2) / (b - 1);
+    let cs = scale(side) * s;
+    let ct = scale(side) * t;
+    let gs = (cs * (GRID - 1) + 32) >> 6;
+    let gt = (ct * (GRID - 1) + 32) >> 6;
+    let (js, fs) = (gs >> 4, gs & 0xF);
+    let (jt, ft) = (gt >> 4, gt & 0xF);
+
+    let w11 = (fs * ft + 8) >> 4;
+    let w10 = ft - w11;
+    let w01 = fs - w11;
+    // `(16 + w11) - fs - ft`, not the specification's `16 - fs - ft + w11`.
+    // The result is the same and never negative -- the four coefficients are
+    // sixteenths of one -- but evaluated left to right on unsigned integers the
+    // written order underflows at `fs = ft = 15`, which is a real corner: it is
+    // the texel furthest from a grid point, and every footprint larger than the
+    // grid has one.
+    let w00 = (16 + w11) - fs - ft;
+
+    let v0 = (js + jt * GRID) as usize;
+    [
+        (v0, w00),
+        (v0 + 1, w01),
+        (v0 + GRID as usize, w10),
+        (v0 + GRID as usize + 1, w11),
+    ]
+}
+
+/// Fit a 4x4 weight grid to the per-texel weights the block wants.
+///
+/// The decoder spreads each grid weight over the texels that sample it, with
+/// the sixteenths [`infill_taps`] returns. The fit is that operator's transpose:
+/// every grid location takes the average of the texels that read it, weighted by
+/// how much they read it. One step of a least-squares solve, which is as much as
+/// four quantisation levels can use -- a full solve would land on the same four
+/// numbers almost everywhere and cost an iteration per block at ingest.
+///
+/// A grid location no texel reads keeps zero and contributes nothing: the
+/// decoder multiplies it by a zero coefficient.
+fn fit_grid(footprint: Footprint, ideal: &[f32]) -> [u8; 16] {
+    let side = footprint.texels();
+    let mut sums = [0.0f32; 16];
+    let mut mass = [0.0f32; 16];
+    for t in 0..side {
+        for s in 0..side {
+            let want = ideal[(t * side + s) as usize];
+            for (index, coefficient) in infill_taps(footprint, s, t) {
+                if coefficient == 0 || index >= 16 {
+                    continue;
+                }
+                let share = coefficient as f32;
+                sums[index] += want * share;
+                mass[index] += share;
+            }
+        }
+    }
+    let mut grid = [0u8; 16];
+    for index in 0..16 {
+        if mass[index] > 0.0 {
+            grid[index] = quantise_unit(sums[index] / mass[index]);
+        }
+    }
+    grid
+}
+
+/// The endpoints and weights for one tile of RGBA pixels.
 ///
 /// Colour and alpha are solved separately because the block interpolates them
 /// separately: the colour endpoints are the extremes along the tile's dominant
 /// RGB axis, and alpha is a one-dimensional problem of its own.
-fn solve_tile(tile: &[[u8; 4]; 16]) -> ([[u8; 4]; 2], [u8; 16], [u8; 16]) {
+fn solve_tile(footprint: Footprint, tile: &[[u8; 4]]) -> ([[u8; 4]; 2], [u8; 16], [u8; 16]) {
     // The dominant axis, as the bounding box's longest side. A covariance
     // eigenvector is better on tiles whose colours lie along a diagonal, and
-    // measurably so only on gradients; the box is what a 4x4 tile of real
-    // content mostly is, and it costs no iteration.
+    // measurably so only on gradients; the box is what a tile of real content
+    // mostly is, and it costs no iteration.
     let mut low = [255u8; 3];
     let mut high = [0u8; 3];
     for pixel in tile {
@@ -332,6 +466,43 @@ fn solve_tile(tile: &[[u8; 4]; 16]) -> ([[u8; 4]; 2], [u8; 16], [u8; 16]) {
         }
     }
 
+    // Which diagonal of the box the colours actually lie along.
+    //
+    // A three-dimensional box has four diagonals, and taking `low -> high`
+    // unconditionally is right only when every channel rises together. A tile
+    // whose red rises while its blue falls lies along a different one, and
+    // projecting it onto this one collapses the two channels into a single
+    // muddled ramp -- the endpoints are then corners no colour in the tile is
+    // near.
+    //
+    // Found by a test image built to be easy: red rising, blue falling, and the
+    // encoder reconstructing it worse than a hard alpha edge. The sign of each
+    // channel's covariance with red is what picks the diagonal, and red is the
+    // reference only because some channel has to be.
+    let mean = {
+        let mut sums = [0.0f32; 3];
+        for pixel in tile {
+            for channel in 0..3 {
+                sums[channel] += f32::from(pixel[channel]);
+            }
+        }
+        sums.map(|sum| sum / tile.len() as f32)
+    };
+    let mut ends = [low, high];
+    for channel in 1..3 {
+        let covariance: f32 = tile
+            .iter()
+            .map(|pixel| {
+                (f32::from(pixel[0]) - mean[0]) * (f32::from(pixel[channel]) - mean[channel])
+            })
+            .sum();
+        if covariance < 0.0 {
+            ends[0][channel] = high[channel];
+            ends[1][channel] = low[channel];
+        }
+    }
+    let (low, high) = (ends[0], ends[1]);
+
     // The projection axis, and a scale that turns a projection into 0..1.
     let axis = [
         f32::from(high[0]) - f32::from(low[0]),
@@ -340,29 +511,35 @@ fn solve_tile(tile: &[[u8; 4]; 16]) -> ([[u8; 4]; 2], [u8; 16], [u8; 16]) {
     ];
     let length = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
 
-    let mut colour_weights = [0u8; 16];
+    // The per-texel weight each plane wants, before the grid has to represent
+    // it. At the 4x4 footprint the grid holds one weight per texel and the fit
+    // below is exact; at 6x6 and 8x8 it is a fit, which is the whole of what
+    // those footprints trade for their smaller blocks.
+    let mut colour_ideal = vec![0.0f32; tile.len()];
     if length > 0.0 {
         for (index, pixel) in tile.iter().enumerate() {
-            let projection = (0..3)
+            colour_ideal[index] = ((0..3)
                 .map(|channel| {
                     (f32::from(pixel[channel]) - f32::from(low[channel])) * axis[channel]
                 })
                 .sum::<f32>()
-                / length;
-            colour_weights[index] = quantise_unit(projection);
+                / length)
+                .clamp(0.0, 1.0);
         }
     }
 
     let alpha_low = tile.iter().map(|pixel| pixel[3]).min().unwrap_or(0);
     let alpha_high = tile.iter().map(|pixel| pixel[3]).max().unwrap_or(0);
-    let mut alpha_weights = [0u8; 16];
+    let mut alpha_ideal = vec![0.0f32; tile.len()];
     if alpha_high > alpha_low {
         let span = f32::from(alpha_high) - f32::from(alpha_low);
         for (index, pixel) in tile.iter().enumerate() {
-            alpha_weights[index] =
-                quantise_unit((f32::from(pixel[3]) - f32::from(alpha_low)) / span);
+            alpha_ideal[index] = (f32::from(pixel[3]) - f32::from(alpha_low)) / span;
         }
     }
+
+    let mut colour_weights = fit_grid(footprint, &colour_ideal);
+    let mut alpha_weights = fit_grid(footprint, &alpha_ideal);
 
     let mut endpoints = [
         [low[0], low[1], low[2], alpha_low],
@@ -410,8 +587,156 @@ fn quantise_unit(position: f32) -> u8 {
     best
 }
 
-/// Encode an RGBA8 image as ASTC 4x4 LDR blocks, in raster block order.
-pub fn encode_astc_4x4(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, AstcError> {
+/// What the decoder will produce for one texel of a block this encoder built.
+///
+/// C.2.18 for the weight, then C.2.19 for the colour: endpoints expand to
+/// sixteen bits by replication, interpolate at the texel's weight, and the top
+/// eight bits are the byte a `GL_RGBA8` readback returns.
+///
+/// This exists so the encoder can grade its own output. A footprint that is
+/// smaller is only better if what it reconstructs is close enough, and "close
+/// enough" is not a judgement anyone can make from the block size --
+/// `crossed-gradients` is *better* at 8x8 than at 4x4 and a quarter the bytes,
+/// while a sprite's alpha edge falls twenty decibels over the same change.
+///
+/// It is a model of the decoder, so it can be wrong. The gate compares what it
+/// predicts against what the platform's decoder actually produces.
+fn reconstruct_texel(
+    footprint: Footprint,
+    endpoints: [[u8; 4]; 2],
+    colour_grid: &[u8; 16],
+    alpha_grid: &[u8; 16],
+    s: u32,
+    t: u32,
+) -> [u8; 4] {
+    let interpolate = |grid: &[u8; 16]| -> u32 {
+        let mut total = 0u32;
+        for (index, coefficient) in infill_taps(footprint, s, t) {
+            if coefficient == 0 {
+                continue;
+            }
+            let stored = grid.get(index).copied().unwrap_or(0);
+            total += u32::from(WEIGHT_LEVELS[stored as usize]) * coefficient;
+        }
+        (total + 8) >> 4
+    };
+    let colour_weight = interpolate(colour_grid);
+    let alpha_weight = interpolate(alpha_grid);
+
+    let mut out = [0u8; 4];
+    for channel in 0..4 {
+        let weight = if channel == 3 {
+            alpha_weight
+        } else {
+            colour_weight
+        };
+        // The endpoints reach the interpolator as the levels the block stores,
+        // not as the bytes the caller asked for.
+        let e0 = u32::from(ENDPOINT_LEVELS[quantise_endpoint(endpoints[0][channel]) as usize]);
+        let e1 = u32::from(ENDPOINT_LEVELS[quantise_endpoint(endpoints[1][channel]) as usize]);
+        let c0 = (e0 << 8) | e0;
+        let c1 = (e1 << 8) | e1;
+        let value = (c0 * (64 - weight) + c1 * weight + 32) / 64;
+        out[channel] = (value >> 8) as u8;
+    }
+    out
+}
+
+/// The worst per-channel error this encoder would produce for an image at a
+/// given footprint.
+///
+/// Measured rather than guessed, on the reconstruction the decoder will perform.
+pub fn worst_error(rgba: &[u8], width: u32, height: u32, footprint: Footprint) -> Option<u8> {
+    footprint.encoded_len(width, height)?;
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    let side = footprint.texels() as usize;
+    let mut tile = vec![[0u8; 4]; side * side];
+    let mut worst = 0u8;
+
+    for block_y in 0..height as usize / side {
+        for block_x in 0..width as usize / side {
+            for row in 0..side {
+                let y = block_y * side + row;
+                let base = (y * width as usize + block_x * side) * 4;
+                for column in 0..side {
+                    let at = base + column * 4;
+                    tile[row * side + column] =
+                        [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]];
+                }
+            }
+            let (endpoints, colour_grid, alpha_grid) = solve_tile(footprint, &tile);
+            for row in 0..side {
+                for column in 0..side {
+                    let got = reconstruct_texel(
+                        footprint,
+                        endpoints,
+                        &colour_grid,
+                        &alpha_grid,
+                        column as u32,
+                        row as u32,
+                    );
+                    let want = tile[row * side + column];
+                    for channel in 0..4 {
+                        let error = got[channel].abs_diff(want[channel]);
+                        worst = worst.max(error);
+                    }
+                }
+            }
+        }
+    }
+    Some(worst)
+}
+
+/// Encode at the smallest footprint whose reconstruction stays within `budget`.
+///
+/// Returns the footprint alongside the blocks, because the container has to
+/// declare it.
+///
+/// # Why the choice is per image
+///
+/// The footprints are not ordered by quality. A smooth gradient reconstructs
+/// *better* at 8x8 than at 4x4 -- fewer blocks means fewer endpoint
+/// quantisations, and a gradient is exactly what bilinear infill represents --
+/// at a quarter of the bytes. A sprite's alpha edge falls from 42 dB to 21 dB
+/// over the same change, because a hard edge inside a 64-texel block is what a
+/// four-by-four weight grid cannot hold. Neither is the general case, so
+/// neither can be the default.
+///
+/// 6x6 is offered and will almost never be chosen: `encoded_len` refuses an
+/// image that is not a whole number of blocks, and no power of two is a
+/// multiple of six. It is here because a texture atlas that happens to be sized
+/// in multiples of six should not be denied it.
+pub fn encode_astc_within(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    budget: u8,
+) -> Result<(Vec<u8>, Footprint), AstcError> {
+    // Largest block first: the first that fits the budget is the fewest bytes.
+    for footprint in [Footprint::X8, Footprint::X6, Footprint::X4] {
+        if footprint.encoded_len(width, height).is_none() {
+            continue;
+        }
+        match worst_error(rgba, width, height, footprint) {
+            Some(error) if error <= budget => {
+                return encode_astc(rgba, width, height, footprint)
+                    .map(|blocks| (blocks, footprint));
+            }
+            _ => continue,
+        }
+    }
+    encode_astc(rgba, width, height, Footprint::X4).map(|blocks| (blocks, Footprint::X4))
+}
+
+/// Encode an RGBA8 image as ASTC LDR blocks, in raster block order.
+pub fn encode_astc(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    footprint: Footprint,
+) -> Result<Vec<u8>, AstcError> {
     let expected = (width as usize) * (height as usize) * 4;
     if rgba.len() != expected {
         return Err(AstcError::BadInputLength {
@@ -419,30 +744,37 @@ pub fn encode_astc_4x4(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
             actual: rgba.len(),
         });
     }
-    if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(4) {
-        return Err(AstcError::UnalignedDimensions { width, height });
-    }
+    let capacity = footprint
+        .encoded_len(width, height)
+        .ok_or(AstcError::UnalignedDimensions { width, height })?;
 
-    let blocks_x = (width / 4) as usize;
-    let blocks_y = (height / 4) as usize;
-    let mut out = Vec::with_capacity(blocks_x * blocks_y * ASTC_BLOCK_BYTES);
-    let mut tile = [[0u8; 4]; 16];
+    let side = footprint.texels() as usize;
+    let blocks_x = width as usize / side;
+    let blocks_y = height as usize / side;
+    let mut out = Vec::with_capacity(capacity);
+    let mut tile = vec![[0u8; 4]; side * side];
 
     for block_y in 0..blocks_y {
         for block_x in 0..blocks_x {
-            for row in 0..4 {
-                let y = block_y * 4 + row;
-                let base = (y * width as usize + block_x * 4) * 4;
-                for column in 0..4 {
+            for row in 0..side {
+                let y = block_y * side + row;
+                let base = (y * width as usize + block_x * side) * 4;
+                for column in 0..side {
                     let at = base + column * 4;
-                    tile[row * 4 + column] = [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]];
+                    tile[row * side + column] =
+                        [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]];
                 }
             }
-            let (endpoints, colour_weights, alpha_weights) = solve_tile(&tile);
+            let (endpoints, colour_weights, alpha_weights) = solve_tile(footprint, &tile);
             out.extend_from_slice(&assemble_block(endpoints, colour_weights, alpha_weights));
         }
     }
     Ok(out)
+}
+
+/// The 4x4 footprint, which is what the ingest path takes today.
+pub fn encode_astc_4x4(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, AstcError> {
+    encode_astc(rgba, width, height, Footprint::X4)
 }
 
 #[cfg(test)]
@@ -569,5 +901,82 @@ mod tests {
         let rgba = vec![0x80u8; 16 * 12 * 4];
         let blocks = encode_astc_4x4(&rgba, 16, 12).expect("aligned");
         assert_eq!(blocks.len(), (16 / 4) * (12 / 4) * ASTC_BLOCK_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod infill_tests {
+    use super::*;
+
+    /// The four interpolation coefficients are sixteenths of one, at every
+    /// texel of every footprint.
+    ///
+    /// This is the invariant the decoder's `(p00*w00 + ... + 8) >> 4` relies on:
+    /// coefficients summing to anything but sixteen scale the weight, which
+    /// scales the colour. It also walks the corner that made the specification's
+    /// own expression underflow when evaluated on unsigned integers.
+    #[test]
+    fn the_infill_coefficients_are_sixteenths_of_one() {
+        for footprint in [Footprint::X4, Footprint::X6, Footprint::X8] {
+            let side = footprint.texels();
+            for t in 0..side {
+                for s in 0..side {
+                    let taps = infill_taps(footprint, s, t);
+                    let total: u32 = taps.iter().map(|(_, weight)| *weight).sum();
+                    assert_eq!(
+                        total, 16,
+                        "{side}x{side} texel ({s},{t}) interpolates with {total}/16"
+                    );
+                }
+            }
+        }
+    }
+
+    /// At the 4x4 footprint the grid is the texel array, so the mapping is the
+    /// identity: each texel reads exactly one grid location, at full weight.
+    ///
+    /// Which is why the 4x4 path needs no fit, and why a fault in the infill
+    /// shows up only in the larger footprints.
+    #[test]
+    fn the_four_by_four_footprint_reads_one_grid_location_per_texel() {
+        for t in 0..4 {
+            for s in 0..4 {
+                let taps = infill_taps(Footprint::X4, s, t);
+                let full: Vec<_> = taps.iter().filter(|(_, weight)| *weight == 16).collect();
+                assert_eq!(full.len(), 1, "texel ({s},{t}) does not read one location");
+                assert_eq!(
+                    full[0].0,
+                    (s + t * GRID) as usize,
+                    "texel ({s},{t}) reads the wrong location"
+                );
+            }
+        }
+    }
+
+    /// Every grid location the larger footprints can name is one the block
+    /// stores.
+    ///
+    /// The specification lets the bilinear read run off the end of a row when
+    /// the fractional part is zero, because the coefficient is then zero too.
+    /// The fit must skip those rather than write past its array, and this is
+    /// what says the ones with a non-zero coefficient are all in range.
+    #[test]
+    fn every_grid_location_with_weight_is_one_the_block_holds() {
+        for footprint in [Footprint::X4, Footprint::X6, Footprint::X8] {
+            let side = footprint.texels();
+            for t in 0..side {
+                for s in 0..side {
+                    for (index, weight) in infill_taps(footprint, s, t) {
+                        if weight > 0 {
+                            assert!(
+                                index < 16,
+                                "{side}x{side} texel ({s},{t}) reads grid slot {index} \
+                                 with weight {weight}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -14,13 +14,28 @@
 
 use shared::device::gpu_caps::GpuCapsSnapshot;
 
-use crate::astc::{VK_FORMAT_ASTC_4X4_UNORM_BLOCK, encode_astc_4x4};
+use crate::astc::{Footprint, encode_astc, encode_astc_within};
 use crate::etc2::{
     VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, encode_etc2_rgb,
     encode_etc2_rgba,
 };
 use crate::fast_image_decoder::decode_image_fast;
 use crate::ktx2::write_ktx2_levels;
+
+/// How far a single channel of a single texel may move before the encoder
+/// refuses a larger ASTC block.
+///
+/// The encoder's own floor is three: endpoints are stored in a range of 48
+/// levels, so about three of 255 after rounding, and a flat image measures
+/// exactly that at every footprint. Eight is that floor with room for the
+/// interpolation, and small enough that the cases a larger block genuinely
+/// cannot hold -- a sprite's alpha edge measures 167, a two-pixel checker
+/// measures 112 -- are nowhere near it.
+///
+/// It is a worst-case bound, not an average: a texture is judged by its worst
+/// texel, which is the side that cannot make anything look worse than it does
+/// today.
+const ASTC_WORST_CHANNEL_BUDGET: u8 = 8;
 
 /// A transcoded sidecar: the entry name to store it under and its KTX2 bytes.
 pub(crate) struct TranscodedSidecar {
@@ -105,13 +120,37 @@ pub(crate) fn transcode_image(
     // universal one, not the better one.
     let use_astc = has_alpha && caps.astc;
 
-    let vk_format = if use_astc {
-        VK_FORMAT_ASTC_4X4_UNORM_BLOCK
-    } else if has_alpha {
-        VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK
+    // Which ASTC footprint, decided by what it reconstructs rather than by what
+    // it costs. The encoder grades its own output against the source and takes
+    // the largest block whose worst channel error stays inside the budget, so a
+    // smooth image lands at a quarter of the bytes and a sprite with a hard
+    // alpha edge stays at one byte per pixel. `worst_error` is a maximum over
+    // the whole image, so one bad texel keeps the whole texture at 4x4 -- the
+    // conservative side, and the one where nothing gets worse.
+    //
+    // In practice this chooses 8x8 or 4x4: no power of two is a multiple of
+    // six, and the encoder refuses an image that is not a whole number of
+    // blocks.
+    let astc = if use_astc {
+        Some(
+            encode_astc_within(
+                &image.rgba,
+                image.width,
+                image.height,
+                ASTC_WORST_CHANNEL_BUDGET,
+            )
+            .ok()?,
+        )
     } else {
-        VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK
+        None
     };
+
+    let vk_format = match &astc {
+        Some((_, footprint)) => footprint.vk_format(),
+        None if has_alpha => VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+        None => VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK,
+    };
+    let astc_footprint = astc.as_ref().map(|(_, footprint)| *footprint);
 
     // The whole chain, not just the base level. A texture that ships one level
     // is sampled with that level at every scale: a minified sprite reads pixels
@@ -122,11 +161,20 @@ pub(crate) fn transcode_image(
     // The chain stops where the encoder would need padding (see `rgba_mip_chain`),
     // so it is often partial -- which the uploader handles by bounding
     // `TEXTURE_MAX_LEVEL` to what it was actually given.
-    let chain = crate::mipmap::rgba_mip_chain(&image.rgba, image.width, image.height, 4);
+    // The chain stops where a level would stop being a whole number of blocks,
+    // and the footprint decides where that is: an 8x8 block needs eight, so a
+    // 256-pixel texture gets levels down to 8 rather than down to 4. Fewer
+    // levels is part of what a larger footprint costs, alongside its
+    // reconstruction, and passing the wrong alignment here would produce a
+    // level the encoder then refuses.
+    let alignment = astc_footprint.map_or(4, Footprint::texels);
+    let chain = crate::mipmap::rgba_mip_chain(&image.rgba, image.width, image.height, alignment);
     let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(chain.len());
     for (level_rgba, level_width, level_height) in &chain {
-        let blocks = if use_astc {
-            encode_astc_4x4(level_rgba, *level_width, *level_height).ok()?
+        let blocks = if let Some(footprint) = astc_footprint {
+            // Every level takes the footprint the base level chose: a KTX2
+            // container declares one format for the whole chain.
+            encode_astc(level_rgba, *level_width, *level_height, footprint).ok()?
         } else if has_alpha {
             encode_etc2_rgba(level_rgba, *level_width, *level_height).ok()?
         } else {
@@ -303,6 +351,71 @@ mod tests {
         // that made this bigger would be a package-size regression for the
         // devices that can read it.
         assert_eq!(parsed.data.len(), (16 / 4) * (16 / 4) * 16);
+    }
+
+    /// A smooth image takes the largest block, which is a quarter of the bytes.
+    ///
+    /// Without this the footprint chooser could refuse everything and every test
+    /// above would still pass: they assert what the sidecar parses as, and a
+    /// chooser that always says 4x4 parses fine. A selection that never selects
+    /// is not a selection.
+    fn smooth_png_with_alpha(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                // A gentle two-dimensional ramp with no wrap and no edge: the
+                // shape bilinear weight infill represents exactly. Red rises
+                // while blue falls, which is deliberate -- it is the tile shape
+                // that made the encoder pick the wrong diagonal of its colour
+                // box, and it measured worse than a hard edge until that was
+                // fixed.
+                let c = (x * 120 / width.max(1)) as u8;
+                let a = 128 + (y * 100 / height.max(1)) as u8;
+                rgba.extend_from_slice(&[c, c / 2 + 40, 200 - c / 2, a]);
+            }
+        }
+        let buffer = image::RgbaImage::from_raw(width, height, rgba).unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+        buffer.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn a_smooth_image_takes_the_largest_block_and_a_quarter_of_the_bytes() {
+        let bytes = smooth_png_with_alpha(32, 32);
+        let sidecar = transcode_image("sky.png", &bytes, with_astc()).expect("transcodes");
+        let parsed = parse_ktx2(&sidecar.bytes).expect("parses");
+        assert_eq!(parsed.header.format, VkFormat::Astc8x8UnormBlock);
+        // (32/8)^2 blocks of sixteen bytes for the base level: a quarter of what
+        // 4x4 would cost, and less than half of ETC2 RGBA.
+        let base = parsed.levels().next().expect("a base level");
+        assert_eq!(base.len(), (32 / 8) * (32 / 8) * 16);
+    }
+
+    #[test]
+    fn a_hard_alpha_edge_keeps_the_small_block() {
+        // The case a 64-texel block cannot hold: an alpha edge *inside* a block
+        // measures 163 of 255, twenty times the budget.
+        //
+        // The bounds are 6 and 23, not 8 and 24, and that is the whole test. An
+        // edge on the block boundary is uniform within every block and
+        // reconstructs perfectly at 8x8 -- the first version of this used 8 and
+        // 24, measured 3, and read as the chooser being backwards when it was
+        // the fixture that had no edge to find.
+        let mut rgba = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                let inside = (6..23).contains(&x) && (6..23).contains(&y);
+                rgba.extend_from_slice(&[220, 40, 40, if inside { 255 } else { 0 }]);
+            }
+        }
+        let buffer = image::RgbaImage::from_raw(32, 32, rgba).unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+        buffer.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        let sidecar =
+            transcode_image("hero.png", &out.into_inner(), with_astc()).expect("transcodes");
+        let parsed = parse_ktx2(&sidecar.bytes).expect("parses");
+        assert_eq!(parsed.header.format, VkFormat::Astc4x4UnormBlock);
     }
 
     #[test]
