@@ -33,7 +33,18 @@
     "  n_a    - not reachable from content; host lifecycle",
     "reply:",
     "  always   - the variant always carries a reply channel",
-    "  optional - the channel is an Option; see callers_supplying_a_reply"
+    "  optional - the channel is an Option; see callers_supplying_a_reply",
+    "",
+    "REMOVED: GLCmd::IsEnabled. It used to be here classified `no` -- every call",
+    "crossed -- with a note saying it was shadowable in principle and not",
+    "shadowed. It is shadowed now: 02_webgl_context.js keeps the ten toggleable",
+    "capabilities in one integer per context, seeded at the GL initial state and",
+    "reset on context loss, so isEnabled answers without leaving the thread and",
+    "the command has no callers left. It was also the one query where crossing",
+    "gave a worse answer: the GL context is shared with Skia, which toggles",
+    "GL_STENCIL_TEST inside its own batches, and the engine toggles",
+    "GL_SCISSOR_TEST around blits -- so the driver's bit is not content's bit,",
+    "while WebGL defines isEnabled purely in terms of content's own calls."
   ],
   "sources": [
     "engine/crates/shared/src/protocol/render_cmd.rs"
@@ -44,12 +55,6 @@
       "reply": "always",
       "producer_answers_locally": "partly",
       "note": "The seven *_BINDING queries come from the facade's own shadow; every other pname crosses."
-    },
-    "GLCmd::IsEnabled": {
-      "api": "WebGLRenderingContext.isEnabled",
-      "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Shadowable in principle and not shadowed. The capability shadow that exists is the renderer's (graphics/backend/gl/state_tracker.rs), which is the wrong side of the boundary to answer this. A producer-side one needs the valid capability set, because enable() with an invalid enum must leave the state unchanged, and a reset on context loss -- so it is a small feature rather than a line, on an API content rarely calls."
     },
     "GLCmd::GetAttribLocation": {
       "api": "WebGLRenderingContext.getAttribLocation",

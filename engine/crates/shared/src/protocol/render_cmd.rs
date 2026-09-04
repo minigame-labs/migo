@@ -774,11 +774,6 @@ pub enum GLCmd {
         canvas_id: CanvasId,
         cap: u32,
     },
-    IsEnabled {
-        canvas_id: CanvasId,
-        cap: u32,
-        resp: RenderCmdResp<bool>,
-    },
     GetParameter {
         canvas_id: CanvasId,
         pname: u32,
@@ -2245,7 +2240,6 @@ impl GLCmd {
             | GLCmd::GetUniformLocation { canvas_id, .. }
             | GLCmd::Enable { canvas_id, .. }
             | GLCmd::Disable { canvas_id, .. }
-            | GLCmd::IsEnabled { canvas_id, .. }
             | GLCmd::ActiveTexture { canvas_id, .. }
             | GLCmd::CreateTexture { canvas_id, .. }
             | GLCmd::BindTexture { canvas_id, .. }

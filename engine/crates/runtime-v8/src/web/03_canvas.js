@@ -1,6 +1,10 @@
 import { primordials } from "ext:core/mod.js";
 import { op_create_offscreen_canvas, op_get_canvas_info, op_resize_canvas, op_destroy_canvas } from "ext:core/ops";
-import { WebGLRenderingContext, WebGL2RenderingContext } from "ext:host_v8_webgl/02_webgl_context.js";
+import {
+    WebGLRenderingContext,
+    WebGL2RenderingContext,
+    _bumpCapabilityGeneration,
+} from "ext:host_v8_webgl/02_webgl_context.js";
 import { CanvasRenderingContext2D } from "ext:host_v8_webgl/02_2d_context.js";
 import {
     flushRenderCommandStream,
@@ -243,6 +247,14 @@ const dispatchWebglContextEvent = (type) => {
     if (type === "webglcontextlost") {
         discardRenderCommandStream();
     }
+    // The capability shadow in the WebGL facade describes a context that is
+    // going away, and then a different one that comes back at its GL initial
+    // state. Bump on both edges: on loss so a query between the two events does
+    // not answer from the dead context's state, and on restore so an `enable`
+    // a listener issued while the context was lost -- whose command was
+    // discarded above and never reached a driver -- does not survive into the
+    // fresh one.
+    _bumpCapabilityGeneration();
     if (!_mainCanvas) return false;
     let prevented = false;
     const event = {

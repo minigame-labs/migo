@@ -5185,19 +5185,6 @@ pub fn op_disable(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u32) {
     queue_gl_fire_and_forget(state, GLCmd::Disable { canvas_id, cap });
 }
 
-#[op2(fast)]
-pub fn op_is_enabled(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u32) -> u32 {
-    send_gl_sync_with_flush(state, |resp| {
-        RenderCommand::GL(GLCmd::IsEnabled {
-            canvas_id,
-            cap,
-            resp,
-        })
-    })
-    .map(|v| if v { 1 } else { 0 })
-    .unwrap_or(0)
-}
-
 /// PERF: Architectural limitation -- this is a synchronous cross-thread call.
 /// `op_get_parameter` flushes the pending GL command batch, sends a
 /// `GetParameter` request to the render thread, and blocks the JS thread

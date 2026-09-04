@@ -40,7 +40,6 @@ import {
     op_webgl_record_attributes,
     op_enable,
     op_disable,
-    op_is_enabled,
     op_get_parameter,
     op_create_texture,
     op_delete_texture,
@@ -304,7 +303,70 @@ const _rawBindBuffer         = _makeOrderedRaw(op_bind_buffer);
 const _rawBufferData         = _makeOrderedRaw(op_buffer_data);
 const _rawGetUniformLocation = _makeOrderedRaw(op_get_uniform_location);
 const _rawGetParameter       = _makeOrderedRaw(op_get_parameter);
-const _rawIsEnabled          = _makeOrderedRaw(op_is_enabled);
+
+// --- Producer-side capability shadow ---------------------------------------
+//
+// `isEnabled` used to be a synchronous round trip: flush the pending stream,
+// hand the question to the render thread, and block this thread until it
+// answered. It is the only WebGL query whose answer this side already knows,
+// because this side is where every `enable` and `disable` was issued.
+//
+// It is also the only one where crossing gives a *worse* answer. The GL context
+// is shared: Skia's Ganesh backend toggles GL_STENCIL_TEST inside its own
+// batches without going through the renderer's tracker (which is why
+// graphics/src/backend/gl/state_tracker.rs always re-issues that one), and the
+// engine itself enables and disables GL_SCISSOR_TEST around blits and damage
+// regions. So the driver bit is not content's bit. WebGL defines `isEnabled`
+// purely in terms of content's own calls plus the initial state, and that is
+// exactly what this table holds.
+//
+// The renderer's `CapabilityShadow` is not the same thing and cannot serve
+// here: it is a de-duplication cache of what the driver was last told, and
+// `invalidate_after_external_gl_use` deliberately forgets all of it whenever
+// Skia has touched the context.
+//
+// Order matches TOGGLEABLE_CAPS in graphics/src/canvas/manager/types.rs. Both
+// lists are the same list, and scripts/test-webgl-capability-table-contract.sh
+// fails if they stop being.
+const _TOGGLEABLE_CAPS = [
+    WebglConstants.BLEND,
+    WebglConstants.CULL_FACE,
+    WebglConstants.DEPTH_TEST,
+    WebglConstants.DITHER,
+    WebglConstants.POLYGON_OFFSET_FILL,
+    WebglConstants.SAMPLE_ALPHA_TO_COVERAGE,
+    WebglConstants.SAMPLE_COVERAGE,
+    WebglConstants.SCISSOR_TEST,
+    WebglConstants.STENCIL_TEST,
+    WebglConstants.RASTERIZER_DISCARD,
+];
+
+// Capability enum -> its bit. A ten-entry Map, so an enum outside the set is
+/// `undefined` rather than a bit that happens to be free: `enable()` with an
+/// invalid enum is GL_INVALID_ENUM and must leave the state alone.
+const _CAP_BIT = new Map();
+for (let i = 0; i < _TOGGLEABLE_CAPS.length; i++) {
+    _CAP_BIT.set(_TOGGLEABLE_CAPS[i], 1 << i);
+}
+
+// GL ES initial state: every capability starts disabled except GL_DITHER.
+// Spelled as a lookup rather than a literal so it cannot drift from the order
+// above -- the bit for DITHER is wherever DITHER is in the list.
+const _CAP_INITIAL = _CAP_BIT.get(WebglConstants.DITHER);
+
+// Bumped whenever the render thread rebuilds the GL context. A context that
+// comes back is at its initial state, so a shadow filled in before the loss
+// describes a context that no longer exists.
+//
+// A generation counter rather than a registry of live contexts: the reset has
+// to reach every context including offscreen ones, and a module-level list of
+// them would keep them alive. Each context compares one integer and refills
+// itself on first use after a loss.
+let _capGeneration = 0;
+
+function _bumpCapabilityGeneration() {
+    _capGeneration++;
+}
 const _rawCreateTexture      = _makeOrderedRaw(op_create_texture);
 const _rawDeleteTexture      = _makeOrderedRaw(op_delete_texture);
 const _rawTexImage2D         = _makeOrderedRaw(op_tex_image_2d);
@@ -853,6 +915,10 @@ class WebGLRenderingContext {
         this._framebufferBinding = null;
         this._renderbufferBinding = null;
 
+        // Producer-side capability shadow; see _TOGGLEABLE_CAPS above.
+        this._capBits = _CAP_INITIAL;
+        this._capGeneration = _capGeneration;
+
         // Record the negotiated attributes so `getContextAttributes()`
         // returns real values instead of bare spec defaults.  We do
         // not actually negotiate (backend is fixed RGBA8 + depth24 +
@@ -1292,9 +1358,27 @@ class WebGLRenderingContext {
 
     // -- Phase 1A: GL State --
 
+    // Refill the capability shadow if the GL context has been rebuilt since it
+    // was last written. One integer compare on the enable/disable path.
+    _freshCapBits() {
+        if (this._capGeneration !== _capGeneration) {
+            this._capBits = _CAP_INITIAL;
+            this._capGeneration = _capGeneration;
+        }
+    }
+
     enable(cap) {
         // opcode 6: H C U.
         if (typeof cap === "number") {
+            const bit = _CAP_BIT.get(cap);
+            // An enum outside the toggleable set is GL_INVALID_ENUM: the driver
+            // rejects it and the state does not move, so the shadow must not
+            // move either. The command still goes out, so the driver still
+            // raises the error it would have raised.
+            if (bit !== undefined) {
+                this._freshCapBits();
+                this._capBits |= bit;
+            }
             encodeEnable(this._canvasId, cap >>> 0);
             return;
         }
@@ -1305,6 +1389,11 @@ class WebGLRenderingContext {
     disable(cap) {
         // opcode 7: H C U.
         if (typeof cap === "number") {
+            const bit = _CAP_BIT.get(cap);
+            if (bit !== undefined) {
+                this._freshCapBits();
+                this._capBits &= ~bit;
+            }
             encodeDisable(this._canvasId, cap >>> 0);
             return;
         }
@@ -1313,7 +1402,14 @@ class WebGLRenderingContext {
     }
 
     isEnabled(cap) {
-        return Boolean(_rawIsEnabled(this._canvasId, cap));
+        const bit = _CAP_BIT.get(cap);
+        // GL_INVALID_ENUM returns GL_FALSE, which is what crossing to the
+        // driver returned for an unknown enum before this shadow existed.
+        if (bit === undefined) {
+            return false;
+        }
+        this._freshCapBits();
+        return (this._capBits & bit) !== 0;
     }
 
     getParameter(pname) {
@@ -2833,4 +2929,5 @@ Object.defineProperty(WebGL2RenderingContext, Symbol.hasInstance, {
 export {
     WebGLRenderingContext,
     WebGL2RenderingContext,
+    _bumpCapabilityGeneration,
 };
