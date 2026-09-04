@@ -897,6 +897,17 @@ class WebGLRenderingContext {
         this._attribLocationCache = new Map();
         this._uniformLocationCache = new Map();
         this._programParameterCache = new Map();
+        // Program introspection. Every one of these was a synchronous round
+        // trip on a value that cannot change until the program is relinked, and
+        // the note in contracts/runtime/synchronous-surface.json says Emscripten
+        // exports walk every attribute and every uniform of every program at
+        // load -- so the stalls arrive in a batch, during startup, which is the
+        // budget Android has been measuring.
+        // programId -> Map(index -> {size, type, name})
+        this._activeAttribCache = new Map();
+        this._activeUniformCache = new Map();
+        // programId -> Map(name -> block index)
+        this._uniformBlockIndexCache = new Map();
         // shaderId -> Map(pname -> value)
         this._shaderParameterCache = new Map();
         this._jsErrorQueue = [];
@@ -952,6 +963,41 @@ class WebGLRenderingContext {
         this._attribLocationCache.delete(programId);
         this._uniformLocationCache.delete(programId);
         this._programParameterCache.delete(programId);
+        // Relinking renumbers the active attributes and uniforms and can change
+        // a uniform block's index, so these go with the rest. Adding a cache
+        // here and forgetting this line is the whole failure mode: the values
+        // stay plausible and belong to the previous link.
+        this._activeAttribCache.delete(programId);
+        this._activeUniformCache.delete(programId);
+        this._uniformBlockIndexCache.delete(programId);
+    }
+
+    /**
+     * One `{size, type, name}` record, from cache or across the boundary.
+     *
+     * The cached value is the raw record; a fresh object is handed out on every
+     * call. Browsers return a new WebGLActiveInfo each time, and a shared object
+     * would let one caller's mutation reach the next -- a cache that hands out
+     * its own storage is a cache that content can corrupt.
+     */
+    _activeInfo(cache, raw, programId, index) {
+        let inner = cache.get(programId);
+        let record = inner && inner.get(index);
+        if (record === undefined) {
+            const json = raw(this._canvasId, programId, index);
+            if (!json) return null;
+            try {
+                record = JSON.parse(json);
+            } catch (_) {
+                return null;
+            }
+            if (!inner) {
+                inner = new Map();
+                cache.set(programId, inner);
+            }
+            inner.set(index, record);
+        }
+        return { size: record.size, type: record.type, name: record.name };
     }
 
     _pushJsError(code) {
@@ -1226,17 +1272,17 @@ class WebGLRenderingContext {
     getActiveAttrib(program, index) {
         const programId = program?.id;
         if (programId === undefined) return null;
-        const json = _rawGetActiveAttrib(this._canvasId, programId, index >>> 0);
-        if (!json) return null;
-        try { return JSON.parse(json); } catch (_) { return null; }
+        return this._activeInfo(
+            this._activeAttribCache, _rawGetActiveAttrib, programId, index >>> 0,
+        );
     }
 
     getActiveUniform(program, index) {
         const programId = program?.id;
         if (programId === undefined) return null;
-        const json = _rawGetActiveUniform(this._canvasId, programId, index >>> 0);
-        if (!json) return null;
-        try { return JSON.parse(json); } catch (_) { return null; }
+        return this._activeInfo(
+            this._activeUniformCache, _rawGetActiveUniform, programId, index >>> 0,
+        );
     }
 
     enableVertexAttribArray(index) {
@@ -2470,7 +2516,19 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
 
     // ---- Uniform Buffer Objects --------------------------------
     getUniformBlockIndex(program, name) {
-        return _rawGetUniformBlockIndex(program._id, name);
+        const programId = program?.id;
+        if (programId === undefined) return -1;
+        let inner = this._uniformBlockIndexCache.get(programId);
+        let index = inner && inner.get(name);
+        if (index === undefined) {
+            index = _rawGetUniformBlockIndex(programId, name);
+            if (!inner) {
+                inner = new Map();
+                this._uniformBlockIndexCache.set(programId, inner);
+            }
+            inner.set(name, index);
+        }
+        return index;
     }
     uniformBlockBinding(program, uniformBlockIndex, uniformBlockBinding) {
         _rawUniformBlockBinding(program._id, uniformBlockIndex, uniformBlockBinding);

@@ -95,20 +95,20 @@
     "GLCmd::GetActiveAttrib": {
       "api": "WebGLRenderingContext.getActiveAttrib",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load; Emscripten exports walk every attribute of every program."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load; Emscripten exports walk every attribute of every program. Cached per (program, index) in the facade now, so the walk crosses once per entry instead of once per call, and `_invalidateProgramCaches` drops it on relink -- relinking renumbers the active attributes, so a cache that survived it would hand back plausible records belonging to the previous link."
     },
     "GLCmd::GetActiveUniform": {
       "api": "WebGLRenderingContext.getActiveUniform",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load; the same walk as GetActiveAttrib and usually larger."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load; the same walk as GetActiveAttrib and usually larger. Cached and invalidated the same way."
     },
     "GLCmd::GetUniformBlockIndex": {
       "api": "WebGL2RenderingContext.getUniformBlockIndex",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Introspection at load. Cacheable the way getUniformLocation is, and not cached."
+      "producer_answers_locally": "partly",
+      "note": "Introspection at load. Cached per (program, name) and invalidated on relink -- the note here used to read 'cacheable the way getUniformLocation is, and not cached'."
     },
     "GLCmd::GetTransformFeedbackVarying": {
       "api": "WebGL2RenderingContext.getTransformFeedbackVarying",
