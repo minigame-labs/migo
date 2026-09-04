@@ -3772,7 +3772,11 @@ pub fn op_submit_render_stream(
 }
 
 /// Inner implementation callable from both the op wrapper and tests.
-pub(crate) fn submit_render_stream_impl(state: &mut OpState, words: &[u32], used_words: u32) -> u32 {
+pub(crate) fn submit_render_stream_impl(
+    state: &mut OpState,
+    words: &[u32],
+    used_words: u32,
+) -> u32 {
     // Pass 1: pure structural validation — no side effects on failure.
     let validated = match crate::rendering::webgl::gl_stream::validate_stream(words, used_words) {
         Ok(v) => v,

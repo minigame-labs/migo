@@ -36,18 +36,16 @@ from pathlib import Path
 
 # Which file carries which block, stated rather than inferred.
 #
-# The 2D block exists in the Rust table and in the WebContent producer; the
-# in-process JavaScript encoder does not have it yet, because its 2D shim still
-# crosses one op per call -- that is the Android cost this block was added to
-# close, and it closes when the shim is rewritten. Listing the blocks per source
-# is what keeps that gap visible here instead of silently unchecked: a source
-# that claims a block must agree on all of it.
+# Every encoder now carries both blocks. The declaration stays per source
+# because that is what makes a gap visible here instead of silently unchecked:
+# a source that claims a block must agree on all of it, and one that drops a
+# block has to say so on this line rather than by quietly failing to match.
 SOURCES = {
     "rust": (Path("engine/crates/frame-wire/src/gl_stream.rs"), {"gl"}),
     "rust 2d": (Path("engine/crates/frame-wire/src/canvas2d.rs"), {"2d"}),
     "in-process js": (
         Path("engine/crates/runtime-v8/src/rendering/webgl/00_render_command_stream.js"),
-        {"gl"},
+        {"gl", "2d"},
     ),
     "webcontent js": (
         Path("platforms/apple/WebContent/PerformancePlus/src/render-opcodes.mjs"),
@@ -63,6 +61,7 @@ PATTERNS = {
     },
     "2d": {
         "rust 2d": re.compile(r"^pub const (OP2D_[A-Z0-9_]+): u32 = (\d+);", re.M),
+        "in-process js": re.compile(r"^\s*const (OP2D_[A-Z0-9_]+) = (\d+);", re.M),
         "webcontent js": re.compile(r"^export const (OP2D_[A-Z0-9_]+) = (\d+);", re.M),
     },
 }
