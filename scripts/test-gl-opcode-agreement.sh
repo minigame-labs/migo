@@ -33,21 +33,40 @@ import re
 import sys
 from pathlib import Path
 
+# Which file carries which block, stated rather than inferred.
+#
+# The 2D block exists in the Rust table and in the WebContent producer; the
+# in-process JavaScript encoder does not have it yet, because its 2D shim still
+# crosses one op per call -- that is the Android cost this block was added to
+# close, and it closes when the shim is rewritten. Listing the blocks per source
+# is what keeps that gap visible here instead of silently unchecked: a source
+# that claims a block must agree on all of it.
 SOURCES = {
-    "rust": Path("engine/crates/frame-wire/src/gl_stream.rs"),
-    "in-process js": Path(
-        "engine/crates/runtime-v8/src/rendering/webgl/00_gl_command_stream.js"
+    "rust": (Path("engine/crates/frame-wire/src/gl_stream.rs"), {"gl"}),
+    "rust 2d": (Path("engine/crates/frame-wire/src/canvas2d.rs"), {"2d"}),
+    "in-process js": (
+        Path("engine/crates/runtime-v8/src/rendering/webgl/00_gl_command_stream.js"),
+        {"gl"},
     ),
-    "webcontent js": Path(
-        "platforms/apple/WebContent/PerformancePlus/src/gl-opcodes.mjs"
+    "webcontent js": (
+        Path("platforms/apple/WebContent/PerformancePlus/src/gl-opcodes.mjs"),
+        {"gl", "2d"},
     ),
 }
 
 PATTERNS = {
-    "rust": re.compile(r"^pub const (OP_[A-Z0-9_]+): u32 = (\d+);", re.M),
-    "in-process js": re.compile(r"^\s*const (OP_[A-Z0-9_]+) = (\d+);", re.M),
-    "webcontent js": re.compile(r"^export const (OP_[A-Z0-9_]+) = (\d+);", re.M),
+    "gl": {
+        "rust": re.compile(r"^pub const (OP_[A-Z0-9_]+): u32 = (\d+);", re.M),
+        "in-process js": re.compile(r"^\s*const (OP_[A-Z0-9_]+) = (\d+);", re.M),
+        "webcontent js": re.compile(r"^export const (OP_[A-Z0-9_]+) = (\d+);", re.M),
+    },
+    "2d": {
+        "rust 2d": re.compile(r"^pub const (OP2D_[A-Z0-9_]+): u32 = (\d+);", re.M),
+        "webcontent js": re.compile(r"^export const (OP2D_[A-Z0-9_]+) = (\d+);", re.M),
+    },
 }
+# Range markers, not opcodes: they name where the block starts and ends.
+BLOCK_MARKERS = {"OP2D_BASE", "OP2D_END"}
 
 HEADER = {
     "rust": re.compile(r"^pub const (MAGIC|STREAM_VERSION): u32 = (0x[0-9A-Fa-f_]+|\d+);", re.M),
@@ -56,21 +75,19 @@ HEADER = {
 }
 
 problems = []
-tables = {}
 headers = {}
+text_of = {}
 
-for name, path in SOURCES.items():
+for name, (path, _blocks) in SOURCES.items():
     if not path.is_file():
         problems.append(f"{name}: {path} is missing")
         continue
-    text = path.read_text(encoding="utf-8")
-    table = {op: int(value) for op, value in PATTERNS[name].findall(text)}
-    if not table:
-        problems.append(f"{name}: no opcodes parsed out of {path}; the pattern no longer matches")
-    tables[name] = table
-    headers[name] = {
-        key: int(value.replace("_", ""), 0) for key, value in HEADER[name].findall(text)
-    }
+    text_of[name] = path.read_text(encoding="utf-8")
+    if name in HEADER:
+        headers[name] = {
+            key: int(value.replace("_", ""), 0)
+            for key, value in HEADER[name].findall(text_of[name])
+        }
 
 if problems:
     print("FAIL: the opcode tables could not be read.", file=sys.stderr)
@@ -78,62 +95,95 @@ if problems:
         print(f"  * {problem}", file=sys.stderr)
     raise SystemExit(1)
 
-source = tables["rust"]
-print(f"\n  - rust declares {len(source)} opcodes")
+print()
 
-for name, table in tables.items():
-    if name == "rust":
+for block, patterns in PATTERNS.items():
+    tables = {}
+    for name, pattern in patterns.items():
+        if name not in text_of:
+            continue
+        table = {
+            op: int(value)
+            for op, value in pattern.findall(text_of[name])
+            if op not in BLOCK_MARKERS
+        }
+        if not table:
+            problems.append(
+                f"{block}: no opcodes parsed out of {name}; the pattern no longer matches"
+            )
+        tables[name] = table
+
+    if not tables:
         continue
-    missing = sorted(set(source) - set(table))
-    extra = sorted(set(table) - set(source))
-    mismatched = sorted(
-        (op, source[op], table[op]) for op in set(source) & set(table) if source[op] != table[op]
-    )
-    if missing:
-        problems.append(f"{name} is missing {len(missing)}: {', '.join(missing[:8])}")
-    if extra:
-        problems.append(f"{name} has {len(extra)} the Rust table does not: {', '.join(extra[:8])}")
-    for op, expected, found in mismatched:
-        problems.append(f"{name}: {op} is {found}, the Rust table says {expected}")
-    if not (missing or extra or mismatched):
-        print(f"  - {name} agrees on all {len(table)}")
+    # The Rust table is the source for its block.
+    source_name = next(name for name in tables if name.startswith("rust"))
+    source = tables[source_name]
+    print(f"  - {block}: {source_name} declares {len(source)} opcodes")
+
+    for name, table in tables.items():
+        if name == source_name:
+            continue
+        missing = sorted(set(source) - set(table))
+        extra = sorted(set(table) - set(source))
+        mismatched = sorted(
+            (op, source[op], table[op])
+            for op in set(source) & set(table)
+            if source[op] != table[op]
+        )
+        if missing:
+            problems.append(f"{block}: {name} is missing {len(missing)}: {', '.join(missing[:8])}")
+        if extra:
+            problems.append(
+                f"{block}: {name} has {len(extra)} the Rust table does not: {', '.join(extra[:8])}"
+            )
+        for op, expected, found in mismatched:
+            problems.append(f"{block}: {name}: {op} is {found}, the Rust table says {expected}")
+        if not (missing or extra or mismatched):
+            print(f"    {name} agrees on all {len(table)}")
+
+    # Contiguity within the block, and no overlap with the other blocks. The
+    # boundaries are load-bearing: a reader classifies a record by its opcode
+    # alone, so an opcode in the wrong range is a record read with the wrong
+    # shape rather than one that is rejected.
+    values = sorted(source.values())
+    if len(set(values)) != len(values):
+        duplicates = sorted({v for v in values if values.count(v) > 1})
+        problems.append(f"{block}: opcode numbers are reused: {duplicates}")
+    if block == "gl":
+        FIXED_TOP = 255
+        fixed = sorted(v for v in values if v <= FIXED_TOP)
+        variable = sorted(v for v in values if v > FIXED_TOP)
+        if fixed and fixed != list(range(1, len(fixed) + 1)):
+            gaps = [n for n in range(1, fixed[-1] + 1) if n not in set(fixed)]
+            problems.append(f"gl: the fixed-length opcodes are not contiguous from 1; missing {gaps[:8]}")
+        if variable and variable != list(range(256, 256 + len(variable))):
+            gaps = [n for n in range(256, variable[-1] + 1) if n not in set(variable)]
+            problems.append(
+                f"gl: the variable-length opcodes are not contiguous from 256; missing {gaps[:8]}"
+            )
+        if variable and max(variable) >= 512:
+            problems.append("gl: an opcode has reached the 2D block at 512")
+        print(f"    {len(fixed)} fixed-length (1..={fixed[-1] if fixed else 0}), "
+              f"{len(variable)} variable-length (256..={variable[-1] if variable else 0})")
+    else:
+        if values != list(range(512, 512 + len(values))):
+            gaps = [n for n in range(512, values[-1] + 1) if n not in set(values)]
+            problems.append(f"2d: the block is not contiguous from 512; missing {gaps[:8]}")
+        print(f"    {len(values)} opcodes (512..={values[-1] if values else 0})")
 
 # The stream header, which is checked before any opcode is read. A producer with
 # the right opcodes and the wrong magic emits a stream the reader refuses whole.
 for key in ("MAGIC", "STREAM_VERSION"):
     values = {name: header.get(key) for name, header in headers.items()}
     if any(value is None for value in values.values()):
-        problems.append(f"{key} is not declared by: {', '.join(n for n, v in values.items() if v is None)}")
+        problems.append(
+            f"{key} is not declared by: {', '.join(n for n, v in values.items() if v is None)}"
+        )
         continue
     if len(set(values.values())) != 1:
         problems.append(f"{key} disagrees: {values}")
     else:
         print(f"  - {key} agrees: {hex(values['rust'])}")
-
-# The numbering is two contiguous blocks, and the split is load-bearing:
-# fixed-length records are 1..=58 and variable-length uniform records are
-# 256..=266, so a reader can tell which shape it is holding from the opcode
-# alone. An opcode dropped into the gap would be a fixed-length number the
-# variable-length path never checks for, and the record would be read with the
-# wrong shape rather than rejected.
-FIXED_TOP = 255
-values = sorted(source.values())
-if len(set(values)) != len(values):
-    duplicates = sorted({v for v in values if values.count(v) > 1})
-    problems.append(f"opcode numbers are reused: {duplicates}")
-
-fixed = sorted(v for v in values if v <= FIXED_TOP)
-variable = sorted(v for v in values if v > FIXED_TOP)
-if fixed and fixed != list(range(1, len(fixed) + 1)):
-    gaps = [n for n in range(1, fixed[-1] + 1) if n not in set(fixed)]
-    problems.append(f"the fixed-length opcodes are not contiguous from 1; missing {gaps[:8]}")
-if variable and variable != list(range(256, 256 + len(variable))):
-    gaps = [n for n in range(256, variable[-1] + 1) if n not in set(variable)]
-    problems.append(f"the variable-length opcodes are not contiguous from 256; missing {gaps[:8]}")
-if variable and variable[0] != 256:
-    problems.append(f"the variable-length block starts at {variable[0]}, not 256")
-print(f"  - {len(fixed)} fixed-length opcodes (1..={fixed[-1] if fixed else 0}), "
-      f"{len(variable)} variable-length (256..={variable[-1] if variable else 0})")
 
 print()
 if problems:
@@ -149,5 +199,5 @@ if problems:
     )
     raise SystemExit(1)
 
-print("PASS: all three opcode tables agree.")
+print("PASS: every opcode table agrees, block by block.")
 PY

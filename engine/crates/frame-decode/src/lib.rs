@@ -48,6 +48,8 @@ use frame_wire::gl_stream::{
     word_count_of,
 };
 
+/// Canvas2D records. See its module docs for why 2D and GL share one stream.
+pub mod canvas2d;
 pub mod codes;
 pub mod validate;
 
@@ -1027,4 +1029,131 @@ mod tests {
         };
         assert_eq!(cmd_approx_bytes(&cmd), cmd.approx_deep_size_bytes());
     }
+}
+
+/// Decode a mixed 2D/GL stream into ordered frame operations.
+///
+/// The general form. [`decode_validated_stream`] is the GL-only view the
+/// in-process runtime still uses, because its collector already groups GL
+/// commands its own way; this is what a producer in another process needs,
+/// where every command -- 2D and GL alike -- arrives as words in one stream.
+///
+/// # Order, and the barrier that preserves it
+///
+/// A frame draws its background with 2D, its sprites with GL, its HUD with 2D.
+/// The renderer must see those in the order they were issued, and it must see
+/// the 2D work *materialized* before the GL work that draws over it: Canvas2D
+/// content lives in a surface the GL path reads, and a GL batch that ran before
+/// the 2D batch behind it was flushed would sample whatever was there before.
+/// So a 2D→GL boundary emits `Materialize` for every canvas with pending work,
+/// exactly as the in-process collector does.
+///
+/// Returns the number of commands decoded, for the caller's own accounting.
+pub fn decode_render_stream<C: GlDecodeContext>(
+    context: &mut C,
+    stream: ValidatedStream<'_>,
+    out: &mut Vec<shared::protocol::FrameOp>,
+) -> usize {
+    use shared::command_vec_pool::PooledVec;
+    use shared::protocol::FrameOp;
+    use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, GlBatchPayload};
+
+    // `words()` is already the used prefix: `validate_stream` bounds the slice
+    // it hands back, which is what makes the walk below need no length check of
+    // its own.
+    let words = stream.words();
+    let used = words.len();
+
+    let mut decoded = 0usize;
+    let mut gl: PooledVec<GLCmd> = PooledVec::take();
+    let mut canvas: PooledVec<Canvas2DCmd> = PooledVec::take();
+    // The canvas the 2D records apply to. `None` until a SELECT_CANVAS arrives,
+    // and a 2D record before one is a producer that never said where to draw.
+    let mut canvas_id: Option<u32> = None;
+    // Canvases whose 2D work the renderer has not flushed yet.
+    let mut pending_materialize: Vec<u32> = Vec::new();
+
+    // Flushing 2D before GL, never the other way round: the whole point of the
+    // barrier is that GL sees materialized 2D content.
+    macro_rules! flush_canvas {
+        () => {
+            if !canvas.is_empty() {
+                let id = canvas_id.unwrap_or(0);
+                out.push(FrameOp::CanvasBatch(CanvasBatchPayload {
+                    canvas_id: id,
+                    commands: std::mem::replace(&mut canvas, PooledVec::take()),
+                    present: false,
+                    dirty_rect: None,
+                }));
+                if !pending_materialize.contains(&id) {
+                    pending_materialize.push(id);
+                }
+            }
+        };
+    }
+    macro_rules! flush_gl {
+        () => {
+            if !gl.is_empty() {
+                out.push(FrameOp::GlBatch(GlBatchPayload {
+                    commands: std::mem::replace(&mut gl, PooledVec::take()),
+                }));
+            }
+        };
+    }
+
+    let mut cursor = 2; // past magic and version
+    while cursor < used {
+        let header = words[cursor];
+        let opcode = opcode_of(header);
+        let word_count = word_count_of(header) as usize;
+        let record = &words[cursor..cursor + word_count];
+        cursor += word_count;
+
+        if opcode == frame_wire::canvas2d::OP2D_SELECT_CANVAS {
+            // A different canvas means a different batch, even for 2D work
+            // either side of it: one batch carries one canvas id.
+            flush_canvas!();
+            canvas_id = Some(record[1]);
+            continue;
+        }
+
+        if opcode >= frame_wire::canvas2d::OP2D_BASE {
+            if canvas_id.is_none() {
+                // Reported rather than guessed. Drawing on canvas zero because
+                // the producer forgot to say which is how content ends up
+                // painting over something else.
+                context.push_error(0, codes::INVALID_OPERATION);
+                continue;
+            }
+            flush_gl!();
+            if let Some(command) = canvas2d::decode_record(opcode, record) {
+                canvas.push(command);
+                decoded += 1;
+            }
+            continue;
+        }
+
+        // GL. Anything pending on the 2D side has to reach the surface first.
+        if !canvas.is_empty() {
+            flush_canvas!();
+        }
+        for id in pending_materialize.drain(..) {
+            out.push(FrameOp::Materialize { canvas_id: id });
+        }
+        if let Some(command) = decode_record(context, opcode, record) {
+            gl.push(command);
+            decoded += 1;
+        }
+    }
+
+    flush_canvas!();
+    flush_gl!();
+    // Trailing 2D work is materialized too: a sync readback or the next frame's
+    // GL has to see it, and the renderer has no other signal that the batch
+    // ended.
+    for id in pending_materialize.drain(..) {
+        out.push(FrameOp::Materialize { canvas_id: id });
+    }
+
+    decoded
 }

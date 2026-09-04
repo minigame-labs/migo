@@ -46,8 +46,6 @@ use shared::{
     surface::SurfaceRef,
 };
 
-use shared::protocol::render_cmd::GLCmd;
-
 use frame_wire::{FrameIngress, IngressDecision, IngressOutcome, PooledFrame, gl_stream};
 
 use crate::runtime::session_thread::{
@@ -310,26 +308,24 @@ impl SubmitPath {
         let validated = gl_stream::validate_stream(&scratch, scratch.len() as u32)
             .map_err(|_| EXTERNAL_ERROR_BAD_COMMAND_STREAM)?;
 
-        // A pooled vector, not a fresh one. The render path runs sixty to a
-        // hundred and twenty times a second, and the commands it carries are
-        // the largest allocation in a frame; the pool is what makes the steady
-        // state allocation-free on this side as well as on the wire side.
-        let mut commands: shared::command_vec_pool::PooledVec<GLCmd> =
-            shared::command_vec_pool::PooledVec::take();
-        frame_decode::decode_validated_stream(
+        // The mixed decoder, not the GL-only one: a producer's frame carries
+        // both kinds and the order between them is the frame. The batches come
+        // back already grouped, with the materialize barriers a GL batch drawn
+        // over 2D content needs.
+        let mut ops = Vec::new();
+        frame_decode::decode_render_stream(
             &mut ExternalDecodeContext(&self.errors),
             validated,
-            &mut commands,
+            &mut ops,
         );
         drop(scratch);
 
-        let packet = shared::FramePacketBuilder::new(u64::from(parsed.frame_id()), 0.0)
-            .push(shared::protocol::FrameOp::BeginFrame)
-            .push(shared::protocol::FrameOp::GlBatch(
-                shared::protocol::render_cmd::GlBatchPayload { commands },
-            ))
-            .push(shared::protocol::FrameOp::Present)
-            .finish();
+        let mut builder = shared::FramePacketBuilder::new(u64::from(parsed.frame_id()), 0.0)
+            .push(shared::protocol::FrameOp::BeginFrame);
+        for op in ops {
+            builder = builder.push(op);
+        }
+        let packet = builder.push(shared::protocol::FrameOp::Present).finish();
 
         dispatch
             .sender

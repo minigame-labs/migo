@@ -188,6 +188,14 @@ pub enum RecordSpec {
 
 /// Returns the `RecordSpec` for a given opcode, or `None` if unknown.
 pub fn record_spec(opcode: u32) -> Option<RecordSpec> {
+    // The 2D block owns everything from its base up. Dispatching on the range
+    // rather than merging the tables keeps each block's spec next to its own
+    // opcode constants, and makes an opcode added to the wrong range a
+    // rejection instead of a record read with the other block's shape.
+    if opcode >= crate::canvas2d::OP2D_BASE {
+        return crate::canvas2d::record_spec(opcode);
+    }
+
     // Bool word indices reference positions within the record (0 = header).
     // From §5 table: B fields and their 0-based positions.
     //

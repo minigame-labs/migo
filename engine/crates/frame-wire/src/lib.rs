@@ -761,6 +761,10 @@ pub fn stamp_checksum(bytes: &mut [u8]) {
 /// cross-process one without either inheriting the other's dependencies.
 pub mod gl_stream;
 
+/// The Canvas2D half of the same stream. See its module docs for why one
+/// stream carries both.
+pub mod canvas2d;
+
 pub mod ingress;
 pub mod pool;
 /// The resource lane: large bytes uploaded out of band and referenceable only

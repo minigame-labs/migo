@@ -88,6 +88,51 @@ export const OP_UNIFORM_MATRIX2FV = 264;
 export const OP_UNIFORM_MATRIX3FV = 265;
 export const OP_UNIFORM_MATRIX4FV = 266;
 
+// The Canvas2D block. One stream carries both kinds because 2D and GL
+// interleave within a frame and the renderer needs the order they were issued
+// in; the ranges are what let a reader tell them apart from the opcode alone.
+//
+// Derived from engine/crates/frame-wire/src/canvas2d.rs, and
+// scripts/test-gl-opcode-agreement.sh keeps the three tables in step.
+
+export const OP2D_SELECT_CANVAS = 512;
+export const OP2D_BEGIN_PATH = 513;
+export const OP2D_CLOSE_PATH = 514;
+export const OP2D_MOVE_TO = 515;
+export const OP2D_LINE_TO = 516;
+export const OP2D_QUADRATIC_CURVE_TO = 517;
+export const OP2D_BEZIER_CURVE_TO = 518;
+export const OP2D_ARC = 519;
+export const OP2D_ARC_TO = 520;
+export const OP2D_RECT = 521;
+export const OP2D_ELLIPSE = 522;
+export const OP2D_FILL = 523;
+export const OP2D_STROKE = 524;
+export const OP2D_CLIP = 525;
+export const OP2D_FILL_RECT = 526;
+export const OP2D_STROKE_RECT = 527;
+export const OP2D_CLEAR_RECT = 528;
+export const OP2D_SAVE = 529;
+export const OP2D_RESTORE = 530;
+export const OP2D_SET_TRANSFORM = 531;
+export const OP2D_RESET_TRANSFORM = 532;
+export const OP2D_TRANSLATE = 533;
+export const OP2D_ROTATE = 534;
+export const OP2D_SCALE = 535;
+export const OP2D_SET_LINE_WIDTH = 536;
+export const OP2D_SET_GLOBAL_ALPHA = 537;
+export const OP2D_SET_MITER_LIMIT = 538;
+export const OP2D_SET_LINE_DASH_OFFSET = 539;
+export const OP2D_SET_SHADOW_BLUR = 540;
+export const OP2D_SET_SHADOW_OFFSET_X = 541;
+export const OP2D_SET_SHADOW_OFFSET_Y = 542;
+export const OP2D_SET_LINE_CAP = 543;
+export const OP2D_SET_LINE_JOIN = 544;
+export const OP2D_SET_COMPOSITE_OPERATION = 545;
+export const OP2D_SET_FILL_STYLE = 546;
+export const OP2D_SET_STROKE_STYLE = 547;
+export const OP2D_SET_SHADOW_COLOR = 548;
+
 /// Pack a record header: low twelve bits opcode, high twenty word count.
 ///
 /// `wordCount` counts the header word itself. A fixture written from the opcode
