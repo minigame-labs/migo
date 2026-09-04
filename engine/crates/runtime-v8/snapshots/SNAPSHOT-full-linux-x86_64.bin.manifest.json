@@ -6,16 +6,16 @@
   "target_triple": "x86_64-unknown-linux-gnu",
   "generation_cpu_policy": "target-baseline",
   "normalized_parameters": ["--arch=x86_64","--cpu-policy=target-baseline","--product-profile=full","--runtime-kind=host","--warmup=none"],
-  "external_references_sha256": "1a0aa7acee30b9c9675f5be01b34513aaca18d0adcbc402c160445c170f3e540",
-  "bootstrap_inputs_sha256": "6dcf44bee1a550aa2d53818d0302ea9e5a4975736e5d33a7b5d9de6b58648957",
+  "external_references_sha256": "8e91fb8f49b9191ccb64d794f4b1b5e8a5c8692d97741e37d7ac315fad840d5e",
+  "bootstrap_inputs_sha256": "dda2000910541898322b389a2f9c580c758866a7e3f9bdbcdc1f9fe65ecec595",
   "features": ["api-commerce","api-connectivity","api-media","api-sensors","api-system","code-signing","profile-full","v8-limits"],
   "features_sha256": "ecb0cd56faa4de5f0830c63cd350f6f62e600fee80ba8224c526a20b8908e6d9",
-  "rust_sources_sha256": "1a0aa7acee30b9c9675f5be01b34513aaca18d0adcbc402c160445c170f3e540",
+  "rust_sources_sha256": "8e91fb8f49b9191ccb64d794f4b1b5e8a5c8692d97741e37d7ac315fad840d5e",
   "v8_archive_sha256": "57cb3d0a0e195738d8ecd366cccbd3c2dd89839e1b9461a9fc43725aac79e911",
-  "snapshot_size": 2233475,
-  "snapshot_sha256": "fa9fab61d8bebc42c96d30789ae84e0889f7c1abcd6af747accd465cb15268d0",
+  "snapshot_size": 2233403,
+  "snapshot_sha256": "40e85598434d61a5a994dff87eaddc57f373a199a14564ca047483c5fa6aa792",
   "js_sources_sha256": "9e37e3bfaa9cce29a4da3e292fed7901a7bd9baa8f0950c93507b7a18633b0fe",
   "deno_core_version": "0.385.0",
-  "git_commit": "cfc18fd",
-  "generated_at": "2026-09-04T05:49:53Z"
+  "git_commit": "b69e768",
+  "generated_at": "2026-09-04T09:00:07Z"
 }
