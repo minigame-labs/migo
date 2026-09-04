@@ -49,7 +49,7 @@
       "api": "WebGLRenderingContext.isEnabled",
       "reply": "always",
       "producer_answers_locally": "no",
-      "note": "The capability set is already tracked for the enable/disable dedup, so this one is shadowable and is not."
+      "note": "Shadowable in principle and not shadowed. The capability shadow that exists is the renderer's (graphics/backend/gl/state_tracker.rs), which is the wrong side of the boundary to answer this. A producer-side one needs the valid capability set, because enable() with an invalid enum must leave the state unchanged, and a reset on context loss -- so it is a small feature rather than a line, on an API content rarely calls."
     },
     "GLCmd::GetAttribLocation": {
       "api": "WebGLRenderingContext.getAttribLocation",
