@@ -1032,6 +1032,7 @@ fn with_collector(
         .try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
     {
         Some(collector) => {
+            collector.record_boundary_crossing();
             mutate(collector);
             collector.should_auto_flush()
         }

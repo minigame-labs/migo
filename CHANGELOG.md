@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The runtime reports how many times a frame's drawing crossed from JavaScript
+  into native, on a five-second window, at `info` level: `[boundary] frames=…
+  crossings/frame=… worst=… commands/frame=… commands/crossing=…`. The ratio is
+  what a command stream exists to move, and it was previously only observable
+  from inside a test.
 
 ### Changed
 - Canvas2D commands cross the JavaScript/native boundary as a binary command

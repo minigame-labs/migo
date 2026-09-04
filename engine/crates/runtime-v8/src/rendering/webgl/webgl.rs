@@ -3401,6 +3401,96 @@ mod tests {
         );
     }
 
+    /// The number G2 is about, reported by the runtime rather than inferred
+    /// from the shape of the code.
+    ///
+    /// Two frames of the same drawing, one encoded and one forced onto the op
+    /// path, and the counter has to tell them apart. Without that it is a
+    /// statistic nobody can act on: a call site that quietly fell back to an op
+    /// looks exactly like one that did not, from anywhere except here.
+    #[test]
+    fn the_boundary_counter_separates_a_batched_frame_from_an_op_per_call_one() {
+        use shared::protocol::render_cmd::CanvasCmd;
+
+        fn crossings_for(name: &'static str, body: &str) -> (u64, u64) {
+            let (mut runtime, render_rx) = new_webgl_runtime();
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut packets = 0;
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    match render_rx.recv_timeout(remaining) {
+                        Ok(RenderCommand::Canvas(CanvasCmd::GetInfo { id: _, resp })) => {
+                            resp.send(Ok((64, 64)));
+                        }
+                        Ok(RenderCommand::FramePacket(_)) => {
+                            packets += 1;
+                            if packets > 0 {
+                                return;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            });
+            let script = format!("const ctx = createCanvas(64, 64).getContext('2d');\n{body}");
+            runtime
+                .exec_script(name, &script)
+                .expect("script must not throw");
+            end_test_frame(&mut runtime);
+            handle.join().expect("helper thread should not panic");
+            let op_state = runtime.op_state_for_test();
+            let state = op_state.borrow();
+            let collector = state.borrow::<UnifiedFrameCollector>();
+            let (_frames, crossings, commands) = collector.boundary_window_for_test();
+            (crossings, commands)
+        }
+
+        // Fifty rectangles, encoded. One submission carries the lot; the frame
+        // also opens the canvas, which is its own op.
+        let (batched, batched_commands) = crossings_for(
+            "boundary_batched.js",
+            "for (let i = 0; i < 50; i++) ctx.fillRect(i, i, 2, 2);\n",
+        );
+
+        // The same fifty, each preceded by a colour the encoder abstains on, so
+        // each one pays a barrier submission and an op.
+        let (per_call, per_call_commands) = crossings_for(
+            "boundary_per_call.js",
+            "for (let i = 0; i < 50; i++) {\n\
+               ctx.fillStyle = 'hsl(' + i + ', 50%, 50%)';\n\
+               ctx.fillRect(i, i, 2, 2);\n\
+             }\n",
+        );
+
+        // Printed, because a test that measures something and keeps the number
+        // to itself makes the next person measure it again.
+        println!(
+            "  encoded: {batched} crossings for {batched_commands} commands\n               per-call: {per_call} crossings for {per_call_commands} commands"
+        );
+
+        assert!(
+            batched <= 4,
+            "fifty encoded rectangles should cross a handful of times, not {batched}"
+        );
+        assert!(
+            per_call >= 50,
+            "fifty colours the encoder abstains on should cross at least once each, got {per_call}"
+        );
+        assert!(
+            per_call > batched * 5,
+            "the counter does not separate the two paths: batched={batched}, per_call={per_call}"
+        );
+        assert!(
+            batched_commands >= 50 && per_call_commands >= 100,
+            "both frames must still carry their commands: {batched_commands} and {per_call_commands}"
+        );
+    }
+
     #[test]
     fn r2_scalar_routing_preserves_baseline_type_acceptance() {
         fn accepts(name: &'static str, source: &'static str) -> bool {
@@ -4160,6 +4250,15 @@ pub(crate) fn submit_render_stream_impl(
         Err(e) => return e.code(),
     };
 
+    // One crossing, whatever the buffer carried. Counted before the decode so
+    // a stream whose records all fail semantic validation still shows the
+    // crossing it cost.
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
+        collector.record_boundary_crossing();
+    }
+
     // Pass 2: semantic decode straight into the collector. The batches the
     // decoder cuts are the batches the collector receives, in the order the
     // frame issued them; nothing is buffered in between.
@@ -4254,6 +4353,7 @@ pub(crate) fn queue_gl_fire_and_forget(state: &mut OpState, cmd: GLCmd) {
         error!("UnifiedFrameCollector missing in op state");
         return;
     };
+    collector.record_boundary_crossing();
     if heap {
         collector.push_gl(cmd);
         // Soft byte-budget backpressure: when a single push has
