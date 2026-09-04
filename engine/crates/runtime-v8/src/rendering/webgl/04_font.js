@@ -1,6 +1,25 @@
 const { core } = Deno;
 const { ops } = core;
 
+// Line height is a pure function of (family, size, bold, italic). The only
+// thing that can change the answer is `loadFont` registering a new face, and
+// that already announces itself through `__migoFontEpoch` -- the same counter
+// measureText's per-canvas cache compares against. One epoch, two caches, so
+// there is no second invalidation rule to keep in step with the first.
+//
+// It was worth caching because of where it is called from: the synchronous
+// surface contract records this one as per-frame in label-heavy UI, sharing
+// measureText's four-millisecond deadline class. Every one of those frames was
+// stalling the JavaScript thread to be told a constant.
+const _lineHeightCache = new Map();
+let _lineHeightCacheEpoch = -1;
+
+// Bounded, because the key space belongs to content: a game that measures a
+// thousand sizes must not be able to grow this without limit. Cleared rather
+// than evicted -- an LRU's bookkeeping would cost more than the crossing it is
+// saving, and the working set here is a handful of entries in any real UI.
+const _LINE_HEIGHT_CACHE_MAX = 256;
+
 /**
  * loadFont(path, family?)
  *
@@ -63,7 +82,22 @@ const getTextLineHeight = (object) => {
     const bold = fontWeight === 'bold' || fontWeight === '700';
     const italic = fontStyle === 'italic';
 
-    return ops.op_get_text_line_height(fontFamily, fontSize, bold, italic);
+    const epoch = globalThis.__migoFontEpoch | 0;
+    if (epoch !== _lineHeightCacheEpoch) {
+        _lineHeightCache.clear();
+        _lineHeightCacheEpoch = epoch;
+    }
+
+    const key = fontFamily + '|' + fontSize + '|' + (bold ? 1 : 0) + (italic ? 1 : 0);
+    let height = _lineHeightCache.get(key);
+    if (height === undefined) {
+        height = ops.op_get_text_line_height(fontFamily, fontSize, bold, italic);
+        if (_lineHeightCache.size >= _LINE_HEIGHT_CACHE_MAX) {
+            _lineHeightCache.clear();
+        }
+        _lineHeightCache.set(key, height);
+    }
+    return height;
 };
 
 export { loadFont, getTextLineHeight };

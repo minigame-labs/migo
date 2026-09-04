@@ -179,8 +179,8 @@
     "RenderCommand::GetTextLineHeight": {
       "api": "CanvasRenderingContext2D line metrics",
       "reply": "always",
-      "producer_answers_locally": "no",
-      "note": "Per-frame in label-heavy UI, which is why it shares measureText's four-millisecond deadline class."
+      "producer_answers_locally": "partly",
+      "note": "Per-frame in label-heavy UI, which is why it shares measureText's four-millisecond deadline class. Cached in 04_font.js by (family, size, bold, italic) -- a pure function of those -- and invalidated by the __migoFontEpoch counter loadFont already bumps for measureText's cache, so there is one invalidation rule rather than two. The cache is bounded because its key space is content's."
     },
     "CanvasCmd::GetInfo": {
       "api": null,
