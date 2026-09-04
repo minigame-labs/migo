@@ -330,6 +330,32 @@ CXX_x86_64_pc_windows_msvc = "clang-cl"
 CC_aarch64_pc_windows_msvc = "clang-cl"
 CXX_aarch64_pc_windows_msvc = "clang-cl"
 
+# The Apple targets, for the same reason and with the same shape. The block
+# above worked out that a plain `CC` here reaches every target and named the
+# Windows ones; the Apple ones have the identical problem and nobody had a
+# machine on which to meet it.
+#
+# This is not a hypothetical. The first CI run that ever compiled this tree with
+# an Apple toolchain -- `.github/workflows/apple-ci.yml`, on macos-15 -- died in
+# `zstd-sys`'s build script with `ToolNotFound: failed to find tool "clang-18"`,
+# before a single line of our own code was compiled. A Mac arriving in this
+# project's future would have met exactly that, and the message points at the
+# reader's toolchain rather than at this file.
+#
+# Plain `clang` and not a versioned name: on Apple platforms cc-rs's own default
+# is `clang`, resolved through the active developer directory so it picks up the
+# right SDK and `-arch` for the target. These keys exist only to stop the
+# Linux-host `CC` above from shadowing that default -- they restore cc-rs's
+# behaviour rather than replacing it.
+CC_aarch64_apple_darwin = "clang"
+CXX_aarch64_apple_darwin = "clang++"
+CC_x86_64_apple_darwin = "clang"
+CXX_x86_64_apple_darwin = "clang++"
+CC_aarch64_apple_ios = "clang"
+CXX_aarch64_apple_ios = "clang++"
+CC_aarch64_apple_ios_sim = "clang"
+CXX_aarch64_apple_ios_sim = "clang++"
+
 # Khronos EGL/GL/GLES headers for Skia's GL EGL interface are expected in the
 # environment via CPATH.  On WSL / minimal Ubuntu hosts without root access,
 # run `scripts/dev-setup-skia.sh` once to fetch them to ~/.local/skia-headers
