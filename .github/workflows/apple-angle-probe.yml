@@ -36,6 +36,15 @@ name: Apple ANGLE probe
 # The revision it resolved to was 52f594287836c9970b67920da0633077aee42649,
 # which is the pin candidate A2.1 needs.
 #
+# The rest of the cost, measured on the same runner in the same run:
+#
+#   gn gen, three configurations   seconds; 12554 / 12560 / 10125 targets
+#   ninja libEGL libGLESv2 (ios)   334 seconds, 100 MB of output
+#
+# So a full A2.1 lane -- one checkout, three configurations, three builds -- is
+# roughly twenty minutes on a free hosted runner. "Wait for a Mac; it is tens of
+# gigabytes and hours of C++" was wrong on every count.
+#
 # So this job checks out and configures, and DELIBERATELY DOES NOT BUILD. A first
 # run that tries to compile ANGLE answers a question we cannot ask yet -- how
 # long the compile takes -- while risking a timeout that tells us nothing about
