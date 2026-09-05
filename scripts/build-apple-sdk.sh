@@ -97,6 +97,47 @@ done
 # The floor, read from the contract
 # ---------------------------------------------------------------------------
 
+# The static library cargo will actually produce for `migo-capi`.
+#
+# Asked of cargo rather than written here. This script copied `libmigo.a` for its
+# whole life while the crate's `[lib] name` has been `migo_capi`, so cargo emits
+# `libmigo_capi.a` and the copy could only ever have failed -- which nobody saw,
+# because the script had never run at all. A second hand-written copy of a name
+# that lives in a manifest is the same defect waiting to happen again.
+read_capi_staticlib_name() {
+    # Metadata goes through a file and the program through the heredoc, the same
+    # shape read_deployment_target uses. `python3 - <<EOF` takes its *program*
+    # from stdin, so piping cargo into it hands the interpreter the JSON as
+    # source text and leaves sys.stdin already consumed.
+    local metadata
+    metadata="$(mktemp)" || return 1
+    if ! (cd "$ENGINE_DIR" && cargo metadata --format-version 1 --no-deps) >"$metadata"; then
+        rm -f "$metadata"
+        return 1
+    fi
+    python3 - "$metadata" <<'CAPILIB'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    meta = json.load(handle)
+for package in meta["packages"]:
+    if package["name"] != "migo-capi":
+        continue
+    for target in package["targets"]:
+        if "staticlib" in target["kind"]:
+            print("lib" + target["name"] + ".a")
+            raise SystemExit(0)
+    print("migo-capi declares no staticlib target", file=sys.stderr)
+    raise SystemExit(1)
+print("migo-capi is not in the workspace metadata", file=sys.stderr)
+raise SystemExit(1)
+CAPILIB
+    local status=$?
+    rm -f "$metadata"
+    return $status
+}
+
 read_deployment_target() {
     local platform="$1"
     python3 - "$CONTRACT" "$platform" <<'PY'
@@ -208,7 +249,7 @@ for tool in xcodebuild lipo cargo; do
 done
 [ "$missing" -eq 0 ] || exit 1
 
-for target in "${RUST_TARGETS[@]}"; do
+for target in ${RUST_TARGETS[@]+"${RUST_TARGETS[@]}"}; do
     if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
         err "Rust target not installed: $target"
         err "  rustup target add $target"
@@ -239,20 +280,57 @@ fi
 # cd into engine/ deliberately: rust-toolchain.toml and .cargo/config.toml are
 # both resolved from the working directory, so building with --manifest-path
 # from the repo root would silently use the machine's default toolchain.
+# Apple's clang, for the parts of the build that do not ask cc-rs.
+#
+# `engine/.cargo/config.toml` sets a bare `CC = "clang-18"` for the WSL/Ubuntu
+# host, and cargo's `[env]` reaches EVERY target. That file already knows this
+# and answers it with `CC_<target>` keys for Windows and Apple -- which works,
+# because cc-rs resolves the target-qualified name first. It works only for
+# cc-rs.
+#
+# skia-bindings does not go through cc-rs to pick the compiler for Skia itself:
+# it hands GN a compiler and GN runs ninja, and what it hands over is the plain
+# `CC`. So the first build that ever compiled Skia for an Apple target died 1429
+# steps into ninja with
+#
+#     clang-18 -isysroot .../iPhoneOS18.5.sdk --target=aarch64-apple-ios ...
+#     /bin/sh: clang-18: command not found
+#
+# Android does not have this problem because skia-bindings takes its compiler
+# from the NDK there, which is why a bare `CC` has been survivable for years.
+#
+# Exported rather than added to `[env]`: cargo's `[env]` has no per-target form
+# for the plain name, and a real environment variable beats a non-forcing
+# `[env]` entry. `${CC:-clang}` so a caller who deliberately set one keeps it.
+export CC="${CC:-clang}"
+export CXX="${CXX:-clang++}"
+info "C/C++ compiler      $CC / $CXX"
+
+CAPI_STATICLIB="$(read_capi_staticlib_name)" || exit 1
+info "cargo staticlib      $CAPI_STATICLIB (from cargo metadata)"
+
 cd "$ENGINE_DIR" || exit 1
 
-for target in "${RUST_TARGETS[@]}"; do
+for target in ${RUST_TARGETS[@]+"${RUST_TARGETS[@]}"}; do
     info "cargo build $target"
     case "$FLOOR_PLATFORM" in
         ios)   export IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" ;;
         macos) export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" ;;
     esac
+    # `${a[@]+"${a[@]}"}` and not `"${a[@]}"`: macOS ships bash 3.2 as /bin/bash,
+    # and there expanding an EMPTY array under `set -u` is an unbound-variable
+    # error rather than nothing. Both of these are empty on real invocations --
+    # `cargo_profile_flag` for a Debug build, `cargo_feature_flags` for the
+    # macos-v8 product -- so two of the three documented ways to call this script
+    # died here on the only OS that can run it. Nothing caught it because the
+    # script had never run at all, and on Linux's bash 5 the plain form is fine.
     if ! cargo build -p migo-capi --target "$target" --locked \
-        "${cargo_feature_flags[@]}" "${cargo_profile_flag[@]}"; then
+        ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} \
+        ${cargo_profile_flag[@]+"${cargo_profile_flag[@]}"}; then
         err "cargo build failed for $target"
         exit 1
     fi
-    cp "target/$target/$profile_dir/libmigo.a" "$STAGE/libs/libmigo-$target.a" || exit 1
+    cp "target/$target/$profile_dir/$CAPI_STATICLIB" "$STAGE/libs/libmigo-$target.a" || exit 1
 done
 
 # One archive per xcframework slice group. Device and simulator must stay

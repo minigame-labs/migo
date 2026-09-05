@@ -34,7 +34,12 @@ reqwest = { workspace = true }
 futures-util = "0.3"
 
 # Shared
-shared = { package = "migo-shared", path = "../shared", default-features = false }
+# `vfs` names the filesystem/package module and the `op_state` that holds its
+# handles; `codec` the text codecs. Both are `shared` defaults, and this crate
+# opts out of defaults, so they have to be asked for by name -- otherwise a
+# whole-workspace build unifies them in and a single-crate build does not,
+# which is the shape where one of the two is silently green.
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["vfs"] }
 tracing = { workspace = true }
 
 # Every platform except OpenHarmony reaches a device through cpal. OpenHarmony's

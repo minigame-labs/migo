@@ -8,21 +8,56 @@ edition = "2024"
 name = "shared"
 
 [features]
-default = ["v8-limits", "code-signing"]
-codec-gbk = ["dep:encoding_rs"]
+# `vfs` and `codec` are on by default because every host product wants them; the
+# one consumer that does not is the engine-free layer, and it already asks for
+# `default-features = false`.
+default = ["v8-limits", "code-signing", "vfs", "codec"]
+
+# The virtual filesystem, the `.mpkg` package format and the integrity checks.
+#
+# THE DRIFT THIS GATES is a build that could not happen at all. This module is the
+# sole owner of `zstd` -- a C library -- and of the hash suite behind it, and a C
+# library needs a compiler for the target. That made `migo-frame-decode`
+# impossible to cross-compile to `aarch64-apple-ios` from a machine with no Apple
+# SDK: `zstd-sys`'s build script shells out to `xcrun`, which does not exist on
+# Linux, so the whole Apple side of the engine-free layer could only ever be
+# checked on a Mac. A decoder that reads bytes produced by content JavaScript has
+# no reason to link an archive format, and `migo-frame-wire` next door already
+# states the rule this follows: every dependency inside a parser's reach is
+# another thing inside its trust boundary.
+#
+# `op_state` sits behind this feature too. It is not itself a filesystem -- it is
+# the host's operational state -- but it *holds* `VirtualFS`, `MountTable` and
+# `GamePaths` handles by value, so it cannot compile without them.
+vfs = [
+    "dep:zstd",
+    "dep:digest",
+    "dep:md-5",
+    "dep:sha1",
+    "dep:sha2",
+    "dep:crc32fast",
+    "dep:hex",
+]
+
+# Text and binary codecs (`base64`, hex, UTF-8 sniffing).
+codec = ["dep:base64", "dep:hex"]
+
+codec-gbk = ["codec", "dep:encoding_rs"]
 v8-limits = []
-code-signing = ["dep:ed25519-dalek"]
+# Signature verification lives in `vfs::integrity`, so asking for it asks for the
+# module that hosts it rather than silently compiling nothing.
+code-signing = ["vfs", "dep:ed25519-dalek"]
 # Hands the process-wide stats registry's lock to a cross-session contention gate in
 # another crate. Enabled only through `[dev-dependencies]`, so resolver 2 keeps it out
 # of every shipped build.
 contention-probe = []
 
 [dependencies]
-base64 = "0.22.1"
-hex = "0.4.3"
-digest = "0.10"
-md-5 = "0.10"
-sha1 = "0.10"
+base64 = { version = "0.22.1", optional = true }
+hex = { version = "0.4.3", optional = true }
+digest = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 bytemuck.workspace = true
 encoding_rs = { version = "0.8.35", optional = true }
@@ -31,10 +66,10 @@ serde_json.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 tracing = { workspace = true }
-sha2 = { version = "0.10" }
+sha2 = { version = "0.10", optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
-crc32fast = "1"
-zstd = { workspace = true }
+crc32fast = { version = "1", optional = true }
+zstd = { workspace = true, optional = true }
 bitflags = "2"
 lru = { workspace = true }
 smallvec = { workspace = true }

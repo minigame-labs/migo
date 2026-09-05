@@ -16,7 +16,12 @@ compress-brotli = ["dep:brotli"]
 [dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
-shared = { package = "migo-shared", path = "../shared", default-features = false }
+# `vfs` names the filesystem/package module and the `op_state` that holds its
+# handles; `codec` the text codecs. Both are `shared` defaults, and this crate
+# opts out of defaults, so they have to be asked for by name -- otherwise a
+# whole-workspace build unifies them in and a single-crate build does not,
+# which is the shape where one of the two is silently green.
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["vfs", "codec"] }
 serde_json.workspace = true
 parking_lot = "0.12.4"
 

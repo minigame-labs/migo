@@ -52,6 +52,11 @@ jobs:
         uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
+          # The iOS device target's standard library, on a Linux runner. It is
+          # what lets the engine-free closure gate below compile for a phone
+          # here rather than only on the macOS lane -- the gate treats a missing
+          # target as a failure, not a skip, so this is load-bearing.
+          targets: aarch64-apple-ios
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -402,6 +407,67 @@ jobs:
       # result cannot come from a detector that stopped working.
       - name: Apple Performance+ engine-free dependency closure
         run: bash scripts/test-apple-performance-rust-closure.sh
+
+      # The other Apple closure, and it asks a different question. The gate
+      # above asks what the Performance+ product links; this one asks whether
+      # the three engine-free crates can be compiled for an iPhone AT ALL from a
+      # machine with no Apple SDK.
+      #
+      # They could not, until `migo-shared`'s filesystem module became optional.
+      # `migo-frame-decode` wanted four types from that crate and inherited its
+      # whole capability set, including `zstd` -- a C library whose build script
+      # shells out to `xcrun`. So every Apple fact about the decoder was only
+      # obtainable on the macOS runner, and the failure named the reader's
+      # toolchain rather than the dependency that caused it.
+      #
+      # It also holds a package-count ceiling per crate. These are parsers for
+      # bytes produced by content JavaScript in another process, so a new
+      # dependency is a widening of a trust boundary and should be a decision
+      # somebody wrote down.
+      - name: Apple engine-free layer cross-compiles from Linux
+        run: bash scripts/test-apple-engine-free-closure.sh
+
+      # The Swift package that is the only Swift a compiler ever sees.
+      #
+      # It exists because `platforms/apple/Package.swift` declares a binary
+      # target for an xcframework built by an hour of Skia on a Mac, so until
+      # that artifact exists nothing in that package compiles -- and what sat in
+      # there uncompiled were the two files mirroring contracts/apple/*.json,
+      # whose own gates compare text and would agree perfectly with a file that
+      # does not build.
+      #
+      # Host-independent, so it runs here rather than only on the macOS lane:
+      # what it checks is that the package still declares no binary target and
+      # no dependencies, imports no engine module, and leaves no source
+      # directory that SwiftPM would silently not compile.
+      - name: Apple engine-free Swift package stays engine-free
+        run: bash scripts/test-apple-swift-core-engine-free.sh
+
+      # macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
+      # unbound-variable error rather than nothing. Linux's bash 5 expands it to
+      # nothing, so the entire class is invisible here and fatal there -- and
+      # `scripts/build-apple-sdk.sh` carried two instances of it, which meant two
+      # of its three documented invocations could never have worked on the only
+      # OS that can run it. Nobody knew because the script had never been run.
+      #
+      # Scope is derived from the workflows: whichever scripts a `macos-*` job
+      # invokes are the ones checked. A list kept in the gate would go stale the
+      # first time a step was added, and a stale scope reads like a clean result.
+      - name: macOS-facing scripts survive bash 3.2
+        run: bash scripts/test-macos-bash32-contract.sh
+
+      # The Apple product cannot be compiled on this runner -- it needs Skia built
+      # by an Apple SDK -- so the cheap way to notice it has drifted is to compare
+      # what Cargo RESOLVES for it against a target that is compiled here daily.
+      #
+      # The drift this catches spent the whole life of the external-frame product
+      # in the tree: `migo-core` calls `enable_io()`, tokio puts that behind
+      # `feature = "net"`, and `migo-core` never declared it. Linux and Android
+      # supplied it from `migo-shared`'s target-gated dependency, so the omission
+      # was invisible -- and iOS, which has neither that gate nor
+      # `migo-runtime-v8`, could never have compiled at all.
+      - name: Apple and Linux Performance+ products resolve alike
+        run: bash scripts/test-apple-product-feature-parity.sh
 
       # The same claim, asked of the bytes rather than the dependency graph.
       # A closure that resolves clean is necessary and not sufficient: what

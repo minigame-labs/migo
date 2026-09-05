@@ -63,7 +63,12 @@ api-commerce = ["embedded-v8", "runtime-v8?/api-commerce"]
 api-system = ["embedded-v8", "runtime-v8?/api-system"]
 
 [dependencies]
-shared = { package = "migo-shared", path = "../shared", default-features = false }
+# `vfs` names the filesystem/package module and the `op_state` that holds its
+# handles; `codec` the text codecs. Both are `shared` defaults, and this crate
+# opts out of defaults, so they have to be asked for by name -- otherwise a
+# whole-workspace build unifies them in and a single-crate build does not,
+# which is the shape where one of the two is silently green.
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["vfs"] }
 runtime-v8 = { package = "migo-runtime-v8", path = "../runtime-v8", default-features = false, optional = true }
 # The cross-process frame envelope. Reader only: no packet builder in a shipped
 # build, which is what `default-features = false` buys here.
@@ -83,7 +88,26 @@ futures = { workspace = true }
 # dependency declaration -- it is a property of whoever else happens to be in
 # the build -- and the external-frame product, which links no engine, is exactly
 # the build where the other crate is not there.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+#
+# `net` was the half of that fix nobody could see, and it took building for a
+# third platform to find it. `create_basic_runtime` calls `enable_io()` and
+# `max_io_events_per_tick()`, both of which tokio puts behind `cfg_io_driver!`
+# -- `feature = "net"`, per tokio's own src/macros/cfg.rs. When the paragraph
+# above was written, the features it named were the ones `migo-runtime-v8`
+# supplied; `net` was arriving from somewhere else entirely, `migo-shared`'s
+#
+#     [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+#
+# which is a legitimate declaration -- `raf_signal` really does use
+# `tokio::io::unix::AsyncFd` there. So on Linux and Android the external-frame
+# product compiled with no engine and still had an IO driver, and the missing
+# declaration here stayed invisible.
+#
+# iOS is the first target with neither: no `migo-runtime-v8`, and not one of
+# those two operating systems. The Apple Performance+ product -- the entire iOS
+# architecture -- could never have compiled, and the error named `enable_io` as
+# "private field, not a method", which reads like a tokio version problem.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -102,7 +126,7 @@ migo-contention-probe = { path = "../../testing/contention-probe", default-featu
 # Section 7.3's contention gate holds the stats registry's lock, which is private to
 # `shared`. Requested here rather than in `[dependencies]` so resolver 2 leaves the
 # accessor out of the cdylib.
-shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["contention-probe"] }
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["contention-probe", "vfs"] }
 
 # On non-Android platforms, enable Rust-native implementations:
 # - zip-extract: Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
@@ -110,4 +134,4 @@ shared = { package = "migo-shared", path = "../shared", default-features = false
 # - rust-image-decode: image/zune-image decoders (Android uses BitmapFactory via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]
 migo-io = { path = "../io", default-features = false, features = ["zip-extract", "rust-image-decode"] }
-shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["codec-gbk"] }
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["codec-gbk", "vfs"] }

@@ -27,6 +27,14 @@ let package = Package(
         .library(name: "MigoApplePerformancePlus", targets: ["MigoApplePerformancePlus"]),
         .library(name: "MigoMacV8", targets: ["MigoMacV8"]),
     ],
+    // The engine-free half, split out so it can be compiled and tested without
+    // the xcframework below. See core/Package.swift for why that mattered: with
+    // one package, a missing build output meant no Swift here was ever compiled
+    // at all. Path dependency rather than a duplicated target -- two copies of
+    // the deployment floors is the drift the floor contract exists to catch.
+    dependencies: [
+        .package(path: "core"),
+    ],
     targets: [
         // The engine, built by scripts/build-apple-sdk.sh.
         //
@@ -40,17 +48,17 @@ let package = Package(
         // `swift build` fails here until the script has run once; that is the
         // intended failure -- the alternative is unsafeFlags, which SwiftPM
         // answers by refusing to let anyone depend on this package.
+        //
+        // No target names it yet: the lane sources are still placeholders and
+        // none of them calls the C ABI. That is a statement about today, not a
+        // plan -- MigoAppleRenderer hands surfaces to the engine and
+        // MigoApplePerformancePlus drives sessions, so both acquire it as soon
+        // as they do anything. It stays declared because deleting and
+        // reinstating the shipping wiring around each milestone is how the
+        // wiring gets reinstated wrongly.
         .binaryTarget(
             name: "MigoEngine",
             path: "Frameworks/MigoEngine.xcframework"
-        ),
-
-        // Shared, engine-agnostic host services: profile resolution, lifecycle,
-        // permissions, metrics. Nothing here knows which lane will be selected.
-        .target(
-            name: "MigoAppleCore",
-            dependencies: ["MigoEngine"],
-            path: "Sources/MigoAppleCore"
         ),
 
         // Internal. CAMetalLayer ownership, surface attach/update/retire, and
@@ -58,7 +66,7 @@ let package = Package(
         // a supported thing to depend on directly.
         .target(
             name: "MigoAppleRenderer",
-            dependencies: ["MigoAppleCore"],
+            dependencies: [.product(name: "MigoAppleCore", package: "core")],
             path: "Sources/MigoAppleRenderer"
         ),
 
@@ -68,7 +76,7 @@ let package = Package(
         // ANGLE and Skia into an app that asked for the opposite.
         .target(
             name: "MigoAppleWebKit",
-            dependencies: ["MigoAppleCore"],
+            dependencies: [.product(name: "MigoAppleCore", package: "core")],
             path: "Sources/MigoAppleWebKit"
         ),
 
@@ -77,7 +85,7 @@ let package = Package(
         // host shape from the ProbeApp evidence.
         .target(
             name: "MigoApplePerformancePlus",
-            dependencies: ["MigoAppleCore", "MigoAppleRenderer", "MigoAppleWebKit"],
+            dependencies: [.product(name: "MigoAppleCore", package: "core"), "MigoAppleRenderer", "MigoAppleWebKit"],
             path: "Sources/MigoApplePerformancePlus",
             // Generated, not authored here. The producer's source lives in
             // platforms/apple/WebContent/PerformancePlus so it can be bundled
@@ -91,14 +99,8 @@ let package = Package(
         // Lane 3: macOS only. In-process V8 with JIT; no second process.
         .target(
             name: "MigoMacV8",
-            dependencies: ["MigoAppleCore", "MigoAppleRenderer"],
+            dependencies: [.product(name: "MigoAppleCore", package: "core"), "MigoAppleRenderer"],
             path: "Sources/MigoMacV8"
-        ),
-
-        .testTarget(
-            name: "MigoAppleCoreTests",
-            dependencies: ["MigoAppleCore"],
-            path: "Tests/MigoAppleCoreTests"
         ),
     ]
 )

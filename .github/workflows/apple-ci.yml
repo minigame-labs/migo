@@ -17,6 +17,15 @@ name: Apple Toolchain
 # unexamined -- until a Mac arrives, which on the current plan is weeks away.
 # This lane makes the compiler answer now instead.
 #
+# Since this lane was written it has acquired a second half. `platforms/apple`
+# declares a `.binaryTarget` for an xcframework that scripts/build-apple-sdk.sh
+# produces, so that package does not resolve until an hour of Skia has run --
+# which meant no Swift in this repository had ever been compiled, including the
+# two files that mirror contracts/apple/*.json and whose gates compare only
+# their text. The engine-free Swift now lives in `platforms/apple/core`, a
+# package with no binary target and no dependencies, and it is built and tested
+# here in seconds.
+#
 # Scope is deliberately the engine-free layer and not the whole product.
 # `migo-capi --features external-frames` cannot build here yet for a reason
 # that has nothing to do with Apple: skia-bindings compiles Skia from source
@@ -119,3 +128,29 @@ jobs:
           -p migo-frame-wire
           -p migo-frame-decode
           -p migo-capi-abi
+
+      # The Swift half, and the first time any Swift here meets a compiler.
+      #
+      # `swift test` and not just `swift build`: MigoAppleCoreTests asserts the
+      # relationship between the deployment floor and the Performance+ lane
+      # minimum, which is the one thing the text-comparing floor contract
+      # cannot check -- it verifies each number against the contract and has no
+      # way to run the comparison between them.
+      - name: Build and test the engine-free Swift package on Apple silicon
+        working-directory: platforms/apple/core
+        run: |
+          swift --version
+          swift build
+          swift test
+
+      # The same sources, compiled for the platform the floor is about. `swift
+      # build` above ran natively on macOS; a deployment floor of iOS 15 is a
+      # statement about a system this step is the only one to ask.
+      - name: Compile the engine-free Swift package for iOS
+        working-directory: platforms/apple/core
+        run: >-
+          xcodebuild build
+          -scheme MigoAppleCore
+          -destination 'generic/platform=iOS'
+          -skipPackagePluginValidation
+          CODE_SIGNING_ALLOWED=NO

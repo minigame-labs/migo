@@ -91,6 +91,7 @@ resolve() {
         --features "$features" \
         -e normal \
         --prefix none \
+        --color never \
         --format '{p}' 2>&1)
 }
 
@@ -108,7 +109,7 @@ violations_in() {
     local tree="$1" package banned
     while read -r package; do
         [[ -n "$package" ]] || continue
-        for banned in "${FORBIDDEN[@]}"; do
+        for banned in ${FORBIDDEN[@]+"${FORBIDDEN[@]}"}; do
             [[ "$package" == "$banned" ]] && echo "$package"
         done
     done < <(printf '%s\n' "$tree" | awk 'NF {print $1}' | sort -u)
@@ -118,7 +119,24 @@ package_count() {
     printf '%s\n' "$1" | awk 'NF {print $1}' | sort -u | wc -l
 }
 
-for target in "${CLEAN_CLOSURES[@]}"; do
+# Read a command's lines into a named array, without `mapfile`.
+#
+# That builtin arrived in bash 4.0 and macOS ships 3.2 -- it has since 2007, for
+# licensing reasons, and GitHub's macOS images are no different. This gate did
+# not run there until there was an Apple archive to audit, and its first run on
+# the macOS lane died with `command not found`, exit 127. The workflow reported
+# that as a failed gate; it was a gate that could not run at all.
+collect_lines() {
+    local __target="$1"; shift
+    local __line
+    eval "$__target=()"
+    while IFS= read -r __line; do
+        [ -n "$__line" ] || continue
+        eval "$__target+=(\"\$__line\")"
+    done
+}
+
+for target in ${CLEAN_CLOSURES[@]+"${CLEAN_CLOSURES[@]}"}; do
     if ! tree="$(resolve "$target")"; then
         problems+=("cargo tree could not resolve $target:
 $(printf '%s\n' "$tree" | sed 's/^/      /')")
@@ -129,8 +147,8 @@ $(printf '%s\n' "$tree" | sed 's/^/      /')")
     if (( count < 20 )); then
         problems+=("$target resolved only $count packages; an almost-empty closure is not a clean one")
     fi
-    mapfile -t found < <(violations_in "$tree")
-    for banned in "${found[@]}"; do
+    collect_lines found < <(violations_in "$tree")
+    for banned in ${found[@]+"${found[@]}"}; do
         [[ -n "$banned" ]] || continue
         why="$(cd engine && cargo tree \
             -p "${target%%:*}" --no-default-features \
@@ -149,11 +167,11 @@ if ! control_tree="$(resolve "$POSITIVE_CONTROL")"; then
     problems+=("the positive control $POSITIVE_CONTROL does not resolve, so the detector is unverified:
 $(printf '%s\n' "$control_tree" | sed 's/^/      /')")
 else
-    mapfile -t detected < <(violations_in "$control_tree")
+    collect_lines detected < <(violations_in "$control_tree")
     missing=()
-    for expected in "${POSITIVE_CONTROL_EXPECTS[@]}"; do
+    for expected in ${POSITIVE_CONTROL_EXPECTS[@]+"${POSITIVE_CONTROL_EXPECTS[@]}"}; do
         found_one=no
-        for package in "${detected[@]}"; do
+        for package in ${detected[@]+"${detected[@]}"}; do
             [[ "$package" == "$expected" ]] && { found_one=yes; break; }
         done
         [[ "$found_one" == yes ]] || missing+=("$expected")
@@ -252,13 +270,13 @@ else
 fi
 
 printf '\n'
-for note in "${notes[@]}"; do echo "  - $note"; done
+for note in ${notes[@]+"${notes[@]}"}; do echo "  - $note"; done
 printf '\n'
 
 if (( ${#problems[@]} > 0 )); then
     echo "FAIL: the Performance+ product is not free of an embedded JavaScript engine." >&2
     printf '\n' >&2
-    for problem in "${problems[@]}"; do echo "  * $problem" >&2; done
+    for problem in ${problems[@]+"${problems[@]}"}; do echo "  * $problem" >&2; done
     printf '\n' >&2
     cat >&2 <<'WHY'
   Why this matters: MigoApplePerformancePlus exists because content JavaScript
