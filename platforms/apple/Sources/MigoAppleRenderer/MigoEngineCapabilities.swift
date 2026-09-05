@@ -159,10 +159,28 @@ extension MigoEngineCapabilities {
     }
 
     /// The whole precondition of `migo_session_attach_surface`, evaluated
-    /// before there is a session or a layer to attach.
+    /// before there is a session or a layer to attach, against what this
+    /// renderer itself requires.
+    public func preflight() -> MigoRendererPreflight {
+        preflight(hostRequires: MIGO_ABI_VERSION_CURRENT, surfaceKind: Self.hostSurfaceKind)
+    }
+
+    /// The same decision against requirements the caller states.
+    ///
+    /// An overload and not a pair of default arguments, which is what this
+    /// obviously wants to be. A default argument is part of the module
+    /// interface -- it is serialized so it can be materialized in a caller that
+    /// may be in another module -- and it is therefore type-checked in the
+    /// module-interface pass, where the imported C module's declarations are
+    /// not in scope. `MIGO_ABI_VERSION_CURRENT` as a default value is
+    /// `cannot find 'MIGO_ABI_VERSION_CURRENT' in scope` at that line and
+    /// nowhere else in this file, which is a confusing enough error to be worth
+    /// a comment rather than a rediscovery. The alternative -- re-exporting the
+    /// C module so a client can see it -- would put the entire C ABI into this
+    /// target's public interface to make one constant reachable.
     public func preflight(
-        hostRequires abiVersion: UInt32 = MIGO_ABI_VERSION_CURRENT,
-        surfaceKind: UInt32 = MigoEngineCapabilities.hostSurfaceKind
+        hostRequires abiVersion: UInt32,
+        surfaceKind: UInt32
     ) -> MigoRendererPreflight {
         guard accepts(abiVersion: abiVersion) else {
             return .abiVersionNotAccepted(

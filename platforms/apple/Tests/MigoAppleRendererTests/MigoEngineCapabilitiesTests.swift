@@ -146,6 +146,37 @@ final class MigoEngineCapabilitiesTests: XCTestCase {
         )
     }
 
+    /// The explicit overload decides against requirements the caller states,
+    /// and the no-argument one against this renderer's own. One mask, two
+    /// questions, two answers -- which is the whole reason a host that wants to
+    /// know about a kind it is not presenting into can ask.
+    func testPreflightAnswersForARequirementTheCallerStates() {
+        // A kind this renderer never passes: the view descriptor, the
+        // convenience path where the host gives up layer ownership. Named by
+        // its constant rather than derived from `hostSurfaceKind` -- the two
+        // happen to be adjacent numbers, and arithmetic on that would be a test
+        // that passes for a reason the header never promised.
+        #if os(iOS)
+            let otherKind = MIGO_PLATFORM_IOS_UI_VIEW
+        #else
+            let otherKind = MIGO_PLATFORM_MACOS_NS_VIEW
+        #endif
+        let capabilities = MigoEngineCapabilities(
+            acceptedABIVersionMin: MIGO_ABI_VERSION_CURRENT,
+            acceptedABIVersionMax: MIGO_ABI_VERSION_CURRENT,
+            attachableSurfaceKinds: 1 << UInt64(otherKind)
+        )
+
+        XCTAssertEqual(
+            capabilities.preflight(hostRequires: MIGO_ABI_VERSION_CURRENT, surfaceKind: otherKind),
+            .ready
+        )
+        XCTAssertEqual(
+            capabilities.preflight(),
+            .surfaceKindNotAttachable(kind: MigoEngineCapabilities.hostSurfaceKind)
+        )
+    }
+
     // MARK: - The mask
 
     /// A kind outside the mask's width is unsupported by definition, and the
