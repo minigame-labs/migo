@@ -357,6 +357,22 @@ jobs:
       - name: JNI outbound signature contract
         run: bash scripts/test-jni-outbound-signature-contract.sh
 
+      # The inbound half of the same boundary, and the same reason a compiler
+      # cannot help: `platform/src/android/jni/**` is `cfg(target_os =
+      # "android")`, so nothing in it is executed by any test on any machine here.
+      #
+      # Its field readers return a Result carrying the field name and the reason,
+      # and every caller used to write `.unwrap_or(default)`. For a Java
+      # primitive or enum that is never right -- those fields always have a
+      # value, so a failed read means the field is not on the class this code
+      # names, which is a host built against a different SDK. Defaulted silently,
+      # a version mismatch looks exactly like a host that chose the default: a
+      # host calling setLogLevel(INFO) could be read as WARN with nothing in the
+      # log to say so, which is how the engine's own boundary counter came to
+      # have never been observed working on a device.
+      - name: JNI silent default contract
+        run: bash scripts/test-jni-silent-default-contract.sh
+
       # The OpenHarmony API floor gate compares imports against a sysroot newer
       # than the floor. Choosing the wrong one does not fail -- it produces a
       # confident pass computed against the wrong symbol set, which is the shape

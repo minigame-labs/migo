@@ -93,14 +93,52 @@ pub(crate) fn get_bool(env: &mut JNIEnv, field_name: &str, obj: &JObject) -> Res
         .map_err(|e| format!("Failed to convert field '{field_name}' to bool: {e}"))
 }
 
-/// Get the ordinal value of an enum field.
-/// This calls the ordinal() method on the enum object.
+/// A field whose read cannot fail because the host left it unset.
+///
+/// THE DRIFT THIS EXISTS TO CATCH shipped and stayed invisible. Every reader
+/// below returns a `Result` carrying the field name and the reason, and every
+/// caller wrote `.unwrap_or(some_default)` — which is correct-looking and
+/// throws the reason away. But a Java `int`, `boolean`, `float` or enum
+/// reference *always has a value*, so `get_field` cannot fail because the host
+/// declined to set one. It fails when the field is not on the class this code
+/// names: a host built against a different SDK than the library it loaded.
+///
+/// Absorbed into a default, that is indistinguishable from a host that chose
+/// the default. `RuntimeConfig.logLevel` could be set to INFO by a host and read
+/// as WARN by the engine, and the only evidence either way was the absence of
+/// logs the host had asked for — which is also what a working INFO run looks
+/// like before the first frame.
+///
+/// `warn!` and not `info!`: the release default level is WARN, so this is
+/// audible in exactly the builds where the mismatch would otherwise be silent.
+pub(crate) fn or_default<T>(read: Result<T, String>, fallback: T) -> T {
+    match read {
+        Ok(value) => value,
+        Err(reason) => {
+            tracing::warn!(
+                "{reason}. A primitive field always has a value, so this is a \
+                 Java/native mismatch rather than an unset option: the host's \
+                 value for it is not in effect and the built-in default is."
+            );
+            fallback
+        }
+    }
+}
+
+/// The ordinal of an enum field, or `None` when the field is null.
+///
+/// Three outcomes and not two, because the third used to be a decision hidden
+/// in here: a null field returned `Ok(0)`, described as "default to first enum
+/// value". The first variant is a different thing for every enum — for
+/// `RuntimeConfig.LogLevel` it is `Trace`, the most verbose level there is,
+/// which is a surprising answer to a field nobody set. Which default is right
+/// belongs to the caller that knows what the field means.
 pub(crate) fn get_enum_ordinal(
     env: &mut JNIEnv,
     field_name: &str,
     field_sig: &str,
     obj: &JObject,
-) -> Result<i32, String> {
+) -> Result<Option<i32>, String> {
     let val = match env.get_field(obj, field_name, field_sig) {
         Ok(v) => v,
         Err(e) => {
@@ -114,7 +152,7 @@ pub(crate) fn get_enum_ordinal(
         .map_err(|e| format!("Enum field '{field_name}' is not an object: {e}"))?;
 
     if enum_obj.is_null() {
-        return Ok(0); // Default to first enum value
+        return Ok(None);
     }
 
     let ordinal = match env.call_method(&enum_obj, "ordinal", "()I", &[]) {
@@ -127,5 +165,6 @@ pub(crate) fn get_enum_ordinal(
 
     ordinal
         .i()
+        .map(Some)
         .map_err(|e| format!("Failed to get ordinal value for '{field_name}': {e}"))
 }
