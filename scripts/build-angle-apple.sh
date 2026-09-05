@@ -354,7 +354,7 @@ check_ready() {
             done
             ;;
         build)
-            for tool in gn ninja lipo xcrun; do
+            for tool in gn ninja lipo xcrun patch; do
                 command -v "$tool" >/dev/null 2>&1 || { err "not on PATH: $tool"; failures=$((failures + 1)); }
             done
             ;;
@@ -592,12 +592,47 @@ locate_product() {
 # we meant to apply the patch, applies it, and exits 0 -- so an unapplied patch
 # would be indistinguishable from an applied one. `--fuzz=0` stops loose context
 # matching from calling a hunk reversible against code it does not match.
+# `patch(1)` DISAGREES WITH ITSELF ACROSS PLATFORMS, and this script runs on the
+# one that differs. GNU patch -- every Linux machine here, and git-bash on
+# Windows -- spells a dry run `--dry-run` and has no `-C`. BSD patch, which is
+# what macOS ships, spells it `-C` and has no `--dry-run`. There is no common
+# spelling, so the tool is asked rather than guessed; this is the same family as
+# macOS having no `timeout(1)`, which cost the probe lane a run to discover.
+#
+# `--no-backup-if-mismatch` is GNU-only as well, and on BSD it is not needed:
+# BSD patch writes a backup only when asked with `-b`, while GNU writes a
+# `.orig` beside any file whose hunks applied at an offset. So it is passed
+# where it exists and omitted where it does not, rather than emulated.
+#
+# The probe is `patch <option> --version`, which discriminates: an unrecognised
+# option makes patch fail before it prints anything. Verified against a nonsense
+# option so that "accepted" is not simply what this probe always says.
+patch_capability() {
+    if patch "$1" --version >/dev/null 2>&1; then
+        printf '%s' "$1"
+    fi
+}
+
+PATCH_DRY_RUN="$(patch_capability --dry-run)"
+[ -n "$PATCH_DRY_RUN" ] || PATCH_DRY_RUN="$(patch_capability -C)"
+PATCH_NO_BACKUP="$(patch_capability --no-backup-if-mismatch)"
+if [ -z "$PATCH_DRY_RUN" ]; then
+    err "this patch(1) accepts neither --dry-run nor -C, so a patch cannot be"
+    err "checked before it is written. Refusing to modify the checkout blind."
+    exit 1
+fi
+# Printed rather than merely used, because which patch macOS actually ships is a
+# fact this project did not have and will want the next time something differs.
+info "patch(1)  $(patch --version 2>/dev/null | head -1) [dry-run=$PATCH_DRY_RUN backup-flag=${PATCH_NO_BACKUP:-none}]"
+
+# Short forms for the rest -- `-t` batch, `-N` forward, `-R` reverse, `-F 0`
+# fuzz -- because those four ARE common to both implementations.
 apply_one_patch() {
     tree="$1"
     patch_file="$2"
     name="$(basename "$patch_file")"
 
-    if patch -p1 -d "$tree" --batch --dry-run --reverse --forward --fuzz=0 \
+    if patch -p1 -d "$tree" -t -N -R -F 0 $PATCH_DRY_RUN \
             < "$patch_file" >/dev/null 2>&1; then
         info "  = already in effect: $name"
         return 0
@@ -607,16 +642,16 @@ apply_one_patch() {
     # one is already applied, patch writes the earlier hunk, skips the later one
     # and exits non-zero -- leaving the tree more modified than it found it, and
     # the next run starting from that new state.
-    if ! patch -p1 -d "$tree" --batch --dry-run --forward --fuzz=0 \
+    if ! patch -p1 -d "$tree" -t -N -F 0 $PATCH_DRY_RUN \
             < "$patch_file" >/dev/null 2>&1; then
         err "$name neither applies cleanly nor is already applied"
         err "the checkout is partly patched or has drifted; leaving it untouched"
         return 1
     fi
-    # `--no-backup-if-mismatch`: GNU patch writes a `.orig` beside any file whose
-    # hunks applied at an offset, and a stray `.orig` inside the source tree is a
-    # file the next `gclient sync` has an opinion about.
-    if ! patch -p1 -d "$tree" --batch --forward --fuzz=0 --no-backup-if-mismatch \
+    # A stray `.orig` inside the source tree is a file the next `gclient sync`
+    # has an opinion about, which is what $PATCH_NO_BACKUP suppresses where the
+    # implementation can create one at all.
+    if ! patch -p1 -d "$tree" -t -N -F 0 $PATCH_NO_BACKUP \
             < "$patch_file" >/dev/null 2>&1; then
         err "$name failed to apply after its own dry run succeeded"
         return 1
