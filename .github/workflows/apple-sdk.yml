@@ -184,19 +184,28 @@ jobs:
       # printed here whether or not the link below succeeds -- when it fails,
       # the answer is already in the log next to the failure.
       #
+      # Every leg, not just the one that links. The lists differ by platform and
+      # the difference is the interesting part: macOS answers `-framework
+      # OpenGL`, the legacy desktop GL framework, which has no iOS counterpart --
+      # the measured form of why the Apple renderer needs ANGLE-Metal rather
+      # than a system GL.
+      #
       # `--target` and not a host build: cargo keeps `--target <host>` and no
-      # `--target` in different directories, so omitting it would compile Skia a
-      # third time for bytes identical to the ones the step above already built.
+      # `--target` in different directories, so omitting it would compile Skia
+      # again for bytes the step above already built. The first target of the
+      # leg, because the slices of one leg share a link line.
       #
       # `continue-on-error` because this step reports, it does not decide. The
-      # question that matters is the link below, and a failure to produce a
-      # convenience listing must not be what stops the lane from answering it.
+      # question that matters is whether the tests link and run, and a failure
+      # to produce a convenience listing must not be what stops the lane from
+      # answering it.
       - name: Record what a C consumer must link alongside the archive
-        if: matrix.host_slice
         continue-on-error: true
         working-directory: engine
+        env:
+          LEG_TARGETS: ${{ matrix.targets }}
         run: >-
-          cargo rustc -p migo-capi --locked --target aarch64-apple-darwin
+          cargo rustc -p migo-capi --locked --target "${LEG_TARGETS%%,*}"
           --no-default-features --features external-frames
           -- --print native-static-libs
 
@@ -214,6 +223,74 @@ jobs:
         run: |
           swift build
           swift test
+
+      # The same assertions, on the platform they are actually about.
+      #
+      # `swift test` above runs them on macOS, where `#if os(iOS)` is false. So
+      # the iOS arm of `MigoEngineCapabilities.hostSurfaceKind` -- and every
+      # assertion that reads it -- has been compiled for iOS and never executed
+      # on it. This repository has been bitten by precisely that before, and
+      # apple-ci.yml's header records it: the ILP32 assertions in the C ABI lane
+      # were written, compiled once, and two of them were wrong about pointer
+      # width the moment anything ran them. Writing a platform arm twice is not
+      # testing it twice.
+      #
+      # It is also the first time the simulator slices are loaded rather than
+      # merely linked: the `lipo` output this leg produces is what an app would
+      # embed, and nothing had ever asked dyld to accept it.
+      #
+      # The simulator is chosen, not named. A hardcoded `name=iPhone 16` is one
+      # runner-image bump away from failing for a reason that has nothing to do
+      # with this repository, so the destination is the udid of whichever iPhone
+      # runtime the image actually carries, newest first. If it carries none,
+      # that is a fact about the image and the step says so.
+      #
+      # `Migo-Package` and not a product scheme: `xcodebuild -list` on this
+      # package reports Migo-Package, MigoApplePerformancePlus, MigoAppleWebKit
+      # and MigoMacV8, and only the first contains the test target. There is no
+      # MigoAppleRenderer scheme -- it is a target, not a product.
+      - name: The ABI tests run on iOS
+        if: matrix.platform == 'ios-simulator'
+        working-directory: platforms/apple
+        run: |
+          set -euo pipefail
+          udid="$(xcrun simctl list devices available --json | python3 -c '
+          import json, re, sys
+
+          runtimes = json.load(sys.stdin)["devices"]
+
+          # Sort key from com.apple.CoreSimulator.SimRuntime.iOS-18-5. Parsed
+          # rather than compared as text: iOS-9-0 sorts after iOS-18-5
+          # lexicographically, which would pick the oldest runtime on an image
+          # carrying both.
+          def version(identifier):
+              digits = re.findall(r"\d+", identifier.rsplit(".", 1)[-1])
+              return tuple(int(d) for d in digits)
+
+          best = None
+          for identifier, devices in runtimes.items():
+              if ".SimRuntime.iOS-" not in identifier:
+                  continue
+              for device in devices:
+                  if not device.get("isAvailable"):
+                      continue
+                  if not device.get("name", "").startswith("iPhone"):
+                      continue
+                  key = (version(identifier), device["name"])
+                  if best is None or key > best[0]:
+                      best = (key, device["udid"], identifier, device["name"])
+
+          if best is None:
+              sys.exit("this runner image carries no available iPhone simulator")
+
+          sys.stderr.write("selected " + best[3] + " on " + best[2] + "\n")
+          print(best[1])
+          ')"
+          xcodebuild test \
+            -scheme Migo-Package \
+            -destination "platform=iOS Simulator,id=$udid" \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
 
       # The half of the deployment-floor contract that reads the product rather
       # than the declaration -- and the half its own header calls the one that
