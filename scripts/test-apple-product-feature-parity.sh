@@ -58,7 +58,25 @@ REFERENCE_TARGET="x86_64-unknown-linux-gnu"
 # expansion of the VALUE and dies with `invalid variable name`. That silently
 # skipped the stale-exemption check when it was written that way, which the
 # injection test caught only because the check failed to fire.
-EXEMPT=()
+EXEMPT=(
+    # skia-bindings compiles its jpeg/pdf/pathops C++ wrappers unconditionally,
+    # while Skia builds pathops only as a dependency of optional("pdf"). With pdf
+    # off, those wrappers reference symbols that do not exist. GNU ld drops the
+    # referencing sections with --gc-sections before it has to resolve anything,
+    # which is why the reference target has never needed this; ld64's
+    # -dead_strip and MSVC's /OPT:REF both run after resolution and cannot.
+    #
+    # Not a hypothetical on Apple. The first executable ever to link libmigo.a --
+    # the XCTest bundle in .github/workflows/apple-sdk.yml -- reported seventeen
+    # undefined SkPathOps, SkJpeg and SkPDF symbols. Every Apple compile step had
+    # passed, because compiling a library does not link one. So this difference
+    # is what makes an Apple product linkable at all, and its cost is the PDF and
+    # JPEG codecs' code size, which Android and OpenHarmony do not pay: their
+    # hosts link libmigo_capi.a into a shared object, where undefined symbols are
+    # resolved at load time and tolerated at link time.
+    "skia-safe=pdf, so Skia builds the pathops its always-compiled wrappers reference; ld64 cannot hide them the way GNU ld does"
+    "skia-bindings=jpeg/jpeg-decode/jpeg-encode/pdf arrive with skia-safe's pdf feature above, which is what supplies SkJpeg* and SkPDF* to the linker"
+)
 
 problems=()
 notes=()
