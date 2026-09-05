@@ -211,6 +211,63 @@ print(f"C ABI export parity: {len(declared)} entry points agree")
 PY
 }
 
+# Every constant these headers declare must be nameable from Swift.
+#
+# THE DRIFT THIS EXISTS TO CATCH was the whole constant surface, silently, for
+# the entire life of these headers. They were written with the conventional
+# `UINT32_C(5)` spelling, which is correct C and correct C++ and which Swift's
+# Clang importer refuses:
+#
+#     note: macro 'MIGO_PLATFORM_MACOS_CA_METAL_LAYER' unavailable:
+#           structure not supported
+#
+# The importer reads a macro's definition tokens rather than its expansion, and
+# a function-like macro invocation is a structure it declines. So all 103
+# constants -- platform kinds, flags, error codes, and MIGO_ABI_VERSION_CURRENT,
+# which every caller must write into every record it passes -- were unnameable
+# from Swift. A Swift host could link the library and could not name one value
+# to call it with, so the only way to write one was to transcribe the numbers.
+#
+# Nothing noticed because no Swift had ever been compiled against these headers.
+# The first target that was, platforms/apple/Sources/MigoAppleRenderer, found it
+# on its first build.
+#
+# The rule is deliberately narrow -- the `*_C()` integer-constant family, not
+# "any call in a macro body" -- because the broad form flags MIGO_API's
+# `__attribute__((visibility("default")))` and every other legitimate one, and a
+# gate that reports things nobody will act on is a gate that grows an exemption
+# list.
+check_constant_spelling() {
+    local bad_form='(U?INT(8|16|32|64|MAX|PTR)_C)\('
+
+    # The control. After the conversion there are zero real instances, so a
+    # detector that had stopped matching would report a clean surface forever.
+    if ! printf '#define X UINT32_C(5)\n' | grep -qE "$bad_form"; then
+        echo "FAIL: the constant-spelling detector does not match a known-bad line;" >&2
+        echo "      its clean result for the headers therefore means nothing." >&2
+        exit 1
+    fi
+
+    local hits
+    hits="$(grep -rnE "^#define [A-Za-z_][A-Za-z0-9_]*[[:space:]].*$bad_form" \
+        "$INCLUDE_DIR/migo" || true)"
+    if [ -n "$hits" ]; then
+        echo "FAIL: a public constant is spelled with a function-like macro:" >&2
+        printf '%s\n' "$hits" >&2
+        cat >&2 <<'WHY'
+
+  Swift's Clang importer reads a macro's definition tokens, not its expansion,
+  and declines a function-like macro invocation -- so a constant written this
+  way cannot be named from Swift at all. Write a suffixed literal instead
+  (`5U`, `(1U << 0)`); it is what UINT32_C expands to on every target this
+  project builds for, and unlike a cast it still works in `#if`. The reason is
+  recorded on MIGO_ABI_VERSION_1 in include/migo/types.h.
+WHY
+        exit 1
+    fi
+    echo "  - every public constant is a suffixed literal, nameable from Swift"
+}
+
 check_repository_integration() {
     require_regex "$ROOT/.github/workflows/pr-ci.yml" \
         '^[[:space:]]+bash scripts/test-c-abi-surface-candidate\.sh$' \
@@ -263,6 +320,9 @@ case "$MODE" in
     --parity)
         check_export_parity
         ;;
+    --spelling)
+        check_constant_spelling
+        ;;
     --ilp32)
         compile_ilp32
         ;;
@@ -270,11 +330,12 @@ case "$MODE" in
         compile_core
         compile_platforms
         compile_ilp32
+        check_constant_spelling
         check_export_parity
         check_repository_integration
         ;;
     *)
-        echo "usage: $0 [--core|--platforms|--ilp32|--parity|--all]" >&2
+        echo "usage: $0 [--core|--platforms|--ilp32|--parity|--spelling|--all]" >&2
         exit 2
         ;;
 esac

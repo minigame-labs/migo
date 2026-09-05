@@ -49,13 +49,14 @@ let package = Package(
         // intended failure -- the alternative is unsafeFlags, which SwiftPM
         // answers by refusing to let anyone depend on this package.
         //
-        // No target names it yet: the lane sources are still placeholders and
-        // none of them calls the C ABI. That is a statement about today, not a
-        // plan -- MigoAppleRenderer hands surfaces to the engine and
-        // MigoApplePerformancePlus drives sessions, so both acquire it as soon
-        // as they do anything. It stays declared because deleting and
-        // reinstating the shipping wiring around each milestone is how the
-        // wiring gets reinstated wrongly.
+        // MigoAppleRenderer names it. That matters beyond the renderer: while
+        // no target depended on this binary target, SwiftPM never had to find a
+        // slice for the platform being built, so `swift build` succeeded on an
+        // xcframework containing only iOS and said nothing about it. The lane
+        // that builds this package was therefore green without checking the
+        // artifact it exists to check. scripts/test-apple-shipping-package-contract.sh
+        // keeps at least one target depending on it, because losing that
+        // property costs nothing at the time and silently un-checks the lane.
         .binaryTarget(
             name: "MigoEngine",
             path: "Frameworks/MigoEngine.xcframework"
@@ -66,8 +67,21 @@ let package = Package(
         // a supported thing to depend on directly.
         .target(
             name: "MigoAppleRenderer",
-            dependencies: [.product(name: "MigoAppleCore", package: "core")],
+            dependencies: [.product(name: "MigoAppleCore", package: "core"), "MigoEngine"],
             path: "Sources/MigoAppleRenderer"
+        ),
+
+        // Runs only where the xcframework has a slice for the host, which is
+        // the macOS build. That is not a gap: the assertions are about the ABI
+        // -- record sizes, a fail-closed write, a bitmask -- and the arm64
+        // macOS slice and the arm64 iOS slice are the same Rust compiled for
+        // the same architecture. What the iOS slice needs proved about it is
+        // that it compiles and links for iOS, which is what the iOS legs of
+        // .github/workflows/apple-sdk.yml do with xcodebuild.
+        .testTarget(
+            name: "MigoAppleRendererTests",
+            dependencies: ["MigoAppleRenderer", "MigoEngine"],
+            path: "Tests/MigoAppleRendererTests"
         ),
 
         // Lane 1: the compatibility and safety baseline. WKWebView runs the

@@ -183,13 +183,22 @@ fn every_wire_error_code_is_non_zero_and_distinct_from_the_ingress_range() {
 // other rather than each against a reviewer's memory.
 // ---------------------------------------------------------------------------
 
-/// `#define NAME UINT32_C(n)` lines in the public header.
+/// `#define NAME <n>U` lines in the public header.
 ///
 /// Parsed rather than restated. Three copies of these numbers exist -- the
 /// header a Swift transport compiles against, the Rust constants this crate
 /// exports, and the enums in `frame-wire` that produce them -- and a test that
 /// listed them a fourth time would only prove the fourth copy agrees with
 /// itself.
+///
+/// The suffixed literal is the required spelling, and the `UINT32_C` form is
+/// named below so that reverting to it fails with a sentence rather than with a
+/// `ParseIntError` on a string nobody expected to be parsing. The reason is in
+/// the comment on `MIGO_ABI_VERSION_1` in `include/migo/types.h`: Swift's Clang
+/// importer reads a macro's definition tokens, declines a function-like macro
+/// invocation, and would leave every constant in these headers unnameable from
+/// Swift -- which is the language of the transport that consumes these very
+/// constants.
 fn header_defines(prefix: &str) -> Vec<(String, u32)> {
     const HEADER: &str = include_str!("../../../../include/migo/external_frames.h");
     let mut defines = Vec::new();
@@ -204,11 +213,22 @@ fn header_defines(prefix: &str) -> Vec<(String, u32)> {
         if !name.starts_with(prefix) {
             continue;
         }
-        let value = value
-            .trim()
-            .trim_start_matches("UINT32_C(")
-            .trim_end_matches(')');
-        defines.push((name.to_string(), value.parse().expect("a decimal constant")));
+        let value = value.trim();
+        assert!(
+            !value.contains("_C("),
+            "{name} is spelled {value}. Constants in the public headers must be suffixed \
+             literals: Swift's importer declines a function-like macro invocation, which \
+             would make this constant unnameable from the transport that uses it."
+        );
+        let digits = value
+            .strip_suffix('U')
+            .unwrap_or_else(|| panic!("{name} is spelled {value}; expected a <n>U literal"));
+        defines.push((
+            name.to_string(),
+            digits
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is spelled {value}; expected a decimal value")),
+        ));
     }
     assert!(
         !defines.is_empty(),

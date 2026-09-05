@@ -35,6 +35,16 @@ Android's runtime is a **static library** a host links into its own `.so`, drive
 
 The generic descriptor is not a universal native-window union. It points to one typed Android, Win32, WinUI, macOS, iOS, X11, Wayland, or OpenHarmony descriptor, preserving the platform's best native integration model.
 
+## Constant spelling
+
+Integer constants here are suffixed literals (`5U`, `(1U << 0)`), not
+`UINT32_C(5)`. Swift's Clang importer reads a macro's definition tokens rather
+than its expansion and declines a function-like macro invocation -- so under the
+conventional spelling, *every* constant in these headers, including
+`MIGO_ABI_VERSION_CURRENT`, was unnameable from Swift. See the comment on
+`MIGO_ABI_VERSION_1` in `types.h`. The forms are equivalent in C and C++, and
+the literal, unlike a cast, still works in `#if`.
+
 ## Structure initialization and extension
 
 Every caller-owned extensible structure starts with `struct_size` and `abi_version`. Callers zero-initialize the complete record, then set both fields explicitly:

@@ -348,12 +348,27 @@ cp "$REPO_ROOT"/include/migo/*.h "$STAGE/headers/migo/" || exit 1
 mkdir -p "$STAGE/headers/migo/platform"
 cp "$REPO_ROOT"/include/migo/platform/*.h "$STAGE/headers/migo/platform/" || exit 1
 
+# An umbrella DIRECTORY, not `umbrella header "migo/migo.h"` plus a hand-listed
+# tail. Two reasons, and the first was invisible until this commit.
+#
+# `migo/migo.h` includes five of the fifteen headers staged above. The rest --
+# external_frames.h and the eight platform descriptors -- are entry points a host
+# includes directly, so under an umbrella header they have to be listed one by
+# one. That list was written with two of the eight platform headers on it, and
+# nothing noticed, because no target depended on this xcframework and the module
+# was therefore never built. A module map is only checked when something imports
+# the module.
+#
+# The second reason is what the list would have cost once it was built:
+# `-Wincomplete-umbrella` fires for every header in the umbrella's directory tree
+# that the module does not cover, so six of the eight platform headers would have
+# produced a warning in every consumer's build, and adding a ninth would produce
+# a seventh. Every header here is self-contained -- each includes only
+# <migo/surface.h> -- so the directory form covers all of them, stays correct
+# when one is added, and is derived rather than transcribed.
 cat > "$STAGE/headers/module.modulemap" <<'MODULEMAP'
 module MigoEngine {
-    umbrella header "migo/migo.h"
-    header "migo/external_frames.h"
-    header "migo/platform/ios.h"
-    header "migo/platform/macos.h"
+    umbrella "migo"
     export *
 }
 MODULEMAP

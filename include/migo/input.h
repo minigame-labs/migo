@@ -55,17 +55,17 @@ MIGO_BEGIN_DECLS
  * event model.
  */
 typedef uint32_t MigoTouchType;
-#define MIGO_TOUCH_START UINT32_C(0)
-#define MIGO_TOUCH_MOVE UINT32_C(1)
-#define MIGO_TOUCH_END UINT32_C(2)
-#define MIGO_TOUCH_CANCEL UINT32_C(3)
+#define MIGO_TOUCH_START 0U
+#define MIGO_TOUCH_MOVE 1U
+#define MIGO_TOUCH_END 2U
+#define MIGO_TOUCH_CANCEL 3U
 
 typedef uint32_t MigoTouchPointFlags;
-#define MIGO_TOUCH_FLAG_NONE UINT32_C(0)
+#define MIGO_TOUCH_FLAG_NONE 0U
 /* This point is part of the event's changedTouches list. */
-#define MIGO_TOUCH_FLAG_CHANGED (UINT32_C(1) << 0)
+#define MIGO_TOUCH_FLAG_CHANGED (1U << 0)
 /* This point left the surface with this event, so it is excluded from touches. */
-#define MIGO_TOUCH_FLAG_REMOVED (UINT32_C(1) << 1)
+#define MIGO_TOUCH_FLAG_REMOVED (1U << 1)
 
 /* Bounded by the engine's fixed inline array; larger counts are rejected. */
 #define MIGO_TOUCH_MAX_POINTS 10
@@ -158,12 +158,12 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_touch(
  * LP64, LLP64 and ILP32 agree, unlike the string-bearing records below.
  */
 typedef uint32_t MigoPointerEventType;
-#define MIGO_POINTER_EVENT_DOWN UINT32_C(0)
-#define MIGO_POINTER_EVENT_MOVE UINT32_C(1)
-#define MIGO_POINTER_EVENT_UP UINT32_C(2)
+#define MIGO_POINTER_EVENT_DOWN 0U
+#define MIGO_POINTER_EVENT_MOVE 1U
+#define MIGO_POINTER_EVENT_UP 2U
 
 /* Highest accepted button ordinal; the DOM defines five. */
-#define MIGO_POINTER_BUTTON_MAX UINT32_C(31)
+#define MIGO_POINTER_BUTTON_MAX 31U
 
 /*
  * x and y are CSS pixels, exactly as in MigoTouchPoint -- the same conversion
@@ -210,9 +210,9 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_pointer_event(
 
 /* DOM WheelEvent.deltaMode: what unit the deltas are in. */
 typedef uint32_t MigoWheelDeltaMode;
-#define MIGO_WHEEL_DELTA_MODE_PIXEL UINT32_C(0)
-#define MIGO_WHEEL_DELTA_MODE_LINE UINT32_C(1)
-#define MIGO_WHEEL_DELTA_MODE_PAGE UINT32_C(2)
+#define MIGO_WHEEL_DELTA_MODE_PIXEL 0U
+#define MIGO_WHEEL_DELTA_MODE_LINE 1U
+#define MIGO_WHEEL_DELTA_MODE_PAGE 2U
 
 /*
  * One scroll. The deltas follow DOM WheelEvent, and delta_mode travels with
@@ -268,10 +268,10 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_wheel_event(
  * direction, MigoOnUpdateKeyboardFn is content correcting that same value.
  */
 typedef uint32_t MigoKeyboardEventType;
-#define MIGO_KEYBOARD_EVENT_INPUT UINT32_C(0)
-#define MIGO_KEYBOARD_EVENT_CONFIRM UINT32_C(1)
-#define MIGO_KEYBOARD_EVENT_COMPLETE UINT32_C(2)
-#define MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE UINT32_C(3)
+#define MIGO_KEYBOARD_EVENT_INPUT 0U
+#define MIGO_KEYBOARD_EVENT_CONFIRM 1U
+#define MIGO_KEYBOARD_EVENT_COMPLETE 2U
+#define MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE 3U
 
 /*
  * value_utf8 is length-delimited and need not be NUL-terminated; only
@@ -327,8 +327,8 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_keyboard_event(
  * so a batch API would be shape without a requirement.
  */
 typedef uint32_t MigoKeyEventType;
-#define MIGO_KEY_EVENT_DOWN UINT32_C(0)
-#define MIGO_KEY_EVENT_UP UINT32_C(1)
+#define MIGO_KEY_EVENT_DOWN 0U
+#define MIGO_KEY_EVENT_UP 1U
 
 /*
  * key and code are DOM values, and they are NOT interchangeable:
@@ -350,17 +350,17 @@ typedef uint32_t MigoKeyEventType;
  * borrowed for the duration of the call.
  */
 typedef uint32_t MigoKeyModifiers;
-#define MIGO_KEY_MODIFIER_NONE UINT32_C(0)
-#define MIGO_KEY_MODIFIER_CONTROL (UINT32_C(1) << 0)
-#define MIGO_KEY_MODIFIER_SHIFT (UINT32_C(1) << 1)
-#define MIGO_KEY_MODIFIER_ALT (UINT32_C(1) << 2)
-#define MIGO_KEY_MODIFIER_META (UINT32_C(1) << 3)
+#define MIGO_KEY_MODIFIER_NONE 0U
+#define MIGO_KEY_MODIFIER_CONTROL (1U << 0)
+#define MIGO_KEY_MODIFIER_SHIFT (1U << 1)
+#define MIGO_KEY_MODIFIER_ALT (1U << 2)
+#define MIGO_KEY_MODIFIER_META (1U << 3)
 
 typedef uint32_t MigoKeyEventFlags;
-#define MIGO_KEY_EVENT_FLAG_NONE UINT32_C(0)
+#define MIGO_KEY_EVENT_FLAG_NONE 0U
 /* The platform's auto-repeat produced this press, not the user pressing again.
  * DOM KeyboardEvent.repeat. */
-#define MIGO_KEY_EVENT_FLAG_REPEAT (UINT32_C(1) << 0)
+#define MIGO_KEY_EVENT_FLAG_REPEAT (1U << 0)
 
 /*
  * modifiers and flags were appended after this record shipped, so they are the
@@ -429,9 +429,9 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_key_event(
  * IME sends composition events alongside the keyboard ones, not instead of them.
  */
 typedef uint32_t MigoCompositionEventType;
-#define MIGO_COMPOSITION_EVENT_START UINT32_C(0)
-#define MIGO_COMPOSITION_EVENT_UPDATE UINT32_C(1)
-#define MIGO_COMPOSITION_EVENT_END UINT32_C(2)
+#define MIGO_COMPOSITION_EVENT_START 0U
+#define MIGO_COMPOSITION_EVENT_UPDATE 1U
+#define MIGO_COMPOSITION_EVENT_END 2U
 
 /*
  * data is the WHOLE current preedit string on start and update, never a delta:
@@ -489,9 +489,9 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_composition_event(
 #define MIGO_GAMEPAD_MAX_BUTTONS 20
 
 typedef uint32_t MigoGamepadButtonFlags;
-#define MIGO_GAMEPAD_BUTTON_FLAG_NONE UINT32_C(0)
-#define MIGO_GAMEPAD_BUTTON_FLAG_PRESSED (UINT32_C(1) << 0)
-#define MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED (UINT32_C(1) << 1)
+#define MIGO_GAMEPAD_BUTTON_FLAG_NONE 0U
+#define MIGO_GAMEPAD_BUTTON_FLAG_PRESSED (1U << 0)
+#define MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED (1U << 1)
 
 /*
  * One button. value is the analogue position -- 0.0 to 1.0 for a trigger, and

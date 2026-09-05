@@ -14,18 +14,28 @@ The maintainer plan behind them is deliberately **not** in this repository --
 What matters for anyone reading the code is in the contracts above and in the
 comments here.
 
-## Status: skeleton
+## Status
 
-Nothing in this directory has been compiled on Apple hardware. The Swift,
-WebContent, and ProbeApp files are declarations of intent, not verified
-implementations. The current skeleton and product baseline also do not prove
-that Performance+ is V8-free: the current dependency chain may still link V8.
-The future release gate must prove that the final Performance+ artifact and
-dependency closure do not link V8.
+Not a skeleton any more, and not a product either. What separates the two halves
+is whether a compiler has seen it, so that is what this section reports.
 
-What is verified on Linux is limited to the existing C ABI and deployment-floor
-gates. All of `Sources/`, `WebContent/`, and `ProbeApp/` remain unverified on
-Apple hardware.
+| | Where it is checked |
+|---|---|
+| `core/` (`MigoAppleCore`) | built, tested and cross-compiled for `aarch64-apple-ios` on every pull request, on an Apple silicon runner |
+| `Sources/MigoAppleRenderer` | compiled for iOS, iOS Simulator and macOS by `.github/workflows/apple-sdk.yml`, and on the macOS leg linked into a test binary and executed on Apple silicon -- the only place the C ABI has ever run on an Apple machine |
+| `Sources/MigoAppleWebKit`, `Sources/MigoMacV8` | placeholders; they compile, and they do nothing |
+| `WebContent/PerformancePlus` | its encoder runs against the same golden corpus as the Rust one, under node, on every pull request |
+| `ProbeApp/` | a README. No sources exist, and none should until there is a device to run them on |
+
+Nothing here has run on an iPhone. The Performance+ topology -- agent,
+transport, frame clock, host shape -- is unselected, and the G0 probe evidence
+selects it; see the table below.
+
+The product baseline also does not prove that Performance+ is V8-free. The
+Cargo half of that claim is checked on Linux every pull request and the archive
+half now reads a real symbol table produced by Apple's toolchain, but the claim
+that belongs to a *release* is about a shipped artifact, and there is no Apple
+release yet.
 
 The first Mac task is the G0 probe contract. It must measure the unresolved
 topology axes below on the current minimum OS and representative devices;
@@ -91,18 +101,33 @@ is why `include/migo/platform/ios.h` exists.
 
 ```
 platforms/apple/
-  Package.swift              floor values derived from contracts/apple/deployment-floor.json
+  core/                      the engine-free package: no binary target, no dependencies
+    Package.swift              so it resolves and builds with nothing fetched and nothing built
+    Sources/MigoAppleCore/     profile policy, deployment floors, lifecycle, permissions, metrics
+    Tests/
+  Package.swift              the shipping package; floor values derived from
+                             contracts/apple/deployment-floor.json
+  Frameworks/                generated: MigoEngine.xcframework (gitignored)
   Sources/
-    MigoAppleCore/           profile policy, lifecycle, permissions, metrics
     MigoAppleRenderer/       internal: CAMetalLayer, display link, surface attach
     MigoAppleWebKit/         lane 1
     MigoApplePerformancePlus/ lane 2: transport, FrameIngress bridge, host view
       Resources/               generated: the WebContent bundle (gitignored)
     MigoMacV8/               lane 3
-  WebContent/PerformancePlus/ source of the bundle that runs inside WebContent
   Tests/
+  WebContent/PerformancePlus/ source of the bundle that runs inside WebContent
   ProbeApp/                  G0 probes only; never linked into a product
 ```
+
+**Two packages, and the split is load-bearing.** The shipping package declares a
+binary target for an xcframework that `scripts/build-apple-sdk.sh` produces, so
+it does not resolve until that script has run on a Mac -- which meant, for the
+whole life of the skeleton, that *no* Swift here was ever compiled, including
+the files that mirror `contracts/apple/*.json` and whose gates compare only
+their text. `core/` is the half that needs no engine, so it is built and tested
+on every pull request. `scripts/test-apple-swift-core-engine-free.sh` keeps it
+engine-free and `scripts/test-apple-shipping-package-contract.sh` keeps the
+shipping package consuming the artifact it declares.
 
 `WebContent/PerformancePlus` is Apple product source, not a cross-platform
 adapter, so it does not live in `adapter/`: it depends on WebKit bootstrap
