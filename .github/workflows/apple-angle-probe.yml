@@ -1,0 +1,240 @@
+name: Apple ANGLE probe
+
+# One question, asked once, before anybody writes a build script for it.
+#
+# A2.1 in the Apple plan is "ANGLE Metal source pin + reproducible xcframework",
+# and it is the blocker for A2.2 (the native presenter) and therefore for every
+# Apple product that renders. The repository already has the shape to copy:
+# scripts/build-angle-windows.sh, contracts/artifact-manifest/windows-angle.lock.json
+# and scripts/fetch-windows-angle.sh do exactly this for Windows.
+#
+# WHY THIS IS NEEDED AT ALL, rather than just writing the Apple version:
+# .github/workflows/apple-sdk.yml measured, on 2026-09-05, what a non-Rust
+# consumer must link against the engine on each Apple platform:
+#
+#   macOS  -lc++ -framework ApplicationServices -framework OpenGL -liconv ...
+#   iOS    -lc++ -framework CoreFoundation -framework CoreGraphics -framework
+#          CoreText -framework ImageIO -framework MobileCoreServices
+#          -framework UIKit -liconv ...
+#
+# There is no GL framework on iOS. Skia is configured for its GL backend, macOS
+# links the legacy `OpenGL` framework to satisfy it, and iOS has nothing to link.
+# That gap is what ANGLE fills, and it is why "just use system GL for a macOS
+# presenter first" buys nothing for iOS: it links a thing iOS does not have.
+#
+# WHAT IS UNKNOWN is narrow and it is the whole cost of the decision: an ANGLE
+# checkout is depot_tools plus a Chromium-style dependency tree measured in tens
+# of gigabytes, and a GitHub-hosted macOS runner has single-digit gigabytes free.
+# If the checkout does not fit, the entire lane is dead and no build script would
+# ever have run. Nobody in this project has measured it.
+#
+# MEASURED, 2026-09-05, run 33948370655 on macos-15-arm64 (macOS 15.7.9,
+# Xcode 16.4): the image starts with 42 GiB free, depot_tools is 12 MB, and
+# `fetch --no-history angle` with target_os limited to mac and ios takes
+# 238 seconds and 12 GB, leaving 29 GiB. The premise that a hosted macOS runner
+# is too small for this was wrong -- it was carried over from the x86 image.
+# The revision it resolved to was 52f594287836c9970b67920da0633077aee42649,
+# which is the pin candidate A2.1 needs.
+#
+# The rest of the cost, measured on the same runner in the same run:
+#
+#   gn gen, three configurations   seconds; 12554 / 12560 / 10125 targets
+#   ninja libEGL libGLESv2 (ios)   334 seconds, 100 MB of output
+#
+# So a full A2.1 lane -- one checkout, three configurations, three builds -- is
+# roughly twenty minutes on a free hosted runner. "Wait for a Mac; it is tens of
+# gigabytes and hours of C++" was wrong on every count.
+#
+# So this job checks out and configures, and DELIBERATELY DOES NOT BUILD. A first
+# run that tries to compile ANGLE answers a question we cannot ask yet -- how
+# long the compile takes -- while risking a timeout that tells us nothing about
+# the question we can ask. Blind-writing a build script for a checkout nobody has
+# performed is the anti-pattern this lane's neighbours were fixed for six times
+# in one round.
+#
+# It runs on demand, and on a branch prefix that exists for it. Never on pull
+# requests, never on a schedule: it is measured in gigabytes of somebody's shared
+# quota and it answers a question whose answer does not change weekly.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'angle-probe/**'
+
+concurrency:
+  group: apple-angle-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checkout-fits:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      # Before anything is fetched, so the numbers below have a baseline that is
+      # about this image rather than about what we did to it.
+      - name: What this runner starts with
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          xcodebuild -version
+          df -h /
+          df -h "$RUNNER_TEMP" || true
+          python3 --version
+
+      # Shallow, and outside the workspace: depot_tools puts its own git in PATH
+      # and a checkout inside the repository would be one more thing to exclude
+      # from every gate that walks the tree.
+      - name: Fetch depot_tools
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+          du -sh "$RUNNER_TEMP/depot_tools"
+          df -h /
+
+      # `--no-history` because the pin this produces is a commit hash, and a
+      # reproducible build needs the tree at that hash, not the history that
+      # reached it. If it still does not fit, that is the answer.
+      #
+      # `target_os` limited to the two Apple platforms so gclient does not sync
+      # the Android and Windows dependency sets, which are most of the tree and
+      # none of the product.
+      - name: Fetch ANGLE
+        id: fetch
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/angle"
+          cd "$RUNNER_TEMP/angle"
+          started=$SECONDS
+          fetch --no-history angle
+          {
+            echo "target_os = ['mac', 'ios']"
+            echo "target_os_only = True"
+          } >> .gclient
+          gclient sync --no-history
+          echo "seconds=$((SECONDS - started))" >> "$GITHUB_OUTPUT"
+
+          # Where the tree landed, read from .gclient rather than assumed.
+          #
+          # `fetch angle` names its solution `.`, so the checkout IS this
+          # directory -- unlike `fetch chromium`, which creates `src/`. The
+          # first run of this probe assumed the chromium shape, and `cd angle`
+          # failed after a four-minute fetch that had otherwise succeeded. The
+          # fix is not the other guess: the file says which, so the file is what
+          # is read, and a recipe that changes shape upstream keeps working.
+          root="$(python3 - <<'PYTHON'
+          import pathlib
+
+          source = pathlib.Path(".gclient").read_text()
+          namespace = {}
+          exec(compile(source, ".gclient", "exec"), namespace)
+          solutions = namespace["solutions"]
+          if len(solutions) != 1:
+              raise SystemExit(
+                  f".gclient declares {len(solutions)} solutions; this probe knows how to "
+                  "locate one"
+              )
+          print(solutions[0]["name"])
+          PYTHON
+          )"
+          echo "ANGLE_ROOT=$(cd "$root" && pwd)" >> "$GITHUB_ENV"
+          cd "$root"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: What the checkout cost
+        if: always()
+        run: |
+          set -x
+          df -h /
+          du -sh "$RUNNER_TEMP/angle" || true
+          du -sh "${ANGLE_ROOT:-$RUNNER_TEMP/angle}/third_party" 2>/dev/null || true
+
+      # Configuration only. This is the half that can be wrong in a way a
+      # checkout cannot reveal: an argument this ANGLE revision does not accept,
+      # or a toolchain assumption that holds on Chromium's bots and not on a
+      # GitHub image. `gn gen` answers both in seconds.
+      #
+      # The arguments mirror the Windows recipe's decisions where they carry
+      # over: no WebGPU backend (migo does not use it, and it is what drags in
+      # Dawn's vendored shader compiler), no debug info, component build off so
+      # the output is the static pieces an xcframework is assembled from.
+      - name: Configure for iOS, the iOS simulator and macOS, without building
+        run: |
+          set -euo pipefail
+          cd "$ANGLE_ROOT"
+
+          # Three configurations, not two, and the third is a fact this probe
+          # produced rather than a guess. `target_os="ios"` alone fails at
+          # import time:
+          #
+          #   ERROR at //build/config/apple/mobile_config.gni:103:3
+          #   target_environment must be in ["simulator", "device", "catalyst"]
+          #
+          # So iOS is configured per environment, which is the same split the
+          # xcframework already has: .github/workflows/apple-sdk.yml builds an
+          # `ios` leg and an `ios-simulator` leg because an xcframework refuses a
+          # fat archive that mixes them. ANGLE has to be built the same way, and
+          # a build script written without this would have discovered it after a
+          # checkout rather than before one.
+          for args in \
+            'target_os="ios" target_environment="device" target_cpu="arm64" ios_enable_code_signing=false' \
+            'target_os="ios" target_environment="simulator" target_cpu="arm64" ios_enable_code_signing=false' \
+            'target_os="mac" target_cpu="arm64"'; do
+            out="out/probe-$(printf '%s' "$args" | tr -dc 'a-z0-9')"
+            gn gen "$out" --args="is_debug=false symbol_level=0 is_component_build=false angle_enable_wgpu=false angle_enable_vulkan=false angle_enable_metal=true $args"
+            echo "--- $out ---"
+            gn args "$out" --list --short --overrides-only
+            echo "targets in graph: $(ninja -C "$out" -t targets all 2>/dev/null | wc -l)"
+          done
+
+      # The last unknown in A2.1's cost, now that the checkout is known to be
+      # four minutes and 12 GB.
+      #
+      # One configuration, not three: the question is how long ANGLE takes to
+      # compile for an Apple target on this runner, and three answers to it
+      # would be the same answer three times. iOS device arm64 because that is
+      # the slice the product actually ships.
+      #
+      # Bounded by the step's own `timeout-minutes`, not by the job's and not by
+      # a `timeout` binary.
+      #
+      # The first attempt used `timeout 3600 ninja ...` and got exit 127 in zero
+      # seconds: macOS ships no `timeout`. That is a GNU coreutils program, and
+      # its absence here is the same family as the bash 3.2 differences
+      # scripts/test-macos-bash32-contract.sh exists for -- a thing that is
+      # correct on every Linux runner in this repository and simply not present
+      # on the only OS that can run this job.
+      #
+      # A per-step timeout is the portable answer and a better one: exceeding it
+      # fails this step alone, and `continue-on-error` plus the `if: always()`
+      # summary below means every fact the earlier steps established survives.
+      #
+      # `libEGL` and `libGLESv2` and not `all`: those two are the deliverable,
+      # and `all` includes ANGLE's own test binaries, which nothing here ships.
+      - name: How long one Apple configuration takes to build
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$ANGLE_ROOT"
+          out="$(ls -d out/probe-*device* | head -1)"
+          echo "building in $out"
+          command -v ninja
+          started=$SECONDS
+          ninja -C "$out" libEGL libGLESv2
+          echo "RESULT: built in $((SECONDS - started)) seconds"
+          df -h /
+          du -sh "$out" || true
+
+      - name: The answer
+        if: always()
+        run: |
+          echo "ANGLE revision:   ${{ steps.fetch.outputs.revision }}"
+          echo "checkout seconds: ${{ steps.fetch.outputs.seconds }}"
+          df -h /
