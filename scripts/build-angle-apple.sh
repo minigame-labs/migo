@@ -359,7 +359,7 @@ check_ready() {
             done
             ;;
         build)
-            for tool in gn ninja lipo xcrun patch; do
+            for tool in gn ninja lipo xcrun patch install_name_tool; do
                 command -v "$tool" >/dev/null 2>&1 || { err "not on PATH: $tool"; failures=$((failures + 1)); }
             done
             ;;
@@ -763,6 +763,33 @@ if [ "$MODE" = "build" ]; then
             info "lipo $input_count slices into $product"
             lipo -create ${inputs[@]+"${inputs[@]}"} -output "$OUT_DIR/$product"
         fi
+    done
+
+    # A PLAIN LIBRARY LEAVES THE LINKER WITH A RELATIVE INSTALL NAME, and that
+    # is measured: the first macOS build of this recipe produced
+    # `LC_ID_DYLIB = ./libEGL.dylib`, while the iOS framework bundles correctly
+    # carried `@rpath/libEGL.framework/libEGL` because `ios_framework_bundle`
+    # sets one. A consumer that LINKS `./libEGL.dylib` records a dependency dyld
+    # resolves against the process's working directory, which is wrong anywhere
+    # and silently wrong inside an .app.
+    #
+    # It would not have bitten this engine, which opens ANGLE by path rather
+    # than linking it -- which is precisely why it would have shipped. `@rpath`
+    # is what an embedded library in `Contents/Frameworks` needs, and it is what
+    # Xcode's own embed step assumes.
+    #
+    # Bundles are skipped: theirs is already correct and set by the build.
+    for target in $NINJA_TARGETS; do
+        installed="$(locate_product "$OUT_DIR" "$target")" || exit 1
+        [ -d "$installed" ] && continue
+        want="@rpath/$(basename "$installed")"
+        if ! install_name_tool -id "$want" "$installed"; then
+            err "could not set the install name of $(basename "$installed") to $want"
+            err "A relative LC_ID_DYLIB is not shippable, so this is fatal rather"
+            err "than a warning."
+            exit 1
+        fi
+        info "install name  $(basename "$installed") -> $want"
     done
 
     # Facts the presenter will need and nobody has: what dyld will call these
