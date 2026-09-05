@@ -183,11 +183,20 @@ jobs:
       # the archive. So the list is asked of rustc rather than written down, and
       # printed here whether or not the link below succeeds -- when it fails,
       # the answer is already in the log next to the failure.
+      #
+      # `--target` and not a host build: cargo keeps `--target <host>` and no
+      # `--target` in different directories, so omitting it would compile Skia a
+      # third time for bytes identical to the ones the step above already built.
+      #
+      # `continue-on-error` because this step reports, it does not decide. The
+      # question that matters is the link below, and a failure to produce a
+      # convenience listing must not be what stops the lane from answering it.
       - name: Record what a C consumer must link alongside the archive
         if: matrix.host_slice
+        continue-on-error: true
         working-directory: engine
         run: >-
-          cargo rustc -p migo-capi --locked
+          cargo rustc -p migo-capi --locked --target aarch64-apple-darwin
           --no-default-features --features external-frames
           -- --print native-static-libs
 

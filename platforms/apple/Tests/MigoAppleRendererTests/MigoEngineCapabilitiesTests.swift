@@ -177,6 +177,34 @@ final class MigoEngineCapabilitiesTests: XCTestCase {
         )
     }
 
+    /// Every shape of constant the public headers use, named from Swift.
+    ///
+    /// Not a tautology, and not really about these particular flags. Swift's
+    /// Clang importer reads a macro's definition tokens rather than its
+    /// expansion, and it refuses shapes it does not model -- which is how all
+    /// 103 constants in these headers came to be unnameable from Swift while
+    /// being perfectly correct C. The headers now use four shapes, and a
+    /// constant in a shape the importer declines is a constant no Apple host
+    /// can write down.
+    ///
+    /// So one reference per shape, and this is what makes them assertions
+    /// rather than mentions: each says something that has to stay true anyway.
+    ///
+    /// It lives in the test target rather than in the library on purpose.
+    /// `xcodebuild` builds the product scheme without tests, so if the answer
+    /// for one shape is no, all three platforms still compile and only this
+    /// fails -- one fact lost instead of every fact in the run.
+    func testEveryConstantShapeInTheHeadersIsNameableFromSwift() {
+        // `<n>U`
+        XCTAssertNotEqual(MIGO_PLATFORM_IOS_CA_METAL_LAYER, MIGO_PLATFORM_UNKNOWN)
+        // `(1U << k)`
+        XCTAssertNotEqual(MIGO_ERROR_FLAG_RECOVERABLE, MIGO_ERROR_FLAG_NONE)
+        // `<n>ULL`
+        XCTAssertEqual(MIGO_SURFACE_CAPABILITY_NONE, 0)
+        // `(1ULL << k)`
+        XCTAssertNotEqual(MIGO_SURFACE_CAPABILITY_WIDE_COLOR, MIGO_SURFACE_CAPABILITY_NONE)
+    }
+
     // MARK: - The mask
 
     /// A kind outside the mask's width is unsupported by definition, and the

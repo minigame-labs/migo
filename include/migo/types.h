@@ -157,7 +157,33 @@
 #define MIGO_LP64 0
 #endif
 
-#define MIGO_ABI_VERSION_1 UINT32_C(1)
+/*
+ * Integer constants in these headers are written as a suffixed literal --
+ * `5U`, `(1U << 0)` -- and never as `UINT32_C(5)`.
+ *
+ * They were UINT32_C for the whole life of these headers, which is the
+ * conventional spelling and was never wrong in C or C++. It is wrong for Swift.
+ * Swift's Clang importer reads the macro's *definition tokens*, not what the
+ * preprocessor would produce from them, and a function-like macro invocation is
+ * a structure it declines:
+ *
+ *     note: macro 'MIGO_PLATFORM_MACOS_CA_METAL_LAYER' unavailable:
+ *           structure not supported
+ *
+ * Every constant these headers declare was in that state -- including
+ * MIGO_ABI_VERSION_CURRENT, which every caller must write into the
+ * `abi_version` field of every record it passes. A Swift host could call the
+ * library and could not name a single value to call it with, so the only way to
+ * write such a host was to transcribe the numbers, which is the drift these
+ * headers exist to prevent. It went unnoticed because no Swift had ever
+ * compiled against them; the first target that did was
+ * platforms/apple/Sources/MigoAppleRenderer.
+ *
+ * The suffixed literal is equivalent in C and C++ -- it is exactly what
+ * UINT32_C expands to on every target this project builds for -- and unlike a
+ * cast (`((uint32_t)5)`, the other importable form) it remains usable in `#if`.
+ */
+#define MIGO_ABI_VERSION_1 1U
 #define MIGO_ABI_VERSION_CURRENT MIGO_ABI_VERSION_1
 
 typedef int32_t MigoResult;
@@ -198,8 +224,8 @@ typedef int32_t MigoResult;
 #define MIGO_ERROR_WOULD_BLOCK ((MigoResult)-12)
 
 typedef uint32_t MigoErrorFlags;
-#define MIGO_ERROR_FLAG_NONE UINT32_C(0)
-#define MIGO_ERROR_FLAG_RECOVERABLE (UINT32_C(1) << 0)
+#define MIGO_ERROR_FLAG_NONE 0U
+#define MIGO_ERROR_FLAG_RECOVERABLE (1U << 0)
 
 typedef struct MigoEngine MigoEngine;
 typedef struct MigoSession MigoSession;

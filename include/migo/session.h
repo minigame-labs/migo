@@ -4,7 +4,7 @@
 #include <migo/surface.h>
 
 typedef uint64_t MigoEngineFlags;
-#define MIGO_ENGINE_FLAG_NONE UINT64_C(0)
+#define MIGO_ENGINE_FLAG_NONE 0ULL
 /*
  * Run content that carries no signing receipt. It is an explicit opt-in rather
  * than a default because silently accepting unsigned content is exactly the
@@ -27,10 +27,10 @@ typedef uint64_t MigoEngineFlags;
  * ABI carries one, "leave this clear in production" would be advice to ship
  * something that cannot start.
  */
-#define MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT (UINT64_C(1) << 0)
+#define MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT (1ULL << 0)
 
 typedef uint64_t MigoSessionFlags;
-#define MIGO_SESSION_FLAG_NONE UINT64_C(0)
+#define MIGO_SESSION_FLAG_NONE 0ULL
 
 /*
  * Storage roots belong to the host: Migo reads and writes only underneath the
@@ -99,7 +99,7 @@ typedef struct MigoSessionConfig {
 } MigoSessionConfig;
 
 typedef uint32_t MigoContentFlags;
-#define MIGO_CONTENT_FLAG_NONE UINT32_C(0)
+#define MIGO_CONTENT_FLAG_NONE 0U
 
 /*
  * Names content the host has already installed under the engine's files
@@ -122,9 +122,9 @@ typedef struct MigoContentDescriptor {
 } MigoContentDescriptor;
 
 typedef uint32_t MigoLifecycleState;
-#define MIGO_LIFECYCLE_CREATED UINT32_C(0)
-#define MIGO_LIFECYCLE_RUNNING UINT32_C(1)
-#define MIGO_LIFECYCLE_PAUSED UINT32_C(2)
+#define MIGO_LIFECYCLE_CREATED 0U
+#define MIGO_LIFECYCLE_RUNNING 1U
+#define MIGO_LIFECYCLE_PAUSED 2U
 
 MIGO_BEGIN_DECLS
 
@@ -222,22 +222,22 @@ typedef void(MIGO_CALL *MigoOnSurfaceReleasedFn)(void *user_data,
                                                  uint64_t generation);
 
 typedef uint32_t MigoKeyboardFlags;
-#define MIGO_KEYBOARD_FLAG_NONE UINT32_C(0)
+#define MIGO_KEYBOARD_FLAG_NONE 0U
 /* The field accepts more than one line. */
-#define MIGO_KEYBOARD_FLAG_MULTIPLE (UINT32_C(1) << 0)
+#define MIGO_KEYBOARD_FLAG_MULTIPLE (1U << 0)
 /* Keep the keyboard up after confirm instead of dismissing it. */
-#define MIGO_KEYBOARD_FLAG_CONFIRM_HOLD (UINT32_C(1) << 1)
+#define MIGO_KEYBOARD_FLAG_CONFIRM_HOLD (1U << 1)
 
 typedef uint32_t MigoKeyboardConfirmType;
-#define MIGO_KEYBOARD_CONFIRM_DONE UINT32_C(0)
-#define MIGO_KEYBOARD_CONFIRM_NEXT UINT32_C(1)
-#define MIGO_KEYBOARD_CONFIRM_SEARCH UINT32_C(2)
-#define MIGO_KEYBOARD_CONFIRM_GO UINT32_C(3)
-#define MIGO_KEYBOARD_CONFIRM_SEND UINT32_C(4)
+#define MIGO_KEYBOARD_CONFIRM_DONE 0U
+#define MIGO_KEYBOARD_CONFIRM_NEXT 1U
+#define MIGO_KEYBOARD_CONFIRM_SEARCH 2U
+#define MIGO_KEYBOARD_CONFIRM_GO 3U
+#define MIGO_KEYBOARD_CONFIRM_SEND 4U
 
 typedef uint32_t MigoKeyboardType;
-#define MIGO_KEYBOARD_TYPE_TEXT UINT32_C(0)
-#define MIGO_KEYBOARD_TYPE_NUMBER UINT32_C(1)
+#define MIGO_KEYBOARD_TYPE_TEXT 0U
+#define MIGO_KEYBOARD_TYPE_NUMBER 1U
 
 /*
  * What content asked for when it opened the keyboard.

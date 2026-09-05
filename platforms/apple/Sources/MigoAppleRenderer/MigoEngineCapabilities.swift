@@ -168,16 +168,22 @@ extension MigoEngineCapabilities {
     /// The same decision against requirements the caller states.
     ///
     /// An overload and not a pair of default arguments, which is what this
-    /// obviously wants to be. A default argument is part of the module
-    /// interface -- it is serialized so it can be materialized in a caller that
-    /// may be in another module -- and it is therefore type-checked in the
-    /// module-interface pass, where the imported C module's declarations are
-    /// not in scope. `MIGO_ABI_VERSION_CURRENT` as a default value is
-    /// `cannot find 'MIGO_ABI_VERSION_CURRENT' in scope` at that line and
-    /// nowhere else in this file, which is a confusing enough error to be worth
-    /// a comment rather than a rediscovery. The alternative -- re-exporting the
-    /// C module so a client can see it -- would put the entire C ABI into this
-    /// target's public interface to make one constant reachable.
+    /// obviously wants to be. A default argument is serialized into the module
+    /// interface so a caller in another module can materialize it, so it is
+    /// type-checked in the emit-module pass -- the one that skips
+    /// non-inlinable function bodies. That is worth knowing because it decides
+    /// what a failure there looks like: the first build of this file reported
+    /// `cannot find 'MIGO_ABI_VERSION_CURRENT' in scope` at the default
+    /// argument and nowhere else, which read as a rule about default arguments
+    /// and was not one. The real cause was that the constant was spelled
+    /// `UINT32_C(1)` and no Swift could name it anywhere; the emit-module pass
+    /// had simply not looked at the function bodies yet. See the comment on
+    /// MIGO_ABI_VERSION_1 in include/migo/types.h.
+    ///
+    /// The overload stays because it is the better shape regardless -- a
+    /// default argument would bake this library's current ABI version into
+    /// every caller at their compile time -- and because it keeps this file out
+    /// of a question it does not need to answer.
     public func preflight(
         hostRequires abiVersion: UInt32,
         surfaceKind: UInt32

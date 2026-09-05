@@ -25,27 +25,27 @@
 typedef uint32_t MigoFrameIngressDecision;
 
 /* Taken. A credit is consumed until the renderer reports completion. */
-#define MIGO_FRAME_INGRESS_ACCEPTED UINT32_C(1)
+#define MIGO_FRAME_INGRESS_ACCEPTED 1U
 /*
  * Legal, but no credit is available. The producer must wait. It must not drop
  * the packet: a frame may carry state or resource changes that a later frame
  * depends on, so "skip it" is not a correct answer on either side.
  */
-#define MIGO_FRAME_INGRESS_WOULD_BLOCK UINT32_C(2)
+#define MIGO_FRAME_INGRESS_WOULD_BLOCK 2U
 /*
  * Malformed, or not addressed to this session. Costs no credit -- otherwise a
  * producer sending garbage would exhaust its own window and stall, which reads
  * on a device as a hang rather than as bad input. The producer must not resend
  * the same bytes.
  */
-#define MIGO_FRAME_INGRESS_REJECTED UINT32_C(3)
+#define MIGO_FRAME_INGRESS_REJECTED 3U
 /*
  * Correct bytes for a runtime generation that no longer exists -- the WebContent
  * process was replaced, or the session reloaded. Distinct from REJECTED because
  * nobody did anything wrong and no retry helps; reporting it as an error sends
  * whoever reads the telemetry looking for a bug that is not there.
  */
-#define MIGO_FRAME_INGRESS_GENERATION_LOST UINT32_C(4)
+#define MIGO_FRAME_INGRESS_GENERATION_LOST 4U
 
 /*
  * Library-written, so it grows append-only: a caller compiled against an
@@ -92,31 +92,31 @@ typedef struct MigoFrameIngressOutcome {
 typedef uint32_t MigoSyncState;
 
 /* No request outstanding. The only state a new one may be posted from. */
-#define MIGO_SYNC_STATE_FREE      UINT32_C(0)
+#define MIGO_SYNC_STATE_FREE      0U
 /* Posted, and the producer is waiting. */
-#define MIGO_SYNC_STATE_PENDING   UINT32_C(1)
+#define MIGO_SYNC_STATE_PENDING   1U
 /* Answered; reply_bytes says how much of the reply buffer is the answer. */
-#define MIGO_SYNC_STATE_READY     UINT32_C(2)
+#define MIGO_SYNC_STATE_READY     2U
 /* Not answered and will not be; error says why. */
-#define MIGO_SYNC_STATE_FAILED    UINT32_C(3)
+#define MIGO_SYNC_STATE_FAILED    3U
 /* Withdrawn by the producer before an answer arrived. */
-#define MIGO_SYNC_STATE_CANCELLED UINT32_C(4)
+#define MIGO_SYNC_STATE_CANCELLED 4U
 
 /*
  * Why a synchronous request failed. Stable across releases: the producer turns
  * these into exceptions its own code catches.
  */
 typedef uint32_t MigoSyncError;
-#define MIGO_SYNC_ERROR_ALREADY_PENDING        UINT32_C(1)
-#define MIGO_SYNC_ERROR_REQUEST_ID_MISMATCH    UINT32_C(2)
-#define MIGO_SYNC_ERROR_STALE_GENERATION       UINT32_C(3)
-#define MIGO_SYNC_ERROR_REPLY_TOO_LARGE        UINT32_C(4)
-#define MIGO_SYNC_ERROR_TIMED_OUT              UINT32_C(5)
-#define MIGO_SYNC_ERROR_SESSION_ENDED          UINT32_C(6)
-#define MIGO_SYNC_ERROR_UNSUPPORTED_OPERATION  UINT32_C(7)
-#define MIGO_SYNC_ERROR_LATE_REPLY             UINT32_C(8)
-#define MIGO_SYNC_ERROR_BAD_DEADLINE           UINT32_C(9)
-#define MIGO_SYNC_ERROR_BAD_REPLY_RESERVATION  UINT32_C(10)
+#define MIGO_SYNC_ERROR_ALREADY_PENDING        1U
+#define MIGO_SYNC_ERROR_REQUEST_ID_MISMATCH    2U
+#define MIGO_SYNC_ERROR_STALE_GENERATION       3U
+#define MIGO_SYNC_ERROR_REPLY_TOO_LARGE        4U
+#define MIGO_SYNC_ERROR_TIMED_OUT              5U
+#define MIGO_SYNC_ERROR_SESSION_ENDED          6U
+#define MIGO_SYNC_ERROR_UNSUPPORTED_OPERATION  7U
+#define MIGO_SYNC_ERROR_LATE_REPLY             8U
+#define MIGO_SYNC_ERROR_BAD_DEADLINE           9U
+#define MIGO_SYNC_ERROR_BAD_REPLY_RESERVATION  10U
 
 /*
  * Caller-written. The 64-bit members precede the 32-bit ones so the record is
@@ -168,25 +168,25 @@ typedef struct MigoSyncOutcome {
  * ------------------------------------------------------------------------- */
 
 typedef uint32_t MigoResourceState;
-#define MIGO_RESOURCE_STATE_RESERVED  UINT32_C(0)
-#define MIGO_RESOURCE_STATE_UPLOADING UINT32_C(1)
-#define MIGO_RESOURCE_STATE_VERIFYING UINT32_C(2)
+#define MIGO_RESOURCE_STATE_RESERVED  0U
+#define MIGO_RESOURCE_STATE_UPLOADING 1U
+#define MIGO_RESOURCE_STATE_VERIFYING 2U
 /* Verified. A frame may name this resource, and not before. */
-#define MIGO_RESOURCE_STATE_READY     UINT32_C(3)
-#define MIGO_RESOURCE_STATE_FAILED    UINT32_C(4)
+#define MIGO_RESOURCE_STATE_READY     3U
+#define MIGO_RESOURCE_STATE_FAILED    4U
 
 typedef uint32_t MigoResourceError;
-#define MIGO_RESOURCE_ERROR_TOO_MANY_RESERVATIONS UINT32_C(1)
-#define MIGO_RESOURCE_ERROR_BAD_SIZE              UINT32_C(2)
-#define MIGO_RESOURCE_ERROR_BAD_CHUNK_COUNT       UINT32_C(3)
-#define MIGO_RESOURCE_ERROR_UNKNOWN_RESERVATION   UINT32_C(4)
-#define MIGO_RESOURCE_ERROR_NON_CONTIGUOUS_CHUNK  UINT32_C(5)
-#define MIGO_RESOURCE_ERROR_CHUNK_OUT_OF_BOUNDS   UINT32_C(6)
-#define MIGO_RESOURCE_ERROR_DIGEST_MISMATCH       UINT32_C(7)
-#define MIGO_RESOURCE_ERROR_TIMED_OUT             UINT32_C(8)
-#define MIGO_RESOURCE_ERROR_EPOCH_ADVANCED        UINT32_C(9)
-#define MIGO_RESOURCE_ERROR_INCOMPLETE            UINT32_C(10)
-#define MIGO_RESOURCE_ERROR_NOT_UPLOADING         UINT32_C(11)
+#define MIGO_RESOURCE_ERROR_TOO_MANY_RESERVATIONS 1U
+#define MIGO_RESOURCE_ERROR_BAD_SIZE              2U
+#define MIGO_RESOURCE_ERROR_BAD_CHUNK_COUNT       3U
+#define MIGO_RESOURCE_ERROR_UNKNOWN_RESERVATION   4U
+#define MIGO_RESOURCE_ERROR_NON_CONTIGUOUS_CHUNK  5U
+#define MIGO_RESOURCE_ERROR_CHUNK_OUT_OF_BOUNDS   6U
+#define MIGO_RESOURCE_ERROR_DIGEST_MISMATCH       7U
+#define MIGO_RESOURCE_ERROR_TIMED_OUT             8U
+#define MIGO_RESOURCE_ERROR_EPOCH_ADVANCED        9U
+#define MIGO_RESOURCE_ERROR_INCOMPLETE            10U
+#define MIGO_RESOURCE_ERROR_NOT_UPLOADING         11U
 
 /*
  * Caller-written. The reservation id is assigned by the library, not chosen
