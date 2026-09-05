@@ -276,6 +276,12 @@ jobs:
                       continue
                   if not device.get("name", "").startswith("iPhone"):
                       continue
+                  # Newest runtime wins; within one runtime the highest
+                  # device name wins. That tie-break is arbitrary and it is
+                  # meant to be: every simulated iPhone runs the same ABI, so
+                  # there is nothing to prefer, and an arbitrary rule that is
+                  # deterministic beats a preference nobody can justify. The
+                  # step logs which device it picked.
                   key = (version(identifier), device["name"])
                   if best is None or key > best[0]:
                       best = (key, device["udid"], identifier, device["name"])
