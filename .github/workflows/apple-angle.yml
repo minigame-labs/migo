@@ -153,6 +153,11 @@ jobs:
               --source "$MIGO_ANGLE_APPLE_SRC" $flags
             echo "::endgroup::"
           done
+          # What was actually built, for the step that packs it. Without this,
+          # narrowing the build to one platform left the pack step iterating all
+          # three and failing on the two that were never built -- a step failing
+          # for a reason that has nothing to do with what it was asked to do.
+          echo "BUILT_PLATFORMS=$platforms" >> "$GITHUB_ENV"
 
       # One archive per platform, made HERE rather than by repacking the
       # workflow artifact later. An iOS product is a framework bundle -- a
@@ -169,10 +174,11 @@ jobs:
       - name: Pack each platform for publication
         run: |
           set -euo pipefail
-          # The platform list comes from the script that defines it, not from
-          # this file. A workflow that iterates its own copy is the third place
-          # the set lives.
-          for platform in $(bash scripts/build-apple-sdk.sh --print-platforms); do
+          # Exactly what the build step built, which on a full run is the list
+          # build-apple-sdk.sh names and on a narrowed one is the subset asked
+          # for. Not this file's own copy of the set, and not a fresh query that
+          # would disagree with the build above.
+          for platform in ${BUILT_PLATFORMS:?the build step did not record what it built}; do
             bash scripts/build-angle-apple.sh --archive "$platform"
           done
 
