@@ -136,6 +136,19 @@ jobs:
       # minimum, which is the one thing the text-comparing floor contract
       # cannot check -- it verifies each number against the contract and has no
       # way to run the comparison between them.
+      # The ANGLE pin, exercised on the platform that will consume it. Three
+      # archives and about 10 MB, so it is cheap enough for a per-pull-request
+      # lane -- and it is the only place any of this runs on a Mac: the pin
+      # gate on Linux checks that the lock is complete and that nothing hardcodes
+      # an asset, and cannot check that the bytes are still THERE, still hash to
+      # what is committed, and still unpack to the layout ANGLE opens.
+      #
+      # It also puts scripts/fetch-apple-angle.sh inside the scope
+      # scripts/test-macos-bash32-contract.sh derives from the workflows, which
+      # is where a script that runs on macOS has to be: /bin/bash there is 3.2.
+      - name: The pinned ANGLE is still fetchable and still hashes to the pin
+        run: bash scripts/fetch-apple-angle.sh
+
       - name: Build and test the engine-free Swift package on Apple silicon
         working-directory: platforms/apple/core
         run: |

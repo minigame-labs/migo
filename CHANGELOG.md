@@ -18,6 +18,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everywhere, because at half a byte per pixel it is smaller than any ASTC
   footprint. The choice is per image and per device, which is only possible
   because ingest runs on the device.
+- Apple: ANGLE over Metal is built from source and pinned
+  (`contracts/artifact-manifest/apple-angle.lock.json` +
+  `scripts/build-angle-apple.sh` + `scripts/fetch-apple-angle.sh`) for every
+  slice group the engine is built for — iOS, the iOS simulator and macOS, five
+  configurations in all. ANGLE publishes no official prebuilt binaries for any
+  platform, so these are self-hosted and hash-verified before use, the same
+  model the Windows ANGLE runtime and the V8 archives already follow. It exists
+  because there is no GL framework on iOS: rustc's own link line for the Apple
+  slices asks for `-framework OpenGL` on macOS and for no GL framework at all on
+  iOS, while Skia is configured for its GL backend. Metal is the only backend
+  built; the desktop GL backend, which defaults to on for macOS, is pinned off
+  so both Apple platforms resolve the same renderer. The published shape differs
+  per platform because upstream's does — a framework bundle on iOS, where Apple
+  accepts an embedded framework and rejects a bare dylib, and a shared library
+  on macOS — and it is deliberately not evened out: `libEGL` locates `libGLESv2`
+  at run time by composing a name against a directory, and that name and
+  directory are platform-specific, so repackaging either side would leave ANGLE
+  searching where its dispatch library is not. `--print-loader-layout` is what
+  answers where each library has to sit; the xcframeworks are split along the
+  same axis instead, one per library per platform family.
 - The runtime reports how many times a frame's drawing crossed from JavaScript
   into native, on a five-second window, at `info` level: `[boundary] frames=…
   crossings/frame=… worst=… commands/frame=… commands/crossing=…`. The ratio is

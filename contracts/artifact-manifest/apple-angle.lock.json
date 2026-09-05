@@ -14,6 +14,47 @@
       "libGLESv2"
     ]
   },
+  "release": "https://github.com/minigame-labs/migo-runtime/releases/download/angle-apple-52f59428",
+  "targets": {
+    "ios-simulator": {
+      "asset": "angle-apple-ios-simulator.tar.gz",
+      "size_bytes": 3918965,
+      "sha256": "3ff8b49b189606335f212ea64cc5b07e18663c1924ae58f5fcc8d13e8a97cdb4",
+      "contents": [
+        "libEGL.framework",
+        "libGLESv2.framework"
+      ],
+      "slices": [
+        "aarch64-apple-ios-sim",
+        "x86_64-apple-ios"
+      ]
+    },
+    "ios": {
+      "asset": "angle-apple-ios.tar.gz",
+      "size_bytes": 1816806,
+      "sha256": "e362c5a533d0d8fa6184f0071c0e3ce71cbd3758e8b8bc646fe66d565ea75485",
+      "contents": [
+        "libEGL.framework",
+        "libGLESv2.framework"
+      ],
+      "slices": [
+        "aarch64-apple-ios"
+      ]
+    },
+    "macos": {
+      "asset": "angle-apple-macos.tar.gz",
+      "size_bytes": 4136160,
+      "sha256": "d35b5a9762a947148f6b0eec2ec0b865871369c2cc1794dc5e2bbaf0f5a7caea",
+      "contents": [
+        "libEGL.dylib",
+        "libGLESv2.dylib"
+      ],
+      "slices": [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin"
+      ]
+    }
+  },
   "notes": {
     "why_a_source_pin_lands_before_the_artifact_hashes": "This file is created in two steps on purpose, and the order is forced rather than chosen: a lock file's artifact hashes have to be the hashes of real bytes, and the bytes do not exist until a recipe pinned to a revision has produced them. So step one -- this -- pins the identity of what will be built (revision, gclient target_os, gn arguments, ninja targets) and is the single source scripts/build-angle-apple.sh reads them from. Step two adds `release` and `targets` with the sha256 of each published file, exactly as contracts/artifact-manifest/windows-angle.lock.json carries them, and scripts/fetch-apple-angle.sh checks those before any byte is trusted. Windows arm64 was built in the same order for the same reason.",
     "why_this_revision": "It is what `fetch --no-history angle` resolved to on 2026-09-05 in .github/workflows/apple-angle-probe.yml (run 33948370655), which is the first and so far only checkout of ANGLE anyone on this project has performed. Three gn configurations were generated against it -- iOS device, iOS simulator and macOS, all arm64 -- and all three accepted the argument set recorded above (12554 / 12560 / 10125 targets in the resulting graphs), so the recipe is measured rather than guessed. Pinning tip-of-the-day is not a quality claim about that commit; it is the commit whose buildability was actually observed, and moving the pin means observing the new one the same way.",
