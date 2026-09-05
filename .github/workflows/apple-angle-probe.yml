@@ -33,6 +33,8 @@ name: Apple ANGLE probe
 # `fetch --no-history angle` with target_os limited to mac and ios takes
 # 238 seconds and 12 GB, leaving 29 GiB. The premise that a hosted macOS runner
 # is too small for this was wrong -- it was carried over from the x86 image.
+# The revision it resolved to was 52f594287836c9970b67920da0633077aee42649,
+# which is the pin candidate A2.1 needs.
 #
 # So this job checks out and configures, and DELIBERATELY DOES NOT BUILD. A first
 # run that tries to compile ANGLE answers a question we cannot ask yet -- how
@@ -153,19 +155,68 @@ jobs:
       # over: no WebGPU backend (migo does not use it, and it is what drags in
       # Dawn's vendored shader compiler), no debug info, component build off so
       # the output is the static pieces an xcframework is assembled from.
-      - name: Configure for iOS and for macOS, without building
+      - name: Configure for iOS, the iOS simulator and macOS, without building
         run: |
           set -euo pipefail
           cd "$ANGLE_ROOT"
+
+          # Three configurations, not two, and the third is a fact this probe
+          # produced rather than a guess. `target_os="ios"` alone fails at
+          # import time:
+          #
+          #   ERROR at //build/config/apple/mobile_config.gni:103:3
+          #   target_environment must be in ["simulator", "device", "catalyst"]
+          #
+          # So iOS is configured per environment, which is the same split the
+          # xcframework already has: .github/workflows/apple-sdk.yml builds an
+          # `ios` leg and an `ios-simulator` leg because an xcframework refuses a
+          # fat archive that mixes them. ANGLE has to be built the same way, and
+          # a build script written without this would have discovered it after a
+          # checkout rather than before one.
           for args in \
-            "target_os=\"ios\" target_cpu=\"arm64\" ios_enable_code_signing=false" \
-            "target_os=\"mac\" target_cpu=\"arm64\""; do
-            out="out/probe-$(echo "$args" | tr -dc 'a-z0-9')"
+            'target_os="ios" target_environment="device" target_cpu="arm64" ios_enable_code_signing=false' \
+            'target_os="ios" target_environment="simulator" target_cpu="arm64" ios_enable_code_signing=false' \
+            'target_os="mac" target_cpu="arm64"'; do
+            out="out/probe-$(printf '%s' "$args" | tr -dc 'a-z0-9')"
             gn gen "$out" --args="is_debug=false symbol_level=0 is_component_build=false angle_enable_wgpu=false angle_enable_vulkan=false angle_enable_metal=true $args"
             echo "--- $out ---"
             gn args "$out" --list --short --overrides-only
-            ninja -C "$out" -t targets all 2>/dev/null | wc -l
+            echo "targets in graph: $(ninja -C "$out" -t targets all 2>/dev/null | wc -l)"
           done
+
+      # The last unknown in A2.1's cost, now that the checkout is known to be
+      # four minutes and 12 GB.
+      #
+      # One configuration, not three: the question is how long ANGLE takes to
+      # compile for an Apple target on this runner, and three answers to it
+      # would be the same answer three times. iOS device arm64 because that is
+      # the slice the product actually ships.
+      #
+      # Bounded by `timeout` rather than by the job's, so exceeding the budget
+      # is a measurement this step reports rather than a kill that erases every
+      # fact the steps before it established. `libEGL` and `libGLESv2` and not
+      # `all`: those two are the deliverable, and `all` includes ANGLE's own
+      # test binaries, which nothing here ships.
+      - name: How long one Apple configuration takes to build
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cd "$ANGLE_ROOT"
+          out="$(ls -d out/probe-*device* | head -1)"
+          echo "building in $out"
+          started=$SECONDS
+          if timeout 3600 ninja -C "$out" libEGL libGLESv2; then
+            echo "RESULT: built in $((SECONDS - started)) seconds"
+          else
+            status=$?
+            if [ "$status" = 124 ]; then
+              echo "RESULT: did not finish within 3600 seconds"
+            else
+              echo "RESULT: ninja exited $status after $((SECONDS - started)) seconds"
+            fi
+          fi
+          df -h /
+          du -sh "$out" || true
 
       - name: The answer
         if: always()
