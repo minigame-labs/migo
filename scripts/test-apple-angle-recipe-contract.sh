@@ -100,8 +100,28 @@ print(json.load(open(sys.argv[1]))["source"]["gn_args_common"])' "$lock" 2>/dev/
             "--print-gn-args answered for $UNMAPPED_CONTROL, so the totality check below proves nothing"
     fi
 
+    # --- the platform set is one set --------------------------------------
+    # Three places iterate "every Apple platform": the recipe's xcframework
+    # assembly, its CI lane, and this gate. They all ask build-apple-sdk.sh, and
+    # what is checked here is that the recipe AGREES -- a platform the SDK script
+    # names must be one the recipe will act on, or an archive step would iterate
+    # three platforms and quietly pack two.
+    if ! platforms="$(bash "$sdk" --print-platforms 2>/dev/null)" || [ -z "$platforms" ]; then
+        report platforms-unavailable "build-apple-sdk.sh --print-platforms produced nothing"
+        platforms=""
+    fi
+    for platform in $platforms; do
+        # Exit 2 is "I do not know this platform"; exit 1 is "I know it and there
+        # is nothing installed", which is the expected answer in a clean tree.
+        bash "$angle" --archive "$platform" >/dev/null 2>&1 && archive_status=0 || archive_status=$?
+        if [ "$archive_status" -eq 2 ]; then
+            report platform-set-disagreement \
+                "build-apple-sdk.sh names '$platform' and build-angle-apple.sh rejects it"
+        fi
+    done
+
     # --- total over the engine's own slices ----------------------------------
-    for platform in ios ios-simulator macos; do
+    for platform in $platforms; do
         if ! slices="$(bash "$sdk" --print-slices "$platform" 2>/dev/null)"; then
             report slices-unavailable "build-apple-sdk.sh --print-slices $platform failed"
             continue
@@ -356,8 +376,21 @@ p.write_text(json.dumps(doc, indent=2))
 PY
 expect_violation "the lock file carries a deployment target" lock-carries-deployment-target "$dest"
 
+# 12. The recipe stops knowing a platform the engine builds for.
+dest="$(fixture platformset)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'SETPY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+s = s.replace(
+    '    if ! slices_for_platform "$PLATFORM" >/dev/null 2>&1; then',
+    '    if [ "$PLATFORM" = "ios-simulator" ] || ! slices_for_platform "$PLATFORM" >/dev/null 2>&1; then',
+    1)
+p.write_text(s)
+SETPY
+expect_violation "the recipe drops a platform the engine builds for" platform-set-disagreement "$dest"
+
 if [ "$failures" -ne 0 ]; then
     bad "$failures check(s) failed"
     exit 1
 fi
-echo "PASS: the Apple ANGLE recipe contract holds, and 11 injections were each seen to break it"
+echo "PASS: the Apple ANGLE recipe contract holds, and 12 injections were each seen to break it"

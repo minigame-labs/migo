@@ -96,6 +96,8 @@
 # Usage:
 #   scripts/build-angle-apple.sh --fetch [--source DIR] [--revision SHA]
 #   scripts/build-angle-apple.sh --platform <ios|ios-simulator|macos> [--source DIR]
+#                                            [--keep-going]
+#   scripts/build-angle-apple.sh --archive <ios|ios-simulator|macos>
 #   scripts/build-angle-apple.sh --xcframework
 #   scripts/build-angle-apple.sh --print-gn-args <rust-target-triple>
 #   scripts/build-angle-apple.sh --check
@@ -105,6 +107,21 @@
 #   --platform       gn gen + ninja for every slice of that platform group, then
 #                    lipo them into engine/third_party/angle-apple-<platform>/.
 #                    macOS only.
+#   --archive        Pack one installed platform into a single .tar.gz for
+#                    publication, beside a .sha256 of it. One archive per
+#                    platform rather than one asset per file, because an iOS
+#                    product is a DIRECTORY (a framework bundle) and a directory
+#                    is not a release asset. Made on the machine that built the
+#                    bytes, so what gets published is what the build produced
+#                    rather than a repackaging of a CI artifact download.
+#   --keep-going     Diagnostic only: pass `-k 0` to ninja so a failing build
+#                    reports EVERY failure instead of stopping at the first.
+#                    It exists because "is this one broken file or twenty" is
+#                    the question that decides whether a problem is patched or
+#                    designed around, and answering it one build at a time costs
+#                    a checkout each time. Never for a shipping build -- it makes
+#                    a partial build look like a finished one, and the install
+#                    step below is what then fails.
 #   --xcframework    Assemble the installed platforms into two xcframeworks in
 #                    platforms/apple/Frameworks/. macOS only. Two, not one:
 #                    `xcodebuild -create-xcframework` holds one library per
@@ -136,30 +153,36 @@ MODE=""
 PLATFORM=""
 PRINT_TRIPLE=""
 REVISION=""
+KEEP_GOING=0
 
 err()  { printf '\033[0;31m[angle-apple] %s\033[0m\n' "$*" >&2; }
 ok()   { printf '\033[0;32m[angle-apple] %s\033[0m\n' "$*"; }
 info() { printf '\033[0;36m[angle-apple] %s\033[0m\n' "$*"; }
 
 usage() {
-    sed -n '/^# Usage:/,/^# ===/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # The header IS the usage text -- one copy, so `--help` cannot drift from
+    # what the file says. The closing banner line is excluded rather than
+    # trimmed afterwards, so the range stays readable.
+    sed -n '/^# Usage:/,/^# ====/{/^# ====/!p;}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --fetch)          MODE="fetch"; shift ;;
         --platform)       MODE="build"; PLATFORM="${2:-}"; shift 2 ;;
+        --archive)        MODE="archive"; PLATFORM="${2:-}"; shift 2 ;;
         --xcframework)    MODE="xcframework"; shift ;;
         --print-gn-args)  MODE="print-gn-args"; PRINT_TRIPLE="${2:-}"; shift 2 ;;
         --check)          MODE="check"; shift ;;
         --source)         SOURCE="${2:-}"; shift 2 ;;
         --revision)       REVISION="${2:-}"; shift 2 ;;
+        --keep-going)     KEEP_GOING=1; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                err "unknown argument: $1"; usage >&2; exit 2 ;;
     esac
 done
 
-[ -n "$MODE" ] || { err "one of --fetch, --platform, --xcframework, --print-gn-args or --check is required"; usage >&2; exit 2; }
+[ -n "$MODE" ] || { err "one of --fetch, --platform, --archive, --xcframework, --print-gn-args or --check is required"; usage >&2; exit 2; }
 [ -f "$LOCK" ] || { err "pin not found: $LOCK"; exit 1; }
 
 # ---------------------------------------------------------------------------
@@ -260,6 +283,13 @@ slices_for_platform() {
     bash "$SDK_SCRIPT" --print-slices "$1"
 }
 
+# Every Apple slice group, from the script that defines them. Iterating a
+# written-out list here would be a second copy of a set that already exists, and
+# the copy that quietly covers two of three is the one nobody notices.
+apple_platforms() {
+    bash "$SDK_SCRIPT" --print-platforms
+}
+
 if [ "$MODE" = "print-gn-args" ]; then
     [ -n "$PRINT_TRIPLE" ] || { err "--print-gn-args needs a Rust target triple"; exit 2; }
     gn_args_for_triple "$PRINT_TRIPLE" || exit 1
@@ -303,7 +333,16 @@ check_ready() {
     for tool in python3 git; do
         command -v "$tool" >/dev/null 2>&1 || { err "not on PATH: $tool"; failures=$((failures + 1)); }
     done
-    case "$MODE" in
+    # `--check` answers for the WHOLE lane, not for itself. A readiness report
+    # that only checks what the reporting mode needs is the shape this
+    # repository keeps removing: it passes on a machine that cannot do the work,
+    # and the first thing anyone learns is a failure four minutes into a 12 GB
+    # fetch. On a host that cannot build ANGLE at all this is expected to fail,
+    # which is the same position scripts/build-apple-sdk.sh takes.
+    checking="$MODE"
+    [ "$MODE" = "check" ] && checking="fetch build archive xcframework"
+    for mode in $checking; do
+    case "$mode" in
         fetch)
             for tool in fetch gclient; do
                 command -v "$tool" >/dev/null 2>&1 || {
@@ -318,10 +357,21 @@ check_ready() {
                 command -v "$tool" >/dev/null 2>&1 || { err "not on PATH: $tool"; failures=$((failures + 1)); }
             done
             ;;
+        archive)
+            command -v tar >/dev/null 2>&1 || { err "not on PATH: tar"; failures=$((failures + 1)); }
+            # Either digest tool, matching what the archive step actually calls.
+            # A readiness check stricter than the code it guards fails for a
+            # reason that is not true, which is worse than not checking.
+            command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 || {
+                err "no sha256 tool on PATH: neither shasum nor sha256sum"
+                failures=$((failures + 1))
+            }
+            ;;
         xcframework)
             command -v xcodebuild >/dev/null 2>&1 || { err "not on PATH: xcodebuild"; failures=$((failures + 1)); }
             ;;
     esac
+    done
     echo "$PINNED_REVISION" | grep -Eq '^[0-9a-f]{40}$' \
         || { err "source.angle_revision is not a 40-character commit hash: $PINNED_REVISION"; failures=$((failures + 1)); }
     return "$failures"
@@ -384,6 +434,53 @@ PY
         exit 1
     fi
     ok "ANGLE at $REVISION in $ANGLE_ROOT"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Archive for publication
+# ---------------------------------------------------------------------------
+
+# Deliberately BEFORE the macOS gate and before the checkout check: packing bytes
+# that already exist needs neither Xcode nor a 12 GB source tree, and a mode that
+# refuses to run on a machine where it would work is a mode nobody can test.
+if [ "$MODE" = "archive" ]; then
+    if ! slices_for_platform "$PLATFORM" >/dev/null 2>&1; then
+        err "--archive needs a platform scripts/build-apple-sdk.sh knows:"
+        apple_platforms | sed 's/^/  /' >&2
+        exit 2
+    fi
+    src="$INSTALL_ROOT/angle-apple-$PLATFORM"
+    [ -d "$src" ] || { err "nothing installed for $PLATFORM: $src"; exit 1; }
+
+    mkdir -p "$BUILD_ROOT"
+    archive="$BUILD_ROOT/angle-apple-$PLATFORM.tar.gz"
+    rm -f "$archive" "$archive.sha256"
+
+    # `COPYFILE_DISABLE=1` so bsdtar does not write AppleDouble `._` members for
+    # extended attributes. Those are metadata about the build machine, they
+    # differ between runs, and one of them inside a framework bundle is a file a
+    # consumer would have to explain.
+    #
+    # This archive is NOT claimed to be byte-reproducible -- gzip stores an
+    # mtime, and nothing here strips it. The pin is trust-on-first-use, the same
+    # model contracts/artifact-manifest/ohos-sdk.lock.json states plainly: the
+    # hash proves the bytes have not changed since they were hashed, not that a
+    # second build would produce them.
+    COPYFILE_DISABLE=1 tar -czf "$archive" -C "$INSTALL_ROOT" "angle-apple-$PLATFORM"
+
+    if command -v shasum >/dev/null 2>&1; then
+        digest="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+    else
+        digest="$(sha256sum "$archive" | cut -d' ' -f1)"
+    fi
+    bytes="$(wc -c < "$archive" | tr -d ' ')"
+    printf '%s  %s\n' "$digest" "$(basename "$archive")" > "$archive.sha256"
+
+    ok "$archive"
+    ok "  sha256      $digest"
+    ok "  size_bytes  $bytes"
+    ok "  contents    $(tar -tzf "$archive" | sed "s|^angle-apple-$PLATFORM/||" | grep -v '^$' | cut -d/ -f1 | sort -u | tr '\n' ' ')"
     exit 0
 fi
 
@@ -459,8 +556,13 @@ if [ "$MODE" = "build" ]; then
         info "gn gen $out"
         ( cd "$ANGLE_ROOT" && gn gen "$out" --args="$args" )
         ( cd "$ANGLE_ROOT" && gn args "$out" --list --short --overrides-only )
-        info "ninja -C $out $NINJA_TARGETS"
-        ( cd "$ANGLE_ROOT" && ninja -C "$out" $NINJA_TARGETS )
+        if [ "$KEEP_GOING" = "1" ]; then
+            info "ninja -k 0 -C $out $NINJA_TARGETS  (diagnostic: reports every failure)"
+            ( cd "$ANGLE_ROOT" && ninja -k 0 -C "$out" $NINJA_TARGETS )
+        else
+            info "ninja -C $out $NINJA_TARGETS"
+            ( cd "$ANGLE_ROOT" && ninja -C "$out" $NINJA_TARGETS )
+        fi
     done
 
     rm -rf "$OUT_DIR"
@@ -554,7 +656,7 @@ if [ "$MODE" = "xcframework" ]; then
         library_count=0
         flavour=""
         present=""
-        for platform in ios ios-simulator macos; do
+        for platform in $(apple_platforms); do
             install_dir="$INSTALL_ROOT/angle-apple-$platform"
             [ -d "$install_dir" ] || continue
             candidate="$(locate_product "$install_dir" "$target")" || exit 1
