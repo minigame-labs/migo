@@ -516,6 +516,13 @@ jobs:
       - name: The Apple ANGLE recipe is total, derived and fails closed
         run: bash scripts/test-apple-angle-recipe-contract.sh
 
+      # The pin is complete, hashed, and nothing downstream names an asset or a
+      # hash itself. Beside the recipe gate because they check the two halves of
+      # one lock file: the recipe gate keeps the SOURCE half derived, this keeps
+      # the ARTIFACT half honest. Neither needs a Mac.
+      - name: The Apple ANGLE pin is complete and fetched by hash
+        run: bash scripts/test-apple-angle-pin-contract.sh
+
       # macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
       # unbound-variable error rather than nothing. Linux's bash 5 expands it to
       # nothing, so the entire class is invisible here and fatal there -- and
