@@ -32,15 +32,24 @@
 #   4. Every lane minimum is at or above its platform's floor. A lane minimum
 #      below the floor is unreachable configuration that still reads as
 #      supported.
-#   5. With --artifacts DIR, LC_BUILD_VERSION minos in the built Mach-O files.
-#      This is the only check that verifies the product rather than the
+#   5. With --artifacts DIR, the deployment target recorded in the built Mach-O
+#      files. This is the only check that verifies the product rather than the
 #      declaration, and it is the one that matters: an Android floor was
 #      declared correctly for API 26 while the shipped library carried a strong
 #      reference to an API 29 symbol and failed to load. Declarations were all
 #      consistent. The artifact was wrong.
 #
-# Fails closed. An unreadable contract, a missing tool in artifact mode, or a
-# sweep that matches nothing at all are errors, not passes.
+#      Every architecture and every archive member of it, through
+#      scripts/lib/macho_build_version.py rather than vtool or otool. What an
+#      Apple slice ships here is an `ar` archive of Mach-O members: vtool takes
+#      a single Mach-O and reports nothing for an archive, and otool handed a
+#      universal archive prints one architecture -- the host's -- with -arch
+#      unable to move it. Two of the three slice groups are `lipo` output, so
+#      the tool that looks right audits half the product and reports a pass.
+#
+# Fails closed. An unreadable contract, an artifact directory with no Mach-O in
+# it, a Mach-O the reader cannot parse, or a sweep that matches nothing at all
+# are errors, not passes.
 # =============================================================================
 set -uo pipefail
 
@@ -70,9 +79,10 @@ usage() {
     cat <<'USAGE'
 usage: test-apple-deployment-floor-contract.sh [--artifacts DIR]
 
-  --artifacts DIR   Additionally read LC_BUILD_VERSION from every Mach-O under
-                    DIR and require its minos to equal the declared floor.
-                    Requires vtool or otool, so in practice a macOS runner.
+  --artifacts DIR   Additionally read the deployment target out of every Mach-O
+                    under DIR -- every universal slice, every archive member --
+                    and require it to equal the declared floor. Needs no Xcode:
+                    the reader parses the file formats itself.
 USAGE
 }
 
@@ -415,49 +425,72 @@ if [ -n "$ARTIFACT_DIR" ]; then
         err "--artifacts $ARTIFACT_DIR is not a directory"
         exit 1
     fi
-    reader=""
-    if command -v vtool >/dev/null 2>&1; then
-        reader="vtool"
-    elif command -v otool >/dev/null 2>&1; then
-        reader="otool"
-    else
-        err "--artifacts needs vtool or otool; neither is on PATH."
+
+    # The reader reports what the bytes say and holds no opinion about the
+    # floor; the floor is this script's business, from the contract. It prints
+    # tab-separated FILE, ARCH and RECORD lines, and
+    # scripts/ci/tests/test_macho_build_version.py pins that shape -- the fields
+    # below are read by position.
+    READER="$SCRIPT_DIR/lib/macho_build_version.py"
+    if [ ! -f "$READER" ]; then
+        err "missing ${READER#$REPO_ROOT/}"
         err "Refusing to report a pass without reading the binaries."
         exit 1
     fi
 
+    if ! artifact_report="$(python3 "$READER" --relative-to "$ARTIFACT_DIR" "$ARTIFACT_DIR" 2>&1)"; then
+        err "could not read the Mach-O files under $ARTIFACT_DIR:"
+        printf '%s\n' "$artifact_report" >&2
+        exit 1
+    fi
+
     checked=0
-    while IFS= read -r macho; do
-        case "$macho" in *.a|*.dylib|*.o) ;; *) continue ;; esac
-        checked=$((checked + 1))
-        if [ "$reader" = "vtool" ]; then
-            load_output="$(vtool -show-build "$macho" 2>/dev/null)"
-        else
-            load_output="$(otool -l "$macho" 2>/dev/null)"
-        fi
-        minos="$(printf '%s\n' "$load_output" | awk '/minos/ { print $2; exit }')"
-        platform="$(printf '%s\n' "$load_output" | awk '/platform/ { print $2; exit }')"
-        if [ -z "$minos" ]; then
-            fail "no LC_BUILD_VERSION in ${macho#$ARTIFACT_DIR/}"
-            continue
-        fi
-        case "$platform" in
-            *IOS*|*ios*|1|7) expected="$ios_floor" ;;
-            *MACOS*|*macos*|6) expected="$macos_floor" ;;
-            *) fail "unrecognised platform '$platform' in ${macho#$ARTIFACT_DIR/}"; continue ;;
+    while IFS=$'\t' read -r kind f1 f2 f3 f4 f5 f6; do
+        case "$kind" in
+            "") ;;
+            FILE)
+                # f1 path, f2 Mach-O objects read, f3 deployment targets found
+                checked=$((checked + 1))
+                if [ "$f2" -eq 0 ]; then
+                    fail "$f1 is a Mach-O container holding no Mach-O object at all"
+                fi
+                ;;
+            ARCH)
+                # f1 path, f2 architecture, f3 objects read, f4 targets found
+                if [ "$f4" -eq 0 ]; then
+                    fail "$f1: the $f2 slice declares no deployment target in any of its $f3 object(s)"
+                fi
+                ;;
+            RECORD)
+                # f1 path, f2 architecture, f3 platform, f4 minos, f5 objects
+                # agreeing on it, f6 one of them
+                case "$f3" in
+                    ios|iossimulator) expected="$ios_floor" ;;
+                    macos)            expected="$macos_floor" ;;
+                    *)
+                        fail "$f1: the $f2 slice targets $f3, a platform contracts/apple/deployment-floor.json does not cover"
+                        continue
+                        ;;
+                esac
+                if [ "$f4" != "$expected" ]; then
+                    fail "$f1: $f2 targets $f3 $f4, contract says $expected ($f5 object(s), e.g. $f6)"
+                else
+                    info "ok: $f1 $f2 targets $f3 $f4 ($f5 object(s))"
+                fi
+                ;;
+            *)
+                fail "the Mach-O reader printed a '$kind' line this gate does not understand"
+                ;;
         esac
-        if [ "$minos" != "$expected" ]; then
-            fail "${macho#$ARTIFACT_DIR/} was built with minos $minos, contract says $expected"
-        fi
-    done < <(find "$ARTIFACT_DIR" -type f 2>/dev/null)
+    done <<<"$artifact_report"
 
     if [ "$checked" -eq 0 ]; then
         fail "--artifacts $ARTIFACT_DIR contained no Mach-O files to read"
     else
-        info "artifacts: read LC_BUILD_VERSION from $checked file(s) using $reader"
+        info "artifacts: read the deployment target from $checked Mach-O container(s)"
     fi
 else
-    info "skip: artifact check needs --artifacts DIR on a macOS runner"
+    info "skip: artifact check needs --artifacts DIR"
 fi
 
 # ---------------------------------------------------------------------------
