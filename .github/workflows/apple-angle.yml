@@ -194,8 +194,13 @@ jobs:
             bash scripts/build-angle-apple.sh --archive "$platform"
           done < "$list"
 
-      # Two xcframeworks, because `xcodebuild -create-xcframework` holds one
-      # library per platform and this ships libEGL and libGLESv2.
+      # Four xcframeworks: one per shipped library per platform family.
+      # `xcodebuild -create-xcframework` holds one library per platform AND
+      # refuses to hold framework bundles beside plain libraries -- it said so
+      # on run 33958391676 -- while ANGLE emits a framework bundle on iOS and a
+      # shared library on macOS. Repackaging macOS to match would break ANGLE's
+      # own lookup of libGLESv2; scripts/build-angle-apple.sh carries the source
+      # lines. So the split follows ANGLE's axis and the count follows from it.
       - name: Assemble the xcframeworks
         run: bash scripts/build-angle-apple.sh --xcframework
 

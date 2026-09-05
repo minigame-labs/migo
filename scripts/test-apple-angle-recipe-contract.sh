@@ -54,6 +54,11 @@ bad()  { printf '\033[0;31m[FAIL]\033[0m %s\n' "$*" >&2; }
 # check above became vacuous -- every slice would "have" a configuration.
 UNMAPPED_CONTROL="aarch64-apple-tvos"
 
+# The same control one level up: a platform group build-apple-sdk.sh does not
+# name. --print-loader-layout answering for it would make the totality check
+# over the real platforms prove nothing.
+UNMAPPED_PLATFORM_CONTROL="tvos"
+
 # ---------------------------------------------------------------------------
 # The audit. One implementation, run against the real tree and against every
 # injected fixture, so a violation this gate claims to catch is a violation it
@@ -260,6 +265,116 @@ print(json.load(open(sys.argv[1]))["source"]["gn_args_common"])' "$lock" 2>/dev/
         done
     done
 
+    # --- the packaging rule ANGLE's own loader imposes ----------------------
+    # libEGL does not link libGLESv2. It opens it at run time under a name it
+    # composes against a directory, so how these products may be laid out is not
+    # a matter of taste, and the tidy-looking repackaging is the one that breaks
+    # it. ANGLE's algorithm, read at the pinned revision:
+    #
+    #   src/common/system_utils.cpp:221-234   name + "." + extension, and on the
+    #                                         iOS family + "/" + name again
+    #   src/common/system_utils_ios.cpp:27    that extension is "framework"
+    #   src/common/system_utils_mac.cpp:26    that extension is "dylib"
+    #   src/common/system_utils_posix.cpp:198 the directory is the app's
+    #                                         Frameworks/ on the iOS family and
+    #                                         libEGL's own directory on macOS
+    #
+    # Recomputed here from that algorithm and compared against what the recipe
+    # answers. The day somebody wraps the macOS libraries in framework bundles
+    # -- which is the obvious way to make one xcframework hold all three
+    # platforms, and which moves libEGL to Versions/A/ where its search for
+    # libGLESv2.dylib finds nothing -- this goes red on a Linux pull request
+    # rather than at the first eglInitialize on a device.
+    targets="$(python3 -c '
+import json, sys
+print(" ".join(json.load(open(sys.argv[1]))["source"]["ninja_targets"]))' "$lock" 2>/dev/null || true)"
+    if [ -z "$targets" ]; then
+        report lock-ninja-targets-missing \
+            "source.ninja_targets is empty, so the loader layout below covers nothing"
+    fi
+
+    # The family a platform's slices are configured for, taken from the gn
+    # arguments the recipe generates rather than from its name. Same axis ANGLE
+    # switches product shape on.
+    platform_family_of() {
+        pf_slices="$(bash "$sdk" --print-slices "$1" 2>/dev/null)" || return 1
+        pf_family=""
+        for pf_triple in $pf_slices; do
+            pf_args="$(bash "$angle" --print-gn-args "$pf_triple" 2>/dev/null)" || return 1
+            case "$pf_args" in
+                *'target_os="ios"'*) pf_this=ios ;;
+                *'target_os="mac"'*) pf_this=mac ;;
+                *) return 1 ;;
+            esac
+            [ -z "$pf_family" ] || [ "$pf_family" = "$pf_this" ] || return 1
+            pf_family="$pf_this"
+        done
+        [ -n "$pf_family" ] || return 1
+        printf '%s' "$pf_family"
+    }
+
+    families=""
+    for platform in $platforms; do
+        if ! family="$(platform_family_of "$platform")"; then
+            report platform-family-underivable \
+                "$platform: no single gn target_os across its slices, so its product shape is undefined"
+            continue
+        fi
+        case " $families " in
+            *" $family "*) ;;
+            *) families="$families $family" ;;
+        esac
+
+        if ! layout="$(bash "$angle" --print-loader-layout "$platform" 2>/dev/null)"; then
+            report loader-layout-unavailable \
+                "--print-loader-layout $platform failed, so the packaging rule has no owner"
+            continue
+        fi
+        for target in $targets; do
+            case "$family" in
+                ios) want_layout="$target.framework/$target" ;;
+                mac) want_layout="$target.dylib" ;;
+            esac
+            got_layout=""
+            while read -r layout_target layout_path; do
+                [ "$layout_target" = "$target" ] && got_layout="$layout_path"
+            done <<LAYOUT
+$layout
+LAYOUT
+            if [ "$got_layout" != "$want_layout" ]; then
+                report loader-layout-drift \
+                    "$platform/$target: ANGLE loads '$want_layout', the recipe lays out '${got_layout:-nothing}'"
+            fi
+        done
+    done
+
+    if bash "$angle" --print-loader-layout "$UNMAPPED_PLATFORM_CONTROL" >/dev/null 2>&1; then
+        report loader-layout-not-fail-closed \
+            "--print-loader-layout answered for $UNMAPPED_PLATFORM_CONTROL, so the check above proves nothing"
+    fi
+
+    # --- the xcframeworks stay split along that same axis --------------------
+    # `xcodebuild -create-xcframework` refuses to hold framework bundles and
+    # plain libraries in one bundle -- measured, run 33958391676 -- and ANGLE
+    # emits one shape on iOS and the other on macOS. So there is one xcframework
+    # per shipped library per family. Counted rather than pattern-matched: the
+    # names belong to the recipe, the arithmetic does not.
+    family_count=0
+    for family in $families; do family_count=$((family_count + 1)); done
+    target_count=0
+    for target in $targets; do target_count=$((target_count + 1)); done
+    if ! xcframeworks="$(bash "$angle" --print-xcframeworks 2>/dev/null)" || [ -z "$xcframeworks" ]; then
+        report xcframeworks-unavailable "--print-xcframeworks produced nothing"
+    elif [ "$family_count" -gt 0 ] && [ "$target_count" -gt 0 ]; then
+        want_bundles=$((target_count * family_count))
+        got_bundles="$(printf '%s\n' "$xcframeworks" | wc -l | tr -d ' ')"
+        uniq_bundles="$(printf '%s\n' "$xcframeworks" | sort -u | wc -l | tr -d ' ')"
+        if [ "$got_bundles" -ne "$want_bundles" ] || [ "$uniq_bundles" -ne "$want_bundles" ]; then
+            report xcframework-not-split-by-family \
+                "$target_count libraries x $family_count families needs $want_bundles xcframeworks; the recipe names $got_bundles ($uniq_bundles distinct)"
+        fi
+    fi
+
     echo "$findings"
     [ "$findings" -eq 0 ]
 }
@@ -442,8 +557,53 @@ dest="$(fixture nopatch)"
 rm -f "$dest/engine/third_party/angle-patches/apple/"*.patch
 expect_violation "the ANGLE patches are deleted" angle-patches-missing "$dest"
 
+# 14. The macOS libraries get wrapped in framework bundles so that one
+#     xcframework can hold every platform. It is the tidy-looking answer to
+#     xcodebuild's refusal, and it breaks ANGLE's own dispatch-library lookup:
+#     libEGL moves to Versions/A/ and searches there for libGLESv2.dylib.
+#     Nothing fails until an application asks EGL for a display, which is why
+#     this is an injection rather than a comment saying not to.
+dest="$(fixture wrapmac)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'WRAPMAC'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        mac) printf '%s.dylib' "$2" ;;"""
+assert s.count(old) == 1
+p.write_text(s.replace(old, """        mac) printf '%s.framework/Versions/A/%s' "$2" "$2" ;;""", 1))
+WRAPMAC
+expect_violation "the macOS libraries are repackaged as framework bundles" loader-layout-drift "$dest"
+
+# 15. The layout question stops failing closed. Without this control, 14 would
+#     pass for a recipe that answered something for every platform name.
+dest="$(fixture layoutopen)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'LAYOUTOPEN'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    family_slices="$(slices_for_platform "$family_platform")" || return 1"""
+assert s.count(old) == 1
+s = s.replace(old, """    family_slices="$(slices_for_platform "$family_platform" 2>/dev/null || true)\"""", 1)
+old = """    [ -n "$family_seen" ] || { err "platform '$family_platform' reports no slices"; return 1; }"""
+assert s.count(old) == 1
+s = s.replace(old, """    [ -n "$family_seen" ] || family_seen=mac""", 1)
+p.write_text(s)
+LAYOUTOPEN
+expect_violation "the loader layout answers for a platform nobody builds" loader-layout-not-fail-closed "$dest"
+
+# 16. The xcframework split collapses: the family stops being part of the name,
+#     so both families are asked to share one bundle. That is exactly the
+#     configuration xcodebuild refused on run 33958391676.
+dest="$(fixture unsplit)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'UNSPLIT'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    printf 'ANGLELib%s-%s' "${1#lib}" "$xcf_token\""""
+assert s.count(old) == 1
+p.write_text(s.replace(old, """    printf 'ANGLELib%s' "${1#lib}\"""", 1))
+UNSPLIT
+expect_violation "the xcframeworks stop being split by platform family" xcframework-not-split-by-family "$dest"
+
 if [ "$failures" -ne 0 ]; then
     bad "$failures check(s) failed"
     exit 1
 fi
-echo "PASS: the Apple ANGLE recipe contract holds, and 13 injections were each seen to break it"
+echo "PASS: the Apple ANGLE recipe contract holds, and 16 injections were each seen to break it"

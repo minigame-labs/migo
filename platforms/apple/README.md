@@ -107,8 +107,14 @@ platforms/apple/
     Tests/
   Package.swift              the shipping package; floor values derived from
                              contracts/apple/deployment-floor.json
-  Frameworks/                generated, gitignored: MigoEngine.xcframework and
-                             ANGLELibEGL / ANGLELibGLESv2.xcframework
+  Frameworks/                generated, gitignored: MigoEngine.xcframework and,
+                             from scripts/build-angle-apple.sh --xcframework,
+                             ANGLELib{EGL,GLESv2}-{ios,macos}.xcframework -- four,
+                             because an xcframework cannot hold ANGLE's iOS
+                             framework bundles beside its macOS libraries and
+                             repackaging either one breaks ANGLE's own lookup of
+                             libGLESv2 (`--print-loader-layout` says what the
+                             layout has to be, and why)
   Sources/
     MigoAppleRenderer/       internal: CAMetalLayer, display link, surface attach
     MigoAppleWebKit/         lane 1

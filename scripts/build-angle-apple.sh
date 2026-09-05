@@ -105,6 +105,8 @@
 #   scripts/build-angle-apple.sh --archive <ios|ios-simulator|macos>
 #   scripts/build-angle-apple.sh --xcframework
 #   scripts/build-angle-apple.sh --print-gn-args <rust-target-triple>
+#   scripts/build-angle-apple.sh --print-loader-layout <ios|ios-simulator|macos>
+#   scripts/build-angle-apple.sh --print-xcframeworks
 #   scripts/build-angle-apple.sh --check
 #
 #   --fetch          Create or update the ANGLE checkout at --source and put it
@@ -127,14 +129,32 @@
 #                    a checkout each time. Never for a shipping build -- it makes
 #                    a partial build look like a finished one, and the install
 #                    step below is what then fails.
-#   --xcframework    Assemble the installed platforms into two xcframeworks in
-#                    platforms/apple/Frameworks/. macOS only. Two, not one:
+#   --xcframework    Assemble the installed platforms into xcframeworks in
+#                    platforms/apple/Frameworks/. macOS only. One per shipped
+#                    library per platform family -- four -- because
 #                    `xcodebuild -create-xcframework` holds one library per
-#                    platform, and this ships two.
+#                    platform AND refuses to mix framework bundles with plain
+#                    libraries, which is the split ANGLE itself makes on
+#                    `is_ios`. The alternative, repackaging macOS to match iOS,
+#                    breaks ANGLE's own dispatch-library lookup; see "The layout
+#                    ANGLE's own loader will search".
 #   --print-gn-args  Print the full gn argument string for one Rust target
 #                    triple and exit, on any host. It is how the contract gate
 #                    checks this script's real behaviour instead of grepping it,
 #                    and it fails closed on a triple with no mapping.
+#   --print-loader-layout
+#                    Print `<ninja target> <path>` per line: where ANGLE's own
+#                    loader will look for each library, relative to the
+#                    directory they are installed into. Any host. The build step
+#                    asserts against it and the contract gate checks it, so the
+#                    rule that decides how these products may be packaged is one
+#                    the recipe can be ASKED about rather than one someone has
+#                    to know.
+#   --print-xcframeworks
+#                    Print the basenames --xcframework would assemble. Any host.
+#                    One per shipped library per platform family; a consumer's
+#                    Package.swift needs these names, and the contract gate uses
+#                    them to check the split survives.
 #   --check          Report readiness and build nothing.
 #
 # bash 3.2: macOS ships it as /bin/bash and this script runs there. No mapfile,
@@ -179,6 +199,10 @@ while [ $# -gt 0 ]; do
         --archive)        MODE="archive"; PLATFORM="${2:-}"; shift 2 ;;
         --xcframework)    MODE="xcframework"; shift ;;
         --print-gn-args)  MODE="print-gn-args"; PRINT_TRIPLE="${2:-}"; shift 2 ;;
+        --print-loader-layout)
+                          MODE="print-loader-layout"; PLATFORM="${2:-}"; shift 2 ;;
+        --print-xcframeworks)
+                          MODE="print-xcframeworks"; shift ;;
         --check)          MODE="check"; shift ;;
         --source)         SOURCE="${2:-}"; shift 2 ;;
         --revision)       REVISION="${2:-}"; shift 2 ;;
@@ -188,7 +212,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -n "$MODE" ] || { err "one of --fetch, --platform, --archive, --xcframework, --print-gn-args or --check is required"; usage >&2; exit 2; }
+[ -n "$MODE" ] || { err "one of --fetch, --platform, --archive, --xcframework, --print-gn-args, --print-loader-layout, --print-xcframeworks or --check is required"; usage >&2; exit 2; }
 [ -f "$LOCK" ] || { err "pin not found: $LOCK"; exit 1; }
 
 # ---------------------------------------------------------------------------
@@ -296,10 +320,151 @@ apple_platforms() {
     bash "$SDK_SCRIPT" --print-platforms
 }
 
+# ---------------------------------------------------------------------------
+# The layout ANGLE's own loader will search
+# ---------------------------------------------------------------------------
+
+# libEGL DOES NOT LINK libGLESv2. `otool -L` on the built library names only
+# system frameworks; libEGL opens its dispatch library at run time, under a name
+# it composes itself. Read at the pinned revision rather than remembered:
+#
+#   src/libEGL/libEGL_autogen.cpp:41     OpenSystemLibraryAndGetError(
+#                                          ANGLE_DISPATCH_LIBRARY,
+#                                          SearchType::ModuleDir)
+#   src/common/system_utils.cpp:221      name + "." + GetSharedLibraryExtension()
+#                             :229-234   ... and on the iOS family, + "/" + name
+#   src/common/system_utils_ios.cpp:27   that extension is "framework"
+#   src/common/system_utils_mac.cpp:26   that extension is "dylib"
+#   src/common/system_utils_posix.cpp:198
+#                                        ModuleDir is GetExecutableDirectory() +
+#                                        "/Frameworks/" on the iOS family, and on
+#                                        macOS the directory libEGL itself was
+#                                        loaded from, via dladdr.
+#
+# So the two products have to be siblings, and their names are load-bearing:
+#
+#   macOS       <the directory libEGL was loaded from>/libGLESv2.dylib
+#   iOS family  <the app bundle>/Frameworks/libGLESv2.framework/libGLESv2
+#
+# Both are what ANGLE's own build already emits, WHICH IS WHY THIS IS ASSERTED
+# RATHER THAN ASSUMED. `xcodebuild -create-xcframework` refuses to hold
+# frameworks and libraries in one bundle, and the tidy-looking answer to that --
+# wrap the macOS libraries in framework bundles so all three platforms match --
+# moves libEGL to libEGL.framework/Versions/A/libEGL, whereupon ANGLE searches
+# libEGL.framework/Versions/A/libGLESv2.dylib and finds nothing. That failure has
+# no build step to land in. It appears the first time an application asks EGL for
+# a display, and nothing in this repository is on the stack to say why. The
+# xcframeworks are split by family instead; see the assembly step at the end.
+#
+# What is owned here is the RELATIVE layout. Where the directory itself ends up
+# -- an app's Frameworks folder, a test bundle, a staging tree -- belongs to
+# whoever embeds it.
+loader_path_for() {
+    case "$1" in
+        ios) printf '%s.framework/%s' "$2" "$2" ;;
+        mac) printf '%s.dylib' "$2" ;;
+        *)   err "no ANGLE loader layout for platform family '$1'"; return 1 ;;
+    esac
+}
+
+loader_layout_for_family() {
+    for layout_target in $NINJA_TARGETS; do
+        layout_path="$(loader_path_for "$1" "$layout_target")" || return 1
+        printf '%s %s\n' "$layout_target" "$layout_path"
+    done
+}
+
+# Which family a platform belongs to, read out of the gn arguments this script
+# already generates for it rather than from a second list of platform names.
+# ANGLE's `angle_shared_library` template switches product shape on `is_ios` and
+# on nothing finer, so `target_os` IS the axis that both the loader layout above
+# and the xcframework split below have to follow.
+family_for_platform() {
+    family_platform="$1"
+    family_slices="$(slices_for_platform "$family_platform")" || return 1
+    family_seen=""
+    for family_triple in $family_slices; do
+        family_args="$(gn_args_for_triple "$family_triple")" || return 1
+        case "$family_args" in
+            *'target_os="ios"'*) family_this=ios ;;
+            *'target_os="mac"'*) family_this=mac ;;
+            *)  err "the gn arguments for $family_triple name no target_os this script knows"
+                return 1 ;;
+        esac
+        if [ -n "$family_seen" ] && [ "$family_seen" != "$family_this" ]; then
+            err "platform '$family_platform' mixes ANGLE families ($family_seen and $family_this):"
+            err "one platform group is one gn target_os, or its products have two shapes and"
+            err "cannot go into one xcframework."
+            return 1
+        fi
+        family_seen="$family_this"
+    done
+    [ -n "$family_seen" ] || { err "platform '$family_platform' reports no slices"; return 1; }
+    printf '%s' "$family_seen"
+}
+
+# The families present, collected from the platforms rather than written out.
+apple_families() {
+    families_seen=""
+    for families_platform in $(apple_platforms); do
+        families_one="$(family_for_platform "$families_platform")" || return 1
+        case " $families_seen " in
+            *" $families_one "*) ;;
+            *)  families_seen="$families_seen $families_one"
+                printf '%s\n' "$families_one" ;;
+        esac
+    done
+    [ -n "$families_seen" ] || { err "build-apple-sdk.sh reports no Apple platforms"; return 1; }
+}
+
+# gn's word for a family -> the word every artifact name in this repository uses.
+# Two vocabularies exist already: gn says "mac", the archives say "macos". This
+# translates rather than letting a third spelling reach a published file, and it
+# fails closed, because a family with no name would otherwise be published under
+# an empty one.
+family_artifact_token() {
+    case "$1" in
+        ios) printf 'ios' ;;
+        mac) printf 'macos' ;;
+        *)   err "no artifact name for ANGLE platform family '$1'"; return 1 ;;
+    esac
+}
+
+# One name, used by the assembly step and by --print-xcframeworks, so what the
+# lane builds and what a consumer is told to expect cannot drift apart.
+# `ANGLELib...` because a SwiftPM binaryTarget is named after the xcframework's
+# basename.
+xcframework_basename() {
+    xcf_token="$(family_artifact_token "$2")" || return 1
+    printf 'ANGLELib%s-%s' "${1#lib}" "$xcf_token"
+}
+
 if [ "$MODE" = "print-gn-args" ]; then
     [ -n "$PRINT_TRIPLE" ] || { err "--print-gn-args needs a Rust target triple"; exit 2; }
     gn_args_for_triple "$PRINT_TRIPLE" || exit 1
     printf '\n'
+    exit 0
+fi
+
+# Beside --print-gn-args and for the same reason: the properties worth checking
+# on every pull request are the ones a host with no Xcode can ask about, and a
+# question answered by RUNNING the recipe cannot drift from what it does the way
+# a grep of its source can.
+if [ "$MODE" = "print-loader-layout" ]; then
+    [ -n "$PLATFORM" ] || { err "--print-loader-layout needs a platform"; exit 2; }
+    layout_family="$(family_for_platform "$PLATFORM")" || exit 1
+    loader_layout_for_family "$layout_family" || exit 1
+    exit 0
+fi
+
+if [ "$MODE" = "print-xcframeworks" ]; then
+    xcf_families="$(apple_families)" || exit 1
+    for xcf_target in $NINJA_TARGETS; do
+        for xcf_family in $xcf_families; do
+            xcf_name="$(xcframework_basename "$xcf_target" "$xcf_family")" || exit 1
+            printf '%s.xcframework\n' "$xcf_name"
+        done
+    done
     exit 0
 fi
 
@@ -792,6 +957,37 @@ if [ "$MODE" = "build" ]; then
         info "install name  $(basename "$installed") -> $want"
     done
 
+    # THE LAYOUT ANGLE'S OWN LOADER WILL SEARCH, checked against what was just
+    # installed. The source lines this comes from, and the repackaging it exists
+    # to stop, are under "The layout ANGLE's own loader will search" above.
+    #
+    # It is deliberately not a restatement of what locate_product already found:
+    # that function finds whatever is named after the ninja target, and this
+    # pins the exact name and shape ANGLE will compose. A product located as
+    # `libEGL.dylib` on a platform whose loader appends `.framework` passes the
+    # first and fails this one.
+    build_family="$(family_for_platform "$PLATFORM")" || exit 1
+    for target in $NINJA_TARGETS; do
+        want_rel="$(loader_path_for "$build_family" "$target")" || exit 1
+        installed="$(locate_product "$OUT_DIR" "$target")" || exit 1
+        if [ ! -e "$OUT_DIR/$want_rel" ]; then
+            err "ANGLE loads $target from '$want_rel', relative to the directory it"
+            err "finds itself in, and there is nothing there. What was installed:"
+            ls -1 "$OUT_DIR" >&2 2>/dev/null || true
+            exit 1
+        fi
+        # The located product and the searched path have to be the SAME product.
+        # A second copy under the searched name would satisfy the check above
+        # while the build shipped the other one.
+        if [ "$installed" != "$OUT_DIR/${want_rel%%/*}" ]; then
+            err "$target was built as '$(basename "$installed")' but ANGLE will load"
+            err "'${want_rel%%/*}'. Those are two different files, and the one that"
+            err "ships is not the one that gets opened."
+            exit 1
+        fi
+        info "loader path   $target -> $want_rel"
+    done
+
     # Facts the presenter will need and nobody has: what dyld will call these
     # libraries, what they expect to find beside them, and which architectures
     # actually landed. Printed rather than asserted -- there is no presenter yet
@@ -817,60 +1013,90 @@ fi
 
 if [ "$MODE" = "xcframework" ]; then
     mkdir -p "$FRAMEWORKS_DIR"
+
+    # ONE xcframework PER SHIPPED LIBRARY PER PLATFORM FAMILY -- four, not two,
+    # and the split is forced from both ends.
+    #
+    # From the tool: `xcodebuild -create-xcframework` was asked, on run
+    # 33958391676, to hold ANGLE's iOS framework bundles and its macOS shared
+    # libraries together, and answered
+    #
+    #     error: an xcframework cannot contain both frameworks and libraries.
+    #
+    # From ANGLE: the obvious way to make that one bundle possible is to wrap
+    # the macOS libraries in framework bundles so every platform matches. That
+    # would break loading. libEGL finds libGLESv2 by composing a name against
+    # the directory it was itself loaded from, and on macOS that name ends
+    # `.dylib` and carries no bundle -- see "The layout ANGLE's own loader will
+    # search" above for the source lines. Wrapping moves libEGL two directories
+    # down and the search follows it. Nothing would fail until an application
+    # asked for a display.
+    #
+    # So each platform keeps exactly the shape ANGLE builds for it, and the
+    # xcframeworks are cut along ANGLE's own axis -- `is_ios`, read here as the
+    # gn target_os each platform's slices carry. A consumer's Package.swift then
+    # names the iOS pair and the macOS pair separately, which is what a package
+    # that supports both platforms has to do anyway.
+    xcf_families="$(apple_families)" || exit 1
+    assembled=0
+
     for target in $NINJA_TARGETS; do
-        # `xcodebuild -create-xcframework` holds ONE library per platform, so two
-        # shipped libraries are two xcframeworks. Named ANGLELibEGL /
-        # ANGLELibGLESv2 because a SwiftPM binaryTarget is named after the
-        # xcframework's basename and has to be a valid identifier.
-        suffix="$(echo "$target" | sed 's/^lib//')"
-        xcframework="$FRAMEWORKS_DIR/ANGLELib$suffix.xcframework"
-        libraries=()
-        library_count=0
-        flavour=""
-        present=""
-        for platform in $(apple_platforms); do
-            install_dir="$INSTALL_ROOT/angle-apple-$platform"
-            [ -d "$install_dir" ] || continue
-            candidate="$(locate_product "$install_dir" "$target")" || exit 1
-            if [ -d "$candidate" ]; then
-                this_flavour="framework"
-            else
-                this_flavour="library"
-            fi
-            # ANGLE produces different shapes on different Apple platforms --
-            # `ios_framework_bundle` on iOS, a plain shared library on macOS --
-            # so an xcframework assembled from all three is asked to hold a
-            # mixture. Whether `xcodebuild -create-xcframework` accepts one is
-            # not asserted here in either direction: it is a fact about a tool,
-            # this lane can ask it, and the answer is either a valid xcframework
-            # whose Info.plist can be read back or xcodebuild's own refusal. What
-            # would be wrong is guessing, and what would be worse is dropping a
-            # platform to make the command succeed.
-            if [ -n "$flavour" ] && [ "$flavour" != "$this_flavour" ]; then
-                info "note: $target is a $flavour on [$present ] and a $this_flavour on $platform"
-                flavour="mixed"
-            else
+        for family in $xcf_families; do
+            name="$(xcframework_basename "$target" "$family")" || exit 1
+            xcframework="$FRAMEWORKS_DIR/$name.xcframework"
+            libraries=()
+            library_count=0
+            flavour=""
+            present=""
+            for platform in $(apple_platforms); do
+                platform_family="$(family_for_platform "$platform")" || exit 1
+                [ "$platform_family" = "$family" ] || continue
+                install_dir="$INSTALL_ROOT/angle-apple-$platform"
+                [ -d "$install_dir" ] || continue
+                candidate="$(locate_product "$install_dir" "$target")" || exit 1
+                if [ -d "$candidate" ]; then
+                    this_flavour="framework"
+                else
+                    this_flavour="library"
+                fi
+                # Within one family the shape has to be uniform, or the split
+                # above is cut along the wrong axis. Asserted rather than left
+                # to xcodebuild: the same refusal arrives either way, but only
+                # one of the two says which platform disagreed with which.
+                if [ -n "$flavour" ] && [ "$flavour" != "$this_flavour" ]; then
+                    err "$target is a $flavour on[$present ] and a $this_flavour on"
+                    err "$platform, and both are in the '$family' family. An xcframework"
+                    err "cannot hold both, so the family is no longer ANGLE's product axis."
+                    exit 1
+                fi
                 flavour="$this_flavour"
-            fi
-            present="$present $platform"
-            case "$this_flavour" in
-                framework) libraries[$library_count]="-framework" ;;
-                library)   libraries[$library_count]="-library" ;;
-            esac
-            library_count=$((library_count + 1))
-            libraries[$library_count]="$candidate"
-            library_count=$((library_count + 1))
+                case "$this_flavour" in
+                    framework) libraries[$library_count]="-framework" ;;
+                    library)   libraries[$library_count]="-library" ;;
+                esac
+                library_count=$((library_count + 1))
+                libraries[$library_count]="$candidate"
+                library_count=$((library_count + 1))
+                present="$present $platform"
+            done
+            # A family with nothing installed is skipped rather than fatal: a
+            # narrowed build (--platform macos alone) is a legitimate way to run
+            # this lane, and it produces the macOS pair only.
+            [ "$library_count" -ne 0 ] || continue
+            rm -rf "$xcframework"
+            info "xcodebuild -create-xcframework ($flavour:$present ) -> $name.xcframework"
+            xcodebuild -create-xcframework ${libraries[@]+"${libraries[@]}"} -output "$xcframework"
+            assembled=$((assembled + 1))
         done
-        if [ "$library_count" -eq 0 ]; then
-            err "no installed platform carries $target; build at least one first:"
-            err "  scripts/build-angle-apple.sh --platform ios"
-            exit 1
-        fi
-        rm -rf "$xcframework"
-        info "xcodebuild -create-xcframework ($flavour:$present) -> $(basename "$xcframework")"
-        xcodebuild -create-xcframework ${libraries[@]+"${libraries[@]}"} -output "$xcframework"
     done
-    ok "assembled into $FRAMEWORKS_DIR"
+
+    if [ "$assembled" -eq 0 ]; then
+        err "no installed platform carries any of: $NINJA_TARGETS"
+        err "build at least one first:"
+        err "  scripts/build-angle-apple.sh --platform ios"
+        exit 1
+    fi
+    ok "assembled $assembled xcframework(s) into $FRAMEWORKS_DIR"
     exit 0
 fi
 
