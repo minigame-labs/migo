@@ -467,6 +467,22 @@ jobs:
       - name: Apple engine-free Swift package stays engine-free
         run: bash scripts/test-apple-swift-core-engine-free.sh
 
+      # The other side of that boundary: the SHIPPING Apple package must consume
+      # the xcframework it declares.
+      #
+      # While no target named the binary target, SwiftPM never had to resolve a
+      # slice for the platform being built, so `swift build` in the Apple SDK
+      # lane passed on an artifact it never opened -- the lane whose entire
+      # purpose is to check that artifact was green while checking nothing about
+      # it. The same walk also keeps the WebKit compatibility lane out of the
+      # engine's dependency closure, which was a comment about intent until
+      # something actually linked the engine and is a claim about bytes now.
+      #
+      # Host-independent: it reads the manifest and the build script, so it runs
+      # here rather than only on the macOS lane that can act on it.
+      - name: Apple shipping Swift package consumes the engine it declares
+        run: bash scripts/test-apple-shipping-package-contract.sh
+
       # macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
       # unbound-variable error rather than nothing. Linux's bash 5 expands it to
       # nothing, so the entire class is invisible here and fatal there -- and

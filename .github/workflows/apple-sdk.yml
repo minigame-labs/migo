@@ -68,12 +68,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `destination` is what xcodebuild is told to build the Swift package
+          # for, and it is per-platform for a reason that only became real when
+          # a target started depending on the xcframework: SwiftPM's own `swift
+          # build` builds for the host, so on these legs it would hand an
+          # iOS-only artifact a request for a macOS slice.
+          #
+          # `host_slice` marks the one leg whose xcframework contains a slice
+          # the runner itself can run. Only there can the package be linked into
+          # a test bundle and executed.
           - platform: ios
             targets: aarch64-apple-ios
+            destination: generic/platform=iOS
+            host_slice: false
           - platform: ios-simulator
             targets: aarch64-apple-ios-sim,x86_64-apple-ios
+            destination: generic/platform=iOS Simulator
+            host_slice: false
           - platform: macos
             targets: aarch64-apple-darwin,x86_64-apple-darwin
+            destination: platform=macOS
+            host_slice: true
 
     env:
       # Inside the workspace so the archive the gate audits has a path the
@@ -130,15 +145,66 @@ jobs:
           bash scripts/test-apple-performance-rust-closure.sh
           --artifact "$MIGO_APPLE_BUILD_ROOT/${{ matrix.platform }}-Debug/libmigo.a"
 
-      # With the artifact present, the shipping Swift package resolves for the
-      # first time. `swift build` here is not a formality: the package's targets
-      # have never been compiled, and one of them declares a resource directory
-      # that build-apple-sdk.sh is supposed to have produced.
-      - name: The shipping Swift package resolves and builds
+      # With the artifact present, the shipping Swift package resolves and is
+      # compiled for the platform this leg built it for.
+      #
+      # `xcodebuild -destination` and not `swift build`: SwiftPM builds for the
+      # host. That distinction was invisible while no target named the binary
+      # target -- SwiftPM never had to find a slice, so `swift build` passed on
+      # all three legs without ever reading the xcframework, and the lane whose
+      # purpose is to check the artifact was green while checking nothing about
+      # it. MigoAppleRenderer now depends on MigoEngine, which is the property
+      # scripts/test-apple-shipping-package-contract.sh keeps.
+      #
+      # `-list` first, so a future scheme rename is a readable failure rather
+      # than "does not contain a scheme named X" with no list of what it does
+      # contain.
+      #
+      # MigoApplePerformancePlus is the scheme because its closure is the whole
+      # lane: the renderer, the WebKit baseline and the engine-free core. The
+      # one target outside it, MigoMacV8, is macOS-only and is covered by the
+      # `swift build` below on the leg where that means something.
+      - name: The shipping Swift package builds for ${{ matrix.platform }}
         working-directory: platforms/apple
         run: |
           ls -la Frameworks/
+          xcodebuild -list
+          xcodebuild build \
+            -scheme MigoApplePerformancePlus \
+            -destination '${{ matrix.destination }}' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
+
+      # What a non-Rust consumer has to link alongside the archive.
+      #
+      # A Rust binary gets these from cargo, which reads them out of every
+      # dependency's build script. A Swift or Objective-C host linking
+      # libmigo.a gets nothing: the directives are cargo metadata and are not in
+      # the archive. So the list is asked of rustc rather than written down, and
+      # printed here whether or not the link below succeeds -- when it fails,
+      # the answer is already in the log next to the failure.
+      - name: Record what a C consumer must link alongside the archive
+        if: matrix.host_slice
+        working-directory: engine
+        run: >-
+          cargo rustc -p migo-capi --locked
+          --no-default-features --features external-frames
+          -- --print native-static-libs
+
+      # The only leg that can do this, and the first execution of this
+      # repository's C ABI on Apple hardware.
+      #
+      # `swift build` covers every target including MigoMacV8; `swift test`
+      # links a real binary -- the first time anything has linked libmigo.a
+      # rather than compiled against its headers -- and runs assertions that
+      # call migo_query_capabilities. Compilation cannot answer whether the
+      # archive is complete; only a link can.
+      - name: The shipping Swift package links and its tests run on Apple silicon
+        if: matrix.host_slice
+        working-directory: platforms/apple
+        run: |
           swift build
+          swift test
 
       # The half of the deployment-floor contract that reads the product rather
       # than the declaration -- and the half its own header calls the one that
