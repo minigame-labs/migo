@@ -192,29 +192,34 @@ jobs:
       # would be the same answer three times. iOS device arm64 because that is
       # the slice the product actually ships.
       #
-      # Bounded by `timeout` rather than by the job's, so exceeding the budget
-      # is a measurement this step reports rather than a kill that erases every
-      # fact the steps before it established. `libEGL` and `libGLESv2` and not
-      # `all`: those two are the deliverable, and `all` includes ANGLE's own
-      # test binaries, which nothing here ships.
+      # Bounded by the step's own `timeout-minutes`, not by the job's and not by
+      # a `timeout` binary.
+      #
+      # The first attempt used `timeout 3600 ninja ...` and got exit 127 in zero
+      # seconds: macOS ships no `timeout`. That is a GNU coreutils program, and
+      # its absence here is the same family as the bash 3.2 differences
+      # scripts/test-macos-bash32-contract.sh exists for -- a thing that is
+      # correct on every Linux runner in this repository and simply not present
+      # on the only OS that can run this job.
+      #
+      # A per-step timeout is the portable answer and a better one: exceeding it
+      # fails this step alone, and `continue-on-error` plus the `if: always()`
+      # summary below means every fact the earlier steps established survives.
+      #
+      # `libEGL` and `libGLESv2` and not `all`: those two are the deliverable,
+      # and `all` includes ANGLE's own test binaries, which nothing here ships.
       - name: How long one Apple configuration takes to build
         continue-on-error: true
+        timeout-minutes: 60
         run: |
-          set -uo pipefail
+          set -euo pipefail
           cd "$ANGLE_ROOT"
           out="$(ls -d out/probe-*device* | head -1)"
           echo "building in $out"
+          command -v ninja
           started=$SECONDS
-          if timeout 3600 ninja -C "$out" libEGL libGLESv2; then
-            echo "RESULT: built in $((SECONDS - started)) seconds"
-          else
-            status=$?
-            if [ "$status" = 124 ]; then
-              echo "RESULT: did not finish within 3600 seconds"
-            else
-              echo "RESULT: ninja exited $status after $((SECONDS - started)) seconds"
-            fi
-          fi
+          ninja -C "$out" libEGL libGLESv2
+          echo "RESULT: built in $((SECONDS - started)) seconds"
           df -h /
           du -sh "$out" || true
 
