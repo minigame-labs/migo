@@ -22,7 +22,7 @@ is whether a compiler has seen it, so that is what this section reports.
 | | Where it is checked |
 |---|---|
 | `core/` (`MigoAppleCore`) | built, tested and cross-compiled for `aarch64-apple-ios` on every pull request, on an Apple silicon runner |
-| `Sources/MigoAppleRenderer` | compiled for iOS, iOS Simulator and macOS, and its tests linked and executed natively, by `.github/workflows/apple-sdk.yml` |
+| `Sources/MigoAppleRenderer` | compiled for iOS, iOS Simulator and macOS by `.github/workflows/apple-sdk.yml`, and on the macOS leg linked into a test binary and executed on Apple silicon -- the only place the C ABI has ever run on an Apple machine |
 | `Sources/MigoAppleWebKit`, `Sources/MigoMacV8` | placeholders; they compile, and they do nothing |
 | `WebContent/PerformancePlus` | its encoder runs against the same golden corpus as the Rust one, under node, on every pull request |
 | `ProbeApp/` | a README. No sources exist, and none should until there is a device to run them on |
