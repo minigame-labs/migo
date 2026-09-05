@@ -1,0 +1,144 @@
+name: Apple ANGLE probe
+
+# One question, asked once, before anybody writes a build script for it.
+#
+# A2.1 in the Apple plan is "ANGLE Metal source pin + reproducible xcframework",
+# and it is the blocker for A2.2 (the native presenter) and therefore for every
+# Apple product that renders. The repository already has the shape to copy:
+# scripts/build-angle-windows.sh, contracts/artifact-manifest/windows-angle.lock.json
+# and scripts/fetch-windows-angle.sh do exactly this for Windows.
+#
+# WHY THIS IS NEEDED AT ALL, rather than just writing the Apple version:
+# .github/workflows/apple-sdk.yml measured, on 2026-09-05, what a non-Rust
+# consumer must link against the engine on each Apple platform:
+#
+#   macOS  -lc++ -framework ApplicationServices -framework OpenGL -liconv ...
+#   iOS    -lc++ -framework CoreFoundation -framework CoreGraphics -framework
+#          CoreText -framework ImageIO -framework MobileCoreServices
+#          -framework UIKit -liconv ...
+#
+# There is no GL framework on iOS. Skia is configured for its GL backend, macOS
+# links the legacy `OpenGL` framework to satisfy it, and iOS has nothing to link.
+# That gap is what ANGLE fills, and it is why "just use system GL for a macOS
+# presenter first" buys nothing for iOS: it links a thing iOS does not have.
+#
+# WHAT IS UNKNOWN is narrow and it is the whole cost of the decision: an ANGLE
+# checkout is depot_tools plus a Chromium-style dependency tree measured in tens
+# of gigabytes, and a GitHub-hosted macOS runner has single-digit gigabytes free.
+# If the checkout does not fit, the entire lane is dead and no build script would
+# ever have run. Nobody in this project has measured it.
+#
+# So this job checks out and configures, and DELIBERATELY DOES NOT BUILD. A first
+# run that tries to compile ANGLE answers a question we cannot ask yet -- how
+# long the compile takes -- while risking a timeout that tells us nothing about
+# the question we can ask. Blind-writing a build script for a checkout nobody has
+# performed is the anti-pattern this lane's neighbours were fixed for six times
+# in one round.
+#
+# It runs on demand, and on a branch prefix that exists for it. Never on pull
+# requests, never on a schedule: it is measured in gigabytes of somebody's shared
+# quota and it answers a question whose answer does not change weekly.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'angle-probe/**'
+
+concurrency:
+  group: apple-angle-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checkout-fits:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      # Before anything is fetched, so the numbers below have a baseline that is
+      # about this image rather than about what we did to it.
+      - name: What this runner starts with
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          xcodebuild -version
+          df -h /
+          df -h "$RUNNER_TEMP" || true
+          python3 --version
+
+      # Shallow, and outside the workspace: depot_tools puts its own git in PATH
+      # and a checkout inside the repository would be one more thing to exclude
+      # from every gate that walks the tree.
+      - name: Fetch depot_tools
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+          du -sh "$RUNNER_TEMP/depot_tools"
+          df -h /
+
+      # `--no-history` because the pin this produces is a commit hash, and a
+      # reproducible build needs the tree at that hash, not the history that
+      # reached it. If it still does not fit, that is the answer.
+      #
+      # `target_os` limited to the two Apple platforms so gclient does not sync
+      # the Android and Windows dependency sets, which are most of the tree and
+      # none of the product.
+      - name: Fetch ANGLE
+        id: fetch
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/angle"
+          cd "$RUNNER_TEMP/angle"
+          started=$SECONDS
+          fetch --no-history angle
+          {
+            echo "target_os = ['mac', 'ios']"
+            echo "target_os_only = True"
+          } >> .gclient
+          gclient sync --no-history --shallow
+          echo "seconds=$((SECONDS - started))" >> "$GITHUB_OUTPUT"
+          cd angle
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: What the checkout cost
+        if: always()
+        run: |
+          set -x
+          df -h /
+          du -sh "$RUNNER_TEMP/angle" || true
+          du -sh "$RUNNER_TEMP/angle/angle/third_party" 2>/dev/null || true
+
+      # Configuration only. This is the half that can be wrong in a way a
+      # checkout cannot reveal: an argument this ANGLE revision does not accept,
+      # or a toolchain assumption that holds on Chromium's bots and not on a
+      # GitHub image. `gn gen` answers both in seconds.
+      #
+      # The arguments mirror the Windows recipe's decisions where they carry
+      # over: no WebGPU backend (migo does not use it, and it is what drags in
+      # Dawn's vendored shader compiler), no debug info, component build off so
+      # the output is the static pieces an xcframework is assembled from.
+      - name: Configure for iOS and for macOS, without building
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/angle/angle"
+          for args in \
+            "target_os=\"ios\" target_cpu=\"arm64\" ios_enable_code_signing=false" \
+            "target_os=\"mac\" target_cpu=\"arm64\""; do
+            out="out/probe-$(echo "$args" | tr -dc 'a-z0-9')"
+            gn gen "$out" --args="is_debug=false symbol_level=0 is_component_build=false angle_enable_wgpu=false angle_enable_vulkan=false angle_enable_metal=true $args"
+            echo "--- $out ---"
+            gn args "$out" --list --short --overrides-only
+            ninja -C "$out" -t targets all 2>/dev/null | wc -l
+          done
+
+      - name: The answer
+        if: always()
+        run: |
+          echo "ANGLE revision:   ${{ steps.fetch.outputs.revision }}"
+          echo "checkout seconds: ${{ steps.fetch.outputs.seconds }}"
+          df -h /
