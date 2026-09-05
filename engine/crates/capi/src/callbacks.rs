@@ -360,15 +360,33 @@ mod tests {
         TestNotifier { notifier, session }
     }
 
+    // Everything a C callback in this module records has to be process-global:
+    // the callbacks are `extern "C"` and are invoked, on the test's own thread,
+    // from inside the code the test is exercising, so there is nowhere to thread
+    // a value out through. Atomics rather than a `Mutex<Counters>` for the same
+    // reason -- the writer runs while the test holds the lock below, and taking
+    // it again there would deadlock.
     static READY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    /// The counters above are process-global, and cargo runs tests in parallel,
-    /// so any two tests that reset and read them race. Serialising the ones that
-    /// do is what makes their assertions mean what they say.
-    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static LAST_ERROR_CODE: AtomicUsize = AtomicUsize::new(0);
     static DESTROY_RESULT: AtomicI32 = AtomicI32::new(i32::MIN);
+
+    /// Held by every test that resets one of the statics above and then reads
+    /// it. Cargo runs a crate's tests in parallel threads of one process, so
+    /// without it one test's reset lands between another's write and its read,
+    /// and the second reads the value the first cleared.
+    ///
+    /// The rule is phrased that way, and this declaration sits below all four
+    /// statics, because the previous wording was positional -- "the counters
+    /// above" -- while `LAST_ERROR_CODE` and `DESTROY_RESULT` were declared
+    /// *below* it. Both were added later, both were reset and read without the
+    /// lock, and a comment that correctly described the hazard was describing a
+    /// set that no longer matched the code. It surfaced as
+    /// `interior_nul_messages_still_report_the_error` reading 0 where it had
+    /// just written 1, in CI, on a change that touched none of this -- and
+    /// passing every local run, three times over, because the race needs the
+    /// two tests to interleave.
+    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static QUEUED_TASK: std::sync::Mutex<Option<(MigoTaskFn, usize)>> = std::sync::Mutex::new(None);
 
     unsafe extern "C" fn inline_dispatch(
@@ -881,6 +899,7 @@ mod tests {
 
     #[test]
     fn a_callback_can_destroy_its_session_and_the_task_pins_allocation_until_return() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         with_engine("callback-reentrant-destroy", |engine| {
             let mut raw_session = std::ptr::null_mut();
             assert_eq!(
@@ -916,6 +935,7 @@ mod tests {
 
     #[test]
     fn error_messages_are_delivered_as_readable_c_strings() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         LAST_ERROR_CODE.store(0, Ordering::SeqCst);
         let notifier = notifier(inline_dispatch);
         notifier.error(MIGO_ERROR_INVALID_ARGUMENT, "content failed to load");
@@ -924,6 +944,7 @@ mod tests {
 
     #[test]
     fn interior_nul_messages_still_report_the_error() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Losing the report entirely would be worse than losing the detail.
         LAST_ERROR_CODE.store(0, Ordering::SeqCst);
         let notifier = notifier(inline_dispatch);
