@@ -132,7 +132,7 @@ macro_rules! jni_json_callback {
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jdouble, jfloat, jint, jlong, jobject, jstring};
 use jni::{JNIEnv, JavaVM};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use migo_core::{
     HostIngress, HostIngressSendError, host_ingress, lease_surface, retire_surface,
@@ -407,29 +407,77 @@ pub(crate) extern "system" fn init(
             }
         };
 
-        // Read optional fields with defaults
+        // Read optional fields with defaults.
+        //
+        // `or_default` and not `.unwrap_or(...)`: these are Java primitives and
+        // an enum reference, which always have a value, so a failed read is a
+        // Java/native mismatch and not an unset option. See its own comment for
+        // what that difference cost.
         let code_cache_dir = super::get_string_field(&mut env, "codeCacheDir", &options)
             .unwrap_or_else(|_| cache_dir.clone());
 
-        let target_fps = super::get_i32(&mut env, "targetFps", &options)
-            .unwrap_or(shared::frame_rate::DEFAULT_FPS as i32);
+        let target_fps = super::or_default(
+            super::get_i32(&mut env, "targetFps", &options),
+            shared::frame_rate::DEFAULT_FPS as i32,
+        );
 
-        let debug_enabled = super::get_bool(&mut env, "debugEnabled", &options).unwrap_or(false);
+        let debug_enabled =
+            super::or_default(super::get_bool(&mut env, "debugEnabled", &options), false);
 
-        let log_level_ordinal = super::get_enum_ordinal(
+        // Three outcomes, and only one of them is the host speaking.
+        //
+        // Falling back to the process default rather than to a literal `Warn`:
+        // the default is `Warn` in a release build and `Debug` in a debug one,
+        // and hardcoding the release answer silenced the build whose purpose is
+        // to talk. `from_ordinal` rather than `From<i32>` because an ordinal the
+        // two enums do not share is a fact worth saying, not a silent `Warn`.
+        let log_level = match super::get_enum_ordinal(
             &mut env,
             "logLevel",
             "Lcom/migo/runtime/RuntimeConfig$LogLevel;",
             &options,
-        )
-        .unwrap_or(3); // Default to Warn (index 3 in new enum)
+        ) {
+            Ok(Some(ordinal)) => match shared::config::LogLevel::from_ordinal(ordinal) {
+                Some(level) => level,
+                None => {
+                    let fallback = shared::log_level::default_level();
+                    warn!(
+                        "RuntimeConfig.logLevel is ordinal {ordinal}, which this library does \
+                         not know. The host's SDK declares a level this engine does not; \
+                         running at the process default ({fallback:?}) instead."
+                    );
+                    fallback
+                }
+            },
+            Ok(None) => {
+                let fallback = shared::log_level::default_level();
+                warn!(
+                    "RuntimeConfig.logLevel is null; running at the process default \
+                     ({fallback:?}). A host that wants a level must set one."
+                );
+                fallback
+            }
+            Err(reason) => {
+                let fallback = shared::log_level::default_level();
+                warn!(
+                    "{reason}. The field is declared on RuntimeConfig, so this is a \
+                     Java/native mismatch: whatever level the host asked for is not in \
+                     effect and the process default ({fallback:?}) is."
+                );
+                fallback
+            }
+        };
 
         let watchdog_enabled =
-            super::get_bool(&mut env, "watchdogEnabled", &options).unwrap_or(true);
-        let watchdog_timeout_secs =
-            super::get_i32(&mut env, "watchdogTimeoutSecs", &options).unwrap_or(10);
-        let code_signing_enabled =
-            super::get_bool(&mut env, "codeSigningEnabled", &options).unwrap_or(true);
+            super::or_default(super::get_bool(&mut env, "watchdogEnabled", &options), true);
+        let watchdog_timeout_secs = super::or_default(
+            super::get_i32(&mut env, "watchdogTimeoutSecs", &options),
+            10,
+        );
+        let code_signing_enabled = super::or_default(
+            super::get_bool(&mut env, "codeSigningEnabled", &options),
+            true,
+        );
 
         // Read optional code signing public key (hex-encoded Ed25519, 64 chars).
         // Returns None if the field is null, empty, or not present.
@@ -451,8 +499,6 @@ pub(crate) extern "system" fn init(
             "preludeScriptsJson",
             &options,
         ));
-
-        let log_level = shared::config::LogLevel::from(log_level_ordinal);
 
         let init_options = InitOptions::new()
             .with_pixel_ratio(display_density)

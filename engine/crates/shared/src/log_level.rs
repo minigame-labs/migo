@@ -78,6 +78,17 @@ pub fn set_default_level(level: LogLevel) {
     DEFAULT_LEVEL.store(ordinal(level), Ordering::Relaxed);
 }
 
+/// The level that applies when nothing more specific does.
+///
+/// Exposed because a caller that fails to read a host's request needs somewhere
+/// honest to fall back to, and "the level this process would use if no host had
+/// asked" is that place. The alternative in use before this existed was a
+/// hardcoded `Warn` at the call site, which is right in a release build and
+/// wrong in a debug one -- it silenced the build whose whole point is to talk.
+pub fn default_level() -> LogLevel {
+    from_ordinal(DEFAULT_LEVEL.load(Ordering::Relaxed))
+}
+
 /// Bind `level` to the calling thread for as long as it runs.
 ///
 /// Called once, at host-thread start, before any of that session's work. Not
@@ -165,6 +176,20 @@ mod tests {
         drop(sessions);
         THREAD_LEVEL.set(0);
         guard
+    }
+
+    /// The default is readable, and it is the value the process was told to use
+    /// rather than a constant written twice.
+    #[test]
+    fn the_default_level_is_the_one_that_was_set() {
+        let _exclusive = exclusive();
+        set_default_level(LogLevel::Error);
+        assert_eq!(default_level(), LogLevel::Error);
+        set_default_level(LogLevel::Debug);
+        assert_eq!(default_level(), LogLevel::Debug);
+        // And it is what an unbound thread with no live session resolves to,
+        // which is the property a caller falling back to it depends on.
+        assert_eq!(effective_level(), LogLevel::Debug);
     }
 
     #[test]

@@ -38,17 +38,36 @@ pub enum LogLevel {
     Off = 5,
 }
 
-impl From<i32> for LogLevel {
-    fn from(value: i32) -> Self {
+impl LogLevel {
+    /// The level a Java `RuntimeConfig.LogLevel` ordinal names, or `None` when
+    /// the two enums do not agree on it.
+    ///
+    /// Separate from [`From<i32>`] because a conversion that cannot fail has to
+    /// answer *something* for an unrecognised ordinal, and every answer is wrong
+    /// in the same way: it makes "the host's SDK declares a level this library
+    /// does not know" indistinguishable from "the host asked for Warn". That is
+    /// a real state — the two enums are two copies of one list, in two
+    /// languages, shipped in two artifacts a host may mix — and the caller that
+    /// read the ordinal is the only place with somewhere to report it.
+    pub fn from_ordinal(value: i32) -> Option<Self> {
         match value {
-            0 => LogLevel::Trace,
-            1 => LogLevel::Debug,
-            2 => LogLevel::Info,
-            3 => LogLevel::Warn,
-            4 => LogLevel::Error,
-            5 => LogLevel::Off,
-            _ => LogLevel::Warn,
+            0 => Some(LogLevel::Trace),
+            1 => Some(LogLevel::Debug),
+            2 => Some(LogLevel::Info),
+            3 => Some(LogLevel::Warn),
+            4 => Some(LogLevel::Error),
+            5 => Some(LogLevel::Off),
+            _ => None,
         }
+    }
+}
+
+impl From<i32> for LogLevel {
+    /// Kept for callers that have nowhere to report and nothing to decide.
+    /// Prefer [`LogLevel::from_ordinal`] wherever an unrecognised ordinal is a
+    /// fact worth saying out loud.
+    fn from(value: i32) -> Self {
+        LogLevel::from_ordinal(value).unwrap_or(LogLevel::Warn)
     }
 }
 
@@ -522,6 +541,51 @@ impl InitOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every declared variant round-trips through its own ordinal.
+    ///
+    /// Driven from the variant list rather than from six hand-written pairs:
+    /// the numbers here are a copy of Java's `RuntimeConfig.LogLevel`, and a
+    /// test that restated them would only prove the third copy agrees with
+    /// itself.
+    #[test]
+    fn every_level_round_trips_through_its_ordinal() {
+        for level in [
+            LogLevel::Trace,
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warn,
+            LogLevel::Error,
+            LogLevel::Off,
+        ] {
+            assert_eq!(LogLevel::from_ordinal(level as i32), Some(level));
+        }
+    }
+
+    /// An ordinal outside the list is reported as unknown, not as a level.
+    ///
+    /// This is the state that used to be invisible: a host whose SDK declares a
+    /// seventh level would have been read as Warn, silently, with the log at the
+    /// level it did not ask for and nothing to say why.
+    #[test]
+    fn an_ordinal_the_two_enums_do_not_share_is_unknown() {
+        assert_eq!(LogLevel::from_ordinal(6), None);
+        assert_eq!(LogLevel::from_ordinal(-1), None);
+        assert_eq!(LogLevel::from_ordinal(i32::MAX), None);
+    }
+
+    /// The lossy conversion still answers, because callers with nowhere to
+    /// report still need a value. Pinned so the two entry points cannot drift
+    /// into disagreeing about a shared ordinal.
+    #[test]
+    fn the_lossy_conversion_agrees_wherever_the_reporting_one_has_an_answer() {
+        for ordinal in -2..8 {
+            match LogLevel::from_ordinal(ordinal) {
+                Some(level) => assert_eq!(LogLevel::from(ordinal), level),
+                None => assert_eq!(LogLevel::from(ordinal), LogLevel::Warn),
+            }
+        }
+    }
 
     #[test]
     fn prelude_scripts_default_empty() {
