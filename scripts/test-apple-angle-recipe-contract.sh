@@ -38,8 +38,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # pipefail hands the PIPELINE that 141. So `if sed ... | grep -q ...; then`
 # silently takes the else branch -- the check does not fail, it does not run.
 #
-# It is timing-dependent, which is what makes it worth a comment instead of a
-# fix: the revision check below passed for as long as this script was short
+# It is timing-dependent, which is why it gets a comment as well as a fix -- the
+# fix alone would not tell the next person why the rule exists. The revision
+# check below passed for as long as this script was short
 # enough that `sed` finished writing before `grep` found its match, and went
 # quiet the day the file it scans grew by seventy lines. A guard that stops
 # checking when its input gets bigger is worse than no guard.
