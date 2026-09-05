@@ -143,6 +143,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOCK="$REPO_ROOT/contracts/artifact-manifest/apple-angle.lock.json"
 SDK_SCRIPT="$REPO_ROOT/scripts/build-apple-sdk.sh"
+PATCH_DIR="$REPO_ROOT/engine/third_party/angle-patches/apple"
 INSTALL_ROOT="$REPO_ROOT/engine/third_party"
 FRAMEWORKS_DIR="$REPO_ROOT/platforms/apple/Frameworks"
 
@@ -372,8 +373,19 @@ check_ready() {
             ;;
     esac
     done
-    echo "$PINNED_REVISION" | grep -Eq '^[0-9a-f]{40}$' \
-        || { err "source.angle_revision is not a 40-character commit hash: $PINNED_REVISION"; failures=$((failures + 1)); }
+    # `case` rather than `echo ... | grep -q`: pipefail plus grep's early exit
+    # reports the writer's SIGPIPE as the pipeline's status, so the test can
+    # silently stop testing. See the head of
+    # scripts/test-apple-angle-recipe-contract.sh, where that cost a live check.
+    case "$PINNED_REVISION" in
+        *[!0-9a-f]* | "")
+            err "source.angle_revision is not a lowercase hex commit hash: $PINNED_REVISION"
+            failures=$((failures + 1)) ;;
+        ????????????????????????????????????????) ;;
+        *)
+            err "source.angle_revision is not 40 characters long: $PINNED_REVISION"
+            failures=$((failures + 1)) ;;
+    esac
     return "$failures"
 }
 
@@ -541,6 +553,97 @@ locate_product() {
     printf '%s' "$found"
 }
 
+# ---------------------------------------------------------------------------
+# Patches
+# ---------------------------------------------------------------------------
+
+# ANGLE does not compile for this project's macOS deployment floor unpatched.
+# `src/common/apple_platform_utils.mm` uses `kIOMainPortDefault`, which Apple
+# introduced in macOS 12.0, with no `@available` guard -- and Chromium's own
+# `mac_deployment_target` defaults to 13.0, so upstream never compiles that line
+# below 12 and has no reason to notice. Measured, not guessed: the macOS leg of
+# .github/workflows/apple-angle.yml failed on exactly that line with
+# `-Werror,-Wunguarded-availability-new` while both iOS legs, whose floor is
+# 15.0, built clean.
+#
+# Suppressing the diagnostic was rejected rather than untried: `kIOMainPortDefault`
+# is a real IOKit symbol macOS 11 does not export, so the library would compile
+# and then fail to load on exactly the floor it claims to support. Raising the
+# floor was the other candidate and is a DECISION -- contracts/apple/deployment-floor.json
+# says so in as many words -- so it is not something a build script gets to make
+# by being easier to write.
+#
+# APPLIED-NESS IS DECIDED BY ASKING `patch` TO REVERSE THE PATCH, never by a
+# sentinel string in the target file. scripts/lib/v8-patch-apply.sh's header
+# records why in detail -- a sentinel restates what a patch does, so it can
+# drift from it, and it drifted four separate ways in this repository, including
+# one that silenced a sysroot patch for every Android build ever run.
+#
+# That library is deliberately NOT sourced here, and the reason is the gate next
+# door: it uses `mapfile` and `local -A`, both bash 4.0, in its tree-audit half.
+# macOS ships bash 3.2, and scripts/test-macos-bash32-contract.sh derives its
+# scope from the scripts a macOS job NAMES -- so a bash-4 construct reached
+# through a `source` would have been outside what it inspects. The three `patch`
+# invocations below are the whole of the method that half of the library
+# provides; the reasoning stays single-sourced in its header rather than copied.
+#
+# `--forward` on the reverse probe is load-bearing: with `--reverse` alone, GNU
+# patch hits its "Unreversed patch detected!  Ignoring -R." heuristic, decides
+# we meant to apply the patch, applies it, and exits 0 -- so an unapplied patch
+# would be indistinguishable from an applied one. `--fuzz=0` stops loose context
+# matching from calling a hunk reversible against code it does not match.
+apply_one_patch() {
+    tree="$1"
+    patch_file="$2"
+    name="$(basename "$patch_file")"
+
+    if patch -p1 -d "$tree" --batch --dry-run --reverse --forward --fuzz=0 \
+            < "$patch_file" >/dev/null 2>&1; then
+        info "  = already in effect: $name"
+        return 0
+    fi
+    # Decide on a dry run before writing anything. `--forward` is not
+    # transactional: given a tree where an earlier hunk is unapplied and a later
+    # one is already applied, patch writes the earlier hunk, skips the later one
+    # and exits non-zero -- leaving the tree more modified than it found it, and
+    # the next run starting from that new state.
+    if ! patch -p1 -d "$tree" --batch --dry-run --forward --fuzz=0 \
+            < "$patch_file" >/dev/null 2>&1; then
+        err "$name neither applies cleanly nor is already applied"
+        err "the checkout is partly patched or has drifted; leaving it untouched"
+        return 1
+    fi
+    # `--no-backup-if-mismatch`: GNU patch writes a `.orig` beside any file whose
+    # hunks applied at an offset, and a stray `.orig` inside the source tree is a
+    # file the next `gclient sync` has an opinion about.
+    if ! patch -p1 -d "$tree" --batch --forward --fuzz=0 --no-backup-if-mismatch \
+            < "$patch_file" >/dev/null 2>&1; then
+        err "$name failed to apply after its own dry run succeeded"
+        return 1
+    fi
+    info "  + applied: $name"
+}
+
+apply_apple_patches() {
+    tree="$1"
+    [ -d "$PATCH_DIR" ] || { err "no patch directory: $PATCH_DIR"; return 1; }
+    applied=0
+    for patch_file in "$PATCH_DIR"/*.patch; do
+        [ -f "$patch_file" ] || continue
+        apply_one_patch "$tree" "$patch_file" || return 1
+        applied=$((applied + 1))
+    done
+    # An empty patch stage is indistinguishable from a clean one, and this
+    # repository has been bitten by that shape more than once. There is at least
+    # one patch; if there is ever none, that is a deletion somebody should have
+    # to justify rather than a silent no-op.
+    if [ "$applied" -eq 0 ]; then
+        err "$PATCH_DIR contains no patches, so this stage checked nothing"
+        return 1
+    fi
+    info "$applied ANGLE patch(es) in effect"
+}
+
 if [ "$MODE" = "build" ]; then
     SLICES="$(slices_for_platform "$PLATFORM")" || exit 1
     OUT_DIR="$INSTALL_ROOT/angle-apple-$PLATFORM"
@@ -549,6 +652,8 @@ if [ "$MODE" = "build" ]; then
     info "revision  $REVISION"
     info "slices    $(echo $SLICES | tr '\n' ' ')"
     info "targets   $NINJA_TARGETS"
+
+    apply_apple_patches "$ANGLE_ROOT" || { err "patch stage failed"; exit 1; }
 
     for triple in $SLICES; do
         args="$(gn_args_for_triple "$triple")" || exit 1

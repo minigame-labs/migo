@@ -32,6 +32,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# NO `grep -q` ON THE READ END OF A PIPE IN THIS FILE, and the reason was
+# measured here rather than remembered. `set -o pipefail` is on; `grep -q` exits
+# at the first match; the writer upstream then takes SIGPIPE and exits 141; and
+# pipefail hands the PIPELINE that 141. So `if sed ... | grep -q ...; then`
+# silently takes the else branch -- the check does not fail, it does not run.
+#
+# It is timing-dependent, which is what makes it worth a comment instead of a
+# fix: the revision check below passed for as long as this script was short
+# enough that `sed` finished writing before `grep` found its match, and went
+# quiet the day the file it scans grew by seventy lines. A guard that stops
+# checking when its input gets bigger is worse than no guard.
+#
+# Every test below therefore reads a file directly or matches with `case`.
 pass() { printf '\033[0;32m[ok]\033[0m %s\n' "$*"; }
 bad()  { printf '\033[0;31m[FAIL]\033[0m %s\n' "$*" >&2; }
 
@@ -70,7 +83,12 @@ run_audit() {
     revision="$(python3 -c '
 import json, sys
 print(json.load(open(sys.argv[1]))["source"]["angle_revision"])' "$lock" 2>/dev/null || true)"
-    if ! printf '%s' "$revision" | grep -Eq '^[0-9a-f]{40}$'; then
+    case "$revision" in
+        *[!0-9a-f]* | "") revision_is_a_hash=0 ;;
+        ????????????????????????????????????????) revision_is_a_hash=1 ;;
+        *) revision_is_a_hash=0 ;;
+    esac
+    if [ "$revision_is_a_hash" -eq 0 ]; then
         report lock-revision-malformed \
             "source.angle_revision is not a 40-character commit hash: '${revision}'"
     fi
@@ -81,15 +99,20 @@ print(json.load(open(sys.argv[1]))["source"]["gn_args_common"])' "$lock" 2>/dev/
 
     # The floor contract owns deployment targets. The lock owning one too would
     # be two answers to one question, and gn takes the last `--args` wins.
-    if printf '%s' "$common" | grep -q 'deployment_target'; then
-        report lock-carries-deployment-target \
-            "source.gn_args_common sets a deployment target; that number belongs to contracts/apple/deployment-floor.json"
-    fi
+    case "$common" in
+        *deployment_target*)
+            report lock-carries-deployment-target \
+                "source.gn_args_common sets a deployment target; that number belongs to contracts/apple/deployment-floor.json"
+            ;;
+    esac
 
     # --- the recipe carries no second copy of the pin ------------------------
     # Comment lines stripped first: prose may quote a hash, and a header that
     # explains where the pin lives is the opposite of the defect.
-    if sed 's/#.*//' "$angle" | grep -Eq '[0-9a-f]{40}'; then
+    # `^[^#]*` rather than stripping comments in a separate process: it is the
+    # same question -- a 40-character hash with no `#` before it on the line --
+    # asked of the file directly, so there is no pipe to go quiet.
+    if grep -Eq '^[^#]*[0-9a-f]{40}' "$angle"; then
         report revision-hardcoded \
             "scripts/build-angle-apple.sh contains a 40-character hash outside a comment; the revision belongs to the lock file"
     fi
@@ -98,6 +121,24 @@ print(json.load(open(sys.argv[1]))["source"]["gn_args_common"])' "$lock" 2>/dev/
     if bash "$angle" --print-gn-args "$UNMAPPED_CONTROL" >/dev/null 2>&1; then
         report not-fail-closed \
             "--print-gn-args answered for $UNMAPPED_CONTROL, so the totality check below proves nothing"
+    fi
+
+    # --- the patch stage has something to apply ----------------------------
+    # ANGLE does not compile for this project's macOS deployment floor
+    # unpatched, so the patch directory is load-bearing rather than optional. An
+    # empty one would make the build's patch stage a no-op that reads exactly
+    # like a clean one -- and the failure would land 900 ninja steps into a
+    # macOS build, naming a line of upstream source rather than a deleted file.
+    patch_dir="$audit_root/engine/third_party/angle-patches/apple"
+    patch_count=0
+    if [ -d "$patch_dir" ]; then
+        for candidate in "$patch_dir"/*.patch; do
+            [ -f "$candidate" ] && patch_count=$((patch_count + 1))
+        done
+    fi
+    if [ "$patch_count" -eq 0 ]; then
+        report angle-patches-missing \
+            "$patch_dir holds no patch; ANGLE does not build for the declared macOS floor without one"
     fi
 
     # --- the platform set is one set --------------------------------------
@@ -250,6 +291,9 @@ fixture() {
     cp "$ROOT/scripts/build-apple-sdk.sh" "$dest/scripts/"
     cp "$ROOT/contracts/artifact-manifest/apple-angle.lock.json" "$dest/contracts/artifact-manifest/"
     cp "$ROOT/contracts/apple/deployment-floor.json" "$dest/contracts/apple/"
+    mkdir -p "$dest/engine/third_party/angle-patches/apple"
+    cp "$ROOT/engine/third_party/angle-patches/apple/"*.patch \
+        "$dest/engine/third_party/angle-patches/apple/" 2>/dev/null || true
     printf '%s' "$dest"
 }
 
@@ -261,7 +305,10 @@ expect_violation() {
         failures=$((failures + 1))
         return
     fi
-    if printf '%s\n' "$out" | grep -q "^VIOLATION $want_id:"; then
+    # Written to a file and matched there, for the reason at the top of this
+    # file: `grep -q` reading a pipe under pipefail reports the writer's SIGPIPE.
+    printf '%s\n' "$out" > "$WORK/last-audit.txt"
+    if grep -q "^VIOLATION $want_id:" "$WORK/last-audit.txt"; then
         pass "injection '$what' -> $want_id"
     else
         bad "injection '$what' went red, but not as $want_id. What it reported:"
@@ -389,8 +436,13 @@ p.write_text(s)
 SETPY
 expect_violation "the recipe drops a platform the engine builds for" platform-set-disagreement "$dest"
 
+# 13. The patch stage loses the patch ANGLE will not build without.
+dest="$(fixture nopatch)"
+rm -f "$dest/engine/third_party/angle-patches/apple/"*.patch
+expect_violation "the ANGLE patches are deleted" angle-patches-missing "$dest"
+
 if [ "$failures" -ne 0 ]; then
     bad "$failures check(s) failed"
     exit 1
 fi
-echo "PASS: the Apple ANGLE recipe contract holds, and 12 injections were each seen to break it"
+echo "PASS: the Apple ANGLE recipe contract holds, and 13 injections were each seen to break it"
