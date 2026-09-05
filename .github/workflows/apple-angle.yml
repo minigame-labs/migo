@@ -130,17 +130,21 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          # `find -type f` and not a `*.dylib` glob: ANGLE emits a framework
+          # BUNDLE on iOS and a plain shared library on macOS, so a glob written
+          # for one shape reports nothing for the other -- and an empty report
+          # reads exactly like a clean one.
           for dir in engine/third_party/angle-apple-*; do
             [ -d "$dir" ] || continue
             echo "=== $dir ==="
-            for lib in "$dir"/*.dylib; do
-              [ -f "$lib" ] || continue
-              echo "--- $lib"
-              shasum -a 256 "$lib"
-              stat -f 'size %z bytes' "$lib"
-              lipo -info "$lib"
-              otool -D "$lib" || true
-              otool -l "$lib" | grep -A4 'LC_BUILD_VERSION' || true
+            find "$dir" -type f | sort | while read -r f; do
+              echo "--- $f"
+              shasum -a 256 "$f"
+              stat -f 'size %z bytes' "$f"
+              # Only Mach-O files answer these; the rest of a bundle is plists.
+              lipo -info "$f" 2>/dev/null || true
+              otool -D "$f" 2>/dev/null || true
+              otool -l "$f" 2>/dev/null | grep -A4 'LC_BUILD_VERSION' || true
             done
           done
           echo "=== xcframeworks ==="

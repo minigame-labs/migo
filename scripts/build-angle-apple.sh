@@ -59,6 +59,26 @@
 #       already forces -- it refuses a fat archive mixing device and simulator.
 #     - One `ninja libEGL libGLESv2` for iOS device arm64 is 334 s and 100 MB.
 #
+# WHAT THE PRODUCT ACTUALLY IS, and why this script does not name it.
+#   ANGLE's own `angle_shared_library` template says it plainly:
+#
+#     # On ios, define an ios_framework_bundle instead of a shared library.
+#     target_type = "shared_library"
+#     if (is_ios) { target_type = "ios_framework_bundle" }
+#
+#   So an iOS build produces `libEGL.framework`, not `libEGL.dylib`. The first
+#   run of this recipe assumed the dylib and failed AFTER a successful 1554-step
+#   ninja build, which is the cheapest possible way to be told -- and only
+#   because the failure printed the directory instead of just the missing name.
+#   The fix is not the other guess: the product is now located by asking the
+#   output directory what it holds named after the ninja target, and a target
+#   that resolves to nothing, or to more than one thing, fails with the listing.
+#   That rule is the same on every platform and stays right when a fourth one
+#   behaves like neither of the first three.
+#
+#   iOS wanting a framework is not an inconvenience, it is Apple's rule: an app
+#   may embed a framework bundle and may not embed a bare dylib.
+#
 # WHAT THE SLICES ARE, AND WHY THEY ARE NOT LISTED HERE.
 #   They are asked of `scripts/build-apple-sdk.sh --print-slices`. The ANGLE
 #   xcframework and the engine xcframework are linked into the same application,
@@ -390,6 +410,40 @@ if [ "$head" != "$REVISION" ]; then
     exit 1
 fi
 
+# What a ninja target actually produced, asked of the output directory.
+#
+# Not a table of extensions per platform: ANGLE emits `libEGL.framework` for iOS
+# and a plain shared library for macOS, and a table would have to be right about
+# a third platform before anyone had built one. The rule here is the same
+# everywhere -- exactly one thing in the output directory is named after the
+# target -- and it fails with the listing when that is not true, which is how
+# the framework was found in the first place.
+#
+# `.TOC` is ninja's link-order side file, not a product; `.dSYM` is a debug
+# bundle these builds do not produce (symbol_level=0) but would be a second
+# match if they ever did.
+locate_product() {
+    out_dir="$1"
+    target="$2"
+    found=""
+    found_count=0
+    for candidate in "$out_dir/$target" "$out_dir/$target".*; do
+        [ -e "$candidate" ] || continue
+        case "$candidate" in
+            *.TOC|*.dSYM) continue ;;
+        esac
+        found="$candidate"
+        found_count=$((found_count + 1))
+    done
+    if [ "$found_count" -ne 1 ]; then
+        err "ninja target '$target' resolved to $found_count products in $out_dir"
+        err "what that directory holds at the top level:"
+        ls -1 "$out_dir" >&2 2>/dev/null || true
+        return 1
+    fi
+    printf '%s' "$found"
+}
+
 if [ "$MODE" = "build" ]; then
     SLICES="$(slices_for_platform "$PLATFORM")" || exit 1
     OUT_DIR="$INSTALL_ROOT/angle-apple-$PLATFORM"
@@ -413,28 +467,54 @@ if [ "$MODE" = "build" ]; then
     mkdir -p "$OUT_DIR"
 
     for target in $NINJA_TARGETS; do
-        product="$target.dylib"
-        inputs=""
+        # An array, not a space-joined string. A developer's Mac has a home
+        # directory named after them and "/Users/Jimmy McGill/..." is an
+        # ordinary path there; a joined string would split it into two
+        # arguments and lipo would report a missing file that exists. CI never
+        # meets a space, so the string form would have passed every run and
+        # failed on the first machine that mattered.
+        inputs=()
+        # A plain counter beside the array, and not `${#inputs[@]}`. bash 3.2's
+        # treatment of an EMPTY array under `set -u` is the exact hazard
+        # scripts/test-macos-bash32-contract.sh exists for, and whether the
+        # length form is safe there is a thing to look up rather than assume --
+        # so it is not used. An integer is unambiguous in every shell.
+        input_count=0
         for triple in $SLICES; do
-            candidate="$ANGLE_ROOT/out/migo-$triple/$product"
-            if [ ! -f "$candidate" ]; then
-                err "ninja target '$target' produced no $product for $triple"
-                err "what the output directory does contain:"
-                ls -1 "$ANGLE_ROOT/out/migo-$triple"/*.dylib 2>/dev/null >&2 || err "  (no .dylib at all)"
-                exit 1
-            fi
-            inputs="$inputs $candidate"
+            candidate="$(locate_product "$ANGLE_ROOT/out/migo-$triple" "$target")" || exit 1
+            inputs[$input_count]="$candidate"
+            input_count=$((input_count + 1))
         done
+
+        product="$(basename "${inputs[0]}")"
+        info "$target -> $product"
+
         # lipo even for one slice would work, but `cp` keeps a single-slice
         # platform a thin Mach-O rather than a one-architecture fat file --
         # which is what build-apple-sdk.sh produces for the same platform, and
         # matching it keeps the two archives comparable.
-        count="$(echo $SLICES | wc -w | tr -d ' ')"
-        if [ "$count" -gt 1 ]; then
-            info "lipo $count slices into $product"
-            lipo -create $inputs -output "$OUT_DIR/$product"
+        if [ "$input_count" -eq 1 ]; then
+            cp -R ${inputs[@]+"${inputs[@]}"} "$OUT_DIR/$product"
+        elif [ -d "${inputs[0]}" ]; then
+            # A framework bundle. lipo joins Mach-O files, not directories, so
+            # one slice's bundle is taken whole and its executable replaced by
+            # the fat one. Taking the bundle whole rather than rebuilding it is
+            # deliberate: everything else inside it -- the Info.plist ninja
+            # generated, the bundle layout -- is architecture-independent and
+            # produced by the build system, and a hand-written copy would be a
+            # second, worse source for it.
+            info "lipo $input_count slices inside $product"
+            cp -R "${inputs[0]}" "$OUT_DIR/$product"
+            binaries=()
+            binary_count=0
+            for bundle in ${inputs[@]+"${inputs[@]}"}; do
+                binaries[$binary_count]="$bundle/$target"
+                binary_count=$((binary_count + 1))
+            done
+            lipo -create ${binaries[@]+"${binaries[@]}"} -output "$OUT_DIR/$product/$target"
         else
-            cp $inputs "$OUT_DIR/$product"
+            info "lipo $input_count slices into $product"
+            lipo -create ${inputs[@]+"${inputs[@]}"} -output "$OUT_DIR/$product"
         fi
     done
 
@@ -443,12 +523,14 @@ if [ "$MODE" = "build" ]; then
     # actually landed. Printed rather than asserted -- there is no presenter yet
     # to have an opinion, and a log is where the next step reads them from.
     for target in $NINJA_TARGETS; do
-        product="$OUT_DIR/$target.dylib"
-        info "--- $target.dylib ---"
-        ls -l "$product"
-        lipo -info "$product" || true
-        otool -D "$product" || true
-        otool -L "$product" || true
+        installed="$(locate_product "$OUT_DIR" "$target")" || exit 1
+        macho="$installed"
+        [ -d "$installed" ] && macho="$installed/$target"
+        info "--- $(basename "$installed") ---"
+        ls -ld "$installed"
+        lipo -info "$macho" || true
+        otool -D "$macho" || true
+        otool -L "$macho" || true
     done
 
     ok "installed $NINJA_TARGETS into $OUT_DIR"
@@ -463,25 +545,56 @@ if [ "$MODE" = "xcframework" ]; then
     mkdir -p "$FRAMEWORKS_DIR"
     for target in $NINJA_TARGETS; do
         # `xcodebuild -create-xcframework` holds ONE library per platform, so two
-        # dylibs are two xcframeworks. Named ANGLELibEGL / ANGLELibGLESv2
-        # because a SwiftPM binaryTarget is named after the xcframework's
-        # basename and has to be a valid identifier.
+        # shipped libraries are two xcframeworks. Named ANGLELibEGL /
+        # ANGLELibGLESv2 because a SwiftPM binaryTarget is named after the
+        # xcframework's basename and has to be a valid identifier.
         suffix="$(echo "$target" | sed 's/^lib//')"
         xcframework="$FRAMEWORKS_DIR/ANGLELib$suffix.xcframework"
-        libraries=""
+        libraries=()
+        library_count=0
+        flavour=""
+        present=""
         for platform in ios ios-simulator macos; do
-            candidate="$INSTALL_ROOT/angle-apple-$platform/$target.dylib"
-            [ -f "$candidate" ] || continue
-            libraries="$libraries -library $candidate"
+            install_dir="$INSTALL_ROOT/angle-apple-$platform"
+            [ -d "$install_dir" ] || continue
+            candidate="$(locate_product "$install_dir" "$target")" || exit 1
+            if [ -d "$candidate" ]; then
+                this_flavour="framework"
+            else
+                this_flavour="library"
+            fi
+            # ANGLE produces different shapes on different Apple platforms --
+            # `ios_framework_bundle` on iOS, a plain shared library on macOS --
+            # so an xcframework assembled from all three is asked to hold a
+            # mixture. Whether `xcodebuild -create-xcframework` accepts one is
+            # not asserted here in either direction: it is a fact about a tool,
+            # this lane can ask it, and the answer is either a valid xcframework
+            # whose Info.plist can be read back or xcodebuild's own refusal. What
+            # would be wrong is guessing, and what would be worse is dropping a
+            # platform to make the command succeed.
+            if [ -n "$flavour" ] && [ "$flavour" != "$this_flavour" ]; then
+                info "note: $target is a $flavour on [$present ] and a $this_flavour on $platform"
+                flavour="mixed"
+            else
+                flavour="$this_flavour"
+            fi
+            present="$present $platform"
+            case "$this_flavour" in
+                framework) libraries[$library_count]="-framework" ;;
+                library)   libraries[$library_count]="-library" ;;
+            esac
+            library_count=$((library_count + 1))
+            libraries[$library_count]="$candidate"
+            library_count=$((library_count + 1))
         done
-        if [ -z "$libraries" ]; then
-            err "no installed platform carries $target.dylib; build at least one first:"
+        if [ "$library_count" -eq 0 ]; then
+            err "no installed platform carries $target; build at least one first:"
             err "  scripts/build-angle-apple.sh --platform ios"
             exit 1
         fi
         rm -rf "$xcframework"
-        info "xcodebuild -create-xcframework -> $(basename "$xcframework")"
-        xcodebuild -create-xcframework $libraries -output "$xcframework"
+        info "xcodebuild -create-xcframework ($flavour:$present) -> $(basename "$xcframework")"
+        xcodebuild -create-xcframework ${libraries[@]+"${libraries[@]}"} -output "$xcframework"
     done
     ok "assembled into $FRAMEWORKS_DIR"
     exit 0
