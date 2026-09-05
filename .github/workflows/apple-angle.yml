@@ -147,6 +147,7 @@ jobs:
           if [ "${KEEP_GOING:-false}" = "true" ]; then
             flags="--keep-going"
           fi
+          mkdir -p "$MIGO_ANGLE_APPLE_BUILD_ROOT"
           for platform in $platforms; do
             echo "::group::ANGLE for $platform"
             bash scripts/build-angle-apple.sh --platform "$platform" \
@@ -157,7 +158,15 @@ jobs:
           # narrowing the build to one platform left the pack step iterating all
           # three and failing on the two that were never built -- a step failing
           # for a reason that has nothing to do with what it was asked to do.
-          echo "BUILT_PLATFORMS=$platforms" >> "$GITHUB_ENV"
+          #
+          # A FILE, not $GITHUB_ENV, and that is a correction: the first version
+          # of this line wrote the list to $GITHUB_ENV, where `--print-platforms`
+          # output is multi-line and the env-file parser reads the second line as
+          # a new assignment. It failed the whole lane with `Invalid format
+          # 'ios-simulator'` AFTER all five configurations had built. The env
+          # protocol has escaping rules for multi-line values; a file has none,
+          # and the value here is a list of words that a file holds natively.
+          printf '%s\n' $platforms > "$MIGO_ANGLE_APPLE_BUILD_ROOT/built-platforms.txt"
 
       # One archive per platform, made HERE rather than by repacking the
       # workflow artifact later. An iOS product is a framework bundle -- a
@@ -178,9 +187,12 @@ jobs:
           # build-apple-sdk.sh names and on a narrowed one is the subset asked
           # for. Not this file's own copy of the set, and not a fresh query that
           # would disagree with the build above.
-          for platform in ${BUILT_PLATFORMS:?the build step did not record what it built}; do
+          list="$MIGO_ANGLE_APPLE_BUILD_ROOT/built-platforms.txt"
+          [ -s "$list" ] || { echo "the build step recorded no platforms" >&2; exit 1; }
+          while read -r platform; do
+            [ -n "$platform" ] || continue
             bash scripts/build-angle-apple.sh --archive "$platform"
-          done
+          done < "$list"
 
       # Two xcframeworks, because `xcodebuild -create-xcframework` holds one
       # library per platform and this ships libEGL and libGLESv2.

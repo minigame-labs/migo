@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Build ANGLE (libEGL.dylib + libGLESv2.dylib) for Apple platforms from source.
+# Build ANGLE for Apple platforms from source: libEGL and libGLESv2, as a
+# framework bundle on iOS and a shared library on macOS -- upstream's own split,
+# not this script's, and the reason is under "WHAT THE PRODUCT ACTUALLY IS".
 # Location: scripts/build-angle-apple.sh
+#
+# It also carries the patches ANGLE needs to compile for this project's macOS
+# deployment floor; see the "Patches" section further down for what and why.
 #
 # WHY THIS EXISTS AT ALL:
 #   .github/workflows/apple-sdk.yml asked rustc, on 2026-09-05, what a non-Rust
