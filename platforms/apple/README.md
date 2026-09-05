@@ -107,7 +107,14 @@ platforms/apple/
     Tests/
   Package.swift              the shipping package; floor values derived from
                              contracts/apple/deployment-floor.json
-  Frameworks/                generated: MigoEngine.xcframework (gitignored)
+  Frameworks/                generated, gitignored: MigoEngine.xcframework and,
+                             from scripts/build-angle-apple.sh --xcframework,
+                             ANGLELib{EGL,GLESv2}-{ios,macos}.xcframework -- four,
+                             because an xcframework cannot hold ANGLE's iOS
+                             framework bundles beside its macOS libraries and
+                             repackaging either one breaks ANGLE's own lookup of
+                             libGLESv2 (`--print-loader-layout` says what the
+                             layout has to be, and why)
   Sources/
     MigoAppleRenderer/       internal: CAMetalLayer, display link, surface attach
     MigoAppleWebKit/         lane 1
@@ -148,3 +155,39 @@ bash scripts/build-apple-sdk.sh --platform macos --configuration Debug
 That is deliberate. The alternative -- `unsafeFlags` pointing at a local
 `libmigo.a` -- would make this package impossible for anyone else to depend on,
 which SwiftPM enforces by refusing such packages as dependencies.
+
+### ANGLE
+
+The renderer needs a GL implementation and iOS does not have one. Asked of rustc
+rather than assumed: the link line the engine requires on macOS ends in
+`-framework OpenGL`, the legacy desktop GL framework, and the iOS link line
+contains no GL framework at all -- there is none to contain. ANGLE over Metal is
+what fills that gap, and it is also why "use system GL for macOS first" buys iOS
+nothing: it links a thing iOS does not have.
+
+```sh
+bash scripts/build-angle-apple.sh --fetch            # 12 GB, about four minutes
+bash scripts/build-angle-apple.sh --platform ios     # about five minutes per slice
+bash scripts/build-angle-apple.sh --platform ios-simulator
+bash scripts/build-angle-apple.sh --platform macos
+bash scripts/build-angle-apple.sh --xcframework
+```
+
+Needs macOS and depot_tools; `--check` reports what is missing without spending
+the checkout. `.github/workflows/apple-angle.yml` runs exactly these commands on
+a free hosted runner, which is where the artifacts come from today.
+
+The revision and the gn arguments are pinned in
+`contracts/artifact-manifest/apple-angle.lock.json`; the slices come from
+`scripts/build-apple-sdk.sh --print-slices`, because both xcframeworks are
+linked into the same application and a slice set that disagrees with the
+engine's fails in a consumer's link step naming neither script.
+`scripts/test-apple-angle-recipe-contract.sh` checks all of that on every pull
+request without a Mac.
+
+Two xcframeworks rather than one: `xcodebuild -create-xcframework` holds one
+library per platform, and this ships `libEGL` and `libGLESv2`. They are shared
+libraries because every presenter in this repository resolves EGL at load time
+and hands `eglGetProcAddress` to `glow` -- Android and OpenHarmony open
+`libEGL.so`, Linux `libEGL.so.1`, Windows ANGLE's own `libEGL.dll`. ANGLE's
+`//:angle_static` exists and is deliberately not what is built.

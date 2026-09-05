@@ -33,6 +33,8 @@ CONFIGURATION="Debug"
 CODE_SIGNING="off"
 PRODUCT=""
 PRINT_TARGET=""
+PRINT_SLICES=""
+PRINT_PLATFORMS=0
 
 err()  { printf '\033[0;31m[apple-sdk] %s\033[0m\n' "$*" >&2; }
 ok()   { printf '\033[0;32m[apple-sdk] %s\033[0m\n' "$*"; }
@@ -45,12 +47,28 @@ usage: build-apple-sdk.sh --platform <ios|ios-simulator|macos>
                           [--configuration Debug|Release]
                           [--code-signing on|off]
        build-apple-sdk.sh --print-deployment-target <ios|macos>
+       build-apple-sdk.sh --print-slices <ios|ios-simulator|macos>
+       build-apple-sdk.sh --print-platforms
 
   --print-deployment-target  Print the deployment target this build would use,
                              read from contracts/apple/deployment-floor.json,
                              and exit. Runs on any host: it is how the contract
                              gate checks the script's real behaviour instead of
                              grepping it for a number.
+  --print-slices             Print the Rust target triples this platform's
+                             xcframework slice group is built from, one per
+                             line, and exit. Also runs on any host, and for the
+                             same reason: scripts/build-angle-apple.sh has to
+                             build ANGLE for exactly these slices or the two
+                             xcframeworks cannot be linked into one app, and a
+                             second copy of the list is how that stops being
+                             true without anyone noticing.
+  --print-platforms          Print the xcframework slice groups this script
+                             knows, one per line, and exit. The same question
+                             one level up: scripts/build-angle-apple.sh, its CI
+                             lane and the pin's contract gate all iterate "every
+                             Apple platform", and three copies of that list is
+                             three chances for one of them to quietly cover two.
 
 Products, and why they are separate builds:
   performance-plus  --no-default-features --features external-frames.
@@ -88,6 +106,8 @@ while [ $# -gt 0 ]; do
         --configuration) CONFIGURATION="${2:-}"; shift 2 ;;
         --code-signing)  CODE_SIGNING="${2:-}"; shift 2 ;;
         --print-deployment-target) PRINT_TARGET="${2:-}"; shift 2 ;;
+        --print-slices)  PRINT_SLICES="${2:-}"; shift 2 ;;
+        --print-platforms) PRINT_PLATFORMS=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               err "unknown argument: $1"; usage >&2; exit 2 ;;
     esac
@@ -159,8 +179,51 @@ print(target)
 PY
 }
 
+# The slices of each xcframework group, and the deployment-floor platform whose
+# target they carry. A function rather than an inline case, because
+# --print-slices has to answer from the same statement the build uses: the
+# moment a slice list is readable in two places, the Apple engine and the Apple
+# ANGLE builds can disagree about which architectures exist, and an xcframework
+# whose slices do not match its neighbour's fails at the consumer's link step
+# with no mention of either script.
+resolve_platform() {
+    case "$1" in
+        ios)           RUST_TARGETS=(aarch64-apple-ios); FLOOR_PLATFORM="ios" ;;
+        ios-simulator) RUST_TARGETS=(aarch64-apple-ios-sim x86_64-apple-ios); FLOOR_PLATFORM="ios" ;;
+        macos)         RUST_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin); FLOOR_PLATFORM="macos" ;;
+        *) return 1 ;;
+    esac
+}
+
 if [ -n "$PRINT_TARGET" ]; then
     read_deployment_target "$PRINT_TARGET" || exit 1
+    exit 0
+fi
+
+# The one place the set of slice groups is written. resolve_platform above is
+# the only other statement that knows them, and it is the one this agrees with
+# by construction: every name here must resolve, and the check below says so.
+APPLE_PLATFORMS="ios ios-simulator macos"
+
+if [ "$PRINT_PLATFORMS" = "1" ]; then
+    for candidate in $APPLE_PLATFORMS; do
+        if ! resolve_platform "$candidate"; then
+            err "internal: --print-platforms names '$candidate', which --platform rejects"
+            exit 1
+        fi
+        printf '%s\n' "$candidate"
+    done
+    exit 0
+fi
+
+if [ -n "$PRINT_SLICES" ]; then
+    if ! resolve_platform "$PRINT_SLICES"; then
+        err "--print-slices must be ios, ios-simulator or macos"
+        exit 2
+    fi
+    # `${a[@]+...}` because macOS ships bash 3.2, where expanding an array that
+    # could be empty under `set -u` is an error rather than nothing.
+    printf '%s\n' ${RUST_TARGETS[@]+"${RUST_TARGETS[@]}"}
     exit 0
 fi
 
@@ -180,12 +243,10 @@ case "$CODE_SIGNING" in
     *) err "--code-signing must be on or off"; exit 2 ;;
 esac
 
-case "$PLATFORM" in
-    ios)           RUST_TARGETS=(aarch64-apple-ios); FLOOR_PLATFORM="ios" ;;
-    ios-simulator) RUST_TARGETS=(aarch64-apple-ios-sim x86_64-apple-ios); FLOOR_PLATFORM="ios" ;;
-    macos)         RUST_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin); FLOOR_PLATFORM="macos" ;;
-    *) err "--platform must be ios, ios-simulator or macos"; exit 2 ;;
-esac
+if ! resolve_platform "$PLATFORM"; then
+    err "--platform must be ios, ios-simulator or macos"
+    exit 2
+fi
 
 DEPLOYMENT_TARGET="$(read_deployment_target "$FLOOR_PLATFORM")" || exit 1
 

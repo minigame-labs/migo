@@ -136,6 +136,21 @@ engine/third_party/linux-sysroot/*
 engine/third_party/angle-windows/
 engine/third_party/angle-windows-*/
 
+# The same class of file for Apple, from scripts/build-angle-apple.sh: the
+# libEGL.dylib and libGLESv2.dylib each xcframework slice group is assembled
+# from, pinned by contracts/artifact-manifest/apple-angle.lock.json (tracked)
+# and fetched by scripts/fetch-apple-angle.sh. Build products, so not tracked,
+# for the same reason the V8 archives above are not.
+engine/third_party/angle-apple-*/
+
+# xcframeworks. platforms/apple/Package.swift declares MigoEngine as a
+# binaryTarget pointing into this directory, and both scripts/build-apple-sdk.sh
+# and scripts/build-angle-apple.sh write their output here. Every one of them is
+# a build product assembled by a script on a Mac; none has ever been tracked, and
+# without this line a `git add -A` after a local Apple build would try to commit
+# a few hundred megabytes of them.
+platforms/apple/Frameworks/
+
 # Binaries built by the out-of-tree consumer examples. They are proof the
 # package works, not source; tests/c_host/build-with-pkgconfig.sh and the
 # CMake project regenerate them.

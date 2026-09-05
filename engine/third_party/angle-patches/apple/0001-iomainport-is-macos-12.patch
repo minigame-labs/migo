@@ -1,0 +1,67 @@
+diff --git a/src/common/apple_platform_utils.mm b/src/common/apple_platform_utils.mm
+--- a/src/common/apple_platform_utils.mm
++++ b/src/common/apple_platform_utils.mm
+@@ -122,8 +122,19 @@
+ #if defined(ANGLE_PLATFORM_MACOS) || defined(ANGLE_PLATFORM_MACCATALYST)
+ bool GetMacosMachineModel(std::string *outMachineModel)
+ {
++    // MIGO: kIOMainPortDefault is macOS 12.0+. This project's macOS deployment
++    // floor is 11.0 and -Wunguarded-availability-new is an error here, so ANGLE
++    // does not build for it unpatched. Chromium's own mac_deployment_target
++    // defaults to 13.0, which is why upstream never meets this.
++    //
++    // MACH_PORT_NULL is the same argument, not a fallback: kIOMainPortDefault is
++    // declared `const mach_port_t` with that value, and IOServiceGetMatching*
++    // documents MACH_PORT_NULL as meaning the default port. Suppressing the
++    // diagnostic instead would be worse than useless -- the symbol is a real
++    // IOKit export macOS 11 does not have, so the library would compile and then
++    // fail to load on exactly the floor it claims.
+     io_service_t platformExpert = IOServiceGetMatchingService(
+-        kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
++        MACH_PORT_NULL, IOServiceMatching("IOPlatformExpertDevice"));
+ 
+     if (platformExpert == IO_OBJECT_NULL)
+     {
+diff --git a/src/gpu_info_util/SystemInfo_macos.mm b/src/gpu_info_util/SystemInfo_macos.mm
+--- a/src/gpu_info_util/SystemInfo_macos.mm
++++ b/src/gpu_info_util/SystemInfo_macos.mm
+@@ -65,7 +65,18 @@
+             ANGLE_UNSAFE_TODO(IOServiceMatching(kServiceNames[i]));
+ 
+         io_iterator_t entryIterator;
+-        if (IOServiceGetMatchingServices(kIOMainPortDefault, matchDictionary, &entryIterator) !=
++        // MIGO: kIOMainPortDefault is macOS 12.0+. This project's macOS deployment
++        // floor is 11.0 and -Wunguarded-availability-new is an error here, so ANGLE
++        // does not build for it unpatched. Chromium's own mac_deployment_target
++        // defaults to 13.0, which is why upstream never meets this.
++        //
++        // MACH_PORT_NULL is the same argument, not a fallback: kIOMainPortDefault is
++        // declared `const mach_port_t` with that value, and IOServiceGetMatching*
++        // documents MACH_PORT_NULL as meaning the default port. Suppressing the
++        // diagnostic instead would be worse than useless -- the symbol is a real
++        // IOKit export macOS 11 does not have, so the library would compile and then
++        // fail to load on exactly the floor it claims.
++        if (IOServiceGetMatchingServices(MACH_PORT_NULL, matchDictionary, &entryIterator) !=
+             kIOReturnSuccess)
+         {
+             continue;
+@@ -160,7 +171,8 @@
+         return;
+ 
+     CFMutableDictionaryRef matchDictionary = IORegistryEntryIDMatching(gpuID);
+-    io_service_t gpuEntry = IOServiceGetMatchingService(kIOMainPortDefault, matchDictionary);
++    // MIGO: see the note at the first kIOMainPortDefault in this file.
++    io_service_t gpuEntry = IOServiceGetMatchingService(MACH_PORT_NULL, matchDictionary);
+ 
+     if (gpuEntry == IO_OBJECT_NULL)
+     {
+@@ -267,7 +279,8 @@
+     // IOServiceGetMatchingService will consume the reference on the matching dictionary,
+     // so we don't need to release the dictionary.
+     io_registry_entry_t acceleratorEntry =
+-        IOServiceGetMatchingService(kIOMainPortDefault, matchingDict);
++        // MIGO: see the note at the first kIOMainPortDefault in this file.
++        IOServiceGetMatchingService(MACH_PORT_NULL, matchingDict);
+     if (acceleratorEntry == IO_OBJECT_NULL)
+     {
+         return 0;

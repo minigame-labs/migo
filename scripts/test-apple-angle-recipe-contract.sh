@@ -1,0 +1,609 @@
+#!/usr/bin/env bash
+# The Apple ANGLE recipe must be derivable, total, and fail closed.
+#
+# THE DRIFT THIS EXISTS TO CATCH is not hypothetical, it is what building ANGLE
+# for Apple cost to learn in the first place. .github/workflows/apple-angle-probe.yml
+# (PR #185) spent a 12 GB checkout establishing three facts a blind script would
+# have got wrong, and two of them are exactly the kind that stay wrong quietly:
+#
+#   - `target_os="ios"` is not a configuration. gn's mobile_config.gni asserts
+#     target_environment is one of simulator/device/catalyst. A build script that
+#     omitted it would fail loudly -- but one that set the WRONG one would
+#     succeed and produce a simulator library named as a device library, and the
+#     first symptom would be an app that will not launch on a phone.
+#   - The slices ANGLE is built for have to be the slices the engine is built
+#     for. Those two xcframeworks are linked into the same application; if they
+#     disagree about which architectures exist, the failure lands in a consumer's
+#     link step naming neither script. scripts/build-apple-sdk.sh owns that list,
+#     so scripts/build-angle-apple.sh asks it (--print-slices) rather than
+#     keeping a copy, and this gate checks the mapping is TOTAL over what that
+#     answer contains.
+#
+# It also keeps the two numbers that already have an owner from acquiring a
+# second one: the deployment targets live in contracts/apple/deployment-floor.json
+# and the revision and gn arguments live in
+# contracts/artifact-manifest/apple-angle.lock.json. A copy in the build script
+# is the one that silently wins on the build machine.
+#
+# Host-only: it asks the scripts questions and reads their answers. Nothing here
+# needs macOS, which is the point -- the expensive lane runs on a cadence, and
+# the properties that can be checked on every pull request should be.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# NO `grep -q` ON THE READ END OF A PIPE IN THIS FILE, and the reason was
+# measured here rather than remembered. `set -o pipefail` is on; `grep -q` exits
+# at the first match; the writer upstream then takes SIGPIPE and exits 141; and
+# pipefail hands the PIPELINE that 141. So `if sed ... | grep -q ...; then`
+# silently takes the else branch -- the check does not fail, it does not run.
+#
+# It is timing-dependent, which is why it gets a comment as well as a fix -- the
+# fix alone would not tell the next person why the rule exists. The revision
+# check below passed for as long as this script was short
+# enough that `sed` finished writing before `grep` found its match, and went
+# quiet the day the file it scans grew by seventy lines. A guard that stops
+# checking when its input gets bigger is worse than no guard.
+#
+# Every test below therefore reads a file directly or matches with `case`.
+pass() { printf '\033[0;32m[ok]\033[0m %s\n' "$*"; }
+bad()  { printf '\033[0;31m[FAIL]\033[0m %s\n' "$*" >&2; }
+
+# A triple that is not, and will not become, an Apple slice this project builds:
+# the fail-closed control. If --print-gn-args ever answers for it, the totality
+# check above became vacuous -- every slice would "have" a configuration.
+UNMAPPED_CONTROL="aarch64-apple-tvos"
+
+# The same control one level up: a platform group build-apple-sdk.sh does not
+# name. --print-loader-layout answering for it would make the totality check
+# over the real platforms prove nothing.
+UNMAPPED_PLATFORM_CONTROL="tvos"
+
+# ---------------------------------------------------------------------------
+# The audit. One implementation, run against the real tree and against every
+# injected fixture, so a violation this gate claims to catch is a violation it
+# has been SEEN to catch.
+#
+# Every finding prints `VIOLATION <id> ...`, and the injections below assert on
+# the id. Asserting only "it went red" is how a gate passes its own proof for
+# the wrong reason -- an injection that breaks the fixture in some unrelated way
+# turns it red just as well.
+# ---------------------------------------------------------------------------
+run_audit() {
+    audit_root="$1"
+    angle="$audit_root/scripts/build-angle-apple.sh"
+    sdk="$audit_root/scripts/build-apple-sdk.sh"
+    lock="$audit_root/contracts/artifact-manifest/apple-angle.lock.json"
+    findings=0
+
+    report() {
+        printf 'VIOLATION %s: %s\n' "$1" "$2"
+        findings=$((findings + 1))
+    }
+
+    for f in "$angle" "$sdk" "$lock"; do
+        [ -f "$f" ] || { report missing-input "$f does not exist"; echo "$findings"; return 1; }
+    done
+
+    # --- the pin is a pin ----------------------------------------------------
+    revision="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["source"]["angle_revision"])' "$lock" 2>/dev/null || true)"
+    case "$revision" in
+        *[!0-9a-f]* | "") revision_is_a_hash=0 ;;
+        ????????????????????????????????????????) revision_is_a_hash=1 ;;
+        *) revision_is_a_hash=0 ;;
+    esac
+    if [ "$revision_is_a_hash" -eq 0 ]; then
+        report lock-revision-malformed \
+            "source.angle_revision is not a 40-character commit hash: '${revision}'"
+    fi
+
+    common="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["source"]["gn_args_common"])' "$lock" 2>/dev/null || true)"
+
+    # The floor contract owns deployment targets. The lock owning one too would
+    # be two answers to one question, and gn takes the last `--args` wins.
+    case "$common" in
+        *deployment_target*)
+            report lock-carries-deployment-target \
+                "source.gn_args_common sets a deployment target; that number belongs to contracts/apple/deployment-floor.json"
+            ;;
+    esac
+
+    # --- the recipe carries no second copy of the pin ------------------------
+    # Comment lines stripped first: prose may quote a hash, and a header that
+    # explains where the pin lives is the opposite of the defect.
+    # `^[^#]*` rather than stripping comments in a separate process: it is the
+    # same question -- a 40-character hash with no `#` before it on the line --
+    # asked of the file directly, so there is no pipe to go quiet.
+    if grep -Eq '^[^#]*[0-9a-f]{40}' "$angle"; then
+        report revision-hardcoded \
+            "scripts/build-angle-apple.sh contains a 40-character hash outside a comment; the revision belongs to the lock file"
+    fi
+
+    # --- fail closed ---------------------------------------------------------
+    if bash "$angle" --print-gn-args "$UNMAPPED_CONTROL" >/dev/null 2>&1; then
+        report not-fail-closed \
+            "--print-gn-args answered for $UNMAPPED_CONTROL, so the totality check below proves nothing"
+    fi
+
+    # --- the patch stage has something to apply ----------------------------
+    # ANGLE does not compile for this project's macOS deployment floor
+    # unpatched, so the patch directory is load-bearing rather than optional. An
+    # empty one would make the build's patch stage a no-op that reads exactly
+    # like a clean one -- and the failure would land 900 ninja steps into a
+    # macOS build, naming a line of upstream source rather than a deleted file.
+    patch_dir="$audit_root/engine/third_party/angle-patches/apple"
+    patch_count=0
+    if [ -d "$patch_dir" ]; then
+        for candidate in "$patch_dir"/*.patch; do
+            [ -f "$candidate" ] && patch_count=$((patch_count + 1))
+        done
+    fi
+    if [ "$patch_count" -eq 0 ]; then
+        report angle-patches-missing \
+            "$patch_dir holds no patch; ANGLE does not build for the declared macOS floor without one"
+    fi
+
+    # --- the platform set is one set --------------------------------------
+    # Three places iterate "every Apple platform": the recipe's xcframework
+    # assembly, its CI lane, and this gate. They all ask build-apple-sdk.sh, and
+    # what is checked here is that the recipe AGREES -- a platform the SDK script
+    # names must be one the recipe will act on, or an archive step would iterate
+    # three platforms and quietly pack two.
+    if ! platforms="$(bash "$sdk" --print-platforms 2>/dev/null)" || [ -z "$platforms" ]; then
+        report platforms-unavailable "build-apple-sdk.sh --print-platforms produced nothing"
+        platforms=""
+    fi
+    for platform in $platforms; do
+        # Exit 2 is "I do not know this platform"; exit 1 is "I know it and there
+        # is nothing installed", which is the expected answer in a clean tree.
+        bash "$angle" --archive "$platform" >/dev/null 2>&1 && archive_status=0 || archive_status=$?
+        if [ "$archive_status" -eq 2 ]; then
+            report platform-set-disagreement \
+                "build-apple-sdk.sh names '$platform' and build-angle-apple.sh rejects it"
+        fi
+    done
+
+    # --- total over the engine's own slices ----------------------------------
+    for platform in $platforms; do
+        if ! slices="$(bash "$sdk" --print-slices "$platform" 2>/dev/null)"; then
+            report slices-unavailable "build-apple-sdk.sh --print-slices $platform failed"
+            continue
+        fi
+        case "$platform" in
+            macos) floor=macos ;;
+            *)     floor=ios ;;
+        esac
+        if ! want_target="$(bash "$sdk" --print-deployment-target "$floor" 2>/dev/null)"; then
+            report floor-unavailable "build-apple-sdk.sh --print-deployment-target $floor failed"
+            continue
+        fi
+
+        for triple in $slices; do
+            if ! args="$(bash "$angle" --print-gn-args "$triple" 2>/dev/null)"; then
+                report unmapped-slice \
+                    "$platform slice $triple has no ANGLE configuration"
+                continue
+            fi
+
+            case "$args" in
+                *"$common"*) ;;
+                *) report gn-args-not-from-lock \
+                       "$triple: the arguments do not contain the lock's gn_args_common verbatim" ;;
+            esac
+
+            case "$triple" in
+                aarch64-*) want_cpu=arm64 ;;
+                x86_64-*)  want_cpu=x64 ;;
+                *)         want_cpu="" ;;
+            esac
+            if [ -n "$want_cpu" ]; then
+                case "$args" in
+                    *"target_cpu=\"$want_cpu\""*) ;;
+                    *) report target-cpu-mismatch \
+                           "$triple: expected target_cpu=\"$want_cpu\"" ;;
+                esac
+            fi
+
+            case "$triple" in
+                *-apple-ios|*-apple-ios-sim)
+                    case "$args" in
+                        *'target_os="ios"'*) ;;
+                        *) report os-mismatch "$triple: expected target_os=\"ios\"" ;;
+                    esac
+                    # device for the one device triple, simulator for both
+                    # simulator triples. x86_64-apple-ios is a SIMULATOR target:
+                    # there has never been an Intel iOS device.
+                    case "$triple" in
+                        aarch64-apple-ios) want_env=device ;;
+                        *)                 want_env=simulator ;;
+                    esac
+                    case "$args" in
+                        *'target_environment='*)
+                            case "$args" in
+                                *"target_environment=\"$want_env\""*) ;;
+                                *) report ios-wrong-target-environment \
+                                       "$triple: expected target_environment=\"$want_env\"" ;;
+                            esac
+                            ;;
+                        *)
+                            report ios-missing-target-environment \
+                                "$triple: target_os=\"ios\" without target_environment; gn asserts on this"
+                            ;;
+                    esac
+                    case "$args" in
+                        *"ios_deployment_target=\"$want_target\""*) ;;
+                        *) report deployment-target-drift \
+                               "$triple: expected ios_deployment_target=\"$want_target\" from the floor contract" ;;
+                    esac
+                    ;;
+                *-apple-darwin)
+                    case "$args" in
+                        *'target_os="mac"'*) ;;
+                        *) report os-mismatch "$triple: expected target_os=\"mac\"" ;;
+                    esac
+                    case "$args" in
+                        *'target_environment='*)
+                            report mac-has-target-environment \
+                                "$triple: target_environment is an iOS-only argument" ;;
+                        *) ;;
+                    esac
+                    case "$args" in
+                        *"mac_deployment_target=\"$want_target\""*) ;;
+                        *) report deployment-target-drift \
+                               "$triple: expected mac_deployment_target=\"$want_target\" from the floor contract" ;;
+                    esac
+                    ;;
+                *)
+                    report unknown-slice-shape \
+                        "$triple: build-apple-sdk.sh reports a slice this gate does not know how to check"
+                    ;;
+            esac
+        done
+    done
+
+    # --- the packaging rule ANGLE's own loader imposes ----------------------
+    # libEGL does not link libGLESv2. It opens it at run time under a name it
+    # composes against a directory, so how these products may be laid out is not
+    # a matter of taste, and the tidy-looking repackaging is the one that breaks
+    # it. ANGLE's algorithm, read at the pinned revision:
+    #
+    #   src/common/system_utils.cpp:221-234   name + "." + extension, and on the
+    #                                         iOS family + "/" + name again
+    #   src/common/system_utils_ios.cpp:27    that extension is "framework"
+    #   src/common/system_utils_mac.cpp:26    that extension is "dylib"
+    #   src/common/system_utils_posix.cpp:198 the directory is the app's
+    #                                         Frameworks/ on the iOS family and
+    #                                         libEGL's own directory on macOS
+    #
+    # Recomputed here from that algorithm and compared against what the recipe
+    # answers. The day somebody wraps the macOS libraries in framework bundles
+    # -- which is the obvious way to make one xcframework hold all three
+    # platforms, and which moves libEGL to Versions/A/ where its search for
+    # libGLESv2.dylib finds nothing -- this goes red on a Linux pull request
+    # rather than at the first eglInitialize on a device.
+    targets="$(python3 -c '
+import json, sys
+print(" ".join(json.load(open(sys.argv[1]))["source"]["ninja_targets"]))' "$lock" 2>/dev/null || true)"
+    if [ -z "$targets" ]; then
+        report lock-ninja-targets-missing \
+            "source.ninja_targets is empty, so the loader layout below covers nothing"
+    fi
+
+    # The family a platform's slices are configured for, taken from the gn
+    # arguments the recipe generates rather than from its name. Same axis ANGLE
+    # switches product shape on.
+    platform_family_of() {
+        pf_slices="$(bash "$sdk" --print-slices "$1" 2>/dev/null)" || return 1
+        pf_family=""
+        for pf_triple in $pf_slices; do
+            pf_args="$(bash "$angle" --print-gn-args "$pf_triple" 2>/dev/null)" || return 1
+            case "$pf_args" in
+                *'target_os="ios"'*) pf_this=ios ;;
+                *'target_os="mac"'*) pf_this=mac ;;
+                *) return 1 ;;
+            esac
+            [ -z "$pf_family" ] || [ "$pf_family" = "$pf_this" ] || return 1
+            pf_family="$pf_this"
+        done
+        [ -n "$pf_family" ] || return 1
+        printf '%s' "$pf_family"
+    }
+
+    families=""
+    for platform in $platforms; do
+        if ! family="$(platform_family_of "$platform")"; then
+            report platform-family-underivable \
+                "$platform: no single gn target_os across its slices, so its product shape is undefined"
+            continue
+        fi
+        case " $families " in
+            *" $family "*) ;;
+            *) families="$families $family" ;;
+        esac
+
+        if ! layout="$(bash "$angle" --print-loader-layout "$platform" 2>/dev/null)"; then
+            report loader-layout-unavailable \
+                "--print-loader-layout $platform failed, so the packaging rule has no owner"
+            continue
+        fi
+        for target in $targets; do
+            case "$family" in
+                ios) want_layout="$target.framework/$target" ;;
+                mac) want_layout="$target.dylib" ;;
+            esac
+            got_layout=""
+            while read -r layout_target layout_path; do
+                [ "$layout_target" = "$target" ] && got_layout="$layout_path"
+            done <<LAYOUT
+$layout
+LAYOUT
+            if [ "$got_layout" != "$want_layout" ]; then
+                report loader-layout-drift \
+                    "$platform/$target: ANGLE loads '$want_layout', the recipe lays out '${got_layout:-nothing}'"
+            fi
+        done
+    done
+
+    if bash "$angle" --print-loader-layout "$UNMAPPED_PLATFORM_CONTROL" >/dev/null 2>&1; then
+        report loader-layout-not-fail-closed \
+            "--print-loader-layout answered for $UNMAPPED_PLATFORM_CONTROL, so the check above proves nothing"
+    fi
+
+    # --- the xcframeworks stay split along that same axis --------------------
+    # `xcodebuild -create-xcframework` refuses to hold framework bundles and
+    # plain libraries in one bundle -- measured, run 33958391676 -- and ANGLE
+    # emits one shape on iOS and the other on macOS. So there is one xcframework
+    # per shipped library per family. Counted rather than pattern-matched: the
+    # names belong to the recipe, the arithmetic does not.
+    family_count=0
+    for family in $families; do family_count=$((family_count + 1)); done
+    target_count=0
+    for target in $targets; do target_count=$((target_count + 1)); done
+    if ! xcframeworks="$(bash "$angle" --print-xcframeworks 2>/dev/null)" || [ -z "$xcframeworks" ]; then
+        report xcframeworks-unavailable "--print-xcframeworks produced nothing"
+    elif [ "$family_count" -gt 0 ] && [ "$target_count" -gt 0 ]; then
+        want_bundles=$((target_count * family_count))
+        got_bundles="$(printf '%s\n' "$xcframeworks" | wc -l | tr -d ' ')"
+        uniq_bundles="$(printf '%s\n' "$xcframeworks" | sort -u | wc -l | tr -d ' ')"
+        if [ "$got_bundles" -ne "$want_bundles" ] || [ "$uniq_bundles" -ne "$want_bundles" ]; then
+            report xcframework-not-split-by-family \
+                "$target_count libraries x $family_count families needs $want_bundles xcframeworks; the recipe names $got_bundles ($uniq_bundles distinct)"
+        fi
+    fi
+
+    echo "$findings"
+    [ "$findings" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# The real tree
+# ---------------------------------------------------------------------------
+failures=0
+output="$(run_audit "$ROOT" 2>&1)" && status=0 || status=$?
+if [ "$status" -eq 0 ]; then
+    pass "the Apple ANGLE recipe is total over the engine's slices and derives every pinned value"
+else
+    bad "the recipe violates the contract:"
+    printf '%s\n' "$output" | sed 's/^/    /' >&2
+    failures=$((failures + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Injections. Each one must turn the audit red FOR ITS OWN REASON.
+# ---------------------------------------------------------------------------
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/migo-angle-recipe.XXXXXX")"
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+fixture() {
+    dest="$WORK/$1"
+    rm -rf "$dest"
+    mkdir -p "$dest/scripts" "$dest/contracts/artifact-manifest" "$dest/contracts/apple"
+    cp "$ROOT/scripts/build-angle-apple.sh" "$dest/scripts/"
+    cp "$ROOT/scripts/build-apple-sdk.sh" "$dest/scripts/"
+    cp "$ROOT/contracts/artifact-manifest/apple-angle.lock.json" "$dest/contracts/artifact-manifest/"
+    cp "$ROOT/contracts/apple/deployment-floor.json" "$dest/contracts/apple/"
+    mkdir -p "$dest/engine/third_party/angle-patches/apple"
+    cp "$ROOT/engine/third_party/angle-patches/apple/"*.patch \
+        "$dest/engine/third_party/angle-patches/apple/" 2>/dev/null || true
+    printf '%s' "$dest"
+}
+
+expect_violation() {
+    what="$1"; want_id="$2"; dest="$3"
+    out="$(run_audit "$dest" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        bad "injection '$what' did not turn the audit red"
+        failures=$((failures + 1))
+        return
+    fi
+    # Written to a file and matched there, for the reason at the top of this
+    # file: `grep -q` reading a pipe under pipefail reports the writer's SIGPIPE.
+    printf '%s\n' "$out" > "$WORK/last-audit.txt"
+    if grep -q "^VIOLATION $want_id:" "$WORK/last-audit.txt"; then
+        pass "injection '$what' -> $want_id"
+    else
+        bad "injection '$what' went red, but not as $want_id. What it reported:"
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        failures=$((failures + 1))
+    fi
+}
+
+# The clean fixture must be green, or every injection below proves nothing: a
+# copy that is already red goes red for any reason at all.
+dest="$(fixture control)"
+if out="$(run_audit "$dest" 2>&1)"; then
+    pass "the unmodified fixture is clean, so each injection below is the only difference"
+else
+    bad "the unmodified fixture is already red; no injection below proves anything:"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    failures=$((failures + 1))
+fi
+
+# 1. A slice loses its configuration.
+dest="$(fixture unmapped)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+start = s.index("        aarch64-apple-ios-sim)\n")
+end = s.index("        x86_64-apple-ios)\n")
+p.write_text(s[:start] + s[end:])
+PY
+expect_violation "a slice arm is deleted" unmapped-slice "$dest"
+
+# 2. The mapping stops failing closed. Without this control, check 1 would pass
+#    for a script that answered anything for everything.
+dest="$(fixture open)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+s = s.replace('''        *)
+            err "no ANGLE configuration for Rust target: $triple"''',
+'''        *)
+            printf '%s target_os="mac" target_cpu="arm64"' "$GN_ARGS_COMMON"; return 0 ;;
+        __never__)
+            err "no ANGLE configuration for Rust target: $triple"''', 1)
+p.write_text(s)
+PY
+expect_violation "an unknown triple gets a default configuration" not-fail-closed "$dest"
+
+# 3. The deployment target acquires a second owner.
+dest="$(fixture floordrift)"
+sed -i 's/"\$ios_target"/"17.0"/' "$dest/scripts/build-angle-apple.sh"
+expect_violation "the iOS deployment target is written into the recipe" deployment-target-drift "$dest"
+
+# 4. target_environment goes missing on an iOS configuration.
+dest="$(fixture noenv)"
+sed -i 's/ target_environment="device"//' "$dest/scripts/build-angle-apple.sh"
+expect_violation "an iOS configuration drops target_environment" ios-missing-target-environment "$dest"
+
+# 5. ...or is present and wrong, which is the one that would build silently.
+dest="$(fixture wrongenv)"
+sed -i 's/target_environment="device"/target_environment="simulator"/' "$dest/scripts/build-angle-apple.sh"
+expect_violation "the device configuration is built for the simulator" ios-wrong-target-environment "$dest"
+
+# 6. A macOS configuration picks up the iOS-only argument.
+dest="$(fixture macenv)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+s = s.replace('%s target_os="mac" target_cpu="arm64" mac_deployment_target="%s"',
+              '%s target_os="mac" target_environment="device" target_cpu="arm64" mac_deployment_target="%s"', 1)
+p.write_text(s)
+PY
+expect_violation "a macOS configuration sets target_environment" mac-has-target-environment "$dest"
+
+# 7. An architecture is built for the wrong CPU.
+dest="$(fixture cpu)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+s = s.replace('%s target_os="mac" target_cpu="x64" mac_deployment_target="%s"',
+              '%s target_os="mac" target_cpu="arm64" mac_deployment_target="%s"', 1)
+p.write_text(s)
+PY
+expect_violation "the Intel macOS slice is configured as arm64" target-cpu-mismatch "$dest"
+
+# 8. The revision gets a second copy in the build script.
+dest="$(fixture pin)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+s = s.replace('MODE=""\n',
+              'MODE=""\nFALLBACK_REVISION="52f594287836c9970b67920da0633077aee42649"\n', 1)
+p.write_text(s)
+PY
+expect_violation "the recipe carries its own copy of the revision" revision-hardcoded "$dest"
+
+# 9. The gn arguments stop coming from the lock.
+dest="$(fixture gnargs)"
+sed -i 's/"\$GN_ARGS_COMMON"/"is_debug=false angle_enable_metal=true"/g' "$dest/scripts/build-angle-apple.sh"
+expect_violation "the gn arguments are written into the recipe" gn-args-not-from-lock "$dest"
+
+# 10. The lock file's pin stops being a pin.
+dest="$(fixture badpin)"
+sed -i 's/"angle_revision": "[0-9a-f]*"/"angle_revision": "main"/' "$dest/contracts/artifact-manifest/apple-angle.lock.json"
+expect_violation "the pin is a branch name" lock-revision-malformed "$dest"
+
+# 11. The lock file starts answering the floor contract's question.
+dest="$(fixture lockfloor)"
+python3 - "$dest/contracts/artifact-manifest/apple-angle.lock.json" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1]); doc = json.loads(p.read_text())
+doc["source"]["gn_args_common"] += ' ios_deployment_target="17.0"'
+p.write_text(json.dumps(doc, indent=2))
+PY
+expect_violation "the lock file carries a deployment target" lock-carries-deployment-target "$dest"
+
+# 12. The recipe stops knowing a platform the engine builds for.
+dest="$(fixture platformset)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'SETPY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+s = s.replace(
+    '    if ! slices_for_platform "$PLATFORM" >/dev/null 2>&1; then',
+    '    if [ "$PLATFORM" = "ios-simulator" ] || ! slices_for_platform "$PLATFORM" >/dev/null 2>&1; then',
+    1)
+p.write_text(s)
+SETPY
+expect_violation "the recipe drops a platform the engine builds for" platform-set-disagreement "$dest"
+
+# 13. The patch stage loses the patch ANGLE will not build without.
+dest="$(fixture nopatch)"
+rm -f "$dest/engine/third_party/angle-patches/apple/"*.patch
+expect_violation "the ANGLE patches are deleted" angle-patches-missing "$dest"
+
+# 14. The macOS libraries get wrapped in framework bundles so that one
+#     xcframework can hold every platform. It is the tidy-looking answer to
+#     xcodebuild's refusal, and it breaks ANGLE's own dispatch-library lookup:
+#     libEGL moves to Versions/A/ and searches there for libGLESv2.dylib.
+#     Nothing fails until an application asks EGL for a display, which is why
+#     this is an injection rather than a comment saying not to.
+dest="$(fixture wrapmac)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'WRAPMAC'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        mac) printf '%s.dylib' "$2" ;;"""
+assert s.count(old) == 1
+p.write_text(s.replace(old, """        mac) printf '%s.framework/Versions/A/%s' "$2" "$2" ;;""", 1))
+WRAPMAC
+expect_violation "the macOS libraries are repackaged as framework bundles" loader-layout-drift "$dest"
+
+# 15. The layout question stops failing closed. Without this control, 14 would
+#     pass for a recipe that answered something for every platform name.
+dest="$(fixture layoutopen)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'LAYOUTOPEN'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    family_slices="$(slices_for_platform "$family_platform")" || return 1"""
+assert s.count(old) == 1
+s = s.replace(old, """    family_slices="$(slices_for_platform "$family_platform" 2>/dev/null || true)\"""", 1)
+old = """    [ -n "$family_seen" ] || { err "platform '$family_platform' reports no slices"; return 1; }"""
+assert s.count(old) == 1
+s = s.replace(old, """    [ -n "$family_seen" ] || family_seen=mac""", 1)
+p.write_text(s)
+LAYOUTOPEN
+expect_violation "the loader layout answers for a platform nobody builds" loader-layout-not-fail-closed "$dest"
+
+# 16. The xcframework split collapses: the family stops being part of the name,
+#     so both families are asked to share one bundle. That is exactly the
+#     configuration xcodebuild refused on run 33958391676.
+dest="$(fixture unsplit)"
+python3 - "$dest/scripts/build-angle-apple.sh" <<'UNSPLIT'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    printf 'ANGLELib%s-%s' "${1#lib}" "$xcf_token\""""
+assert s.count(old) == 1
+p.write_text(s.replace(old, """    printf 'ANGLELib%s' "${1#lib}\"""", 1))
+UNSPLIT
+expect_violation "the xcframeworks stop being split by platform family" xcframework-not-split-by-family "$dest"
+
+if [ "$failures" -ne 0 ]; then
+    bad "$failures check(s) failed"
+    exit 1
+fi
+echo "PASS: the Apple ANGLE recipe contract holds, and 16 injections were each seen to break it"

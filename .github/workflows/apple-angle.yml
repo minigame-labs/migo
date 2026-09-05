@@ -1,0 +1,273 @@
+name: Apple ANGLE
+
+# A2.1: build ANGLE-Metal for every Apple slice the engine is built for, and
+# produce the artifacts a pin can be written against.
+#
+# WHY THIS LANE EXISTS SEPARATELY FROM apple-sdk.yml. That one builds the engine
+# and is measured in minutes on a warm cache. This one starts with a 12 GB
+# gclient checkout and five ninja builds, and it answers a question that does not
+# change weekly -- so it runs on demand and on a branch prefix, never on a pull
+# request and never on a schedule. It is somebody's shared quota, in gigabytes.
+#
+# WHAT IS ALREADY KNOWN, so that a failure here is news rather than the first
+# measurement. .github/workflows/apple-angle-probe.yml (PR #185, run
+# 33948370655) established on this same image:
+#
+#   fetch --no-history angle (target_os mac+ios)   233 s   12 GB   29 GiB left
+#   gn gen, three configurations                   seconds
+#   ninja libEGL libGLESv2, iOS device arm64       334 s   100 MB of output
+#
+# So five configurations is roughly half an hour, and the runner's 42 GiB of
+# free space is not the constraint anybody assumed it was. The probe deliberately
+# stopped there; this is the lane that does the work.
+#
+# WHY THE RECIPE IS IN A SCRIPT AND NOT IN THIS FILE. `/build` is gitignored and
+# a workflow is not a place a recipe can be run from a Mac. scripts/build-angle-apple.sh
+# is the recipe; this file is a machine that runs it. Everything that decides
+# what gets built -- the revision, the gn arguments, the slice list -- is asked
+# of a contract or of scripts/build-apple-sdk.sh, and
+# scripts/test-apple-angle-recipe-contract.sh checks that on every pull request
+# without needing a Mac at all.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: >-
+          Space-separated slice groups to build. Empty means every one
+          build-apple-sdk.sh names. Narrowing it is how a question about one
+          platform is answered without paying for the other two.
+        required: false
+        default: ''
+      keep_going:
+        description: >-
+          Diagnostic: pass -k 0 to ninja so a failing build reports every
+          failure rather than stopping at the first. Never for a build whose
+          output is meant to be published.
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches:
+      - 'apple-angle/**'
+
+concurrency:
+  group: apple-angle-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # One job, not a matrix over platforms. A matrix leg cannot share the
+    # checkout, so three legs would be three 12 GB fetches to save nothing: the
+    # ninja builds are sequential work either way and the whole lane fits in the
+    # step timeouts below.
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    env:
+      # Inside the workspace, because actions/upload-artifact will not take a
+      # path outside it -- and `/build` is gitignored, so nothing that lands here
+      # can be committed by accident. `github.workspace` is available where
+      # job-level `env` is evaluated; `runner.temp` is not, which is why the
+      # ANGLE checkout below is set from `$RUNNER_TEMP` inside a step instead.
+      MIGO_ANGLE_APPLE_BUILD_ROOT: ${{ github.workspace }}/build/angle-apple
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Before anything is fetched, so the numbers mean something about the
+      # image rather than about what this lane did to it.
+      # `$RUNNER_TEMP` and not a job-level `env:` entry: the `runner` context is
+      # not available where job-level `env` is evaluated, and a workflow that
+      # references it there is rejected as a file issue before any step runs --
+      # which reports as a failed run with no job and no log to read.
+      - name: What this runner starts with
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          xcodebuild -version
+          df -h /
+          echo "MIGO_ANGLE_APPLE_SRC=$RUNNER_TEMP/angle" >> "$GITHUB_ENV"
+
+      # Outside the workspace: depot_tools puts its own git on PATH, and a
+      # checkout inside the repository would be one more thing every gate that
+      # walks the tree has to exclude.
+      - name: Fetch depot_tools
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+
+      # The recipe's own readiness report, before it costs anything. It names
+      # what is missing rather than dying inside a four-minute fetch.
+      - name: The recipe is ready to run
+        run: bash scripts/build-angle-apple.sh --check --source "$MIGO_ANGLE_APPLE_SRC"
+
+      # macOS has no `timeout(1)` -- that is GNU coreutils, and the probe's first
+      # build attempt got exit 127 in zero seconds from assuming otherwise. A
+      # per-step `timeout-minutes` is the portable answer and a better one: it
+      # fails this step alone, and the `if: always()` steps below still report
+      # every fact the earlier ones established.
+      - name: Fetch ANGLE at the pinned revision
+        timeout-minutes: 45
+        run: bash scripts/build-angle-apple.sh --fetch --source "$MIGO_ANGLE_APPLE_SRC"
+
+      - name: What the checkout cost
+        if: always()
+        run: |
+          set -x
+          df -h /
+          du -sh "$MIGO_ANGLE_APPLE_SRC" || true
+
+      # One loop rather than three steps. Three named steps read better in the
+      # step list, but they cannot be narrowed: answering a question about macOS
+      # meant paying twenty minutes for the two iOS legs first, and that is the
+      # cost that decides how many times anyone is willing to ask.
+      #
+      # The platform list still comes from build-apple-sdk.sh; the dispatch input
+      # only selects a subset of it, and a name outside it is rejected by the
+      # recipe rather than silently skipped.
+      - name: Build ANGLE
+        timeout-minutes: 150
+        env:
+          SELECTED: ${{ inputs.platforms }}
+          KEEP_GOING: ${{ inputs.keep_going }}
+        run: |
+          set -euo pipefail
+          platforms="${SELECTED:-}"
+          if [ -z "$platforms" ]; then
+            platforms="$(bash scripts/build-apple-sdk.sh --print-platforms)"
+          fi
+          flags=""
+          if [ "${KEEP_GOING:-false}" = "true" ]; then
+            flags="--keep-going"
+          fi
+          mkdir -p "$MIGO_ANGLE_APPLE_BUILD_ROOT"
+          for platform in $platforms; do
+            echo "::group::ANGLE for $platform"
+            bash scripts/build-angle-apple.sh --platform "$platform" \
+              --source "$MIGO_ANGLE_APPLE_SRC" $flags
+            echo "::endgroup::"
+          done
+          # What was actually built, for the step that packs it. Without this,
+          # narrowing the build to one platform left the pack step iterating all
+          # three and failing on the two that were never built -- a step failing
+          # for a reason that has nothing to do with what it was asked to do.
+          #
+          # A FILE, not $GITHUB_ENV, and that is a correction: the first version
+          # of this line wrote the list to $GITHUB_ENV, where `--print-platforms`
+          # output is multi-line and the env-file parser reads the second line as
+          # a new assignment. It failed the whole lane with `Invalid format
+          # 'ios-simulator'` AFTER all five configurations had built. The env
+          # protocol has escaping rules for multi-line values; a file has none,
+          # and the value here is a list of words that a file holds natively.
+          printf '%s\n' $platforms > "$MIGO_ANGLE_APPLE_BUILD_ROOT/built-platforms.txt"
+
+      # One archive per platform, made HERE rather than by repacking the
+      # workflow artifact later. An iOS product is a framework bundle -- a
+      # directory -- and a directory is not a release asset, so something has to
+      # pack it; doing it on the machine that produced the bytes means what gets
+      # published is the build's own output rather than whatever survived an
+      # artifact upload's own zip (which does not promise to preserve a mode bit
+      # or a symlink).
+      #
+      # The three numbers each one prints -- sha256, size, contents -- are
+      # exactly the fields contracts/artifact-manifest/apple-angle.lock.json
+      # needs, which is the point: the pin is transcribed from a build log, not
+      # computed by hand somewhere else.
+      - name: Pack each platform for publication
+        run: |
+          set -euo pipefail
+          # Exactly what the build step built, which on a full run is the list
+          # build-apple-sdk.sh names and on a narrowed one is the subset asked
+          # for. Not this file's own copy of the set, and not a fresh query that
+          # would disagree with the build above.
+          list="$MIGO_ANGLE_APPLE_BUILD_ROOT/built-platforms.txt"
+          [ -s "$list" ] || { echo "the build step recorded no platforms" >&2; exit 1; }
+          while read -r platform; do
+            [ -n "$platform" ] || continue
+            bash scripts/build-angle-apple.sh --archive "$platform"
+          done < "$list"
+
+      # Four xcframeworks: one per shipped library per platform family.
+      # `xcodebuild -create-xcframework` holds one library per platform AND
+      # refuses to hold framework bundles beside plain libraries -- it said so
+      # on run 33958391676 -- while ANGLE emits a framework bundle on iOS and a
+      # shared library on macOS. Repackaging macOS to match would break ANGLE's
+      # own lookup of libGLESv2; scripts/build-angle-apple.sh carries the source
+      # lines. So the split follows ANGLE's axis and the count follows from it.
+      - name: Assemble the xcframeworks
+        run: bash scripts/build-angle-apple.sh --xcframework
+
+      # The identity of what was built, in a form the lock file can be written
+      # from. sha256 per file, because that is the shape
+      # contracts/artifact-manifest/windows-angle.lock.json already uses and
+      # scripts/fetch-apple-angle.sh will check file by file.
+      - name: The bytes, and what they say about themselves
+        if: always()
+        run: |
+          set -euo pipefail
+          # `find -type f` and not a `*.dylib` glob: ANGLE emits a framework
+          # BUNDLE on iOS and a plain shared library on macOS, so a glob written
+          # for one shape reports nothing for the other -- and an empty report
+          # reads exactly like a clean one.
+          for dir in engine/third_party/angle-apple-*; do
+            [ -d "$dir" ] || continue
+            echo "=== $dir ==="
+            find "$dir" -type f | sort | while read -r f; do
+              echo "--- $f"
+              shasum -a 256 "$f"
+              stat -f 'size %z bytes' "$f"
+              # Only Mach-O files answer these; the rest of a bundle is plists.
+              lipo -info "$f" 2>/dev/null || true
+              otool -D "$f" 2>/dev/null || true
+              otool -l "$f" 2>/dev/null | grep -A4 'LC_BUILD_VERSION' || true
+            done
+          done
+          echo "=== xcframeworks ==="
+          ls -la platforms/apple/Frameworks/ || true
+          for x in platforms/apple/Frameworks/ANGLELib*.xcframework; do
+            [ -d "$x" ] || continue
+            echo "--- $x"
+            cat "$x/Info.plist"
+          done
+
+      # The whole point of the lane: bytes a pin can be written against. Kept for
+      # longer than apple-sdk.yml keeps its xcframework, because the next step is
+      # a human publishing these as release assets and hashing them.
+      - name: Keep the ANGLE libraries
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: angle-apple-libraries
+          path: engine/third_party/angle-apple-*
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Keep the xcframeworks
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: angle-apple-xcframeworks
+          path: platforms/apple/Frameworks/ANGLELib*.xcframework
+          if-no-files-found: warn
+          retention-days: 30
+
+      # The publishable form. These are the files that become release assets and
+      # whose sha256 the lock file pins, so they are kept separately from the
+      # unpacked tree above and for the same 30 days.
+      - name: Keep the publishable archives
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: angle-apple-archives
+          path: |
+            build/angle-apple/angle-apple-*.tar.gz
+            build/angle-apple/angle-apple-*.tar.gz.sha256
+          if-no-files-found: warn
+          retention-days: 30
