@@ -28,6 +28,12 @@ name: Apple ANGLE probe
 # If the checkout does not fit, the entire lane is dead and no build script would
 # ever have run. Nobody in this project has measured it.
 #
+# MEASURED, 2026-09-05, run 33948370655 on macos-15-arm64 (macOS 15.7.9,
+# Xcode 16.4): the image starts with 42 GiB free, depot_tools is 12 MB, and
+# `fetch --no-history angle` with target_os limited to mac and ios takes
+# 238 seconds and 12 GB, leaving 29 GiB. The premise that a hosted macOS runner
+# is too small for this was wrong -- it was carried over from the x86 image.
+#
 # So this job checks out and configures, and DELIBERATELY DOES NOT BUILD. A first
 # run that tries to compile ANGLE answers a question we cannot ask yet -- how
 # long the compile takes -- while risking a timeout that tells us nothing about
@@ -100,9 +106,34 @@ jobs:
             echo "target_os = ['mac', 'ios']"
             echo "target_os_only = True"
           } >> .gclient
-          gclient sync --no-history --shallow
+          gclient sync --no-history
           echo "seconds=$((SECONDS - started))" >> "$GITHUB_OUTPUT"
-          cd angle
+
+          # Where the tree landed, read from .gclient rather than assumed.
+          #
+          # `fetch angle` names its solution `.`, so the checkout IS this
+          # directory -- unlike `fetch chromium`, which creates `src/`. The
+          # first run of this probe assumed the chromium shape, and `cd angle`
+          # failed after a four-minute fetch that had otherwise succeeded. The
+          # fix is not the other guess: the file says which, so the file is what
+          # is read, and a recipe that changes shape upstream keeps working.
+          root="$(python3 - <<'PYTHON'
+          import pathlib
+
+          source = pathlib.Path(".gclient").read_text()
+          namespace = {}
+          exec(compile(source, ".gclient", "exec"), namespace)
+          solutions = namespace["solutions"]
+          if len(solutions) != 1:
+              raise SystemExit(
+                  f".gclient declares {len(solutions)} solutions; this probe knows how to "
+                  "locate one"
+              )
+          print(solutions[0]["name"])
+          PYTHON
+          )"
+          echo "ANGLE_ROOT=$(cd "$root" && pwd)" >> "$GITHUB_ENV"
+          cd "$root"
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: What the checkout cost
@@ -111,7 +142,7 @@ jobs:
           set -x
           df -h /
           du -sh "$RUNNER_TEMP/angle" || true
-          du -sh "$RUNNER_TEMP/angle/angle/third_party" 2>/dev/null || true
+          du -sh "${ANGLE_ROOT:-$RUNNER_TEMP/angle}/third_party" 2>/dev/null || true
 
       # Configuration only. This is the half that can be wrong in a way a
       # checkout cannot reveal: an argument this ANGLE revision does not accept,
@@ -125,7 +156,7 @@ jobs:
       - name: Configure for iOS and for macOS, without building
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/angle/angle"
+          cd "$ANGLE_ROOT"
           for args in \
             "target_os=\"ios\" target_cpu=\"arm64\" ios_enable_code_signing=false" \
             "target_os=\"mac\" target_cpu=\"arm64\""; do
