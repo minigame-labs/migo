@@ -47,6 +47,21 @@
 #      unable to move it. Two of the three slice groups are `lipo` output, so
 #      the tool that looks right audits half the product and reports a pass.
 #
+#      The comparison is "not newer than the floor", not equality, and that
+#      difference is the check. A member built against an OLDER target loads
+#      under the floor; one built against a NEWER target is the Android defect
+#      above -- bytes that need more than the product promises. Equality could
+#      not be required even if it were harmless, because most of the archive is
+#      not compiled here: the device slice carries 384 objects from rustup's
+#      prebuilt std at iOS 10.0 and 1369 from Skia's GN build at iOS 12.0
+#      against 256 of this repository's own at 15.0, and no deployment target
+#      this build sets reaches either of the first two.
+#
+#      What it does require is that SOMETHING in every slice was built against
+#      the floor exactly. Without that, a build which never received the
+#      deployment target at all would pass on the strength of dependencies that
+#      happen to sit below it.
+#
 # Fails closed. An unreadable contract, an artifact directory with no Mach-O in
 # it, a Mach-O the reader cannot parse, or a sweep that matches nothing at all
 # are errors, not passes.
@@ -81,8 +96,9 @@ usage: test-apple-deployment-floor-contract.sh [--artifacts DIR]
 
   --artifacts DIR   Additionally read the deployment target out of every Mach-O
                     under DIR -- every universal slice, every archive member --
-                    and require it to equal the declared floor. Needs no Xcode:
-                    the reader parses the file formats itself.
+                    and require that none of them needs more OS than the floor,
+                    and that something in each slice was built against it
+                    exactly. Needs no Xcode: the reader parses the file formats.
 USAGE
 }
 
@@ -444,12 +460,46 @@ if [ -n "$ARTIFACT_DIR" ]; then
         exit 1
     fi
 
+    # Version comparison rather than equality, because the two directions are
+    # not the same defect. `newer_than a b` succeeds when a requires more OS
+    # than b. Missing components count as zero, so 15 and 15.0 compare equal.
+    # awk because `sort -V` is not on every runner this has to work on.
+    newer_than() {
+        awk -v a="$1" -v b="$2" 'BEGIN {
+            split(a, left, "."); split(b, right, ".")
+            for (i = 1; i <= 3; i++) {
+                if (left[i] + 0 > right[i] + 0) exit 0
+                if (left[i] + 0 < right[i] + 0) exit 1
+            }
+            exit 1
+        }'
+    }
+
     checked=0
+    slice_path=""
+    slice_arch=""
+    slice_records=0
+    slice_at_floor=0
+
+    # A slice is judged when the next one starts, because "was anything in it
+    # built against the floor" is a property of the whole slice rather than of
+    # any one record.
+    finish_slice() {
+        if [ -n "$slice_path" ] && [ "$slice_records" -gt 0 ] && [ "$slice_at_floor" -eq 0 ]; then
+            fail "$slice_path: nothing in the $slice_arch slice was built against the declared floor, so nothing shows the deployment target reached the compiler"
+        fi
+        slice_path=""
+        slice_arch=""
+        slice_records=0
+        slice_at_floor=0
+    }
+
     while IFS=$'\t' read -r kind f1 f2 f3 f4 f5 f6; do
         case "$kind" in
             "") ;;
             FILE)
                 # f1 path, f2 Mach-O objects read, f3 deployment targets found
+                finish_slice
                 checked=$((checked + 1))
                 if [ "$f2" -eq 0 ]; then
                     fail "$f1 is a Mach-O container holding no Mach-O object at all"
@@ -457,13 +507,18 @@ if [ -n "$ARTIFACT_DIR" ]; then
                 ;;
             ARCH)
                 # f1 path, f2 architecture, f3 objects read, f4 targets found
+                finish_slice
                 if [ "$f4" -eq 0 ]; then
                     fail "$f1: the $f2 slice declares no deployment target in any of its $f3 object(s)"
+                else
+                    slice_path="$f1"
+                    slice_arch="$f2"
+                    slice_records="$f4"
                 fi
                 ;;
             RECORD)
-                # f1 path, f2 architecture, f3 platform, f4 minos, f5 objects
-                # agreeing on it, f6 one of them
+                # f1 path, f2 architecture, f3 platform, f4 the target these
+                # objects were built against, f5 how many agree, f6 one of them
                 case "$f3" in
                     ios|iossimulator) expected="$ios_floor" ;;
                     macos)            expected="$macos_floor" ;;
@@ -472,10 +527,19 @@ if [ -n "$ARTIFACT_DIR" ]; then
                         continue
                         ;;
                 esac
-                if [ "$f4" != "$expected" ]; then
-                    fail "$f1: $f2 targets $f3 $f4, contract says $expected ($f5 object(s), e.g. $f6)"
+                case "$f4" in
+                    ""|*[!0-9.]*)
+                        fail "$f1: the $f2 slice reports '$f4' as a deployment target, which is not a version"
+                        continue
+                        ;;
+                esac
+                if [ "$f4" = "$expected" ]; then
+                    slice_at_floor=1
+                    info "ok: $f1 $f2 was built against the declared $f3 floor $f4 ($f5 object(s))"
+                elif newer_than "$f4" "$expected"; then
+                    fail "$f1: $f2 carries $f5 object(s) built against $f3 $f4, newer than the $expected floor (e.g. $f6)"
                 else
-                    info "ok: $f1 $f2 targets $f3 $f4 ($f5 object(s))"
+                    info "$f1: $f2 carries $f5 object(s) built against $f3 $f4, below the $expected floor and so loadable under it (e.g. $f6)"
                 fi
                 ;;
             *)
@@ -483,6 +547,7 @@ if [ -n "$ARTIFACT_DIR" ]; then
                 ;;
         esac
     done <<<"$artifact_report"
+    finish_slice
 
     if [ "$checked" -eq 0 ]; then
         fail "--artifacts $ARTIFACT_DIR contained no Mach-O files to read"

@@ -91,6 +91,12 @@ def ar_member(name: str, data: bytes, extended: bool = False) -> bytes:
         field = f"#1/{len(payload)}"
         body = payload + data
     else:
+        # Refused rather than truncated: a name that overflows the 16-byte field
+        # runs into the header's mtime and yields an archive no reader can parse.
+        # A builder that emits one quietly turns a passing test into a lie about
+        # the parser.
+        if len(name) > 16:
+            raise ValueError(f"{name!r} exceeds ar's 16-byte name field; pass extended=True")
         field = name
         body = data
     header = (
