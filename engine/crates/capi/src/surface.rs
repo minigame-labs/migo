@@ -415,6 +415,25 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                                     tracing::error!(
                                         "migo_session_attach_surface: ingress capture failed: {error}"
                                     );
+                                    // The session this call spawned has already
+                                    // gone: the renderer failed to initialise
+                                    // and tore it down between the spawn
+                                    // returning and this line. Measured on the
+                                    // iOS simulator with no ANGLE present,
+                                    // where it is a race attach loses about two
+                                    // runs in three -- and the host was told
+                                    // nothing, because only failures raised
+                                    // INSIDE the session thread report through
+                                    // on_error.
+                                    if let Some(notifier) = &notifier {
+                                        notifier.error(
+                                            MIGO_ERROR_INTERNAL,
+                                            format!(
+                                                "the session exited while attach was still \
+                                                 installing it: {error}"
+                                            ),
+                                        );
+                                    }
                                     let _ = retire_surface(host);
                                     if let Err(error) = started.engine.shutdown_and_join() {
                                         tracing::error!(
