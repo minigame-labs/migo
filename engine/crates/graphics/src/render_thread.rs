@@ -1816,7 +1816,6 @@ impl RenderThread {
                 // re-checked below regardless. See `SurfaceControl::live_candidate`.
                 let claimed = surface_control.live_candidate();
                 let mut initial_onscreen: Option<(u32, u32)> = None;
-                let mut startup_failed = false;
 
                 // With a Surface still live, create the onscreen context immediately.
                 if let Some(lease) = claimed {
@@ -1857,8 +1856,29 @@ impl RenderThread {
                             let (e, _) =
                                 recreate_engine_error("initial Surface rejected", error);
                             error!("create_onscreen failed: {}", e);
-                            gpu_caps.set_failed(format!("create_onscreen failed: {}", e));
-                            startup_failed = true;
+                            // Deliberately not `gpu_caps.set_failed`, which it used to
+                            // be. That level answers one question -- are the published
+                            // capability values real -- and they are: they came from
+                            // `DeviceCapabilities::detect` against the resource
+                            // context, which is up, and `publish_gpu_caps` reads
+                            // nothing an onscreen surface contributes to. Answering it
+                            // "no" here said "capabilities unknown" when the truth was
+                            // "capabilities known, no surface".
+                            //
+                            // And it said so permanently. `set_failed` latches: it
+                            // stores the detail, sets both `failed` and `ready`, and
+                            // there is no way back. So `ensure_gpu_ready` failed for
+                            // the rest of the session, content could never start --
+                            // `load_content` is once per Session and the C boundary
+                            // exposes no restart -- and the engine was simultaneously
+                            // telling the host to attach another Surface, which that
+                            // session could then never use. A recoverable failure made
+                            // the session unrecoverable.
+                            //
+                            // What remains is the state a warm start begins in: caps
+                            // real, no Surface, waiting for the `UpdateSurface` that
+                            // brings the next one.
+                            //
                             // The same route the update path takes for the same
                             // failure, and the asymmetry was the defect: an initial
                             // install that genuinely fails leaves this thread alive
@@ -1884,12 +1904,13 @@ impl RenderThread {
                     }
                 }
 
-                // Publish Ready only after every startup step represented by the
-                // host's GPU join has succeeded. A surface failure has already
-                // published Failed and must never be overwritten by Ready.
-                if !startup_failed {
-                    cm.publish_gpu_caps();
-                }
+                // Published unconditionally, because by here the question it
+                // answers has an answer: `CanvasManager` construction is what detects
+                // the capabilities, and reaching this line means it succeeded. Whether
+                // an onscreen surface was installed is a different question, asked and
+                // answered elsewhere -- see the surface-rejection arm above for why
+                // conflating the two made a recoverable failure permanent.
+                cm.publish_gpu_caps();
 
                 // Build the text context here, and not before.
                 //
@@ -1903,7 +1924,7 @@ impl RenderThread {
                 // directions: after the caps that unblock the host, and long
                 // before any game code can ask for a glyph, so no first
                 // `fillText` pays for it either.
-                if !startup_failed {
+                {
                     let built = std::time::Instant::now();
                     shared_text_ctx.lock().get();
                     debug!(

@@ -14,6 +14,30 @@ const EXTERNAL: &str = include_str!("../external.rs");
 const REGISTRY: &str = include_str!("../registry.rs");
 const CAPI_SURFACE: &str = include_str!("../../../../capi/src/surface.rs");
 
+/// A region with its line comments removed.
+///
+/// Every "must not contain" assertion below goes through this, and it is not
+/// fastidiousness: the comments in this codebase deliberately name the thing they
+/// explain, so a comment reading "deliberately not gpu_caps.set_failed" satisfies a
+/// search for `set_failed`, and the assertion that the call is absent then fails on
+/// the prose saying it is absent. That happened. Rewording the comment would have
+/// worked until the next person wrote a clear one.
+///
+/// Line comments only. A block comment inside one of these regions would need
+/// handling and there are none; a `//` inside a string literal would be stripped
+/// wrongly and there are none of those either. Either appearing is cheap to notice,
+/// because the assertion goes green and its injection proof goes green with it.
+fn code_only(region: &str) -> String {
+    region
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(offset) => &line[..offset],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn host_new_body() -> &'static str {
     let start = HOST
         .find("pub(crate) fn new(")
@@ -151,7 +175,7 @@ fn a_launch_that_fails_is_announced_like_one_that_succeeds() {
          reach the work without the announcement"
     );
     assert!(
-        !pairing.contains("should_notify_error"),
+        !code_only(pairing).contains("should_notify_error"),
         "the launch report must not be throttled: it runs once per launch, so a \
          suppressed first report would be the only report there was"
     );
@@ -235,7 +259,7 @@ fn the_external_session_tells_its_host_what_the_embedded_one_does() {
         .find("RenderEvent::ContextLost => {")
         .expect("context loss must still be handled");
     assert!(
-        !drain[lost..recovered].contains("notify_error"),
+        !code_only(&drain[lost..recovered]).contains("notify_error"),
         "a recoverable context loss must not be reported; the unrecoverable case is \
          the ContextRecovered arm"
     );
@@ -243,7 +267,7 @@ fn the_external_session_tells_its_host_what_the_embedded_one_does() {
         .find("other => {")
         .expect("the remaining events must still be handled");
     assert!(
-        !drain[content..].contains("notify_error"),
+        !code_only(&drain[content..]).contains("notify_error"),
         "a failed drawing command is the producer's, and the producer is another \
          process that already learns about its own errors"
     );
@@ -288,12 +312,12 @@ fn startup_registrations_are_guarded_until_host_publication() {
     // in the Host registry handle, retired by the `unregister_sender` that every
     // exit path already goes through.
     assert!(
-        !SHELL.contains("mark_vsync_registered"),
+        !code_only(SHELL).contains("mark_vsync_registered"),
         "the frame clock's sender must not need guarding: its lifetime is the Host \
          registry handle's"
     );
     assert!(
-        !SHELL.contains("register_vsync_sender"),
+        !code_only(SHELL).contains("register_vsync_sender"),
         "the shell must not register a frame clock behind the ingress's back"
     );
     assert!(
@@ -340,7 +364,7 @@ fn a_session_is_handed_its_own_ingress_rather_than_looking_it_up() {
         "the spawn must carry the session's own ingress out"
     );
     assert!(
-        !CAPI_SURFACE.contains("host_ingress("),
+        !code_only(CAPI_SURFACE).contains("host_ingress("),
         "attach must not look up the session it is installing; that lookup is for \
          callers who only have an id, and whose question is whether it is still alive"
     );
@@ -440,7 +464,20 @@ fn gpu_failure_detail_is_initialized_before_ready_publication() {
 }
 
 #[test]
-fn gpu_caps_publish_only_after_initial_surface_outcome() {
+fn gpu_caps_failed_means_the_gpu_did_not_come_up_and_nothing_else() {
+    // The property: that level answers one question -- are the published capability
+    // values real -- and only the step that produces them may answer it "no".
+    //
+    // A failed *onscreen* install used to answer it too, and permanently:
+    // `set_failed` latches, so `ensure_gpu_ready` failed for the rest of the session
+    // and content could never start -- `load_content` is once per Session and the C
+    // boundary exposes no restart. Meanwhile the same failure reports a surface loss,
+    // telling the host to attach another Surface that this session could then never
+    // use. A recoverable failure made the session unrecoverable.
+    //
+    // The values themselves were never in doubt: they come from
+    // `DeviceCapabilities::detect` against the resource context, and
+    // `publish_gpu_caps` reads nothing an onscreen surface contributes to.
     let manager_start = CANVAS_MANAGER
         .find("pub(crate) fn new_with_resource(")
         .expect("CanvasManager constructor must remain present");
@@ -450,24 +487,51 @@ fn gpu_caps_publish_only_after_initial_surface_outcome() {
         .expect("CanvasManager constructor must end before new_canvas_id");
     assert!(
         !CANVAS_MANAGER[manager_start..manager_end].contains("gpu_caps.set("),
-        "CanvasManager construction must not publish caps before the initial surface"
+        "CanvasManager construction must not publish caps before it has detected them"
     );
     assert!(CANVAS_MANAGER.contains("pub(crate) fn publish_gpu_caps(&self)"));
 
-    let render_init = RENDER_THREAD
-        .split("CanvasManager::new_with_resource")
+    // Derived rather than listed: exactly two sites may report a GPU that did not
+    // come up -- construction failing, and a panic before it finished -- and a third
+    // appearing is the drift this exists to catch.
+    let failures = RENDER_THREAD.matches("gpu_caps.set_failed(").count();
+    assert_eq!(
+        failures, 2,
+        "only construction and the panic barrier may declare the GPU unusable: \
+         {failures} sites do"
+    );
+    let construction = RENDER_THREAD
+        .find("CanvasManager init failed")
+        .expect("the construction failure must remain present");
+    let panic_arm = RENDER_THREAD
+        .find("RenderThread panicked during initialization")
+        .expect("the panic arm must remain present");
+    assert!(
+        construction < panic_arm,
+        "the two sites are construction and the panic barrier, in that order"
+    );
+
+    // And the surface arms answer with a surface loss instead, which is recoverable.
+    let init = RENDER_THREAD
+        .split("if let Some(lease) = claimed {")
         .nth(1)
-        .expect("render initialization must construct CanvasManager");
-    let surface = render_init
-        .find("surface_control.live_candidate()")
-        .expect("render initialization must claim the initial Surface from the control plane");
-    let guarded_publish = render_init
-        .find("if !startup_failed")
-        .expect("failed surface setup must not publish successful caps");
-    let publish = render_init
-        .find("cm.publish_gpu_caps()")
-        .expect("successful render initialization must publish caps");
-    assert!(surface < guarded_publish && guarded_publish < publish);
+        .expect("the initial install must remain present")
+        .split("cm.publish_gpu_caps();")
+        .next()
+        .expect("the initial install must end before the caps publication");
+    assert!(
+        !code_only(init).contains("set_failed"),
+        "a Surface the platform refused must not be reported as an unusable GPU"
+    );
+    assert!(
+        RENDER_THREAD.contains("cm.publish_gpu_caps();"),
+        "the capabilities must still be published"
+    );
+    assert!(
+        !code_only(RENDER_THREAD).contains("startup_failed"),
+        "the flag that gated the publication is gone: reaching that line means \
+         construction succeeded, which is the whole of what caps depend on"
+    );
 }
 
 #[test]
@@ -506,7 +570,7 @@ fn the_initial_surface_is_claimed_after_gpu_init_and_by_one_route_only() {
         .next()
         .expect("RenderThread::spawn must have a signature");
     assert!(
-        !signature.contains("SurfaceLease"),
+        !code_only(signature).contains("SurfaceLease"),
         "RenderThread::spawn must take no Surface: the control plane is the only \
          route, so there is nowhere else for a pin to reappear"
     );
@@ -524,7 +588,7 @@ fn the_initial_surface_is_claimed_after_gpu_init_and_by_one_route_only() {
         .next()
         .expect("the RecreateOnscreen command must end");
     assert!(
-        !command.contains("SurfaceLease"),
+        !code_only(command).contains("SurfaceLease"),
         "RecreateOnscreen must carry no Surface: it is the wake and the reply \
          channel for a level, not the delivery of a lease"
     );
@@ -590,7 +654,7 @@ fn an_initial_surface_that_cannot_be_installed_is_reported_like_a_later_one() {
         .split("if let Some(lease) = claimed {")
         .nth(1)
         .expect("the initial install must remain present")
-        .split("if !startup_failed")
+        .split("cm.publish_gpu_caps();")
         .next()
         .expect("the initial install must end before the caps publication");
     let update = RENDER_THREAD
@@ -621,46 +685,65 @@ fn an_initial_surface_that_cannot_be_installed_is_reported_like_a_later_one() {
         "the initial install must take the generation before the lease moves"
     );
     assert!(
-        !init.contains("lease.clone()"),
+        !code_only(init).contains("lease.clone()"),
         "the initial install must not retain a clone of the lease to report with: \
          that is the pin the candidate level exists to avoid"
     );
 }
 
 #[test]
-fn a_surface_the_host_took_back_during_gpu_init_is_not_a_startup_failure() {
-    // The property: "the host retired it while the GPU was coming up" is
-    // cancellation, not a render failure.
+fn a_surface_the_host_took_back_is_cancellation_and_one_it_refused_is_a_loss() {
+    // The property: the two ways an initial install can fail to install are told
+    // apart, and each is answered with the thing that is true of it.
     //
-    // `gpu_caps.set_failed` is what `ensure_gpu_ready` turns into
-    // `Render2DInitError` before the first line of launch JS, so routing this
-    // through it aborts a launch over a Surface the host itself took back -- and
-    // names the GPU as the culprit while the GPU is fine. The truthful state is
-    // the one a warm start begins in: caps Ready, no Surface, waiting for the
-    // `UpdateSurface` that brings the next one.
+    // A candidate the host retired between the read and the preflight is
+    // cancellation. Nothing is reported, because the host is the party that retired
+    // it -- it knows. What is left is the state a warm start begins in: capabilities
+    // real, no Surface, waiting for the `UpdateSurface` that brings the next one.
+    //
+    // A candidate the *platform* refused is a loss. The host does not know, has no
+    // other channel to learn it on, and needs to attach another -- so that arm
+    // retires the generation and reports.
+    //
+    // Neither declares the GPU unusable; see
+    // `gpu_caps_failed_means_the_gpu_did_not_come_up_and_nothing_else` for what that
+    // conflation cost.
     let install = RENDER_THREAD
         .split("if let Some(lease) = claimed {")
         .nth(1)
-        .expect("the initial install must remain present");
-    let arm = install
+        .expect("the initial install must remain present")
+        .split("cm.publish_gpu_caps();")
+        .next()
+        .expect("the initial install must end before the caps publication");
+    let cancelled_at = install
         .find("Err(SurfaceRecreateError::Binding(SurfaceBindingError::StaleGeneration))")
-        .expect("a retired candidate must be matched separately from a real failure");
-    let blanket = install
-        .find("gpu_caps.set_failed(")
-        .expect("a real install failure must still publish Failed");
+        .expect("a retired candidate must be matched separately from a refused one");
+    let refused_at = install[cancelled_at..]
+        .find("Err(error) => {")
+        .map(|offset| cancelled_at + offset)
+        .expect("a refused candidate must still have an arm");
+    let cancelled = code_only(&install[cancelled_at..refused_at]);
+    let refused = code_only(&install[refused_at..]);
+
     assert!(
-        arm < blanket,
-        "the cancellation arm must be matched before the arm that publishes Failed"
-    );
-    let cancelled = &install[arm..blanket];
-    assert!(
-        !cancelled.contains("set_failed"),
-        "a retired candidate must not publish a GPU failure"
+        !cancelled.contains("retire_unexpected_surface("),
+        "a candidate the host retired must not be reported back to the host: it is \
+         the party that retired it"
     );
     assert!(
-        !cancelled.contains("startup_failed = true"),
-        "a retired candidate must not suppress the caps publication the GPU earned"
+        refused.contains("retire_unexpected_surface("),
+        "a candidate the platform refused must be reported: the host has no other \
+         way to learn it, and needs to attach another"
     );
+    for (arm, which) in [
+        (&cancelled, "cancellation"),
+        (&refused, "a refused Surface"),
+    ] {
+        assert!(
+            !arm.contains("set_failed"),
+            "{which} must not declare the GPU unusable"
+        );
+    }
 }
 
 #[test]
@@ -867,23 +950,23 @@ fn every_startup_error_the_caller_sees_was_announced_exactly_once() {
     // way it can fail, including a panic, which the barrier reports.
     let after_handshake = &body[handshake_at..];
     assert!(
-        !after_handshake.contains("report_unspawned_failure("),
+        !code_only(after_handshake).contains("report_unspawned_failure("),
         "the handshake observes a failure that already reported; announcing it \
          again is the duplicate this test exists to prevent"
     );
     assert!(
-        !after_handshake.contains("notify_error("),
+        !code_only(after_handshake).contains("notify_error("),
         "the handshake must not report through any route"
     );
 
     // The pairing above is only meaningful if the helper is the sole reporter in
     // those two regions -- a bare `notify_error` there would satisfy no count.
     assert!(
-        !body[..spawn_at].contains("notify_error("),
+        !code_only(&body[..spawn_at]).contains("notify_error("),
         "pre-spawn reporting must go through report_unspawned_failure"
     );
     assert!(
-        !body[join_at..host_at].contains("notify_error("),
+        !code_only(&body[join_at..host_at]).contains("notify_error("),
         "spawn-failure reporting must go through report_unspawned_failure"
     );
 }
