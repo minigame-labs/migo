@@ -98,6 +98,20 @@ final class MigoSurfaceAttachTests: XCTestCase {
         override func setUpWithError() throws {
             try super.setUpWithError()
 
+            // Turn the engine's own diagnostics on before anything creates an
+            // engine: `migo_engine_create` reads MIGO_CAPI_LOG once and installs
+            // a subscriber, and without it every `tracing::error!` the library
+            // emits is discarded.
+            //
+            // Not a debugging leftover. When the iOS arm of this test first ran,
+            // attach answered MIGO_ERROR_INTERNAL and the log said nothing at
+            // all -- the session thread had failed on its way up and the one
+            // sentence naming the reason went to a subscriber that did not
+            // exist. A test whose whole purpose is producing evidence should not
+            // be throwing the library's own account of a failure away, and the
+            // cost of finding out otherwise is a lane round trip per question.
+            setenv("MIGO_CAPI_LOG", "info", 1)
+
             // Directories the engine may write into. A test that pointed these
             // at the source tree would be a test that leaves artefacts behind on
             // the machine that ran it.
