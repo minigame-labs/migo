@@ -34,6 +34,62 @@ import XCTest
     private let ledgerConstantName = "MIGO_PLATFORM_IOS_CA_METAL_LAYER"
 #endif
 
+/// Where the engine's account of a failure goes, so a failing assertion can
+/// carry it.
+///
+/// `on_error` is the channel `session.h` promises operational errors arrive on
+/// -- "Runtime errors and recoverable pressure notifications" -- and installing
+/// it is what a host does. Not installing it is why the first iOS run of these
+/// tests could only report `MIGO_ERROR_INTERNAL`: the session thread had failed
+/// on its way up, `run_external_session` had called `notify_error` with the
+/// reason, and there was nobody on the other end. `MIGO_CAPI_LOG` does not
+/// cover this on a simulator either -- the test process's stdout does not reach
+/// the xcodebuild log, and that run's log contains no engine line at all.
+///
+/// Locked because the callback runs on whichever thread dispatched the task,
+/// and the assertions read it from the test's thread.
+private final class EngineErrors {
+    private let lock = NSLock()
+    private var reported: [String] = []
+
+    func record(_ message: String) {
+        lock.lock()
+        reported.append(message)
+        lock.unlock()
+    }
+
+    /// What to append to a failure message: the engine's own words, or an
+    /// explicit statement that it said nothing, which is itself a finding.
+    var summary: String {
+        lock.lock()
+        defer { lock.unlock() }
+        if reported.isEmpty {
+            return "the engine reported no error through on_error"
+        }
+        return reported.joined(separator: " | ")
+    }
+}
+
+/// Runs the task inline, which `session.h` explicitly allows: "the dispatcher
+/// ... must invoke it exactly once (inline or later)". A test has no event loop
+/// to post to, and a queued task would be a second thing that has to be pumped
+/// before an assertion could read what it delivered.
+private let dispatchInline: MigoDispatchFn = { _, task, taskContext in
+    guard let task else { return MIGO_ERROR_DISPATCH_REJECTED }
+    task(taskContext)
+    return MIGO_OK
+}
+
+private let recordEngineError: MigoOnErrorFn = { userData, _, error in
+    guard let userData, let error else { return }
+    let sink = Unmanaged<EngineErrors>.fromOpaque(userData).takeUnretainedValue()
+    var text = "(no message)"
+    if let message = error.pointee.message_utf8 {
+        text = String(cString: message)
+    }
+    sink.record("code \(error.pointee.code): \(text)")
+}
+
 /// A host-owned `CAMetalLayer` survives the whole C ABI attach path.
 ///
 /// WHAT THIS PROVES, precisely, because the constant it feeds is guarded by a
@@ -94,6 +150,10 @@ final class MigoSurfaceAttachTests: XCTestCase {
         /// else keeps it alive. This array is cleared last, after
         /// `migo_engine_destroy` has returned.
         private var retained: [AnyObject] = []
+
+        /// Held by the fixture because the engine is handed an unretained
+        /// pointer to it and may call back from its own thread.
+        private let engineErrors = EngineErrors()
 
         override func setUpWithError() throws {
             try super.setUpWithError()
@@ -162,6 +222,25 @@ final class MigoSurfaceAttachTests: XCTestCase {
             let result = migo_session_create(engine, &sessionConfig, &startedSession)
             XCTAssertEqual(result, MIGO_OK, "migo_session_create returned \(result)")
             session = try XCTUnwrap(startedSession)
+
+            // Before the first attach, which is the only window the ABI allows:
+            // "Callback configuration can be installed successfully only once
+            // per Session and only before its first Surface attach".
+            //
+            // This makes the attach below a slightly more representative
+            // exercise than it was -- a real host installs callbacks, so the
+            // attach path now builds a Notifier as it would in production
+            // instead of taking the None branch -- and it is the only way a
+            // failure inside the session thread can reach an assertion.
+            var callbacks = MigoHostCallbacks()
+            callbacks.struct_size = UInt32(MemoryLayout<MigoHostCallbacks>.size)
+            callbacks.abi_version = MIGO_ABI_VERSION_CURRENT
+            callbacks.user_data = Unmanaged.passUnretained(engineErrors).toOpaque()
+            callbacks.dispatch = dispatchInline
+            callbacks.on_error = recordEngineError
+            let installed = migo_session_set_host_callbacks(session, &callbacks)
+            XCTAssertEqual(
+                installed, MIGO_OK, "migo_session_set_host_callbacks returned \(installed)")
         }
 
         /// The documented shutdown handshake, in full, and asserted at every
@@ -348,6 +427,8 @@ final class MigoSurfaceAttachTests: XCTestCase {
                 assertion that earns \(ledgerConstantName) its place in \
                 MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS; until it passes on this runner, \
                 that constant must not list it.
+
+                What the engine said: \(engineErrors.summary)
                 """)
             XCTAssertNotNil(attachment, "attach reported success and produced no attachment")
         #else
