@@ -165,14 +165,19 @@ impl SurfaceControl {
     /// Surface would have.
     ///
     /// Non-destructive by design -- see the type's documentation.
-    pub fn live_candidate(&self) -> Option<SurfaceLease> {
+    ///
+    /// The revision comes back with it because a caller that acts on what it read may
+    /// later need to say *which* publication it acted on -- see
+    /// [`Self::retire_publication_and_request`] for the retirement that would
+    /// otherwise take a valid replacement with it.
+    pub fn live_candidate(&self) -> Option<(SurfaceCandidateRevision, SurfaceLease)> {
         // Cloning under the lock is safe where dropping is not: three Arc
         // increments, no destructor, no host code.
         self.candidate
             .lock()
             .as_ref()
-            .map(|(_, lease)| lease.clone())
-            .filter(SurfaceLease::is_live)
+            .filter(|(_, lease)| lease.is_live())
+            .map(|(revision, lease)| (*revision, lease.clone()))
     }
 
     /// Read the live Surface only if it is the publication the caller was told about.
@@ -253,6 +258,46 @@ impl SurfaceControl {
         // Before the wake, so a worker that is about to look finds the level in
         // the state this retirement leaves it in rather than one request behind.
         self.release_dead_candidate();
+        self.wake_render();
+        Some(generation)
+    }
+
+    /// Retire the generation only while `revision` is still the published candidate.
+    ///
+    /// A generation is not enough here, and the gap is the same one
+    /// [`SurfaceCandidateRevision`] exists for. A resize republishes the live
+    /// generation with a new native target, so a worker whose install failed can hold
+    /// a generation that still matches the gate while the candidate behind it is
+    /// already a valid replacement. Retiring on the generation alone would revoke that
+    /// replacement and report its loss to a host that had just supplied it.
+    ///
+    /// The check and the transition share the candidate lock, so a publication cannot
+    /// slip between them: publishing takes the same lock.
+    pub fn retire_publication_and_request(
+        &self,
+        revision: SurfaceCandidateRevision,
+    ) -> Option<SurfaceGeneration> {
+        let retired = {
+            let mut published = self.candidate.lock();
+            match published.as_ref() {
+                Some((current, lease)) if *current == revision => {
+                    let generation = lease.generation();
+                    if self.gate.retire_if_current(generation) {
+                        self.latest_retired
+                            .fetch_max(generation.get(), Ordering::AcqRel);
+                        published.take().map(|(_, lease)| (generation, lease))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        // The lease drops with the guard gone, for the reason
+        // `release_dead_candidate` spells out: this can be the drop that publishes
+        // RELEASED and runs host code inline.
+        let (generation, lease) = retired?;
+        drop(lease);
         self.wake_render();
         Some(generation)
     }
@@ -468,10 +513,10 @@ mod tests {
             .unwrap()
             .commit();
 
-        let at_startup = control
+        let (_, at_startup) = control
             .live_candidate()
             .expect("the live candidate is what the worker installs");
-        let at_update = control
+        let (_, at_update) = control
             .live_candidate()
             .expect("and it is still what the Host has when the worker looks again");
         assert_eq!(at_startup.size(), (640, 480));
@@ -582,6 +627,55 @@ mod tests {
     }
 
     #[test]
+    fn retiring_a_failed_publication_spares_the_replacement_that_shares_its_generation() {
+        // The failure this prevents. A worker reads the candidate, its EGL install
+        // takes a while, and a resize republishes the *same* generation with a new
+        // native target -- legitimate, and the host now considers that replacement its
+        // live Surface. The old install then fails. Retiring on the generation alone,
+        // which is all it had, revoked the replacement too and reported a loss for a
+        // Surface the host had just supplied and which was fine.
+        let control = Arc::new(SurfaceControl::new());
+        let token = control.attach_or_update().unwrap();
+        let generation = PublicSurfaceGeneration::new(1).unwrap();
+        let first: SurfaceRef = Arc::new(TestSurface);
+        let replacement: SurfaceRef = Arc::new(TestSurface);
+        let failed = SurfaceLease::new_tracked(first, token.clone(), generation);
+        let live = SurfaceLease::new_tracked(replacement, token, generation);
+        assert_eq!(failed.generation(), live.generation());
+
+        let failed_publication = control.publish_candidate(failed.clone());
+        let live_publication = control.publish_candidate(live.clone());
+
+        assert!(
+            control
+                .retire_publication_and_request(failed_publication)
+                .is_none(),
+            "a publication that has been superseded must retire nothing"
+        );
+        assert!(
+            live.is_live(),
+            "the replacement must survive the older publication's failure"
+        );
+        assert_eq!(
+            control
+                .live_candidate_for(live_publication)
+                .map(|lease| lease.generation()),
+            Some(live.generation()),
+            "and must still be the candidate a worker would install"
+        );
+
+        // The current publication does retire, which is the other half: a failure that
+        // is still the live one has to be reported.
+        assert_eq!(
+            control.retire_publication_and_request(live_publication),
+            Some(live.generation())
+        );
+        assert!(!live.is_live());
+        assert!(control.live_candidate().is_none());
+        drop((failed, live));
+    }
+
+    #[test]
     fn a_request_that_outlived_its_candidate_does_not_adopt_the_next_one() {
         // The failure this prevents, in the order it happens: `update_surface`
         // publishes generation 1 and queues a recreate; the reply times out after
@@ -616,7 +710,9 @@ mod tests {
         // The bare read stays available for the one caller with no expectation to
         // check: a worker starting up, which installs whatever is live.
         assert_eq!(
-            control.live_candidate().map(|lease| lease.generation()),
+            control
+                .live_candidate()
+                .map(|(_, lease)| lease.generation()),
             Some(second.generation())
         );
         drop(second);

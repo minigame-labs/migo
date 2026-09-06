@@ -768,7 +768,7 @@ fn an_initial_surface_that_cannot_be_installed_is_reported_like_a_later_one() {
     // Both arms are pinned, because "they agree" is the property and a check on one
     // of them cannot express it.
     let init = RENDER_THREAD
-        .split("if let Some(lease) = claimed {")
+        .split("if let Some((revision, lease)) = claimed {")
         .nth(1)
         .expect("the initial install must remain present")
         .split("cm.publish_gpu_caps();")
@@ -777,16 +777,32 @@ fn an_initial_surface_that_cannot_be_installed_is_reported_like_a_later_one() {
     let update = RENDER_THREAD
         .split("let Some(lease) = surface_control.live_candidate_for(requested)")
         .nth(1)
-        .expect("the update install must remain present");
+        .expect("the update install must remain present")
+        // Bounded at the next arm. Unbounded, this swept in the presentation path,
+        // which retires by generation deliberately: it is asking about the Surface
+        // already installed, not about a request that failed to install one.
+        .split("\n                            other => {")
+        .next()
+        .expect("the update arm must end");
 
     for (arm, which) in [
         (init, "the initial install"),
         (update, "the update install"),
     ] {
+        // `retire_published_surface`, not `retire_unexpected_surface`: a request whose
+        // install failed must retire the publication it acted on, not everything
+        // sharing its generation. A resize republishes the live generation, so the
+        // generation-only form would revoke a valid replacement and report its loss to
+        // a host that had just supplied it. That form remains for the presentation
+        // path, which asks about what is installed rather than about a request.
         assert!(
-            arm.contains("retire_unexpected_surface("),
-            "{which} must retire the generation and report the loss when the \
-             platform genuinely refuses the Surface"
+            arm.contains("retire_published_surface("),
+            "{which} must retire the publication it acted on and report the loss when \
+             the platform genuinely refuses the Surface"
+        );
+        assert!(
+            !code_only(arm).contains("retire_unexpected_surface("),
+            "{which} must not retire by generation: a resize republishes the live one"
         );
         assert!(
             arm.contains("SurfaceLossReason::PlatformError"),
@@ -794,12 +810,19 @@ fn an_initial_surface_that_cannot_be_installed_is_reported_like_a_later_one() {
         );
     }
 
-    // And the report must not cost a second pin: naming the generation is what the
-    // update path needed a retained clone for, and the initial path takes two `Copy`
-    // values instead.
+    // And the report must not cost a second pin. Naming what failed is what the
+    // update path keeps a retained clone of the lease for; the initial path takes the
+    // revision out of the read itself and the public generation before the lease
+    // moves, both `Copy`.
     assert!(
-        init.contains("let generation = lease.generation();"),
-        "the initial install must take the generation before the lease moves"
+        RENDER_THREAD.contains("if let Some((revision, lease)) = claimed {"),
+        "the initial read must yield the publication with the lease, so naming it \
+         later costs nothing"
+    );
+    assert!(
+        init.contains("let public_generation = lease.public_generation();"),
+        "the host-facing generation must be taken before the lease moves into the \
+         install"
     );
     assert!(
         !code_only(init).contains("lease.clone()"),
@@ -826,7 +849,7 @@ fn a_surface_the_host_took_back_is_cancellation_and_one_it_refused_is_a_loss() {
     // `gpu_caps_failed_means_the_gpu_did_not_come_up_and_nothing_else` for what that
     // conflation cost.
     let install = RENDER_THREAD
-        .split("if let Some(lease) = claimed {")
+        .split("if let Some((revision, lease)) = claimed {")
         .nth(1)
         .expect("the initial install must remain present")
         .split("cm.publish_gpu_caps();")
@@ -843,12 +866,12 @@ fn a_surface_the_host_took_back_is_cancellation_and_one_it_refused_is_a_loss() {
     let refused = code_only(&install[refused_at..]);
 
     assert!(
-        !cancelled.contains("retire_unexpected_surface("),
+        !cancelled.contains("retire_published_surface("),
         "a candidate the host retired must not be reported back to the host: it is \
          the party that retired it"
     );
     assert!(
-        refused.contains("retire_unexpected_surface("),
+        refused.contains("retire_published_surface("),
         "a candidate the platform refused must be reported: the host has no other \
          way to learn it, and needs to attach another"
     );

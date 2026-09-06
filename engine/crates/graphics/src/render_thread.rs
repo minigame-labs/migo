@@ -172,6 +172,31 @@ type SurfaceLossReporter = Arc<dyn Fn(PublicSurfaceGeneration, SurfaceLossReason
 /// report it over the reliable Host control stream. A concurrent expected
 /// detach wins the generation CAS and makes this a no-op, so host destruction
 /// can never be misreported as platform loss.
+/// Retire the publication a worker acted on, and report its loss.
+///
+/// Distinct from [`retire_unexpected_surface`], which retires by generation. That is
+/// the right question for a Surface already installed and found unusable at present
+/// time; it is the wrong one for a request whose install failed, because a resize
+/// republishes the live generation and retiring on it alone revokes the replacement
+/// too. See `SurfaceControl::retire_publication_and_request`.
+fn retire_published_surface(
+    surface_control: &SurfaceControl,
+    revision: shared::surface::SurfaceCandidateRevision,
+    public_generation: PublicSurfaceGeneration,
+    reason: SurfaceLossReason,
+    report: &SurfaceLossReporter,
+) -> bool {
+    if surface_control
+        .retire_publication_and_request(revision)
+        .is_some()
+    {
+        report(public_generation, reason);
+        true
+    } else {
+        false
+    }
+}
+
 fn retire_unexpected_surface(
     surface_control: &SurfaceControl,
     expected_generation: shared::surface::SurfaceGeneration,
@@ -1818,13 +1843,12 @@ impl RenderThread {
                 let mut initial_onscreen: Option<(u32, u32)> = None;
 
                 // With a Surface still live, create the onscreen context immediately.
-                if let Some(lease) = claimed {
+                if let Some((revision, lease)) = claimed {
                     let size = lease.size();
                     // Taken before the lease moves. Both are `Copy`, so naming the
-                    // generation this install was for costs no second pin on the
+                    // publication this install was for costs no second pin on the
                     // host's Surface -- which is the whole reason the candidate is a
                     // level rather than a payload.
-                    let generation = lease.generation();
                     let public_generation = lease.public_generation();
                     let initial_result = install_surface_lease(
                         &graphics_platform,
@@ -1898,9 +1922,9 @@ impl RenderThread {
                             // travels on the must-deliver control channel and its
                             // contract is that the generation is already dead when it
                             // arrives, so the host can attach another.
-                            retire_unexpected_surface(
+                            retire_published_surface(
                                 &surface_control,
-                                generation,
+                                revision,
                                 public_generation,
                                 SurfaceLossReason::PlatformError,
                                 &report_surface_loss,
@@ -2150,9 +2174,9 @@ impl RenderThread {
                                             error,
                                         );
                                         let unexpectedly_retired = loss_candidate.is_live()
-                                            && retire_unexpected_surface(
+                                            && retire_published_surface(
                                                 &surface_control,
-                                                generation,
+                                                requested,
                                                 public_generation,
                                                 SurfaceLossReason::PlatformError,
                                                 &report_surface_loss,
