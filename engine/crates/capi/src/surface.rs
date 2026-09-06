@@ -455,41 +455,23 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                         }
                         Err(error) => {
                             tracing::error!("migo_session_attach_surface: spawn failed: {error:?}");
-                            // And tell the host, which nothing here did.
+                            // Deliberately not reported here.
                             //
-                            // Every failure INSIDE the session thread reports
-                            // through `notify_error`; a failure to get that
-                            // thread up reported through `tracing` alone. The
-                            // difference matters because `tracing` needs a
-                            // subscriber the library refuses to install by
-                            // default, so on any platform where the host has no
-                            // other window into the process, the entire class of
-                            // "the session did not start" arrived as a bare
-                            // MIGO_ERROR_INTERNAL with no reason attached.
+                            // `spawn_tracked` inherits `spawn_session_thread`'s
+                            // contract: every startup `Err` it returns has
+                            // already reached the host through `on_error`
+                            // exactly once, carrying the failing thread's own
+                            // account of why it stopped.
                             //
-                            // Found on the iOS simulator, where attach returns
-                            // this roughly half the time and the reason -- the
-                            // session thread's own account of why it exited --
-                            // reached nobody. `session.h` promises on_error
-                            // carries "runtime errors"; a session that never
-                            // started is the first one a host needs.
-                            if let Some(notifier) = &notifier {
-                                let detail = error.detail.as_deref().unwrap_or("");
-                                let text = if detail.is_empty() {
-                                    format!(
-                                        "session thread did not start: {} (engine code {})",
-                                        error.msg,
-                                        error.code.as_u16()
-                                    )
-                                } else {
-                                    format!(
-                                        "session thread did not start: {}: {detail} (engine code {})",
-                                        error.msg,
-                                        error.code.as_u16()
-                                    )
-                                };
-                                notifier.error(MIGO_ERROR_INTERNAL, text);
-                            }
+                            // A report here used to sit in this branch, and it
+                            // double-notified for the common case. The two
+                            // causes -- a thread that never started, and a
+                            // thread that started and then failed -- are
+                            // distinguishable at this level only by matching on
+                            // the error message, and the one this branch can
+                            // describe is always the vaguer of the two. So the
+                            // report lives where the silence actually was:
+                            // beside the spawn that failed.
                             rollback_surface_transition(&session);
                             return MIGO_ERROR_INTERNAL;
                         }
