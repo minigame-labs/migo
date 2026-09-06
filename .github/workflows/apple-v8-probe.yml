@@ -1,0 +1,237 @@
+name: Apple V8 probe
+
+# One question, asked once, before anybody writes a build script for it.
+#
+# A2.3 in the Apple plan is "macOS V8 native product", and its blocker is a
+# supply-chain lane nobody has built: `librusty_v8.a` + `src_binding.rs` +
+# `component-manifest.json` for the two darwin triples. The repository already
+# has the shape to copy four times over -- scripts/build-v8-{linux,android,ohos,
+# windows}.sh, contracts/artifact-manifest/{android,ohos,windows}-v8.lock.json
+# and scripts/fetch-v8-archives.sh -- so the destination is not in doubt.
+#
+# WHY THIS IS NEEDED AT ALL, rather than writing the Apple version directly.
+# Every one of those four locks pins `normalized_gn_args`, and a pin is a claim
+# that those arguments were ACCEPTED by a real gn run for that target. The Apple
+# ANGLE round made the cost of skipping that explicit: its own probe
+# (.github/workflows/apple-angle-probe.yml, run 33948370655) resolved the
+# revision and proved three gn configurations were accepted BEFORE
+# scripts/build-angle-apple.sh existed, and the recipe was then written against
+# measured facts. The round after it still needed four lane iterations, and all
+# four defects were of the kind only a real build reveals. Writing a darwin V8
+# lock from a plausible argument list would be pinning a guess.
+#
+# WHAT IS UNKNOWN, narrowly, and each item is a decision this lane pays for:
+#
+#   1. Does `V8_FROM_SOURCE=1` actually work on a hosted macOS runner? V8 from
+#      source is a Chromium-style checkout; the ANGLE probe found the arm64
+#      image starts with 42 GiB free, which was a surprise carried over from
+#      the x86 image, so the disk premise has to be measured for V8 too and not
+#      inherited from that result.
+#   2. Is `x86_64-apple-darwin` a cross-compile problem or a non-problem? On an
+#      Apple silicon runner it is a cross-build, and V8's snapshot toolchain is
+#      exactly where OpenHarmony's cross-build needed a pinned
+#      `v8_snapshot_toolchain` (scripts/build-v8-ohos.sh) -- while Apple's own
+#      toolchain cross-compiles x86_64 as a first-class case. Which of those two
+#      worlds darwin lands in decides whether the recipe needs one code path or
+#      two.
+#   3. Can `src_binding.rs` be GENERATED here? OpenHarmony's cannot -- its SDK
+#      clang is too old for bindgen, so the binding is pre-committed and
+#      ohos-v8.lock.json records that as structural. Xcode ships a current
+#      libclang, so darwin should be able to generate it, but "should" is what
+#      this lane replaces.
+#   4. Which gn arguments does a darwin build accept, verbatim? This is the
+#      answer the lock exists to carry.
+#   5. Does the archive honour the macOS floor the project already declares?
+#      contracts/apple/deployment-floor.json says macOS 11.0, and an archive
+#      built without `-mmacosx-version-min` would link on the runner and fail on
+#      a consumer's older Mac -- a failure with no build step to land in, which
+#      is the same shape as the ANGLE loader-path trap.
+#
+# WHAT THIS LANE DELIBERATELY DOES NOT DO: publish anything, write a lock, or
+# leave an archive behind. It answers questions and prints them. The pin is a
+# separate change written by someone reading this run's log, exactly as A2.1 was.
+#
+# Runner cost: macOS minutes bill at 10x, but public repositories are unmetered
+# on standard runners, so this costs nothing and does not compete with the Linux
+# gates for quota.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      # Deliberately NOT `apple/**` or `apple-v8/**`-adjacent to any expensive
+      # lane's trigger: apple-sdk.yml fires on `apple/**` and takes an hour, and
+      # apple-angle.yml fires on `apple-angle/**` and moves 12 GB. A probe that
+      # dragged either along would cost more than it measures. That mistake has
+      # been made once already, on the #188 branch.
+      - 'v8-probe/**'
+
+concurrency:
+  group: apple-v8-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    # `macos-15` and not `macos-latest`: the label that floats is the label that
+    # changes the toolchain under a green run without a commit, and this lane
+    # exists to record what a specific toolchain answered.
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    env:
+      # rusty_v8's own knob. Without it the crate downloads a prebuilt archive
+      # for the host triple and this lane would measure nothing about building.
+      V8_FROM_SOURCE: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Recorded first, so a later failure can be read without guessing which
+      # image produced it. The ANGLE probe's own header shows why: the disk
+      # figure everyone believed came from a retired x86 image.
+      - name: What this runner starts with
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          echo "--- disk ---"
+          df -h /
+          echo "--- cpus / memory ---"
+          sysctl -n hw.ncpu hw.memsize
+          echo "--- what the project already declares as its macOS floor ---"
+          python3 -c "import json;print(json.load(open('contracts/apple/deployment-floor.json')))"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          targets: x86_64-apple-darwin
+
+      # The pin every other platform's lock already carries. Read out of a
+      # committed lock rather than typed here, so this probe cannot measure a
+      # different rusty_v8 than the one the engine links.
+      - name: Which rusty_v8 the engine is pinned to
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          lock = json.load(open("contracts/artifact-manifest/ohos-v8.lock.json"))
+          for key in ("rusty_v8_version", "rusty_v8_revision", "v8_revision"):
+              print(f"{key}={lock[key]}")
+          print("sources:", json.dumps(lock["sources"], indent=2))
+          PY
+
+      # QUESTION 1 and 4, together: does a from-source build start at all, and
+      # what does it configure with. `--dry-run` first so the answer to "does
+      # cargo even resolve this target" is separate from an hour of C++.
+      - name: Does the darwin host target resolve at all
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "host triple: $host"
+          cargo tree -p migo-core --target "$host" -i v8 --depth 1 || true
+
+      # QUESTION 1, the expensive half. Timed and bounded on purpose: if a
+      # from-source V8 does not finish inside this budget on a hosted runner,
+      # that is itself the answer -- the lane would have to be a self-hosted or
+      # release-asset arrangement, which is a different design.
+      - name: Build rusty_v8 from source for the host darwin triple
+        id: host_build
+        timeout-minutes: 90
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          start=$(date +%s)
+          # `-p v8` alone: the point is the V8 archive, not the engine. Building
+          # migo-core would drag Skia in and confuse the timing this lane exists
+          # to report.
+          cargo build -p v8 --release --target "$host" 2>&1 | tail -40
+          echo "seconds=$(( $(date +%s) - start ))"
+          echo "--- disk after ---"
+          df -h /
+
+      # QUESTION 4: the arguments that were actually used. rusty_v8's build
+      # script writes them into its OUT_DIR, so this reads the answer rather
+      # than restating an intention.
+      - name: What gn arguments the build used
+        if: always() && steps.host_build.outcome == 'success'
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          echo "--- args.gn ---"
+          find target -name args.gn -path "*gn_out*" -print -exec cat {} \; | head -60
+          echo "--- the archive ---"
+          find target -name librusty_v8.a -print -exec ls -la {} \; | head
+          echo "--- and the generated binding, if there is one (QUESTION 3) ---"
+          find target -name src_binding.rs -print -exec wc -l {} \; | head
+
+      # QUESTION 5: what deployment target the bytes actually carry. `vtool` is
+      # the authority; a build that silently used the runner's own macOS version
+      # as its floor would link here and fail on a consumer's Mac, and nothing in
+      # this repository would have said so.
+      - name: What macOS floor the archive really carries
+        if: always() && steps.host_build.outcome == 'success'
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          archive="$(find target -name librusty_v8.a | head -1)"
+          echo "archive: $archive"
+          # An `ar` archive is not a Mach-O: extract one member and ask about
+          # that. Asking vtool about the archive itself reports nothing useful,
+          # which is a trap this repository has already documented for the
+          # Apple tooling.
+          tmp="$(mktemp -d)"
+          ( cd "$tmp" && ar x "$OLDPWD/$archive" && ls | head -3 )
+          member="$(ls "$tmp" | grep -m1 '\.o$' || true)"
+          if [ -n "$member" ]; then
+            vtool -show-build "$tmp/$member" || true
+            otool -hv "$tmp/$member" | head -5 || true
+          else
+            echo "no object member found to inspect"
+          fi
+
+      # QUESTION 2: the cross-build. Last, because it is the one most likely to
+      # fail, and a failure here still leaves questions 1/3/4/5 answered.
+      - name: Cross-build rusty_v8 for x86_64-apple-darwin
+        id: cross_build
+        continue-on-error: true
+        timeout-minutes: 90
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo build -p v8 --release --target x86_64-apple-darwin 2>&1 | tail -60
+          echo "seconds=$(( $(date +%s) - start ))"
+
+      - name: The answer
+        if: always()
+        run: |
+          set -euo pipefail
+          cat <<'EOF'
+          Read the steps above and record, in contracts/artifact-manifest/apple-v8.lock.json:
+
+            1. V8_FROM_SOURCE on a hosted macOS runner: did the host build finish,
+               in how long, and with how much disk left. If it did not fit, say so --
+               that kills the hosted-runner design and the next question is where
+               else it could run.
+            2. x86_64-apple-darwin: did the cross-build succeed with no extra
+               arguments? If it needed a pinned v8_snapshot_toolchain the way
+               OpenHarmony does, the recipe needs two code paths, not one.
+            3. src_binding.rs: generated here, or must it be pre-committed the way
+               OpenHarmony's is? That decision belongs in the lock's `notes`.
+            4. The verbatim args.gn contents -- this is what `normalized_gn_args`
+               will be, minus machine-local paths.
+            5. The macOS floor vtool reports. If it is not 11.0 it disagrees with
+               contracts/apple/deployment-floor.json, and the recipe has to pass
+               the floor explicitly rather than inherit the runner's.
+
+          Then, and only then, write scripts/build-v8-apple.sh and the lock's
+          source half. Do not pin an argument list this run did not accept.
+          EOF
