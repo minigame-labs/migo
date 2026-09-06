@@ -1856,28 +1856,33 @@ impl RenderThread {
                             let (e, _) =
                                 recreate_engine_error("initial Surface rejected", error);
                             error!("create_onscreen failed: {}", e);
-                            // Deliberately not `gpu_caps.set_failed`, which it used to
-                            // be. That level answers one question -- are the published
-                            // capability values real -- and they are: they came from
+                            // This does conflate two questions, and the conflation is
+                            // deliberate until one thing is built.
+                            //
+                            // `gpu_caps` answers "are the published capability values
+                            // real", and after this failure they are: they came from
                             // `DeviceCapabilities::detect` against the resource
                             // context, which is up, and `publish_gpu_caps` reads
-                            // nothing an onscreen surface contributes to. Answering it
-                            // "no" here said "capabilities unknown" when the truth was
-                            // "capabilities known, no surface".
+                            // nothing an onscreen surface contributes to. Worse,
+                            // `set_failed` latches -- there is no way back -- so
+                            // `ensure_gpu_ready` fails for the rest of the session and
+                            // content can never start, while the loss reported below
+                            // tells the host to attach a Surface this session could
+                            // then never use.
                             //
-                            // And it said so permanently. `set_failed` latches: it
-                            // stores the detail, sets both `failed` and `ready`, and
-                            // there is no way back. So `ensure_gpu_ready` failed for
-                            // the rest of the session, content could never start --
-                            // `load_content` is once per Session and the C boundary
-                            // exposes no restart -- and the engine was simultaneously
-                            // telling the host to attach another Surface, which that
-                            // session could then never use. A recoverable failure made
-                            // the session unrecoverable.
+                            // It stays because the alternative is silence on the
+                            // platform that ships. Publishing Ready here makes this
+                            // state indistinguishable from a warm start -- which
+                            // legitimately begins with no Surface -- so the launch
+                            // cannot treat it as a failure, and the only remaining
+                            // signal is the surface loss below. `notify_surface_lost`
+                            // has no implementation in `platform` and no Java bridge,
+                            // so on Android that signal reaches nobody: content would
+                            // announce ready, draw nothing, and report nothing.
                             //
-                            // What remains is the state a warm start begins in: caps
-                            // real, no Surface, waiting for the `UpdateSurface` that
-                            // brings the next one.
+                            // ⇒ Remove this the moment Android can deliver a surface
+                            // loss. Not before.
+                            gpu_caps.set_failed(format!("create_onscreen failed: {}", e));
                             //
                             // The same route the update path takes for the same
                             // failure, and the asymmetry was the defect: an initial
@@ -2026,9 +2031,18 @@ impl RenderThread {
                 let pause_started_at: core::cell::Cell<Option<Instant>> =
                     core::cell::Cell::new(None);
 
+                /// What the command handler tells the loop to do next.
+                ///
+                /// `Failed` exists because one stop has a reason worth keeping: a
+                /// direct `ReleaseOnscreen` that cannot prove the driver let go of the
+                /// native reference terminates the worker, and that EGL error is the
+                /// only account of why. Returning the same `Shutdown` a requested stop
+                /// returns discarded it, and the session then reported "the renderer
+                /// stopped; it recorded no reason" while holding the reason.
                 enum LoopCtl {
                     Continue,
                     Shutdown,
+                    Failed(EngineError),
                 }
 
                 let handle_one_cmd = |cmd: RenderCommand,
@@ -2423,11 +2437,18 @@ impl RenderThread {
                                 }
                             }
 
-                            let release_failed = result.is_err();
+                            // Kept before the diagnostic consumes `result`, because
+                            // this is the only account of why the worker is about to
+                            // stop and the session has nothing else to report.
+                            let release_failure = result.as_ref().err().map(|error| {
+                                EngineError::new(ErrorCode::RenderBackendError)
+                                    .with_msg("the renderer could not release the host's Surface")
+                                    .with_detail(error.to_string())
+                            });
                             if let Some(diagnostic) = diagnostic {
                                 let _ = diagnostic.send(result);
                             }
-                            if release_failed {
+                            if let Some(failure) = release_failure {
                                 // Ordinary teardown could not prove the driver
                                 // released its native reference. Terminate this
                                 // render owner immediately. The common owner
@@ -2435,7 +2456,7 @@ impl RenderThread {
                                 // with explicit-destroy/eglTerminate proof and
                                 // otherwise quarantines both for process life.
                                 destroy_render_owner(cm, render_binding);
-                                return LoopCtl::Shutdown;
+                                return LoopCtl::Failed(failure);
                             }
                         }
 
@@ -2612,7 +2633,7 @@ impl RenderThread {
                             Ok(cmd) => {
                                 match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, frame_scheduler, frame_clock, dirty, paused, has_vsync, surface_system, render_binding, render_server) {
                                     LoopCtl::Continue => {}
-                                    LoopCtl::Shutdown => return LoopCtl::Shutdown,
+                                    stop => return stop,
                                 }
                             }
                             Err(_) => break,
@@ -3106,6 +3127,10 @@ impl RenderThread {
                                         shared::stats::unregister_stats(host_id);
                                         return Ok(());
                                     }
+                                    LoopCtl::Failed(failure) => {
+                                        shared::stats::unregister_stats(host_id);
+                                        return Err(failure);
+                                    }
                                 }
                             }
                         }
@@ -3146,6 +3171,10 @@ impl RenderThread {
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
                                     return Ok(());
+                                }
+                                LoopCtl::Failed(failure) => {
+                                    shared::stats::unregister_stats(host_id);
+                                    return Err(failure);
                                 }
                             }
 
@@ -3237,6 +3266,10 @@ impl RenderThread {
                                     shared::stats::unregister_stats(host_id);
                                     return Ok(());
                                 }
+                                LoopCtl::Failed(failure) => {
+                                    shared::stats::unregister_stats(host_id);
+                                    return Err(failure);
+                                }
                             }
 
                             // 3) Present (swap) the drained frame.
@@ -3260,6 +3293,10 @@ impl RenderThread {
                                             shared::stats::unregister_stats(host_id);
                                             return Ok(());
                                         }
+                                        LoopCtl::Failed(failure) => {
+                                            shared::stats::unregister_stats(host_id);
+                                            return Err(failure);
+                                        }
                                     }
                                     // Drain remaining pending commands.
                                     match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut frame_clock, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
@@ -3267,6 +3304,10 @@ impl RenderThread {
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
                                             return Ok(());
+                                        }
+                                        LoopCtl::Failed(failure) => {
+                                            shared::stats::unregister_stats(host_id);
+                                            return Err(failure);
                                         }
                                     }
                                     // Eager upload drain: LoadImage ops

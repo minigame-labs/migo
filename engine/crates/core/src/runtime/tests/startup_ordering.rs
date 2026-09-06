@@ -13,6 +13,10 @@ const RENDER_CMD: &str = include_str!("../../../../shared/src/protocol/render_cm
 const EXTERNAL: &str = include_str!("../external.rs");
 const REGISTRY: &str = include_str!("../registry.rs");
 const CAPI_SURFACE: &str = include_str!("../../../../capi/src/surface.rs");
+/// Android's `HostNotifier`. The one platform whose host cannot hear a surface
+/// loss: `notify_surface_lost` is implemented only by the C boundary's
+/// `CapiHostKit`, and this impl takes the trait's no-op default.
+const ANDROID_PLATFORM: &str = include_str!("../../../../platform/src/android/platform.rs");
 
 /// A region with its line comments removed.
 ///
@@ -231,6 +235,17 @@ fn the_external_session_tells_its_host_what_the_embedded_one_does() {
         update_arm.contains("platform.notify_error("),
         "a Surface the renderer cannot install must reach the host: the reply channel \
          that carried the reason ends in this arm, and attach has already returned"
+    );
+    // But not every failure of that update is a failure to report. `Cancelled` means
+    // what the update was for is gone: either the host retired the Surface, in which
+    // case the party being told is the party that did it, or the render worker is
+    // gone, in which case `RenderExit` reports it with a reason this arm does not
+    // have. It would otherwise reach the host as MIGO_ERROR_INTERNAL, because that is
+    // what the C boundary maps every engine error onto -- an ordinary attach/detach
+    // race announced as an internal engine fault.
+    assert!(
+        update_arm.contains("error.code != ErrorCode::Cancelled"),
+        "a cancelled update must not be reported as a failure"
     );
 
     let drain = EXTERNAL
@@ -464,20 +479,32 @@ fn gpu_failure_detail_is_initialized_before_ready_publication() {
 }
 
 #[test]
-fn gpu_caps_failed_means_the_gpu_did_not_come_up_and_nothing_else() {
-    // The property: that level answers one question -- are the published capability
-    // values real -- and only the step that produces them may answer it "no".
+fn a_refused_surface_declares_the_gpu_unusable_only_while_android_cannot_hear_a_loss() {
+    // A deferral, asserted so that it expires by itself.
     //
-    // A failed *onscreen* install used to answer it too, and permanently:
-    // `set_failed` latches, so `ensure_gpu_ready` failed for the rest of the session
-    // and content could never start -- `load_content` is once per Session and the C
-    // boundary exposes no restart. Meanwhile the same failure reports a surface loss,
-    // telling the host to attach another Surface that this session could then never
-    // use. A recoverable failure made the session unrecoverable.
+    // `gpu_caps` answers "are the published capability values real", and after a
+    // refused *onscreen* install they are: they come from
+    // `DeviceCapabilities::detect` against the resource context, which is up, and
+    // `publish_gpu_caps` reads nothing an onscreen surface contributes to. Worse,
+    // `set_failed` latches, so `ensure_gpu_ready` fails for the rest of the session
+    // and content can never start -- while the surface loss reported alongside tells
+    // the host to attach a Surface this session could then never use.
     //
-    // The values themselves were never in doubt: they come from
-    // `DeviceCapabilities::detect` against the resource context, and
-    // `publish_gpu_caps` reads nothing an onscreen surface contributes to.
+    // It stays anyway, because the alternative is silence on the platform that ships.
+    // Publishing Ready makes the state indistinguishable from a warm start, which
+    // legitimately begins with no Surface, so the launch cannot treat it as a failure
+    // -- and the only remaining signal is the loss, which on Android reaches nobody.
+    //
+    // So the blocker is asserted rather than remembered.
+    assert!(
+        !ANDROID_PLATFORM.contains("fn notify_surface_lost"),
+        "AndroidPlatform now implements notify_surface_lost, so a refused Surface can \
+         be reported without latching gpu_caps: delete the set_failed in the refused-\
+         Surface arm of render_thread.rs, and the caps question stops being conflated \
+         with the Surface question. The C boundary has always delivered this callback; \
+         Android taking the trait default is what made the latch the only signal"
+    );
+
     let manager_start = CANVAS_MANAGER
         .find("pub(crate) fn new_with_resource(")
         .expect("CanvasManager constructor must remain present");
@@ -491,46 +518,25 @@ fn gpu_caps_failed_means_the_gpu_did_not_come_up_and_nothing_else() {
     );
     assert!(CANVAS_MANAGER.contains("pub(crate) fn publish_gpu_caps(&self)"));
 
-    // Derived rather than listed: exactly two sites may report a GPU that did not
-    // come up -- construction failing, and a panic before it finished -- and a third
-    // appearing is the drift this exists to catch.
+    // Derived rather than listed: construction failing, a panic before it finished,
+    // and the refused Surface above. A fourth appearing is the drift to catch.
     let failures = RENDER_THREAD.matches("gpu_caps.set_failed(").count();
     assert_eq!(
-        failures, 2,
-        "only construction and the panic barrier may declare the GPU unusable: \
-         {failures} sites do"
-    );
-    let construction = RENDER_THREAD
-        .find("CanvasManager init failed")
-        .expect("the construction failure must remain present");
-    let panic_arm = RENDER_THREAD
-        .find("RenderThread panicked during initialization")
-        .expect("the panic arm must remain present");
-    assert!(
-        construction < panic_arm,
-        "the two sites are construction and the panic barrier, in that order"
+        failures, 3,
+        "exactly three sites may declare the GPU unusable -- construction, the panic \
+         barrier, and the deferral above -- and {failures} do"
     );
 
-    // And the surface arms answer with a surface loss instead, which is recoverable.
-    let init = RENDER_THREAD
-        .split("if let Some(lease) = claimed {")
-        .nth(1)
-        .expect("the initial install must remain present")
-        .split("cm.publish_gpu_caps();")
-        .next()
-        .expect("the initial install must end before the caps publication");
-    assert!(
-        !code_only(init).contains("set_failed"),
-        "a Surface the platform refused must not be reported as an unusable GPU"
-    );
+    // The publication itself is no longer gated on a flag: reaching it means
+    // construction succeeded, which is the whole of what capabilities depend on.
     assert!(
         RENDER_THREAD.contains("cm.publish_gpu_caps();"),
         "the capabilities must still be published"
     );
     assert!(
         !code_only(RENDER_THREAD).contains("startup_failed"),
-        "the flag that gated the publication is gone: reaching that line means \
-         construction succeeded, which is the whole of what caps depend on"
+        "the flag that gated the publication is gone; the latch above is the whole of \
+         what a refused Surface still does to readiness"
     );
 }
 
@@ -743,15 +749,18 @@ fn a_surface_the_host_took_back_is_cancellation_and_one_it_refused_is_a_loss() {
         "a candidate the platform refused must be reported: the host has no other \
          way to learn it, and needs to attach another"
     );
-    for (arm, which) in [
-        (&cancelled, "cancellation"),
-        (&refused, "a refused Surface"),
-    ] {
-        assert!(
-            !arm.contains("set_failed"),
-            "{which} must not declare the GPU unusable"
-        );
-    }
+    assert!(
+        !cancelled.contains("set_failed"),
+        "cancellation must not declare the GPU unusable: the host took its own \
+         Surface back and the capabilities were never in question"
+    );
+    // The refused arm does, deliberately and conditionally -- see
+    // `a_refused_surface_declares_the_gpu_unusable_only_while_android_cannot_hear_a_loss`.
+    assert!(
+        refused.contains("set_failed"),
+        "a refused Surface must keep failing readiness while that is the only signal \
+         Android can hear"
+    );
 }
 
 #[test]
@@ -838,6 +847,51 @@ fn the_render_worker_names_every_way_it_stops() {
         guarded.matches('{').count(),
         guarded.matches('}').count(),
         "the publish must sit outside the readiness guard, not inside it"
+    );
+}
+
+#[test]
+fn a_stop_with_a_reason_is_distinguishable_from_one_without() {
+    // The property: the loop cannot flatten a reason it was given.
+    //
+    // A direct `ReleaseOnscreen` that cannot prove the driver let go of the native
+    // reference terminates the worker deliberately, and the EGL error is the only
+    // account of why. Returning the same `Shutdown` a requested stop returns
+    // discarded it, and the session then reported "the renderer stopped; it recorded
+    // no reason" while the reason was in hand.
+    let ctl = RENDER_THREAD
+        .split("enum LoopCtl {")
+        .nth(1)
+        .expect("the loop control enum must remain present")
+        .split('}')
+        .next()
+        .expect("the enum must end");
+    assert!(
+        code_only(ctl).contains("Failed(EngineError)"),
+        "the loop control must be able to carry a reason, or a stop that has one \
+         cannot say so"
+    );
+    assert!(
+        RENDER_THREAD.contains("return LoopCtl::Failed(failure);"),
+        "the release failure must return its reason rather than a bare stop"
+    );
+
+    // Every site that acts on a stop must act on both kinds. The count is derived,
+    // so a sixth site added without the failing arm moves one number and not the
+    // other -- though the compiler gets there first, since the match is exhaustive.
+    let requested = RENDER_THREAD.matches("LoopCtl::Shutdown => {").count();
+    let failed = RENDER_THREAD
+        .matches("LoopCtl::Failed(failure) => {")
+        .count();
+    assert_eq!(
+        requested, failed,
+        "every loop site that handles a requested stop must handle a failing one: \
+         {requested} handle the first, {failed} the second"
+    );
+    assert!(
+        RENDER_THREAD.contains("return Err(failure);"),
+        "a failing stop must leave the body as an Err, which is what the tail turns \
+         into the published reason"
     );
 }
 

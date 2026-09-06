@@ -789,12 +789,23 @@ fn handle_command(
                 // already returned, so nothing else can answer for it -- and the
                 // embedded execution has told its host about this class of failure
                 // all along, through the render-error path this lane had none of.
-                platform.notify_error(
-                    id,
-                    error.code.as_u16(),
-                    &error.msg,
-                    error.detail.as_deref().unwrap_or(""),
-                );
+                //
+                // Cancelled is excluded, and not as a special case: it means this
+                // update did not happen because what it was for is gone. Either the
+                // host retired the Surface, in which case the party that made it gone
+                // is the party being told, or the render worker is gone, in which case
+                // `RenderExit` reports it with the reason this arm does not have. A
+                // normal attach/detach race would otherwise reach the host as
+                // MIGO_ERROR_INTERNAL, because that is what the C boundary maps every
+                // engine error onto.
+                if error.code != ErrorCode::Cancelled {
+                    platform.notify_error(
+                        id,
+                        error.code.as_u16(),
+                        &error.msg,
+                        error.detail.as_deref().unwrap_or(""),
+                    );
+                }
             }
         }
 
