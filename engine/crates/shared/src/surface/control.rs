@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt,
+    num::NonZeroU64,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -37,6 +38,36 @@ impl Error for SurfaceControlAttachError {}
 impl From<SurfaceGenerationError> for SurfaceControlAttachError {
     fn from(_: SurfaceGenerationError) -> Self {
         Self::GenerationExhausted
+    }
+}
+
+/// Which publication of the candidate Surface a request was made for.
+///
+/// A distinct type from [`SurfaceGeneration`] on purpose, and the reason is a defect
+/// this replaced. A generation identifies an *attachment*, and one attachment is
+/// published more than once: a resize rebuilds the native target and mints a lease
+/// against the same live generation. So two queued requests could name the same
+/// generation, and the older one -- still queued after its reply timed out -- matched
+/// the newer one's candidate, installed it under the older request's presentation
+/// parameters, answered on the older request's channel, and on failure retired the
+/// generation the host was actively using.
+///
+/// Naming this a generation would have made that mistake available again; naming it
+/// something else makes the compiler refuse it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SurfaceCandidateRevision(NonZeroU64);
+
+impl SurfaceCandidateRevision {
+    /// The numeric value, for logs and diagnostics.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for SurfaceCandidateRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0.get())
     }
 }
 
@@ -81,8 +112,11 @@ pub struct SurfaceControl {
     shutting_down: AtomicBool,
     latest_retired: AtomicU64,
     render_wake: OnceLock<crossbeam_channel::Sender<()>>,
-    /// The Surface this Host currently has, if any. Revoked on retirement.
-    candidate: Mutex<Option<SurfaceLease>>,
+    /// The Surface this Host currently has, if any, and which publication it is.
+    /// Revoked on retirement.
+    candidate: Mutex<Option<(SurfaceCandidateRevision, SurfaceLease)>>,
+    /// Publications so far. Only ever incremented, so a revision is never reused.
+    published: AtomicU64,
 }
 
 impl SurfaceControl {
@@ -94,22 +128,30 @@ impl SurfaceControl {
             latest_retired: AtomicU64::new(0),
             render_wake: OnceLock::new(),
             candidate: Mutex::new(None),
+            published: AtomicU64::new(0),
         }
     }
 
-    /// Publish the Surface a render worker should install.
+    /// Publish the Surface a render worker should install, and name the publication.
     ///
-    /// Supersedes whatever was published before, which by then is a generation the
-    /// gate has already retired -- a newer one is only mintable once the previous
-    /// is detached.
-    pub fn publish_candidate(&self, lease: SurfaceLease) {
-        let superseded = self.candidate.lock().replace(lease);
+    /// The returned revision is what a request carries so it can be matched against
+    /// the candidate it was actually made for. Supersedes whatever was published
+    /// before -- which may be the same generation, since a resize republishes one.
+    pub fn publish_candidate(&self, lease: SurfaceLease) -> SurfaceCandidateRevision {
+        // Starts at one, so `NonZeroU64` makes "never published" unrepresentable
+        // rather than something every reader has to remember to exclude.
+        let revision = SurfaceCandidateRevision(
+            NonZeroU64::new(self.published.fetch_add(1, Ordering::AcqRel) + 1)
+                .expect("a count incremented from zero is non-zero"),
+        );
+        let superseded = self.candidate.lock().replace((revision, lease));
         // Dropped outside the lock, always: see `release_dead_candidate`.
         drop(superseded);
         // A retirement that landed between minting this generation and publishing
         // it is honoured now, by the same rule every retirement uses, rather than
         // leaving a Surface nobody can install published until a worker looks.
         self.release_dead_candidate();
+        revision
     }
 
     /// Read whatever Surface is currently live, with no expectation about which.
@@ -126,28 +168,35 @@ impl SurfaceControl {
     pub fn live_candidate(&self) -> Option<SurfaceLease> {
         // Cloning under the lock is safe where dropping is not: three Arc
         // increments, no destructor, no host code.
-        self.candidate.lock().clone().filter(SurfaceLease::is_live)
+        self.candidate
+            .lock()
+            .as_ref()
+            .map(|(_, lease)| lease.clone())
+            .filter(SurfaceLease::is_live)
     }
 
-    /// Read the live Surface only if it is the generation the caller was told about.
+    /// Read the live Surface only if it is the publication the caller was told about.
     ///
-    /// This exists as a separate entry point because a caller acting on a *request*
-    /// must not adopt whatever happens to be published now. A recreate request can
-    /// outlive its own candidate: `RenderService` gives up on the reply after 500 ms
-    /// and the request stays queued, so by the time a worker reaches it the host may
-    /// have detached that Surface and attached another. Reading the bare level there
-    /// would install the new Surface under the old request's presentation parameters
-    /// and reply on the old request's channel -- and if that install failed, the
-    /// failure path would retire the generation the host had just attached.
+    /// A separate entry point because a caller acting on a *request* must not adopt
+    /// whatever happens to be published now. A recreate request can outlive its own
+    /// candidate: `RenderService` gives up on the reply after 500 ms and the request
+    /// stays queued, so by the time a worker reaches it the host may have resized or
+    /// reattached. Reading the bare level there would install the newer Surface under
+    /// the older request's presentation parameters and reply on the older request's
+    /// channel -- and if that install failed, the failure path would retire the
+    /// generation the host was actively using.
     ///
-    /// Naming the generation is what the payload used to do implicitly: a request
-    /// carrying its own lease identified itself, and a stale one was rejected as a
-    /// stale generation. Moving the Surface to a level took that away, so the
-    /// request carries the one thing it needs to stay self-identifying -- a
-    /// generation, which is `Copy` and pins nothing.
-    pub fn live_candidate_for(&self, expected: SurfaceGeneration) -> Option<SurfaceLease> {
-        self.live_candidate()
-            .filter(|lease| lease.generation() == expected)
+    /// A request carrying its own lease identified itself; moving the Surface to a
+    /// level took that away, so the request carries the one thing that restores it.
+    /// Per *publication* and not per generation, because a resize republishes the
+    /// same generation -- see [`SurfaceCandidateRevision`].
+    pub fn live_candidate_for(&self, expected: SurfaceCandidateRevision) -> Option<SurfaceLease> {
+        self.candidate
+            .lock()
+            .as_ref()
+            .filter(|(revision, _)| *revision == expected)
+            .map(|(_, lease)| lease.clone())
+            .filter(SurfaceLease::is_live)
     }
 
     /// Drop the published Surface once it can never be installed.
@@ -156,7 +205,10 @@ impl SurfaceControl {
     fn release_dead_candidate(&self) {
         let dead = {
             let mut published = self.candidate.lock();
-            if published.as_ref().is_some_and(|lease| !lease.is_live()) {
+            if published
+                .as_ref()
+                .is_some_and(|(_, lease)| !lease.is_live())
+            {
                 published.take()
             } else {
                 None
@@ -287,7 +339,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use super::SurfaceControl;
+    use super::{SurfaceCandidateRevision, SurfaceControl};
     use crate::surface::{
         PublicSurfaceGeneration, Surface, SurfaceLease, SurfaceRef, SurfaceReleasePhase,
     };
@@ -307,13 +359,15 @@ mod tests {
 
     /// The host's own lease for a freshly attached Surface, plus the level a render
     /// worker reads -- the state a session is in while its render thread builds EGL.
-    fn attach_and_publish(control: &Arc<SurfaceControl>) -> SurfaceLease {
+    fn attach_and_publish(
+        control: &Arc<SurfaceControl>,
+    ) -> (SurfaceLease, SurfaceCandidateRevision) {
         let token = control.attach_or_update().unwrap();
         let surface: SurfaceRef = Arc::new(TestSurface);
         let host =
             SurfaceLease::new_tracked(surface, token, PublicSurfaceGeneration::new(1).unwrap());
-        control.publish_candidate(host.clone());
-        host
+        let revision = control.publish_candidate(host.clone());
+        (host, revision)
     }
 
     #[test]
@@ -329,7 +383,7 @@ mod tests {
         // right from either side.
         for exact in [false, true] {
             let control = Arc::new(SurfaceControl::new());
-            let host = attach_and_publish(&control);
+            let (host, _revision) = attach_and_publish(&control);
             let pending = Arc::new(AtomicUsize::new(0));
 
             // The detach sequence the C boundary runs: prepare, retire, commit,
@@ -387,7 +441,7 @@ mod tests {
     #[test]
     fn a_worker_arriving_after_a_retirement_finds_no_candidate() {
         let control = Arc::new(SurfaceControl::new());
-        let host = attach_and_publish(&control);
+        let (host, _revision) = attach_and_publish(&control);
 
         assert!(control.retire_current_and_request().is_some());
 
@@ -407,7 +461,7 @@ mod tests {
         // Consuming it on the first read would leave the second with nothing and
         // the session convinced its attach had failed.
         let control = Arc::new(SurfaceControl::new());
-        let host = attach_and_publish(&control);
+        let (host, _revision) = attach_and_publish(&control);
         let pending = Arc::new(AtomicUsize::new(0));
         let release = host
             .prepare_release(Arc::clone(&pending), None)
@@ -489,6 +543,45 @@ mod tests {
     }
 
     #[test]
+    fn two_requests_for_one_generation_are_still_told_apart() {
+        // The case a generation cannot express, and the reason the request carries a
+        // revision instead. A resize rebuilds the native target and mints a lease
+        // against the *same* live generation -- `attach_or_update` reuses it while the
+        // gate is live -- so two queued requests can name one generation. The older
+        // one, still queued after its reply timed out, would then match the newer
+        // one's candidate: install it under the older request's presentation
+        // parameters, answer on the older request's channel, and on failure retire the
+        // generation the host is actively using.
+        let control = Arc::new(SurfaceControl::new());
+        let token = control.attach_or_update().unwrap();
+        let first: SurfaceRef = Arc::new(TestSurface);
+        let resized: SurfaceRef = Arc::new(TestSurface);
+        let generation = PublicSurfaceGeneration::new(1).unwrap();
+        let before = SurfaceLease::new_tracked(first, token.clone(), generation);
+        let after = SurfaceLease::new_tracked(resized, token, generation);
+        assert_eq!(
+            before.generation(),
+            after.generation(),
+            "a resize republishes one generation, which is what makes this necessary"
+        );
+
+        let stale_request = control.publish_candidate(before.clone());
+        let live_request = control.publish_candidate(after.clone());
+        assert_ne!(stale_request, live_request);
+
+        assert!(
+            control.live_candidate_for(stale_request).is_none(),
+            "the request whose publication was superseded must be refused, even \
+             though its generation is still the live one"
+        );
+        assert!(
+            control.live_candidate_for(live_request).is_some(),
+            "and the request for the current publication must be served"
+        );
+        drop((before, after));
+    }
+
+    #[test]
     fn a_request_that_outlived_its_candidate_does_not_adopt_the_next_one() {
         // The failure this prevents, in the order it happens: `update_surface`
         // publishes generation 1 and queues a recreate; the reply times out after
@@ -502,13 +595,12 @@ mod tests {
         // A request carrying its own lease used to be self-identifying, and this is
         // what replaced that.
         let control = Arc::new(SurfaceControl::new());
-        let first = attach_and_publish(&control);
-        let stale_request = first.generation();
+        let (first, stale_request) = attach_and_publish(&control);
 
         assert!(control.retire_current_and_request().is_some());
         drop(first);
-        let second = attach_and_publish(&control);
-        assert_ne!(second.generation(), stale_request);
+        let (second, live_request) = attach_and_publish(&control);
+        assert_ne!(stale_request, live_request);
 
         assert!(
             control.live_candidate_for(stale_request).is_none(),
@@ -516,10 +608,10 @@ mod tests {
         );
         assert_eq!(
             control
-                .live_candidate_for(second.generation())
+                .live_candidate_for(live_request)
                 .map(|lease| lease.generation()),
             Some(second.generation()),
-            "and the request that names the live generation must still be served"
+            "and the request for the current publication must still be served"
         );
         // The bare read stays available for the one caller with no expectation to
         // check: a worker starting up, which installs whatever is live.
@@ -543,7 +635,7 @@ mod tests {
         // the same and only the pin would last longer. That is exactly why it needs
         // a test: a redundant guard nobody can see fail is a guard someone deletes.
         let control = Arc::new(SurfaceControl::new());
-        let host = attach_and_publish(&control);
+        let (host, _revision) = attach_and_publish(&control);
         let pending = Arc::new(AtomicUsize::new(0));
         let prepared = host.prepare_release(Arc::clone(&pending), None).unwrap();
         control

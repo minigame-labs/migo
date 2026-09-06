@@ -115,8 +115,9 @@ if rg -qU 'RecreateOnscreen[[:space:]]*\{[^}]*SurfaceLease' \
 as a revocable level on SurfaceControl ($CRATES/shared/src/protocol/render_cmd.rs)"
 fi
 require_literal "$CRATES/shared/src/surface/control.rs" \
-    "candidate: Mutex<Option<SurfaceLease>>" \
-    "SurfaceControl does not publish the Surface a render worker installs"
+    "candidate: Mutex<Option<(SurfaceCandidateRevision, SurfaceLease)>>" \
+    "SurfaceControl does not publish the Surface a render worker installs, paired with \
+the publication a request can name"
 require_literal "$CRATES/core/src/services/render.rs" \
     "self.surface_control.publish_candidate(lease.clone());" \
     "a Surface update does not publish through the queue-independent control plane"
@@ -130,9 +131,20 @@ require_literal "$CRATES/graphics/src/render_thread.rs" \
 was asked about; a request that outlived its candidate would then install the one \
 that replaced it, under the old request's parameters, and on failure retire the \
 generation the host had just attached"
+# A *publication* and not a generation, which is a distinction this line learned the
+# hard way. `attach_or_update` reuses the live generation, so a resize republishes one
+# -- and two queued requests naming the same generation let the older one match the
+# newer one's candidate: installed under stale presentation parameters, answered on a
+# dead channel, and on failure retiring the generation the host was actively using.
 require_multiline_regex "$CRATES/shared/src/protocol/render_cmd.rs" \
-    'RecreateOnscreen[[:space:]]*\{[^}]*generation:[[:space:]]*SurfaceGeneration' \
-    "the onscreen recreate request must name the generation it is for"
+    'RecreateOnscreen[[:space:]]*\{[^}]*revision:[[:space:]]*SurfaceCandidateRevision' \
+    "the onscreen recreate request must name the publication it is for"
+if rg -qU 'RecreateOnscreen[[:space:]]*\{[^}]*generation:[[:space:]]*SurfaceGeneration' \
+    "$CRATES/shared/src/protocol/render_cmd.rs"; then
+    fail "onscreen recreation is identified by a generation again; one generation is \
+published more than once, so it cannot tell two requests apart \
+($CRATES/shared/src/protocol/render_cmd.rs)"
+fi
 # Two literals, because the gate moved behind SurfaceControl: the registry holds
 # the control, and the control holds the gate. Pinning only the registry field
 # would pass for a SurfaceControl that had quietly stopped owning a gate, which

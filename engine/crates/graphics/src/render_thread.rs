@@ -2071,7 +2071,7 @@ impl RenderThread {
 
                         RenderCommand::Canvas(canvas_cmd) => match canvas_cmd {
                             shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
-                                generation: requested,
+                                revision: requested,
                                 pixel_ratio,
                                 resp,
                             } => {

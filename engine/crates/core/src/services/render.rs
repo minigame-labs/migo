@@ -198,11 +198,11 @@ impl RenderService {
         // sat in the queue -- which, before the first frame, is however long EGL
         // initialization takes, and `RELEASED` cannot be published while any lease
         // is alive. A retirement revokes the level instead.
-        self.surface_control.publish_candidate(lease.clone());
+        let revision = self.surface_control.publish_candidate(lease.clone());
 
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
-            generation: lease.generation(),
+            revision,
             pixel_ratio,
             resp: RenderCmdResp::from_sync(tx),
         });

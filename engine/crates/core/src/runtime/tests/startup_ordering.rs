@@ -598,9 +598,16 @@ fn the_initial_surface_is_claimed_after_gpu_init_and_by_one_route_only() {
     // under its own stale presentation parameters, and on failure retire the
     // generation the host had just attached. Carrying its own lease used to make it
     // self-identifying; a generation does the same and pins nothing.
+    // A publication, not a generation: `attach_or_update` reuses the live generation,
+    // so a resize republishes one and two queued requests could name the same
+    // generation -- letting the older match the newer's candidate.
     assert!(
-        command.contains("generation: SurfaceGeneration,"),
-        "RecreateOnscreen must name the generation it is for"
+        code_only(command).contains("revision: SurfaceCandidateRevision,"),
+        "RecreateOnscreen must name the publication it is for"
+    );
+    assert!(
+        !code_only(command).contains("SurfaceGeneration"),
+        "a generation cannot identify a request: one is published more than once"
     );
     assert!(
         RENDER_THREAD.contains("surface_control.live_candidate_for(requested)"),
@@ -614,8 +621,9 @@ fn the_initial_surface_is_claimed_after_gpu_init_and_by_one_route_only() {
 
     // And the control plane must actually be able to revoke what it parked.
     assert!(
-        CONTROL.contains("candidate: Mutex<Option<SurfaceLease>>"),
-        "SurfaceControl must own the published candidate"
+        CONTROL.contains("candidate: Mutex<Option<(SurfaceCandidateRevision, SurfaceLease)>>"),
+        "SurfaceControl must own the published candidate, paired with the publication \
+         a request can name"
     );
     for retire in [
         "pub fn retire_current_and_request(&self)",
