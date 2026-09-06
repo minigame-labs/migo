@@ -250,6 +250,10 @@ pub unsafe extern "C" fn migo_session_attach_surface(
             existing_window_state,
         ) = {
             let Ok(mut state) = session.state.lock() else {
+                // The one INTERNAL this function could return without saying
+                // anything at all. Every other one logs; this one is first, so
+                // it is the one a host hits before there is any other signal.
+                tracing::error!("migo_session_attach_surface: the Session state lock is poisoned");
                 return MIGO_ERROR_INTERNAL;
             };
             if state.surface_transition != SurfaceTransition::Idle

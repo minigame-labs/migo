@@ -159,8 +159,17 @@ pub(crate) fn install_dev_logging(level: shared::config::LogLevel) {
         LogLevel::Warn => tracing::Level::WARN,
         LogLevel::Error | LogLevel::Off => tracing::Level::ERROR,
     };
+    // stderr, not the default stdout. Diagnostics are not program output, and
+    // on Apple the difference is the whole channel: an XCTest host's stderr is
+    // what `xcodebuild` folds into its log -- every "Test Case ... started" line
+    // arrives that way -- and its stdout does not appear at all. So a session
+    // that failed to start on the iOS simulator wrote its one explanatory line
+    // to a stream nobody was reading, and the failure reached the lane as a bare
+    // MIGO_ERROR_INTERNAL. Measured 2026-09-06: `MIGO_CAPI_LOG=info` produced
+    // zero engine lines in a run whose XCTest lines were all present.
     let _ = tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(true)
+        .with_writer(std::io::stderr)
         .try_init();
 }
