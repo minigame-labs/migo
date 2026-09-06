@@ -678,7 +678,32 @@ impl Host {
 
         match cmd {
             HostCommand::EvaluateModule { game_id, entry } => {
-                self.on_evaluate_module(game_id, entry).await
+                // Success is announced -- `on_evaluate_module` ends in
+                // `notify_game_ready` -- so failure has to be too, and it was not.
+                // Nothing else said it either: `migo_session_load_content` returns as
+                // soon as it has enqueued this command, `handle_command` logs what it
+                // gets back and reports none of it, and `tracing` needs a subscriber
+                // the library refuses to install by default. A launch that failed
+                // therefore produced silence, on the one platform that ships.
+                //
+                // `session.h` already promises `on_error` carries "failures raised
+                // while the content runs, because by then the caller's stack is long
+                // gone". Content that never started is the first such failure an
+                // embedder needs, and it includes the renderer having failed to come
+                // up, which `ensure_gpu_ready` raises from here.
+                //
+                // Not throttled, unlike the render-error path beside it: a Session
+                // loads content once, so this cannot repeat except across a restart.
+                self.on_evaluate_module(game_id, entry)
+                    .await
+                    .inspect_err(|error| {
+                        self.platform.notify_error(
+                            self.id,
+                            error.code.as_u16(),
+                            &error.msg,
+                            error.detail.as_deref().unwrap_or(""),
+                        );
+                    })
             }
             HostCommand::EvalScript { source } => self.on_eval_script(source),
 

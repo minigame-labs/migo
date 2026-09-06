@@ -120,6 +120,44 @@ fn gpu_readiness_is_joined_before_any_launch_js() {
 }
 
 #[test]
+fn a_launch_that_fails_is_announced_like_one_that_succeeds() {
+    // The property: the two outcomes of a launch travel the same way.
+    //
+    // Only one of them did. `on_evaluate_module` ends in `notify_game_ready`, and
+    // its `Err` reached `handle_command`, which logs every failure and reports
+    // none -- so a game that did not start told the embedder nothing, on the one
+    // platform that ships. That silence covers the renderer failing to initialise,
+    // because `ensure_gpu_ready` raises it from this path.
+    let arm = HOST
+        .split("HostCommand::EvaluateModule { game_id, entry } => {")
+        .nth(1)
+        .expect("the launch command must still be handled")
+        .split("\n            HostCommand::")
+        .next()
+        .expect("the launch arm must end");
+    assert!(
+        arm.contains("self.platform.notify_error("),
+        "a launch that fails must reach the host through on_error"
+    );
+    let launch = HOST
+        .split("async fn on_evaluate_module(")
+        .nth(1)
+        .expect("the launch path must remain present");
+    assert!(
+        launch.contains("self.platform.notify_game_ready(self.id);"),
+        "the success half of the pairing must remain present, or this test is \
+         asserting a symmetry that no longer has two sides"
+    );
+    // And deliberately unthrottled, unlike the render-error reports beside it: a
+    // Session loads content once, so there is no burst to coalesce and a
+    // suppressed first report would be the only one there was.
+    assert!(
+        !arm.contains("should_notify_error"),
+        "the launch report must not be throttled"
+    );
+}
+
+#[test]
 fn host_drop_destroys_v8_before_stopping_render() {
     // V8 must be destroyed on the thread that owns its isolate, and that thread
     // is also the one that stops GL -- so the isolate has to go first. This used
