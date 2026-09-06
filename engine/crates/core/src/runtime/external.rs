@@ -81,6 +81,11 @@ pub struct ExternalFrameSession {
 pub struct SpawnedExternalSession {
     pub session: ExternalFrameSession,
     pub resource: Option<shared::surface::SurfaceResourceLease>,
+    /// The session's own direct data-plane handles. Handed over by the spawn rather
+    /// than looked up afterwards, so a caller cannot race this session's teardown
+    /// for its own ingress -- which on the iOS simulator it lost about two runs in
+    /// three whenever the renderer failed to start.
+    pub ingress: crate::runtime::registry::HostIngress,
 }
 
 /// Why a frame that the ingress accepted still did not reach the renderer.
@@ -505,6 +510,7 @@ pub fn spawn_external_frame_session(
             clock,
         },
         resource: started.resource,
+        ingress: started.ingress,
     })
 }
 
@@ -526,6 +532,7 @@ fn run_external_session(
         platform_for_error,
         opt,
         surface_control,
+        vsync_rx,
         restart_boundary,
         ready_tx,
     } = ctx;
@@ -539,6 +546,7 @@ fn run_external_session(
         &platform,
         &opt,
         surface_control,
+        vsync_rx,
     ) {
         Ok(shell) => shell,
         Err(error) => {
@@ -577,6 +585,10 @@ fn run_external_session(
         context_lost: _context_lost,
         timer_backgrounded: _timer_backgrounded,
         gpu_init_started: _gpu_init_started,
+        // Why the render worker stopped, read at the one place this session
+        // observes it stopping. `gpu_caps` cannot answer it: a panic after the
+        // first frame leaves that level saying Ready.
+        render_exit,
         t_start: _t_start,
     } = shell;
 
@@ -678,7 +690,47 @@ fn run_external_session(
                             // The render thread is gone. Nothing else will
                             // arrive on this channel, and continuing to select
                             // on it would spin.
-                            info!("[Host {id}] frame clock closed");
+                            //
+                            // And this is the only place that observes it going,
+                            // so this is where the host is told. It used to be
+                            // told by nothing: the worker logged its reason and
+                            // dropped this sender, and the line below was the
+                            // whole of the engine's response. On the iOS
+                            // simulator, where the renderer failed for want of
+                            // ANGLE, the host's only signal was `attach` losing a
+                            // race for a registry entry the exiting session was
+                            // removing -- so it arrived about two runs in three,
+                            // as a bare MIGO_ERROR_INTERNAL with no reason.
+                            //
+                            // `RenderExit` records nothing when the worker was
+                            // asked to stop, and this branch cannot be reached
+                            // that way: a requested shutdown breaks this loop from
+                            // the command arm before the clock closes. So a worker
+                            // that arrived here without a reason is one that
+                            // stopped without saying why, and saying *that* is
+                            // still more use to a host than silence.
+                            let failure = render_exit.failure();
+                            info!(
+                                "[Host {id}] frame clock closed: {}",
+                                failure.map_or_else(
+                                    || "no reason recorded".to_string(),
+                                    ToString::to_string
+                                )
+                            );
+                            match failure {
+                                Some(failure) => platform_for_error.notify_error(
+                                    id,
+                                    failure.code.as_u16(),
+                                    &failure.msg,
+                                    failure.detail.as_deref().unwrap_or(""),
+                                ),
+                                None => platform_for_error.notify_error(
+                                    id,
+                                    ErrorCode::Internal.as_u16(),
+                                    "the renderer stopped",
+                                    "it recorded no reason",
+                                ),
+                            }
                             break;
                         }
                     }

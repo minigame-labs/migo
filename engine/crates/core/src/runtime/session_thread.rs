@@ -37,7 +37,7 @@ use shared::{
 // process-wide Migo-IO executor instead.
 const HOST_BLOCKING_FALLBACK_THREADS: usize = 4;
 
-use crate::runtime::{HostId, registry, restart_boundary::RestartBoundary};
+use crate::runtime::{HostId, registry, registry::HostIngress, restart_boundary::RestartBoundary};
 use crate::services::PlatformServices;
 
 /// Result of starting a Host whose initial Surface belongs to a public
@@ -45,6 +45,10 @@ use crate::services::PlatformServices;
 pub struct SpawnedSurfaceHost {
     pub host: HostThread,
     pub resource: SurfaceResourceLease,
+    /// The session's own direct data-plane handles. Handed over by the spawn rather
+    /// than looked up afterwards, so a caller cannot race this session's teardown
+    /// for its own ingress.
+    pub ingress: HostIngress,
 }
 
 /// Owning handle for one Migo Host thread.
@@ -186,6 +190,11 @@ pub(crate) struct SessionThreadContext {
     pub(crate) platform_for_error: Arc<dyn PlatformServices>,
     pub(crate) opt: InitOptions,
     pub(crate) surface_control: Arc<SurfaceControl>,
+    /// The externally paced frame clock's receiver, or `None` where the engine
+    /// paces itself. Created with its sender before this thread exists, because the
+    /// sender belongs to the ingress the caller is handed and the caller is handed
+    /// it before the thread runs.
+    pub(crate) vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
     pub(crate) restart_boundary: RestartBoundary,
     /// Sent once construction has succeeded far enough that a caller waiting on
     /// a cold start can stop waiting. Dropped without sending on failure, which
@@ -291,13 +300,26 @@ where
     // Host thread; the registry keeps only a reader.
     let restart_boundary = crate::runtime::restart_boundary::RestartBoundary::new();
     let log_level = opt.log_level();
-    registry::register_sender(
+    // Only platforms that publish external timestamps get a frame clock at all;
+    // handing a never-fed receiver to the render thread would make it wait for
+    // timestamps nobody sends. `uses_external_vsync` is a property of the platform
+    // services, which exist here, so the question is answerable before the thread
+    // is -- and it has to be, because the sender travels in the ingress this
+    // function returns.
+    let (vsync_tx, vsync_rx) = if platform.uses_external_vsync() {
+        let (tx, rx) = crossbeam_channel::bounded::<f64>(2);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let ingress = registry::register_sender(
         id,
         host_tx.clone(),
         critical_host_tx.clone(),
         Arc::clone(&surface_control),
         restart_boundary.reader(),
         log_level,
+        vsync_tx,
     );
 
     // Clone the platform Arc so we can use it in the catch_unwind path
@@ -329,6 +351,7 @@ where
                     platform_for_error: Arc::clone(&platform_for_error),
                     opt,
                     surface_control,
+                    vsync_rx,
                     restart_boundary,
                     ready_tx,
                 });
@@ -414,6 +437,7 @@ where
         return Ok(StartedHost {
             host,
             resource: initial_resource,
+            ingress,
         });
     }
 
@@ -434,6 +458,7 @@ where
     Ok(StartedHost {
         host,
         resource: initial_resource,
+        ingress,
     })
 }
 
@@ -442,6 +467,10 @@ where
 pub(crate) struct StartedHost {
     pub(crate) host: HostThread,
     pub(crate) resource: Option<SurfaceResourceLease>,
+    /// The session's own direct data-plane handles, from the registration that
+    /// published them. Handed over rather than looked up: the caller would
+    /// otherwise be racing this session's teardown for its own ingress.
+    pub(crate) ingress: HostIngress,
 }
 fn join_failed_start(mut host: HostThread, startup_error: EngineError) -> EngineError {
     match host.join() {

@@ -81,6 +81,7 @@ impl RenderService {
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
         context_lost: std::sync::Arc<shared::op_state::ContextLostState>,
+        render_exit: std::sync::Arc<shared::render_exit::RenderExit>,
         wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         raf_demand: shared::raf_signal::RafDemandRef,
         request_vsync: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -121,6 +122,7 @@ impl RenderService {
             request_vsync,
             std::sync::Arc::clone(&surface_control),
             report_surface_loss,
+            render_exit,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.

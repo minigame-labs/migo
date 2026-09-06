@@ -10,6 +10,9 @@ const CANVAS_MANAGER: &str = include_str!("../../../../graphics/src/canvas/manag
 const GPU_CAPS: &str = include_str!("../../../../shared/src/device/gpu_caps.rs");
 const CONTROL: &str = include_str!("../../../../shared/src/surface/control.rs");
 const RENDER_CMD: &str = include_str!("../../../../shared/src/protocol/render_cmd.rs");
+const EXTERNAL: &str = include_str!("../external.rs");
+const REGISTRY: &str = include_str!("../registry.rs");
+const CAPI_SURFACE: &str = include_str!("../../../../capi/src/surface.rs");
 
 fn host_new_body() -> &'static str {
     let start = HOST
@@ -141,16 +144,31 @@ fn host_drop_destroys_v8_before_stopping_render() {
 #[test]
 fn startup_registrations_are_guarded_until_host_publication() {
     let body = host_new_body();
-    // The guard moved to the shell with the registrations it protects: both the
-    // vsync sender and the console buffer are registered during the neutral
-    // bring-up, so a guard living beside `Host` would have been guarding
-    // something it could no longer see.
+    // The guard moved to the shell with the registrations it protects: the console
+    // buffer is registered during the neutral bring-up, so a guard living beside
+    // `Host` would have been guarding something it could no longer see.
     assert!(SHELL.contains("struct HostStartupGuard"));
     assert!(SHELL.contains("impl Drop for HostStartupGuard"));
     assert!(SHELL.contains("startup_guard.mark_console_registered()"));
+    // The frame clock's sender is deliberately not one of them any more, and
+    // needing a branch here was the symptom rather than the fix. It lived in a
+    // registry of its own, so retiring it was somebody's job on each of spawn
+    // failure, startup failure and ordinary exit -- and on the external-frame
+    // product nobody held that job, so every session leaked an entry. It now sits
+    // in the Host registry handle, retired by the `unregister_sender` that every
+    // exit path already goes through.
     assert!(
-        SHELL.contains("startup_guard.mark_vsync_registered()"),
-        "the vsync registration must stay inside the guard's protection"
+        !SHELL.contains("mark_vsync_registered"),
+        "the frame clock's sender must not need guarding: its lifetime is the Host \
+         registry handle's"
+    );
+    assert!(
+        !SHELL.contains("register_vsync_sender"),
+        "the shell must not register a frame clock behind the ingress's back"
+    );
+    assert!(
+        REGISTRY.contains("vsync_tx: Option<crossbeam_channel::Sender<f64>>,"),
+        "the Host registry handle must own the frame clock's sender"
     );
     // And it is still handed back armed, so the embedded half's own failure
     // paths are covered by it rather than by nothing.
@@ -168,6 +186,37 @@ fn startup_registrations_are_guarded_until_host_publication() {
     assert!(
         assemble < disarm && disarm < publish,
         "guard must remain armed through assembly and disarm immediately before publication"
+    );
+}
+
+#[test]
+fn a_session_is_handed_its_own_ingress_rather_than_looking_it_up() {
+    // The property: `attach` never asks the registry for the session it is
+    // starting.
+    //
+    // It used to. The session thread removes its own entry on the way out, so a
+    // renderer that failed to initialise took the entry away while `attach` was
+    // still walking towards it -- measured on the iOS simulator, `attach` lost that
+    // race about two runs in three and answered MIGO_ERROR_INTERNAL where the other
+    // third answered MIGO_OK, for one input. Every part of the ingress exists before
+    // any thread does, so the registration hands it back and there is nothing to
+    // lose.
+    assert!(
+        REGISTRY.contains(") -> HostIngress {"),
+        "registration must answer with the ingress it published"
+    );
+    assert!(
+        SESSION_THREAD.contains("pub(crate) ingress: HostIngress,"),
+        "the spawn must carry the session's own ingress out"
+    );
+    assert!(
+        !CAPI_SURFACE.contains("host_ingress("),
+        "attach must not look up the session it is installing; that lookup is for \
+         callers who only have an id, and whose question is whether it is still alive"
+    );
+    assert!(
+        CAPI_SURFACE.contains("Some(started.ingress)"),
+        "attach must install the ingress the spawn handed it"
     );
 }
 
@@ -416,11 +465,120 @@ fn a_surface_the_host_took_back_during_gpu_init_is_not_a_startup_failure() {
 #[test]
 fn render_init_panic_wakes_gpu_join_as_failure() {
     let panic_handler = RENDER_THREAD
-        .split("if let Err(panic_info) = result")
+        .split("Err(panic_info) => {")
         .nth(1)
         .expect("render panic handler must remain present");
     assert!(panic_handler.contains("if !gpu_caps.is_ready()"));
     assert!(panic_handler.contains("gpu_caps.set_failed"));
+}
+
+#[test]
+fn the_render_worker_names_every_way_it_stops() {
+    // The property: a session that observes its renderer gone can say why.
+    //
+    // It could not before. The worker logged its reason and dropped its frame
+    // clock sender; the external session logged "frame clock closed" and exited;
+    // and the host, whose `on_error` exists for this, heard nothing. What it heard
+    // instead was `attach` losing a race for a registry entry the exiting session
+    // was removing -- about two runs in three on the iOS simulator, arriving as a
+    // bare MIGO_ERROR_INTERNAL with no reason attached.
+    //
+    // Pinned in three parts, because each one alone is satisfiable while the
+    // property is false.
+    let body = RENDER_THREAD
+        .split("std::panic::catch_unwind(std::panic::AssertUnwindSafe(")
+        .nth(1)
+        .expect("the render body must remain inside the panic barrier");
+
+    // One: the body is typed, so an exit cannot decline to say which it was.
+    assert!(
+        body.contains("|| -> Result<(), EngineError> {"),
+        "the render body must return a Result, so every exit names itself rather \
+         than relying on whoever wrote it to remember"
+    );
+
+    // Two: the reason is published in exactly one place, at the tail. Two publish
+    // sites is how a later exit comes to be reported by neither.
+    let publishes = RENDER_THREAD
+        .matches("render_exit.publish_failure(")
+        .count();
+    assert_eq!(
+        publishes, 2,
+        "the tail must be the only publisher: one site for a failed body and one \
+         for a panic, and nothing anywhere else"
+    );
+    // Anchored on the barrier's own closing marker, not on `match result {`:
+    // there are two of those in this file and `nth(1)` picked the wrong one, which
+    // is the extraction-by-name-pattern mistake this suite exists to avoid.
+    let tail = RENDER_THREAD
+        .split("})); // end catch_unwind")
+        .nth(1)
+        .expect("the tail must classify the body's outcome");
+    assert!(
+        tail.contains("Ok(Ok(())) => {}"),
+        "a body that ran and was asked to stop must record nothing"
+    );
+    assert!(
+        tail.contains("Ok(Err(failure)) => render_exit.publish_failure(failure)"),
+        "a body that failed must publish the failure it returned"
+    );
+
+    // Three: a panic publishes whatever `gpu_caps` says. A panic after the first
+    // frame leaves that level reporting Ready, so gating the terminal reason on it
+    // -- the way the caps write beside it is gated, correctly -- would lose exactly
+    // the panics that happen once a session is running.
+    let panic_arm = tail
+        .split("Err(panic_info) => {")
+        .nth(1)
+        .expect("the panic arm must remain present");
+    let caps_guard = panic_arm
+        .find("if !gpu_caps.is_ready()")
+        .expect("the caps write must stay guarded");
+    let publish = panic_arm
+        .find("render_exit.publish_failure(")
+        .expect("a panic must publish a terminal reason");
+    assert!(
+        caps_guard < publish,
+        "the guarded caps write comes first; the unguarded publish follows it"
+    );
+    let guarded = &panic_arm[caps_guard..publish];
+    assert_eq!(
+        guarded.matches('{').count(),
+        guarded.matches('}').count(),
+        "the publish must sit outside the readiness guard, not inside it"
+    );
+}
+
+#[test]
+fn the_session_reports_the_reason_its_renderer_stopped() {
+    // The other half: publishing is worth nothing if nobody reads it. The external
+    // execution is the one with a `select!` arm that can see the frame clock close,
+    // and that arm is where the host has to be told.
+    let arm = EXTERNAL
+        .split("timestamp = raf_rx.recv(raf_demand.session_ticket())")
+        .nth(1)
+        .expect("the external session must select on its frame clock")
+        .split("\n            }")
+        .next()
+        .expect("the frame-clock arm must end");
+    let closed = arm
+        .find("None => {")
+        .expect("a closed frame clock must still be handled");
+    let closed = &arm[closed..];
+    assert!(
+        closed.contains("render_exit.failure()"),
+        "the closed-clock branch must read why the worker stopped"
+    );
+    assert!(
+        closed.contains("platform_for_error.notify_error("),
+        "and must tell the host, which is the whole point of recording it"
+    );
+    assert!(
+        closed.contains("\"the renderer stopped\""),
+        "a worker that stopped without recording a reason must still be reported: \
+         this branch is unreachable on a requested shutdown, so silence here would \
+         only ever hide a real failure"
+    );
 }
 
 #[test]

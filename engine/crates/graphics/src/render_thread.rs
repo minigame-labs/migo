@@ -1719,6 +1719,9 @@ impl RenderThread {
         // is retired before this closure runs, and expected host detach never
         // reaches it.
         report_surface_loss: SurfaceLossReporter,
+        // Where this thread says why it stopped, for the session that will observe
+        // its frame clock closing and otherwise have nothing to tell the host.
+        render_exit: Arc<shared::render_exit::RenderExit>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
         let (surface_control_tx, surface_control_rx) = crossbeam_channel::bounded(1);
@@ -1767,7 +1770,16 @@ impl RenderThread {
                 shared::thread_priority::set_current_thread_priority(
                     shared::thread_priority::Priority::Display,
                 );
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // The body answers one question on the way out: was it asked to
+                // stop, or did it fail before it could render? It returns a
+                // `Result`, so that every way out of it has to say which of the
+                // two it is. Only the tail publishes, which is what makes
+                // "nothing recorded means it was asked to stop" a property of the
+                // type rather than of everyone remembering to record. See
+                // `shared::render_exit::RenderExit` for why the host cannot learn
+                // this from an event.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> Result<(), EngineError> {
                 // Declared before CanvasManager so unwind drops EGL ownership
                 // first and the retained native Surface lease last.
                 let mut render_binding = RenderSurfaceBinding::new();
@@ -1785,7 +1797,9 @@ impl RenderThread {
                     Err(e) => {
                         gpu_caps.set_failed(format!("CanvasManager init failed: {}", e));
                         error!("CanvasManager init failed: {}", e);
-                        return;
+                        return Err(EngineError::new(ErrorCode::Render2DInitError)
+                            .with_msg("the renderer could not initialise")
+                            .with_detail(e.to_string()));
                     }
                 };
 
@@ -2960,7 +2974,7 @@ impl RenderThread {
                         info!("RenderThread observed shutdown request");
                         destroy_render_owner(&mut cm, &mut render_binding);
                         shared::stats::unregister_stats(host_id);
-                        return;
+                        return Ok(());
                     }
 
                     // --- Deferred EGL context recovery ---
@@ -3037,7 +3051,7 @@ impl RenderThread {
                                     LoopCtl::Continue => {}
                                     LoopCtl::Shutdown => {
                                         shared::stats::unregister_stats(host_id);
-                                        return;
+                                        return Ok(());
                                     }
                                 }
                             }
@@ -3078,7 +3092,7 @@ impl RenderThread {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
-                                    return;
+                                    return Ok(());
                                 }
                             }
 
@@ -3168,7 +3182,7 @@ impl RenderThread {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
-                                    return;
+                                    return Ok(());
                                 }
                             }
 
@@ -3191,7 +3205,7 @@ impl RenderThread {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
-                                            return;
+                                            return Ok(());
                                         }
                                     }
                                     // Drain remaining pending commands.
@@ -3199,7 +3213,7 @@ impl RenderThread {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
-                                            return;
+                                            return Ok(());
                                         }
                                     }
                                     // Eager upload drain: LoadImage ops
@@ -3238,34 +3252,51 @@ impl RenderThread {
                                     info!("Command channel closed, exiting RenderThread");
                                     destroy_render_owner(&mut cm, &mut render_binding);
                                     shared::stats::unregister_stats(host_id);
-                                    return;
+                                    return Ok(());
                                 }
                             }
                         }
                     }
                 }
                 })); // end catch_unwind
-                if let Err(panic_info) = result {
-                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
-                    if !gpu_caps.is_ready() {
-                        gpu_caps.set_failed(format!(
-                            "RenderThread panicked during initialization: {msg}"
-                        ));
-                    }
-                    error!("[RenderThread host={}] PANIC: {}", host_id, msg);
-                    if let Some(stats) = shared::stats::get_stats(host_id) {
-                        stats.fatal_error_code.store(
-                            shared::error::ErrorCode::Internal.as_u16() as u32,
-                            std::sync::atomic::Ordering::Relaxed,
+                // The one place any of this is published. Nothing recorded means
+                // the body returned `Ok(())`, which it can only do having been
+                // asked to stop.
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failure)) => render_exit.publish_failure(failure),
+                    Err(panic_info) => {
+                        let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "Unknown panic".to_string()
+                        };
+                        if !gpu_caps.is_ready() {
+                            gpu_caps.set_failed(format!(
+                                "RenderThread panicked during initialization: {msg}"
+                            ));
+                        }
+                        error!("[RenderThread host={}] PANIC: {}", host_id, msg);
+                        // Published whether or not caps were already ready. A panic
+                        // after the first frame leaves `gpu_caps` saying Ready, so
+                        // that level cannot be what tells the host its renderer is
+                        // gone -- which is exactly the case a `is_ready` guard here
+                        // used to leave with no account anywhere.
+                        render_exit.publish_failure(
+                            EngineError::new(ErrorCode::Internal)
+                                .with_msg("the render thread panicked")
+                                .with_detail(msg),
                         );
+                        if let Some(stats) = shared::stats::get_stats(host_id) {
+                            stats.fatal_error_code.store(
+                                shared::error::ErrorCode::Internal.as_u16() as u32,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        shared::stats::unregister_stats(host_id);
                     }
-                    shared::stats::unregister_stats(host_id);
                 }
             })
             .map_err(|e| {

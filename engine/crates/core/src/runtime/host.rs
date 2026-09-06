@@ -42,7 +42,6 @@ use crate::{
         HostId,
         input_state::{InputRetraction, InputState},
         session_temp::SessionTemp,
-        vsync,
     },
     services::{AudioService, PlatformServices, RenderService},
 };
@@ -224,7 +223,6 @@ impl Drop for Host {
         );
         self.render.shutdown();
         self.audio.shutdown();
-        vsync::unregister_vsync_sender(self.id);
         // NOTE: stats lifecycle is owned by the render thread — it registers
         // on entry and unregisters on all exit paths (Shutdown, channel close,
         // panic). Do not call unregister_stats here to avoid a double-free.
@@ -294,6 +292,7 @@ impl Host {
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
         surface_control: Arc<shared::surface::SurfaceControl>,
+        vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
         restart_boundary: crate::runtime::restart_boundary::RestartBoundary,
     ) -> EngineResult<Self> {
         // The engine-neutral half: render thread, frame clock, audio, platform
@@ -309,6 +308,7 @@ impl Host {
             &platform,
             &init_options,
             surface_control,
+            vsync_rx,
         )?;
         let SessionShell {
             t_start,
@@ -321,6 +321,13 @@ impl Host {
             network_policy,
             gpu_caps,
             context_lost,
+            // Not read on this path, and the reason is that this execution has no
+            // point at which it observes the render worker going away: the frame
+            // clock is consumed by `op_await_next_frame` inside the JavaScript
+            // event loop, not by a `select!` arm that could notice it closing.
+            // What this execution notices instead is `gpu_caps` reporting Failed
+            // when `ensure_gpu_ready` joins it before the first line of launch JS.
+            render_exit: _render_exit,
             raf_rx,
             raf_demand,
             request_vsync,
