@@ -121,39 +121,57 @@ fn gpu_readiness_is_joined_before_any_launch_js() {
 
 #[test]
 fn a_launch_that_fails_is_announced_like_one_that_succeeds() {
-    // The property: the two outcomes of a launch travel the same way.
+    // The property: the two outcomes of loading content travel the same way, from
+    // the same place, for every caller.
     //
-    // Only one of them did. `on_evaluate_module` ends in `notify_game_ready`, and
-    // its `Err` reached `handle_command`, which logs every failure and reports
-    // none -- so a game that did not start told the embedder nothing, on the one
-    // platform that ships. That silence covers the renderer failing to initialise,
-    // because `ensure_gpu_ready` raises it from this path.
-    let arm = HOST
-        .split("HostCommand::EvaluateModule { game_id, entry } => {")
+    // Only one of them did. `launch_content` ends in `notify_game_ready`, and its
+    // `Err` reached `handle_command`, which logs every failure and reports none --
+    // so a game that did not start told the embedder nothing, on the one platform
+    // that ships. That silence covers the renderer failing to initialise, because
+    // `ensure_gpu_ready` raises it from this path.
+    //
+    // Pinned on the *pairing function*, not on a caller. A report attached to the
+    // launch command alone left the other caller -- a restart, which reloads the
+    // previous module through the same path -- announcing its successes and
+    // swallowing its failures. Review caught that; this assertion is what would.
+    let pairing = HOST
+        .split("async fn on_evaluate_module(")
         .nth(1)
-        .expect("the launch command must still be handled")
-        .split("\n            HostCommand::")
+        .expect("the launch pairing must remain present")
+        .split("\n    async fn ")
         .next()
-        .expect("the launch arm must end");
+        .expect("the pairing must end before the function it wraps");
     assert!(
-        arm.contains("self.platform.notify_error("),
+        pairing.contains("self.platform.notify_error("),
         "a launch that fails must reach the host through on_error"
     );
-    let launch = HOST
-        .split("async fn on_evaluate_module(")
+    assert!(
+        pairing.contains("self.launch_content(game_id, entry).await"),
+        "the pairing must wrap the work rather than duplicate it, so no caller can \
+         reach the work without the announcement"
+    );
+    assert!(
+        !pairing.contains("should_notify_error"),
+        "the launch report must not be throttled: it runs once per launch, so a \
+         suppressed first report would be the only report there was"
+    );
+
+    let work = HOST
+        .split("async fn launch_content(")
         .nth(1)
         .expect("the launch path must remain present");
     assert!(
-        launch.contains("self.platform.notify_game_ready(self.id);"),
+        work.contains("self.platform.notify_game_ready(self.id);"),
         "the success half of the pairing must remain present, or this test is \
          asserting a symmetry that no longer has two sides"
     );
-    // And deliberately unthrottled, unlike the render-error reports beside it: a
-    // Session loads content once, so there is no burst to coalesce and a
-    // suppressed first report would be the only one there was.
-    assert!(
-        !arm.contains("should_notify_error"),
-        "the launch report must not be throttled"
+
+    // And every caller goes through the pairing, which is what makes it one.
+    let callers = HOST.matches("self.launch_content(").count();
+    assert_eq!(
+        callers, 1,
+        "only the pairing may call the work; a second caller would be a second \
+         chance to swallow a failure"
     );
 }
 

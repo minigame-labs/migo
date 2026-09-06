@@ -678,32 +678,7 @@ impl Host {
 
         match cmd {
             HostCommand::EvaluateModule { game_id, entry } => {
-                // Success is announced -- `on_evaluate_module` ends in
-                // `notify_game_ready` -- so failure has to be too, and it was not.
-                // Nothing else said it either: `migo_session_load_content` returns as
-                // soon as it has enqueued this command, `handle_command` logs what it
-                // gets back and reports none of it, and `tracing` needs a subscriber
-                // the library refuses to install by default. A launch that failed
-                // therefore produced silence, on the one platform that ships.
-                //
-                // `session.h` already promises `on_error` carries "failures raised
-                // while the content runs, because by then the caller's stack is long
-                // gone". Content that never started is the first such failure an
-                // embedder needs, and it includes the renderer having failed to come
-                // up, which `ensure_gpu_ready` raises from here.
-                //
-                // Not throttled, unlike the render-error path beside it: a Session
-                // loads content once, so this cannot repeat except across a restart.
-                self.on_evaluate_module(game_id, entry)
-                    .await
-                    .inspect_err(|error| {
-                        self.platform.notify_error(
-                            self.id,
-                            error.code.as_u16(),
-                            &error.msg,
-                            error.detail.as_deref().unwrap_or(""),
-                        );
-                    })
+                self.on_evaluate_module(game_id, entry).await
             }
             HostCommand::EvalScript { source } => self.on_eval_script(source),
 
@@ -1213,7 +1188,48 @@ impl Host {
         }
     }
 
+    /// Launch content, announcing the outcome either way.
+    ///
+    /// Only success used to be announced. `launch_content` ends in
+    /// `notify_game_ready`; its `Err` went to `handle_command`, which logs every
+    /// failure and reports none -- so of the two outcomes of loading content, one
+    /// reached the embedder and one did not.
+    ///
+    /// Nothing else covered the gap. `migo_session_load_content` returns as soon as
+    /// it has enqueued its command, so the caller's stack is gone by the time the
+    /// answer exists; `tracing` needs a subscriber the library refuses to install by
+    /// default; and `DebugStats.fatal_error_code`, which might have carried it, is
+    /// written only for panics and read by nothing in the Java SDK. That silence
+    /// covers the renderer having failed to come up, because `ensure_gpu_ready`
+    /// raises it from here.
+    ///
+    /// `session.h` already promised the behaviour: `on_error` carries "failures
+    /// raised while the content runs, because by then the caller's stack is long
+    /// gone". Content that never started is the first such failure an embedder needs.
+    ///
+    /// The pairing lives here rather than at the caller because there is more than
+    /// one caller: a restart reloads the previous module through the same path, and a
+    /// report attached to the launch command alone left that reload announcing its
+    /// successes and swallowing its failures.
+    ///
+    /// Deliberately unthrottled, unlike the render-error reports elsewhere in this
+    /// file. Those exist because a game hammering a broken pipeline can emit one per
+    /// frame; this runs once per launch or restart, so there is no burst to coalesce
+    /// and a suppressed first report would be the only report there was.
     async fn on_evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
+        let outcome = self.launch_content(game_id, entry).await;
+        if let Err(error) = &outcome {
+            self.platform.notify_error(
+                self.id,
+                error.code.as_u16(),
+                &error.msg,
+                error.detail.as_deref().unwrap_or(""),
+            );
+        }
+        outcome
+    }
+
+    async fn launch_content(&mut self, game_id: String, entry: String) -> EngineResult<()> {
         let t_eval_start = Instant::now();
         self.last_game_id = Some(game_id.clone());
         self.last_entry = Some(entry.clone());
