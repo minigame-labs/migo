@@ -176,6 +176,80 @@ fn a_launch_that_fails_is_announced_like_one_that_succeeds() {
 }
 
 #[test]
+fn the_external_session_tells_its_host_what_the_embedded_one_does() {
+    // The property: a host-facing render failure reaches the host on both products.
+    //
+    // It reached it on one. The embedded execution has forwarded surface loss and
+    // reported swap and context-recovery failures since those events existed; the
+    // external execution logged all of them and reported none -- so on the Apple
+    // product `MigoOnSurfaceLostFn`, which `session.h` declares and the C boundary
+    // wires, could not fire at all. That was an omission rather than a decision, and
+    // the decisions that *were* made are asserted alongside it so a later reading
+    // cannot mistake one for the other.
+    let handler = EXTERNAL
+        .split("fn handle_command(")
+        .nth(1)
+        .expect("the external command handler must remain present");
+    assert!(
+        handler.contains("platform.notify_surface_lost(id, public_generation, reason);"),
+        "surface loss must reach the callback session.h declares for it"
+    );
+    // Bound to the arm rather than to the handler: two arms here can report, so a
+    // substring check on the whole handler would pass while this one stayed silent.
+    let update = handler
+        .find("HostCommand::UpdateSurface {")
+        .expect("the surface update must still be handled");
+    let update_arm = &handler[update
+        ..handler[update..]
+            .find("\n        HostCommand::")
+            .map_or(handler.len(), |offset| update + offset)];
+    assert!(
+        update_arm.contains("platform.notify_error("),
+        "a Surface the renderer cannot install must reach the host: the reply channel \
+         that carried the reason ends in this arm, and attach has already returned"
+    );
+
+    let drain = EXTERNAL
+        .split("fn drain_render_events(")
+        .nth(1)
+        .expect("the external event drain must remain present");
+    let recovered = drain
+        .find("RenderEvent::ContextRecovered { success } => {")
+        .expect("context recovery must still be handled");
+    let swap = drain
+        .find("RenderEvent::SwapFailed { message } => {")
+        .expect("swap failure must still be handled");
+    assert!(
+        drain[recovered..swap].contains("if !success {"),
+        "only an unrecoverable loss may be reported: on_error is delivered as \
+         non-recoverable, and a loss on its own is followed by a recovery"
+    );
+    assert!(
+        drain[swap..].contains("RENDER_ERROR_NOTIFY_MIN_INTERVAL"),
+        "the swap report must be spaced: a Surface that rejects every swap produces \
+         one event per frame and on_error is a call into host code"
+    );
+
+    // And the two deliberate silences, pinned so they stay deliberate.
+    let lost = drain
+        .find("RenderEvent::ContextLost => {")
+        .expect("context loss must still be handled");
+    assert!(
+        !drain[lost..recovered].contains("notify_error"),
+        "a recoverable context loss must not be reported; the unrecoverable case is \
+         the ContextRecovered arm"
+    );
+    let content = drain
+        .find("other => {")
+        .expect("the remaining events must still be handled");
+    assert!(
+        !drain[content..].contains("notify_error"),
+        "a failed drawing command is the producer's, and the producer is another \
+         process that already learns about its own errors"
+    );
+}
+
+#[test]
 fn host_drop_destroys_v8_before_stopping_render() {
     // V8 must be destroyed on the thread that owns its isolate, and that thread
     // is also the one that stops GL -- so the isolate has to go first. This used

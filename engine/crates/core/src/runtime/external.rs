@@ -655,6 +655,7 @@ fn run_external_session(
     startup_guard.disarm();
 
     let mut last_context_epoch = 0u64;
+    let mut last_swap_report: Option<std::time::Instant> = None;
     runtime.block_on(async move {
         loop {
             tokio::select! {
@@ -665,12 +666,20 @@ fn run_external_session(
                     };
                     if !handle_command(
                         id, command, &mut render, &mut audio, &backgrounded, &ingress,
+                        &platform_for_error,
                     ) {
                         break;
                     }
                 }
                 () = render_notify.notified() => {
-                    drain_render_events(id, &render_events, &ingress, &mut last_context_epoch);
+                    drain_render_events(
+                        id,
+                        &render_events,
+                        &ingress,
+                        &mut last_context_epoch,
+                        &platform_for_error,
+                        &mut last_swap_report,
+                    );
                 }
                 timestamp = raf_rx.recv(raf_demand.session_ticket()) => {
                     match timestamp {
@@ -755,6 +764,7 @@ fn handle_command(
     audio: &mut crate::services::AudioService,
     backgrounded: &Arc<std::sync::atomic::AtomicBool>,
     ingress: &Arc<Mutex<FrameIngress>>,
+    platform: &Arc<dyn PlatformServices>,
 ) -> bool {
     use std::sync::atomic::Ordering;
 
@@ -774,6 +784,17 @@ fn handle_command(
             }
             if let Err(error) = render.update_surface(lease, pixel_ratio) {
                 error!("[Host {id}] update_surface failed: {error:?}");
+                // The host handed over a Surface the renderer cannot use, and the
+                // reply channel that carried the reason ends here. `attach` has
+                // already returned, so nothing else can answer for it -- and the
+                // embedded execution has told its host about this class of failure
+                // all along, through the render-error path this lane had none of.
+                platform.notify_error(
+                    id,
+                    error.code.as_u16(),
+                    &error.msg,
+                    error.detail.as_deref().unwrap_or(""),
+                );
             }
         }
 
@@ -786,6 +807,12 @@ fn handle_command(
             reason,
         } => {
             warn!("[Host {id}] surface {public_generation:?} lost: {reason:?}");
+            // `MigoOnSurfaceLostFn` is declared in `session.h`, wired through the C
+            // boundary, and was never fired by this execution -- a public callback
+            // that could not happen on the Apple product. The embedded execution has
+            // forwarded this since the command existed; the difference was an
+            // omission, not a decision.
+            platform.notify_surface_lost(id, public_generation, reason);
             render.pause();
         }
 
@@ -830,11 +857,21 @@ fn handle_command(
 
 /// Drain what the renderer has to say, and keep the ingress on the same
 /// timeline it is.
+/// Minimum spacing between repeats of one render-error report.
+///
+/// Only presentation needs it: a Surface that rejects every swap produces one
+/// event per frame, and `on_error` is a call into host code. The other reports here
+/// happen at most once per attach or per loss episode, so they are not spaced --
+/// suppressing a report that fires once would suppress the only one there was.
+const RENDER_ERROR_NOTIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn drain_render_events(
     id: crate::runtime::HostId,
     events: &shared::render_event::RenderEventReceiver,
     ingress: &Arc<Mutex<FrameIngress>>,
     last_context_epoch: &mut u64,
+    platform: &Arc<dyn PlatformServices>,
+    last_swap_report: &mut Option<std::time::Instant>,
 ) {
     while let Ok(event) = events.try_recv() {
         match event {
@@ -853,10 +890,48 @@ fn drain_render_events(
             }
             RenderEvent::ContextRecovered { success } => {
                 info!("[Host {id}] GL context recovered: success={success}");
+                // The unrecoverable case, and the only one of the pair the host is
+                // told about. A loss on its own is recoverable -- the render thread
+                // rebuilds the share group and always follows up with this event --
+                // and `on_error` is delivered as non-recoverable, so reporting every
+                // loss would tell a compliant host to tear down a session that
+                // recovered milliseconds later. Not spaced: the render thread already
+                // reports once per loss episode.
+                if !success {
+                    platform.notify_error(
+                        id,
+                        ErrorCode::RenderBackendError.as_u16(),
+                        "render context recovery failed",
+                        "",
+                    );
+                }
             }
             RenderEvent::SwapFailed { message } => {
                 warn!("[Host {id}] swap failed: {message}");
+                // Presentation is the host's own Surface refusing the frame, so the
+                // host is the one who can act on it. Spaced, because a Surface that
+                // rejects every swap produces one of these per frame.
+                let now = std::time::Instant::now();
+                let due = last_swap_report.is_none_or(|last| {
+                    now.duration_since(last) >= RENDER_ERROR_NOTIFY_MIN_INTERVAL
+                });
+                if due {
+                    *last_swap_report = Some(now);
+                    platform.notify_error(
+                        id,
+                        ErrorCode::RenderBackendError.as_u16(),
+                        "render swap failed",
+                        &message,
+                    );
+                }
             }
+            // Deliberately not reported to the host: a failed drawing command is the
+            // producer's, not the embedder's. In this lane the producer is a separate
+            // process that already learns about its own errors -- WebGL through the
+            // queue `getError` drains, and anything that invalidates its resource ids
+            // through the epoch bump above, which makes the next packet naming a dead
+            // id fail loudly. Handing them to `on_error` as well would report a
+            // content bug to the one party that cannot fix it.
             other => {
                 debug!("[Host {id}] render event: {other:?}");
             }
