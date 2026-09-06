@@ -125,9 +125,14 @@ require_literal "$CRATES/graphics/src/render_thread.rs" \
     "render startup does not read the Surface level; a lease handed in at spawn is \
 pinned across GPU initialization"
 require_literal "$CRATES/graphics/src/render_thread.rs" \
-    "let Some(lease) = surface_control.live_candidate() else {" \
-    "onscreen recreation does not read the Surface level, so the payload has to be \
-travelling with the command again"
+    "let Some(lease) = surface_control.live_candidate_for(requested)" \
+    "onscreen recreation reads the Surface level without saying which generation it \
+was asked about; a request that outlived its candidate would then install the one \
+that replaced it, under the old request's parameters, and on failure retire the \
+generation the host had just attached"
+require_multiline_regex "$CRATES/shared/src/protocol/render_cmd.rs" \
+    'RecreateOnscreen[[:space:]]*\{[^}]*generation:[[:space:]]*SurfaceGeneration' \
+    "the onscreen recreate request must name the generation it is for"
 # Two literals, because the gate moved behind SurfaceControl: the registry holds
 # the control, and the control holds the gate. Pinning only the registry field
 # would pass for a SurfaceControl that had quietly stopped owning a gate, which

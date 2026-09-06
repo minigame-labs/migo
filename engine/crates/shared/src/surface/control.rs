@@ -112,7 +112,10 @@ impl SurfaceControl {
         self.release_dead_candidate();
     }
 
-    /// Read the Surface to install, while its generation is still live.
+    /// Read whatever Surface is currently live, with no expectation about which.
+    ///
+    /// For a worker starting up: it has not been told about a particular
+    /// generation, so any live one is the one to install.
     ///
     /// `None` means the host took it back, which is not a failure: a session whose
     /// Surface was retired before the renderer could install one is in the state a
@@ -124,6 +127,27 @@ impl SurfaceControl {
         // Cloning under the lock is safe where dropping is not: three Arc
         // increments, no destructor, no host code.
         self.candidate.lock().clone().filter(SurfaceLease::is_live)
+    }
+
+    /// Read the live Surface only if it is the generation the caller was told about.
+    ///
+    /// This exists as a separate entry point because a caller acting on a *request*
+    /// must not adopt whatever happens to be published now. A recreate request can
+    /// outlive its own candidate: `RenderService` gives up on the reply after 500 ms
+    /// and the request stays queued, so by the time a worker reaches it the host may
+    /// have detached that Surface and attached another. Reading the bare level there
+    /// would install the new Surface under the old request's presentation parameters
+    /// and reply on the old request's channel -- and if that install failed, the
+    /// failure path would retire the generation the host had just attached.
+    ///
+    /// Naming the generation is what the payload used to do implicitly: a request
+    /// carrying its own lease identified itself, and a stale one was rejected as a
+    /// stale generation. Moving the Surface to a level took that away, so the
+    /// request carries the one thing it needs to stay self-identifying -- a
+    /// generation, which is `Copy` and pins nothing.
+    pub fn live_candidate_for(&self, expected: SurfaceGeneration) -> Option<SurfaceLease> {
+        self.live_candidate()
+            .filter(|lease| lease.generation() == expected)
     }
 
     /// Drop the published Surface once it can never be installed.
@@ -462,6 +486,48 @@ mod tests {
             1,
             "the release notification ran while the candidate lock was held"
         );
+    }
+
+    #[test]
+    fn a_request_that_outlived_its_candidate_does_not_adopt_the_next_one() {
+        // The failure this prevents, in the order it happens: `update_surface`
+        // publishes generation 1 and queues a recreate; the reply times out after
+        // 500 ms while the request stays queued; the host detaches 1 and attaches 2,
+        // which publishes 2 and queues its own recreate. The worker then reaches the
+        // *first* request. Reading the bare level there hands it generation 2 -- so
+        // it would install the host's new Surface under the old request's
+        // presentation parameters, answer on the old request's channel, and if that
+        // install failed, retire the generation the host had just attached.
+        //
+        // A request carrying its own lease used to be self-identifying, and this is
+        // what replaced that.
+        let control = Arc::new(SurfaceControl::new());
+        let first = attach_and_publish(&control);
+        let stale_request = first.generation();
+
+        assert!(control.retire_current_and_request().is_some());
+        drop(first);
+        let second = attach_and_publish(&control);
+        assert_ne!(second.generation(), stale_request);
+
+        assert!(
+            control.live_candidate_for(stale_request).is_none(),
+            "a superseded request must be refused, not served the new Surface"
+        );
+        assert_eq!(
+            control
+                .live_candidate_for(second.generation())
+                .map(|lease| lease.generation()),
+            Some(second.generation()),
+            "and the request that names the live generation must still be served"
+        );
+        // The bare read stays available for the one caller with no expectation to
+        // check: a worker starting up, which installs whatever is live.
+        assert_eq!(
+            control.live_candidate().map(|lease| lease.generation()),
+            Some(second.generation())
+        );
+        drop(second);
     }
 
     #[test]

@@ -436,6 +436,21 @@ fn the_initial_surface_is_claimed_after_gpu_init_and_by_one_route_only() {
         "RecreateOnscreen must carry no Surface: it is the wake and the reply \
          channel for a level, not the delivery of a lease"
     );
+    // It must still say *which* Surface, though. A request can outlive its own
+    // candidate -- the reply times out after 500 ms while the request stays queued --
+    // and one that could not name a generation would install whatever replaced it,
+    // under its own stale presentation parameters, and on failure retire the
+    // generation the host had just attached. Carrying its own lease used to make it
+    // self-identifying; a generation does the same and pins nothing.
+    assert!(
+        command.contains("generation: SurfaceGeneration,"),
+        "RecreateOnscreen must name the generation it is for"
+    );
+    assert!(
+        RENDER_THREAD.contains("surface_control.live_candidate_for(requested)"),
+        "the recreate path must read the level for the generation it was asked \
+         about, not whatever is published when it gets there"
+    );
     assert!(
         RENDER_SERVICE.contains("self.surface_control.publish_candidate(lease.clone());"),
         "an update must publish through the control plane"

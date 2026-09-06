@@ -476,6 +476,17 @@ pub enum CanvasCmd {
     /// is a level on `SurfaceControl` instead, which a retirement revokes; this is
     /// the wake and the reply channel for it.
     RecreateOnscreen {
+        /// Which published Surface this request is for.
+        ///
+        /// Not the Surface itself: a generation is `Copy` and pins nothing, so it
+        /// costs the host nothing to have one sitting in a queue. But the request
+        /// does have to name one. `RenderService` gives up on the reply after
+        /// 500 ms while the request stays queued, so a worker can reach it after
+        /// the host has detached that Surface and attached another -- and a request
+        /// that could not say which Surface it was for would install the new one
+        /// under these presentation parameters, answer on this channel, and on
+        /// failure retire the generation the host had just attached.
+        generation: SurfaceGeneration,
         /// Transactional DPR update. The backend commits this only after the
         /// Surface installation succeeds; `None` preserves the current value.
         pixel_ratio: Option<PixelRatio>,

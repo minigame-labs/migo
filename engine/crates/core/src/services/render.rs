@@ -202,6 +202,7 @@ impl RenderService {
 
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
+            generation: lease.generation(),
             pixel_ratio,
             resp: RenderCmdResp::from_sync(tx),
         });

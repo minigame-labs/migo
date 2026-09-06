@@ -2023,15 +2023,20 @@ impl RenderThread {
 
                         RenderCommand::Canvas(canvas_cmd) => match canvas_cmd {
                             shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
+                                generation: requested,
                                 pixel_ratio,
                                 resp,
                             } => {
                                 // Read now rather than carried here, so the host's
                                 // Surface was never pinned by this command sitting
-                                // in the queue. `None` means the host retired it
-                                // while this was in flight, which the session
-                                // observes as a cancelled update.
-                                let Some(lease) = surface_control.live_candidate() else {
+                                // in the queue -- but read *for the generation this
+                                // request names*, so a request that outlived its own
+                                // candidate cannot adopt the one that replaced it.
+                                // `None` covers both: the host retired it, or a
+                                // newer one superseded it. Either way the session
+                                // observes a cancelled update.
+                                let Some(lease) = surface_control.live_candidate_for(requested)
+                                else {
                                     let _ = resp.send(Err(EngineError::new(ErrorCode::Cancelled)
                                         .with_msg(
                                             "recreate onscreen: Surface retired before install",
