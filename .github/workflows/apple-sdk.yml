@@ -328,39 +328,54 @@ jobs:
         working-directory: platforms/apple
         run: |
           set -euo pipefail
-          # The device the step above booted and set the loader path on. Asking
-          # the picker again would be a second selection, and a second selection
-          # can answer differently -- at which point the tests would run on a
-          # device with no ANGLE while the log said otherwise.
           udid="$MIGO_SIM_UDID"
-          # TEST_RUNNER_<NAME> is how xcodebuild puts <NAME> into the environment
-          # of the process it launches inside the simulator. A simulator process
-          # inherits nothing from this runner's shell, and setting the variable
-          # in the device's launchd (`simctl spawn ... launchctl setenv`) does
-          # not reach it either -- tried on 2026-09-06.
-          #
-          # FRAMEWORK_PATH and not LIBRARY_PATH, which was the second thing tried
-          # and also failed. On iOS ANGLE ships as frameworks, not dylibs -- the
-          # pin's `contents` for this target is exactly
-          # ["libEGL.framework", "libGLESv2.framework"] -- and the presenter asks
-          # dlopen for "libEGL.framework/libEGL". DYLD_LIBRARY_PATH is consulted
-          # for leaf names; a framework-shaped path is what DYLD_FRAMEWORK_PATH
-          # is for. Both are set: the macOS side of the same constant is a bare
-          # `libEGL.dylib`, and one env block that covers both shapes is one
-          # fewer thing to get wrong when this step grows a second platform.
-          #
-          # Why it matters at all: without ANGLE the render thread dies and takes
-          # the session with it, which is what made this step's attach assertion
-          # a coin flip. See the fetch step above.
+          dd="$GITHUB_WORKSPACE/build/apple-sim-dd"
           angle="$GITHUB_WORKSPACE/engine/third_party/angle-apple-ios-simulator"
-          ls -la "$angle"
-          xcodebuild test \
+
+          # Build first, plant ANGLE, then run -- rather than one `xcodebuild
+          # test` -- because the only way to put a library where this process
+          # will find it is to put it where dyld already looks.
+          #
+          # Two env-var routes were tried on 2026-09-06 and neither reached the
+          # process: `simctl spawn ... launchctl setenv DYLD_LIBRARY_PATH`, and
+          # `TEST_RUNNER_DYLD_FRAMEWORK_PATH` on the xcodebuild command line. The
+          # failing run's own dlopen diagnostic is what settled it -- its "tried:"
+          # list contains only bundle-relative and @rpath entries and no
+          # DYLD_-supplied directory at all, while naming the two directories
+          # below verbatim.
+          #
+          # Both destinations, because the two lookups are different questions:
+          # the presenter dlopens "libEGL.framework/libEGL", which dyld answers
+          # from the products directory and the test bundle; and libEGL then
+          # opens libGLESv2 itself by composing a path against its own location,
+          # which is why GLESv2 has to sit beside it wherever it lands.
+          xcodebuild build-for-testing \
             -scheme Migo-Package \
             -destination "platform=iOS Simulator,id=$udid" \
+            -derivedDataPath "$dd" \
             -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO \
-            TEST_RUNNER_DYLD_FRAMEWORK_PATH="$angle" \
-            TEST_RUNNER_DYLD_LIBRARY_PATH="$angle"
+            CODE_SIGNING_ALLOWED=NO
+
+          products="$dd/Build/Products/Debug-iphonesimulator"
+          planted=0
+          for dest in "$products/PackageFrameworks" "$products"/*.xctest/Frameworks; do
+            mkdir -p "$dest"
+            cp -R "$angle"/*.framework "$dest/"
+            echo "planted ANGLE in $dest"
+            planted=$((planted + 1))
+          done
+          # A copy that silently landed nowhere would leave this step testing the
+          # same thing it tested before the fix.
+          if [ "$planted" -eq 0 ]; then
+            echo "no destination for ANGLE under $products" >&2
+            exit 1
+          fi
+
+          xcodebuild test-without-building \
+            -scheme Migo-Package \
+            -destination "platform=iOS Simulator,id=$udid" \
+            -derivedDataPath "$dd" \
+            CODE_SIGNING_ALLOWED=NO
 
       # The half of the deployment-floor contract that reads the product rather
       # than the declaration -- and the half its own header calls the one that
