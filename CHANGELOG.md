@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- macOS: a host-owned `CAMetalLayer` can be attached through the C ABI.
+  `MIGO_PLATFORM_MACOS_CA_METAL_LAYER` now appears in the library's advertised
+  attachable kinds, and it appears because an attach ran, not because a backend
+  compiled: `apple-sdk.yml` run 34017950809 built a real `CAMetalLayer` on a
+  hosted macOS runner, carried it through `migo_session_attach_surface` as
+  generation 1, and completed the whole retirement handshake — `begin_detach`,
+  poll to `MIGO_SURFACE_RELEASE_RELEASED`, `migo_surface_release_destroy`,
+  `migo_session_destroy`, `migo_engine_destroy` — before releasing the layer.
+  An `NSView` is refused rather than resolved to a layer, so the host keeps
+  ownership of its own drawable. The same run loaded the pinned ANGLE under the
+  name the recipe declares and got an EGL display back from it. iOS is
+  deliberately not included: its arm of the same module compiles everywhere and
+  has attached nothing anywhere.
 - Images with transparency are transcoded to ASTC at package ingest on devices
   whose GPU decodes it, and stay on ETC2 elsewhere. The block footprint is
   chosen per image by what it reconstructs: the encoder grades its own output

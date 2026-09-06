@@ -4,6 +4,34 @@ import XCTest
 
 #if os(macOS)
     import AppKit
+#elseif os(iOS)
+    import UIKit
+#endif
+
+// What this platform's two descriptors are, stated once, so each test below has
+// one body rather than two.
+//
+// Both platforms declare the same PAIR, for the reason ios.h gives: "a tagless
+// void* would let a host set the wrong kind, compile cleanly, and hand a UIView*
+// to code that calls nextDrawable on it". That pair is exactly what these two
+// tests exercise -- the layer is accepted, the view is refused -- so the pair is
+// what is named here and the bodies stay platform-free.
+#if os(macOS)
+    private typealias HostView = NSView
+    private typealias LayerPayload = MigoMacosMetalLayerDescriptor
+    private typealias ViewPayload = MigoMacosNsViewDescriptor
+    private let layerKind = MIGO_PLATFORM_MACOS_CA_METAL_LAYER
+    private let viewKind = MIGO_PLATFORM_MACOS_NS_VIEW
+    private let viewTypeName = "NSView"
+    private let ledgerConstantName = "MIGO_PLATFORM_MACOS_CA_METAL_LAYER"
+#elseif os(iOS)
+    private typealias HostView = UIView
+    private typealias LayerPayload = MigoIosMetalLayerDescriptor
+    private typealias ViewPayload = MigoIosUiViewDescriptor
+    private let layerKind = MIGO_PLATFORM_IOS_CA_METAL_LAYER
+    private let viewKind = MIGO_PLATFORM_IOS_UI_VIEW
+    private let viewTypeName = "UIView"
+    private let ledgerConstantName = "MIGO_PLATFORM_IOS_CA_METAL_LAYER"
 #endif
 
 /// A host-owned `CAMetalLayer` survives the whole C ABI attach path.
@@ -42,7 +70,7 @@ import XCTest
 /// needs nothing, because this test target already links the engine and already
 /// runs on the macOS lane.
 final class MigoSurfaceAttachTests: XCTestCase {
-    #if os(macOS)
+    #if os(macOS) || os(iOS)
         private var root: URL!
         private var engine: OpaquePointer!
         private var session: OpaquePointer!
@@ -272,20 +300,29 @@ final class MigoSurfaceAttachTests: XCTestCase {
 
     /// A host-owned `CAMetalLayer` is accepted, and the engine reports the
     /// attachment rather than merely not failing.
+    ///
+    /// Runs on both Apple platforms, against each one's own layer descriptor.
+    /// It ran only on macOS until 2026-09-06, and the cost of that was not
+    /// coverage in the abstract: `MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS` admits a
+    /// kind only after an attach succeeded, so the iOS kind could not be admitted
+    /// while the only attach that had ever run was `#if os(macOS)`. The
+    /// iOS-simulator leg of `apple-sdk.yml` was already running this bundle --
+    /// `xcodebuild test -scheme Migo-Package` against a real simulator -- and
+    /// reporting these two cases as skipped.
     func testAHostOwnedMetalLayerAttaches() throws {
-        #if os(macOS)
+        #if os(macOS) || os(iOS)
             let layer = CAMetalLayer()
             layer.drawableSize = CGSize(width: 256, height: 256)
             layer.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
 
-            var payload = MigoMacosMetalLayerDescriptor()
-            payload.struct_size = UInt32(MemoryLayout<MigoMacosMetalLayerDescriptor>.size)
+            var payload = LayerPayload()
+            payload.struct_size = UInt32(MemoryLayout<LayerPayload>.size)
             payload.abi_version = MIGO_ABI_VERSION_CURRENT
-            payload.platform_kind = MIGO_PLATFORM_MACOS_CA_METAL_LAYER
+            payload.platform_kind = layerKind
             payload.ca_metal_layer = Unmanaged.passUnretained(layer).toOpaque()
 
             let result = attach(
-                kind: MIGO_PLATFORM_MACOS_CA_METAL_LAYER,
+                kind: layerKind,
                 payload: &payload,
                 payloadSize: payload.struct_size,
                 hostObject: layer)
@@ -294,24 +331,25 @@ final class MigoSurfaceAttachTests: XCTestCase {
                 result, MIGO_OK,
                 """
                 attaching a host-owned CAMetalLayer returned \(result). This is the \
-                assertion that earns MIGO_PLATFORM_MACOS_CA_METAL_LAYER its place in \
+                assertion that earns \(ledgerConstantName) its place in \
                 MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS; until it passes on this runner, \
                 that constant must not list it.
                 """)
             XCTAssertNotNil(attachment, "attach reported success and produced no attachment")
         #else
-            throw XCTSkip("the attach path under test is the macOS one")
+            throw XCTSkip("this package is built for macOS and iOS only")
         #endif
     }
 
     /// The other half of the same decision: a view is refused, not resolved.
     ///
-    /// `MigoMacosNsViewDescriptor` is a payload the ABI parses and the platform
-    /// module deliberately declines, because ANGLE handed a plain `CALayer`
-    /// succeeds and quietly takes ownership of a metal layer it created itself. A
-    /// refusal is the only outcome that leaves the host in charge of its own
-    /// drawable, so it is asserted rather than assumed -- and asserting it here is
-    /// what separates "attach works" from "attach accepts whatever it is given".
+    /// `MigoMacosNsViewDescriptor` and `MigoIosUiViewDescriptor` are payloads the
+    /// ABI parses and the platform module deliberately declines, because ANGLE
+    /// handed a plain `CALayer` succeeds and quietly takes ownership of a metal
+    /// layer it created itself. A refusal is the only outcome that leaves the
+    /// host in charge of its own drawable, so it is asserted rather than assumed
+    /// -- and asserting it here is what separates "attach works" from "attach
+    /// accepts whatever it is given".
     ///
     /// WHICH refusal this reaches, precisely: the capability mask's, not the
     /// platform module's match arm. `parse_for_platforms` is handed
@@ -321,28 +359,32 @@ final class MigoSurfaceAttachTests: XCTestCase {
     /// resolved_to_a_layer` in `capi/src/platform/apple.rs`, which runs on Linux.
     /// Two independent refusals for one rule, which is the intent -- but worth
     /// naming, so nobody reads this test as proof of the arm it does not reach.
-    func testAnNsViewIsRefusedRatherThanResolvedToALayer() throws {
-        #if os(macOS)
-            let view = NSView(frame: CGRect(x: 0, y: 0, width: 256, height: 256))
+    func testAHostViewIsRefusedRatherThanResolvedToALayer() throws {
+        #if os(macOS) || os(iOS)
+            let view = HostView(frame: CGRect(x: 0, y: 0, width: 256, height: 256))
 
-            var payload = MigoMacosNsViewDescriptor()
-            payload.struct_size = UInt32(MemoryLayout<MigoMacosNsViewDescriptor>.size)
+            var payload = ViewPayload()
+            payload.struct_size = UInt32(MemoryLayout<ViewPayload>.size)
             payload.abi_version = MIGO_ABI_VERSION_CURRENT
-            payload.platform_kind = MIGO_PLATFORM_MACOS_NS_VIEW
-            payload.ns_view = Unmanaged.passUnretained(view).toOpaque()
+            payload.platform_kind = viewKind
+            #if os(macOS)
+                payload.ns_view = Unmanaged.passUnretained(view).toOpaque()
+            #else
+                payload.ui_view = Unmanaged.passUnretained(view).toOpaque()
+            #endif
 
             let result = attach(
-                kind: MIGO_PLATFORM_MACOS_NS_VIEW,
+                kind: viewKind,
                 payload: &payload,
                 payloadSize: payload.struct_size,
                 hostObject: view)
 
             XCTAssertEqual(
                 result, MIGO_ERROR_UNSUPPORTED_PLATFORM,
-                "an NSView must be declined so the host keeps ownership of its drawable")
+                "a \(viewTypeName) must be declined so the host keeps ownership of its drawable")
             XCTAssertNil(attachment, "a declined attach must produce no attachment")
         #else
-            throw XCTSkip("the attach path under test is the macOS one")
+            throw XCTSkip("this package is built for macOS and iOS only")
         #endif
     }
 }
