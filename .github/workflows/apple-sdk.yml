@@ -248,20 +248,12 @@ jobs:
         if: matrix.host_slice || matrix.platform == 'ios-simulator'
         run: bash scripts/fetch-apple-angle.sh ${{ matrix.platform }}
 
-      # A simulator process does not inherit this runner's environment, so the
-      # loader path has to be set inside the booted device. `simctl` shares the
-      # host filesystem, so the path the fetch unpacked to is the path the
-      # simulator can open.
-      - name: Put ANGLE on the simulator's loader path
+      # Which simulator the tests below will use, decided once.
+      - name: Choose the simulator
         if: matrix.platform == 'ios-simulator'
         run: |
           set -euo pipefail
           udid="$(bash "$GITHUB_WORKSPACE/scripts/pick-iphone-simulator.sh")"
-          echo "booting $udid"
-          xcrun simctl boot "$udid" || true
-          xcrun simctl bootstatus "$udid" -b
-          xcrun simctl spawn "$udid" launchctl setenv DYLD_LIBRARY_PATH \
-            "$GITHUB_WORKSPACE/engine/third_party/angle-apple-ios-simulator"
           echo "MIGO_SIM_UDID=$udid" >> "$GITHUB_ENV"
 
       - name: The shipping Swift package links and its tests run on Apple silicon
@@ -341,11 +333,20 @@ jobs:
           # can answer differently -- at which point the tests would run on a
           # device with no ANGLE while the log said otherwise.
           udid="$MIGO_SIM_UDID"
+          # TEST_RUNNER_<NAME> is how xcodebuild puts <NAME> into the environment
+          # of the process it launches inside the simulator. A simulator process
+          # inherits nothing from this runner's shell, and setting the variable
+          # in the device's launchd (`simctl spawn ... launchctl setenv`) does
+          # not reach it either -- tried on 2026-09-06, and the run still logged
+          # "load ANGLE failed". Without ANGLE the render thread dies and takes
+          # the session with it, which is what made this step's attach assertion
+          # a coin flip; see the fetch step above.
           xcodebuild test \
             -scheme Migo-Package \
             -destination "platform=iOS Simulator,id=$udid" \
             -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            TEST_RUNNER_DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/engine/third_party/angle-apple-ios-simulator"
 
       # The half of the deployment-floor contract that reads the product rather
       # than the declaration -- and the half its own header calls the one that
