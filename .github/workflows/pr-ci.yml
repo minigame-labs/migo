@@ -523,6 +523,26 @@ jobs:
       - name: The Apple ANGLE pin is complete and fetched by hash
         run: bash scripts/test-apple-angle-pin-contract.sh
 
+      # The third copy of the same rule, and the one with no build step behind
+      # it. The recipe decides where ANGLE's own loader will look; the presenter
+      # decides what it falls back to opening. Those two agreeing is what makes
+      # the library load at all, and pulling them apart raises no compile error
+      # and no link error -- it fails at `eglGetDisplay` on a device, with
+      # nothing of ours on the stack.
+      - name: The Apple presenter opens the ANGLE the recipe produces
+        run: bash scripts/test-apple-egl-loader-name-contract.sh
+
+      # The other pair of Apple constants nothing was holding together: the
+      # renderer's `hostSurfaceKind` and the C ABI's `OWN_LAYER_KIND`. They are
+      # deliberately independent -- `preflight()` compares them at run time, and
+      # that comparison is why a host can learn it is about to pass a kind the
+      # library will refuse -- so their AGREEMENT is the invariant and nothing
+      # checked it. The renderer's own verdict test is written as an implication
+      # and passes either way; a disagreement just makes `preflight()` refuse a
+      # surface the library accepts, with nothing red anywhere.
+      - name: The Apple renderer and the C ABI name the same surface kind
+        run: bash scripts/test-apple-host-surface-kind-contract.sh
+
       # macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
       # unbound-variable error rather than nothing. Linux's bash 5 expands it to
       # nothing, so the entire class is invisible here and fatal there -- and

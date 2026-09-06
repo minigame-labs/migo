@@ -499,6 +499,20 @@ jobs:
       - name: The Apple ANGLE pin is complete and fetched by hash
         run: bash scripts/test-apple-angle-pin-contract.sh
 
+      # The rule that decides whether ANGLE loads at all, held between the two
+      # places that state it. A release is the last point at which the presenter
+      # naming a library the published archives do not contain is still cheap to
+      # find: after this it is a device-only failure at `eglGetDisplay`.
+      - name: The Apple presenter opens the ANGLE the recipe produces
+        run: bash scripts/test-apple-egl-loader-name-contract.sh
+
+      # A release is the last cheap moment to notice that the renderer and the C
+      # ABI stopped naming the same surface kind. After it, the symptom is a host
+      # that preflights, is told its own surface kind is not attachable, and
+      # declines to render.
+      - name: The Apple renderer and the C ABI name the same surface kind
+        run: bash scripts/test-apple-host-surface-kind-contract.sh
+
       # macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
       # unbound-variable error rather than nothing. Linux's bash 5 expands it to
       # nothing, so the entire class is invisible here and fatal there -- and

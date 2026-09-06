@@ -74,10 +74,21 @@ mod tests {
         // being checked. Windows was absent from it while Windows fell through
         // to `unsupported`, so this assertion passed on a build that shipped an
         // SDK able to attach nothing.
+        //
+        // It has since drifted the other way, which is the failure mode a
+        // hand-kept claim has and is worth leaving recorded: OpenHarmony gained a
+        // platform module and a native-window kind and was never added here, so
+        // an `*-linux-ohos` build took the `else` branch and asserted that a
+        // platform which attaches a window advertises nothing. Nobody noticed,
+        // because running a test binary for that target needs the device --
+        // `verify-change.sh` compiles OpenHarmony and cannot execute it. Apple
+        // arrived in the same state and is added in the same breath.
         if cfg!(any(
             target_os = "android",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            target_vendor = "apple",
+            all(target_os = "linux", not(target_env = "ohos")),
+            all(target_os = "linux", target_env = "ohos")
         )) {
             assert_ne!(
                 caps.platform_kinds, 0,

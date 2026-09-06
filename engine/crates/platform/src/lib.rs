@@ -24,6 +24,26 @@ pub(crate) mod jni_profile_contract;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux;
 
+// `target_vendor` rather than `target_os`, unlike every other platform here.
+// macOS and iOS differ in exactly one line of this module -- the name of the
+// file ANGLE ships in -- so a `target_os` pair would be two copies of one
+// presenter, and a third Apple platform would silently reach neither.
+//
+// `test` as well, and that is the load-bearing half: an Apple-only module is a
+// module no pull request executes, because every gate in this repository runs on
+// Linux. Under `cfg(test)` the surface identity, factory refusal and provider
+// pairing logic runs on every Linux run instead. Nothing here loads EGL at
+// construction time, so there is nothing Apple-specific to have available.
+//
+// `feature = "test-support"` for the same coverage one crate further out.
+// `cfg(test)` does not cross a crate boundary, so without it the C ABI's own
+// Apple module -- eight match arms over a platform payload enum -- could not be
+// compiled anywhere but on a Mac. `migo-capi` already enables this feature from
+// its `[dev-dependencies]` for the X11 arm, which resolver 2 keeps out of every
+// shipped build.
+#[cfg(any(target_vendor = "apple", test, feature = "test-support"))]
+pub mod apple;
+
 // OpenHarmony reports target_os = "linux" with target_env = "ohos", so it must
 // be selected on the env rather than the OS -- the desktop Linux module above
 // excludes it for the same reason.
