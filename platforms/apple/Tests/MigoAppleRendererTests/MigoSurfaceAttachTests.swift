@@ -142,12 +142,37 @@ final class MigoSurfaceAttachTests: XCTestCase {
                 XCTAssertEqual(began, MIGO_OK, "migo_surface_begin_detach returned \(began)")
 
                 if let release {
+                    // The status record is a CALLER-OWNED versioned output, so
+                    // its header is an input to the call rather than something
+                    // the library fills in. `write_versioned_output` reads
+                    // `struct_size` out of the caller's storage to decide how
+                    // many bytes it may write there, and a record left at its
+                    // Swift default holds zero -- below the minimum this ABI
+                    // defines -- so the query is refused before it ever looks at
+                    // the release.
+                    //
+                    // Asserting that refusal here rather than only fixing it: it
+                    // is the documented contract, and the first run of this lane
+                    // failed 463 times on exactly this while reporting "the
+                    // retired surface never reported RELEASED" -- which names the
+                    // wrong half of the system. A host reading that message would
+                    // go looking for a renderer that never started.
+                    var uninitialised = MigoSurfaceReleaseStatus()
+                    XCTAssertEqual(
+                        migo_surface_release_query(release, &uninitialised),
+                        MIGO_ERROR_INVALID_ARGUMENT,
+                        "a status record whose struct_size was never set must be refused, "
+                            + "because struct_size is what bounds the write into the "
+                            + "caller's own storage")
+
+                    var status = MigoSurfaceReleaseStatus()
+                    status.struct_size = UInt32(MemoryLayout<MigoSurfaceReleaseStatus>.size)
+                    status.abi_version = MIGO_ABI_VERSION_CURRENT
+                    var released = false
                     // Polled, not waited on: the header says the query never
                     // blocks precisely so a host can ask from its UI thread or an
                     // idle handler. A host's obligation is to keep asking while
                     // its event loop runs, so that is what this imitates.
-                    var status = MigoSurfaceReleaseStatus()
-                    var released = false
                     let deadline = Date().addingTimeInterval(5)
                     while Date() < deadline {
                         let queried = migo_surface_release_query(release, &status)

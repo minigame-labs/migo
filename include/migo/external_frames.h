@@ -289,9 +289,19 @@ typedef struct MigoExternalSessionDescriptor {
  * transport may hand over a Data's interior pointer and reuse or free its own
  * storage immediately.
  *
+ * out_outcome IS CALLER-OWNED AND ITS HEADER IS AN INPUT. Set struct_size and
+ * abi_version before every call: struct_size is what bounds the write into your
+ * storage, so a record that arrives holding zeros is refused rather than filled
+ * in, and the call returns MIGO_ERROR_INVALID_ARGUMENT without having looked at
+ * the packet. On this entry point that mistake does not degrade anything -- it
+ * refuses every frame the producer ever sends, forever, while the transport
+ * itself is working -- so it is worth initialising the record once and reusing
+ * it rather than re-deriving it per frame.
+ *
  * Returns MIGO_OK when the outcome was written -- including when the outcome
  * says the packet was rejected. A non-OK result means the call itself could not
- * be made: a bad handle, a null buffer, or no surface attached yet.
+ * be made: a bad handle, a null buffer, an outcome record whose header was not
+ * filled in, or no surface attached yet.
  */
 MigoResult migo_session_submit_external_frame(MigoSession *session,
                                               const uint8_t *bytes,

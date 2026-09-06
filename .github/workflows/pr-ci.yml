@@ -543,6 +543,16 @@ jobs:
       - name: The Apple renderer and the C ABI name the same surface kind
         run: bash scripts/test-apple-host-surface-kind-contract.sh
 
+      # Three entry points hand the caller a versioned record to fill in, and in
+      # all three `struct_size` is an INPUT that bounds the library's write. Only
+      # one header said so. The first host code written against another of them
+      # -- the A2.2 attach test -- zero-initialised the record and the lane
+      # reported "the retired surface never reported RELEASED", a statement about
+      # a renderer that was working. Nothing about writing the next one fails to
+      # compile, and the cost lands on whoever integrates it.
+      - name: Every caller-owned output record documents its struct_size input
+        run: bash scripts/test-capi-output-record-doc-contract.sh
+
       # The macOS V8 source pin agrees with cargo, the peer locks, the Apple
       # deployment floor and the fetch script. Every number in that lock is also
       # stated somewhere with more authority, and a pin that drifts from one of
