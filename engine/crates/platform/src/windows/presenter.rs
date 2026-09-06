@@ -393,6 +393,32 @@ mod tests {
         assert!(factory.prepare(&offscreen).is_err());
     }
 
+    /// A pbuffer and a window are never the same native surface, whatever their
+    /// sizes.
+    ///
+    /// The mirror of `apple::presenter`'s
+    /// `offscreen_and_layer_targets_are_never_the_same_surface` and of
+    /// `linux::presenter`'s X11 one, and it was the only one of the three
+    /// missing. `same_native_surface`'s `_ => false` arm -- the arm that answers
+    /// a headless target compared against an onscreen one -- was asserted by
+    /// nothing: flipping it to `true` left all six presenter tests green.
+    ///
+    /// What that arm being wrong costs: a move between headless and onscreen
+    /// would read as "the surface did not change", and the engine would go on
+    /// rendering into the one it already had.
+    #[test]
+    fn offscreen_and_window_targets_are_never_the_same_surface() {
+        let offscreen = WindowsEglSurfaceFactory::offscreen()
+            .prepare(&WindowsOffscreenSurface::new(800, 600))
+            .expect("prepare offscreen");
+        let onscreen = WindowsEglSurfaceFactory::hwnd()
+            .prepare(&unsafe { WindowsHwndSurface::new(hwnd(0x1234), 800, 600) })
+            .expect("prepare window");
+
+        assert!(!offscreen.same_native_surface(onscreen.as_ref()));
+        assert!(!onscreen.same_native_surface(offscreen.as_ref()));
+    }
+
     /// A resized window is still the same native surface. Reporting otherwise
     /// would retire an attachment the host never replaced.
     #[test]
