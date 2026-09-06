@@ -337,16 +337,30 @@ jobs:
           # of the process it launches inside the simulator. A simulator process
           # inherits nothing from this runner's shell, and setting the variable
           # in the device's launchd (`simctl spawn ... launchctl setenv`) does
-          # not reach it either -- tried on 2026-09-06, and the run still logged
-          # "load ANGLE failed". Without ANGLE the render thread dies and takes
+          # not reach it either -- tried on 2026-09-06.
+          #
+          # FRAMEWORK_PATH and not LIBRARY_PATH, which was the second thing tried
+          # and also failed. On iOS ANGLE ships as frameworks, not dylibs -- the
+          # pin's `contents` for this target is exactly
+          # ["libEGL.framework", "libGLESv2.framework"] -- and the presenter asks
+          # dlopen for "libEGL.framework/libEGL". DYLD_LIBRARY_PATH is consulted
+          # for leaf names; a framework-shaped path is what DYLD_FRAMEWORK_PATH
+          # is for. Both are set: the macOS side of the same constant is a bare
+          # `libEGL.dylib`, and one env block that covers both shapes is one
+          # fewer thing to get wrong when this step grows a second platform.
+          #
+          # Why it matters at all: without ANGLE the render thread dies and takes
           # the session with it, which is what made this step's attach assertion
-          # a coin flip; see the fetch step above.
+          # a coin flip. See the fetch step above.
+          angle="$GITHUB_WORKSPACE/engine/third_party/angle-apple-ios-simulator"
+          ls -la "$angle"
           xcodebuild test \
             -scheme Migo-Package \
             -destination "platform=iOS Simulator,id=$udid" \
             -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
-            TEST_RUNNER_DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/engine/third_party/angle-apple-ios-simulator"
+            TEST_RUNNER_DYLD_FRAMEWORK_PATH="$angle" \
+            TEST_RUNNER_DYLD_LIBRARY_PATH="$angle"
 
       # The half of the deployment-floor contract that reads the product rather
       # than the declaration -- and the half its own header calls the one that
