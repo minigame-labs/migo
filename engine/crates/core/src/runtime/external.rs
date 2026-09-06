@@ -806,6 +806,26 @@ fn handle_command(
                         error.detail.as_deref().unwrap_or(""),
                     );
                 }
+            } else if !backgrounded.load(Ordering::Relaxed) {
+                // The other half of a handover `OnShow` already documents and this
+                // arm never performed. `OnShow` with no live Surface deliberately
+                // does not resume -- a renderer with nothing to present into would
+                // run for nothing -- and says the resume belongs to the
+                // `UpdateSurface` that follows. It did not: `SurfaceSystem`
+                // preserves `Paused` across `on_surface_available`, so the Surface
+                // installed and no frame could be presented until some unrelated
+                // `OnShow` arrived.
+                //
+                // Reaching it took the surface-loss callback starting to fire: a host
+                // that hears its Surface is gone detaches, attaches a replacement,
+                // and stays foregrounded throughout, so nothing else was coming.
+                //
+                // Guarded on `backgrounded` for the reason the embedded execution
+                // guards it: a host may install a Surface while hidden, and resuming
+                // then runs render and audio in the background. In that case the
+                // Surface is live but paused, and `OnShow` drives the resume.
+                render.resume();
+                audio.resume();
             }
         }
 

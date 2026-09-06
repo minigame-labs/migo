@@ -204,6 +204,66 @@ fn a_launch_that_fails_is_announced_like_one_that_succeeds() {
 }
 
 #[test]
+fn the_handover_onshow_defers_to_is_actually_performed() {
+    // The property: whichever of the two arms declines to resume, the other does it.
+    //
+    // `OnShow` with no live Surface deliberately does not resume -- a renderer with
+    // nothing to present into would run for nothing -- and its comment says the
+    // resume belongs to the `UpdateSurface` that follows. That handover was never
+    // implemented on this execution, and `SurfaceSystem` preserves `Paused` across
+    // `on_surface_available`, so a Surface installed while paused presented nothing
+    // until some unrelated `OnShow` arrived.
+    //
+    // It became reachable when the surface-loss callback started firing: a host that
+    // hears its Surface is gone detaches, attaches a replacement, and stays
+    // foregrounded throughout, so nothing else was coming.
+    let handler = EXTERNAL
+        .split("fn handle_command(")
+        .nth(1)
+        .expect("the external command handler must remain present");
+    let show = handler
+        .find("HostCommand::OnShow")
+        .expect("OnShow must still be handled");
+    let show_arm = &handler[show..handler[show..]
+        .find("\n        HostCommand::")
+        .map_or(handler.len(), |offset| show + offset)];
+    assert!(
+        show_arm.contains("render.has_live_surface()"),
+        "OnShow must still decline to resume without a live Surface, which is what \
+         makes the other arm's resume necessary"
+    );
+
+    let update = handler
+        .find("HostCommand::UpdateSurface {")
+        .expect("the surface update must still be handled");
+    let update_arm = &handler[update
+        ..handler[update..]
+            .find("\n        HostCommand::")
+            .map_or(handler.len(), |offset| update + offset)];
+    assert!(
+        update_arm.contains("render.resume();"),
+        "the update must perform the resume OnShow deferred to it, or a Surface \
+         installed while paused presents nothing"
+    );
+    assert!(
+        update_arm.contains("audio.resume();"),
+        "and resume audio with it, as OnShow would have"
+    );
+    assert!(
+        update_arm.contains("!backgrounded.load(Ordering::Relaxed)"),
+        "guarded on backgrounded, for the reason the embedded execution guards it: a \
+         host may install a Surface while hidden, and resuming then runs render and \
+         audio in the background"
+    );
+    // The guard is the whole point of the pairing, so the embedded half must still
+    // have it too -- otherwise this asserts a symmetry with one side.
+    assert!(
+        HOST.contains("if !self.backgrounded.load(Ordering::Relaxed) {"),
+        "the embedded execution must still gate its post-update resume the same way"
+    );
+}
+
+#[test]
 fn the_external_session_tells_its_host_what_the_embedded_one_does() {
     // The property: a host-facing render failure reaches the host on both products.
     //
