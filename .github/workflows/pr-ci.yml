@@ -543,6 +543,19 @@ jobs:
       - name: The Apple renderer and the C ABI name the same surface kind
         run: bash scripts/test-apple-host-surface-kind-contract.sh
 
+      # The macOS V8 source pin agrees with cargo, the peer locks, the Apple
+      # deployment floor and the fetch script. Every number in that lock is also
+      # stated somewhere with more authority, and a pin that drifts from one of
+      # them fails later as somebody else's bug -- a `v8_revision` a version
+      # behind yields an archive whose `src_binding.rs` describes a different V8
+      # API, and the error lands in a consumer's link step naming neither file.
+      #
+      # It also asserts the artifact half is ABSENT rather than half-present: no
+      # macOS runner has built these bytes yet, so a lock carrying their hashes
+      # would be the worse failure.
+      - name: The macOS V8 source pin agrees with its neighbours
+        run: bash scripts/test-apple-v8-pin-contract.sh
+
       # macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
       # unbound-variable error rather than nothing. Linux's bash 5 expands it to
       # nothing, so the entire class is invisible here and fatal there -- and
