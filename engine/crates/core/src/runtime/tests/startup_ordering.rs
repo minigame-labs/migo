@@ -572,6 +572,62 @@ fn the_initial_surface_is_claimed_after_gpu_init_and_by_one_route_only() {
 }
 
 #[test]
+fn an_initial_surface_that_cannot_be_installed_is_reported_like_a_later_one() {
+    // The property: the two install paths answer a genuine platform failure the
+    // same way.
+    //
+    // They did not. An update that fails to install retires the generation and
+    // reports the loss on the must-deliver control channel; an *initial* install
+    // that fails only logged and set `gpu_caps`. That leaves nothing to observe:
+    // the worker stays alive and running, so no channel closes and no reply
+    // arrives, and the external-frame execution does not read `gpu_caps`. A host
+    // whose Surface could not be used was therefore never told, and could not know
+    // to attach another.
+    //
+    // Both arms are pinned, because "they agree" is the property and a check on one
+    // of them cannot express it.
+    let init = RENDER_THREAD
+        .split("if let Some(lease) = claimed {")
+        .nth(1)
+        .expect("the initial install must remain present")
+        .split("if !startup_failed")
+        .next()
+        .expect("the initial install must end before the caps publication");
+    let update = RENDER_THREAD
+        .split("let Some(lease) = surface_control.live_candidate_for(requested)")
+        .nth(1)
+        .expect("the update install must remain present");
+
+    for (arm, which) in [
+        (init, "the initial install"),
+        (update, "the update install"),
+    ] {
+        assert!(
+            arm.contains("retire_unexpected_surface("),
+            "{which} must retire the generation and report the loss when the \
+             platform genuinely refuses the Surface"
+        );
+        assert!(
+            arm.contains("SurfaceLossReason::PlatformError"),
+            "{which} must name the reason the host reads"
+        );
+    }
+
+    // And the report must not cost a second pin: naming the generation is what the
+    // update path needed a retained clone for, and the initial path takes two `Copy`
+    // values instead.
+    assert!(
+        init.contains("let generation = lease.generation();"),
+        "the initial install must take the generation before the lease moves"
+    );
+    assert!(
+        !init.contains("lease.clone()"),
+        "the initial install must not retain a clone of the lease to report with: \
+         that is the pin the candidate level exists to avoid"
+    );
+}
+
+#[test]
 fn a_surface_the_host_took_back_during_gpu_init_is_not_a_startup_failure() {
     // The property: "the host retired it while the GPU was coming up" is
     // cancellation, not a render failure.

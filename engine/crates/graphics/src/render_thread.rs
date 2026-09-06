@@ -1821,6 +1821,12 @@ impl RenderThread {
                 // With a Surface still live, create the onscreen context immediately.
                 if let Some(lease) = claimed {
                     let size = lease.size();
+                    // Taken before the lease moves. Both are `Copy`, so naming the
+                    // generation this install was for costs no second pin on the
+                    // host's Surface -- which is the whole reason the candidate is a
+                    // level rather than a payload.
+                    let generation = lease.generation();
+                    let public_generation = lease.public_generation();
                     let initial_result = install_surface_lease(
                         &graphics_platform,
                         &mut cm,
@@ -1853,6 +1859,27 @@ impl RenderThread {
                             error!("create_onscreen failed: {}", e);
                             gpu_caps.set_failed(format!("create_onscreen failed: {}", e));
                             startup_failed = true;
+                            // The same route the update path takes for the same
+                            // failure, and the asymmetry was the defect: an initial
+                            // install that genuinely fails leaves this thread alive
+                            // and running, so nothing closes, nothing replies, and
+                            // there is no edge for a session to observe. On the
+                            // external-frame product that meant a host whose Surface
+                            // could not be used was never told -- it does not read
+                            // `gpu_caps`, and the frame clock stays open because the
+                            // worker has not stopped.
+                            //
+                            // Retiring first is what makes it deliverable: the report
+                            // travels on the must-deliver control channel and its
+                            // contract is that the generation is already dead when it
+                            // arrives, so the host can attach another.
+                            retire_unexpected_surface(
+                                &surface_control,
+                                generation,
+                                public_generation,
+                                SurfaceLossReason::PlatformError,
+                                &report_surface_loss,
+                            );
                         }
                     }
                 }
