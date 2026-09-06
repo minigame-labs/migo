@@ -1719,10 +1719,13 @@ fn validate_apple_v8_target(target: &TargetIdentity) -> Result<(), ManifestError
         ));
     }
     // `major.minor`, both decimal. Rejecting a bare major is the point rather
-    // than pedantry: Apple's own MACOSX_DEPLOYMENT_TARGET is written 11.0, and a
-    // manifest recording "11" would compare unequal to the contract that spells
-    // it 11.0 while describing the same floor -- a disagreement about text
-    // presented as a disagreement about the platform.
+    // than pedantry: Apple spells its deployment targets with both components, so
+    // a manifest recording only a major would compare unequal to the contract
+    // while describing the same floor -- a disagreement about text presented as a
+    // disagreement about the platform. The number itself is deliberately not
+    // written here; contracts/apple/deployment-floor.json is its single source and
+    // scripts/test-apple-deployment-floor-contract.sh fails the build when a file
+    // outside the derived set carries its own copy.
     let floor = &target.runtime_floor["macos"];
     let mut parts = floor.split('.');
     let well_formed = match (parts.next(), parts.next(), parts.next()) {
