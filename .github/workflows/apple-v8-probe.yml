@@ -116,99 +116,123 @@ jobs:
       # committed lock rather than typed here, so this probe cannot measure a
       # different rusty_v8 than the one the engine links.
       - name: Which rusty_v8 the engine is pinned to
+        id: pin
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 - <<'PY' | tee -a "$GITHUB_OUTPUT"
           import json
           lock = json.load(open("contracts/artifact-manifest/ohos-v8.lock.json"))
-          for key in ("rusty_v8_version", "rusty_v8_revision", "v8_revision"):
-              print(f"{key}={lock[key]}")
-          print("sources:", json.dumps(lock["sources"], indent=2))
+          print(f"rusty_v8_revision={lock['rusty_v8_revision']}")
+          print(f"rusty_v8_version={lock['rusty_v8_version']}")
+          print(f"v8_revision={lock['v8_revision']}")
           PY
 
-      # QUESTION 1 and 4, together: does a from-source build start at all, and
-      # what does it configure with. `--dry-run` first so the answer to "does
-      # cargo even resolve this target" is separate from an hour of C++.
-      - name: Does the darwin host target resolve at all
-        working-directory: engine
+      # QUESTION 1, first half: the checkout. `scripts/build-v8-linux.sh` builds
+      # inside a SEPARATE rusty_v8 git checkout (`RUSTY_V8_SRC`, default
+      # `../rusty_v8_src`) and refuses to run without one -- it does not build the
+      # crates.io `v8` crate from the engine workspace, because
+      # `V8_FROM_SOURCE=1` needs V8's own source tree and the published crate
+      # does not carry it. On this workstation that checkout is 13 GB.
+      #
+      # rusty_v8 vendors V8 and its Chromium dependencies as git submodules, so
+      # this is a clone rather than depot_tools + gclient. That is worth
+      # measuring rather than assuming: the ANGLE probe found the arm64 image
+      # starts with 42 GiB free, so 13 GB should fit, but nobody has timed the
+      # clone on a hosted runner.
+      - name: Clone rusty_v8 at the pinned revision
+        id: checkout_v8
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          git clone --filter=blob:none https://github.com/denoland/rusty_v8 "$RUNNER_TEMP/rusty_v8_src"
+          cd "$RUNNER_TEMP/rusty_v8_src"
+          git checkout --quiet "${{ steps.pin.outputs.rusty_v8_revision }}"
+          git submodule update --init --recursive --depth 1
+          echo "clone_seconds=$(( $(date +%s) - start ))"
+          echo "--- what it cost ---"
+          du -sh . ./v8 2>/dev/null || true
+          df -h /
+
+      # QUESTION 1, the expensive half, and QUESTION 3 on the way past. Timed and
+      # bounded on purpose: if a from-source V8 does not finish inside this budget
+      # on a hosted runner, that is itself the answer -- the lane would have to be
+      # self-hosted or release-asset based, which is a different design.
+      #
+      # `-p v8` inside the rusty_v8 checkout, exactly as build-v8-linux.sh:307
+      # does. Building migo-core instead would drag Skia in and confuse the timing
+      # this lane exists to report.
+      - name: Build librusty_v8.a for the host darwin triple
+        id: host_build
+        timeout-minutes: 90
         run: |
           set -euo pipefail
           host="$(rustc -vV | sed -n 's/^host: //p')"
           echo "host triple: $host"
-          cargo tree -p migo-core --target "$host" -i v8 --depth 1 || true
-
-      # QUESTION 1, the expensive half. Timed and bounded on purpose: if a
-      # from-source V8 does not finish inside this budget on a hosted runner,
-      # that is itself the answer -- the lane would have to be a self-hosted or
-      # release-asset arrangement, which is a different design.
-      - name: Build rusty_v8 from source for the host darwin triple
-        id: host_build
-        timeout-minutes: 90
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          host="$(rustc -vV | sed -n 's/^host: //p')"
+          cd "$RUNNER_TEMP/rusty_v8_src"
           start=$(date +%s)
-          # `-p v8` alone: the point is the V8 archive, not the engine. Building
-          # migo-core would drag Skia in and confuse the timing this lane exists
-          # to report.
-          cargo build -p v8 --release --target "$host" 2>&1 | tail -40
-          echo "seconds=$(( $(date +%s) - start ))"
+          cargo build --release --target "$host" -p v8 2>&1 | tail -40
+          echo "build_seconds=$(( $(date +%s) - start ))"
           echo "--- disk after ---"
           df -h /
 
-      # QUESTION 4: the arguments that were actually used. rusty_v8's build
-      # script writes them into its OUT_DIR, so this reads the answer rather
-      # than restating an intention.
-      - name: What gn arguments the build used
+      # QUESTION 4: the arguments that were actually used, and QUESTION 3's
+      # answer. Both are read out of the build tree at the paths
+      # build-v8-linux.sh:60,69 already name, so this reports what happened
+      # rather than restating an intention.
+      - name: What gn arguments the build used, and whether a binding was generated
         if: always() && steps.host_build.outcome == 'success'
-        working-directory: engine
         run: |
           set -euo pipefail
-          echo "--- args.gn ---"
-          find target -name args.gn -path "*gn_out*" -print -exec cat {} \; | head -60
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          gn_out="$RUNNER_TEMP/rusty_v8_src/target/$host/release/gn_out"
+          echo "--- args.gn (this is what normalized_gn_args must carry) ---"
+          cat "$gn_out/args.gn"
           echo "--- the archive ---"
-          find target -name librusty_v8.a -print -exec ls -la {} \; | head
-          echo "--- and the generated binding, if there is one (QUESTION 3) ---"
-          find target -name src_binding.rs -print -exec wc -l {} \; | head
+          ls -la "$gn_out/obj/librusty_v8.a"
+          echo "--- src_binding.rs: generated here, or must it be pre-committed? ---"
+          if [ -f "$gn_out/src_binding.rs" ]; then
+            wc -l "$gn_out/src_binding.rs"
+            echo "GENERATED on this platform"
+          else
+            echo "NOT generated -- the lock must record that as structural, the way ohos-v8.lock.json does"
+          fi
 
       # QUESTION 5: what deployment target the bytes actually carry. `vtool` is
       # the authority; a build that silently used the runner's own macOS version
-      # as its floor would link here and fail on a consumer's Mac, and nothing in
-      # this repository would have said so.
+      # as its floor would link here and fail on a consumer's older Mac, and
+      # nothing in this repository would have said so.
       - name: What macOS floor the archive really carries
         if: always() && steps.host_build.outcome == 'success'
-        working-directory: engine
         run: |
           set -euo pipefail
-          archive="$(find target -name librusty_v8.a | head -1)"
-          echo "archive: $archive"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          archive="$RUNNER_TEMP/rusty_v8_src/target/$host/release/gn_out/obj/librusty_v8.a"
           # An `ar` archive is not a Mach-O: extract one member and ask about
           # that. Asking vtool about the archive itself reports nothing useful,
-          # which is a trap this repository has already documented for the
-          # Apple tooling.
+          # which is a trap this repository has already recorded for the Apple
+          # tooling.
           tmp="$(mktemp -d)"
-          ( cd "$tmp" && ar x "$OLDPWD/$archive" && ls | head -3 )
-          member="$(ls "$tmp" | grep -m1 '\.o$' || true)"
+          cd "$tmp"
+          ar x "$archive"
+          member="$(ls | grep -m1 '\.o$' || true)"
           if [ -n "$member" ]; then
-            vtool -show-build "$tmp/$member" || true
-            otool -hv "$tmp/$member" | head -5 || true
+            vtool -show-build "$member" || true
+            otool -hv "$member" | head -5 || true
           else
             echo "no object member found to inspect"
           fi
 
       # QUESTION 2: the cross-build. Last, because it is the one most likely to
       # fail, and a failure here still leaves questions 1/3/4/5 answered.
-      - name: Cross-build rusty_v8 for x86_64-apple-darwin
-        id: cross_build
+      - name: Cross-build librusty_v8.a for x86_64-apple-darwin
         continue-on-error: true
         timeout-minutes: 90
-        working-directory: engine
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP/rusty_v8_src"
           start=$(date +%s)
-          cargo build -p v8 --release --target x86_64-apple-darwin 2>&1 | tail -60
-          echo "seconds=$(( $(date +%s) - start ))"
+          cargo build --release --target x86_64-apple-darwin -p v8 2>&1 | tail -60
+          echo "cross_build_seconds=$(( $(date +%s) - start ))"
 
       - name: The answer
         if: always()
