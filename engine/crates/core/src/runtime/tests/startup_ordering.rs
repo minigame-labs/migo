@@ -8,6 +8,8 @@ const RENDER_SERVICE: &str = include_str!("../../services/render.rs");
 const RENDER_THREAD: &str = include_str!("../../../../graphics/src/render_thread.rs");
 const CANVAS_MANAGER: &str = include_str!("../../../../graphics/src/canvas/manager/mod.rs");
 const GPU_CAPS: &str = include_str!("../../../../shared/src/device/gpu_caps.rs");
+const CONTROL: &str = include_str!("../../../../shared/src/surface/control.rs");
+const RENDER_CMD: &str = include_str!("../../../../shared/src/protocol/render_cmd.rs");
 
 fn host_new_body() -> &'static str {
     let start = HOST
@@ -278,8 +280,8 @@ fn gpu_caps_publish_only_after_initial_surface_outcome() {
         .nth(1)
         .expect("render initialization must construct CanvasManager");
     let surface = render_init
-        .find("if let Some(lease) = initial_surface")
-        .expect("render initialization must resolve the initial SurfaceLease");
+        .find("surface_control.live_candidate()")
+        .expect("render initialization must claim the initial Surface from the control plane");
     let guarded_publish = render_init
         .find("if !startup_failed")
         .expect("failed surface setup must not publish successful caps");
@@ -287,6 +289,128 @@ fn gpu_caps_publish_only_after_initial_surface_outcome() {
         .find("cm.publish_gpu_caps()")
         .expect("successful render initialization must publish caps");
     assert!(surface < guarded_publish && guarded_publish < publish);
+}
+
+#[test]
+fn the_initial_surface_is_claimed_after_gpu_init_and_by_one_route_only() {
+    // The property: no lease waits anywhere the host cannot hurry.
+    //
+    // A `SurfaceLease` pins the native Surface, and RELEASED is published by the
+    // last one going away, so wherever a lease waits, `migo_surface_begin_detach`
+    // waits with it. It waited in two places: handed to the worker at spawn it was
+    // owned across GPU bring-up -- measured at 33 ms on macOS and 5.7-41 s on the
+    // iOS simulator, where ANGLE compiles its Metal shaders cold -- and carried
+    // inside `RecreateOnscreen` it sat in a queue behind the same phase. Neither
+    // pin bought anything: `CanvasManager` construction takes an `EglProvider` and
+    // never names a window, and the candidate's liveness is re-checked at install
+    // regardless.
+    //
+    // Three halves, and the ordering one alone is not enough -- either delivery
+    // route reappearing would restore the pin while this file still looked right.
+    let claim = RENDER_THREAD
+        .find("surface_control.live_candidate()")
+        .expect("the render thread must claim its candidate from the control plane");
+    let init = RENDER_THREAD
+        .find("CanvasManager::new_with_resource(")
+        .expect("render initialization must construct CanvasManager");
+    assert!(
+        init < claim,
+        "the candidate must be claimed after GPU initialization, not carried through it"
+    );
+
+    let spawn = RENDER_THREAD
+        .split("pub fn spawn(")
+        .nth(1)
+        .expect("RenderThread::spawn must remain present");
+    let signature = spawn
+        .split(") -> EngineResult<Self> {")
+        .next()
+        .expect("RenderThread::spawn must have a signature");
+    assert!(
+        !signature.contains("SurfaceLease"),
+        "RenderThread::spawn must take no Surface: the control plane is the only \
+         route, so there is nowhere else for a pin to reappear"
+    );
+
+    // The second route that used to exist, and the reason the level is read rather
+    // than consumed. `RecreateOnscreen` carried an owning lease, so a pre-ready
+    // re-attach left the host's Surface pinned in a bounded queue behind the same
+    // initialization -- unbounded, because `RenderService` gives up on the reply
+    // after 500 ms and the lease stays queued regardless.
+    let command = RENDER_CMD
+        .split("    RecreateOnscreen {")
+        .nth(1)
+        .expect("the RecreateOnscreen command must remain present")
+        .split("    },")
+        .next()
+        .expect("the RecreateOnscreen command must end");
+    assert!(
+        !command.contains("SurfaceLease"),
+        "RecreateOnscreen must carry no Surface: it is the wake and the reply \
+         channel for a level, not the delivery of a lease"
+    );
+    assert!(
+        RENDER_SERVICE.contains("self.surface_control.publish_candidate(lease.clone());"),
+        "an update must publish through the control plane"
+    );
+
+    // And the control plane must actually be able to revoke what it parked.
+    assert!(
+        CONTROL.contains("candidate: Mutex<Option<SurfaceLease>>"),
+        "SurfaceControl must own the published candidate"
+    );
+    for retire in [
+        "pub fn retire_current_and_request(&self)",
+        "pub fn retire_generation_and_request(&self, expected: SurfaceGeneration)",
+    ] {
+        let body = CONTROL
+            .split(retire)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{retire} must remain present"))
+            .split("\n    pub fn ")
+            .next()
+            .expect("the retirement body must end");
+        assert!(
+            body.contains("self.release_dead_candidate();"),
+            "{retire} must revoke a published candidate it just made unusable"
+        );
+    }
+}
+
+#[test]
+fn a_surface_the_host_took_back_during_gpu_init_is_not_a_startup_failure() {
+    // The property: "the host retired it while the GPU was coming up" is
+    // cancellation, not a render failure.
+    //
+    // `gpu_caps.set_failed` is what `ensure_gpu_ready` turns into
+    // `Render2DInitError` before the first line of launch JS, so routing this
+    // through it aborts a launch over a Surface the host itself took back -- and
+    // names the GPU as the culprit while the GPU is fine. The truthful state is
+    // the one a warm start begins in: caps Ready, no Surface, waiting for the
+    // `UpdateSurface` that brings the next one.
+    let install = RENDER_THREAD
+        .split("if let Some(lease) = claimed {")
+        .nth(1)
+        .expect("the initial install must remain present");
+    let arm = install
+        .find("Err(SurfaceRecreateError::Binding(SurfaceBindingError::StaleGeneration))")
+        .expect("a retired candidate must be matched separately from a real failure");
+    let blanket = install
+        .find("gpu_caps.set_failed(")
+        .expect("a real install failure must still publish Failed");
+    assert!(
+        arm < blanket,
+        "the cancellation arm must be matched before the arm that publishes Failed"
+    );
+    let cancelled = &install[arm..blanket];
+    assert!(
+        !cancelled.contains("set_failed"),
+        "a retired candidate must not publish a GPU failure"
+    );
+    assert!(
+        !cancelled.contains("startup_failed = true"),
+        "a retired candidate must not suppress the caps publication the GPU earned"
+    );
 }
 
 #[test]
@@ -319,5 +443,88 @@ fn caller_ready_signal_stays_after_host_construction() {
     assert!(
         SESSION_THREAD.contains("ready_tx.send(())"),
         "the shared helper is what actually signals readiness"
+    );
+}
+
+#[test]
+fn every_startup_error_the_caller_sees_was_announced_exactly_once() {
+    // The property: `spawn_session_thread` returns no `Err` the host has not
+    // already heard about, and none it has heard about twice.
+    //
+    // It needs pinning because the two halves look interchangeable from either
+    // end. A failure inside the thread announces its own specific reason and
+    // *then* drops `ready_tx` -- and dropping `ready_tx` unsent is the only
+    // thing the caller's handshake can observe. So a caller that reports what
+    // the handshake told it delivers a second, vaguer callback for a failure
+    // that already spoke, and the host cannot collapse the two: the notifier
+    // posts every event independently. That is not hypothetical; the duplicate
+    // existed, at the C boundary, and the two causes are distinguishable there
+    // only by matching on the error message.
+    let start = SESSION_THREAD
+        .find("pub(crate) fn spawn_session_thread<Body>(")
+        .expect("spawn_session_thread must remain present");
+    let body = &SESSION_THREAD[start..];
+    let end = body
+        .find("pub(crate) struct StartedHost")
+        .expect("spawn_session_thread must end before StartedHost");
+    let body = &body[..end];
+
+    let spawn_at = body
+        .find("let spawn_result = thread::Builder::new()")
+        .expect("the thread spawn must remain present");
+    let join_at = body
+        .find("let join = match spawn_result {")
+        .expect("the spawn outcome must still be matched");
+    let host_at = body
+        .find("let host = HostThread::new(id, join);")
+        .expect("the spawn-failure arm must end at the HostThread it could not build");
+    let handshake_at = body
+        .find("if ready_rx.recv().is_err() {")
+        .expect("the cold-start handshake must remain present");
+
+    // The two regions where no thread can be holding `ready_tx`: before the
+    // spawn statement, and the arm where the spawn itself failed and dropped the
+    // closure without running it. Derived by pairing counts rather than by
+    // listing the exits, so an exit added without a report moves one count and
+    // not the other.
+    for (region, what) in [
+        (&body[..spawn_at], "before the thread is spawned"),
+        (&body[join_at..host_at], "when the spawn itself fails"),
+    ] {
+        let built = region.matches("EngineError::new(").count();
+        let announced = region.matches("report_unspawned_failure(").count();
+        assert!(
+            built > 0,
+            "the region {what} must still have a failure to announce"
+        );
+        assert_eq!(
+            built, announced,
+            "every error built {what} must be announced, because no thread exists \
+             to announce it: {built} built, {announced} announced"
+        );
+    }
+
+    // And the mirror. Past the handshake the thread has already spoken for every
+    // way it can fail, including a panic, which the barrier reports.
+    let after_handshake = &body[handshake_at..];
+    assert!(
+        !after_handshake.contains("report_unspawned_failure("),
+        "the handshake observes a failure that already reported; announcing it \
+         again is the duplicate this test exists to prevent"
+    );
+    assert!(
+        !after_handshake.contains("notify_error("),
+        "the handshake must not report through any route"
+    );
+
+    // The pairing above is only meaningful if the helper is the sole reporter in
+    // those two regions -- a bare `notify_error` there would satisfy no count.
+    assert!(
+        !body[..spawn_at].contains("notify_error("),
+        "pre-spawn reporting must go through report_unspawned_failure"
+    );
+    assert!(
+        !body[join_at..host_at].contains("notify_error("),
+        "spawn-failure reporting must go through report_unspawned_failure"
     );
 }

@@ -1670,7 +1670,6 @@ impl RenderThread {
         vsync_rx: Option<Receiver<f64>>,
         frame_demand_rx: Option<Receiver<()>>,
         host_id: i32,
-        initial_surface: Option<SurfaceLease>,
         graphics_platform: crate::egl_platform::GraphicsPlatform,
         dpi: f32,
         app_cache_dir: Option<std::path::PathBuf>,
@@ -1711,8 +1710,10 @@ impl RenderThread {
         // graphics stays decoupled from `platform` (it only invokes a closure).
         request_vsync: Option<Arc<dyn Fn() + Send + Sync>>,
         // Queue-independent native-lifetime control plane. It owns the
-        // generation gate and installs a dedicated must-deliver command stream
-        // before the render worker can touch the initial candidate.
+        // generation gate, installs a dedicated must-deliver command stream, and
+        // parks the initial candidate Surface -- which this thread claims once it
+        // can use one, rather than being handed at spawn. See
+        // `SurfaceControl::take_live_handoff` for why that difference matters.
         surface_control: Arc<SurfaceControl>,
         // Reliable control-plane report back to the Host. The generation gate
         // is retired before this closure runs, and expected host detach never
@@ -1788,13 +1789,24 @@ impl RenderThread {
                     }
                 };
 
-                let has_initial_surface = initial_surface.is_some();
-                let initial_surface_size = initial_surface.as_ref().map(|surface| surface.size());
-                let mut initial_onscreen_ok = false;
+                // Read here, and deliberately not handed in at spawn.
+                //
+                // A `SurfaceLease` pins the host's native Surface, and RELEASED is
+                // published by the last one going away. Owning the candidate from
+                // spawn meant owning it across the `CanvasManager` construction
+                // above -- which names no window and so cannot touch that Surface
+                // -- and for all of that time a host asking for its Surface back
+                // could not be answered. That is 33 ms on macOS and a measured
+                // 5.7-41 s on the iOS simulator, where ANGLE compiles its Metal
+                // shaders cold, and it bought nothing: the candidate's liveness is
+                // re-checked below regardless. See `SurfaceControl::live_candidate`.
+                let claimed = surface_control.live_candidate();
+                let mut initial_onscreen: Option<(u32, u32)> = None;
                 let mut startup_failed = false;
 
-                // If an initial surface is provided, create the onscreen context immediately.
-                if let Some(lease) = initial_surface {
+                // With a Surface still live, create the onscreen context immediately.
+                if let Some(lease) = claimed {
+                    let size = lease.size();
                     let initial_result = install_surface_lease(
                         &graphics_platform,
                         &mut cm,
@@ -1806,7 +1818,20 @@ impl RenderThread {
                     match initial_result {
                         Ok(kind) => {
                             debug_assert_eq!(kind, RecreateKind::Initial);
-                            initial_onscreen_ok = true;
+                            initial_onscreen = Some(size);
+                        }
+                        // The host retired it in the window between the claim and
+                        // the preflight. Cancellation, not failure: the GPU came up,
+                        // there is simply no Surface to draw into, which is the
+                        // state a warm-started session begins in and which the next
+                        // `UpdateSurface` resolves. Publishing Failed here would
+                        // fail the host's GPU join and abort a launch over a
+                        // Surface the host itself took back.
+                        Err(SurfaceRecreateError::Binding(SurfaceBindingError::StaleGeneration)) => {
+                            debug!(
+                                "[RenderThread host={}] initial Surface retired before install",
+                                host_id
+                            );
                         }
                         Err(error) => {
                             let (e, _) =
@@ -1884,13 +1909,12 @@ impl RenderThread {
                 // the command-handling closure can reset it via shared capture.
                 let vsync_armed = std::cell::Cell::new(false);
                 let mut surface_system = SurfaceSystem::new();
-                if initial_onscreen_ok {
+                // The `on_resume` arm this used to carry was unreachable: the size
+                // and the "was there a surface" flag were two mappings of one
+                // Option, so the size was always present wherever the flag was.
+                if let Some(size) = initial_onscreen {
                     if render_binding.is_live() {
-                        if let Some(size) = initial_surface_size {
                         surface_system.on_surface_available(size);
-                        } else if has_initial_surface {
-                            surface_system.on_resume();
-                        }
                     } else {
                         surface_system.on_surface_destroyed();
                     }
@@ -1985,10 +2009,21 @@ impl RenderThread {
 
                         RenderCommand::Canvas(canvas_cmd) => match canvas_cmd {
                             shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
-                                lease,
                                 pixel_ratio,
                                 resp,
                             } => {
+                                // Read now rather than carried here, so the host's
+                                // Surface was never pinned by this command sitting
+                                // in the queue. `None` means the host retired it
+                                // while this was in flight, which the session
+                                // observes as a cancelled update.
+                                let Some(lease) = surface_control.live_candidate() else {
+                                    let _ = resp.send(Err(EngineError::new(ErrorCode::Cancelled)
+                                        .with_msg(
+                                            "recreate onscreen: Surface retired before install",
+                                        )));
+                                    return LoopCtl::Continue;
+                                };
                                 let size = lease.size();
                                 let generation = lease.generation();
                                 let public_generation = lease.public_generation();

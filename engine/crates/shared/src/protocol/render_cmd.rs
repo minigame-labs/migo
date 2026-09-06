@@ -8,7 +8,7 @@ pub use crate::protocol::color::Color;
 
 use crate::error::{EngineError, ErrorCode};
 use crate::protocol::FramePacket;
-use crate::surface::{PixelRatio, SurfaceGeneration, SurfaceLease, SurfaceReleaseDisposition};
+use crate::surface::{PixelRatio, SurfaceGeneration, SurfaceReleaseDisposition};
 
 pub type CanvasId = u32;
 pub type ImageId = u32;
@@ -466,8 +466,16 @@ pub enum CanvasCmd {
         resp: RenderCmdResp<()>,
     },
 
+    /// Install the Surface the control plane currently publishes.
+    ///
+    /// Deliberately carries no `SurfaceLease`. A lease pins the host's native
+    /// Surface and `RELEASED` waits for the last one to go, so a lease riding this
+    /// command would sit in a bounded queue holding the Surface hostage behind
+    /// whatever the render thread is doing -- including, before the first frame,
+    /// EGL initialization, measured at 5.7-41 s on the iOS simulator. The payload
+    /// is a level on `SurfaceControl` instead, which a retirement revokes; this is
+    /// the wake and the reply channel for it.
     RecreateOnscreen {
-        lease: SurfaceLease,
         /// Transactional DPR update. The backend commits this only after the
         /// Surface installation succeeds; `None` preserves the current value.
         pixel_ratio: Option<PixelRatio>,

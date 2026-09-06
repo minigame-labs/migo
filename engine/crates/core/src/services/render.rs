@@ -17,6 +17,9 @@ use super::{SurfaceAttachmentSlot, SurfaceTransitionError};
 pub(crate) struct RenderService {
     attachment: SurfaceAttachmentSlot,
     surface_system: SurfaceSystem,
+    /// Where the Surface to install is published. Held rather than only handed to
+    /// the render thread, because every update publishes through it.
+    surface_control: std::sync::Arc<shared::surface::SurfaceControl>,
     thread: RenderThread,
 }
 
@@ -89,13 +92,20 @@ impl RenderService {
         >,
     ) -> EngineResult<Self> {
         let surface_size = initial_surface.as_ref().map(|lease| lease.size());
+        // Published for the render thread to read rather than handed to it, so a
+        // host that detaches while the GPU is still coming up is answered at once
+        // instead of waiting out EGL initialization. The logical owner of the
+        // attachment stays here: this slot arbitrates generations, answers
+        // `has_live_surface`, and is what a context restore reads.
+        if let Some(lease) = initial_surface.as_ref() {
+            surface_control.publish_candidate(lease.clone());
+        }
 
         let thread = RenderThread::spawn(
             raf_tx,
             vsync_rx,
             frame_demand_rx,
             host_id,
-            initial_surface.clone(),
             graphics_platform,
             pixel_ratio,
             app_cache_dir,
@@ -109,7 +119,7 @@ impl RenderService {
             wake,
             raf_demand,
             request_vsync,
-            surface_control,
+            std::sync::Arc::clone(&surface_control),
             report_surface_loss,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
@@ -134,6 +144,7 @@ impl RenderService {
                 None => SurfaceAttachmentSlot::empty(),
             },
             surface_system,
+            surface_control,
             thread,
         })
     }
@@ -180,9 +191,15 @@ impl RenderService {
             .map_err(|error| transition_error("recreate onscreen: rejected Surface", error))?;
         let surface_size = lease.size();
 
+        // Published before the wake, never carried by it. A lease riding the
+        // command would pin the host's native Surface for as long as the command
+        // sat in the queue -- which, before the first frame, is however long EGL
+        // initialization takes, and `RELEASED` cannot be published while any lease
+        // is alive. A retirement revokes the level instead.
+        self.surface_control.publish_candidate(lease.clone());
+
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
-            lease: lease.clone(),
             pixel_ratio,
             resp: RenderCmdResp::from_sync(tx),
         });
