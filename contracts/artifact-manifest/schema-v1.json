@@ -1,610 +1,711 @@
 {
- "$defs": {
-  "androidFloor": {
-   "additionalProperties": false,
-   "properties": {
-    "android_api": {
-     "const": "26"
-    }
-   },
-   "required": [
-    "android_api"
-   ],
-   "type": "object"
-  },
-  "androidTarget": {
-   "oneOf": [
-    {
-     "additionalProperties": false,
-     "properties": {
-      "abi": {
-       "const": "android"
-      },
-      "arch": {
-       "const": "aarch64"
-      },
-      "cpu_baseline": {
-       "const": "armv8-a"
-      },
-      "os": {
-       "const": "android"
-      },
-      "required_cpu_features": {
-       "const": [
-        "neon"
-       ]
-      },
-      "runtime_floor": {
-       "$ref": "#/$defs/androidFloor"
-      },
-      "triple": {
-       "const": "aarch64-linux-android"
-      }
-     },
-     "required": [
-      "triple",
-      "os",
-      "arch",
-      "abi",
-      "cpu_baseline",
-      "required_cpu_features",
-      "runtime_floor"
-     ],
-     "type": "object"
-    },
-    {
-     "additionalProperties": false,
-     "properties": {
-      "abi": {
-       "const": "android"
-      },
-      "arch": {
-       "const": "x86_64"
-      },
-      "cpu_baseline": {
-       "const": "x86-64-v1"
-      },
-      "os": {
-       "const": "android"
-      },
-      "required_cpu_features": {
-       "const": [
-        "cmov",
-        "sse2"
-       ]
-      },
-      "runtime_floor": {
-       "$ref": "#/$defs/androidFloor"
-      },
-      "triple": {
-       "const": "x86_64-linux-android"
-      }
-     },
-     "required": [
-      "triple",
-      "os",
-      "arch",
-      "abi",
-      "cpu_baseline",
-      "required_cpu_features",
-      "runtime_floor"
-     ],
-     "type": "object"
-    }
-   ]
-  },
-  "artifactHashes": {
-   "additionalProperties": false,
-   "properties": {
-    "cxx_runtime": {
-     "$ref": "#/$defs/sha256",
-     "description": "SHA-256 of the shipped libc++_shared.so. Optional: present only when the payload contains one. The Android packaging step ships the shared STL if and only if libmigo.so names it in DT_NEEDED, which today none of the Android binaries does -- V8's archive carries Chromium's libc++ statically. Provenance only; the Android SDK reads runtime_binary."
-    },
-    "runtime_binary": {
-     "$ref": "#/$defs/sha256"
-    },
-    "rust_binding": {
-     "$ref": "#/$defs/sha256"
-    },
-    "v8_archive": {
-     "$ref": "#/$defs/sha256"
-    }
-   },
-   "required": [
-    "runtime_binary",
-    "v8_archive",
-    "rust_binding"
-   ],
-   "type": "object"
-  },
-  "graphics": {
-   "additionalProperties": false,
-   "properties": {
-    "backend_family": {
-     "$ref": "#/$defs/nonPlaceholder"
-    },
-    "required_api": {
-     "$ref": "#/$defs/nonPlaceholder"
-    }
-   },
-   "required": [
-    "backend_family",
-    "required_api"
-   ],
-   "type": "object"
-  },
-  "linuxV8Target": {
-   "additionalProperties": false,
-   "properties": {
-    "abi": {
-     "const": "gnu"
-    },
-    "arch": {
-     "const": "x86_64"
-    },
-    "cpu_baseline": {
-     "const": "x86-64-v1"
-    },
-    "os": {
-     "const": "linux"
-    },
-    "required_cpu_features": {
-     "const": [
-      "cmov",
-      "sse2"
-     ]
-    },
-    "runtime_floor": {
-     "additionalProperties": false,
-     "properties": {
-      "glibc": {
-       "const": "2.31"
-      },
-      "glibcxx": {
-       "const": "3.4.28"
-      }
-     },
-     "required": [
-      "glibc",
-      "glibcxx"
-     ],
-     "type": "object"
-    },
-    "triple": {
-     "const": "x86_64-unknown-linux-gnu"
-    }
-   },
-   "required": [
-    "triple",
-    "os",
-    "arch",
-    "abi",
-    "cpu_baseline",
-    "required_cpu_features",
-    "runtime_floor"
-   ],
-   "type": "object"
-  },
-  "nonPlaceholder": {
-   "minLength": 1,
-   "not": {
-    "enum": [
-     "unknown",
-     "UNKNOWN",
-     "unset",
-     "UNSET"
-    ]
-   },
-   "type": "string"
-  },
-  "ohosV8Target": {
-   "oneOf": [
-    {
-     "additionalProperties": false,
-     "properties": {
-      "abi": {
-       "const": "ohos"
-      },
-      "arch": {
-       "const": "x86_64"
-      },
-      "cpu_baseline": {
-       "const": "x86-64-v1"
-      },
-      "os": {
-       "const": "linux"
-      },
-      "required_cpu_features": {
-       "const": [
-        "cmov",
-        "sse2"
-       ]
-      },
-      "runtime_floor": {
-       "additionalProperties": false,
-       "properties": {
-        "ohos_api": {
-         "pattern": "^[0-9]+$",
-         "type": "string"
+  "$defs": {
+    "androidFloor": {
+      "additionalProperties": false,
+      "properties": {
+        "android_api": {
+          "const": "26"
         }
-       },
-       "required": [
-        "ohos_api"
-       ],
-       "type": "object"
       },
-      "triple": {
-       "const": "x86_64-unknown-linux-ohos"
-      }
-     },
-     "required": [
-      "triple",
-      "os",
-      "arch",
-      "abi",
-      "cpu_baseline",
-      "required_cpu_features",
-      "runtime_floor"
-     ],
-     "type": "object"
+      "required": [
+        "android_api"
+      ],
+      "type": "object"
     },
-    {
-     "additionalProperties": false,
-     "properties": {
-      "abi": {
-       "const": "ohos"
-      },
-      "arch": {
-       "const": "aarch64"
-      },
-      "cpu_baseline": {
-       "const": "armv8-a"
-      },
-      "os": {
-       "const": "linux"
-      },
-      "required_cpu_features": {
-       "const": [
-        "neon"
-       ]
-      },
-      "runtime_floor": {
-       "additionalProperties": false,
-       "properties": {
-        "ohos_api": {
-         "pattern": "^[0-9]+$",
-         "type": "string"
+    "androidTarget": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "const": "android"
+            },
+            "arch": {
+              "const": "aarch64"
+            },
+            "cpu_baseline": {
+              "const": "armv8-a"
+            },
+            "os": {
+              "const": "android"
+            },
+            "required_cpu_features": {
+              "const": [
+                "neon"
+              ]
+            },
+            "runtime_floor": {
+              "$ref": "#/$defs/androidFloor"
+            },
+            "triple": {
+              "const": "aarch64-linux-android"
+            }
+          },
+          "required": [
+            "triple",
+            "os",
+            "arch",
+            "abi",
+            "cpu_baseline",
+            "required_cpu_features",
+            "runtime_floor"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "const": "android"
+            },
+            "arch": {
+              "const": "x86_64"
+            },
+            "cpu_baseline": {
+              "const": "x86-64-v1"
+            },
+            "os": {
+              "const": "android"
+            },
+            "required_cpu_features": {
+              "const": [
+                "cmov",
+                "sse2"
+              ]
+            },
+            "runtime_floor": {
+              "$ref": "#/$defs/androidFloor"
+            },
+            "triple": {
+              "const": "x86_64-linux-android"
+            }
+          },
+          "required": [
+            "triple",
+            "os",
+            "arch",
+            "abi",
+            "cpu_baseline",
+            "required_cpu_features",
+            "runtime_floor"
+          ],
+          "type": "object"
         }
-       },
-       "required": [
-        "ohos_api"
-       ],
-       "type": "object"
+      ]
+    },
+    "appleV8Target": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "const": "darwin"
+            },
+            "arch": {
+              "const": "aarch64"
+            },
+            "cpu_baseline": {
+              "const": "armv8-a"
+            },
+            "os": {
+              "const": "macos"
+            },
+            "required_cpu_features": {
+              "const": [
+                "neon"
+              ]
+            },
+            "runtime_floor": {
+              "additionalProperties": false,
+              "properties": {
+                "macos": {
+                  "pattern": "^[0-9]+\\.[0-9]+$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "macos"
+              ],
+              "type": "object"
+            },
+            "triple": {
+              "const": "aarch64-apple-darwin"
+            }
+          },
+          "required": [
+            "triple",
+            "os",
+            "arch",
+            "abi",
+            "cpu_baseline",
+            "required_cpu_features",
+            "runtime_floor"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "const": "darwin"
+            },
+            "arch": {
+              "const": "x86_64"
+            },
+            "cpu_baseline": {
+              "const": "x86-64-v1"
+            },
+            "os": {
+              "const": "macos"
+            },
+            "required_cpu_features": {
+              "const": [
+                "cmov",
+                "sse2"
+              ]
+            },
+            "runtime_floor": {
+              "additionalProperties": false,
+              "properties": {
+                "macos": {
+                  "pattern": "^[0-9]+\\.[0-9]+$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "macos"
+              ],
+              "type": "object"
+            },
+            "triple": {
+              "const": "x86_64-apple-darwin"
+            }
+          },
+          "required": [
+            "triple",
+            "os",
+            "arch",
+            "abi",
+            "cpu_baseline",
+            "required_cpu_features",
+            "runtime_floor"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "artifactHashes": {
+      "additionalProperties": false,
+      "properties": {
+        "cxx_runtime": {
+          "$ref": "#/$defs/sha256",
+          "description": "SHA-256 of the shipped libc++_shared.so. Optional: present only when the payload contains one. The Android packaging step ships the shared STL if and only if libmigo.so names it in DT_NEEDED, which today none of the Android binaries does -- V8's archive carries Chromium's libc++ statically. Provenance only; the Android SDK reads runtime_binary."
+        },
+        "runtime_binary": {
+          "$ref": "#/$defs/sha256"
+        },
+        "rust_binding": {
+          "$ref": "#/$defs/sha256"
+        },
+        "v8_archive": {
+          "$ref": "#/$defs/sha256"
+        }
       },
-      "triple": {
-       "const": "aarch64-unknown-linux-ohos"
-      }
-     },
-     "required": [
-      "triple",
-      "os",
-      "arch",
-      "abi",
-      "cpu_baseline",
-      "required_cpu_features",
-      "runtime_floor"
-     ],
-     "type": "object"
-    }
-   ]
-  },
-  "packageVersion": {
-   "maxLength": 128,
-   "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
-   "type": "string"
-  },
-  "patch": {
-   "additionalProperties": false,
-   "properties": {
-    "id": {
-     "$ref": "#/$defs/nonPlaceholder"
+      "required": [
+        "runtime_binary",
+        "v8_archive",
+        "rust_binding"
+      ],
+      "type": "object"
+    },
+    "graphics": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_family": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "required_api": {
+          "$ref": "#/$defs/nonPlaceholder"
+        }
+      },
+      "required": [
+        "backend_family",
+        "required_api"
+      ],
+      "type": "object"
+    },
+    "linuxV8Target": {
+      "additionalProperties": false,
+      "properties": {
+        "abi": {
+          "const": "gnu"
+        },
+        "arch": {
+          "const": "x86_64"
+        },
+        "cpu_baseline": {
+          "const": "x86-64-v1"
+        },
+        "os": {
+          "const": "linux"
+        },
+        "required_cpu_features": {
+          "const": [
+            "cmov",
+            "sse2"
+          ]
+        },
+        "runtime_floor": {
+          "additionalProperties": false,
+          "properties": {
+            "glibc": {
+              "const": "2.31"
+            },
+            "glibcxx": {
+              "const": "3.4.28"
+            }
+          },
+          "required": [
+            "glibc",
+            "glibcxx"
+          ],
+          "type": "object"
+        },
+        "triple": {
+          "const": "x86_64-unknown-linux-gnu"
+        }
+      },
+      "required": [
+        "triple",
+        "os",
+        "arch",
+        "abi",
+        "cpu_baseline",
+        "required_cpu_features",
+        "runtime_floor"
+      ],
+      "type": "object"
+    },
+    "nonPlaceholder": {
+      "minLength": 1,
+      "not": {
+        "enum": [
+          "unknown",
+          "UNKNOWN",
+          "unset",
+          "UNSET"
+        ]
+      },
+      "type": "string"
+    },
+    "ohosV8Target": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "const": "ohos"
+            },
+            "arch": {
+              "const": "x86_64"
+            },
+            "cpu_baseline": {
+              "const": "x86-64-v1"
+            },
+            "os": {
+              "const": "linux"
+            },
+            "required_cpu_features": {
+              "const": [
+                "cmov",
+                "sse2"
+              ]
+            },
+            "runtime_floor": {
+              "additionalProperties": false,
+              "properties": {
+                "ohos_api": {
+                  "pattern": "^[0-9]+$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ohos_api"
+              ],
+              "type": "object"
+            },
+            "triple": {
+              "const": "x86_64-unknown-linux-ohos"
+            }
+          },
+          "required": [
+            "triple",
+            "os",
+            "arch",
+            "abi",
+            "cpu_baseline",
+            "required_cpu_features",
+            "runtime_floor"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "const": "ohos"
+            },
+            "arch": {
+              "const": "aarch64"
+            },
+            "cpu_baseline": {
+              "const": "armv8-a"
+            },
+            "os": {
+              "const": "linux"
+            },
+            "required_cpu_features": {
+              "const": [
+                "neon"
+              ]
+            },
+            "runtime_floor": {
+              "additionalProperties": false,
+              "properties": {
+                "ohos_api": {
+                  "pattern": "^[0-9]+$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ohos_api"
+              ],
+              "type": "object"
+            },
+            "triple": {
+              "const": "aarch64-unknown-linux-ohos"
+            }
+          },
+          "required": [
+            "triple",
+            "os",
+            "arch",
+            "abi",
+            "cpu_baseline",
+            "required_cpu_features",
+            "runtime_floor"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "packageVersion": {
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+      "type": "string"
+    },
+    "patch": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "id",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "build_recipe": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "build_recipe_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "licenses": {
+          "items": {
+            "$ref": "#/$defs/nonPlaceholder"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        }
+      },
+      "required": [
+        "source_revision",
+        "build_recipe",
+        "build_recipe_sha256",
+        "licenses"
+      ],
+      "type": "object"
+    },
+    "revision": {
+      "pattern": "^[0-9a-fA-F]{40}$",
+      "type": "string"
     },
     "sha256": {
-     "$ref": "#/$defs/sha256"
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "snapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "arch": {
+          "enum": [
+            "aarch64",
+            "x86_64"
+          ]
+        },
+        "bootstrap_inputs_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "bytes_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "external_references_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "generation_cpu_policy": {
+          "const": "target-baseline"
+        },
+        "generator": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "normalized_parameters": {
+          "items": {
+            "$ref": "#/$defs/nonPlaceholder"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "product_profile": {
+          "enum": [
+            "full",
+            "slim"
+          ]
+        },
+        "runtime_kind": {
+          "enum": [
+            "host",
+            "worker"
+          ]
+        },
+        "schema": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "target_triple": {
+          "$ref": "#/$defs/nonPlaceholder"
+        }
+      },
+      "required": [
+        "runtime_kind",
+        "product_profile",
+        "target_triple",
+        "arch",
+        "schema",
+        "generator",
+        "generation_cpu_policy",
+        "normalized_parameters",
+        "external_references_hash",
+        "bootstrap_inputs_hash",
+        "bytes_hash"
+      ],
+      "type": "object"
+    },
+    "toolchain": {
+      "additionalProperties": false,
+      "properties": {
+        "compiler": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "linker": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "rustc": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "sdk": {
+          "$ref": "#/$defs/nonPlaceholder"
+        }
+      },
+      "required": [
+        "rustc",
+        "compiler",
+        "sdk",
+        "linker"
+      ],
+      "type": "object"
+    },
+    "v8Runtime": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "const": "v8"
+        },
+        "normalized_gn_args": {
+          "items": {
+            "$ref": "#/$defs/nonPlaceholder"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "patches": {
+          "items": {
+            "$ref": "#/$defs/patch"
+          },
+          "type": "array"
+        },
+        "rusty_v8_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "rusty_v8_version": {
+          "$ref": "#/$defs/nonPlaceholder"
+        },
+        "v8_revision": {
+          "$ref": "#/$defs/revision"
+        }
+      },
+      "required": [
+        "backend",
+        "rusty_v8_version",
+        "rusty_v8_revision",
+        "v8_revision",
+        "normalized_gn_args",
+        "patches"
+      ],
+      "type": "object"
+    },
+    "windowsV8Target": {
+      "additionalProperties": false,
+      "properties": {
+        "abi": {
+          "const": "msvc"
+        },
+        "arch": {
+          "const": "x86_64"
+        },
+        "cpu_baseline": {
+          "const": "x86-64-v1"
+        },
+        "os": {
+          "const": "windows"
+        },
+        "required_cpu_features": {
+          "const": [
+            "cmov",
+            "sse2"
+          ]
+        },
+        "runtime_floor": {
+          "additionalProperties": false,
+          "properties": {
+            "msvc_runtime": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "msvc_runtime"
+          ],
+          "type": "object"
+        },
+        "triple": {
+          "const": "x86_64-pc-windows-msvc"
+        }
+      },
+      "required": [
+        "triple",
+        "os",
+        "arch",
+        "abi",
+        "cpu_baseline",
+        "required_cpu_features",
+        "runtime_floor"
+      ],
+      "type": "object"
     }
-   },
-   "required": [
-    "id",
-    "sha256"
-   ],
-   "type": "object"
   },
-  "provenance": {
-   "additionalProperties": false,
-   "properties": {
-    "build_recipe": {
-     "$ref": "#/$defs/nonPlaceholder"
+  "$id": "https://migo.dev/contracts/artifact-manifest/schema-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_id": {
+      "$ref": "#/$defs/sha256"
     },
-    "build_recipe_sha256": {
-     "$ref": "#/$defs/sha256"
+    "build_type": {
+      "enum": [
+        "debug",
+        "release"
+      ]
     },
-    "licenses": {
-     "items": {
-      "$ref": "#/$defs/nonPlaceholder"
-     },
-     "minItems": 1,
-     "type": "array",
-     "uniqueItems": true
+    "codegen_profile": {
+      "enum": [
+        "z",
+        "2",
+        "3"
+      ]
     },
-    "source_revision": {
-     "$ref": "#/$defs/revision"
-    }
-   },
-   "required": [
-    "source_revision",
-    "build_recipe",
-    "build_recipe_sha256",
-    "licenses"
-   ],
-   "type": "object"
-  },
-  "revision": {
-   "pattern": "^[0-9a-fA-F]{40}$",
-   "type": "string"
-  },
-  "sha256": {
-   "pattern": "^[0-9a-f]{64}$",
-   "type": "string"
-  },
-  "snapshot": {
-   "additionalProperties": false,
-   "properties": {
-    "arch": {
-     "enum": [
-      "aarch64",
-      "x86_64"
-     ]
+    "graphics": {
+      "$ref": "#/$defs/graphics"
     },
-    "bootstrap_inputs_hash": {
-     "$ref": "#/$defs/sha256"
-    },
-    "bytes_hash": {
-     "$ref": "#/$defs/sha256"
-    },
-    "external_references_hash": {
-     "$ref": "#/$defs/sha256"
-    },
-    "generation_cpu_policy": {
-     "const": "target-baseline"
-    },
-    "generator": {
-     "$ref": "#/$defs/nonPlaceholder"
-    },
-    "normalized_parameters": {
-     "items": {
-      "$ref": "#/$defs/nonPlaceholder"
-     },
-     "minItems": 1,
-     "type": "array",
-     "uniqueItems": true
+    "hashes": {
+      "$ref": "#/$defs/artifactHashes"
     },
     "product_profile": {
-     "enum": [
-      "full",
-      "slim"
-     ]
+      "enum": [
+        "full",
+        "slim"
+      ]
     },
-    "runtime_kind": {
-     "enum": [
-      "host",
-      "worker"
-     ]
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "runtime": {
+      "$ref": "#/$defs/v8Runtime"
     },
     "schema": {
-     "$ref": "#/$defs/nonPlaceholder"
+      "const": "migo-artifact-manifest/v1"
     },
-    "target_triple": {
-     "$ref": "#/$defs/nonPlaceholder"
+    "snapshots": {
+      "items": {
+        "$ref": "#/$defs/snapshot"
+      },
+      "maxItems": 2,
+      "minItems": 1,
+      "type": "array"
+    },
+    "target": {
+      "$ref": "#/$defs/androidTarget"
+    },
+    "toolchain": {
+      "$ref": "#/$defs/toolchain"
     }
-   },
-   "required": [
-    "runtime_kind",
-    "product_profile",
-    "target_triple",
-    "arch",
+  },
+  "required": [
     "schema",
-    "generator",
-    "generation_cpu_policy",
-    "normalized_parameters",
-    "external_references_hash",
-    "bootstrap_inputs_hash",
-    "bytes_hash"
-   ],
-   "type": "object"
-  },
-  "toolchain": {
-   "additionalProperties": false,
-   "properties": {
-    "compiler": {
-     "$ref": "#/$defs/nonPlaceholder"
-    },
-    "linker": {
-     "$ref": "#/$defs/nonPlaceholder"
-    },
-    "rustc": {
-     "$ref": "#/$defs/nonPlaceholder"
-    },
-    "sdk": {
-     "$ref": "#/$defs/nonPlaceholder"
-    }
-   },
-   "required": [
-    "rustc",
-    "compiler",
-    "sdk",
-    "linker"
-   ],
-   "type": "object"
-  },
-  "v8Runtime": {
-   "additionalProperties": false,
-   "properties": {
-    "backend": {
-     "const": "v8"
-    },
-    "normalized_gn_args": {
-     "items": {
-      "$ref": "#/$defs/nonPlaceholder"
-     },
-     "minItems": 1,
-     "type": "array",
-     "uniqueItems": true
-    },
-    "patches": {
-     "items": {
-      "$ref": "#/$defs/patch"
-     },
-     "type": "array"
-    },
-    "rusty_v8_revision": {
-     "$ref": "#/$defs/revision"
-    },
-    "rusty_v8_version": {
-     "$ref": "#/$defs/nonPlaceholder"
-    },
-    "v8_revision": {
-     "$ref": "#/$defs/revision"
-    }
-   },
-   "required": [
-    "backend",
-    "rusty_v8_version",
-    "rusty_v8_revision",
-    "v8_revision",
-    "normalized_gn_args",
-    "patches"
-   ],
-   "type": "object"
-  },
-  "windowsV8Target": {
-   "additionalProperties": false,
-   "properties": {
-    "abi": {
-     "const": "msvc"
-    },
-    "arch": {
-     "const": "x86_64"
-    },
-    "cpu_baseline": {
-     "const": "x86-64-v1"
-    },
-    "os": {
-     "const": "windows"
-    },
-    "required_cpu_features": {
-     "const": [
-      "cmov",
-      "sse2"
-     ]
-    },
-    "runtime_floor": {
-     "additionalProperties": false,
-     "properties": {
-      "msvc_runtime": {
-       "type": "string"
-      }
-     },
-     "required": [
-      "msvc_runtime"
-     ],
-     "type": "object"
-    },
-    "triple": {
-     "const": "x86_64-pc-windows-msvc"
-    }
-   },
-   "required": [
-    "triple",
-    "os",
-    "arch",
-    "abi",
-    "cpu_baseline",
-    "required_cpu_features",
-    "runtime_floor"
-   ],
-   "type": "object"
-  }
- },
- "$id": "https://migo.dev/contracts/artifact-manifest/schema-v1.json",
- "$schema": "https://json-schema.org/draft/2020-12/schema",
- "additionalProperties": false,
- "properties": {
-  "artifact_id": {
-   "$ref": "#/$defs/sha256"
-  },
-  "build_type": {
-   "enum": [
-    "debug",
-    "release"
-   ]
-  },
-  "codegen_profile": {
-   "enum": [
-    "z",
-    "2",
-    "3"
-   ]
-  },
-  "graphics": {
-   "$ref": "#/$defs/graphics"
-  },
-  "hashes": {
-   "$ref": "#/$defs/artifactHashes"
-  },
-  "product_profile": {
-   "enum": [
-    "full",
-    "slim"
-   ]
-  },
-  "provenance": {
-   "$ref": "#/$defs/provenance"
-  },
-  "runtime": {
-   "$ref": "#/$defs/v8Runtime"
-  },
-  "schema": {
-   "const": "migo-artifact-manifest/v1"
-  },
-  "snapshots": {
-   "items": {
-    "$ref": "#/$defs/snapshot"
-   },
-   "maxItems": 2,
-   "minItems": 1,
-   "type": "array"
-  },
-  "target": {
-   "$ref": "#/$defs/androidTarget"
-  },
-  "toolchain": {
-   "$ref": "#/$defs/toolchain"
-  }
- },
- "required": [
-  "schema",
-  "artifact_id",
-  "product_profile",
-  "build_type",
-  "codegen_profile",
-  "target",
-  "toolchain",
-  "runtime",
-  "snapshots",
-  "graphics",
-  "hashes",
-  "provenance"
- ],
- "title": "Migo Android artifact slice manifest v1",
- "type": "object"
+    "artifact_id",
+    "product_profile",
+    "build_type",
+    "codegen_profile",
+    "target",
+    "toolchain",
+    "runtime",
+    "snapshots",
+    "graphics",
+    "hashes",
+    "provenance"
+  ],
+  "title": "Migo Android artifact slice manifest v1",
+  "type": "object"
 }

@@ -48,6 +48,40 @@ final class MigoEngineCapabilitiesTests: XCTestCase {
         )
     }
 
+    /// The renderer's own surface kind is one the linked library will accept.
+    ///
+    /// The two are deliberately independent statements of one fact, and that
+    /// independence is what makes `preflight` mean anything: `hostSurfaceKind` is
+    /// what this renderer presents into (`#if os`, in Swift) and the mask is what
+    /// the library can attach (`OWN_LAYER_KIND`, `#[cfg(target_os)]`, in Rust).
+    /// Nothing links them, and pulling them apart raises no compile error on
+    /// either side.
+    ///
+    /// The verdict test above cannot catch it, on purpose: it is written as an
+    /// implication, so a disagreement takes its `else` branch and passes. What a
+    /// disagreement actually does is tell a host "this surface kind is not
+    /// attachable" on a platform that attaches it perfectly well, and the host
+    /// then declines to render for a reason that is nobody's fault.
+    ///
+    /// Asserted unconditionally, which was not possible before the Apple platform
+    /// module existed -- `migo-capi` selected `unsupported` for every Apple target
+    /// and the mask was zero, so this would have pinned an absence. That is the
+    /// rule this file follows, and this is the assertion it was waiting for.
+    func testTheRendererAndTheLibraryAgreeOnThisHostsSurfaceKind() throws {
+        let capabilities = try MigoEngineCapabilities.query()
+        let kind = MigoEngineCapabilities.hostSurfaceKind
+
+        XCTAssertTrue(
+            capabilities.canAttach(surfaceKind: kind),
+            """
+            this renderer presents into surface kind \(kind) and the linked library \
+            advertises \(String(capabilities.attachableSurfaceKinds, radix: 2)). One of \
+            MigoEngineCapabilities.hostSurfaceKind and migo-capi's OWN_LAYER_KIND has \
+            moved without the other.
+            """
+        )
+    }
+
     /// The fail-closed half of the record contract, executed rather than
     /// asserted about.
     ///

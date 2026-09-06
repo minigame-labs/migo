@@ -9,6 +9,18 @@
 
 #[cfg(target_os = "android")]
 mod android;
+// `target_vendor` and not two `target_os` arms: macOS and iOS share one module,
+// and a third Apple platform arriving should reach the same code rather than
+// silently fall through to `unsupported`.
+//
+// `test` compiles it on Linux too, where it is never wired up -- the re-export
+// below stays Apple-only. That is deliberate: this module decides eight match
+// arms over `ValidatedPlatformSurface`, and without it the only machine that
+// ever type-checked them would be a macOS runner. `platform/test-support`, which
+// this crate already enables from `[dev-dependencies]`, is what makes the Apple
+// presenter visible here across the crate boundary.
+#[cfg(any(target_vendor = "apple", test))]
+mod apple;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux;
 #[cfg(all(target_os = "linux", target_env = "ohos"))]
@@ -16,6 +28,7 @@ mod ohos;
 #[cfg(not(any(
     target_os = "android",
     target_os = "windows",
+    target_vendor = "apple",
     all(target_os = "linux", not(target_env = "ohos")),
     all(target_os = "linux", target_env = "ohos")
 )))]
@@ -25,6 +38,10 @@ mod windows;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::{
+    PlatformContext, PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
+};
+#[cfg(target_vendor = "apple")]
+pub(crate) use apple::{
     PlatformContext, PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
 };
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -38,6 +55,7 @@ pub(crate) use ohos::{
 #[cfg(not(any(
     target_os = "android",
     target_os = "windows",
+    target_vendor = "apple",
     all(target_os = "linux", not(target_env = "ohos")),
     all(target_os = "linux", target_env = "ohos")
 )))]
@@ -51,6 +69,8 @@ pub(crate) use windows::{
 
 #[cfg(all(test, target_os = "android"))]
 pub(crate) use android::{test_platform_context, test_platform_target};
+#[cfg(all(test, target_vendor = "apple"))]
+pub(crate) use apple::{test_platform_context, test_platform_target};
 #[cfg(all(test, target_os = "linux", not(target_env = "ohos")))]
 pub(crate) use linux::{test_platform_context, test_platform_target};
 #[cfg(all(test, target_os = "linux", target_env = "ohos"))]
@@ -60,6 +80,7 @@ pub(crate) use ohos::{test_platform_context, test_platform_target};
     not(any(
         target_os = "android",
         target_os = "windows",
+        target_vendor = "apple",
         all(target_os = "linux", not(target_env = "ohos")),
         all(target_os = "linux", target_env = "ohos")
     ))
@@ -82,12 +103,23 @@ mod contract_tests {
     /// kind. Missing from the platform module, the library loads, exports
     /// everything and advertises nothing -- which is how a Windows package
     /// shipped that could not attach a window.
+    ///
+    /// The constant is also a ledger, not only a parser capability: its own
+    /// comment admits a kind "only after an attach succeeded on a device". So
+    /// there is a second way to reach this assertion, and an Apple build is in it
+    /// right now -- the parser has the arms, the platform module builds the
+    /// objects, and the ledger has not admitted the kinds because the evidence
+    /// lives on `apple-sdk.yml`, which does not run on pull requests. The message
+    /// names both causes so whoever hits it does not go looking for a missing
+    /// parser arm that is not missing.
     #[test]
     fn every_attachable_kind_is_also_parseable() {
         assert_eq!(
             supported_platform_kinds() & !MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS,
             0,
-            "this build attaches a platform kind the ABI parser rejects"
+            "this build advertises a platform kind MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS does \
+             not carry. Either the ABI parser has no arm for it, or it has one and the kind is \
+             still waiting on the attach evidence the ledger admits kinds on"
         );
     }
 }

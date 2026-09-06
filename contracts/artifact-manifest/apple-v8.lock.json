@@ -1,0 +1,104 @@
+{
+  "schema": "migo-v8-build-lock/v1",
+  "notes": [
+    "The source half of the macOS V8 supply chain. It pins IDENTITY -- which",
+    "rusty_v8, which V8, which gn, which targets -- and deliberately does not pin",
+    "gn arguments. android-v8.lock.json and ohos-v8.lock.json do not either: the",
+    "argument list is exported by the build recipe and recorded into each",
+    "component-manifest.json's `normalized_gn_args` by the manifest writer, so it",
+    "is a description of what a real build used rather than a claim typed here in",
+    "advance. windows-v8.lock.json is the exception and says why in its own notes:",
+    "that target cross-compiles to a DLL and pins the arguments because the shape",
+    "of the artifact depends on them.",
+    "",
+    "WHAT IS DELIBERATELY ABSENT: hashes. A component-manifest.json carries the",
+    "sha256 of real bytes, and those bytes do not exist until a macOS runner has",
+    "built them -- .github/workflows/apple-v8-probe.yml exists to establish what",
+    "that build costs and which arguments it accepts before a recipe is written",
+    "against guesses. The Apple ANGLE round made the price of skipping that step",
+    "explicit: its probe ran first, the recipe was written against measured facts,",
+    "and the round still needed four lane iterations, every one of which found a",
+    "defect only a real build could reveal.",
+    "",
+    "iOS is not here, and that is a decision rather than an omission. On iOS the",
+    "content JavaScript runs in WKWebView's WebContent process to get the system",
+    "JIT -- an embedded V8 there would be interpreted, which is the arrangement",
+    "the project already rejected for in-process JavaScriptCore. macOS is the one",
+    "Apple platform with no architectural obstacle to in-process V8: the public",
+    "hardened-runtime entitlement allows JIT."
+  ],
+  "rusty_v8_version": "145.0.0",
+  "rusty_v8_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
+  "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921",
+  "sources": {
+    "rusty_v8": "https://github.com/denoland/rusty_v8/tree/e6a88b35dd3d7f2849a0df33a71d338701c55316",
+    "v8": "https://chromium.googlesource.com/v8/v8/+/8defb67673c5483ae56258a2de01b07e947dc921"
+  },
+  "gn": {
+    "version": "2502",
+    "revision": "17b0057970fa2b07a20cbb4289ab78cf93565f35",
+    "source": "https://gn.googlesource.com/gn",
+    "required_patches": [
+      "0001-suppress-gcc-multiline-comment-warning"
+    ],
+    "notes": [
+      "The same gn source, revision and patch set the Android and OpenHarmony",
+      "builds pin. The BINARY cannot be shared with them -- theirs is a Linux",
+      "executable and this recipe runs on macOS -- so what is pinned here is the",
+      "source identity the macOS binary must also have been built from.",
+      "",
+      "The patch is named for gcc and is still listed for macOS on purpose: it is",
+      "part of the pinned gn identity, and a gn built from a different patch set is",
+      "a different gn no matter which compiler ignored the warning it suppresses.",
+      "Whether Apple's clang needs the suppression is not the question; whether",
+      "this is the same gn is."
+    ]
+  },
+  "required_patches": [],
+  "macos": {
+    "deployment_target": "11.0",
+    "notes": [
+      "Derived from contracts/apple/deployment-floor.json's macos platform entry,",
+      "not chosen here. That file is the single source for every Apple deployment",
+      "target and scripts/test-apple-deployment-floor-contract.sh fails the build",
+      "when a consumer carries its own copy of the number -- this entry exists so",
+      "the V8 recipe has something to pass to the compiler, and it is checked",
+      "against the contract rather than trusted.",
+      "",
+      "It matters for a reason with no build step to land in: an archive built",
+      "without an explicit deployment target inherits the runner's own macOS",
+      "version as its floor. That links on the runner and fails on a consumer's",
+      "older Mac, which is the same shape as the ANGLE loader-path trap -- correct",
+      "everywhere the project can see, wrong where it cannot."
+    ]
+  },
+  "targets": {
+    "aarch64": {
+      "triple": "aarch64-apple-darwin",
+      "cpu_baseline": "armv8-a",
+      "required_cpu_features": [
+        "neon"
+      ]
+    },
+    "x86_64": {
+      "triple": "x86_64-apple-darwin",
+      "cpu_baseline": "x86-64-v1",
+      "required_cpu_features": [
+        "cmov",
+        "sse2"
+      ]
+    }
+  },
+  "targets_notes": [
+    "The baselines are the same conservative pair every other platform's lock",
+    "carries, and that is deliberate. This field states the MINIMUM a consumer's",
+    "CPU must satisfy, not a description of the machine that built the archive.",
+    "",
+    "It would be easy to write something higher and plausible here: macOS 11 runs",
+    "on Apple silicon from the M1 up and on Intel Macs from roughly Haswell, so",
+    "every supported machine does in fact have NEON, SSE4.2 and POPCNT. But",
+    "whether the ARCHIVE requires them is a question about what the compiler",
+    "emitted, and nothing has compiled it yet. Raising a baseline is a claim about",
+    "bytes; it belongs in the same change as the bytes."
+  ]
+}

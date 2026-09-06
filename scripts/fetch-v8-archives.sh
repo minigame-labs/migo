@@ -66,7 +66,19 @@ BASE_URL="${MIGO_V8_ARCHIVE_BASE_URL:-https://github.com/minigame-labs/migo/rele
 # as the asset suffix for every target but Windows (see above), so a release
 # asset is otherwise always librusty_v8-<target>.a and there is no second naming
 # scheme to keep in sync.
-KNOWN_TARGETS=(aarch64-linux-android x86_64-linux-android x86_64-linux-gnu aarch64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos x86_64-pc-windows-msvc aarch64-pc-windows-msvc)
+#
+# The name is the Rust triple with `unknown-` removed, which is why
+# `x86_64-linux-gnu` and `aarch64-apple-darwin` are both spelled the way they
+# are: the first has an `unknown` vendor to drop and the second does not.
+#
+# The two darwin entries have no committed manifest yet, and that is a working
+# state rather than a half-wire: this script refuses a target whose
+# component-manifest.json is absent, which is exactly the fail-closed behaviour
+# the header above argues for. They are listed so that the moment the macOS lane
+# publishes archives there is one place already naming them, and
+# scripts/test-apple-v8-pin-contract.sh asserts this list and
+# contracts/artifact-manifest/apple-v8.lock.json agree about which triples exist.
+KNOWN_TARGETS=(aarch64-linux-android x86_64-linux-android x86_64-linux-gnu aarch64-linux-gnu x86_64-linux-ohos aarch64-linux-ohos aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc)
 DEFAULT_TARGETS=(aarch64-linux-android x86_64-linux-android)
 
 info() { printf '\033[0;36m[v8-fetch] %s\033[0m\n' "$*"; }

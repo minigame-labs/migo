@@ -1655,11 +1655,94 @@ fn validate_v8_component_target(target: &TargetIdentity) -> Result<(), ManifestE
         ("android", "android") => validate_android_target(target),
         ("linux", "gnu") => validate_linux_v8_target(target),
         ("linux", "ohos") => validate_ohos_v8_target(target),
+        ("macos", "darwin") => validate_apple_v8_target(target),
         ("windows", "msvc") => validate_windows_v8_target(target),
         (os, abi) => Err(ManifestError::new(format!(
             "unsupported V8 component target OS/ABI: {os}/{abi}"
         ))),
     }
+}
+
+/// macOS, x86_64 and aarch64. There is no iOS arm and there is not meant to be:
+/// on iOS the content JavaScript runs in WKWebView's WebContent process to get
+/// the system JIT, so an embedded V8 there would be interpreted -- the
+/// arrangement this project already rejected for in-process JavaScriptCore.
+/// macOS is the one Apple platform whose public hardened-runtime entitlement
+/// allows JIT, so it is the only one that ships a V8 component.
+///
+/// `os = "macos"` with `abi = "darwin"` because that is what the toolchain says:
+/// rustc reports `target_os = "macos"` and the triple's last component is
+/// `darwin`. `target_vendor = "apple"` is the wrong spelling here even though the
+/// engine's conditional code selects on it -- that predicate covers iOS too, and
+/// this component exists only for macOS.
+///
+/// The floor is an OS version rather than a library version, unlike Linux's
+/// glibc/glibcxx pair: what a consumer's Mac must be new enough for is the
+/// deployment target the archive was compiled against. Its single source is
+/// contracts/apple/deployment-floor.json, and
+/// scripts/test-apple-v8-pin-contract.sh is what holds the lock to it.
+fn validate_apple_v8_target(target: &TargetIdentity) -> Result<(), ManifestError> {
+    let (expected_baseline, expected_features): (&str, &[&str]) = match target.arch.as_str() {
+        "x86_64" => ("x86-64-v1", &["cmov", "sse2"]),
+        "aarch64" => ("armv8-a", &["neon"]),
+        arch => {
+            return Err(ManifestError::new(format!(
+                "unsupported Apple V8 target arch: {arch}"
+            )));
+        }
+    };
+    require_equal(
+        "target.triple",
+        &target.triple,
+        &format!("{}-apple-darwin", target.arch),
+    )?;
+    require_equal("target.os", &target.os, "macos")?;
+    require_equal("target.abi", &target.abi, "darwin")?;
+    require_equal(
+        "target.cpu_baseline",
+        &target.cpu_baseline,
+        expected_baseline,
+    )?;
+    require_sorted_unique(
+        "target.required_cpu_features",
+        &target.required_cpu_features,
+    )?;
+    if target.required_cpu_features != expected_features {
+        return Err(ManifestError::new(format!(
+            "target.required_cpu_features for Apple {} must be {expected_features:?}",
+            target.arch
+        )));
+    }
+    if target.runtime_floor.len() != 1 || !target.runtime_floor.contains_key("macos") {
+        return Err(ManifestError::new(
+            "Apple V8 target.runtime_floor must be exactly one macos entry",
+        ));
+    }
+    // `major.minor`, both decimal. Rejecting a bare major is the point rather
+    // than pedantry: Apple spells its deployment targets with both components, so
+    // a manifest recording only a major would compare unequal to the contract
+    // while describing the same floor -- a disagreement about text presented as a
+    // disagreement about the platform. The number itself is deliberately not
+    // written here; contracts/apple/deployment-floor.json is its single source and
+    // scripts/test-apple-deployment-floor-contract.sh fails the build when a file
+    // outside the derived set carries its own copy.
+    let floor = &target.runtime_floor["macos"];
+    let mut parts = floor.split('.');
+    let well_formed = match (parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), None) => {
+            !major.is_empty()
+                && !minor.is_empty()
+                && major.bytes().all(|byte| byte.is_ascii_digit())
+                && minor.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        _ => false,
+    };
+    if !well_formed {
+        return Err(ManifestError::new(format!(
+            "Apple V8 target.runtime_floor.macos must be a major.minor version, got {floor:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// OpenHarmony, whose `os`/`abi` pair is `linux`/`ohos` because that is what the

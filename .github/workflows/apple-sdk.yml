@@ -224,6 +224,51 @@ jobs:
           swift build
           swift test
 
+      # The published ANGLE archives, so the step below has something to load.
+      # Only the macOS one: this is the leg whose slices the runner can execute,
+      # and the iOS archives would be bytes nothing here opens.
+      #
+      # Deliberately not given to `swift test` above. That test asserts about the
+      # C ABI boundary and says so; putting ANGLE on its loader path would let its
+      # render thread reach a CAMetalLayer that is in no window hierarchy, where
+      # `nextDrawable` has nothing to hand back -- a slower, less deterministic
+      # run that proves nothing the step below does not prove directly.
+      - name: Fetch the pinned ANGLE for the host slice
+        if: matrix.host_slice
+        run: bash scripts/fetch-apple-angle.sh macos
+
+      # The presenter's own tests, on Apple hardware, and the only place ANGLE is
+      # asked to load.
+      #
+      # scripts/test-apple-egl-loader-name-contract.sh proves the presenter names
+      # the file the recipe produces; that is a text comparison and it runs on
+      # Linux. This is the other half: a file answers to that name, exports the
+      # EGL entry points, and `eglInitialize` finds a backend behind it. Until
+      # this step existed, `APPLE_EGL_LIBRARY` was a string literal no code path
+      # had ever read.
+      #
+      # `--no-default-features --features external-frames`, matching the product
+      # this lane builds, and not a preference: the default `profile-full` links
+      # V8, and there is no macOS V8 component -- building that supply chain is
+      # its own unstarted piece of work. Asking for it here would fail on a
+      # missing `librusty_v8.a` and say nothing about the presenter.
+      #
+      # `--target <host>` rather than no `--target`: cargo keeps the two in
+      # different directories, so omitting it compiles Skia a second time for
+      # bytes the xcframework step above already built. The host triple is asked
+      # of rustc rather than taken from the matrix, because this step has to run
+      # a binary and only the host can.
+      - name: The Apple presenter's ANGLE bring-up runs on Apple silicon
+        if: matrix.host_slice
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "running migo-platform's tests for $host"
+          DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/engine/third_party/angle-apple-macos" \
+            cargo test -p migo-platform --locked --target "$host" \
+            --no-default-features --features external-frames
+
       # The same assertions, on the platform they are actually about.
       #
       # `swift test` above runs them on macOS, where `#if os(iOS)` is false. So
