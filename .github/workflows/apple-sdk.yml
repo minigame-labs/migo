@@ -217,25 +217,54 @@ jobs:
       # rather than compiled against its headers -- and runs assertions that
       # call migo_query_capabilities. Compilation cannot answer whether the
       # archive is complete; only a link can.
+      # The published ANGLE archives, for every leg that RUNS something.
+      #
+      # ⚠️ THE COMMENT THAT USED TO BE HERE SAID THE OPPOSITE, and it was wrong in
+      # a way that made an evidence test a coin flip. It read: "Deliberately not
+      # given to `swift test`... putting ANGLE on its loader path would let its
+      # render thread reach a CAMetalLayer that is in no window hierarchy, where
+      # `nextDrawable` has nothing to hand back." The premise was that the attach
+      # test does not need the renderer. It does -- not to draw, but to stay
+      # alive.
+      #
+      # What actually happens without ANGLE, measured 2026-09-06 once the engine
+      # log reached this lane at all: `graphics::render_thread` reports
+      # "CanvasManager init failed: load ANGLE failed: not linked into the
+      # process", the external-frame session exits, and
+      # `migo_session_attach_surface` -- which returned as soon as the tokio
+      # runtime was up, by design -- then races that teardown for the session's
+      # ingress. Whoever wins decides whether attach answers MIGO_OK or
+      # MIGO_ERROR_INTERNAL. On the macOS runner attach won every time; on the
+      # iOS simulator it lost roughly two runs in three, which is how the flake
+      # was found.
+      #
+      # An external-frame session that is never handed a packet never presents a
+      # frame, so `nextDrawable` is not reached and the original worry does not
+      # apply to this test.
+      # Only the legs that RUN something. The `ios` leg builds a device slice
+      # this runner cannot execute, so its archives would be bytes nothing opens
+      # -- which is what the previous version of this step got right.
+      - name: Fetch the pinned ANGLE this leg will run against
+        if: matrix.host_slice || matrix.platform == 'ios-simulator'
+        run: bash scripts/fetch-apple-angle.sh ${{ matrix.platform }}
+
+      # Which simulator the tests below will use, decided once.
+      - name: Choose the simulator
+        if: matrix.platform == 'ios-simulator'
+        run: |
+          set -euo pipefail
+          udid="$(bash "$GITHUB_WORKSPACE/scripts/pick-iphone-simulator.sh")"
+          echo "MIGO_SIM_UDID=$udid" >> "$GITHUB_ENV"
+
       - name: The shipping Swift package links and its tests run on Apple silicon
         if: matrix.host_slice
         working-directory: platforms/apple
+        env:
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/engine/third_party/angle-apple-macos
         run: |
           swift build
           swift test
 
-      # The published ANGLE archives, so the step below has something to load.
-      # Only the macOS one: this is the leg whose slices the runner can execute,
-      # and the iOS archives would be bytes nothing here opens.
-      #
-      # Deliberately not given to `swift test` above. That test asserts about the
-      # C ABI boundary and says so; putting ANGLE on its loader path would let its
-      # render thread reach a CAMetalLayer that is in no window hierarchy, where
-      # `nextDrawable` has nothing to hand back -- a slower, less deterministic
-      # run that proves nothing the step below does not prove directly.
-      - name: Fetch the pinned ANGLE for the host slice
-        if: matrix.host_slice
-        run: bash scripts/fetch-apple-angle.sh macos
 
       # The presenter's own tests, on Apple hardware, and the only place ANGLE is
       # asked to load.
@@ -299,48 +328,53 @@ jobs:
         working-directory: platforms/apple
         run: |
           set -euo pipefail
-          udid="$(xcrun simctl list devices available --json | python3 -c '
-          import json, re, sys
+          udid="$MIGO_SIM_UDID"
+          dd="$GITHUB_WORKSPACE/build/apple-sim-dd"
+          angle="$GITHUB_WORKSPACE/engine/third_party/angle-apple-ios-simulator"
 
-          runtimes = json.load(sys.stdin)["devices"]
-
-          # Sort key from com.apple.CoreSimulator.SimRuntime.iOS-18-5. Parsed
-          # rather than compared as text: iOS-9-0 sorts after iOS-18-5
-          # lexicographically, which would pick the oldest runtime on an image
-          # carrying both.
-          def version(identifier):
-              digits = re.findall(r"\d+", identifier.rsplit(".", 1)[-1])
-              return tuple(int(d) for d in digits)
-
-          best = None
-          for identifier, devices in runtimes.items():
-              if ".SimRuntime.iOS-" not in identifier:
-                  continue
-              for device in devices:
-                  if not device.get("isAvailable"):
-                      continue
-                  if not device.get("name", "").startswith("iPhone"):
-                      continue
-                  # Newest runtime wins; within one runtime the highest
-                  # device name wins. That tie-break is arbitrary and it is
-                  # meant to be: every simulated iPhone runs the same ABI, so
-                  # there is nothing to prefer, and an arbitrary rule that is
-                  # deterministic beats a preference nobody can justify. The
-                  # step logs which device it picked.
-                  key = (version(identifier), device["name"])
-                  if best is None or key > best[0]:
-                      best = (key, device["udid"], identifier, device["name"])
-
-          if best is None:
-              sys.exit("this runner image carries no available iPhone simulator")
-
-          sys.stderr.write("selected " + best[3] + " on " + best[2] + "\n")
-          print(best[1])
-          ')"
-          xcodebuild test \
+          # Build first, plant ANGLE, then run -- rather than one `xcodebuild
+          # test` -- because the only way to put a library where this process
+          # will find it is to put it where dyld already looks.
+          #
+          # Two env-var routes were tried on 2026-09-06 and neither reached the
+          # process: `simctl spawn ... launchctl setenv DYLD_LIBRARY_PATH`, and
+          # `TEST_RUNNER_DYLD_FRAMEWORK_PATH` on the xcodebuild command line. The
+          # failing run's own dlopen diagnostic is what settled it -- its "tried:"
+          # list contains only bundle-relative and @rpath entries and no
+          # DYLD_-supplied directory at all, while naming the two directories
+          # below verbatim.
+          #
+          # Both destinations, because the two lookups are different questions:
+          # the presenter dlopens "libEGL.framework/libEGL", which dyld answers
+          # from the products directory and the test bundle; and libEGL then
+          # opens libGLESv2 itself by composing a path against its own location,
+          # which is why GLESv2 has to sit beside it wherever it lands.
+          xcodebuild build-for-testing \
             -scheme Migo-Package \
             -destination "platform=iOS Simulator,id=$udid" \
+            -derivedDataPath "$dd" \
             -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
+
+          products="$dd/Build/Products/Debug-iphonesimulator"
+          planted=0
+          for dest in "$products/PackageFrameworks" "$products"/*.xctest/Frameworks; do
+            mkdir -p "$dest"
+            cp -R "$angle"/*.framework "$dest/"
+            echo "planted ANGLE in $dest"
+            planted=$((planted + 1))
+          done
+          # A copy that silently landed nowhere would leave this step testing the
+          # same thing it tested before the fix.
+          if [ "$planted" -eq 0 ]; then
+            echo "no destination for ANGLE under $products" >&2
+            exit 1
+          fi
+
+          xcodebuild test-without-building \
+            -scheme Migo-Package \
+            -destination "platform=iOS Simulator,id=$udid" \
+            -derivedDataPath "$dd" \
             CODE_SIGNING_ALLOWED=NO
 
       # The half of the deployment-floor contract that reads the product rather

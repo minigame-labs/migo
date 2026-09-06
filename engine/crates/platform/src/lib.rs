@@ -50,7 +50,22 @@ pub mod apple;
 #[cfg(all(target_os = "linux", target_env = "ohos"))]
 pub mod ohos;
 
-#[cfg(target_os = "windows")]
+// `test` and `feature = "test-support"` for the reason spelled out above the
+// Apple module, and it applies here word for word: a Windows-only module is a
+// module no pull request executes, because every gate in this repository runs on
+// Linux. Nothing in here is Windows-specific to the compiler -- the whole module
+// imports only std, `graphics::egl_platform`, `khronos_egl`, `shared` and
+// `migo_core`, and an HWND is carried as a `NonNull<c_void>` -- so the surface
+// identity and factory-refusal logic compiles and runs on Linux exactly as the
+// Apple presenter's does.
+//
+// What that is worth, measured rather than assumed: the Windows compile lane
+// builds this module and runs nothing in it, so its twelve tests had never
+// executed anywhere; they pass. `same_native_surface`'s `_ => false` arm was in
+// the same state the Apple one was found in -- flipping it to `true` left all
+// six presenter tests green -- and is now covered by
+// `offscreen_and_window_targets_are_never_the_same_surface`.
+#[cfg(any(target_os = "windows", test, feature = "test-support"))]
 pub mod windows;
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");

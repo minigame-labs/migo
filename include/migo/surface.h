@@ -299,9 +299,22 @@ MIGO_API MigoResult MIGO_CALL migo_surface_begin_detach(
  *
  * A release that has reached RELEASED stays valid and queryable after the
  * owning Session is destroyed. Session destruction refuses while it is still
- * PENDING. Returns
- * MIGO_ERROR_INVALID_ARGUMENT if either pointer is NULL. out_status is written
- * only on MIGO_OK, never partially.
+ * PENDING.
+ *
+ * out_status IS CALLER-OWNED AND ITS HEADER IS AN INPUT. Set struct_size and
+ * abi_version before the call: struct_size is what bounds the write into your
+ * storage, so a record that arrives holding zeros -- which is what an
+ * uninitialised struct holds in C and what a default-initialised one holds in
+ * Swift -- is refused rather than filled in. Failing that way rather than
+ * writing sizeof(this build's record) is the only behaviour that stays safe
+ * when a host built against an older header calls a newer library.
+ *
+ * Returns MIGO_ERROR_INVALID_ARGUMENT if either pointer is NULL or
+ * out_status->struct_size is below the minimum record this ABI defines, and
+ * MIGO_ERROR_UNSUPPORTED_ABI if its abi_version is not the current one or its
+ * struct_size is larger than the record this build knows how to fill.
+ * out_status is written only on MIGO_OK, never partially, and the header you
+ * supplied is preserved rather than overwritten.
  */
 MIGO_API MigoResult MIGO_CALL migo_surface_release_query(
     const MigoSurfaceRelease *release,

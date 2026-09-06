@@ -250,6 +250,10 @@ pub unsafe extern "C" fn migo_session_attach_surface(
             existing_window_state,
         ) = {
             let Ok(mut state) = session.state.lock() else {
+                // The one INTERNAL this function could return without saying
+                // anything at all. Every other one logs; this one is first, so
+                // it is the one a host hits before there is any other signal.
+                tracing::error!("migo_session_attach_surface: the Session state lock is poisoned");
                 return MIGO_ERROR_INTERNAL;
             };
             if state.surface_transition != SurfaceTransition::Idle
@@ -411,6 +415,25 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                                     tracing::error!(
                                         "migo_session_attach_surface: ingress capture failed: {error}"
                                     );
+                                    // The session this call spawned has already
+                                    // gone: the renderer failed to initialise
+                                    // and tore it down between the spawn
+                                    // returning and this line. Measured on the
+                                    // iOS simulator with no ANGLE present,
+                                    // where it is a race attach loses about two
+                                    // runs in three -- and the host was told
+                                    // nothing, because only failures raised
+                                    // INSIDE the session thread report through
+                                    // on_error.
+                                    if let Some(notifier) = &notifier {
+                                        notifier.error(
+                                            MIGO_ERROR_INTERNAL,
+                                            format!(
+                                                "the session exited while attach was still \
+                                                 installing it: {error}"
+                                            ),
+                                        );
+                                    }
                                     let _ = retire_surface(host);
                                     if let Err(error) = started.engine.shutdown_and_join() {
                                         tracing::error!(
@@ -432,6 +455,41 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                         }
                         Err(error) => {
                             tracing::error!("migo_session_attach_surface: spawn failed: {error:?}");
+                            // And tell the host, which nothing here did.
+                            //
+                            // Every failure INSIDE the session thread reports
+                            // through `notify_error`; a failure to get that
+                            // thread up reported through `tracing` alone. The
+                            // difference matters because `tracing` needs a
+                            // subscriber the library refuses to install by
+                            // default, so on any platform where the host has no
+                            // other window into the process, the entire class of
+                            // "the session did not start" arrived as a bare
+                            // MIGO_ERROR_INTERNAL with no reason attached.
+                            //
+                            // Found on the iOS simulator, where attach returns
+                            // this roughly half the time and the reason -- the
+                            // session thread's own account of why it exited --
+                            // reached nobody. `session.h` promises on_error
+                            // carries "runtime errors"; a session that never
+                            // started is the first one a host needs.
+                            if let Some(notifier) = &notifier {
+                                let detail = error.detail.as_deref().unwrap_or("");
+                                let text = if detail.is_empty() {
+                                    format!(
+                                        "session thread did not start: {} (engine code {})",
+                                        error.msg,
+                                        error.code.as_u16()
+                                    )
+                                } else {
+                                    format!(
+                                        "session thread did not start: {}: {detail} (engine code {})",
+                                        error.msg,
+                                        error.code.as_u16()
+                                    )
+                                };
+                                notifier.error(MIGO_ERROR_INTERNAL, text);
+                            }
                             rollback_surface_transition(&session);
                             return MIGO_ERROR_INTERNAL;
                         }

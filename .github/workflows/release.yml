@@ -513,6 +513,12 @@ jobs:
       - name: The Apple renderer and the C ABI name the same surface kind
         run: bash scripts/test-apple-host-surface-kind-contract.sh
 
+      # A release publishes these headers. An output record whose caller-owned
+      # `struct_size` contract is undocumented ships a refusal that integrators
+      # cannot explain from the header they were given.
+      - name: Every caller-owned output record documents its struct_size input
+        run: bash scripts/test-capi-output-record-doc-contract.sh
+
       # The macOS V8 source pin agrees with cargo, the peer locks, the Apple
       # deployment floor and the fetch script. Every number in that lock is also
       # stated somewhere with more authority, and a pin that drifts from one of

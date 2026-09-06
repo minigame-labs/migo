@@ -4,7 +4,91 @@ import XCTest
 
 #if os(macOS)
     import AppKit
+#elseif os(iOS)
+    import UIKit
 #endif
+
+// What this platform's two descriptors are, stated once, so each test below has
+// one body rather than two.
+//
+// Both platforms declare the same PAIR, for the reason ios.h gives: "a tagless
+// void* would let a host set the wrong kind, compile cleanly, and hand a UIView*
+// to code that calls nextDrawable on it". That pair is exactly what these two
+// tests exercise -- the layer is accepted, the view is refused -- so the pair is
+// what is named here and the bodies stay platform-free.
+#if os(macOS)
+    private typealias HostView = NSView
+    private typealias LayerPayload = MigoMacosMetalLayerDescriptor
+    private typealias ViewPayload = MigoMacosNsViewDescriptor
+    private let layerKind = MIGO_PLATFORM_MACOS_CA_METAL_LAYER
+    private let viewKind = MIGO_PLATFORM_MACOS_NS_VIEW
+    private let viewTypeName = "NSView"
+    private let ledgerConstantName = "MIGO_PLATFORM_MACOS_CA_METAL_LAYER"
+#elseif os(iOS)
+    private typealias HostView = UIView
+    private typealias LayerPayload = MigoIosMetalLayerDescriptor
+    private typealias ViewPayload = MigoIosUiViewDescriptor
+    private let layerKind = MIGO_PLATFORM_IOS_CA_METAL_LAYER
+    private let viewKind = MIGO_PLATFORM_IOS_UI_VIEW
+    private let viewTypeName = "UIView"
+    private let ledgerConstantName = "MIGO_PLATFORM_IOS_CA_METAL_LAYER"
+#endif
+
+/// Where the engine's account of a failure goes, so a failing assertion can
+/// carry it.
+///
+/// `on_error` is the channel `session.h` promises operational errors arrive on
+/// -- "Runtime errors and recoverable pressure notifications" -- and installing
+/// it is what a host does. Not installing it is why the first iOS run of these
+/// tests could only report `MIGO_ERROR_INTERNAL`: the session thread had failed
+/// on its way up, `run_external_session` had called `notify_error` with the
+/// reason, and there was nobody on the other end. `MIGO_CAPI_LOG` does not
+/// cover this on a simulator either -- the test process's stdout does not reach
+/// the xcodebuild log, and that run's log contains no engine line at all.
+///
+/// Locked because the callback runs on whichever thread dispatched the task,
+/// and the assertions read it from the test's thread.
+private final class EngineErrors {
+    private let lock = NSLock()
+    private var reported: [String] = []
+
+    func record(_ message: String) {
+        lock.lock()
+        reported.append(message)
+        lock.unlock()
+    }
+
+    /// What to append to a failure message: the engine's own words, or an
+    /// explicit statement that it said nothing, which is itself a finding.
+    var summary: String {
+        lock.lock()
+        defer { lock.unlock() }
+        if reported.isEmpty {
+            return "the engine reported no error through on_error"
+        }
+        return reported.joined(separator: " | ")
+    }
+}
+
+/// Runs the task inline, which `session.h` explicitly allows: "the dispatcher
+/// ... must invoke it exactly once (inline or later)". A test has no event loop
+/// to post to, and a queued task would be a second thing that has to be pumped
+/// before an assertion could read what it delivered.
+private let dispatchInline: MigoDispatchFn = { _, task, taskContext in
+    guard let task else { return MIGO_ERROR_DISPATCH_REJECTED }
+    task(taskContext)
+    return MIGO_OK
+}
+
+private let recordEngineError: MigoOnErrorFn = { userData, _, error in
+    guard let userData, let error else { return }
+    let sink = Unmanaged<EngineErrors>.fromOpaque(userData).takeUnretainedValue()
+    var text = "(no message)"
+    if let message = error.pointee.message_utf8 {
+        text = String(cString: message)
+    }
+    sink.record("code \(error.pointee.code): \(text)")
+}
 
 /// A host-owned `CAMetalLayer` survives the whole C ABI attach path.
 ///
@@ -42,7 +126,7 @@ import XCTest
 /// needs nothing, because this test target already links the engine and already
 /// runs on the macOS lane.
 final class MigoSurfaceAttachTests: XCTestCase {
-    #if os(macOS)
+    #if os(macOS) || os(iOS)
         private var root: URL!
         private var engine: OpaquePointer!
         private var session: OpaquePointer!
@@ -67,8 +151,26 @@ final class MigoSurfaceAttachTests: XCTestCase {
         /// `migo_engine_destroy` has returned.
         private var retained: [AnyObject] = []
 
+        /// Held by the fixture because the engine is handed an unretained
+        /// pointer to it and may call back from its own thread.
+        private let engineErrors = EngineErrors()
+
         override func setUpWithError() throws {
             try super.setUpWithError()
+
+            // Turn the engine's own diagnostics on before anything creates an
+            // engine: `migo_engine_create` reads MIGO_CAPI_LOG once and installs
+            // a subscriber, and without it every `tracing::error!` the library
+            // emits is discarded.
+            //
+            // Not a debugging leftover. When the iOS arm of this test first ran,
+            // attach answered MIGO_ERROR_INTERNAL and the log said nothing at
+            // all -- the session thread had failed on its way up and the one
+            // sentence naming the reason went to a subscriber that did not
+            // exist. A test whose whole purpose is producing evidence should not
+            // be throwing the library's own account of a failure away, and the
+            // cost of finding out otherwise is a lane round trip per question.
+            setenv("MIGO_CAPI_LOG", "info", 1)
 
             // Directories the engine may write into. A test that pointed these
             // at the source tree would be a test that leaves artefacts behind on
@@ -120,6 +222,25 @@ final class MigoSurfaceAttachTests: XCTestCase {
             let result = migo_session_create(engine, &sessionConfig, &startedSession)
             XCTAssertEqual(result, MIGO_OK, "migo_session_create returned \(result)")
             session = try XCTUnwrap(startedSession)
+
+            // Before the first attach, which is the only window the ABI allows:
+            // "Callback configuration can be installed successfully only once
+            // per Session and only before its first Surface attach".
+            //
+            // This makes the attach below a slightly more representative
+            // exercise than it was -- a real host installs callbacks, so the
+            // attach path now builds a Notifier as it would in production
+            // instead of taking the None branch -- and it is the only way a
+            // failure inside the session thread can reach an assertion.
+            var callbacks = MigoHostCallbacks()
+            callbacks.struct_size = UInt32(MemoryLayout<MigoHostCallbacks>.size)
+            callbacks.abi_version = MIGO_ABI_VERSION_CURRENT
+            callbacks.user_data = Unmanaged.passUnretained(engineErrors).toOpaque()
+            callbacks.dispatch = dispatchInline
+            callbacks.on_error = recordEngineError
+            let installed = migo_session_set_host_callbacks(session, &callbacks)
+            XCTAssertEqual(
+                installed, MIGO_OK, "migo_session_set_host_callbacks returned \(installed)")
         }
 
         /// The documented shutdown handshake, in full, and asserted at every
@@ -142,12 +263,37 @@ final class MigoSurfaceAttachTests: XCTestCase {
                 XCTAssertEqual(began, MIGO_OK, "migo_surface_begin_detach returned \(began)")
 
                 if let release {
+                    // The status record is a CALLER-OWNED versioned output, so
+                    // its header is an input to the call rather than something
+                    // the library fills in. `write_versioned_output` reads
+                    // `struct_size` out of the caller's storage to decide how
+                    // many bytes it may write there, and a record left at its
+                    // Swift default holds zero -- below the minimum this ABI
+                    // defines -- so the query is refused before it ever looks at
+                    // the release.
+                    //
+                    // Asserting that refusal here rather than only fixing it: it
+                    // is the documented contract, and the first run of this lane
+                    // failed 463 times on exactly this while reporting "the
+                    // retired surface never reported RELEASED" -- which names the
+                    // wrong half of the system. A host reading that message would
+                    // go looking for a renderer that never started.
+                    var uninitialised = MigoSurfaceReleaseStatus()
+                    XCTAssertEqual(
+                        migo_surface_release_query(release, &uninitialised),
+                        MIGO_ERROR_INVALID_ARGUMENT,
+                        "a status record whose struct_size was never set must be refused, "
+                            + "because struct_size is what bounds the write into the "
+                            + "caller's own storage")
+
+                    var status = MigoSurfaceReleaseStatus()
+                    status.struct_size = UInt32(MemoryLayout<MigoSurfaceReleaseStatus>.size)
+                    status.abi_version = MIGO_ABI_VERSION_CURRENT
+                    var released = false
                     // Polled, not waited on: the header says the query never
                     // blocks precisely so a host can ask from its UI thread or an
                     // idle handler. A host's obligation is to keep asking while
                     // its event loop runs, so that is what this imitates.
-                    var status = MigoSurfaceReleaseStatus()
-                    var released = false
                     let deadline = Date().addingTimeInterval(5)
                     while Date() < deadline {
                         let queried = migo_surface_release_query(release, &status)
@@ -247,20 +393,29 @@ final class MigoSurfaceAttachTests: XCTestCase {
 
     /// A host-owned `CAMetalLayer` is accepted, and the engine reports the
     /// attachment rather than merely not failing.
+    ///
+    /// Runs on both Apple platforms, against each one's own layer descriptor.
+    /// It ran only on macOS until 2026-09-06, and the cost of that was not
+    /// coverage in the abstract: `MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS` admits a
+    /// kind only after an attach succeeded, so the iOS kind could not be admitted
+    /// while the only attach that had ever run was `#if os(macOS)`. The
+    /// iOS-simulator leg of `apple-sdk.yml` was already running this bundle --
+    /// `xcodebuild test -scheme Migo-Package` against a real simulator -- and
+    /// reporting these two cases as skipped.
     func testAHostOwnedMetalLayerAttaches() throws {
-        #if os(macOS)
+        #if os(macOS) || os(iOS)
             let layer = CAMetalLayer()
             layer.drawableSize = CGSize(width: 256, height: 256)
             layer.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
 
-            var payload = MigoMacosMetalLayerDescriptor()
-            payload.struct_size = UInt32(MemoryLayout<MigoMacosMetalLayerDescriptor>.size)
+            var payload = LayerPayload()
+            payload.struct_size = UInt32(MemoryLayout<LayerPayload>.size)
             payload.abi_version = MIGO_ABI_VERSION_CURRENT
-            payload.platform_kind = MIGO_PLATFORM_MACOS_CA_METAL_LAYER
+            payload.platform_kind = layerKind
             payload.ca_metal_layer = Unmanaged.passUnretained(layer).toOpaque()
 
             let result = attach(
-                kind: MIGO_PLATFORM_MACOS_CA_METAL_LAYER,
+                kind: layerKind,
                 payload: &payload,
                 payloadSize: payload.struct_size,
                 hostObject: layer)
@@ -269,24 +424,27 @@ final class MigoSurfaceAttachTests: XCTestCase {
                 result, MIGO_OK,
                 """
                 attaching a host-owned CAMetalLayer returned \(result). This is the \
-                assertion that earns MIGO_PLATFORM_MACOS_CA_METAL_LAYER its place in \
+                assertion that earns \(ledgerConstantName) its place in \
                 MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS; until it passes on this runner, \
                 that constant must not list it.
+
+                What the engine said: \(engineErrors.summary)
                 """)
             XCTAssertNotNil(attachment, "attach reported success and produced no attachment")
         #else
-            throw XCTSkip("the attach path under test is the macOS one")
+            throw XCTSkip("this package is built for macOS and iOS only")
         #endif
     }
 
     /// The other half of the same decision: a view is refused, not resolved.
     ///
-    /// `MigoMacosNsViewDescriptor` is a payload the ABI parses and the platform
-    /// module deliberately declines, because ANGLE handed a plain `CALayer`
-    /// succeeds and quietly takes ownership of a metal layer it created itself. A
-    /// refusal is the only outcome that leaves the host in charge of its own
-    /// drawable, so it is asserted rather than assumed -- and asserting it here is
-    /// what separates "attach works" from "attach accepts whatever it is given".
+    /// `MigoMacosNsViewDescriptor` and `MigoIosUiViewDescriptor` are payloads the
+    /// ABI parses and the platform module deliberately declines, because ANGLE
+    /// handed a plain `CALayer` succeeds and quietly takes ownership of a metal
+    /// layer it created itself. A refusal is the only outcome that leaves the
+    /// host in charge of its own drawable, so it is asserted rather than assumed
+    /// -- and asserting it here is what separates "attach works" from "attach
+    /// accepts whatever it is given".
     ///
     /// WHICH refusal this reaches, precisely: the capability mask's, not the
     /// platform module's match arm. `parse_for_platforms` is handed
@@ -296,28 +454,32 @@ final class MigoSurfaceAttachTests: XCTestCase {
     /// resolved_to_a_layer` in `capi/src/platform/apple.rs`, which runs on Linux.
     /// Two independent refusals for one rule, which is the intent -- but worth
     /// naming, so nobody reads this test as proof of the arm it does not reach.
-    func testAnNsViewIsRefusedRatherThanResolvedToALayer() throws {
-        #if os(macOS)
-            let view = NSView(frame: CGRect(x: 0, y: 0, width: 256, height: 256))
+    func testAHostViewIsRefusedRatherThanResolvedToALayer() throws {
+        #if os(macOS) || os(iOS)
+            let view = HostView(frame: CGRect(x: 0, y: 0, width: 256, height: 256))
 
-            var payload = MigoMacosNsViewDescriptor()
-            payload.struct_size = UInt32(MemoryLayout<MigoMacosNsViewDescriptor>.size)
+            var payload = ViewPayload()
+            payload.struct_size = UInt32(MemoryLayout<ViewPayload>.size)
             payload.abi_version = MIGO_ABI_VERSION_CURRENT
-            payload.platform_kind = MIGO_PLATFORM_MACOS_NS_VIEW
-            payload.ns_view = Unmanaged.passUnretained(view).toOpaque()
+            payload.platform_kind = viewKind
+            #if os(macOS)
+                payload.ns_view = Unmanaged.passUnretained(view).toOpaque()
+            #else
+                payload.ui_view = Unmanaged.passUnretained(view).toOpaque()
+            #endif
 
             let result = attach(
-                kind: MIGO_PLATFORM_MACOS_NS_VIEW,
+                kind: viewKind,
                 payload: &payload,
                 payloadSize: payload.struct_size,
                 hostObject: view)
 
             XCTAssertEqual(
                 result, MIGO_ERROR_UNSUPPORTED_PLATFORM,
-                "an NSView must be declined so the host keeps ownership of its drawable")
+                "a \(viewTypeName) must be declined so the host keeps ownership of its drawable")
             XCTAssertNil(attachment, "a declined attach must produce no attachment")
         #else
-            throw XCTSkip("the attach path under test is the macOS one")
+            throw XCTSkip("this package is built for macOS and iOS only")
         #endif
     }
 }

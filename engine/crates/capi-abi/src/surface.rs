@@ -68,7 +68,28 @@ pub const MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS: u64 = (1 << MIGO_PLATFORM_ANDROI
     // with every other gate while no implementation existed. The evidence here
     // is an OpenHarmony emulator log reading "surface attached, generation 1"
     // after "surface created 1316 x 2598".
-    | (1 << MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW);
+    | (1 << MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW)
+    // The evidence here is apple-sdk.yml run 34017950809, macOS leg, on a hosted
+    // macos-15 arm64 runner: `MigoSurfaceAttachTests.testAHostOwnedMetalLayerAttaches`
+    // built a real CAMetalLayer, carried it through migo_session_attach_surface
+    // as generation 1, and then completed the whole retirement handshake --
+    // begin_detach, poll to RELEASED, release_destroy, session_destroy,
+    // engine_destroy -- before releasing the layer. Not a compile: a run.
+    | (1 << MIGO_PLATFORM_MACOS_CA_METAL_LAYER);
+
+// MIGO_PLATFORM_IOS_CA_METAL_LAYER IS DELIBERATELY ABSENT, and this note is here
+// so nobody adds it for symmetry.
+//
+// The iOS arm of the platform module is the same code as the macOS arm and it
+// compiles on every pull request, which is exactly the evidence this constant
+// refuses. `MigoSurfaceAttachTests` is the only place an attach has ever run,
+// its cases are `#if os(macOS)`, and on the iOS-simulator leg -- where
+// `xcodebuild test -scheme Migo-Package` does execute this package's tests --
+// they skip. So no iOS attach has succeeded anywhere.
+//
+// What would earn it: those cases running on the iOS simulator against
+// MigoIosMetalLayerDescriptor. That needs no new lane; the lane is already
+// there.
 
 /// Authoritative, level-triggered state returned by a release query.
 pub const MIGO_SURFACE_RELEASE_PENDING: u32 = 0;
