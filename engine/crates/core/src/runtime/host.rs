@@ -1368,21 +1368,10 @@ impl Host {
             self.id, w, h
         );
 
-        // Retry a bounded number of times: a transiently full render command
-        // queue can make the bounded-blocking recreate send/reply time out, and a
-        // dropped recreate would strand the app on a black frame with no further
-        // surface callback from Java. Surface updates are rare, so a few host-
-        // thread retries are an acceptable tradeoff for not losing the surface.
-        let mut result = self.render.update_surface(lease.clone(), pixel_ratio);
-        let mut attempts = 1u32;
-        while result.is_err() && lease.is_live() && attempts < 3 {
-            attempts += 1;
-            warn!(
-                "[Host {}] on_update_surface attempt {} after error: {:?}",
-                self.id, attempts, result
-            );
-            result = self.render.update_surface(lease.clone(), pixel_ratio);
-        }
+        // The bounded retry this used to run lives in `RenderService::update_surface`
+        // now, so the external-frame execution gets it too: only this one had it, and
+        // the same transient queue pressure stranded that product and not this one.
+        let result = self.render.update_surface(lease.clone(), pixel_ratio);
 
         // Resume the foreground after the surface is (re)created — but only when
         // actually foregrounded. Android can deliver surfaceCreated/Changed while

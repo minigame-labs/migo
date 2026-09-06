@@ -204,6 +204,49 @@ fn a_launch_that_fails_is_announced_like_one_that_succeeds() {
 }
 
 #[test]
+fn installing_a_surface_retries_for_both_products_from_one_place() {
+    // The property: a transient failure to install is retried, whichever execution
+    // asked.
+    //
+    // Only the embedded one retried. Its reason applies to both -- a transiently full
+    // render command queue makes the bounded-blocking recreate time out, and a
+    // dropped recreate strands the app on a black frame with no further surface
+    // callback coming -- but the retry sat in that execution's command handler, so
+    // the external-frame product reported the timeout and gave up. Same pressure,
+    // one product stranded.
+    //
+    // Pinned as "one place", not "both places": a second copy is how the two came to
+    // disagree, and would let them disagree again.
+    assert!(
+        RENDER_SERVICE.contains("const INSTALL_ATTEMPTS: u32 = 3;"),
+        "the attempt bound must be named where the retry runs"
+    );
+    let update = RENDER_SERVICE
+        .split("pub(crate) fn update_surface(")
+        .nth(1)
+        .expect("update_surface must remain present")
+        .split("\n    fn ")
+        .next()
+        .expect("update_surface must end before the next method");
+    assert!(
+        update.contains("attempts < Self::INSTALL_ATTEMPTS"),
+        "the retry must live in the service, so both executions get it"
+    );
+    assert!(
+        update.contains("lease.is_live()"),
+        "a retired Surface must not be retried for: the host has taken it back and a \
+         later attempt would arbitrate over something that no longer exists"
+    );
+
+    for (source, which) in [(HOST, "the embedded"), (EXTERNAL, "the external-frame")] {
+        assert!(
+            !code_only(source).contains("attempts < 3"),
+            "{which} execution must not carry its own copy of the retry"
+        );
+    }
+}
+
+#[test]
 fn the_handover_onshow_defers_to_is_actually_performed() {
     // The property: whichever of the two arms declines to resume, the other does it.
     //

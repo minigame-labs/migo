@@ -15,6 +15,7 @@ use shared::{
 use super::{SurfaceAttachmentSlot, SurfaceTransitionError};
 
 pub(crate) struct RenderService {
+    host_id: i32,
     attachment: SurfaceAttachmentSlot,
     surface_system: SurfaceSystem,
     /// Where the Surface to install is published. Held rather than only handed to
@@ -57,6 +58,9 @@ mod tests {
 
 impl RenderService {
     pub(crate) const RECREATE_ONSCREEN_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// How many times one Surface update may be attempted. See `update_surface`.
+    const INSTALL_ATTEMPTS: u32 = 3;
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -136,6 +140,7 @@ impl RenderService {
             surface_system.on_surface_available(surface_size);
         }
         Ok(Self {
+            host_id,
             attachment: match initial_surface {
                 Some(lease) => SurfaceAttachmentSlot::from_initial(lease),
                 // Not "detached after having been attached": never attached.
@@ -183,7 +188,40 @@ impl RenderService {
     }
 
     /// Update onscreen surface and request backend recreate.
+    ///
+    /// Retried a bounded number of times, because a transiently full render command
+    /// queue can make the bounded-blocking recreate time out and a dropped recreate
+    /// strands the app on a black frame with no further surface callback coming.
+    /// Surface updates are rare, so a few retries on the calling thread are worth not
+    /// losing the Surface.
+    ///
+    /// The retry lives here and not in a caller, which is where it used to live. Only
+    /// the embedded execution had one; the external-frame execution reported the
+    /// timeout and gave up, so the same transient queue pressure stranded one product
+    /// and not the other. Installing a Surface is what needs retrying, not the
+    /// particular command handler that asked for it -- so putting it here is what
+    /// makes the two products agree by construction rather than by both remembering.
     pub(crate) fn update_surface(
+        &mut self,
+        lease: SurfaceLease,
+        pixel_ratio: Option<PixelRatio>,
+    ) -> EngineResult<()> {
+        let mut attempts = 1u32;
+        let mut result = self.install_surface(lease.clone(), pixel_ratio);
+        // A retired Surface is not worth retrying for: the host has taken it back and
+        // a later attempt would be arbitrating over something that no longer exists.
+        while result.is_err() && lease.is_live() && attempts < Self::INSTALL_ATTEMPTS {
+            attempts += 1;
+            warn!(
+                "[Host {}] update_surface attempt {} after error: {:?}",
+                self.host_id, attempts, result
+            );
+            result = self.install_surface(lease.clone(), pixel_ratio);
+        }
+        result
+    }
+
+    fn install_surface(
         &mut self,
         lease: SurfaceLease,
         pixel_ratio: Option<PixelRatio>,
