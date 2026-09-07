@@ -37,8 +37,23 @@ fn surface_for_restore(lease: Option<SurfaceLease>) -> EngineResult<SurfaceLease
     })
 }
 
+/// Classify an arbitration rejection by what it means, not by where it happened.
+///
+/// A stale generation is the host having taken its Surface back, which is nobody's
+/// fault and nothing to report: `Cancelled` is the code the rest of this file already
+/// uses for "what this was for is gone". A conflicting live generation is an ordering
+/// error -- two live generations at once -- and stays `InvalidOperation`.
+///
+/// Both used to be `InvalidOperation`, and the consumer's decision about whether to
+/// report is made on the code, so an ordinary attach/detach race reached the host as
+/// MIGO_ERROR_INTERNAL. Deciding it here is what makes that decision possible at all:
+/// this is the only place that knows which of the two it was.
 fn transition_error(context: &'static str, error: SurfaceTransitionError) -> EngineError {
-    EngineError::new(ErrorCode::InvalidOperation)
+    let code = match error {
+        SurfaceTransitionError::StaleGeneration => ErrorCode::Cancelled,
+        SurfaceTransitionError::ConflictingLiveGeneration => ErrorCode::InvalidOperation,
+    };
+    EngineError::new(code)
         .with_msg(context)
         .with_detail(error.to_string())
 }

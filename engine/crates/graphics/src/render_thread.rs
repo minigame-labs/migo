@@ -227,8 +227,22 @@ fn destroy_render_owner(cm: &mut CanvasManager, render_binding: &mut RenderSurfa
     }
 }
 
+/// Classify a binding rejection by what it means, not by where it happened.
+///
+/// A stale generation is the host having taken its Surface back while this request was
+/// in flight -- benign, and `Cancelled` is what the session reads to mean "do not
+/// report this". The other two are ordering errors: two live generations at once, or a
+/// recreate already in progress, neither of which a host causes.
+///
+/// All three used to be `InvalidOperation`, and the session decides whether to report
+/// on the code, so a host detaching mid-update reached it as MIGO_ERROR_INTERNAL.
 fn binding_error(context: &'static str, error: SurfaceBindingError) -> EngineError {
-    EngineError::new(ErrorCode::InvalidOperation)
+    let code = match error {
+        SurfaceBindingError::StaleGeneration => ErrorCode::Cancelled,
+        SurfaceBindingError::ConflictingLiveGeneration
+        | SurfaceBindingError::RecreateInProgress => ErrorCode::InvalidOperation,
+    };
+    EngineError::new(code)
         .with_msg(context)
         .with_detail(error.to_string())
 }

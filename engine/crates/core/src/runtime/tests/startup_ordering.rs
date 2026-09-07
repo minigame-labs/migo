@@ -307,6 +307,57 @@ fn the_handover_onshow_defers_to_is_actually_performed() {
 }
 
 #[test]
+fn staleness_is_classified_as_cancellation_where_it_is_known() {
+    // The property: "the host took its Surface back" carries one code, decided by
+    // whichever site noticed, and an ordering error carries a different one.
+    //
+    // Both arbitration sites used to flatten every variant onto `InvalidOperation`.
+    // The session decides whether to report on the code, so it could exclude
+    // `Cancelled` -- as it does -- and still announce an ordinary attach/detach race
+    // as MIGO_ERROR_INTERNAL, which is what the C boundary maps every engine error
+    // onto. Excluding `InvalidOperation` instead would have swallowed the ordering
+    // errors with it, so the classification has to happen where the variant is still
+    // in hand.
+    for (source, mapper, which) in [
+        (
+            RENDER_SERVICE,
+            "fn transition_error(",
+            "the session's arbitration",
+        ),
+        (RENDER_THREAD, "fn binding_error(", "the render binding's"),
+    ] {
+        let body = source
+            .split(mapper)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{which} error mapper must remain present"))
+            .split("\n}")
+            .next()
+            .unwrap_or_else(|| panic!("{which} error mapper must end"));
+        assert!(
+            body.contains("StaleGeneration => ErrorCode::Cancelled"),
+            "{which} rejection for a retired generation must be Cancelled, which is \
+             what the session reads to mean \"do not report this\""
+        );
+        assert!(
+            body.contains("ConflictingLiveGeneration"),
+            "{which} mapper must still name the ordering error separately, or the \
+             classification is a rename rather than a distinction"
+        );
+        assert!(
+            body.contains("ErrorCode::InvalidOperation"),
+            "{which} ordering error must keep a code the session does report"
+        );
+    }
+
+    // And the consumer still keys on that one code, which is what makes deciding it
+    // at the source worth anything.
+    assert!(
+        EXTERNAL.contains("error.code != ErrorCode::Cancelled"),
+        "the session must decide on the code the mappers set"
+    );
+}
+
+#[test]
 fn the_external_session_tells_its_host_what_the_embedded_one_does() {
     // The property: a host-facing render failure reaches the host on both products.
     //
