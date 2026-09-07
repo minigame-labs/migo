@@ -288,9 +288,27 @@ fn an_install_whose_reply_was_given_up_on_is_still_reconciled() {
          nothing: its own was superseded"
     );
     assert!(
-        confirm.contains("if !lease.is_live()"),
-        "a generation retired between the install and the report must not be \
-         committed: the host has already taken it back"
+        confirm.contains("self.surface_control.live_candidate_for(revision)"),
+        "the lease must be read back from the level, which answers only while that \
+         publication is live -- so a generation retired between the install and the \
+         report arrives as None rather than as an attachment to publish"
+    );
+
+    // And the record must not be a pin. Keeping the lease here would hold the host's
+    // native Surface until the report arrived, and past the point RELEASED is meant to
+    // be publishable if it never did or if the host detached first -- which is the
+    // defect this whole arrangement removes, reintroduced one layer up.
+    let field = RENDER_SERVICE
+        .split("    outstanding:")
+        .nth(1)
+        .expect("the outstanding record must remain present")
+        .split(',')
+        .next()
+        .expect("its type must end");
+    assert!(
+        !field.contains("SurfaceLease"),
+        "the outstanding record must name a publication, not hold a lease: the level \
+         already holds it and hands it back only while it is live"
     );
 
     // And both executions reconcile, because both can give up on a reply.

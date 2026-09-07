@@ -29,7 +29,14 @@ pub(crate) struct RenderService {
     /// paused with nothing coming -- the same state a lost-and-replaced Surface used to
     /// end in. `SurfaceInstalled` arrives on the must-deliver channel and
     /// `confirm_install` reconciles against this.
-    outstanding: Option<(shared::surface::SurfaceCandidateRevision, SurfaceLease)>,
+    ///
+    /// A revision and not the lease, deliberately. Holding the lease here would pin the
+    /// host's native Surface until the report arrived -- and if it never did, or the
+    /// host detached first, past the point `RELEASED` is meant to be publishable. That
+    /// is the defect this whole arrangement exists to remove, and keeping a second copy
+    /// of the lease would have reintroduced it one layer up. The candidate level
+    /// already holds it, and hands it back only while it is live.
+    outstanding: Option<shared::surface::SurfaceCandidateRevision>,
     thread: RenderThread,
 }
 
@@ -248,12 +255,9 @@ impl RenderService {
             result = self.install_surface(lease.clone(), pixel_ratio);
         }
         if result.is_err() && lease.is_live() {
-            // Every attempt republished, so the last publication is the one the
-            // renderer may still install. Recorded rather than forgotten: see
-            // `outstanding`.
-            if let Some(revision) = self.surface_control.published_revision() {
-                self.outstanding = Some((revision, lease));
-            }
+            // Every attempt republished, so the last publication is the one the renderer
+            // may still install. Recorded rather than forgotten: see `outstanding`.
+            self.outstanding = self.surface_control.published_revision();
         }
         result
     }
@@ -270,7 +274,7 @@ impl RenderService {
         &mut self,
         revision: shared::surface::SurfaceCandidateRevision,
     ) -> bool {
-        let Some((outstanding, lease)) = self.outstanding.take() else {
+        let Some(outstanding) = self.outstanding.take() else {
             return false;
         };
         if outstanding != revision {
@@ -279,13 +283,14 @@ impl RenderService {
             // keep waiting for.
             return false;
         }
-        // The generation can still have been retired between the install and this
-        // report, and committing a dead one would publish an attachment the host has
-        // already taken back.
-        if !lease.is_live() {
+        // Read back from the level rather than from a copy kept here. It answers with
+        // the lease only while that publication is still the live one, so a generation
+        // retired between the install and this report -- the host taking its Surface
+        // back -- arrives as `None` instead of as an attachment to publish.
+        let Some(lease) = self.surface_control.live_candidate_for(revision) else {
             self.surface_system.on_surface_destroyed();
             return false;
-        }
+        };
         let size = lease.size();
         if self.attachment.commit(lease).is_err() {
             self.surface_system.on_surface_destroyed();
