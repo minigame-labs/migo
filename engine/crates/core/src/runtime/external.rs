@@ -798,7 +798,15 @@ fn handle_command(
                 // normal attach/detach race would otherwise reach the host as
                 // MIGO_ERROR_INTERNAL, because that is what the C boundary maps every
                 // engine error onto.
-                if error.code != ErrorCode::Cancelled {
+                // And not while a reconciliation is still possible. The service keeps
+                // the last publication outstanding when its request was enqueued and
+                // has not answered, so the install may yet land and commit -- reporting
+                // now would announce a failure for a slow recreate that then succeeds,
+                // as MIGO_ERROR_INTERNAL, which is what the C boundary maps every engine
+                // error onto. A request that never reached the queue records nothing, so
+                // its failure is reported here immediately, which is the case that
+                // genuinely has no second chance.
+                if error.code != ErrorCode::Cancelled && !render.install_pending() {
                     platform.notify_error(
                         id,
                         error.code.as_u16(),

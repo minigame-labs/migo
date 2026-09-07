@@ -282,10 +282,38 @@ fn an_install_whose_reply_was_given_up_on_is_still_reconciled() {
         .split("\n    fn ")
         .next()
         .expect("it must end");
+    // Compared before it is taken, and the ordering is the property. Retries publish as
+    // they go, so a report for revision 1 can arrive while revision 3 is what this
+    // service waits for -- taking first would discard 3 on the mismatch and leave 3's
+    // own report with nothing to commit.
+    let compare = confirm
+        .find("if self.outstanding != Some(revision)")
+        .expect("a report must be compared against the outstanding record");
+    let clear = confirm
+        .find("self.outstanding = None;")
+        .expect("a matching report must clear the record");
     assert!(
-        confirm.contains("if outstanding != revision"),
-        "a report for a publication this service did not give up on must commit \
-         nothing: its own was superseded"
+        compare < clear,
+        "the record must be compared before it is cleared, or a mismatched report \
+         discards a publication that is still waiting"
+    );
+
+    // Only a request the queue accepted can ever be reported, so only that one is
+    // recorded. One that never reached the queue would leave the service waiting for a
+    // report nobody sends -- and, with the timeout suppressed while a reconciliation is
+    // pending, leave the host told nothing either.
+    assert!(
+        RENDER_SERVICE.contains("self.outstanding = failure.in_flight;"),
+        "only an in-flight request may be recorded as outstanding"
+    );
+    assert!(
+        RENDER_SERVICE.contains("fn in_flight(") && RENDER_SERVICE.contains("fn not_enqueued("),
+        "the two outcomes must be named apart at the point they are produced"
+    );
+    assert!(
+        EXTERNAL.contains("!render.install_pending()"),
+        "a timeout must not be announced while its install may still land: it would \
+         report a failure for a slow recreate that then succeeds"
     );
     assert!(
         confirm.contains("self.surface_control.live_candidate_for(revision)"),
