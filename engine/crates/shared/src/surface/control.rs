@@ -154,6 +154,18 @@ impl SurfaceControl {
         revision
     }
 
+    /// Which publication is current, if any.
+    ///
+    /// For a caller that has just published and needs to name what it published --
+    /// `publish_candidate` returns the same value, and this is for the paths that
+    /// published through a helper.
+    pub fn published_revision(&self) -> Option<SurfaceCandidateRevision> {
+        self.candidate
+            .lock()
+            .as_ref()
+            .map(|(revision, _)| *revision)
+    }
+
     /// Read whatever Surface is currently live, with no expectation about which.
     ///
     /// For a worker starting up: it has not been told about a particular

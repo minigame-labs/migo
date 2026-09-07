@@ -168,6 +168,13 @@ fn mark_surface_destroyed(surface: &mut SurfaceSystem) {
 
 type SurfaceLossReporter = Arc<dyn Fn(PublicSurfaceGeneration, SurfaceLossReason) + Send + Sync>;
 
+/// Reports that the publication named was installed.
+///
+/// A second closure rather than one carrying an enum, because there are two reports and
+/// each type says what it carries. `graphics` cannot name `HostCommand`, which is why
+/// either one is a closure at all.
+type SurfaceInstallReporter = Arc<dyn Fn(shared::surface::SurfaceCandidateRevision) + Send + Sync>;
+
 /// Retire exactly the generation whose still-live native target failed, then
 /// report it over the reliable Host control stream. A concurrent expected
 /// detach wins the generation CAS and makes this a no-op, so host destruction
@@ -1758,6 +1765,12 @@ impl RenderThread {
         // is retired before this closure runs, and expected host detach never
         // reaches it.
         report_surface_loss: SurfaceLossReporter,
+        // The other must-deliver report: which publication is now installed. The
+        // session commits its attachment slot from the recreate reply when that
+        // arrives in time and from this when it does not, and neither side can promise
+        // "in time" -- the reply is given up on after 500 ms while the request stays
+        // queued.
+        report_surface_installed: SurfaceInstallReporter,
         // Where this thread says why it stopped, for the session that will observe
         // its frame clock closing and otherwise have nothing to tell the host.
         render_exit: Arc<shared::render_exit::RenderExit>,
@@ -1876,6 +1889,7 @@ impl RenderThread {
                         Ok(kind) => {
                             debug_assert_eq!(kind, RecreateKind::Initial);
                             initial_onscreen = Some(size);
+                            report_surface_installed(revision);
                         }
                         // The host retired it in the window between the claim and
                         // the preflight. Cancellation, not failure: the GPU came up,
@@ -2164,6 +2178,7 @@ impl RenderThread {
 
                                 match recreate {
                                     Ok(_) => {
+                                        report_surface_installed(requested);
                                         if render_binding.is_live() {
                                             surface_system.on_surface_available(size);
                                         } else {

@@ -21,6 +21,15 @@ pub(crate) struct RenderService {
     /// Where the Surface to install is published. Held rather than only handed to
     /// the render thread, because every update publishes through it.
     surface_control: std::sync::Arc<shared::surface::SurfaceControl>,
+    /// A publication whose install this service stopped waiting for.
+    ///
+    /// The recreate reply is given up on after 500 ms while the request stays queued,
+    /// so the renderer can install afterwards. Without this the slot stayed
+    /// uncommitted while the renderer held a live Surface, and the renderer stayed
+    /// paused with nothing coming -- the same state a lost-and-replaced Surface used to
+    /// end in. `SurfaceInstalled` arrives on the must-deliver channel and
+    /// `confirm_install` reconciles against this.
+    outstanding: Option<(shared::surface::SurfaceCandidateRevision, SurfaceLease)>,
     thread: RenderThread,
 }
 
@@ -110,6 +119,9 @@ impl RenderService {
                 + Send
                 + Sync,
         >,
+        report_surface_installed: std::sync::Arc<
+            dyn Fn(shared::surface::SurfaceCandidateRevision) + Send + Sync,
+        >,
     ) -> EngineResult<Self> {
         let surface_size = initial_surface.as_ref().map(|lease| lease.size());
         // Published for the render thread to read rather than handed to it, so a
@@ -141,6 +153,7 @@ impl RenderService {
             request_vsync,
             std::sync::Arc::clone(&surface_control),
             report_surface_loss,
+            report_surface_installed,
             render_exit,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
@@ -167,6 +180,7 @@ impl RenderService {
             },
             surface_system,
             surface_control,
+            outstanding: None,
             thread,
         })
     }
@@ -233,7 +247,56 @@ impl RenderService {
             );
             result = self.install_surface(lease.clone(), pixel_ratio);
         }
+        if result.is_err() && lease.is_live() {
+            // Every attempt republished, so the last publication is the one the
+            // renderer may still install. Recorded rather than forgotten: see
+            // `outstanding`.
+            if let Some(revision) = self.surface_control.published_revision() {
+                self.outstanding = Some((revision, lease));
+            }
+        }
         result
+    }
+
+    /// Commit an install this service had stopped waiting for.
+    ///
+    /// Returns whether it committed, which is what a caller uses to decide about
+    /// resuming: the reply path resumes on its own success, and this is the other half
+    /// of the same decision.
+    ///
+    /// Idempotent. Every successful install is reported, including the ones whose reply
+    /// arrived in time, so the ordinary case reaches this with nothing outstanding.
+    pub(crate) fn confirm_install(
+        &mut self,
+        revision: shared::surface::SurfaceCandidateRevision,
+    ) -> bool {
+        let Some((outstanding, lease)) = self.outstanding.take() else {
+            return false;
+        };
+        if outstanding != revision {
+            // A different publication was installed than the one this service gave up
+            // on, which means its own was superseded. Nothing to commit, and nothing to
+            // keep waiting for.
+            return false;
+        }
+        // The generation can still have been retired between the install and this
+        // report, and committing a dead one would publish an attachment the host has
+        // already taken back.
+        if !lease.is_live() {
+            self.surface_system.on_surface_destroyed();
+            return false;
+        }
+        let size = lease.size();
+        if self.attachment.commit(lease).is_err() {
+            self.surface_system.on_surface_destroyed();
+            return false;
+        }
+        self.surface_system.on_surface_available(size);
+        info!(
+            "[Host {}] confirmed a Surface install this service had given up on",
+            self.host_id
+        );
+        true
     }
 
     fn install_surface(

@@ -10,6 +10,7 @@ const CANVAS_MANAGER: &str = include_str!("../../../../graphics/src/canvas/manag
 const GPU_CAPS: &str = include_str!("../../../../shared/src/device/gpu_caps.rs");
 const CONTROL: &str = include_str!("../../../../shared/src/surface/control.rs");
 const RENDER_CMD: &str = include_str!("../../../../shared/src/protocol/render_cmd.rs");
+const HOST_CMD: &str = include_str!("../../../../shared/src/protocol/host_cmd.rs");
 const EXTERNAL: &str = include_str!("../external.rs");
 const REGISTRY: &str = include_str!("../registry.rs");
 const CAPI_SURFACE: &str = include_str!("../../../../capi/src/surface.rs");
@@ -247,6 +248,61 @@ fn installing_a_surface_retries_for_both_products_from_one_place() {
 }
 
 #[test]
+fn an_install_whose_reply_was_given_up_on_is_still_reconciled() {
+    // The property: the outcome of an install cannot be lost.
+    //
+    // `RenderService` gives up on the recreate reply after 500 ms while the request
+    // stays queued, so the renderer can install afterwards. The session's slot then
+    // stayed uncommitted while the renderer held a live Surface, and -- because the
+    // resume runs only on the reply's success -- the renderer stayed paused with
+    // nothing coming. That is the same state a lost-and-replaced Surface used to end
+    // in, reached by a different route, so closing one and not the other would have
+    // left the bug reachable.
+    //
+    // Every successful install is reported, not only the ones whose reply was lost:
+    // the worker cannot know whether anyone is still listening, and a report nobody
+    // needs is a no-op.
+    assert!(
+        RENDER_THREAD.contains("report_surface_installed(revision);"),
+        "the startup install must report what it installed"
+    );
+    assert!(
+        RENDER_THREAD.contains("report_surface_installed(requested);"),
+        "the update install must report what it installed"
+    );
+    assert!(
+        HOST_CMD.contains("SurfaceInstalled {"),
+        "the report must travel as a command, on the channel that must deliver it"
+    );
+
+    let confirm = RENDER_SERVICE
+        .split("pub(crate) fn confirm_install(")
+        .nth(1)
+        .expect("the reconciliation must remain present")
+        .split("\n    fn ")
+        .next()
+        .expect("it must end");
+    assert!(
+        confirm.contains("if outstanding != revision"),
+        "a report for a publication this service did not give up on must commit \
+         nothing: its own was superseded"
+    );
+    assert!(
+        confirm.contains("if !lease.is_live()"),
+        "a generation retired between the install and the report must not be \
+         committed: the host has already taken it back"
+    );
+
+    // And both executions reconcile, because both can give up on a reply.
+    for (source, which) in [(HOST, "the embedded"), (EXTERNAL, "the external-frame")] {
+        assert!(
+            source.contains("confirm_install(revision)"),
+            "{which} execution must reconcile the report"
+        );
+    }
+}
+
+#[test]
 fn the_handover_onshow_defers_to_is_actually_performed() {
     // The property: whichever of the two arms declines to resume, the other does it.
     //
@@ -299,10 +355,26 @@ fn the_handover_onshow_defers_to_is_actually_performed() {
          audio in the background"
     );
     // The guard is the whole point of the pairing, so the embedded half must still
-    // have it too -- otherwise this asserts a symmetry with one side.
+    // have it too -- otherwise this asserts a symmetry with one side. It lives in one
+    // method there now, shared by the update's own reply and the reconciliation of an
+    // install this host had stopped waiting for: two copies is how two paths come to
+    // disagree about a guard.
+    let resume = HOST
+        .split("fn resume_foreground_if_visible(&mut self) {")
+        .nth(1)
+        .expect("the embedded resume must remain a single named place")
+        .split("\n    }")
+        .next()
+        .expect("it must end");
     assert!(
-        HOST.contains("if !self.backgrounded.load(Ordering::Relaxed) {"),
-        "the embedded execution must still gate its post-update resume the same way"
+        resume.contains("if self.backgrounded.load(Ordering::Relaxed) {"),
+        "the embedded execution must still gate its resume on being foregrounded"
+    );
+    assert_eq!(
+        HOST.matches("self.resume_foreground_if_visible();").count(),
+        2,
+        "both places a Surface becomes usable must go through it: the update's reply \
+         and the SurfaceInstalled reconciliation"
     );
 }
 

@@ -266,6 +266,12 @@ impl SessionShell {
                 })),
             )
         };
+        let install_reporter_tx = critical_host_tx.clone();
+        let report_surface_installed: Arc<
+            dyn Fn(shared::surface::SurfaceCandidateRevision) + Send + Sync,
+        > = Arc::new(move |revision| {
+            let _ = install_reporter_tx.send(HostCommand::SurfaceInstalled { revision });
+        });
         let report_surface_loss: Arc<
             dyn Fn(shared::surface::PublicSurfaceGeneration, shared::surface::SurfaceLossReason)
                 + Send
@@ -298,6 +304,7 @@ impl SessionShell {
             uses_external_vsync.then(|| request_vsync.clone()).flatten(),
             surface_control,
             report_surface_loss,
+            report_surface_installed,
         )?;
         // Preserve the old two-second render-startup budget. V8 construction
         // below consumes this same deadline while the render thread initializes.

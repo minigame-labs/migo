@@ -770,6 +770,16 @@ impl Host {
                 self.render.on_surface_destroyed(generation);
                 Ok(())
             }
+            HostCommand::SurfaceInstalled { revision } => {
+                // The renderer installed something. Ordinarily the reply already
+                // committed it and this confirms nothing; when the reply was given up
+                // on, this is the only thing that will.
+                if self.render.confirm_install(revision) {
+                    self.resume_foreground_if_visible();
+                }
+                Ok(())
+            }
+
             HostCommand::SurfaceLost {
                 public_generation,
                 reason,
@@ -1380,19 +1390,35 @@ impl Host {
         // surface is marked live but stays paused, and the OnShow live-surface
         // path drives the resume once `backgrounded` clears.
         if result.is_ok() {
-            if !self.backgrounded.load(Ordering::Relaxed) {
-                self.enter_foreground();
-                if let Some(args) = self.pending_on_show_args.take() {
-                    self.js.set_timer_backgrounded(false);
-                    self.js.invoke_host_hook("_internalTriggerOnShow", &args);
-                }
-            }
+            self.resume_foreground_if_visible();
             info!("[Host {}] on_update_surface completed", self.id);
         } else if let Err(ref e) = result {
             warn!("[Host {}] on_update_surface failed: {}", self.id, e);
         }
 
         result
+    }
+
+    /// Resume after a Surface became usable, but only when actually foregrounded.
+    ///
+    /// Android can deliver surfaceCreated/Changed while still hidden (before onResume)
+    /// or recreate a Surface while backgrounded; resuming then would run render and
+    /// audio in the background. In that case the Surface is live but stays paused, and
+    /// the OnShow live-surface path drives the resume once `backgrounded` clears.
+    ///
+    /// Shared by the two places a Surface becomes usable -- the update's own reply, and
+    /// a `SurfaceInstalled` report for an update this host had stopped waiting for.
+    /// One copy, because the guard is the part that matters and two copies is how two
+    /// paths come to disagree about it.
+    fn resume_foreground_if_visible(&mut self) {
+        if self.backgrounded.load(Ordering::Relaxed) {
+            return;
+        }
+        self.enter_foreground();
+        if let Some(args) = self.pending_on_show_args.take() {
+            self.js.set_timer_backgrounded(false);
+            self.js.invoke_host_hook("_internalTriggerOnShow", &args);
+        }
     }
 
     fn retract_input_for_focus_loss(&mut self) {

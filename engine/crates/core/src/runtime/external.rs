@@ -833,6 +833,17 @@ fn handle_command(
             render.on_surface_destroyed(generation);
         }
 
+        HostCommand::SurfaceInstalled { revision } => {
+            // The renderer installed something. Ordinarily the reply already committed
+            // it and this confirms nothing; when the reply was given up on, this is the
+            // only thing that will -- and without it the session believed it had no
+            // Surface while the renderer held a live one and stayed paused.
+            if render.confirm_install(revision) && !backgrounded.load(Ordering::Relaxed) {
+                render.resume();
+                audio.resume();
+            }
+        }
+
         HostCommand::SurfaceLost {
             public_generation,
             reason,
