@@ -15,8 +15,28 @@ use shared::{
 use super::{SurfaceAttachmentSlot, SurfaceTransitionError};
 
 pub(crate) struct RenderService {
+    host_id: i32,
     attachment: SurfaceAttachmentSlot,
     surface_system: SurfaceSystem,
+    /// Where the Surface to install is published. Held rather than only handed to
+    /// the render thread, because every update publishes through it.
+    surface_control: std::sync::Arc<shared::surface::SurfaceControl>,
+    /// A publication whose install this service stopped waiting for.
+    ///
+    /// The recreate reply is given up on after 500 ms while the request stays queued,
+    /// so the renderer can install afterwards. Without this the slot stayed
+    /// uncommitted while the renderer held a live Surface, and the renderer stayed
+    /// paused with nothing coming -- the same state a lost-and-replaced Surface used to
+    /// end in. `SurfaceInstalled` arrives on the must-deliver channel and
+    /// `confirm_install` reconciles against this.
+    ///
+    /// A revision and not the lease, deliberately. Holding the lease here would pin the
+    /// host's native Surface until the report arrived -- and if it never did, or the
+    /// host detached first, past the point `RELEASED` is meant to be publishable. That
+    /// is the defect this whole arrangement exists to remove, and keeping a second copy
+    /// of the lease would have reintroduced it one layer up. The candidate level
+    /// already holds it, and hands it back only while it is live.
+    outstanding: Option<shared::surface::SurfaceCandidateRevision>,
     thread: RenderThread,
 }
 
@@ -33,8 +53,55 @@ fn surface_for_restore(lease: Option<SurfaceLease>) -> EngineResult<SurfaceLease
     })
 }
 
+/// Classify an arbitration rejection by what it means, not by where it happened.
+///
+/// A stale generation is the host having taken its Surface back, which is nobody's
+/// fault and nothing to report: `Cancelled` is the code the rest of this file already
+/// uses for "what this was for is gone". A conflicting live generation is an ordering
+/// error -- two live generations at once -- and stays `InvalidOperation`.
+///
+/// Both used to be `InvalidOperation`, and the consumer's decision about whether to
+/// report is made on the code, so an ordinary attach/detach race reached the host as
+/// MIGO_ERROR_INTERNAL. Deciding it here is what makes that decision possible at all:
+/// this is the only place that knows which of the two it was.
+/// A failed install attempt, and whether its request is still in flight.
+///
+/// The distinction decides whether anything will ever report the outcome. A request the
+/// queue accepted may still be installed and reported afterwards; one that never reached
+/// the queue will not be, so recording it as outstanding would leave the service waiting
+/// for a report nobody is going to send -- and, with the timeout report suppressed while
+/// a reconciliation is pending, leave the host told nothing either.
+struct InstallAttemptFailure {
+    error: EngineError,
+    in_flight: Option<shared::surface::SurfaceCandidateRevision>,
+}
+
+impl InstallAttemptFailure {
+    /// Nothing is waiting to be reported: either the request never reached the queue, or
+    /// it already answered.
+    fn not_enqueued(error: EngineError) -> Self {
+        Self {
+            error,
+            in_flight: None,
+        }
+    }
+
+    /// The queue took the request and it has not answered, so a `SurfaceInstalled`
+    /// report can still settle it.
+    fn in_flight(revision: shared::surface::SurfaceCandidateRevision, error: EngineError) -> Self {
+        Self {
+            error,
+            in_flight: Some(revision),
+        }
+    }
+}
+
 fn transition_error(context: &'static str, error: SurfaceTransitionError) -> EngineError {
-    EngineError::new(ErrorCode::InvalidOperation)
+    let code = match error {
+        SurfaceTransitionError::StaleGeneration => ErrorCode::Cancelled,
+        SurfaceTransitionError::ConflictingLiveGeneration => ErrorCode::InvalidOperation,
+    };
+    EngineError::new(code)
         .with_msg(context)
         .with_detail(error.to_string())
 }
@@ -54,6 +121,9 @@ mod tests {
 
 impl RenderService {
     pub(crate) const RECREATE_ONSCREEN_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// How many times one Surface update may be attempted. See `update_surface`.
+    const INSTALL_ATTEMPTS: u32 = 3;
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -78,6 +148,7 @@ impl RenderService {
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
         context_lost: std::sync::Arc<shared::op_state::ContextLostState>,
+        render_exit: std::sync::Arc<shared::render_exit::RenderExit>,
         wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         raf_demand: shared::raf_signal::RafDemandRef,
         request_vsync: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -87,15 +158,25 @@ impl RenderService {
                 + Send
                 + Sync,
         >,
+        report_surface_installed: std::sync::Arc<
+            dyn Fn(shared::surface::SurfaceCandidateRevision) + Send + Sync,
+        >,
     ) -> EngineResult<Self> {
         let surface_size = initial_surface.as_ref().map(|lease| lease.size());
+        // Published for the render thread to read rather than handed to it, so a
+        // host that detaches while the GPU is still coming up is answered at once
+        // instead of waiting out EGL initialization. The logical owner of the
+        // attachment stays here: this slot arbitrates generations, answers
+        // `has_live_surface`, and is what a context restore reads.
+        if let Some(lease) = initial_surface.as_ref() {
+            surface_control.publish_candidate(lease.clone());
+        }
 
         let thread = RenderThread::spawn(
             raf_tx,
             vsync_rx,
             frame_demand_rx,
             host_id,
-            initial_surface.clone(),
             graphics_platform,
             pixel_ratio,
             app_cache_dir,
@@ -109,8 +190,10 @@ impl RenderService {
             wake,
             raf_demand,
             request_vsync,
-            surface_control,
+            std::sync::Arc::clone(&surface_control),
             report_surface_loss,
+            report_surface_installed,
+            render_exit,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.
@@ -124,6 +207,7 @@ impl RenderService {
             surface_system.on_surface_available(surface_size);
         }
         Ok(Self {
+            host_id,
             attachment: match initial_surface {
                 Some(lease) => SurfaceAttachmentSlot::from_initial(lease),
                 // Not "detached after having been attached": never attached.
@@ -134,6 +218,8 @@ impl RenderService {
                 None => SurfaceAttachmentSlot::empty(),
             },
             surface_system,
+            surface_control,
+            outstanding: None,
             thread,
         })
     }
@@ -170,19 +256,127 @@ impl RenderService {
     }
 
     /// Update onscreen surface and request backend recreate.
+    ///
+    /// Retried a bounded number of times, because a transiently full render command
+    /// queue can make the bounded-blocking recreate time out and a dropped recreate
+    /// strands the app on a black frame with no further surface callback coming.
+    /// Surface updates are rare, so a few retries on the calling thread are worth not
+    /// losing the Surface.
+    ///
+    /// The retry lives here and not in a caller, which is where it used to live. Only
+    /// the embedded execution had one; the external-frame execution reported the
+    /// timeout and gave up, so the same transient queue pressure stranded one product
+    /// and not the other. Installing a Surface is what needs retrying, not the
+    /// particular command handler that asked for it -- so putting it here is what
+    /// makes the two products agree by construction rather than by both remembering.
     pub(crate) fn update_surface(
         &mut self,
         lease: SurfaceLease,
         pixel_ratio: Option<PixelRatio>,
     ) -> EngineResult<()> {
-        self.attachment
-            .prepare(&lease)
-            .map_err(|error| transition_error("recreate onscreen: rejected Surface", error))?;
+        let mut attempts = 1u32;
+        let mut result = self.install_surface(lease.clone(), pixel_ratio);
+        // A retired Surface is not worth retrying for: the host has taken it back and
+        // a later attempt would be arbitrating over something that no longer exists.
+        while result.is_err() && lease.is_live() && attempts < Self::INSTALL_ATTEMPTS {
+            attempts += 1;
+            warn!(
+                "[Host {}] update_surface attempt {} failed: {:?}",
+                self.host_id,
+                attempts,
+                result.as_ref().err().map(|failure| &failure.error)
+            );
+            result = self.install_surface(lease.clone(), pixel_ratio);
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                // Only the last attempt's request can still be in flight: every attempt
+                // republished, so an earlier one's revision has been superseded and its
+                // queued request will find nothing to install. And only a request the
+                // queue accepted will ever be reported, which is why a dispatch that
+                // never enqueued records nothing to wait for.
+                if lease.is_live() {
+                    self.outstanding = failure.in_flight;
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Whether an install this service stopped waiting for may still be reported.
+    ///
+    /// A caller deciding whether to announce a timeout needs this: while it is true the
+    /// operation has not failed, it has only not answered yet.
+    #[inline]
+    pub(crate) fn install_pending(&self) -> bool {
+        self.outstanding.is_some()
+    }
+
+    /// Commit an install this service had stopped waiting for.
+    ///
+    /// Returns whether it committed, which is what a caller uses to decide about
+    /// resuming: the reply path resumes on its own success, and this is the other half
+    /// of the same decision.
+    ///
+    /// Idempotent. Every successful install is reported, including the ones whose reply
+    /// arrived in time, so the ordinary case reaches this with nothing outstanding.
+    pub(crate) fn confirm_install(
+        &mut self,
+        revision: shared::surface::SurfaceCandidateRevision,
+    ) -> bool {
+        // Compared before it is taken, and that ordering is the point. Retries publish
+        // as they go, so a report for revision 1 can arrive while revision 3 is what
+        // this service is waiting for -- and taking first would discard 3 on the
+        // mismatch, leaving 3's own report with nothing to commit.
+        if self.outstanding != Some(revision) {
+            return false;
+        }
+        self.outstanding = None;
+        // Read back from the level rather than from a copy kept here. It answers with
+        // the lease only while that publication is still the live one, so a generation
+        // retired between the install and this report -- the host taking its Surface
+        // back -- arrives as `None` instead of as an attachment to publish.
+        let Some(lease) = self.surface_control.live_candidate_for(revision) else {
+            self.surface_system.on_surface_destroyed();
+            return false;
+        };
+        let size = lease.size();
+        if self.attachment.commit(lease).is_err() {
+            self.surface_system.on_surface_destroyed();
+            return false;
+        }
+        self.surface_system.on_surface_available(size);
+        info!(
+            "[Host {}] confirmed a Surface install this service had given up on",
+            self.host_id
+        );
+        true
+    }
+
+    fn install_surface(
+        &mut self,
+        lease: SurfaceLease,
+        pixel_ratio: Option<PixelRatio>,
+    ) -> Result<(), InstallAttemptFailure> {
+        self.attachment.prepare(&lease).map_err(|error| {
+            InstallAttemptFailure::not_enqueued(transition_error(
+                "recreate onscreen: rejected Surface",
+                error,
+            ))
+        })?;
         let surface_size = lease.size();
+
+        // Published before the wake, never carried by it. A lease riding the
+        // command would pin the host's native Surface for as long as the command
+        // sat in the queue -- which, before the first frame, is however long EGL
+        // initialization takes, and `RELEASED` cannot be published while any lease
+        // is alive. A retirement revokes the level instead.
+        let revision = self.surface_control.publish_candidate(lease.clone());
 
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
-            lease: lease.clone(),
+            revision,
             pixel_ratio,
             resp: RenderCmdResp::from_sync(tx),
         });
@@ -192,9 +386,11 @@ impl RenderService {
         // than the legacy drop-on-full `send`, so a transiently full render queue
         // doesn't silently drop the recreate and strand the reply/onShow.
         self.sender().dispatch(cmd).map_err(|e| {
-            EngineError::new(ErrorCode::Cancelled)
-                .with_msg("recreate onscreen: send failed")
-                .with_detail(e.to_string())
+            InstallAttemptFailure::not_enqueued(
+                EngineError::new(ErrorCode::Cancelled)
+                    .with_msg("recreate onscreen: send failed")
+                    .with_detail(e.to_string()),
+            )
         })?;
 
         match rx.recv_timeout(Self::RECREATE_ONSCREEN_TIMEOUT) {
@@ -204,12 +400,17 @@ impl RenderService {
                 // raced with EGL recreation.
                 if !lease.is_live() {
                     self.surface_system.on_surface_destroyed();
-                    return Err(EngineError::new(ErrorCode::Cancelled)
-                        .with_msg("recreate onscreen: Surface retired before commit"));
+                    return Err(InstallAttemptFailure::not_enqueued(
+                        EngineError::new(ErrorCode::Cancelled)
+                            .with_msg("recreate onscreen: Surface retired before commit"),
+                    ));
                 }
                 self.attachment.commit(lease).map_err(|error| {
                     self.surface_system.on_surface_destroyed();
-                    transition_error("recreate onscreen: commit rejected Surface", error)
+                    InstallAttemptFailure::not_enqueued(transition_error(
+                        "recreate onscreen: commit rejected Surface",
+                        error,
+                    ))
                 })?;
                 self.surface_system.on_surface_available(surface_size);
                 info!(
@@ -224,7 +425,7 @@ impl RenderService {
                     "RenderService::update_surface backend error: requested={}x{}, err={}",
                     surface_size.0, surface_size.1, e
                 );
-                Err(e)
+                Err(InstallAttemptFailure::not_enqueued(e))
             }
 
             Err(RecvTimeoutError::Timeout) => {
@@ -234,12 +435,15 @@ impl RenderService {
                     surface_size.1,
                     Self::RECREATE_ONSCREEN_TIMEOUT.as_millis()
                 );
-                Err(EngineError::new(ErrorCode::Timeout)
-                    .with_msg("recreate onscreen: timed out")
-                    .with_detail(format!(
-                        "timed out after {}ms",
-                        Self::RECREATE_ONSCREEN_TIMEOUT.as_millis()
-                    )))
+                Err(InstallAttemptFailure::in_flight(
+                    revision,
+                    EngineError::new(ErrorCode::Timeout)
+                        .with_msg("recreate onscreen: timed out")
+                        .with_detail(format!(
+                            "timed out after {}ms",
+                            Self::RECREATE_ONSCREEN_TIMEOUT.as_millis()
+                        )),
+                ))
             }
 
             Err(e) => {
@@ -247,9 +451,11 @@ impl RenderService {
                     "RenderService::update_surface recv failed: requested={}x{}, err={:?}",
                     surface_size.0, surface_size.1, e
                 );
-                Err(EngineError::new(ErrorCode::Cancelled)
-                    .with_msg("recreate onscreen: recv failed")
-                    .with_detail(format!("{e:?}")))
+                Err(InstallAttemptFailure::not_enqueued(
+                    EngineError::new(ErrorCode::Cancelled)
+                        .with_msg("recreate onscreen: recv failed")
+                        .with_detail(format!("{e:?}")),
+                ))
             }
         }
     }
